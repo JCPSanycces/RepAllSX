@@ -1,0 +1,735 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ 
+#########################################################################
+# SBONFAC : Impression : Facture Ventes                                 #
+# --------------------------------------------------------------------- #
+# Chargement des paramètres et mise à jour de l'indicateur d'impression #
+#########################################################################
+
+
+###########################################
+# Appelé par le Call ETAT from AIMP3      #
+# --------------------------------------- #
+# Le Call ETAT effectue dans l'ordre :    #
+#   - Un Gosub ACTION  (ACTION="EXEC")    #
+#   - Un Call  IMPRIME (NBPAR,PARAMETRE)  #
+###########################################
+$ACTION
+Case ACTION
+  When "CONTPRT" : Gosub CONTPRT
+  When "EXEC"    : Gosub EXEC
+Endcase
+Return
+
+###########################################
+# Contrôle destination (choix imprimante) #
+# --------------------------------------- #
+#  Préchargement du nombre de copies      #
+#  Par défaut provient des destinations   #
+###########################################
+$CONTPRT
+#------ Préchargement si contexte gestion des factures de ventes -----#
+If GFONCTION="GESSIH" & clalev([M:SIH0])
+  If !find([M:RPT]IMPRIME,0,1,3,4)
+    #Fq97284-Gbn-La vérification doit se faire sur le client facture
+    If [M:SIH0]BPCINV<>[F:BPC]BPCNUM
+     Read [F:BPC]BPC0=[M:SIH0]BPCINV
+    Endif
+    #97284-fin
+    If find([M:SIH0]INVTYP,2,4)
+     #Fq73266-Gbn-uniquement s'il y a un modèle d'impression sur le tiers
+     If [F:BPC]TPMCOD<>""
+       [M:RPT]NBRCPY=max([M:SIH0]COPNBE,1) : # Nombre de copies
+     Endif
+    Else
+     #Fq73266-Gbn-uniquement s'il y a un modèle d'impression sur le tiers
+     If [F:BPC]TPMCOD<>""
+       [M:RPT]NBRCPY=max([M:SIH0]COPNBR,1) : # Nombre de copies
+     Endif
+    Endif
+  Else
+    [M:RPT]NBRCPY=0 : # pas de copie pour prévisu, message, fichier
+    Grizo [M:RPT]NBRCPY : Affzo [M:RPT]NBRCPY #Fq73266
+  Endif
+Endif
+#-----
+Return
+
+
+############################################################################
+# Avant l'impression du document, chargement paramètres si impression auto #
+# ------------------------------------------------------------------------ #
+# Nota : On force le nombre de copies à 1 car on a écrit dans la table     #
+#        AREPORTM, les enregistrements en fonction du nombre de copie.     #
+############################################################################
+$EXEC
+
+#----- Ne rien faire si pas impression auto, cela se fera par le Call IMPRIME -----#
+If dim([V]GWNUMREQ)<1 | dim([V]GWSEQREQ)<1 | dim([V]GWTRTAUTO)<1 | [V]GWTRTAUTO<>1
+  Return
+Endif
+#-----
+If dim(I)<1       Local Integer I             : Endif
+If dim(J)<1       Local Integer J             : Endif
+If dim([L]ETAT)<1 Local Char    ETAT(GLONARP) : Endif
+
+#-----
+For I=1 To [L]NBPAR
+  J=instr(1,[L]PARAMETRE(I),"=")
+  If J
+    [L]PARAM=left$([L]PARAMETRE(I),J-1)
+    Case [L]PARAM
+      When "X3ETA"          : Call GETPARAM([L]PARAM,[L]NBPAR,[L]PARAMETRE,[L]ETAT) From ETAT
+      When "__REQUETE"      : [L]PARAMETRE(I) = "__REQUETE="+num$([V]GWNUMREQ)
+      When "_PrinterCopies" : [L]PARAMETRE(I) = "_PrinterCopies="+chr$(1)+"1"
+      When "numedt"         : [L]PARAMETRE(I) = "numedt="+num$([V]GWNUMREQ)
+      When "seqedt"         : [L]PARAMETRE(I) = "seqedt="+num$([V]GWSEQREQ)
+      When "usr"            : [L]PARAMETRE(I) = "usr="+GUSER
+      When "etat"           : [L]PARAMETRE(I) = "etat="+[L]ETAT
+      When "euro"           : [L]PARAMETRE(I) = "euro="+GEURO
+      When "traitauto"      : [L]PARAMETRE(I) = "traitauto=1"
+    Endcase
+  Endif
+Next I
+#-----
+Return
+
+
+####################################
+# Appelé par le Call ETAT          #
+#   après l'action EXEC            #
+#   avant l'impression du document #
+####################################
+Subprog IMPRIME(NBPAR,PARAMETRE)
+Value    Integer NBPAR
+Variable Char    PARAMETRE()()
+
+#----- Si impression auto ne rien faire AREPORTM est déjà chargé -----#
+If dim([V]GWTRTAUTO)>0 & [V]GWTRTAUTO=1  End : Endif
+#----- Ouverture des tables -----#
+Local File AREPORTM   [ARM]
+Local File SINVOICE   [SIH]
+Local File SINVOICEV  [SIV]
+Local File SINVOICEV  [SIVV]  :#--CPO 83064
+Local File SINVOICE   [SIHH]  :#--CPO 83064
+Local File GACCDUDATE [DUD]   :#--CPO 83064
+Local File PAYORDER   [PYO]   :#--CPO 83064
+Local File TMPSRPT    [TRPT]  :#--CPO 83064
+Local File ZFACLOTES  [ZFL]
+#----- Déclaration des variables locales -----#
+Local Char    CRITERE(255)(2), PARAM(30) , VALEUR(30) , ETAT(GLONARP)
+Local Integer NUMREQ, IMPR, DUPLIC, I, J
+Local Date    DATREF
+#RMA * 11-07-2012 * 75916 - multicopy priting
+Local Char MULCOPPAR
+
+#--CPO 83064
+Local Decimal WMTTREGLE,WREGLEMENTS
+Local Decimal WINSATI,WINSATI_PREV
+Local Decimal WMTTREPRISFACT
+Local Decimal WACPTDDES,WACPTVERSES
+Local Decimal WMTTACPTECH
+Local Integer WSTAT, WSTAT_PREV
+
+Local Decimal WACPTDDES_ECH
+Local Decimal WACPTVERSES_ECH
+#--/CPO
+
+
+#----- Chargement des paramètres et du filtre -----#
+[L]CRITERE(0) = "1=1" #Gbn-83537
+[L]CRITERE(1) = "1=1" #Gbn-83537
+#-----
+For I=1 To [L]NBPAR
+  J=instr(1,[L]PARAMETRE(I),"=")
+  If J
+    [L]PARAM  = left$([L]PARAMETRE(I),J-1)
+    Call GETPARAM ([L]PARAM,[L]NBPAR,[L]PARAMETRE,VALEUR) From ETAT
+    #Gbn-83537-CRITERE devient variable dimensionnée
+    Case [L]PARAM
+      When "X3ETA"       : [L]ETAT     = [L]VALEUR
+      When "__REQUETE"   : [L]NUMREQ   = val([L]VALEUR)
+      When "sitedeb"     : [L]CRITERE(0) -= "& SALFCY>='"+[L]VALEUR+"'"
+      When "sitefin"     : [L]CRITERE(0) -= "& SALFCY<='"+[L]VALEUR+"'"
+      When "clientdeb"   : [L]CRITERE(0) -= "& BPCINV>='"+[L]VALEUR+"'"
+      When "clientfin"   : [L]CRITERE(0) -= "& BPCINV<='"+[L]VALEUR+"'"
+      When "facturedeb"  : [L]CRITERE(0) -= "& NUM>='"+[L]VALEUR+"'"
+      When "facturefin"  : [L]CRITERE(0) -= "& NUM<='"+[L]VALEUR+"'"
+      When "typedeb"     : [L]CRITERE(0) -= "& INVTYP>="+num$([L]VALEUR)
+      When "typefin"     : [L]CRITERE(0) -= "& INVTYP<="+num$([L]VALEUR)
+      When "datedeb"     : [L]DATREF   = gdat$(val(right$([L]VALEUR,7)),
+&                                        val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+                           [L]CRITERE(0) -= "& INVDAT >=["+format$(GFMD,[L]DATREF)+']'
+      When "datefin"     : [L]DATREF   = gdat$(val(right$([L]VALEUR,7)),
+&                                        val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+                           [L]CRITERE(0) -= "& INVDAT <=["+format$(GFMD,[L]DATREF)+']'
+# -- SBONFAC2
+      When "devdeb"      : [L]CRITERE(1) -= "& CUR>='"+[L]VALEUR+"'"
+      When "devfin"      : [L]CRITERE(1) -= "& CUR<='"+[L]VALEUR+"'"
+
+      When "codimp"         : [L]IMPR     = 2
+   #                           If [L]IMPR=1
+     #                           [L]CRITERE(0) -= "& STARPT=1" # Impression -> ne doit pas etre imprimé
+     #                         Else
+      #                          [L]CRITERE(0) -= "& STARPT=2" # Ré-impression -> doit être déjà imprimé
+      #                        Endif
+      When "duplicata"      : [L]DUPLIC    = val([L]VALEUR)
+      When "numedt"         : [L]PARAMETRE(I) = "numedt="+num$([L]NUMREQ)
+      When "seqedt"         : [L]PARAMETRE(I) = "seqedt=0"
+      When "usr"            : [L]PARAMETRE(I) = "usr="+GUSER
+      When "etat"           : [L]PARAMETRE(I) = "etat="+[L]ETAT
+      When "euro"           : [L]PARAMETRE(I) = "euro="+GEURO
+      When "_PrinterCopies" : [L]PARAMETRE(I) = "_PrinterCopies="+chr$(1)+"1" #Gbn-Fq75916
+      ##- Sam87923 : SEPA Bank --#
+      #--CPO 87923 SEPA Bank (modified while addind the 102423 feature)
+      #--18/12/2014 No use to do this => it keeps only the last value (the one for the last [SIV])
+      #--Commented here and done differently further below
+      #When "paramsddprn"    :
+      #                  If func AFNC.ACTIV("SDD")
+      #                        Local Char WSDDPRN
+      #                        If GFCY<>''
+      #                           Call PARAM (GFCY,"SDDPRN",WSDDPRN ) From ADOVAL
+      #                        Else
+      #                           Call PARAM ([F:SIH]FCY,"SDDPRN",WSDDPRN ) From ADOVAL
+      #                        Endif
+      #                        [L]PARAMETRE(I) = "paramsddprn="+WSDDPRN
+      #                  Else
+      #                        [L]PARAMETRE(I) = "paramsddprn=1"
+      #                  Endif
+    Endcase
+  Endif
+Next
+
+#----------------------------------------------------------------#
+#  - Création d'un seul enregistrement dans AREPORTM             #
+#  - Mise à jour indicateur d'impression sur l'entête de facture #
+#----------------------------------------------------------------#
+Call DEBTRANS From GLOCK
+
+#--CPO 83064
+#Trbegin [ARM], [SIV], [SIH]
+Trbegin [ARM], [SIV], [SIH],[TRPT]
+#--/CPO
+
+#----- Chargement buffer AREPORTM -----#
+
+# ACA (2010-05-03) Bug 56921 : Si enchaine
+Look [ARM]ARM0 = [L]NUMREQ;GUSER;[F:ARP]RPTCOD;1
+If !fstat
+  # Enreg trouvé, car lancement enchainé
+  # On bloque la boucle
+  CRITERE="1=2"
+  #On laisse GOK=1 sinon l'état ne sort pas
+Endif
+
+Raz [F:ARM]
+[F:ARM]USR    = GUSER
+[F:ARM]RPTCOD = [F:ARP]RPTCOD
+[F:ARM]NUMREQ = [L]NUMREQ
+[F:ARM]CREDAT = date$
+#-----
+
+Local Integer STARPT # 1=Non imprimé, 2=Imprimé
+Local Integer TYPRPT # 1=Définitif, 2=Duplicata, 3=Provisoire
+#--CPO 87923 12/12/2014 SEPA Bank
+#--CPO 102423 Belgium discount
+Local Char WSDDPRN, WDEPMGTMOD
+Local Integer WACTIVSDD
+WACTIVSDD = func AFNC.ACTIV("SDD")
+#--/
+
+#[L]CRITERE(0) -= "& NUM IN ("
+#[L]CRITERE(0) = " NUM IN ("
+#For [ZFL] ZFL0 Where evalue("1=1")
+#  [L]CRITERE(0) -= "'"+[ZFL]NUM+"',"
+#Next
+#[L]CRITERE(0) -= "'A')"
+
+#[L]CRITERE(0) = "[SIV]NUM IN [ZFL]NUM"
+
+Infbox [L]CRITERE(0)
+
+For [SIV] SIV0 Where evalue([L]CRITERE(0))
+  #RMA * 75916
+For  [ZFL]ZFL0 Where evalue("NUM = '"+[F:SIV]NUM+"'")
+
+  Call PARAM ([F:SIV]CPY,"MULCOPRINT",MULCOPPAR) From ADOVAL
+
+  #- Sam87923 : SEPA Bank --#
+  #--CPO 87923 SEPA Bank (modified while addind the 102423 feature)
+  #--18/12/2014 No use to do this => it keeps only the last value (the one for the last [SIV])
+  #--Commented here and done differently further below
+  #For I=1 To [L]NBPAR
+  #  J=instr(1,[L]PARAMETRE(I),"=")
+  #  If J
+  #    [L]PARAM  = left$([L]PARAMETRE(I),J-1)
+  #    Call GETPARAM ([L]PARAM,[L]NBPAR,[L]PARAMETRE,VALEUR) From ETAT
+  #    Case [L]PARAM
+  #      When "paramsddprn"    :
+  #                      If func AFNC.ACTIV("SDD")
+  #                            Local Char WSDDPRN
+  #                            Call PARAM ([F:SIV]SALFCY,"SDDPRN",WSDDPRN ) From ADOVAL
+  #                            [L]PARAMETRE(I) = "paramsddprn="+WSDDPRN
+  #                      Else
+  #                            [L]PARAMETRE(I) = "paramsddprn=1"
+  #                      Endif
+  #    Endcase
+  #  Endif
+  #Next
+  #--//CPO 87923
+
+  #----- Création d'un enregistrement par copie dans la table AREPORTM -----#
+  #Gbn-Fq75916
+  Local Integer INBCOP, LNBCOP : Raz [F:ARM]NUMCOP
+  If MULCOPPAR="2"
+   # Issue 113222 - 2016-01-25 by CPO : Number of copies for invoice/credit memo printing KO
+   #LNBCOP = max(1,[M:RPT]NBRCPY, [F:SIV]COPNBR)
+   Local Integer WCOPNB : WCOPNB=0
+   If find([F:SIV]INVTYP,2,4)
+     WCOPNB=[F:SIV]COPNBE
+   Else
+     WCOPNB=[F:SIV]COPNBR
+   Endif
+   LNBCOP = max(1,[M:RPT]NBRCPY, WCOPNB)
+   # End issue 113222
+  Else
+   LNBCOP = max(1,[M:RPT]NBRCPY)
+  Endif
+
+  For INBCOP=1 To LNBCOP
+   [F:ARM]NUMLIG+= 1
+   If MULCOPPAR="2" : [F:ARM]NUMCOP+= 1 : Else : [F:ARM]NUMCOP = 0 : Endif #RMA * 75916
+   [F:ARM]CLEA1  = [F:SIV]NUM
+
+   Gosub ALIMETAT_PE From ETAT
+   Write [ARM]
+   If fstat  GOK=0 : Call FSTA("ARM") From GLOCK : Break : Endif
+  Next
+  #----- Mise à jour table entête facture si demande d'impression -----#
+  ## Mise à jour de la zone STARPT dans SINVOICE qui indique si la facture définitive a été imprimée
+  Gosub ALIM_ORDER_DISCOUNT  :#--CPO 83064 Edition facture et commande avec acompte
+  If fstat>0 or GOK=0 : Break : Endif
+#  #--CPO 83064 Edition facture et commande avec acompte
+#  #--uniquement pour les factures non validées et avec reprise d'acomptes commandes
+#  Raz WACPTDDES,WACPTVERSES,WMTTACPTECH
+#  If [F:SIV]INVTYP=1 and sum([F:SIV]INSATI)>0 and [F:SIV]INVSTA<>3
+#    Gosub FIND_ORDER_DISCOUNT
+#    #--uniquement si besoin
+#    If WACPTDDES>0 or WACPTVERSES>0
+#      Raz [F:TRPT]
+#      [F:TRPT]=[F:ARM]
+#
+#      [F:TRPT]VCRNUM     = [F:SIV]NUM
+#      [F:TRPT]SIVCUR     = [F:SIV]CUR
+#      [F:TRPT]SIVACPTDDE = WACPTDDES
+#      [F:TRPT]SIVACPTVER = WACPTVERSES
+#      [F:TRPT]SIVACPTECH = WMTTACPTECH
+#
+#      Write [TRPT]
+#      If fstat  GOK=0 : Call FSTA("TRPT") From GLOCK : Break : Endif
+#    Endif
+#  Endif
+#  #--/CPO
+  Gosub ALIM_DEPMGTMOD :#--CPO 102423 Belgium discount
+  If fstat>0 or GOK=0 : Break : Endif
+#  #--CPO 102423 Belgium discount
+#  Read [F:SIH]SIH0=[F:SIV]NUM
+#  If !fstat and [F:SIH]DEPRAT<>0
+#    Call PARAM([F:SIV]SALFCY,"DEPMGTMOD",WDEPMGTMOD) From ADOVAL
+#    If find(WDEPMGTMOD,"1","5")
+#      Read [F:TRPT]TSRPT0=[F:ARM]NUMREQ;GUSER;[F:ARM]RPTCOD;[F:SIV]NUM
+#      If !fstat
+#        [F:TRPT]DEPMGTMOD = val(WDEPMGTMOD)
+#        Rewrite [TRPT]
+#        If fstat : GOK=0 : Call FSTA("TRPT") From GLOCK : Break : Endif
+#      Else
+#        Raz [F:TRPT]
+#        [F:TRPT]       = [F:ARM]
+#        [F:TRPT]VCRNUM = [F:SIV]NUM
+#
+#        [F:TRPT]DEPMGTMOD = val(WDEPMGTMOD)
+#        Write [TRPT]
+#        If fstat : GOK=0 : Call FSTA("TRPT") From GLOCK : Break : Endif
+#      Endif
+#    Endif
+#  Endif
+#  #--/
+  Gosub ALIM_SDDPRN :#--CPO 87923 SEPA Bank (modified while addind the 102423 feature)
+  If fstat>0 or GOK=0 : Break : Endif
+#  #--CPO 87923 SEPA Bank (modified while addind the 102423 feature)
+#  If WACTIVSDD
+#    Raz WSDDPRN
+#    Call PARAM ([F:SIV]SALFCY,"SDDPRN",WSDDPRN ) From ADOVAL
+#    If WSDDPRN = "2"
+#      Read [F:TRPT]TSRPT0=[F:ARM]NUMREQ;GUSER;[F:ARM]RPTCOD;[F:SIV]NUM
+#      If !fstat
+#        [F:TRPT]SDDPRN = val(WSDDPRN)
+#        Rewrite [TRPT]
+#        If fstat : GOK=0 : Call FSTA("TRPT") From GLOCK : Break : Endif
+#      Else
+#        Raz [F:TRPT]
+#        [F:TRPT]       = [F:ARM]
+#        [F:TRPT]VCRNUM = [F:SIV]NUM
+#
+#        [F:TRPT]SDDPRN = val(WSDDPRN)
+#        Write [TRPT]
+#        If fstat : GOK=0 : Call FSTA("TRPT") From GLOCK : Break : Endif
+#      Endif
+#    Endif
+#  Endif
+#  #--/
+
+  #----- Mise à jour table entête facture si demande d'impression -----#
+  ## Mise à jour de la zone STARPT dans SINVOICE qui indique si la facture définitive a été imprimée
+  Gosub STATYPRPT
+  Local Char CTYPRPT
+  If MULCOPPAR <> "2"  #RMA * 75916
+    Gosub STATYPRPT
+    CTYPRPT = num$([L]TYPRPT)
+  Else
+   Gosub STATYPRPT #Gbn * 75916
+   [L]CTYPRPT = "1"
+  Endif
+  #--CPO 85859 Mention "Provisoire" et plusieures factures à la suite
+  #--Si passage par paramètre : "mention" sera défini par la dernière facture traitée
+  #--Solution : passer par le champ CLEA11 de AREPORTM pour chaque facture
+  Call SETPARAM ("mention",[L]NBPAR,[L]PARAMETRE,CTYPRPT) From ETAT
+  Update [ARM] Where NUMREQ= [L]NUMREQ  and USR=GUSER and RPTCOD=[F:ARP]RPTCOD and CLEA1=[F:SIV]NUM
+&              With  CLEA11 = [L]CTYPRPT
+  #--/
+
+#  [F:SIH]STARPT=[L]STARPT
+#  [F:SIV]STARPT=[L]STARPT
+#  Rewrite [SIV]
+#  If fstat  GOK=0 : Call FSTA("SIV") From GLOCK : Break : Endif
+#  Rewrite [SIH]
+#  If fstat  GOK=0 : Call FSTA("SIH") From GLOCK : Break : Endif
+  Update [SIV] Where NUM=[F:ARM]CLEA1 With STARPT=[L]STARPT
+  If fstat  GOK=0 : Call FSTA("SIV") From GLOCK : Break : Endif
+  Update [SIH] Where NUM=[F:ARM]CLEA1 With STARPT=[L]STARPT
+  If fstat  GOK=0 : Call FSTA("SIH") From GLOCK : Break : Endif
+  #-----
+ Next
+Next
+If GOK<1  Rollback  Else  Commit : Endif
+
+End
+
+# Définit :
+## Local Integer STARPT # 1=Non imprimé, 2=Imprimé
+## Local Integer TYPRPT # 1=Définitif, 2=Duplicata, 3=Provisoire
+$STATYPRPT
+  [L]STARPT = [F:SIV]STARPT
+  #---CPO 72218 DUPLIC variable inexistante (si passage par traitements auto)
+  #---il faut tester le dim(DUPLIC) et gerer le cas STARPT=2 (Imprimé) si DUPLIC n'est pas définie.
+  If dim([L]DUPLIC)>0 :# 72218
+    If [L]DUPLIC=1 # Duplicata demandée
+      [L]TYPRPT = 2
+    Else : # Duplicata non demandée
+      [L]TYPRPT = 1
+    Endif
+  Endif
+  If [L]STARPT<>2
+    # FGR 07/08/2014 : X3SUIVI96843 (début)
+    If dim(SVALSIVCFM) < 0 Then
+      Local Char SVALSIVCFM(10)
+    Endif
+    If [F:SIV]INVTYP = 5 Then
+      SVALSIVCFM = "1"
+    Else
+      SVALSIVCFM = func AFNC.PARAM("SIVCFM",[F:SIV]SALFCY)
+    Endif
+    # FGR 07/08/2014 : X3SUIVI96843 (fin)
+    #Case func AFNC.PARAM("SIVCFM",[F:SIV]SALFCY)  # FGR 07/08/2014 : X3SUIVI96843
+    Case SVALSIVCFM                                # FGR 07/08/2014 : X3SUIVI96843
+      When "1" : #Non
+        [L]STARPT = 2
+        [L]TYPRPT = 1 : #Définitive
+      When "2" : #Oui
+        [L]STARPT = 2
+        [L]TYPRPT = 1 : #Définitive
+      When "3" : #Oui après validation
+        If [F:SIV]INVSTA=3 : #Facture validée
+          [L]STARPT = 2
+          [L]TYPRPT = 1 : #Facture Définitive
+        Else
+          [L]STARPT = 1
+          [L]TYPRPT = 3 : #Facture Provisoire
+        Endif
+    Endcase
+  #---CPO 72218 DUPLIC variable inexistante (si passage par traitements auto)
+  #---dans le cas où la facture a déjà été 'imprimée', on force le duplicata à 2
+  Elsif [L]STARPT=2 and dim([L]DUPLIC)<=0
+    [L]TYPRPT=2 :# Pas de duplicata avec la fact définitive
+  #---CPO
+  Endif
+
+
+Return
+
+###########################################################################
+# Appelé par Gosub depuis le traitement TRTX3ETA                          #
+# ----------------------------------------------------------------------- #
+#   - Création d'un enregistrement par copie désirée dans AREPORTM        #
+#   - Mise à jour indicateur d'impression sur l'entête du document        #
+# ----------------------------------------------------------------------- #
+# Les variables locales suivantes sont disponibles :                      #
+#     WADXLOG  = Indicateur transaction (0 = pas de transaction en cours) #
+#     ETAT     = Code de l'état                                           #
+#     REQUETE  = Numéro de requête                                        #
+#     LIGNE    = Numéro de ligne de AREPORTM                              #
+#     SEQUENCE = Numéro de séquence de AREPORTM                           #
+# Les buffers [F:SIH] et [F:SIV] sont chargés et les entêtes sont écrites #
+###########################################################################
+$ALIM_ETAT
+#--CPO 107105
+#----CPO 83064
+If clalev([F:SIVV])=0 : Local File SINVOICEV  [SIVV] : Endif
+If clalev([F:SIHH])=0 : Local File SINVOICE   [SIHH] : Endif
+If clalev([F:TRPT])=0 : Local File TMPSRPT    [TRPT] : Endif
+If clalev([F:DUD])=0  : Local File GACCDUDATE [DUD]  : Endif
+If clalev([F:PYO])=0  : Local File PAYORDER   [PYO]  : Endif
+
+Local Decimal WMTTREGLE,WREGLEMENTS
+Local Decimal WINSATI,WINSATI_PREV
+Local Decimal WMTTREPRISFACT
+Local Decimal WACPTDDES,WACPTVERSES
+Local Decimal WMTTACPTECH
+Local Integer WSTAT, WSTAT_PREV
+
+Local Decimal WACPTDDES_ECH
+Local Decimal WACPTVERSES_ECH
+#------CPO 87923 12/12/2014 SEPA Bank
+#------CPO 102423 Belgium discount
+Local Char WSDDPRN, WDEPMGTMOD
+Local Integer WACTIVSDD
+WACTIVSDD = func AFNC.ACTIV("SDD")
+#------/
+#----/
+#--/
+
+#RMA * 75916
+Local Char MULCOPPAR
+Call PARAM ([F:SIV]CPY,"MULCOPRINT",MULCOPPAR) From ADOVAL
+#-----
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin [ARM], [SIV], [SIH]
+Endif
+#----- Création des enregistrements dans la table AREPORTM -----#
+Raz [F:ARM]
+[F:ARM]NUMREQ = REQUETE
+[F:ARM]USR    = GUSER
+[F:ARM]RPTCOD = ETAT
+[F:ARM]NUMLIG = LIGNE
+[F:ARM]SEQREQ = SEQUENCE
+[F:ARM]CLEA1  = [F:SIH]NUM
+[F:ARM]CREDAT = date$
+#-----
+For I=1 To max(NBRCOPIE,1)
+  [F:ARM]NUMLIG+=1
+  If MULCOPPAR="2" : [F:ARM]NUMCOP+= 1 : Else : [F:ARM]NUMCOP = 0 : Endif
+  Gosub ALIMETAT_PE From ETAT
+  Write [ARM]
+  If fstat  GOK=0 : Call FSTA("ARM") From GLOCK : Break : Endif
+Next I
+#-----
+If fstat  Goto AB_ALIM_ETAT : Endif
+
+#--CPO 107105 Alimentation depuis lancement traitements auto
+Gosub ALIM_ORDER_DISCOUNT  :#--CPO 83064 Edition facture et commande avec acompte
+Gosub ALIM_DEPMGTMOD       :#--CPO 102423 Belgium discount
+Gosub ALIM_SDDPRN          :#--CPO 87923 SEPA Bank (modified while addind the 102423 feature)
+If fstat or GOK=0 : Goto AB_ALIM_ETAT : Endif
+#--/
+
+LIGNE   =[F:ARM]NUMLIG
+SEQUENCE=[F:ARM]SEQREQ
+#----- Mise à jour indicateur d'impression de l'entête commande -----#
+
+Local Integer STARPT # 1=Non imprimé, 2=Imprimé
+Local Integer TYPRPT # 1=Définitif, 2=Duplicata, 3=Provisoire
+Gosub STATYPRPT
+Update [SIV] Where NUM=[F:ARM]CLEA1 With STARPT=[L]STARPT
+If fstat  GOK=0 : Call FSTA("SIV") From GLOCK : Goto AB_ALIM_ETAT : Endif
+Update [SIH] Where NUM=[F:ARM]CLEA1 With STARPT=[L]STARPT
+If fstat  GOK=0 : Call FSTA("SIH") From GLOCK : Goto AB_ALIM_ETAT : Endif
+[F:SIV]STARPT=[L]STARPT : # La classe [F] n'est pas màj par l'Update
+[F:SIH]STARPT=[L]STARPT : # La classe [F] n'est pas màj par l'Update
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+Return
+#-----
+$AB_ALIM_ETAT
+If [L]WADXLOG=0
+  Rollback
+Endif
+Return
+
+
+#--------------------------------------------------------------------------------------------
+$FIND_ORDER_DISCOUNT
+Local Integer I,IA,IB
+Local Decimal WMTT_ACPT_VER_PREV
+
+Raz WACPTDDES,WACPTVERSES
+Raz WINSATI,WSTAT,WREGLEMENTS
+Raz WMTTACPTECH
+
+# Boucle de recherche des réglements des acomptes affectés à la facture
+For IA=0 To dim([F:SIV]INSORDNUM)-1
+  If [F:SIV]INSORDNUM(IA)<>""
+    Raz WREGLEMENTS,WINSATI
+    Read [DUD]DUD0="*SO";[F:SIV]INSORDNUM(IA);1;[F:SIV]INSLIN(IA)
+    If !fstat
+      If [F:SIV]CUR <> [F:DUD]CUR
+        WSTAT=0
+        Call CONVERT([F:SIV]CUR,[F:DUD]CUR,GLOCALDEV,[F:SIH]CURTYP,datesyst,
+&                    [F:SIV]INSATI(IA),WINSATI,WSTAT) From TRTDEV
+        If WSTAT<>0 : WINSATI=[F:SIV]INSATI(IA) : Endif
+      Else
+        WINSATI=[F:SIV]INSATI(IA)
+      Endif
+      #--recherche réglement de cet acompte non encore imputé à une facture
+      #--(creation d'un enr. [PYO] uniquement si le règlement est validé)
+      Filter [PYO] Where DUDNUM=[F:DUD]ACCNUM & DUDLIG=[F:DUD]DUDLIG
+&                  Order By Key PYO0
+      For [PYO]
+        #--CPO A FAIRE : Le [F:PYO]DUDPAYAMT est en quelle devise ?
+        #--Si celle de [DUD] alors il faut convertir aussi ce dernier...
+        WREGLEMENTS +=[F:PYO]DUDPAYAMT
+      Next
+      Filter [PYO]
+
+      WMTTACPTECH += ([F:DUD]PAYCUR + [F:DUD]TMPCUR)
+
+      #--CPO Phase II Calcul des mtts demandés et versés
+      Raz WMTT_ACPT_VER_PREV
+      Gosub RECH_ACPTS_VER_PREV
+      WACPT_REGL_RESTANTS = ([F:DUD]TMPCUR + WREGLEMENTS)
+      If WMTT_ACPT_VER_PREV>0
+        If ([F:DUD]TMPCUR + WREGLEMENTS)-[L]WMTT_ACPT_VER_PREV>0
+          WACPT_REGL_RESTANTS = ([F:DUD]TMPCUR + WREGLEMENTS)-[L]WMTT_ACPT_VER_PREV
+        Endif
+      Endif
+      If WINSATI>=WACPT_REGL_RESTANTS
+        WACPTDDES += WINSATI-WACPT_REGL_RESTANTS
+      Endif
+      If WINSATI<WACPT_REGL_RESTANTS
+        WACPTVERSES += WINSATI
+      Else
+        WACPTVERSES += WACPT_REGL_RESTANTS
+      Endif
+    Endif
+  Endif
+Next
+
+Return
+#--------------------------------------------------------------------------------------------
+$RECH_ACPTS_VER_PREV
+Raz WMTT_ACPT_VER_PREV
+Filter [SIVV] Where SALFCY=[F:SIV]SALFCY and find([F:SIV]INSORDNUM(IA),INSORDNUM)>0 and INVDAT<=[F:SIV]INVDAT and CREDATTIM<[F:SIV]CREDATTIM
+& and INVSTA<>3 and INVTYP=1 and NUM<[F:SIV]NUM
+& Order By Key TMP0 = INVDAT;CREDATTIM;NUM
+For [SIVV]TMP0
+  For I = 0 To dim([F:SIVV]INSORDNUM)-1
+    If [F:SIVV]INSORDNUM(I)=[F:SIV]INSORDNUM(IA) and [F:SIVV]INSLIN(I)=[F:SIV]INSLIN(IA)
+      If [F:SIVV]CUR <> [F:DUD]CUR
+        WSTAT_PREV=0
+        If [F:SIHH]NUM<>[F:SIVV]NUM
+          Read [F:SIHH]SIH0=[F:SIVV]NUM
+        Endif
+        Call CONVERT([F:SIVV]CUR,[F:DUD]CUR,GLOCALDEV,[F:SIHH]CURTYP,datesyst,
+&                    [F:SIVV]INSATI(I),WINSATI_PREV,WSTAT_PREV) From TRTDEV
+        If WSTAT_PREV<>0 : WINSATI_PREV=[F:SIVV]INSATI(I) : Endif
+      Else
+        WINSATI_PREV=[F:SIVV]INSATI(I)
+      Endif
+
+      If WINSATI_PREV<([F:DUD]TMPCUR + WREGLEMENTS)
+        WMTT_ACPT_VER_PREV += WINSATI_PREV
+      Else
+        WMTT_ACPT_VER_PREV += ([F:DUD]TMPCUR + WREGLEMENTS)
+      Endif
+    Endif
+  Next I
+Next
+Filter [SIVV]
+Return
+#--------------------------------------------------------------------------------------------------
+$ALIM_ORDER_DISCOUNT
+  #--CPO 83064 Edition facture et commande avec acompte
+  #--uniquement pour les factures non validées et avec reprise d'acomptes commandes
+  Raz WACPTDDES,WACPTVERSES,WMTTACPTECH
+  If [F:SIV]INVTYP=1 and sum([F:SIV]INSATI)>0 and [F:SIV]INVSTA<>3
+    Gosub FIND_ORDER_DISCOUNT
+    #--uniquement si besoin
+    If WACPTDDES>0 or WACPTVERSES>0
+      Raz [F:TRPT]
+      [F:TRPT]=[F:ARM]
+
+      [F:TRPT]VCRNUM     = [F:SIV]NUM
+      [F:TRPT]SIVCUR     = [F:SIV]CUR
+      [F:TRPT]SIVACPTDDE = WACPTDDES
+      [F:TRPT]SIVACPTVER = WACPTVERSES
+      [F:TRPT]SIVACPTECH = WMTTACPTECH
+
+      Write [TRPT]
+      If fstat  GOK=0 : Call FSTA("TRPT") From GLOCK : Endif #Break : Endif
+    Endif
+  Endif
+  #--/CPO
+Return
+#--------------------------------------------------------------------------------------------------
+$ALIM_DEPMGTMOD
+  #--CPO 102423 Belgium discount
+  Read [F:SIH]SIH0=[F:SIV]NUM
+  If !fstat and [F:SIH]DEPRAT<>0
+    Call PARAM([F:SIV]SALFCY,"DEPMGTMOD",WDEPMGTMOD) From ADOVAL
+    If find(WDEPMGTMOD,"1","5")
+      Read [F:TRPT]TSRPT0=[F:ARM]NUMREQ;GUSER;[F:ARM]RPTCOD;[F:SIV]NUM
+      If !fstat
+        [F:TRPT]DEPMGTMOD = val(WDEPMGTMOD)
+        Rewrite [TRPT]
+        If fstat : GOK=0 : Call FSTA("TRPT") From GLOCK : Endif #Break : Endif
+      Else
+        Raz [F:TRPT]
+        [F:TRPT]       = [F:ARM]
+        [F:TRPT]VCRNUM = [F:SIV]NUM
+
+        [F:TRPT]DEPMGTMOD = val(WDEPMGTMOD)
+        Write [TRPT]
+        If fstat : GOK=0 : Call FSTA("TRPT") From GLOCK : Endif #Break : Endif
+      Endif
+    Endif
+  Endif
+  #--/
+Return
+#--------------------------------------------------------------------------------------------------
+$ALIM_SDDPRN
+  #--CPO 87923 SEPA Bank (modified while addind the 102423 feature)
+  If WACTIVSDD
+    Raz WSDDPRN
+    Call PARAM ([F:SIV]SALFCY,"SDDPRN",WSDDPRN ) From ADOVAL
+    If WSDDPRN = "2"
+      Read [F:TRPT]TSRPT0=[F:ARM]NUMREQ;GUSER;[F:ARM]RPTCOD;[F:SIV]NUM
+      If !fstat
+        [F:TRPT]SDDPRN = val(WSDDPRN)
+        Rewrite [TRPT]
+        If fstat : GOK=0 : Call FSTA("TRPT") From GLOCK : Endif # Break : Endif
+      Else
+        Raz [F:TRPT]
+        [F:TRPT]       = [F:ARM]
+        [F:TRPT]VCRNUM = [F:SIV]NUM
+
+        [F:TRPT]SDDPRN = val(WSDDPRN)
+        Write [TRPT]
+        If fstat : GOK=0 : Call FSTA("TRPT") From GLOCK : Endif # Break : Endif
+      Endif
+    Endif
+  Endif
+  #--/
+Return
+#--------------------------------------------------------------------------------------------------
+
