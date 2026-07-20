@@ -1,0 +1,2286 @@
+#<AdxTL>@(#)11.0.0.0 $Revision$
+####################################################################################################################
+# MTOLINKLIB librairie d'outils pour la mise à jour de la table des affectations MTOLINK
+####################################################################################################################
+# UPDMTOLINK :    Mise à jour MTOLINK
+#---------------------------------
+#              Type de traitement MAJCOD
+#              C = création lien
+#              M = modification lien
+#              A = suppression lien
+#              P = Proposition de liens
+#
+#                  Recherche de liens possibles:
+#                  PRPTYP = 1: Proposition complète: annule et remplace les liens existants
+#                  PRPTYP = 2: Complément: conservation des liens existants, proposition
+#                              pour la quantité non affectée
+#                  PRPTYP = 3: Virtuelle
+#                              PRPMOD = 1 (mise à jour) interdit dans ce cas
+#                  Modes de traitements possibles:
+#                  PRPMOD = 1: Mise à jour
+#                  PRPMOD = 2: Simulation (vérification qté disponible et réponse)
+#                  PRPMOD = 3: Consultation (pour affichage proposition), il faut passer le nom du traitement appelant
+#
+#              R = Révision des affectations en cas de sur-affectation d'une ressource OU demande
+#                  Proposition de liens sur une ressource ou demande
+#                  sans création de liens sur les demande OU ressource non précédemment liées
+#                  GH 01/08/13 bug 91361
+#
+#              Z = raz de tous liens associés à une demande OU une ressource
+#                  (suivant les paramètres renseignés DEM*** ou RESS***)
+#
+#              E = Traitement en entrée de ressource
+#              S = annulation de traitement en entrée de ressource
+#
+# le buffer [M:MLIK] doit être chargé
+#--------------------------------------------------------------
+# $OPEN_MTO        Ouverture tables et masque écran
+# -------------------------------------------------------------
+# controle présence quantité affectée forcée sur ressource
+# Subprog CHECK_RESS_FRCQTY(LFCY, LTYP, LNUM, LLIN, LSEQ, LRET)
+#--------------------------------------------------------------
+# récupération quantité affectée forcée sur ressource
+# Subprog GET_RESS_FRCQTY(LFCY, LTYP, LNUM, LLIN, LSEQ, LFRCQTY)
+#--------------------------------------------------------------
+# controle présence quantité affectée forcée sur demande
+# Subprog CHECK_DEM_FRCQTY(LFCY, LTYP, LNUM, LLIN, LSEQ, LWTYP, LRET)
+#--------------------------------------------------------------
+# récupération quantité affectée forcée sur demande
+# Subprog GET_DEM_FRCQTY(LFCY, LTYP, LNUM, LLIN, LSEQ, LWTYP, LFRCQTY)
+#--------------------------------------------------------------
+# A partir de l'identifiant, renvoit si il s'agit d'un contexte contremarque
+# Funprog IS_DIRECT_ORDER(LFCY, LTYP, LNUM, LLIN, LSEQ)
+#--------------------------------------------------------------
+# A partir d'article et site, s'agit-il d'un article sujet à contremarque (mode 101)
+# Funprog IS_DIRECT_ORDER_CTX(LFCY, LITM)
+#--------------------------------------------------------------
+# existe-t-il des affectations liées à ce document
+# Funprog LINK_EXISTS(LFCY, LTYP, LNUM, LLIN, LSEQ, LWTYP)
+#--------------------------------------------------------------
+# mise à jour ORDERS en référence à buffer MLIK
+# Subprog UPDORDERS_FROM_MLIK
+####################################################################################################################
+
+# vérif intégrée pour pallier aux appels manquants à OPEN_MTO (normal à la première mise en oeuvre)
+$CHECK_MTO
+If !clalev([F:PTO]) | !clalev([F:MLK]) | !clalev([M:MLIK]): Gosub OPEN_MTO : Endif
+Return
+
+$OPEN_MTO
+If !clalev([F:MLK]) :  Local File MTOLINK   [MLK] : Endif
+If !clalev([F:PTO]) :  Local File PARMTO    [PTO] : Endif  : # Règles d'affectations MTO
+If !clalev([M:MLIK]):  Local Mask MLIK      [MLIK]: Endif  : # Masque maj affectations MTO
+If !clalev([F:ORDB]):  Local File ORDERS    [ORDB]: Endif    # FQ 71360 GA 02/2011 avant [ORD1] pb sur les maj automatiques
+Return
+
+########################################################################
+Subprog UPDMTOLINK
+Local Integer IOK, IMOD, I, J, K, L
+Local Integer SI, SJ
+Local Char    WCLE(200)
+Local Decimal WREQQTY, WCOVQTY, WMTOQTY
+Local Date    WCOVDAT, WDATHOR
+Local Integer ISDEM, ISRESS, ISRESSM, ISRESSE, ISITEM
+Local Integer WNBRULE, NDEM, NRESS, NFRESS
+Local Char    WPTOCOD(GLONPTO)
+Local Char    WUOM(GLONUOM)
+Local Integer I_RULE, ONE_PASS, OFFSET
+Local Decimal R_MINQTY, R_MAXQTY
+Local Date    R_MINDAT, R_MAXDAT
+Local Char    R_BPSNUM(GLONBPR), R_PJT(GLONPJT), R_UOM(GLONUOM), R_USRFLD1(50), R_USRFLD2(50), R_USRFLD3(50)
+Local Char    MTOLINK_PE_MODE(3)
+Local Decimal ENT_CUMALLQTY         # 76887
+Local Integer WTYP2
+Local Integer TEST
+Local Char    WCLE(100) : # GH 13/01/2014 bug 95628 ne pas utiliser GCLE, ça perturbe les imports
+# If GUSER="GH" : TEST=1 : Endif
+
+If find([M:MLIK]MAJCOD,"P","R","E") : # Proposition, Révision, Entrée
+    Local Integer XDIM : XDIM = 500
+    Local Integer TDEM_TYP(XDIM)
+    Local Char    TDEM_NUM(GLONVCR)(XDIM)
+    Local Decimal TDEM_RMN(XDIM)
+    Local Decimal TDEM_MTO(XDIM)
+    Local Integer TDEM_OFF(XDIM)
+    Local Date    TDEM_DAT(XDIM)
+    Local Char    TDEM_PJT(GLONPJT)(XDIM)
+    Local Char    TDEM_UOM(GLONUOM)(XDIM)
+    Local Char    TDEM_USRFLD1(50)(XDIM)
+    Local Char    TDEM_USRFLD2(50)(XDIM)
+    Local Char    TDEM_USRFLD3(50)(XDIM)
+
+    Local Integer TRESS_TYP(XDIM)
+    Local Char    TRESS_NUM(GLONVCR)(XDIM)
+    Local Decimal TRESS_RMN(XDIM)
+    Local Decimal TRESS_MTO(XDIM)
+    Local Integer TRESS_OFF(XDIM)
+    Local Date    TRESS_DAT(XDIM)
+    Local Char    TRESS_BPR(GLONBPR)(XDIM)
+    Local Char    TRESS_PJT(GLONPJT)(XDIM)
+    Local Char    TRESS_UOM(GLONUOM)(XDIM)
+    Local Char    TRESS_USRFLD1(50)(XDIM)
+    Local Char    TRESS_USRFLD2(50)(XDIM)
+    Local Char    TRESS_USRFLD3(50)(XDIM)
+
+    If clalev ([F:PTO])  = 0 : Local File PARMTO     [PTO]  : Endif
+    If clalev ([F:ITF])  = 0 : Local File ITMFACILIT [ITF]  : Endif
+Endif
+
+If find([M:MLIK]MAJCOD,"P","R") : # Proposition ou Révision
+    Local Integer TFRESS_TYP(XDIM)
+    Local Char    TFRESS_NUM(GLONVCR)(XDIM)
+    Local Decimal TFRESS_RMN(XDIM)
+    Local Decimal TFRESS_MTO(XDIM)
+    Local Integer TFRESS_OFF(XDIM)
+    Local Date    TFRESS_DAT(XDIM)
+    Local Integer TFRESS_SYN(XDIM)
+
+    I = max(0,dim([F:PTO]UNTFLT)) + 3 : # nb max de règles = nb standards + 3 spécifiques
+    Local Integer WUSRFLT(I)
+    Local Integer WPJTFLT(I)
+    Local Integer WUNTFLT(I)
+    Local Integer WQTYFLT(I)
+    Local Decimal WQTYPCTUP(I)
+    Local Decimal WQTYPCTDOWN(I)
+    Local Integer WBPSFLT(I)
+    Local Integer WDATFLT(I)
+    Local Decimal WDATMARUP(I)
+    Local Decimal WDATMARDOWN(I)
+
+    If clalev ([F:ITM])  = 0 : Local File ITMMASTER  [ITM]  : Endif
+    If clalev ([F:ITP])  = 0 : Local File ITMBPS     [ITP]  : Endif
+    If clalev ([F:BPS])  = 0 : Local File BPSUPPLIER [BPS]  : Endif
+
+    If GMODU(6) = 2
+      If clalev ([F:POQW]) = 0 : Local File PORDERQ    [POQW] : Endif
+      If clalev ([F:PSDW]) = 0 : Local File PREQUISD   [PSDW] : Endif
+      If clalev ([F:POCW]) = 0 : Local File PORDERC    [POCW] : Endif
+      # If clalev ([F:SCOW]) = 0 : Local File SCOHEAD    [SCOW] : Endif
+      If clalev ([F:SCIW]) = 0 : Local File SCOITM     [SCIW] : Endif
+    Endif
+
+    If GMODU(5) = 2
+      If clalev ([F:SOPW]) = 0 : Local File SORDERP    [SOPW] : Endif
+      If clalev ([F:SOCW]) = 0 : Local File SORDERC    [SOCW] : Endif
+    Endif
+
+    If GMODU(8) = 2
+      # If clalev ([F:MFGW]) = 0 : Local File MFGHEAD   [MFGW] : Endif
+      If clalev ([F:MFIW]) = 0 : Local File MFGITM    [MFIW] : Endif
+    Endif
+Endif
+
+If clalev ([F:MLK1]) = 0 : Local File MTOLINK    [MLK1] : Endif
+If clalev ([F:ORDB]) = 0 : Local File ORDERS     [ORDB] : Endif
+
+IOK = 0
+Case [M:MLIK]MAJCOD
+    When "C"     : Gosub MTOLINK_NEW
+    When "M"     : Gosub MTOLINK_MOD
+    When "A"     : Gosub MTOLINK_DEL
+    When "P"     : Gosub MTOLINK_PRP
+    When "Z"     : Gosub MTOLINK_RAZ
+    When "E"     : Gosub MTOLINK_ENT
+    When "R"     : Gosub MTOLINK_REV
+Endcase
+
+End
+
+#------------------------------------------------------------------------
+# création de lien
+$MTOLINK_NEW
+
+# vérification existence des encours concernés
+If IOK = 0
+    Gosub CHECK_DEMAND
+    If IOK : IOK=0 : Gosub CHECK_RESSOURCE : Endif
+Endif
+# If !IOK : Return : Endif : # GH 13/10/2015 bug 111344 [M:MLIK]RET<>0 indicates something is wrong
+If !IOK : [M:MLIK]RET=1 : Return : Endif
+
+Raz [F:MLK1]
+[F:MLK1] = [M:MLIK]
+[F:MLK1]CREDAT = date$
+[F:MLK1]CREUSR = GUSER
+[F:MLK1]EXPNUM = [C]EXPORT
+
+## GH 13/03/2013 dm 88039
+GPOINT = "BEFMLKCRE" : Gosub  ENTREE From EXEFNC
+If GOK<1 : Return : Endif
+
+Write [MLK1]
+If fstat : GOK = 0 : Call FSTA("MLK1") From GLOCK : Return : Endif
+
+GOK=1
+Return
+
+#------------------------------------------------------------------------
+# modification de lien
+$MTOLINK_MOD
+# vérification existence des encours concernés
+If IOK = 0
+    Gosub CHECK_DEMAND
+    If IOK : IOK=0 : Gosub CHECK_RESSOURCE : Endif
+Endif
+# If !IOK : Return : Endif : # GH 13/10/2015 bug 111344 [M:MLIK]RET<>0 indicates something is wrong
+If !IOK : [M:MLIK]RET=1 : Return : Endif
+
+IOK = 0
+For [MLK1]MLK0 Where STOFCY  = [M:MLIK]STOFCY
+&                  & ITMREF  = [M:MLIK]ITMREF
+&                  & DEMTYP  = [M:MLIK]DEMTYP
+&                  & DEMNUM  = [M:MLIK]DEMNUM
+&                  & DEMLIN  = [M:MLIK]DEMLIN
+&                  & DEMSEQ  = [M:MLIK]DEMSEQ
+&                  & DWIPTYP = [M:MLIK]DWIPTYP
+&                  & RESSTYP = [M:MLIK]RESSTYP
+&                  & RESSNUM = [M:MLIK]RESSNUM
+&                  & RESSLIN = [M:MLIK]RESSLIN
+&                  & RESSSEQ = [M:MLIK]RESSSEQ
+    Readlock [MLK1] Curr
+    If fstat = 1
+        GOK   = -1
+        GLOCK = "$MTOLINK"-[M:MLIK]STOFCY-[M:MLIK]ITMREF-num$([M:MLIK]DEMTYP)-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)
+        Break
+    Elsif fstat
+        Break : # IOK=0
+    Endif
+
+    IOK = 1
+
+    # en mise à jour suite à réception partielle de stock, la modification ne doit pas surcharger autre chose que les élements clés et la quantité 69610
+    Case [M:MLIK]MAJCOD
+        When "P","R" : [F:MLK1]LIKQTY+= [M:MLIK]LIKQTY : [M:MLIK]LIKQTY = [F:MLK1]LIKQTY
+                       [M:MLIK]FRCFLG = [F:MLK1]FRCFLG
+                       [M:MLIK]FMIFLG = [F:MLK1]FMIFLG
+                       IMOD=1
+        When "E"     : [F:MLK1]LIKQTY = [M:MLIK]LIKQTY
+        When Default : [F:MLK1] = [M:MLIK]
+    Endcase
+
+    [F:MLK1]UPDDAT = date$
+    [F:MLK1]UPDUSR = GUSER
+    [F:MLK1]EXPNUM = [C]EXPORT
+
+    ## GH 13/03/2013 dm 88039
+    GPOINT = "BEFMLKUPD" : Gosub  ENTREE From EXEFNC
+    If GOK<1 : Break : Endif
+
+    Rewrite [MLK1]
+    If fstat : GOK = 0 : Call FSTA("MLK1") From GLOCK : Break : Endif
+Next
+
+If !IOK & GOK>0 : IOK=1 : Goto MTOLINK_NEW : Endif
+Return
+
+#------------------------------------------------------------------------
+# suppression de lien
+$MTOLINK_DEL
+If [M:MLIK]DEMNUM<>"" & !IOK
+   Gosub CHECK_DEMAND : # pour reinitialiser eventuellement [M:MLIK]DWIPTYP
+Endif
+
+# on ne vérifie pas les demande/ressource transmis en paramètre
+
+WCLE = [M:MLIK]STOFCY-[M:MLIK]ITMREF-num$([M:MLIK]DEMTYP)-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)
+For [MLK1]MLK0 Where STOFCY  = [M:MLIK]STOFCY
+&                  & ITMREF  = [M:MLIK]ITMREF
+&                  & DEMTYP  = [M:MLIK]DEMTYP
+&                  & DEMNUM  = [M:MLIK]DEMNUM
+&                  & DEMLIN  = [M:MLIK]DEMLIN
+&                  & DEMSEQ  = [M:MLIK]DEMSEQ
+&                  & DWIPTYP = [M:MLIK]DWIPTYP
+&                  & RESSTYP = [M:MLIK]RESSTYP
+&                  & RESSNUM = [M:MLIK]RESSNUM
+&                  & RESSLIN = [M:MLIK]RESSLIN
+&                  & RESSSEQ = [M:MLIK]RESSSEQ
+    Readlock [MLK1] Curr
+    If fstat = 1
+       GOK = -1 : GLOCK = "$MTOLINK"-WCLE : Break
+    Elsif fstat
+       GOK=0 : Call RSTA("MLK1",WCLE)From GLOCK : Break
+    Endif
+
+    ## GH 13/03/2013 dm 88039
+    GPOINT = "BEFMLKDEL" : Gosub  ENTREE From EXEFNC
+    If GOK<1 : Break : Endif
+
+    Delete [MLK1]
+    If fstat=1 | fstat>5
+     GOK=0 : Call RSTA("MLK1",WCLE) From GLOCK : Break
+    Endif
+
+    Break
+Next
+Return
+
+#------------------------------------------------------------------------
+# proposition de lien
+#------------------------------------------------------------------------
+# Cinématique générale:
+#            - vérification demande ou ressource passée en paramètre (si c'est le cas)
+#            - Raz des affectations existantes si mode complet
+#            - Chargement de 2 tableaux contenant les demandes et ressources disponibles
+#            - balayage des tableaux pour déterminer les affectations possibles
+#-------------------------------------------------------------------------
+$MTOLINK_PRP
+If [M:MLIK]STOFCY = ""                            : Return : Endif        # site absent
+If [M:MLIK]ITMREF = ""                            : Return : Endif        # article absent
+If !find([M:MLIK]PRPTYP,1,2,3)                    : Return : Endif        # type erroné
+If !find([M:MLIK]PRPMOD,1,2,3)                    : Return : Endif        # mode erroné
+If [M:MLIK]PRPTYP = 3 & [M:MLIK]PRPMOD=1          : Return : Endif        # incohérence type/mode
+
+# initialisation flags
+ISDEM   = ([M:MLIK]DEMNUM  <> "")
+ISRESS  = ([M:MLIK]RESSNUM <> "")
+ISRESSE = ISDEM & ISRESS
+ISRESSM = !ISDEM & ISRESS
+ISITEM  = !ISDEM & !ISRESS
+
+# article
+If [F:ITM]ITMREF <> [M:MLIK]ITMREF
+    Read [ITM]ITM0=[M:MLIK]ITMREF
+    If fstat : Return : Endif
+Endif
+
+# pas d'affectations sur les services
+If [F:ITM]SCSFLG = 2 : Return : Endif
+
+# article/site
+If [F:ITF]STOFCY <> [M:MLIK]STOFCY | [F:ITF]ITMREF <> [M:MLIK]ITMREF
+    Read [ITF]ITF0=[M:MLIK]ITMREF;[M:MLIK]STOFCY
+    If fstat : Return : Endif
+Endif
+
+# règle d'affectation
+If [F:ITF]PTOCOD = ""
+   Call PARAM([M:MLIK]STOFCY,"DEFPTO",WPTOCOD) From ADOVAL : # WPTOCOD = GDEFPTO : # GH 20/11/13 bug 94608
+Else WPTOCOD = [F:ITF]PTOCOD
+Endif
+If [F:PTO]PTOCOD <> WPTOCOD
+    Read [PTO]PTO0=WPTOCOD
+    If fstat : Raz [F:PTO] : Endif
+Endif
+If [F:PTO]PTOCOD = "" : Return : Endif
+
+# vérification demande/ressource transmis en paramètre
+If IOK=0
+ If ISDEM
+  Gosub CHECK_DEMAND
+  If IOK & ISRESS : IOK=0 : Gosub CHECK_RESSOURCE : Endif
+ Elsif ISRESS
+  Gosub CHECK_RESSOURCE
+ Else
+  IOK=1
+ Endif
+ If !IOK : Return : Endif
+Endif
+
+If [M:MLIK]PRPTYP=1
+ # proposition complète => suppression des liens existants
+ Gosub MTOLINK_RAZ2
+ If GOK<1 : Return : Endif
+Endif
+
+#-----------------------------------------------------------
+# phase 2 - chargement des tableaux des demandes et ressources
+$MTOLINK_PRP2
+WCOVQTY = 0
+WCOVDAT = [0/0/0]
+# chargement du tableau des demandes
+Raz TDEM_TYP, TDEM_NUM, TDEM_RMN, TDEM_MTO, TDEM_OFF, TDEM_DAT, TDEM_PJT, TDEM_UOM, NDEM
+If ISDEM
+   # on veut proposer des affectations en référence à une demande, on charge une seule ligne
+    For [ORDB]ORD3  Where STOFCY = [M:MLIK]STOFCY & ITMREF = [M:MLIK]ITMREF & FMI = 1 & MTOQTY < (RMNEXTQTY-ALLQTY)
+&                       & VCRTYP = [M:MLIK]DEMTYP
+&                       & VCRNUM = [M:MLIK]DEMNUM
+&                       & VCRLIN = [M:MLIK]DEMLIN
+&                       & VCRSEQ = [M:MLIK]DEMSEQ
+&                       & WIPTYP = [M:MLIK]DWIPTYP
+        If NDEM >= XDIM : Break : Endif
+
+        Gosub ALIM_TDEM
+        Break
+    Next
+
+    # si lien 1 à 1, on vérifie si une affectation existe déjà
+    If NDEM=1 & TDEM_MTO(0)>0 & [F:PTO]PTODIR = 2
+       IMOD=0
+       For [MLK1]MLK0 Where STOFCY  = [M:MLIK]STOFCY
+&                         & ITMREF  = [M:MLIK]ITMREF
+&                         & DEMTYP  = [M:MLIK]DEMTYP
+&                         & DEMNUM  = [M:MLIK]DEMNUM
+&                         & DEMLIN  = [M:MLIK]DEMLIN
+&                         & DEMSEQ  = [M:MLIK]DEMSEQ
+&                         & DWIPTYP = [M:MLIK]DWIPTYP
+           If ISRESS & [F:MLK1]RESSTYP=[M:MLIK]RESSTYP
+&                    & [F:MLK1]RESSNUM=[M:MLIK]RESSNUM
+&                    & [F:MLK1]RESSLIN=[M:MLIK]RESSLIN
+&                    & [F:MLK1]RESSSEQ=[M:MLIK]RESSSEQ
+              IMOD=1 : Break    : # un lien existe entre la demande et la ressource
+           Elsif !ISRESS & !IMOD
+              IMOD=1            : # au moins un lien existe pour la demande
+           Elsif !ISRESS & IMOD
+              IMOD=2 : Break    : # plusieurs liens existent pour la demande
+           Endif
+       Next
+       If !ISRESS & IMOD=1  : # un seul lien pour la demande => on fixe la ressource
+          ISRESS=1 : ISRESSE=1
+          [M:MLIK]RESSTYP = [F:MLK1]RESSTYP
+          [M:MLIK]RESSNUM = [F:MLK1]RESSNUM
+          [M:MLIK]RESSLIN = [F:MLK1]RESSLIN
+          [M:MLIK]RESSSEQ = [F:MLK1]RESSSEQ
+       Elsif ISRESS & !IMOD : # pas de lien entre la demande et la ressource => on sort
+          Return
+       Endif
+    Endif
+
+Else
+    If [F:PTO]PTOHORFLG = 2 & [F:PTO]PTOHOR > 0
+       WDATHOR = date$+([F:PTO]PTOHOR*7)
+       Filter [ORDB] Where ENDDAT<=[L]WDATHOR
+    Else
+       WDATHOR = [0/0/0]
+    Endif
+    If TEST
+     Call ECR_TRACE("[ORDB]ORD4 Where STOFCY="+[M:MLIK]STOFCY-"& ITMREF="+[M:MLIK]ITMREF-"& ISDEM(WIPTYP) & WIPSTA=1 & FMI=1 & MTOQTY<(RMNEXTQTY-ALLQTY)"-string$(WDATHOR<>[0/0/0],"& ENDDAT<="
+&                    +format$(GFMD,WDATHOR)),0) From GESECRAN
+    Endif
+    # Issue X3-57516 - 2017-09-28 by ALSHE : enhance selection for WIPTYP with 14 for project demands in atuomatic assignment
+    For [ORDB]ORD4 Where STOFCY=[M:MLIK]STOFCY & ITMREF=[M:MLIK]ITMREF & FMI=1 & MTOQTY<(RMNEXTQTY-ALLQTY)
+&                       & find(WIPTYP,1,3,6,8,10,14)<>0 & WIPSTA = 1
+        If NDEM >= XDIM : Break : Endif
+
+        Gosub ALIM_TDEM
+    Next
+    If WDATHOR<>[0/0/0] : Filter [ORDB] : Endif
+    If NDEM>1
+       # tri basé sur l'offset pour avoir les commandes dans l'ordre de priorité
+       Sorta NDEM TDEM_OFF, TDEM_TYP, TDEM_NUM, TDEM_RMN, TDEM_MTO, TDEM_DAT, TDEM_PJT, TDEM_UOM,
+&            TDEM_USRFLD1, TDEM_USRFLD2, TDEM_USRFLD3
+&            Order By TDEM_OFF(indice), indice
+    Endif
+Endif
+If NDEM<1 : Return : Endif
+
+If TEST & NDEM>1
+ Call ECR_TRACE("Sorta TDEM_OFF Asc -> TDEM_OFF TDEM_TYP TDEM_NUM",0) From GESECRAN
+ For I=0 To NDEM-1
+  Call ECR_TRACE(num$(TDEM_OFF(I))-num$(TDEM_TYP(I))-TDEM_NUM(I),0) From GESECRAN
+ Next
+ Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+# chargement du tableau des ressources
+Raz TRESS_TYP, TRESS_NUM, TRESS_RMN, TRESS_MTO, TRESS_OFF, TRESS_DAT, TRESS_BPR, TRESS_PJT, TRESS_UOM, NRESS
+If ISRESS
+   # on veut proposer des affectations en référence à une ressource, on charge une seule ligne
+   For [ORDB]ORD3 Where STOFCY = [M:MLIK]STOFCY & ITMREF = [M:MLIK]ITMREF & FMI = 1 & MTOQTY < RMNEXTQTY
+&                     & VCRTYP = [M:MLIK]RESSTYP
+&                     & VCRNUM = [M:MLIK]RESSNUM
+&                     & VCRLIN = [M:MLIK]RESSLIN
+&                     & VCRSEQ = [M:MLIK]RESSSEQ
+&                     & find(WIPTYP,2,5,7,9,13)<>0
+        If NRESS >= XDIM : Break : Endif
+
+        Gosub ALIM_TRESS
+        Break
+    Next
+Else
+   If TEST
+    Call ECR_TRACE("[ORDB]ORD4 Where STOFCY="+[M:MLIK]STOFCY-"& ITMREF="+[M:MLIK]ITMREF-"& ISRESS(WIPTYP) & WIPSTA=1 & FMI=1 & MTOQTY<RMNEXTQTY",0) From GESECRAN
+   Endif
+   For [ORDB]ORD4 Where STOFCY=[M:MLIK]STOFCY & ITMREF=[M:MLIK]ITMREF & FMI=1 & MTOQTY<RMNEXTQTY
+&                     & find(WIPTYP,2,5,7,9,13)<>0 & WIPSTA=1
+       If NRESS >= XDIM : Break : Endif
+
+       Gosub ALIM_TRESS
+   Next
+   If NRESS>1
+      # tri basé sur la date de fin des ressources
+      Sorta NRESS TRESS_OFF, TRESS_TYP, TRESS_NUM, TRESS_RMN, TRESS_MTO, TRESS_DAT, TRESS_BPR, TRESS_PJT, TRESS_UOM,
+&           TRESS_USRFLD1, TRESS_USRFLD2, TRESS_USRFLD3
+&         Order By TRESS_OFF(indice), indice
+   Endif
+Endif
+If NRESS<1 : Return : Endif
+
+If TEST & NRESS>1
+ Call ECR_TRACE("Sorta TRESS_OFF Asc -> TRESS_OFF TRESS_TYP TRESS_NUM",0) From GESECRAN
+ For I=0 To NRESS-1
+  Call ECR_TRACE(num$(TRESS_OFF(I))-num$(TRESS_TYP(I))-TRESS_NUM(I),0) From GESECRAN
+ Next
+ Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+Goto MTOLINK_PRP3
+
+#-------------------------------------
+$ALIM_TDEM
+If [M:MLIK]MAJCOD="P"
+    # Point d'entrée MTOLINK_PRP pour exclure des demandes
+    If find("MTOLINKLIB",GENTSTD(1..GNBENTREE))
+       MTOLINK_PE_MODE ="D"
+       GPOINT = "MTOLINK_PRP"
+       GPE=0 : Gosub  ENTREE From EXEFNC
+       If GPE : Return : Endif
+    Endif
+Endif
+
+TDEM_TYP(NDEM)    = [F:ORDB]WIPTYP
+TDEM_NUM(NDEM)    = [F:ORDB]WIPNUM
+TDEM_RMN(NDEM)    = [F:ORDB]RMNEXTQTY - [F:ORDB]ALLQTY - [F:ORDB]MTOQTY
+TDEM_MTO(NDEM)    = [F:ORDB]MTOQTY
+
+# gestion de l'offset (application des priorisations sur les demandes)
+OFFSET = 0
+# si PEC priorité activée et facteur > 0
+If [F:PTO]PIOMOD = 2 & [F:PTO]PIOFCT > 0 & find([F:ORDB]PIO,1,2,3)
+   OFFSET += [F:PTO]PIOFCT * ([F:ORDB]PIO - 1)
+   If TEST
+      Call ECR_TRACE("PIO="+num$([F:ORDB]PIO)-"-> OFFSET+="+num$([F:PTO]PIOFCT*([F:ORDB]PIO-1)),-1) From GESECRAN
+   Endif
+Endif
+# si PEC rupture activée et facteur > 0
+If [F:PTO]SHTMOD = 2 & [F:PTO]SHTFCT > 0 & [F:ORDB]SHTQTY > 0
+   OFFSET += [F:PTO]SHTFCT
+   If TEST
+      Call ECR_TRACE("SHTQTY="+num$([F:ORDB]SHTQTY)-"-> OFFSET+="+num$([F:PTO]SHTFCT),-1) From GESECRAN
+   Endif
+Endif
+# si PEC type demande activée et facteur > 0
+If [F:PTO]DEMMOD = 2 & [F:PTO]DEMFCT > 0
+   If [F:PTO]DEMCAT = 2 & [F:ORDB]WIPTYP = 1       : OFFSET += [F:PTO]DEMFCT : Endif
+   If [F:PTO]DEMCAT = 3 & find([F:ORDB]WIPTYP,3,6) : OFFSET += [F:PTO]DEMFCT : Endif
+   If TEST & (([F:PTO]DEMCAT = 2 & [F:ORDB]WIPTYP = 1) |  ([F:PTO]DEMCAT = 3 & find([F:ORDB]WIPTYP,3,6)))
+      Call ECR_TRACE("WIPTYP="+num$([F:ORDB]WIPTYP)-"-> OFFSET+="+num$([F:PTO]DEMFCT),-1) From GESECRAN
+   Endif
+Endif
+TDEM_OFF(NDEM) = nday([F:ORDB]ENDDAT) - OFFSET
+
+TDEM_DAT(NDEM)   = [F:ORDB]ENDDAT
+TDEM_PJT(NDEM)   = [F:ORDB]PJT
+Gosub GET_UOM
+TDEM_UOM(NDEM)   = WUOM
+
+If TEST
+ Call ECR_TRACE("VCRTYP VCRNUM VCRLIN VCRSEQ ="-num$([F:ORDB]VCRTYP)+"-"+mess([F:ORDB]VCRTYP,701,1)-[F:ORDB]VCRNUM-num$([F:ORDB]VCRLIN)-num$([F:ORDB]VCRSEQ),0) From GESECRAN
+ Call ECR_TRACE("WIPTYP WIPNUM MTOQTY RMNEXTQTY ALLQTY SHTQTY="-num$([F:ORDB]WIPTYP)+"-"+mess([F:ORDB]WIPTYP,306,1)-[F:ORDB]WIPNUM-num$([F:ORDB]MTOQTY)-num$([F:ORDB]RMNEXTQTY)-num$([F:ORDB]ALLQTY)
+&                -num$([F:ORDB]SHTQTY),0) From GESECRAN
+ Call ECR_TRACE("ENDDAT OFFSET UOM PJT ="-format$(GFMD,[F:ORDB]ENDDAT)-num$(OFFSET)-WUOM-[F:ORDB]PJT,0) From GESECRAN
+ If TDEM_USRFLD1(NDEM)<>"" Call ECR_TRACE("USRFLD1 ="-TDEM_USRFLD1(NDEM),0) From GESECRAN : Endif
+ If TDEM_USRFLD2(NDEM)<>"" Call ECR_TRACE("USRFLD2 ="-TDEM_USRFLD2(NDEM),0) From GESECRAN : Endif
+ If TDEM_USRFLD3(NDEM)<>"" Call ECR_TRACE("USRFLD3 ="-TDEM_USRFLD3(NDEM),0) From GESECRAN : Endif
+ Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+NDEM+=1
+Return
+
+#-------------------------------------
+$ALIM_TRESS
+If [M:MLIK]MAJCOD="P"
+    # si la ressource est déjà affectée à une demande de FMI<>1, alors on ne peut pas l'affecter à une autre demande
+    Filter [MLK1] Where FMIFLG=2
+    Look [MLK1]MLK1 = [M:MLIK]STOFCY;[M:MLIK]ITMREF;[F:ORDB]VCRTYP;[F:ORDB]VCRNUM;[F:ORDB]VCRLIN;[F:ORDB]VCRSEQ
+    Filter [MLK1]
+    If fstat<=2 : Return : Endif
+
+    # Point d'entrée MTOLINK_PRP pour exclure des ressources
+    If find("MTOLINKLIB",GENTSTD(1..GNBENTREE))
+       MTOLINK_PE_MODE ="R"
+       GPOINT = "MTOLINK_PRP"
+       GPE=0 : Gosub  ENTREE From EXEFNC
+       If GPE : Return : Endif
+    Endif
+Endif
+
+TRESS_TYP(NRESS)   = [F:ORDB]WIPTYP
+TRESS_NUM(NRESS)   = [F:ORDB]WIPNUM
+TRESS_RMN(NRESS)   = [F:ORDB]RMNEXTQTY - [F:ORDB]MTOQTY
+TRESS_MTO(NRESS)   = [F:ORDB]MTOQTY
+TRESS_OFF(NRESS)   = nday([F:ORDB]ENDDAT)
+TRESS_DAT(NRESS)   = [F:ORDB]ENDDAT
+TRESS_BPR(NRESS)   = [F:ORDB]BPRNUM
+TRESS_PJT(NRESS)   = [F:ORDB]PJT
+Gosub GET_UOM
+TRESS_UOM(NRESS)   = WUOM
+
+If TEST
+ Call ECR_TRACE("VCRTYP VCRNUM VCRLIN VCRSEQ ="-num$([F:ORDB]VCRTYP)+"-"+mess([F:ORDB]VCRTYP,701,1)-[F:ORDB]VCRNUM-num$([F:ORDB]VCRLIN)-num$([F:ORDB]VCRSEQ),0) From GESECRAN
+ Call ECR_TRACE("WIPTYP WIPNUM MTOQTY RMNEXTQTY SHTQTY BPR="-num$([F:ORDB]WIPTYP)+"-"+mess([F:ORDB]WIPTYP,306,1)-[F:ORDB]WIPNUM-num$([F:ORDB]MTOQTY)-num$([F:ORDB]RMNEXTQTY)-num$([F:ORDB]SHTQTY)
+&               -[F:ORDB]BPRNUM,0) From GESECRAN
+ Call ECR_TRACE("ENDDAT UOM PJT ="-format$(GFMD,[F:ORDB]ENDDAT)-WUOM-[F:ORDB]PJT,0) From GESECRAN
+ If TRESS_USRFLD1(NDEM)<>"" Call ECR_TRACE("USRFLD1 ="-TRESS_USRFLD1(NDEM),0) From GESECRAN : Endif
+ If TRESS_USRFLD2(NDEM)<>"" Call ECR_TRACE("USRFLD2 ="-TRESS_USRFLD2(NDEM),0) From GESECRAN : Endif
+ If TRESS_USRFLD3(NDEM)<>"" Call ECR_TRACE("USRFLD3 ="-TRESS_USRFLD3(NDEM),0) From GESECRAN : Endif
+ Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+NRESS += 1
+Return
+
+#-------------------------------------
+# Phase 3 - génération des affectations
+$MTOLINK_PRP3
+# préparation des règles
+Gosub LOAD_RULES
+
+Raz [M:MLIK]REQQTY, [M:MLIK]COVQTY, [M:MLIK]COVDAT
+
+#  on part des demandes ...
+#------------------------
+# boucle sur les demandes
+For I = 0 To NDEM - 1
+    WREQQTY = TDEM_RMN(I)
+
+    # si disponible nul et simulation, on saute cette ressource
+    If WREQQTY <= 0 : Goto NXT_PRP3D1 : Endif
+
+    Read [ORDB]ORD0=TDEM_TYP(I);TDEM_NUM(I);[M:MLIK]ITMREF
+    If fstat : Goto NXT_PRP3D1 : Endif
+
+    [M:MLIK]REQQTY += WREQQTY
+
+    # si le buffer MLIK ne contient pas l'identification de la demande, c'est le moment ...
+    If !ISDEM
+        [M:MLIK]DEMTYP  = [F:ORDB]VCRTYP
+        [M:MLIK]DEMNUM  = [F:ORDB]VCRNUM
+        [M:MLIK]DEMLIN  = [F:ORDB]VCRLIN
+        [M:MLIK]DEMSEQ  = [F:ORDB]VCRSEQ
+        [M:MLIK]DWIPTYP = [F:ORDB]WIPTYP
+        [M:MLIK]DWIPSTA = [F:ORDB]WIPSTA
+     Endif
+
+    # Envoi infos au programme appelant pour gestion trace
+    If [M:MLIK]FEEDBACK = 2
+        [M:MLIK]FEEDBACKT = 1
+        Gosub SAVE_IND
+        Gosub TRACE_LINK From =[M:MLIK]TRTNAM
+        Gosub RESTORE_IND
+    Endif
+
+    # initialisation indice règle
+    I_RULE   = -1
+    ONE_PASS =  0
+
+#----------------------------------------------------------------------------------------
+# Phase 3 - Indice R1: boucle sur les règles dans le cadre de l'affectation des ressources
+$NXT_PRP3R1
+
+    Gosub NEXT_RULE
+
+    # s'il existe au moins une règle et le code 9 est retourné, c'est fini pour cette demande ...
+    If ((I_RULE = 9 & WNBRULE > 0) | ONE_PASS)  : Goto NXT_PRP3R3 : Endif
+
+    # préparation d'une copie filtrée du tableau des ressources
+    # une seule fois si aucune règle
+    If (WNBRULE > 0 | I = 0) : Gosub GEN_FILTERED_RESS : Endif
+
+    # si aucune règle n'est paramétrée, il faut s'assurer de passer une fois avec les ressources
+    # non filtrée, pour ce faire on utilise l'indicateur ONE_PASS
+    If (I_RULE = 9 & WNBRULE = 0) : ONE_PASS = 1 : Endif
+
+    # si aucune ressource compatible, règle suivante ...
+    If NFRESS = 0 : Goto NXT_PRP3R1 : Endif
+
+    #---------------------------
+    # boucle sur les ressources
+    For J = 0 To NFRESS - 1
+        IMOD=2
+
+        # disponible pour affectation
+        WMTOQTY = TFRESS_RMN(J)
+
+        # si disponible nul et simulation, on saute cette ressource
+        If WMTOQTY <= 0 : Goto NXT_PRP3R2 : Endif
+
+        # lecture de la ressource
+        Read [ORDB]ORD0=TFRESS_TYP(J);TFRESS_NUM(J);[M:MLIK]ITMREF
+        If fstat : Goto NXT_PRP3R2 : Endif
+
+        # si lien 1 à 1 et la demande n'est pas affectée, il faut prendre une ressource non affectée
+        If [F:PTO]PTODIR = 2 & TDEM_MTO(I) = 0 & TFRESS_MTO(J) > 0 : Goto NXT_PRP3R2 : Endif
+
+        # si lien 1 à 1 et quantité affectée pour la demande
+        IMOD=0
+        For [MLK1]MLK0 Where STOFCY  = [M:MLIK]STOFCY
+&                          & ITMREF  = [M:MLIK]ITMREF
+&                          & DEMTYP  = [M:MLIK]DEMTYP
+&                          & DEMNUM  = [M:MLIK]DEMNUM
+&                          & DEMLIN  = [M:MLIK]DEMLIN
+&                          & DEMSEQ  = [M:MLIK]DEMSEQ
+&                          & DWIPTYP = [M:MLIK]DWIPTYP
+&                          & RESSTYP = [F:ORDB]VCRTYP
+&                          & RESSNUM = [F:ORDB]VCRNUM
+&                          & RESSLIN = [F:ORDB]VCRLIN
+&                          & RESSSEQ = [F:ORDB]VCRSEQ
+          IMOD = 1 : Break
+        Next
+
+        # si lien 1 à 1 et quantité affectée pour la demande, on n'affecte que les ressources liées à la demande
+        If [F:PTO]PTODIR = 2 & TDEM_MTO(I) > 0 & !IMOD : IMOD=2 : Goto NXT_PRP3R2 : Endif
+
+        # quantité à  affecter
+        If WMTOQTY > (WREQQTY - WCOVQTY) : WMTOQTY = (WREQQTY - WCOVQTY) : Endif
+
+        Case [M:MLIK]PRPMOD
+            When 1:    # mode mise à jour, création nouveau lien
+                       Gosub FILL_LINKR
+                       [M:MLIK]LIKQTY = WMTOQTY
+
+                       IOK = 1 : IMOD=0
+                       Gosub MTOLINK_MOD
+                       If GOK>0
+                          WCLE = [M:MLIK]STOFCY-[M:MLIK]ITMREF-num$([M:MLIK]RESSTYP)-[M:MLIK]RESSNUM-num$([M:MLIK]RESSLIN)-num$([M:MLIK]RESSSEQ)
+                          # mise à jour Ressource
+                          Readlock [ORDB]ORD0=TFRESS_TYP(J);TFRESS_NUM(J);[M:MLIK]ITMREF
+                          If fstat=1
+                             GOK = -1 : GLOCK = "$ORDERS"-WCLE : Break 2
+                          Elsif fstat
+                             GOK = 0 : Call RSTA("ORDB",WCLE) From GLOCK : Break 2
+                          Endif
+                          [F:ORDB]MTOQTY += WMTOQTY
+                          [F:ORDB]UPDDAT  = date$
+                          [F:ORDB]UPDUSR  = GUSER
+                          Rewrite [ORDB]
+                          If fstat : GOK = 0 : Call FSTA("ORDB") From GLOCK : Break 2 : Endif
+
+                          WCOVQTY += WMTOQTY
+                          # disponibilité la + tardive
+                          If WCOVDAT = [0/0/0] | TFRESS_DAT(J) > WCOVDAT : WCOVDAT = TFRESS_DAT(J) : Endif
+                          TFRESS_RMN(J) -= WMTOQTY : TFRESS_MTO(J) += WMTOQTY
+                          TDEM_RMN(I)   -= WMTOQTY : TDEM_MTO(I)   += WMTOQTY
+
+                          # Envoi infos au programme appelant pour gestion trace
+                          If [M:MLIK]FEEDBACK = 2
+                             [M:MLIK]FEEDBACKT = 2
+                             Gosub SAVE_IND
+                             Gosub TRACE_LINK From =[M:MLIK]TRTNAM
+                             Gosub RESTORE_IND
+                          Endif
+                       Else GOK = 1
+                       Endif
+            When 2:    # mode simulation, on cumule les quantités affectables
+                       WCOVQTY += WMTOQTY
+                       If WCOVDAT = [0/0/0] | TFRESS_DAT(J) > WCOVDAT : WCOVDAT = TFRESS_DAT(J) : Endif
+                       TFRESS_RMN(J) -= WMTOQTY : TFRESS_MTO(J) += WMTOQTY
+                       TDEM_RMN(I)   -= WMTOQTY : TDEM_MTO(I)   += WMTOQTY
+
+                       # Envoi infos au programme appelant pour gestion trace
+                       If [M:MLIK]FEEDBACK = 2
+                           [M:MLIK]FEEDBACKT = 2
+                           Gosub SAVE_IND
+                           Gosub TRACE_LINK From =[M:MLIK]TRTNAM
+                           Gosub RESTORE_IND
+                       Endif
+            When 3:    # mode consultation, on donne la main au programme appelant avec les infos dans MLIK
+                       If ISDEM
+                           Gosub FILL_LINKR
+                           [M:MLIK]LIKQTY  = WMTOQTY
+                           Gosub SAVE_IND
+                           Gosub TRT_LINK From =[M:MLIK]TRTNAM
+                           Gosub RESTORE_IND
+                       Endif
+
+                       WCOVQTY += WMTOQTY
+                       If WCOVDAT = [0/0/0] | TFRESS_DAT(J) > WCOVDAT : WCOVDAT = TFRESS_DAT(J) : Endif
+                       TFRESS_RMN(J) -= WMTOQTY : TFRESS_MTO(J) += WMTOQTY
+                       TDEM_RMN(I)   -= WMTOQTY : TDEM_MTO(I)   += WMTOQTY
+        Endcase
+
+        # plus rien à affecter, on sort
+        If WCOVQTY >= WREQQTY : Break : Endif
+#-----------------------------------------------
+# Phase 3 - Indice R2: boucle sur les ressources
+$NXT_PRP3R2
+    Next J
+
+    # la ressource ne convient pas (WCOVQTY=0)
+    If ISRESS & IMOD=2 : Goto NXT_PRP3R3 : Endif
+
+    # mise à jour de TRESS en fonction de TFRESS
+    Gosub UPDATE_TRESS
+
+    # plus rien à affecter, on sort
+    If WCOVQTY >= WREQQTY : Goto NXT_PRP3R3 : Endif
+
+    # application règle suivante
+    Goto NXT_PRP3R1
+#-----------------------------------------------
+# Phase 3 - Indice R3: mise à jour demande
+$NXT_PRP3R3
+
+    # mise à jour Demande
+    If [M:MLIK]PRPMOD = 1 & WCOVQTY > 0
+        WCLE = [M:MLIK]STOFCY-[M:MLIK]ITMREF-num$([M:MLIK]DEMTYP)-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)
+        Readlock [ORDB]ORD0=TDEM_TYP(I);TDEM_NUM(I);[M:MLIK]ITMREF
+        If fstat=1
+           GOK = -1 : GLOCK = "$ORDERS"-WCLE : Break
+        Elsif fstat
+           GOK = 0 : Call RSTA("ORDB",WCLE) From GLOCK : Break
+        Endif
+        [F:ORDB]MTOQTY += WCOVQTY
+        [F:ORDB]UPDDAT  = date$
+        [F:ORDB]UPDUSR  = GUSER
+        Rewrite [ORDB]
+        If fstat : GOK = 0 : Call FSTA("ORDB") From GLOCK : Break : Endif
+    Else
+        Read [ORDB]ORD0=TDEM_TYP(I);TDEM_NUM(I);[M:MLIK]ITMREF
+    Endif
+
+    [M:MLIK]COVQTY += WCOVQTY
+    [M:MLIK]COVDAT  = WCOVDAT
+
+    If ISRESS & !ISDEM & WCOVQTY > 0 & [M:MLIK]PRPMOD = 3
+       Gosub FILL_LINKD
+       [M:MLIK]LIKQTY  = WCOVQTY
+       Gosub SAVE_IND
+       Gosub TRT_LINK From =[M:MLIK]TRTNAM
+       Gosub RESTORE_IND
+    Endif
+
+    # Envoi infos au programme appelant pour gestion trace
+    If [M:MLIK]FEEDBACK = 2
+        [M:MLIK]FEEDBACKT = 3
+        Gosub SAVE_IND
+        Gosub TRACE_LINK From =[M:MLIK]TRTNAM
+        Gosub RESTORE_IND
+    Endif
+
+    WCOVQTY = 0
+    WCOVDAT = [0/0/0]
+#---------------------------------------------
+# Phase 3 - Indice D1: boucle sur les demandes
+$NXT_PRP3D1
+Next I
+Return
+
+
+#------------------------------------------------------------------------
+# révision des liens
+#------------------------------------------------------------------------
+# Cinématique générale : idem que la proposition de lien
+#            - avec une ressource OU une demande renseignée
+#            - en type annule et remplace
+#            - affectation possible que sur les liens initialement existants
+#-------------------------------------------------------------------------
+$MTOLINK_REV
+If [M:MLIK]STOFCY = ""                            : Return : Endif        # site absent
+If [M:MLIK]ITMREF = ""                            : Return : Endif        # article absent
+If [M:MLIK]PRPTYP<>1                              : Return : Endif        # type erroné
+If !find([M:MLIK]PRPMOD,1,2,3)                    : Return : Endif        # mode erroné
+If [M:MLIK]PRPTYP = 3 & [M:MLIK]PRPMOD=1          : Return : Endif        # incohérence type/mode
+
+# initialisation flags
+ISDEM   = ([M:MLIK]DEMNUM  <> "")
+ISRESS  = ([M:MLIK]RESSNUM <> "")
+If !ISDEM & !ISRESS : Return : Endif
+ISRESSE = ISDEM & ISRESS
+ISRESSM = !ISDEM & ISRESS
+ISITEM  = !ISDEM & !ISRESS
+
+# article
+If [F:ITM]ITMREF <> [M:MLIK]ITMREF
+    Read [ITM]ITM0=[M:MLIK]ITMREF
+    If fstat : Return : Endif
+Endif
+
+# pas d'affectations sur les services
+If [F:ITM]SCSFLG = 2 : Return : Endif
+
+# article/site
+If [F:ITF]STOFCY <> [M:MLIK]STOFCY | [F:ITF]ITMREF <> [M:MLIK]ITMREF
+    Read [ITF]ITF0=[M:MLIK]ITMREF;[M:MLIK]STOFCY
+    If fstat : Return : Endif
+Endif
+
+# règle d'affectation
+If [F:ITF]PTOCOD = ""
+   Call PARAM([M:MLIK]STOFCY,"DEFPTO",WPTOCOD) From ADOVAL : # WPTOCOD = GDEFPTO : # GH 20/11/13 bug 94608
+Else WPTOCOD = [F:ITF]PTOCOD
+Endif
+If [F:PTO]PTOCOD <> WPTOCOD
+    Read [PTO]PTO0=WPTOCOD
+    If fstat : Raz [F:PTO] : Endif
+Endif
+If [F:PTO]PTOCOD = "" : Return : Endif
+
+# vérification demande/ressource transmis en paramètre
+If IOK=0
+ If ISDEM
+  Gosub CHECK_DEMAND
+  If IOK & ISRESS : IOK=0 : Gosub CHECK_RESSOURCE : Endif
+ Else
+  Gosub CHECK_RESSOURCE
+ Endif
+ If !IOK : Return : Endif
+Endif
+
+# suppression des liens existants + chargemment des demandes et ressources
+Raz TDEM_TYP, TDEM_NUM, TDEM_RMN, TDEM_MTO, TDEM_OFF, TDEM_DAT, TDEM_PJT, TDEM_UOM, NDEM
+Raz TRESS_TYP, TRESS_NUM, TRESS_RMN, TRESS_MTO, TRESS_OFF, TRESS_DAT, TRESS_BPR, TRESS_PJT, TRESS_UOM, NRESS
+
+Gosub MTOLINK_RAZ2
+If GOK<1 : Return : Endif
+If NRESS=0 | NDEM=0 : Return : Endif
+
+# tri basé sur la date de fin des ressources
+Sorta NRESS TRESS_OFF, TRESS_TYP, TRESS_NUM, TRESS_RMN, TRESS_MTO, TRESS_DAT, TRESS_BPR, TRESS_PJT, TRESS_UOM,
+&           TRESS_USRFLD1, TRESS_USRFLD2, TRESS_USRFLD3
+&     Order By TRESS_OFF(indice), indice
+
+If TEST & NRESS>1
+ Call ECR_TRACE("Sorta TRESS_OFF Asc -> TRESS_OFF TRESS_TYP TRESS_NUM",0) From GESECRAN
+ For I=0 To NRESS-1
+  Call ECR_TRACE(num$(TRESS_OFF(I))-num$(TRESS_TYP(I))-TRESS_NUM(I),0) From GESECRAN
+ Next
+ Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+# tri basé sur l'offset pour avoir les commandes dans l'ordre de priorité
+Sorta NDEM TDEM_OFF, TDEM_TYP, TDEM_NUM, TDEM_RMN, TDEM_MTO, TDEM_DAT, TDEM_PJT, TDEM_UOM,
+&          TDEM_USRFLD1, TDEM_USRFLD2, TDEM_USRFLD3
+&          Order By TDEM_OFF(indice), indice
+
+If TEST & NDEM>1
+ Call ECR_TRACE("Sorta TDEM_OFF Asc -> TDEM_OFF TDEM_TYP TDEM_NUM",0) From GESECRAN
+ For I=0 To NDEM-1
+  Call ECR_TRACE(num$(TDEM_OFF(I))-num$(TDEM_TYP(I))-TDEM_NUM(I),0) From GESECRAN
+ Next
+ Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+Goto MTOLINK_PRP3
+
+
+#------------------------------------------------------------------------
+# Entrée de ressource: allocation aux demandes concernées
+#------------------------------------------------------------------------
+# Cinématique générale:
+#            - vérification ressource passée en paramètre
+#            - Chargement tableau contenant les demandes
+#            - balayage du tableau et allocation
+#-------------------------------------------------------------------------
+$MTOLINK_ENT
+If [M:MLIK]STOFCY = ""                             : Return : Endif        # site absent
+If [M:MLIK]ITMREF = ""                             : Return : Endif        # article absent
+If [M:MLIK]RESSNUM = ""                            : Return : Endif        # pas de ressource
+If [M:MLIK]LIKQTY <= 0                             : Return : Endif        # pas de qté entrée
+
+# article/site
+If [F:ITF]STOFCY <> [M:MLIK]STOFCY & [F:ITF]ITMREF <> [M:MLIK]ITMREF
+    Read [ITF]ITF0=[M:MLIK]ITMREF;[M:MLIK]STOFCY
+    If fstat : Return : Endif
+Endif
+
+# règle d'affectation
+If [F:ITF]PTOCOD = ""
+   Call PARAM([M:MLIK]STOFCY,"DEFPTO",WPTOCOD) From ADOVAL : # WPTOCOD = GDEFPTO : # GH 20/11/13 bug 94608
+Else WPTOCOD = [F:ITF]PTOCOD
+Endif
+If [F:PTO]PTOCOD <> WPTOCOD
+    Read [PTO]PTO0=WPTOCOD
+    If fstat : Raz [F:PTO] : Endif
+Endif
+If [F:PTO]PTOCOD = "" : Return : Endif
+
+If IOK=0
+ Gosub CHECK_RESSOURCE
+ If !IOK : Return : Endif
+Endif
+
+#-----------------------------------------------------------
+# chargement du tableau des demandes
+$MTOLINK_ENT1
+
+# on charge la ressource en mémoire
+Raz TRESS_TYP,  TRESS_NUM, NRESS
+For [ORDB]ORD3 Where STOFCY = [M:MLIK]STOFCY
+&                  & ITMREF = [M:MLIK]ITMREF
+&                  & VCRTYP = [M:MLIK]RESSTYP
+&                  & VCRNUM = [M:MLIK]RESSNUM
+&                  & VCRLIN = [M:MLIK]RESSLIN
+&                  & VCRSEQ = [M:MLIK]RESSSEQ
+&                  & find(WIPTYP,2,5,7,9,13)<>0
+    TRESS_TYP(NRESS)    = [F:ORDB]WIPTYP
+    TRESS_NUM(NRESS)    = [F:ORDB]WIPNUM
+    Gosub FILL_LINKR
+    NRESS += 1
+    Break
+Next
+If NRESS<1 : Return : Endif
+
+# chargement des demandes affectées à la ressource
+Raz TDEM_TYP,  TDEM_NUM, TDEM_MTO, TDEM_OFF, TDEM_DAT, NDEM
+For [MLK1]MLK1 Where STOFCY   = [M:MLIK]STOFCY
+&                  & ITMREF   = [M:MLIK]ITMREF
+&                  & RESSTYP  = [M:MLIK]RESSTYP
+&                  & RESSNUM  = [M:MLIK]RESSNUM
+&                  & RESSLIN  = [M:MLIK]RESSLIN
+&                  & RESSSEQ  = [M:MLIK]RESSSEQ
+    If NDEM >= XDIM : Break : Endif
+
+    # on charge les demandes correspondantes en mémoire (pour priorisation)
+    For [ORDB]ORD3 Where STOFCY = [F:MLK1]STOFCY
+&                      & ITMREF = [F:MLK1]ITMREF
+&                      & VCRTYP = [F:MLK1]DEMTYP
+&                      & VCRNUM = [F:MLK1]DEMNUM
+&                      & VCRLIN = [F:MLK1]DEMLIN
+&                      & VCRSEQ = [F:MLK1]DEMSEQ
+&                      & WIPTYP = [F:MLK1]DWIPTYP
+        # Issue 75446 - 2011-07-29 by SR
+        If NDEM >= XDIM : Break 2 : Endif
+        TDEM_TYP(NDEM)    = [F:ORDB]WIPTYP
+        TDEM_NUM(NDEM)    = [F:ORDB]WIPNUM
+        TDEM_MTO(NDEM)    = [F:MLK1]LIKQTY
+
+        # gestion de l'offset (application des priorisations sur les demandes)
+        OFFSET = 0
+        # si PEC priorité activée et facteur > 0
+        If [F:PTO]PIOMOD = 2 & [F:PTO]PIOFCT > 0 & find([F:ORDB]PIO,1,2,3)
+            OFFSET += [F:PTO]PIOFCT * ([F:ORDB]PIO - 1)
+        Endif
+        # si PEC rupture activée et facteur > 0
+        If [F:PTO]SHTMOD = 2 & [F:PTO]SHTFCT > 0 & [F:ORDB]SHTQTY > 0
+            OFFSET += [F:PTO]SHTFCT
+        Endif
+        # si PEC type demande activée et facteur > 0
+        If [F:PTO]DEMMOD = 2 & [F:PTO]DEMFCT > 0
+            If [F:PTO]DEMCAT = 2 & [F:ORDB]WIPTYP = 1       : OFFSET += [F:PTO]DEMFCT : Endif
+            If [F:PTO]DEMCAT = 3 & find([F:ORDB]WIPTYP,3,6) : OFFSET += [F:PTO]DEMFCT : Endif
+        Endif
+        TDEM_OFF(NDEM) = nday([F:ORDB]ENDDAT) - OFFSET
+
+        TDEM_DAT(NDEM)   = [F:ORDB]ENDDAT
+        NDEM += 1
+    Next
+Next
+
+# tri basé sur l'offset pour avoir les commandes dans l'ordre de priorité
+If NDEM>1
+  Sorta NDEM TDEM_OFF, TDEM_TYP, TDEM_NUM, TDEM_MTO, TDEM_DAT Order By TDEM_OFF(indice), indice
+Endif
+
+GPE = 0
+GPOINT = "MTOLINK_ENT2" : Gosub  ENTREE From EXEFNC
+If GOK < 1 : Return : Endif
+If !GPE
+   Gosub MTOLINK_ENT2
+Endif
+Return
+
+#-------------------------------------
+# Phase 2, allocation
+$MTOLINK_ENT2
+ENT_CUMALLQTY = 0         # 76887
+WCOVQTY = 0
+
+# mémorisation quantité entrée
+WREQQTY = [M:MLIK]LIKQTY
+
+#------------------------
+# boucle sur les demandes
+For I = 0 To NDEM - 1
+    # appel programme appelant pour transfert allocation
+    # diminuer/supprimer affectation
+    # boucle tant que covqty < [M:MLIK]LIKQTY
+
+    # lecture [ORD]
+    Read [ORDB]ORD0=TDEM_TYP(I);TDEM_NUM(I);[M:MLIK]ITMREF
+    If fstat : Goto NXT_ENT2 : Endif
+
+    Gosub FILL_LINKD
+    [M:MLIK]LIKQTY  = min(TDEM_MTO(I),WREQQTY-WCOVQTY)
+
+    # allocation automatique de la quantité entrée
+    If [F:PTO]DIRALL = 2
+        Gosub SAVE_IND
+        Gosub MAJ_MTO_ALLOCATION From =[M:MLIK]TRTNAM
+        ## Issue 122340 GH 11/04/17 - indicates when assignment was not totally moved in allocation
+        If WQTE2<>[M:MLIK]LIKQTY
+           Call ECR_TRACE(mess(388,193,1)-[M:MLIK]ITMREF
+&                        +"\"+mess([M:MLIK]DEMTYP,701,1)-[M:MLIK]DEMNUM
+&                        +"\"+mess([M:MLIK]RESSTYP,701,1)-[M:MLIK]RESSNUM
+&                        ,-1) From GESECRAN
+        Endif
+        Gosub RESTORE_IND
+    Endif
+
+    If [M:MLIK]LIKQTY=0 : Goto NXT_ENT2 : Endif : # GH 15/01/15
+
+    # incrémentation quantité traitée
+    WCOVQTY += [M:MLIK]LIKQTY
+
+    # mise à jour encours demande
+    Readlock [ORDB]ORD0=TDEM_TYP(I);TDEM_NUM(I);[M:MLIK]ITMREF
+    If fstat=1  : GOK=-1 : GLOCK = "$ORDERS"-num$(TDEM_TYP(I))-TDEM_NUM(I)-[M:MLIK]ITMREF : Break
+    Elsif fstat : GOK=0 : Call RSTA("ORDB",num$(TDEM_TYP(I))-TDEM_NUM(I)-[M:MLIK]ITMREF) From GLOCK : Break
+    Endif
+    [F:ORDB]MTOQTY -= [M:MLIK]LIKQTY
+    If [F:ORDB]MTOQTY < 0 : [F:ORDB]MTOQTY = 0 : Endif
+
+    [F:ORDB]UPDDAT = date$
+    [F:ORDB]UPDUSR =  GUSER
+    Rewrite [ORDB]
+    If fstat : GOK=0 : Call FSTA("ORDB") From GLOCK : Break : Endif
+
+    # mise à jour affectation
+    If [M:MLIK]LIKQTY>=TDEM_MTO(I) : # [M:MLIK]LIKQTY=TDEM_MTO(I) : # GH 10/12/2013 bug 89163
+        Gosub MTOLINK_DEL
+    Else
+        [M:MLIK]LIKQTY = TDEM_MTO(I) - [M:MLIK]LIKQTY
+        Gosub MTOLINK_MOD
+    Endif
+
+    # si on a atteint la quantité entrée, on sort
+    If WCOVQTY >= WREQQTY : Break : Endif
+$NXT_ENT2
+Next I
+If GOK<1 : Return : Endif
+
+# mise à jour encours ressource
+Readlock [ORDB]ORD0=TRESS_TYP(0);TRESS_NUM(0);[M:MLIK]ITMREF
+If fstat=1  : GOK=-1 : GLOCK = "$ORDERS"-num$(TRESS_TYP(0))-TRESS_NUM(0)-[M:MLIK]ITMREF : Return
+Elsif fstat : GOK=0 : Call RSTA("ORDB",num$(TRESS_TYP(0))-TRESS_NUM(0)-[M:MLIK]ITMREF) From GLOCK : Return
+Endif
+
+[F:ORDB]MTOQTY -= WREQQTY
+If [F:ORDB]MTOQTY < 0 : [F:ORDB]MTOQTY = 0 : Endif
+[F:ORDB]UPDDAT = date$
+[F:ORDB]UPDUSR =  GUSER
+Rewrite [ORDB]
+If fstat : GOK=0  : Call FSTA("ORDB") From GLOCK : Endif
+
+Return
+
+#---------------------------------------------
+$FILL_LINKR
+[M:MLIK]RESSTYP = [F:ORDB]VCRTYP
+[M:MLIK]RESSNUM = [F:ORDB]VCRNUM
+[M:MLIK]RESSLIN = [F:ORDB]VCRLIN
+[M:MLIK]RESSSEQ = [F:ORDB]VCRSEQ
+[M:MLIK]RWIPTYP = [F:ORDB]WIPTYP
+[M:MLIK]RWIPSTA = [F:ORDB]WIPSTA
+[M:MLIK]FRCFLG  = 1
+[M:MLIK]FMIFLG  = 1
+Return
+
+#---------------------------------------------
+$FILL_LINKD
+[M:MLIK]DEMTYP  = [F:ORDB]VCRTYP
+[M:MLIK]DEMNUM  = [F:ORDB]VCRNUM
+[M:MLIK]DEMLIN  = [F:ORDB]VCRLIN
+[M:MLIK]DEMSEQ  = [F:ORDB]VCRSEQ
+[M:MLIK]DWIPTYP = [F:ORDB]WIPTYP
+[M:MLIK]DWIPSTA = [F:ORDB]WIPSTA
+[M:MLIK]FRCFLG  = 1
+[M:MLIK]FMIFLG  = 1
+Return
+
+#------------------------------------------------------------------------
+# raz des liens
+$MTOLINK_RAZ
+If [M:MLIK]STOFCY = ""                            : Return : Endif        # site absent
+If [M:MLIK]ITMREF = ""                            : Return : Endif        # article absent
+
+# initialisation flags
+ISDEM   = ([M:MLIK]DEMNUM  <> "")
+ISRESS  = ([M:MLIK]RESSNUM <> "")
+ISRESSE = ISDEM & ISRESS
+ISRESSM = !ISDEM & ISRESS
+ISITEM  = !ISDEM & !ISRESS
+
+If ISDEM & !IOK
+   Gosub CHECK_DEMAND : # pour reinitialiser eventuellement [M:MLIK]DWIPTYP
+Endif
+
+# on ne vérifie pas les demande/ressource transmis en paramètre
+
+#------------------------------------------------------------------------
+# purge des liens existants basée sur la demande
+$MTOLINK_RAZ2
+If ISDEM
+   # recherche des liens basés sur la demande
+   WCLE = [M:MLIK]STOFCY-[M:MLIK]ITMREF-num$([M:MLIK]DEMTYP)-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)
+   If !ISRESS
+    Filter [MLK1] Where DEMTYP  = [M:MLIK]DEMTYP
+&                     & DEMNUM  = [M:MLIK]DEMNUM
+&                     & DEMLIN  = [M:MLIK]DEMLIN
+&                     & DEMSEQ  = [M:MLIK]DEMSEQ
+&                     & DWIPTYP = [M:MLIK]DWIPTYP
+&                 Order By Key MLK0
+   Else
+    Filter [MLK1] Where DEMTYP  = [M:MLIK]DEMTYP
+&                     & DEMNUM  = [M:MLIK]DEMNUM
+&                     & DEMLIN  = [M:MLIK]DEMLIN
+&                     & DEMSEQ  = [M:MLIK]DEMSEQ
+&                     & DWIPTYP = [M:MLIK]DWIPTYP
+&                     & RESSTYP = [M:MLIK]RESSTYP
+&                     & RESSNUM = [M:MLIK]RESSNUM
+&                     & RESSLIN = [M:MLIK]RESSLIN
+&                     & RESSSEQ = [M:MLIK]RESSSEQ
+&                 Order By Key MLK0
+   Endif
+Elsif ISRESS
+    # recherche des liens basés sur la ressource
+    WCLE = [M:MLIK]STOFCY-[M:MLIK]ITMREF-num$([M:MLIK]RESSTYP)-[M:MLIK]RESSNUM-num$([M:MLIK]RESSLIN)-num$([M:MLIK]RESSSEQ)
+    Filter [MLK1] Where RESSTYP = [M:MLIK]RESSTYP
+&                     & RESSNUM = [M:MLIK]RESSNUM
+&                     & RESSLIN = [M:MLIK]RESSLIN
+&                     & RESSSEQ = [M:MLIK]RESSSEQ
+&                 Order By Key MLK1
+Else
+    # recherche des liens basés sur l'article site
+    WCLE = [M:MLIK]STOFCY-[M:MLIK]ITMREF
+    Filter [MLK1] Order By Key MLK0
+Endif
+
+For [MLK1] Where STOFCY=[M:MLIK]STOFCY & ITMREF=[M:MLIK]ITMREF
+
+    K=1
+
+    # si affectation de contremarque, pas de RAZ, sauf appel en suppression explicite
+    If [F:MLK1]FMIFLG = 2 & [M:MLIK]FMIFLG <> 9 : K=0 : Endif
+
+    # si affectation forcée on vérifie le paramètre
+    If [F:MLK1]FRCFLG = 2 & [M:MLIK]FRCPRO = 1  : K=0 : Endif
+
+    If [M:MLIK]MAJCOD="R" : # Révision
+       If (!ISDEM & NDEM<XDIM) | (ISDEM & NDEM=0)
+          For [ORDB]ORD3 Where STOFCY = [F:MLK1]STOFCY
+&                            & ITMREF = [F:MLK1]ITMREF
+&                            & VCRTYP = [F:MLK1]DEMTYP
+&                            & VCRNUM = [F:MLK1]DEMNUM
+&                            & VCRLIN = [F:MLK1]DEMLIN
+&                            & VCRSEQ = [F:MLK1]DEMSEQ
+&                            & WIPTYP = [F:MLK1]DWIPTYP
+              If [F:ORDB]RMNEXTQTY>[F:ORDB]ALLQTY & (K | [F:ORDB]MTOQTY < ([F:ORDB]RMNEXTQTY-[F:ORDB]ALLQTY))
+                 Gosub ALIM_TDEM
+                 If K
+                    WMTOQTY = min(TDEM_MTO(NDEM-1),[F:MLK1]LIKQTY) : # WMTOQTY = [F:MLK1]LIKQTY : # Issue 99635 GH 23/08/2018 - TDEM_MTO should not become negative
+                    TDEM_RMN(NDEM-1)+= WMTOQTY
+                    TDEM_MTO(NDEM-1)-= WMTOQTY
+                 Endif
+                 Break
+              Endif
+          Next
+       Elsif ISDEM & K
+          WMTOQTY = min(TDEM_MTO(NDEM-1),[F:MLK1]LIKQTY) : # WMTOQTY = [F:MLK1]LIKQTY : # Issue 99635 GH 23/08/2018 - TDEM_MTO should not become negative
+          TDEM_RMN(NDEM-1)+= WMTOQTY
+          TDEM_MTO(NDEM-1)-= WMTOQTY
+       Endif
+
+       If (!ISRESS & NRESS<XDIM) | (ISRESS & NRESS=0)
+          For [ORDB]ORD3 Where STOFCY = [F:MLK1]STOFCY
+&                            & ITMREF = [F:MLK1]ITMREF
+&                            & VCRTYP = [F:MLK1]RESSTYP
+&                            & VCRNUM = [F:MLK1]RESSNUM
+&                            & VCRLIN = [F:MLK1]RESSLIN
+&                            & VCRSEQ = [F:MLK1]RESSSEQ
+&                            & find([F:ORDB]WIPTYP,2,5,7,9,13)<>0
+&                            & [F:ORDB]RMNEXTQTY > 0
+              If [F:ORDB]RMNEXTQTY>0 & (K | [F:ORDB]MTOQTY < [F:ORDB]RMNEXTQTY)
+                 Gosub ALIM_TRESS
+                 If K
+                    WMTOQTY = min(TRESS_MTO(NRESS-1),[F:MLK1]LIKQTY) : # WMTOQTY = [F:MLK1]LIKQTY : # Issue 99635 GH 23/08/2018 - TRESS_MTO should not become negative
+                    TRESS_RMN(NRESS-1)+= WMTOQTY
+                    TRESS_MTO(NRESS-1)-= WMTOQTY
+                 Endif
+                 Break
+             Endif
+          Next
+       Elsif ISRESS & K
+          WMTOQTY = min(TRESS_MTO(NRESS-1),[F:MLK1]LIKQTY) : # WMTOQTY = [F:MLK1]LIKQTY : # Issue 99635 GH 23/08/2018 - TRESS_MTO should not become negative
+          TRESS_RMN(NRESS-1)+= WMTOQTY
+          TRESS_MTO(NRESS-1)-= WMTOQTY
+       Endif
+    Endif
+
+    If K=0 : Goto NXT_RAZ2 : Endif
+
+    Readlock [MLK1] Curr
+    If fstat = 1
+       GLOCK = "$MTOLINK"-WCLE : GOK = -1 : Break
+    Elsif fstat
+       GOK = 0 : Call RSTA("MLK1",WCLE) From GLOCK : Break
+    Endif
+
+    # mise à jour de la ressource associée
+    WCLE = [F:MLK1]STOFCY-[F:MLK1]RESSNUM-num$([F:MLK1]RESSLIN)-num$([F:MLK1]RESSSEQ)
+    Filter [ORDB] Where VCRTYP = [F:MLK1]RESSTYP
+&                     & VCRNUM = [F:MLK1]RESSNUM
+&                     & VCRLIN = [F:MLK1]RESSLIN
+&                     & VCRSEQ = [F:MLK1]RESSSEQ
+&                     & find(WIPTYP,2,5,7,9,13)<>0
+    Gosub MTOLINK_RAZMAJ
+    Filter [ORDB]
+    If GOK <= 0 : Break : Endif
+
+    # mise à jour de la demande associée
+    WCLE = [F:MLK1]STOFCY-[F:MLK1]DEMNUM-num$([F:MLK1]DEMLIN)-num$([F:MLK1]DEMSEQ)
+    Filter [ORDB] Where VCRTYP = [F:MLK1]DEMTYP
+&                     & VCRNUM = [F:MLK1]DEMNUM
+&                     & VCRLIN = [F:MLK1]DEMLIN
+&                     & VCRSEQ = [F:MLK1]DEMSEQ
+&                     & WIPTYP = [F:MLK1]DWIPTYP
+    Gosub MTOLINK_RAZMAJ
+    Filter [ORDB]
+    If GOK <= 0 : Break : Endif
+
+    ## GH 13/03/2013 dm 88039
+    GPOINT = "BEFMLKDEL" : Gosub  ENTREE From EXEFNC
+    If GOK<1 : Break : Endif
+
+    # Envoi infos au programme appelant pour gestion trace
+    If [M:MLIK]FEEDBACK = 2
+     [M:MLIK]FEEDBACKT = 0
+     Gosub TRACE_LINK From =[M:MLIK]TRTNAM
+    Endif
+
+    Delete [MLK1]
+    If fstat=1 | fstat>5
+     GOK=0 : Call RSTA("MLK1",WCLE) From GLOCK : Break
+    Endif
+
+$NXT_RAZ2
+Next
+Filter [MLK1]
+If GOK <= 0 : Return : Endif
+
+# raz quantité affectée subsistante
+If ISDEM            : K=1 : Gosub MTOLINK_RAZORD : Endif
+If ISRESS           : K=2 : Gosub MTOLINK_RAZORD : Endif
+If !ISDEM & !ISRESS : K=3 : Gosub MTOLINK_RAZORD : Endif
+
+Return
+
+#------------------------------------------------------------------------
+
+$MTOLINK_RAZMAJ
+For [ORDB]ORD3 Where STOFCY=[M:MLIK]STOFCY & ITMREF=[M:MLIK]ITMREF & MTOQTY<>0
+    Readlock [ORDB] Curr
+    If fstat = 1  :
+       GOK = -1 : GLOCK ="$ORDERS"-WCLE : Break
+     Elsif fstat
+       GOK = 0 : Call RSTA("ORDB",WCLE) From GLOCK : Break
+     Endif
+
+     # décrémentation de la quantité affectée
+     [F:ORDB]MTOQTY -= [F:MLK1]LIKQTY
+     If [F:ORDB]MTOQTY < 0 : [F:ORDB]MTOQTY = 0 : Endif
+
+     [F:ORDB]UPDDAT = date$
+     [F:ORDB]UPDUSR = GUSER
+     Rewrite [ORDB]
+     If fstat : GOK = 0 : Call FSTA("ORDB") From GLOCK : Break : Endif
+
+     # GH 06/07/2012 bug 83344 empêche les RAZFMIxxx dans SUBSOHA de se déclencher
+     # désaffectation d'une SOF ou TPF de contemarque => raz infos FMI de la ligne de document
+     #If find([F:ORDB]WIPTYP,1,8) & [F:ORDB]FMI<>1
+     #   If !clalev([F:SOQ]) : Local File SORDERQ [SOQ] : Endif : # optimisation
+     #   Call MAJFMISOQ([F:ORDB]VCRNUM, [F:ORDB]VCRLIN, [F:ORDB]VCRSEQ,"", 0, 0, 2, K) From TRTVENMAJ
+     #   If K : GOK=0 : Break : Endif
+     #Endif
+
+     # Le solde d'une ligne de cde de vente conserve les nos de contremarque dans les ressource et demmande
+     # alors que l'annulation d'une ligne de cde de vente raze les nos de contremarque dans la ressource (la demande est supprimée)
+
+     Break
+Next
+Return
+
+#------------------------------------------------------------------------
+# a présent, raz des encours sur lesquels il resterait de l'affecté sans lien
+$MTOLINK_RAZORD
+Case K
+  When 1
+   WCLE =[M:MLIK]STOFCY-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)
+   Filter [ORDB] Where VCRTYP  = [M:MLIK]DEMTYP
+&                    & VCRNUM  = [M:MLIK]DEMNUM
+&                    & VCRLIN  = [M:MLIK]DEMLIN
+&                    & VCRSEQ  = [M:MLIK]DEMSEQ
+&                    & WIPTYP  = [M:MLIK]DWIPTYP
+&                Order By Key ORD3
+  When 2
+   WCLE =[M:MLIK]STOFCY-[M:MLIK]RESSNUM-num$([M:MLIK]RESSLIN)-num$([M:MLIK]RESSSEQ)
+   Filter [ORDB] Where VCRTYP = [M:MLIK]RESSTYP
+&                    & VCRNUM = [M:MLIK]RESSNUM
+&                    & VCRLIN = [M:MLIK]RESSLIN
+&                    & VCRSEQ = [M:MLIK]RESSSEQ
+&                    & find(WIPTYP,2,5,7,9,13)<>0
+&                Order By Key ORD3
+  When 3
+   WCLE =[M:MLIK]STOFCY-[M:MLIK]ITMREF
+   Filter [ORDB] Order By Key ORD1
+Endcase
+
+For [ORDB] Where STOFCY=[M:MLIK]STOFCY & ITMREF=[M:MLIK]ITMREF & MTOQTY<>0
+    # vérification que cette qté affectée est orpheline (pas d'affectation liée)
+
+    If func CBNLIB.ISDEM([F:ORDB]WIPTYP)
+     Filter [MLK1] Where DWIPTYP = [F:ORDB]WIPTYP
+     Look [MLK1]MLK0 = [F:ORDB]STOFCY;[F:ORDB]ITMREF;[F:ORDB]VCRTYP;[F:ORDB]VCRNUM;[F:ORDB]VCRLIN;[F:ORDB]VCRSEQ
+     Filter [MLK1]
+    Else
+     Look [MLK1]MLK1 = [F:ORDB]STOFCY;[F:ORDB]ITMREF;[F:ORDB]VCRTYP;[F:ORDB]VCRNUM;[F:ORDB]VCRLIN;[F:ORDB]VCRSEQ
+    Endif
+    If fstat<=2 : Goto NXT_RAZORD : Endif
+
+    Readlock [ORDB] Curr
+    If fstat = 1
+       GLOCK = "$ORDERS"-WCLE : GOK = -1 : Break
+    Elsif fstat
+       GOK = 0 : Call RSTA("ORDB",WCLE) From GLOCK : Break
+    Endif
+
+    # raz de la quantité affectée
+    [F:ORDB]MTOQTY = 0
+
+    [F:ORDB]UPDDAT = date$
+    [F:ORDB]UPDUSR = GUSER
+    Rewrite [ORDB]
+    If fstat : GOK=0 : Call FSTA("ORDB") From GLOCK : Break : Endif
+
+$NXT_RAZORD
+Next
+Filter [ORDB]
+
+Return
+
+#------------------------------------------------------------------------
+# vérification de la demande
+# en création et suppression, on en profite pour mettre à jour ORDERS
+$CHECK_DEMAND
+
+# pas les SCF
+If [M:MLIK]DWIPTYP = 4 : Return : Endif
+
+# demande ?
+If !func CBNLIB.ISDEM([M:MLIK]DWIPTYP) : Return : Endif
+
+[L]WTYP2 = func WIPTYP2([M:MLIK]DWIPTYP)
+
+# demande
+For [ORDB]ORD3 Where STOFCY = [M:MLIK]STOFCY
+&                  & ITMREF = [M:MLIK]ITMREF
+&                  & VCRTYP = [M:MLIK]DEMTYP
+&                  & VCRNUM = [M:MLIK]DEMNUM
+&                  & VCRLIN = [M:MLIK]DEMLIN
+&                  & VCRSEQ = [M:MLIK]DEMSEQ
+&                  & find(WIPTYP,[M:MLIK]DWIPTYP,[L]WTYP2)<>0
+
+    [M:MLIK]DWIPTYP=[F:ORDB]WIPTYP : # GH 14/06/12 bug 77574
+    [M:MLIK]DWIPSTA=[F:ORDB]WIPSTA : # GH 31/05/12 bug 82463
+
+    # affectations seulement sur statut ferme pour le moment
+    If [F:ORDB]WIPSTA <> 1 : Break : Endif
+
+    # il doit y avoir une quantité restante à affecter
+    If !find([M:MLIK]MAJCOD,"A","Z") &  ([F:ORDB]RMNEXTQTY - [F:ORDB]ALLQTY) <= 0 : Break : Endif
+
+    If [M:MLIK]MAJCOD = "P" : # si proposition
+        # proposition sur les demandes sans contremarque uniquement
+        If [F:ORDB]FMI<>1 : Break : Endif
+
+        # calcul de la partie non affectée
+        If [M:MLIK]PRPTYP = 1
+            # besoin en proposition complète
+            WREQQTY = [F:ORDB]RMNEXTQTY - [F:ORDB]ALLQTY
+        Else
+            # besoin en proposition complémentaire
+            WREQQTY = [F:ORDB]RMNEXTQTY - [F:ORDB]ALLQTY - [F:ORDB]MTOQTY
+        Endif
+        If WREQQTY <= 0 : Break : Endif
+    Endif
+
+    IOK = 1 : Break
+Next
+
+Return
+
+#--------------------------------------------------------------------------
+# vérification de la ressource
+# en création et suppression, on en profite pour mettre à jour ORDERS
+$CHECK_RESSOURCE
+
+For [ORDB]ORD3 Where STOFCY = [M:MLIK]STOFCY
+&                  & ITMREF = [M:MLIK]ITMREF
+&                  & VCRTYP = [M:MLIK]RESSTYP
+&                  & VCRNUM = [M:MLIK]RESSNUM
+&                  & VCRLIN = [M:MLIK]RESSLIN
+&                  & VCRSEQ = [M:MLIK]RESSSEQ
+&                  & find(WIPTYP,2,5,7,9,13)<>0
+
+    [M:MLIK]RWIPTYP=[F:ORDB]WIPTYP : # GH 13/06/12 bug 80971
+    [M:MLIK]RWIPSTA=[F:ORDB]WIPSTA : # GH 31/05/12 bug 82463
+
+    # affectations seulement sur statut ferme pour le moment
+    If [F:ORDB]WIPSTA <> 1 : Break : Endif
+
+    If [M:MLIK]MAJCOD = "P" : # si proposition
+        # proposition sur les ressources sans contremarque uniquement
+        If [F:ORDB]FMI<>1 : Break : Endif
+
+        # calcul de la partie non affectée
+        If [M:MLIK]PRPTYP = 1
+            # besoin en proposition complète
+            WCOVQTY = [F:ORDB]RMNEXTQTY
+        Else
+            # besoin en proposition complémentaire
+            WCOVQTY = [F:ORDB]RMNEXTQTY - [F:ORDB]MTOQTY
+        Endif
+        If WCOVQTY <= 0 : Break : Endif
+    Endif
+
+    IOK = 1 : Break
+Next
+
+Return
+
+#-----------------------------------------------------------------------------
+# récupération de l'UOM dans le document d'origine
+$GET_UOM
+Case [F:ORDB]WIPTYP
+    When 1,9:  Case [F:ORDB]WIPSTA
+                   When 1, 2 : Case [F:ORDB]ABBFIL
+                                   When "SOQ":    Read [SOPW]SOP0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN;[F:ORDB]VCRSEQ
+                                                  If fstat : Raz [F:SOPW] : Endif
+                                                  WUOM = [F:SOPW]SAU
+                                   When "SOC":    Read [SOCW]SOC0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN
+                                                  If fstat : Raz [F:SOCW] : Endif
+                                                  WUOM = [F:SOCW]SAU
+                               Endcase
+                   #When 2:     Read [SOCW]SOC0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN
+                   #            If fstat : Raz [F:SOCW] : Endif
+                   #            WUOM = [F:SOCW]SAU
+               Endcase
+    When 2,7:  Case [F:ORDB]WIPSTA
+                   When 1:     Case [F:ORDB]ABBFIL
+                                   When "POQ":     Read [POQW]POQ0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN;[F:ORDB]VCRSEQ
+                                                   If fstat : Raz [F:POQW] : Endif
+                                                   WUOM = [F:POQW]UOM
+                                   When "POC":     Read [POCW]POC0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN
+                                                   If fstat : Raz [F:POCW] : Endif
+                                                   WUOM = [F:POCW]PUU
+                               Endcase
+                   When 2:     Case [F:ORDB]ABBFIL
+                                   When "PSD":    Read [PSDW]PSD0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN
+                                                  If fstat : Raz [F:PSDW] : Endif
+                                                  WUOM = [F:PSDW]PUU
+                                   When "POC":    Read [POCW]POC0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN
+                                                  If fstat : Raz [F:POCW] : Endif
+                                                  WUOM = [F:POCW]PUU
+                                   Endcase
+               Endcase
+    When 5:    Read [MFIW]MFI0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN
+               If fstat : Raz [F:MFIW] : Endif
+               WUOM = [F:MFIW]UOM
+    When 13:   Read [SCIW]SCI0=[F:ORDB]VCRNUM;[F:ORDB]VCRLIN
+               If fstat : Raz [F:SCIW] : Endif
+               WUOM = [F:SCIW]PUU
+Endcase
+If WUOM = "" : WUOM = [F:ITM]STU : Endif
+
+Return
+
+#--------------------------------------------------------------------------
+# chargement des règles de priorisation des ressources
+$LOAD_RULES
+WNBRULE  = 0
+
+# Point d'entrée MTOLINK_RULES pour ajouter des règles
+# ces règles sont en premières positions donc prioritaires, maximum 3
+If find("MTOLINKLIB",GENTSTD(1..GNBENTREE))
+    MTOLINK_PE_MODE = "ACT"
+    GPOINT = "MTOLINK_RULES"
+    Gosub  ENTREE From EXEFNC
+
+    # si plus de 3 règles sont ajoutées, anomalie, on efface
+    If WNBRULE > 3 : WNBRULE = 0 : Endif
+Endif
+
+For K = 0 To dim([F:PTO]UNTFLT)-1
+    If !find([F:PTO]UNTFLT(K),1,2) : Break : Endif
+    WUSRFLT(WNBRULE)     = 1
+    WPJTFLT(WNBRULE)     = [F:PTO]PJTFLT(K)
+    WUNTFLT(WNBRULE)     = [F:PTO]UNTFLT(K)
+    WQTYFLT(WNBRULE)     = [F:PTO]QTYFLT(K)
+    WQTYPCTUP(WNBRULE)   = [F:PTO]QTYPCTUP(K)
+    WQTYPCTDOWN(WNBRULE) = [F:PTO]QTYPCTDOWN(K)
+    WBPSFLT(WNBRULE)     = [F:PTO]BPSFLT(K)
+    WDATFLT(WNBRULE)     = [F:PTO]DATFLT(K)
+    WDATMARUP(WNBRULE)   = [F:PTO]DATMARUP(K)
+    WDATMARDOWN(WNBRULE) = [F:PTO]DATMARDOWN(K)
+    WNBRULE += 1
+Next K
+
+# initialisation fournisseur prioritaire
+Filter [ITP] Where ITMREF=[M:MLIK]ITMREF & DOUFLG=1
+Read [ITP]ITP1 First
+Filter [ITP]
+If fstat>2 : Return : Endif
+
+# lecture fournisseur
+Read [BPS]BPS0=[F:ITP]BPSNUM
+If !fstat & [F:BPS]DOUFLG = 1
+    R_BPSNUM = [F:ITP]BPSNUM
+Endif
+
+Return
+
+#--------------------------------------------------------------------------
+# chargement prochaine règle de priorisation des ressources
+$NEXT_RULE
+# incrémentation compteur règles
+I_RULE += 1
+
+# dépassement de tableau
+If I_RULE >= WNBRULE : I_RULE = 9 : Return : Endif
+
+R_USRFLD1 = TDEM_USRFLD1(I)
+R_USRFLD2 = TDEM_USRFLD2(I)
+R_USRFLD3 = TDEM_USRFLD3(I)
+If TEST
+ Call ECR_TRACE("R_USRFLDi("+num$(I)+") i(1)="+R_USRFLD1-"i(2)="+R_USRFLD2-"i(3)="+R_USRFLD3,-1) From GESECRAN
+Endif
+
+# si quantité homogène, préparation bornes mini + maxi
+If WQTYFLT(I_RULE) = 2
+    R_MINQTY = TDEM_RMN(I) - ((TDEM_RMN(I) * WQTYPCTDOWN(I_RULE)) / 100)
+    R_MAXQTY = TDEM_RMN(I) + ((TDEM_RMN(I) * WQTYPCTUP  (I_RULE)) / 100)
+Endif
+
+If WDATFLT(I_RULE) = 2
+    R_MINDAT = TDEM_DAT(I) - WDATMARDOWN(I_RULE)
+    R_MAXDAT = TDEM_DAT(I) + WDATMARUP  (I_RULE)
+Endif
+
+If WUNTFLT(I_RULE) = 2
+    R_UOM = TDEM_UOM(I)
+Endif
+
+If WPJTFLT(I_RULE) = 2
+    R_PJT = TDEM_PJT(I)
+Endif
+Return
+
+#-----------------------------------------------------------------------------------------------
+# génération d'une copie filtrée du tableau des ressources en tenant compte de la règle en cours
+$GEN_FILTERED_RESS
+NFRESS = 0
+For K = 0 To NRESS - 1
+
+    # si la ressource est déjà affectée complètement, inutile de la charger
+    If TRESS_RMN(K) <= 0 : Goto NEXTFRESS : Endif
+
+    # si I_RULE = 9, il n'y a pas de règle, on recopie tout le tableau
+    If I_RULE <> 9
+        # règle utilisateur
+        If WUSRFLT(I_RULE) = 2
+           MTOLINK_PE_MODE = "APP"
+           GPOINT = "MTOLINK_RULES"
+           GPE=0 : Gosub  ENTREE From EXEFNC
+           If TEST
+            Call ECR_TRACE("APP TRESS_USRFLDk("+num$(K)+") k(1)="+TRESS_USRFLD1(K)-"k(2)="+TRESS_USRFLD2(K)-"k(3)="+TRESS_USRFLD3(K),GPE) From GESECRAN
+           Endif
+           If GPE : Goto NEXTFRESS : Endif
+        Endif
+
+        If find("MTOLINKLIB",GENTSTD(1..GNBENTREE))
+           MTOLINK_PE_MODE = "BPP"
+           GPOINT = "MTOLINK_RULES"
+           GPE=0 : Gosub  ENTREE From EXEFNC
+           If TEST
+            Call ECR_TRACE("BPP TRESS_USRFLDk("+num$(K)+") k(1)="+TRESS_USRFLD1(K)-"k(2)="+TRESS_USRFLD2(K)-"k(3)="+TRESS_USRFLD3(K),GPE) From GESECRAN
+           Endif
+           If GPE : Goto NEXTFRESS : Endif
+        Endif
+
+        # contrôle quantité compatible
+        If WQTYFLT(I_RULE) = 2
+            If (TRESS_RMN(K) < R_MINQTY | TRESS_RMN(K) > R_MAXQTY) : Goto NEXTFRESS : Endif
+        Endif
+
+        # contrôle date compatible
+        If WDATFLT(I_RULE) = 2
+            If (TRESS_DAT(K) < R_MINDAT | TRESS_DAT(K) > R_MAXDAT) : Goto NEXTFRESS : Endif
+        Endif
+
+        # filtre fournisseur
+        # si ordre de type 2, 7 ou 13 (PO, TR, EO), alors on filtre sur le fournisseur prioritaire de la fiche article
+        # En cas d'article à la fois achetés et fabriqués, les OFs sont considérés comme prioritaires
+        If WBPSFLT(I_RULE) = 2
+            If find(TRESS_TYP(K), 2, 7, 13) & R_BPSNUM <> ""
+                If TRESS_BPR(K) <> R_BPSNUM : Goto NEXTFRESS : Endif
+            Endif
+        Endif
+
+        # filtre unité document
+        If WUNTFLT(I_RULE) = 2
+            If TRESS_UOM(K) <> R_UOM : Goto NEXTFRESS : Endif
+        Endif
+
+        # filtre affaire
+# 79350
+#        If WPJTFLT(I_RULE) = 2 & R_PJT <> ""
+        If WPJTFLT(I_RULE) = 2
+            If TRESS_PJT(K) <> R_PJT : Goto NEXTFRESS : Endif
+        Endif
+    Endif
+
+    # chargement copie TFRESS
+    TFRESS_TYP(NFRESS) = TRESS_TYP(K)
+    TFRESS_NUM(NFRESS) = TRESS_NUM(K)
+    TFRESS_RMN(NFRESS) = TRESS_RMN(K)
+    TFRESS_MTO(NFRESS) = TRESS_MTO(K)
+    TFRESS_OFF(NFRESS) = TRESS_OFF(K)
+    TFRESS_DAT(NFRESS) = TRESS_DAT(K)
+    TFRESS_SYN(NFRESS) = K
+    NFRESS += 1
+
+$NEXTFRESS
+Next K
+
+Return
+
+#-----------------------------------------------------------------------------
+# mise à jour tableau TRESS selon TFRESS (report quantités affectées/restantes)
+$UPDATE_TRESS
+For L = 0 To NFRESS - 1
+    TRESS_RMN(TFRESS_SYN(L)) = TFRESS_RMN(L)
+    TRESS_MTO(TFRESS_SYN(L)) = TFRESS_MTO(L)
+Next L
+Return
+
+#-----------------------------------------------------------------------------
+# Dans le traitement de proposition, on a 2 boucles utilisant les indices I et J
+# il est essentiel que les appels "extérieurs" ne remettent pas en cause ceux-ci.
+$SAVE_IND
+SI = I
+SJ = J
+Return
+
+$RESTORE_IND
+I = SI
+J = SJ
+Return
+
+#-----------------------------------------------------------------------------
+# GH 14/06/2012 bug 77574
+
+Funprog WIPTYP2(TYP1)
+Value Integer TYP1
+
+Case TYP1
+ When 1        : End 8
+ When 8        : End 1
+ When Default  : End TYP1
+Endcase
+End
+#-----------------------------------------------------------------------------
+# GH 06/07/2012 bug 81041
+
+Funprog FMITYP(FMI)
+Value Integer FMI
+Case FMI
+  When 5 : End 10
+  When 6 : End 36
+  When 3 : End 14
+Endcase
+End 0
+
+#-----------------------------------------------------------------------------
+# présence d'une affectation forcée et non contremarque
+Subprog CHECK_FRCQTY(LFCY, LITM, LTYP, LNUM, LLIN, LSEQ, LWTYP, LRET)
+Value    Char    LFCY
+Value    Char    LITM
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LWTYP
+Variable Integer LRET
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+
+If func CBNLIB.ISDEM(LWTYP)
+    Local Integer LWTYP2
+    LWTYP2 = func WIPTYP2(LWTYP)
+
+    For [MLK]MLK0 Where STOFCY  = LFCY
+&                     & ITMREF  = LITM
+&                     & DEMTYP  = LTYP
+&                     & DEMNUM  = LNUM
+&                     & DEMLIN  = LLIN
+&                     & DEMSEQ  = LSEQ
+&                     & find(DWIPTYP,LWTYP,LWTYP2)<>0
+&                     & FRCFLG  = 2
+      LRET = 1
+      # pas de warning pour les contremarques
+      If [F:MLK]FMIFLG = 2 : LRET = 0 : Endif
+      Break
+    Next
+Else
+    For [MLK]MLK1 Where STOFCY  = LFCY
+&                     & ITMREF  = LITM
+&                     & RESSTYP = LTYP
+&                     & RESSNUM = LNUM
+&                     & RESSLIN = LLIN
+&                     & RESSSEQ = LSEQ
+&                     & FRCFLG  = 2
+        LRET = 1
+        # pas de warning pour les contremarques
+        If [F:MLK]FMIFLG = 2 : LRET = 0 : Endif
+        Break
+    Next
+Endif
+End
+
+#-----------------------------------------------------------------------------
+# récupération quantité affectée (forcée si LTYP>=0)
+Subprog GET_FRCQTY(LFCY, LITM, LTYP, LNUM, LLIN, LSEQ, LWTYP, LFRCQTY)
+Value    Char    LFCY
+Value    Char    LITM
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LWTYP
+Variable Decimal LFRCQTY
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+Local Integer TSTFRC
+
+If LTYP<0
+   LTYP = -LTYP
+Else
+   TSTFRC = 1 : # on ne considère que les affectations forcées
+Endif
+
+LFRCQTY = 0
+
+If func CBNLIB.ISDEM(LWTYP)
+    Local Integer LWTYP2
+    LWTYP2 = func WIPTYP2(LWTYP)
+
+    For [MLK]MLK0 Where STOFCY  = LFCY
+&                     & ITMREF  = LITM
+&                     & DEMTYP  = LTYP
+&                     & DEMNUM  = LNUM
+&                     & DEMLIN  = LLIN
+&                     & DEMSEQ  = LSEQ
+&                     & find(DWIPTYP,LWTYP,LWTYP2)<>0
+        If !TSTFRC | [F:MLK]FRCFLG=2
+            LFRCQTY += [F:MLK]LIKQTY
+            # pas de warning pour les contremarques
+            If [F:MLK]FMIFLG = 2 : LFRCQTY = 0 : Break : Endif
+        Endif
+    Next
+Else
+    For [MLK]MLK1 Where STOFCY  = LFCY
+&                     & ITMREF  = LITM
+&                     & RESSTYP = LTYP
+&                     & RESSNUM = LNUM
+&                     & RESSLIN = LLIN
+&                     & RESSSEQ = LSEQ
+        If !TSTFRC | [F:MLK]FRCFLG=2
+            LFRCQTY += [F:MLK]LIKQTY
+            # pas de warning pour les contremarques
+            If [F:MLK]FMIFLG = 2 : LFRCQTY = 0 : Break : Endif
+        Endif
+    Next
+Endif
+End
+
+#------------------------------------   IMPORTANT     --------------------------------
+# GH 05/07/2012 Ce subprog sera bientôt supprimée en standard, ne pas l'utiliser
+#               remplacé par CHECK_FRCQTY
+#-------------------------------------------------------------------------------------
+# présence d'une affectation forcée et non contremarque sur une ressource
+Subprog CHECK_RESS_FRCQTY(LFCY, LTYP, LNUM, LLIN, LSEQ, LRET)
+Value    Char    LFCY
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Variable Integer LRET
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+
+For [MLK]MLK1 Where STOFCY  = LFCY
+&                 & RESSTYP = LTYP
+&                 & RESSNUM = LNUM
+&                 & RESSLIN = LLIN
+&                 & RESSSEQ = LSEQ
+&                 & FRCFLG  = 2
+    LRET = 1
+    # pas de warning pour les contremarques
+    If [F:MLK]FMIFLG = 2 : LRET = 0 : Endif
+    Break
+Next
+
+End
+
+#------------------------------------   IMPORTANT     --------------------------------
+# GH 05/07/2012 Ce subprog sera bientôt supprimée en standard, ne pas l'utiliser
+#               remplacé par GET_FRCQTY
+#-------------------------------------------------------------------------------------
+# récupération quantité affectée forcée non contremarque sur une ressource
+Subprog GET_RESS_FRCQTY(LFCY, LTYP, LNUM, LLIN, LSEQ, LFRCQTY)
+Value    Char    LFCY
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Variable Decimal LFRCQTY
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+
+LFRCQTY = 0
+For [MLK]MLK1 Where STOFCY  = LFCY
+&                 & RESSTYP = LTYP
+&                 & RESSNUM = LNUM
+&                 & RESSLIN = LLIN
+&                 & RESSSEQ = LSEQ
+&                 & FRCFLG  = 2
+    LFRCQTY += [F:MLK]LIKQTY
+    # pas de warning pour les contremarques
+    If [F:MLK]FMIFLG = 2 : LFRCQTY = 0 : Break : Endif
+Next
+
+End
+
+#------------------------------------   IMPORTANT     --------------------------------
+# GH 05/07/2012 Ce subprog sera bientôt supprimée en standard, ne pas l'utiliser
+#               remplacé par CHECK_FRCQTY
+#-------------------------------------------------------------------------------------
+# présence d'une affectation forcée et non contremarque sur demande
+Subprog CHECK_DEM_FRCQTY(LFCY, LTYP, LNUM, LLIN, LSEQ, LWTYP, LRET)
+Value    Char    LFCY
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LWTYP
+Variable Integer LRET
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+Local Integer LWTYP2
+LWTYP2 = func WIPTYP2(LWTYP)
+
+For [MLK]MLK0 Where STOFCY  = LFCY
+&                 & DEMTYP  = LTYP
+&                 & DEMNUM  = LNUM
+&                 & DEMLIN  = LLIN
+&                 & DEMSEQ  = LSEQ
+&                 & find(DWIPTYP,LWTYP,LWTYP2)<>0
+&                 & FRCFLG  = 2
+    LRET = 1
+    # pas de warning pour les contremarques
+    If [F:MLK]FMIFLG = 2 : LRET = 0 : Endif
+    Break
+Next
+
+End
+
+#------------------------------------   IMPORTANT     --------------------------------
+# GH 05/07/2012 Ce subprog sera bientôt supprimée en standard, ne pas l'utiliser
+#               remplacé par GET_FRCQTY
+#-------------------------------------------------------------------------------------
+# récupération quantité affectée forcée sur demande
+Subprog GET_DEM_FRCQTY(LFCY, LTYP, LNUM, LLIN, LSEQ, LWTYP, LFRCQTY)
+Value    Char    LFCY
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LWTYP
+Variable Decimal LFRCQTY
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+
+Local Integer LWTYP2
+LWTYP2 = func WIPTYP2(LWTYP)
+
+LFRCQTY = 0
+For [MLK]MLK0 Where STOFCY  = LFCY
+&                 & DEMTYP  = LTYP
+&                 & DEMNUM  = LNUM
+&                 & DEMLIN  = LLIN
+&                 & DEMSEQ  = LSEQ
+&                 & find(DWIPTYP,LWTYP,LWTYP2)<>0
+&                 & FRCFLG  = 2
+    LFRCQTY += [F:MLK]LIKQTY
+    # pas de warning pour les contremarques
+    If [F:MLK]FMIFLG = 2 : LFRCQTY = 0 : Break : Endif
+Next
+
+End
+
+#-----------------------------------------------------------------------------
+# A partir de l'identifiant, renvoit si il s'agit d'un contexte contremarque
+Funprog IS_DIRECT_ORDER(LFCY, LTYP, LNUM, LLIN, LSEQ)
+Value    Char    LFCY
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Local Integer LDIRECT
+
+If clalev ([F:ORD]) = 0 : Local File ORDERS   [ORD] : Endif
+
+# FQ 70303 GA 02/2011 ne pas tenir compte des affectations si contremarque et statut <> Ferme
+
+LDIRECT = 0
+For [ORD]ORD3 Where STOFCY = LFCY
+&                 & VCRTYP = LTYP
+&                 & VCRNUM = LNUM
+&                 & VCRLIN = LLIN
+&                 & VCRSEQ = LSEQ
+&                 & FMI>1 & WIPSTA=1
+  LDIRECT = 1 : Break
+Next
+
+End LDIRECT
+
+#-----------------------------------------------------------------------------
+# A partir de l'identifiant, renvoit l'identifiant de sa contremarque
+Subprog GET_DIRECT_ORDER(LFCY, LITM, LTYP, LNUM, LLIN, LSEQ, LWTYP, LTYP2, LNUM2, LLIN2, LSEQ2)
+Value    Char    LFCY
+Value    Char    LITM
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LWTYP
+Variable Integer LTYP2
+Variable Char    LNUM2
+Variable Integer LLIN2
+Variable Integer LSEQ2
+
+Raz LTYP2, LNUM2, LLIN2, LSEQ2
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+
+If func CBNLIB.ISDEM(LWTYP)
+    Local Integer LWTYP2
+    LWTYP2 = func WIPTYP2(LWTYP)
+
+    For [MLK]MLK0 Where STOFCY  = LFCY
+&                     & ITMREF  = LITM
+&                     & DEMTYP  = LTYP
+&                     & DEMNUM  = LNUM
+&                     & DEMLIN  = LLIN
+&                     & DEMSEQ  = LSEQ
+&                     & find(DWIPTYP,LWTYP,LWTYP2)<>0
+&                     & FMIFLG  = 2
+      LTYP2  = [F:MLK]RESSTYP
+      LNUM2  = [F:MLK]RESSNUM
+      LLIN2  = [F:MLK]RESSLIN
+      LSEQ2  = [F:MLK]RESSSEQ
+      Break
+    Next
+Else
+    For [MLK]MLK1 Where STOFCY  = LFCY
+&                     & ITMREF  = LITM
+&                     & RESSTYP = LTYP
+&                     & RESSNUM = LNUM
+&                     & RESSLIN = LLIN
+&                     & RESSSEQ = LSEQ
+&                     & FMIFLG  = 2
+      LTYP2  = [F:MLK]DEMTYP
+      LNUM2  = [F:MLK]DEMNUM
+      LLIN2  = [F:MLK]DEMLIN
+      LSEQ2  = [F:MLK]DEMSEQ
+      Break
+    Next
+Endif
+End
+
+#-----------------------------------------------------------------------------
+# A partir d'article et site, s'agit-il d'un article sujet à contremarque (1 à 1)
+Funprog IS_DIRECT_ORDER_CTX(LFCY, LITM)
+Value    Char    LFCY
+Value    Char    LITM
+
+Local Integer LDIRECTCTX
+Local Char    WPTOCOD(GLONPTO)
+
+If clalev ([F:ITF]) = 0 : Local File ITMFACILIT [ITF] : Endif
+If clalev ([F:PTO]) = 0 : Local File PARMTO     [PTO] : Endif
+
+If [F:ITF]ITMREF <> LITM | [F:ITF]STOFCY <> LFCY
+    Read [ITF]ITF0=LITM;LFCY
+    If fstat : Raz [F:ITF] : Endif
+Endif
+
+If [F:ITF]PTOCOD = ""
+   Call PARAM(LFCY,"DEFPTO",WPTOCOD) From ADOVAL : # WPTOCOD = GDEFPTO : # GH 20/11/13 bug 94608
+Else WPTOCOD = [F:ITF]PTOCOD
+Endif
+If [F:PTO]PTOCOD <> WPTOCOD
+    Read [PTO]PTO0=WPTOCOD
+    If fstat : Raz [F:PTO] : Endif
+Endif
+
+If [F:PTO]PTODIR = 2 : LDIRECTCTX = 1 : Endif
+
+End LDIRECTCTX
+
+#-----------------------------------------------------------------------------
+# existe-t-il des affectations liées à ce document
+Funprog LINK_EXISTS(LFCY, LTYP, LNUM, LLIN, LSEQ, LWTYP)
+Value    Char    LFCY
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LWTYP
+
+Local    Integer LEXIST
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+
+If func CBNLIB.ISDEM(LWTYP)
+    Local Integer LWTYP2
+    LWTYP2 = func WIPTYP2(LWTYP)
+
+    Filter [MLK] Where STOFCY  = LFCY
+&                    & DEMTYP  = LTYP
+&                    & DEMNUM  = LNUM
+&                    & DEMLIN  = LLIN
+&                    & DEMSEQ  = LSEQ
+&                    & find(DWIPTYP,LWTYP,LWTYP2)<>0
+&            Order By Key MLK0
+Else
+    Filter [MLK] Where STOFCY  = LFCY
+&                    & RESSTYP = LTYP
+&                    & RESSNUM = LNUM
+&                    & RESSLIN = LLIN
+&                    & RESSSEQ = LSEQ
+&            Order By Key MLK1
+Endif
+
+LEXIST = 0
+For [MLK]
+    LEXIST = 1 : Break
+Next
+
+Filter [MLK]
+
+End LEXIST
+
+#------------------------------------   IMPORTANT     --------------------------------
+# GH 05/07/2012 Ce funprog sera bientôt supprimée en standard, ne pas l'utiliser
+#-------------------------------------------------------------------------------------
+# existe-t-il des affectations liées à une ligne de contrat
+Funprog LINK_EXISTS_DL(LFCY, LTYP, LNUM, LLIN, LWTYP)
+Value    Char    LFCY
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LWTYP
+
+Local    Integer LEXIST
+
+If clalev ([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+
+If func CBNLIB.ISDEM(LWTYP)
+    Local Integer LWTYP2
+    LWTYP2 = func WIPTYP2(LWTYP)
+
+    Filter [MLK] Where STOFCY  = LFCY
+&                    & DEMTYP  = LTYP
+&                    & DEMNUM  = LNUM
+&                    & DEMLIN  = LLIN
+&                    & find(DWIPTYP,LWTYP,LWTYP2)<>0
+&            Order By Key MLK0
+Else
+    Filter [MLK] Where STOFCY  = LFCY
+&                    & RESSTYP = LTYP
+&                    & RESSNUM = LNUM
+&                    & RESSLIN = LLIN
+&            Order By Key MLK1
+Endif
+
+LEXIST = 0
+For [MLK]
+    LEXIST = 1 : Break
+Next
+
+Filter [MLK]
+
+End LEXIST
+
+#-----------------------------------------------------------------------------
+# mise à jour ORDERS en référence à buffer MLIK
+Subprog UPDORDERS_FROM_MLIK
+
+If clalev ([F:ORDB]) = 0 : Local File ORDERS     [ORDB] : Endif
+
+# maj demande
+For [ORDB]ORD3 Where STOFCY = [M:MLIK]STOFCY
+&                  & ITMREF = [M:MLIK]ITMREF
+&                  & VCRTYP = [M:MLIK]DEMTYP
+&                  & VCRNUM = [M:MLIK]DEMNUM
+&                  & VCRLIN = [M:MLIK]DEMLIN
+&                  & VCRSEQ = [M:MLIK]DEMSEQ
+&                  & WIPTYP = [M:MLIK]DWIPTYP
+    Readlock [ORDB] Curr
+    If fstat = 1  : GOK = -1
+                    GLOCK ="$ORDERS"-[M:MLIK]STOFCY-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)
+                    Break
+    Elsif fstat   : GOK = 0
+                    Call RSTA("ORDB",[M:MLIK]STOFCY-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ))From GLOCK
+                    Break
+    Endif
+
+    Case [M:MLIK]MAJCOD
+        When "C" :         [F:ORDB]MTOQTY += [M:MLIK]LIKQTY
+        When "A" :         [F:ORDB]MTOQTY -= [M:MLIK]LIKQTY
+        When "M" :         [F:ORDB]MTOQTY  = [M:MLIK]LIKQTY
+    Endcase
+    If [F:ORDB]MTOQTY < 0 : [F:ORDB]MTOQTY = 0 : Endif
+
+    [F:ORDB]UPDDAT = date$
+    [F:ORDB]UPDUSR = GUSER
+    Rewrite [ORDB]
+    If fstat : GOK=0 : Call FSTA("ORDB") From GLOCK : Break : Endif
+    Break
+Next
+If GOK <= 0 : End : Endif
+
+# maj ressource
+For [ORDB]ORD3 Where STOFCY = [M:MLIK]STOFCY
+&                  & ITMREF = [M:MLIK]ITMREF
+&                  & VCRTYP = [M:MLIK]RESSTYP
+&                  & VCRNUM = [M:MLIK]RESSNUM
+&                  & VCRLIN = [M:MLIK]RESSLIN
+&                  & VCRSEQ = [M:MLIK]RESSSEQ
+&                  & find(WIPTYP,2,5,7,9,13)<>0
+    Readlock [ORDB] Curr
+    If fstat = 1  : GOK = -1
+                    GLOCK ="$ORDERS"-[M:MLIK]STOFCY-[M:MLIK]RESSNUM-num$([M:MLIK]RESSLIN)-num$([M:MLIK]RESSSEQ)
+                    Break
+    Elsif fstat   : GOK = 0
+                    Call RSTA("ORDB",[M:MLIK]STOFCY-[M:MLIK]RESSNUM-num$([M:MLIK]RESSLIN)-num$([M:MLIK]RESSSEQ)) From GLOCK
+                    Break
+    Endif
+
+    Case [M:MLIK]MAJCOD
+        When "C" :         [F:ORDB]MTOQTY += [M:MLIK]LIKQTY
+        When "A" :         [F:ORDB]MTOQTY -= [M:MLIK]LIKQTY
+        When "M" :         [F:ORDB]MTOQTY  = [M:MLIK]LIKQTY
+    Endcase
+    If [F:ORDB]MTOQTY < 0 : [F:ORDB]MTOQTY = 0 : Endif
+
+    [F:ORDB]UPDDAT = date$
+    [F:ORDB]UPDUSR = GUSER
+    Rewrite [ORDB]
+    If fstat : GOK=0 : Call FSTA("ORDB") From GLOCK : Break : Endif
+    Break
+Next
+
+End
+

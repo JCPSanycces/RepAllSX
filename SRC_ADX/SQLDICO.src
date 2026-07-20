@@ -1,0 +1,499 @@
+#<AdxTL>@(#)7.0.0.0 $Revision:   1.1  $
+#
+# Comparaison entre index du dictionnaire et index réels
+# Version oracle et SQL server
+# Fait par Dom
+# (C) 2001 ADONIX
+###############################
+# VPO 29/12/05 traitement complété
+# VPO 10/01/06 séparation liste des index inexistant car table inactive
+###############################
+#
+
+Local Char PARAM(30)(1..1) , VALEUR(10)
+Call TRAITE_CHAR(VALEUR,PARAM,"","SQLDICO","",1,"XYSQLDICO") From GTRAITE
+End
+
+$ACTION
+Case ACTION
+ When "INIT" : TRA = 1 : TMP = 1
+ When "EXEC" : Call SQLDICO
+Endcase
+Return
+
+#############################################################################
+Subprog SQLDICO
+
+# Nombre maxi d'index testés (en standard, il y en a un peu moins de 1000)
+# VPO 28/12/05 passe de 1500 a 2500 (cas prodtest) #JPGA 20/05/2010 BUG-64908 : Nombre passé de 2500 à 3000
+Local Integer MAX_INDEX : MAX_INDEX=3000
+Local Integer NB_INDEX,NB_IDICO,NB_INDBASE,NB_INDBLOB,NB_IPASDIC,NB_INDINT,NB_INDACT,NB_INDPASVAL
+Local Integer NB_IDICOSPE,NB_INDSPEVAL
+
+
+# Déclaration des variables
+Local Char NOM_TABLES(20)(1..MAX_INDEX),NOM_INDEX(30)(1..MAX_INDEX),TYPE_BASE(1),CHAINE(255),NOM_BASE(30)
+Local Integer INDEX_TROUVES(1..MAX_INDEX), I_I, I_J, I_K,SI_ERREUR,L_BLOB
+############################################
+# On aura dans INDEX_TROUVES(NB_INDEX)
+# 0 : # Index "NOM_BASE" non décrits dans le dictionnaire X3
+# 1 : # Index du dictionnaire X3 OK
+# 2 : # Index non conforme à la règle de nommage ADONIX
+# 3 : # Index interne adonix
+# 4 : # Table non decrite dans dico
+############################################
+Local Char REQUETE(250)
+Local Char Z_ADXIFS(1),Z_ADXIRS(2)
+# Issue 83278 - 2012-07-03 by VPO : pb sur recherche type de base
+#Local Libelle OCT_LUS(1..30)
+Local Integer OK,NB_TMP
+
+# Recherche des index dans la base et comparaison avec le dictionnaire
+Call AVERTIR(mess(182,126,1)-nomap,OK) From GESECRAN
+If OK<>2 : End : Endif
+
+# On sauvegarde les séparateurs
+Z_ADXIFS=adxifs
+Z_ADXIRS=adxirs
+adxifs=""
+adxirs=chr$(10)
+
+# Sur quelle base tourne-t-on ? Il faut aller décortiquer un fichier fde
+# Issue 83278 - 2012-07-03 by VPO : pb sur recherche type de base
+#Openi filpath("FIL","ADOVAL","fde") Using [FDE]
+#Rdseq CHAINE Using [FDE]
+#Getseq 21,OCT_LUS Using [FDE]
+#Openi Using [FDE]
+
+# Décodage de la base (le codage a vraiment été fait pour tromper l'ennemi !!)
+# et définition de l'ordre SQL de recherche des index
+# Issue 83278 - 2012-07-03 by VPO : pb sur recherche type de base
+#Case OCT_LUS(21) When 2 : #Oracle
+#                 When 4 : #Sqlserver
+Case GTYPDBA
+    When 1 : TYPE_BASE="3"
+             NOM_BASE="Oracle    "
+             REQUETE="Select index_name, table_name from user_indexes"
+&                   +" Order By table_name "
+    When 2 : TYPE_BASE="5"
+             NOM_BASE="Sql server"
+             ##############
+             # VPO 22/03/06 BUG35442 Sql Server 2005
+             Local Char WVERSSQL
+             OK=0
+             Call VERS_SQL(WVERSSQL,OK)
+             If OK<>0 : End : Endif
+             If WVERSSQL="8"
+             REQUETE="Select i.name, o.name from sysindexes i, sysobjects o, sysusers u"
+&                   +" Where o.id=i.id and o.uid=u.uid and i.name<>o.name"
+&                   + " and i.name not like '%_ROWID' and (i.status=0 or i.status=2) and u.name='"+nomap+"'"
+&                   +" Order By o.name, i.name "
+             Else
+             REQUETE="Select i.name, o.name from sysindexes i, sysobjects o"
+&                   +" Where o.id=i.id and i.name<>o.name"
+&                   + " and i.name not like '%_ROWID' and (i.status=0 or i.status=2) and SCHEMA_NAME(o.uid)='"+nomap+"'"
+&                   +" Order By o.name, i.name "
+             Endif
+    When Default :
+             Errbox "Fonction impossible pour ce SGBD"
+             End
+Endcase
+
+# On restaure la situation
+adxifs=Z_ADXIFS
+adxirs=Z_ADXIRS
+
+# On ouvre la trace
+Call OUVRE_TRACE(mess(182,126,1)-nomap) From LECFIC
+# Recherche des index dans la base et comparaison avec le dictionnaire
+
+# Une petite sécurité au cas où...
+Raz NB_INDEX,NOM_TABLES,NOM_INDEX,INDEX_TROUVES, NB_IDICO,NB_IDICOSPE
+Raz NB_INDBASE,NB_INDBLOB,NB_IPASDIC,NB_INDINT,NB_INDACT,NB_INDPASVAL,NB_INDSPEVAL
+
+
+# Parcours de la table des index et vérification croisée d'existence
+Local File ATABLE [AT1]
+
+# On parcourt les index de la base et on range le résultat dans les variables
+For (Char A(30)(0..1)) From TYPE_BASE Sql REQUETE As [AAA_]
+  NB_INDEX+=1
+  NOM_TABLES(NB_INDEX)=A(1)
+  If ( TYPE_BASE="3" & (A(1)="SYSBLBK" | A(1)="SYSCLBK") )
+     NOM_INDEX(NB_INDEX)=A : INDEX_TROUVES(NB_INDEX)=3 : # Index interne adonix
+  Else
+      Read [AT1]CODFIC=A(1)
+      If fstat>1
+         NOM_INDEX(NB_INDEX)=A : INDEX_TROUVES(NB_INDEX)=4 : # Table non decrite dans dico
+      Else
+          I_I=instr(1,toupper(A),toupper(A(1))+"_")
+          If I_I=0
+             NOM_INDEX(NB_INDEX)=A : INDEX_TROUVES(NB_INDEX)=2 : # Index non conforme à la règle de nommage ADONIX
+          Else
+             NOM_INDEX(NB_INDEX)=right$(toupper(A),len(A(1))+2)
+          Endif
+      Endif
+  Endif
+Next
+
+###########################################################
+# Vérification existence des index du dico X3
+###########################################################
+# Parcours de la table des index et vérification croisée d'existence
+Local File ATABIND [ATI], ATABLE [ATB], ACTIV [ACV], ATABZON [ATZ], ATYPE [ATY]
+
+# Est-on dans le superviseur ? Si non, on ne doit pas voir les tables de type Systeme X3
+If filinfo(filpath("FIL","ADOSSIER","fde",0),0)<0
+  Link [ATI] With [ATB]CODFIC=[ATI]CODFIC As [ATD] Where [ATB]TYPFIC<>3 Order By Key CODIND
+Else
+  Link [ATI] With [ATB]CODFIC=[ATI]CODFIC As [ATD] Order By Key CODIND
+Endif
+
+
+Raz SI_ERREUR : # Vaudra 1 si une erreur a déjà été rencontrée
+
+For [ATD]
+  NB_IDICO+=1
+  I_K=0
+  I_J=find([ATI]CODFIC,NOM_TABLES(1..NB_INDEX))
+  If I_J
+     For I_I=I_J To NB_INDEX
+        If [ATI]CODFIC<>NOM_TABLES(I_I) : Break : Endif
+        If [ATI]CODIND=NOM_INDEX(I_I) : I_K=I_I : Break : Endif
+     Next I_I
+  Endif
+# Index non trouvé ? Vérifier d'abord si la table n'est pas protégée par un code activité non actif...
+  If I_K=0
+     If [ATB]CODACT<>""
+        Read [ACV]CODACT=[ATB]CODACT
+        If [ACV]FLACT=1 : NB_INDACT+=1 : Goto NO_ERROR : Endif
+     Endif
+     If [ATI]CODACT<>""
+        Read [ACV]CODACT=[ATI]CODACT
+        If [ACV]FLACT=1 : NB_INDACT+=1 : Goto NO_ERROR : Endif
+     Endif
+     If filinfo(filpath("FIL",[F:ATI]CODFIC,"fde",0),0)>0
+         If SI_ERREUR=0
+            # Liste des index du dictionnaire X3 non existants sous
+            Call ECR_TRACE(mess(183,126,1)-NOM_BASE,0) From GESECRAN
+            Call ECR_TRACE(string$(80,"*"),0) From GESECRAN
+            # Table          Index           Description détaillée de l'index
+            Call ECR_TRACE_F(mess(56,123,1),mess(10,176,1),mess(184,126,1),"","",12,12,12,0,0,0) From GESECRAN
+            Call ECR_TRACE(string$(80,"-"),0) From GESECRAN
+         Endif
+         SI_ERREUR=1
+         Call ECR_TRACE_F([ATI]CODFIC,[ATI]CODIND,[ATI]DESCRIPT,"","",12,12,76,0,0,0) From GESECRAN
+         NB_IPASDIC+=1
+     Endif
+  Else
+     #cet index est OK (sauf si Index non conforme)
+     INDEX_TROUVES(I_K)=max(INDEX_TROUVES(I_K),1) : # S'il valait 2, on garde cette valeur
+  Endif
+
+$NO_ERROR
+
+Next
+If SI_ERREUR
+    Call ECR_TRACE(string$(80,"-")+"\",0) From GESECRAN
+Endif
+
+
+###########################################################
+# Vérification des index inexistants du dico X3 car table inactives
+###########################################################
+
+Raz SI_ERREUR : # Vaudra 1 si une erreur a déjà été rencontrée
+
+For [ATD]
+  I_K=0
+  I_J=find([ATI]CODFIC,NOM_TABLES(1..NB_INDEX))
+  If I_J
+     For I_I=I_J To NB_INDEX
+        If [ATI]CODFIC<>NOM_TABLES(I_I) : Break : Endif
+        If [ATI]CODIND=NOM_INDEX(I_I) : I_K=I_I : Break : Endif
+     Next I_I
+  Endif
+# Index non trouvé ? Vérifier d'abord si la table n'est pas protégée par un code activité non actif...
+  If I_K=0
+     If [ATB]CODACT<>""
+        Read [ACV]CODACT=[ATB]CODACT
+        If [ACV]FLACT=1 : Goto NO_ERR_INACTIF : Endif
+     Endif
+     If [ATI]CODACT<>""
+        Read [ACV]CODACT=[ATI]CODACT
+        If [ACV]FLACT=1 : Goto NO_ERR_INACTIF : Endif
+     Endif
+     If filinfo(filpath("FIL",[F:ATI]CODFIC,"fde",0),0)<0
+         NB_INDPASVAL+=1
+         If SI_ERREUR=0
+            # Liste des index inexistants car tables inactives
+            Call ECR_TRACE(mess(228,126,1),0) From GESECRAN
+            Call ECR_TRACE(string$(80,"*"),0) From GESECRAN
+            # Table          Index           Description détaillée de l'index
+            Call ECR_TRACE_F(mess(56,123,1),mess(10,176,1),mess(184,126,1),"","",12,12,12,0,0,0) From GESECRAN
+            Call ECR_TRACE(string$(80,"-"),0) From GESECRAN
+         Endif
+         SI_ERREUR=1
+         Call ECR_TRACE_F([ATI]CODFIC,[ATI]CODIND,[ATI]DESCRIPT,"","",12,12,76,0,0,0) From GESECRAN
+     Endif
+  Endif
+
+$NO_ERR_INACTIF
+
+Next
+If SI_ERREUR
+    Call ECR_TRACE(string$(80,"-")+"\",0) From GESECRAN
+Endif
+
+
+###########
+# Parcours de la table des index d'optimisation et vérification croisée d'existence
+Local File AINDEX [ANX], ATABLE [AT2]
+
+# Est-on dans le superviseur ? Si non, on ne doit pas voir les tables de type Systeme X3
+If filinfo(filpath("FIL","ADOSSIER","fde",0),0)<0
+  Link [ANX] With [ATB]CODFIC=[ANX]TABLE As [ANX2] Where [ATB]TYPFIC<>3 Order By Key ANX2
+Else
+  Link [ANX] With [ATB]CODFIC=[ANX]TABLE As [ANX2] Order By Key ANX2
+Endif
+
+
+Raz SI_ERREUR : # Vaudra 1 si une erreur a déjà été rencontrée
+
+For [ANX2]
+  NB_IDICOSPE+=1
+  I_K=0
+  I_J=find([ANX]TABLE,NOM_TABLES(1..NB_INDEX))
+  If I_J
+     For I_I=I_J To NB_INDEX
+        If [ANX]TABLE<>NOM_TABLES(I_I) : Break : Endif
+        If [ANX]CODIND=NOM_INDEX(I_I) : I_K=I_I : Break : Endif
+     Next I_I
+  Endif
+# Index non trouvé ? Vérifier d'abord si la table n'est pas protégée par un code activité non actif...
+  If I_K=0
+     If [ATB]CODACT<>""
+        Read [ACV]CODACT=[ATB]CODACT
+        If [ACV]FLACT=1 : NB_INDACT+=1 : Goto NO_ERROR_SPE : Endif
+     Endif
+     If filinfo(filpath("FIL",[F:ANX]TABLE,"fde",0),0)>0 & [ANX]FLACT=2
+         If SI_ERREUR=0
+            # Liste des index du dictionnaire X3 non existants sous
+            Call ECR_TRACE(mess(183,126,1)-NOM_BASE,0) From GESECRAN
+            Call ECR_TRACE(string$(80,"*"),0) From GESECRAN
+            # Table          Index           Description détaillée de l'index
+            Call ECR_TRACE_F(mess(56,123,1),mess(10,176,1),mess(184,126,1),"","",12,12,12,0,0,0) From GESECRAN
+            Call ECR_TRACE(string$(80,"-"),0) From GESECRAN
+         Endif
+         SI_ERREUR=1
+         Call ECR_TRACE_F([ANX]TABLE,[ANX]CODIND,[ANX]DESCRIPT,"","",12,12,76,0,0,0) From GESECRAN
+         NB_IPASDIC+=1
+     Endif
+  Else
+     #cet index est OK (sauf si Index non conforme)
+     INDEX_TROUVES(I_K)=max(INDEX_TROUVES(I_K),1) : # S'il valait 2, on garde cette valeur
+  Endif
+
+$NO_ERROR_SPE
+
+Next
+If SI_ERREUR
+    Call ECR_TRACE(string$(80,"-")+"\",0) From GESECRAN
+Endif
+
+###
+###########################################################
+# Vérification des index d'optimisation inexistants du dico X3 car inactifs ou table inactives
+Raz SI_ERREUR : # Vaudra 1 si une erreur a déjà été rencontrée
+
+For [ANX2]
+  I_K=0
+  I_J=find([ANX]TABLE,NOM_TABLES(1..NB_INDEX))
+  If I_J
+     For I_I=I_J To NB_INDEX
+        If [ANX]TABLE<>NOM_TABLES(I_I) : Break : Endif
+        If [ANX]CODIND=NOM_INDEX(I_I) : I_K=I_I : Break : Endif
+     Next I_I
+  Endif
+# Index non trouvé ? Vérifier d'abord si la table n'est pas protégée par un code activité non actif...
+  If I_K=0
+     If [ATB]CODACT<>""
+        Read [ACV]CODACT=[ATB]CODACT
+        If [ACV]FLACT=1 : Goto NO_ERR_SPEINACTIF: Endif
+     Endif
+     If filinfo(filpath("FIL",[F:ANX]TABLE,"fde",0),0)<0 | [ANX]FLACT<>2
+         NB_INDSPEVAL+=1
+         If SI_ERREUR=0
+            # Liste des index inexistants car tables inactives
+            Call ECR_TRACE(mess(245,126,1),0) From GESECRAN
+            Call ECR_TRACE(string$(80,"*"),0) From GESECRAN
+            # Table          Index           Description détaillée de l'index
+            Call ECR_TRACE_F(mess(56,123,1),mess(10,176,1),mess(184,126,1),"","",12,12,12,0,0,0) From GESECRAN
+            Call ECR_TRACE(string$(80,"-"),0) From GESECRAN
+         Endif
+         SI_ERREUR=1
+         Call ECR_TRACE_F([ANX]TABLE,[ANX]CODIND,[ANX]DESCRIPT,"","",12,12,76,0,0,0) From GESECRAN
+     Endif
+  Endif
+
+$NO_ERR_SPEINACTIF
+
+Next
+If SI_ERREUR
+    Call ECR_TRACE(string$(80,"-")+"\",0) From GESECRAN
+Endif
+
+###########################################################
+# Vérification des index internes
+###########################################################
+Raz SI_ERREUR : # Vaudra 1 si une erreur a déjà été rencontrée
+
+For I_I=1 To NB_INDEX
+  If INDEX_TROUVES(I_I)=3
+     If SI_ERREUR=0
+        # Liste des index internes adonix sous
+        Call ECR_TRACE(mess(221,126,1)-NOM_BASE,0) From GESECRAN
+        Call ECR_TRACE(string$(80,"*"),0) From GESECRAN
+        # Table "NOM_BASE"          Index
+        Call ECR_TRACE_F(mess(56,123,1)-NOM_BASE,mess(10,176,1),"","","",25,25,0,0,0,0) From GESECRAN
+        Call ECR_TRACE(string$(80,"-"),0) From GESECRAN
+     Endif
+     SI_ERREUR=1
+     Call ECR_TRACE_F(NOM_TABLES(I_I),NOM_INDEX(I_I),"","","",25,75,0,0,0,0) From GESECRAN
+     NB_INDINT+=1
+   Endif
+Next I_I
+If SI_ERREUR
+    Call ECR_TRACE(string$(80,"-")+"\",0) From GESECRAN
+Endif
+
+###########################################################
+# Vérification qu'aucun index de la base n'a été oublié
+###########################################################
+Raz SI_ERREUR : # Vaudra 1 si une erreur a déjà été rencontrée
+
+For I_I=1 To NB_INDEX
+  If INDEX_TROUVES(I_I)=0 |  INDEX_TROUVES(I_I)=4
+&    | (INDEX_TROUVES(I_I)=2
+&    & ((TYPE_BASE="3" & left$(NOM_INDEX(I_I),6)<>"SYS_IL")|(TYPE_BASE="5" & NOM_INDEX(I_I)<>"t"+NOM_TABLES(I_I))))
+     If SI_ERREUR=0
+        # Index "NOM_BASE" non décrits dans le dictionnaire X3
+        Call ECR_TRACE(mess(10,176,1)-NOM_BASE-mess(185,126,1),0) From GESECRAN
+        Call ECR_TRACE(string$(80,"*"),0) From GESECRAN
+        # Table "NOM_BASE"          Index
+        Call ECR_TRACE_F(mess(56,123,1)-NOM_BASE,mess(10,176,1),"","","",25,25,0,0,0,0) From GESECRAN
+        Call ECR_TRACE(string$(80,"-"),0) From GESECRAN
+     Endif
+     SI_ERREUR=1
+     Call ECR_TRACE_F(NOM_TABLES(I_I),NOM_INDEX(I_I),"","","",25,75,0,0,0,0) From GESECRAN
+     NB_INDBASE+=1
+   Endif
+Next I_I
+If SI_ERREUR
+    Call ECR_TRACE(string$(80,"-")+"\",0) From GESECRAN
+Endif
+
+###########################################################
+# Liste des index non conformes
+###########################################################
+Link [ATZ] With [ATY]CODTYP=[ATZ]CODTYP As [ATT] Order By CODZONE
+
+SI_ERREUR=0 : # Vaudra 1 si une erreur a déjà été rencontrée
+For I_I=1 To NB_INDEX
+  L_BLOB=0
+  If INDEX_TROUVES(I_I)=2
+    # On vérifie s'il s'agit d'un Blob. Sous Oracle SYS_ILxxxx. Sous Sql Server tNOM_TABLE
+    # On vérifie qu'au moins un Blob ou un Clob est aassocié à cette table
+   Read [ATB]CODFIC=NOM_TABLES(I_I)
+   If fstat<2
+     For [ATT] Where ([ATY]TYPTYP=9 | [ATY]TYPTYP=10) & [ATZ]CODFIC=NOM_TABLES(I_I)
+      L_BLOB=1 : Break
+    Next
+   Endif
+   If (left$(NOM_INDEX(I_I),6)<>"SYS_IL" | TYPE_BASE<>"3" | L_BLOB=0)
+&   & (NOM_INDEX(I_I)<>"t"+NOM_TABLES(I_I) | TYPE_BASE<>"5" | L_BLOB=0)
+     If SI_ERREUR=0
+        # Index "NOM_BASE" non conformes aux normes adonix X3
+        Call ECR_TRACE(mess(10,176,1)-NOM_BASE-mess(186,126,1),0) From GESECRAN
+        Call ECR_TRACE(string$(80,"*"),0) From GESECRAN
+        # Table "NOM_BASE"          Index
+        Call ECR_TRACE_F(mess(56,123,1)-NOM_BASE,mess(10,176,1),"","","",25,25,0,0,0,0) From GESECRAN
+        Call ECR_TRACE(string$(80,"-"),0) From GESECRAN
+     Endif
+     SI_ERREUR=1
+     Call ECR_TRACE_F(NOM_TABLES(I_I),NOM_INDEX(I_I),"","","",25,75,0,0,0,0) From GESECRAN
+     Endif
+   Endif
+   If (TYPE_BASE="3" & left$(NOM_INDEX(I_I),6)="SYS_IL" & L_BLOB=1)
+     NB_INDBLOB+=1
+   Endif
+   If (TYPE_BASE="5" & NOM_INDEX(I_I)="t"+NOM_TABLES(I_I) & L_BLOB=1)
+    NB_INDBLOB+=1
+   Endif
+Next I_I
+If SI_ERREUR
+    Call ECR_TRACE(string$(80,"-")+"\",0) From GESECRAN
+Endif
+
+NB_TMP=NB_IDICO
+Call ECR_TRACE_F(mess(188,126,1),"",format$("N:4",NB_IDICO),"","",60,2,5,0,0,0) From GESECRAN
+# Nombre d'index décrits dans le dictionnaire X3
+
+NB_TMP+=NB_IDICOSPE
+Call ECR_TRACE_F(mess(247,126,1),"+",format$("N:4",NB_IDICOSPE),"->",format$("N:4",NB_TMP),60,2,10,3,5,0) From GESECRAN
+# Nombre d'index d'optimisation décrits dans le dictionnaire X3
+
+NB_TMP-=NB_INDACT
+Call ECR_TRACE_F(mess(224,126,1)-mess(226,126,1),"-",format$("N:4",NB_INDACT),"->",format$("N:4",NB_TMP),60,2,10,3,5,0) From GESECRAN
+# Nombre d'index inexistants car code activité non actif
+
+NB_TMP-=NB_INDPASVAL
+Call ECR_TRACE_F(mess(229,126,1),"-",format$("N:4",NB_INDPASVAL),"->",format$("N:4",NB_TMP),60,2,10,3,5,0) From GESECRAN
+# Nombre d'index inexistants car tables inactives
+
+NB_TMP-=NB_INDSPEVAL
+Call ECR_TRACE_F(mess(246,126,1),"-",format$("N:4",NB_INDSPEVAL),"->",format$("N:4",NB_TMP),60,2,10,3,5,0) From GESECRAN
+# Nombre d'index d'optimisation inexistants car inactifs ou tables inactives
+
+NB_TMP-=NB_IPASDIC
+Call ECR_TRACE_F(mess(223,126,1),"-",format$("N:4",NB_IPASDIC),"->",format$("N:4",NB_TMP),60,2,10,3,5,0) From GESECRAN
+# Nombre d'index du dictionnaire non existants
+
+NB_TMP+=NB_INDINT
+Call ECR_TRACE_F(mess(222,126,1),"+",format$("N:4",NB_INDINT),"->",format$("N:4",NB_TMP),60,2,10,3,5,0) From GESECRAN
+# Nombre d'index internes adonix
+
+NB_TMP+=NB_INDBASE
+Call ECR_TRACE_F(mess(224,126,1)-NOM_BASE-mess(185,126,1),"+",format$("N:4",NB_INDBASE),"->",format$("N:4",NB_TMP),60,2,10,3,5,0) From GESECRAN
+# Nombre d'index trouvés dans la base et pas dans dico
+
+NB_TMP+=NB_INDBLOB
+Call ECR_TRACE_F(mess(224,126,1)-mess(225,126,1),"+",format$("N:4",NB_INDBLOB),"->",format$("N:4",NB_TMP),60,2,10,3,5,0) From GESECRAN
+# Nombre d'index INDBLOB
+
+Call ECR_TRACE_F("","","------","","",60,2,5,0,0,0) From GESECRAN
+Call ECR_TRACE_F(mess(187,126,1)-NOM_BASE,"=",format$("N:4",NB_INDEX),"","",60,2,5,0,0,0) From GESECRAN
+# Nombre d'index trouvés dans la base
+
+Call FERME_TRACE From LECFIC
+End
+
+
+
+###################################################################################################
+# VPO 22/03/06 BUG35442 Sql Server 2005
+###################################################################################################
+Subprog VERS_SQL(VERSION_SQL,ERR)
+Variable Char VERSION_SQL
+Variable Integer ERR
+
+Call NOVERS_SQL(VERSION_SQL,ERR) From SQLPROP
+End
+
+###################################################################################################
+###################################################################################################
+$ERR_SQL_VERS
+GMESSAGE = errp-"("+num$(errl)+")"+"\"+mess(6,123,1)-num$(errn)-":"-errmes$(errn)+"\"+errm
+Call ERREUR(GMESSAGE) From GESECRAN
+ERR=1
+End

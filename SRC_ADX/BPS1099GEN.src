@@ -1,0 +1,452 @@
+#<AdxTL>@(#)5.0.0.0 $Revision$
+######################################################################################
+#    Process :    BPS1099GEN - 1099 Forms's screen B9G 1099 Forms
+#    RSchmid  12/20/2010
+#    Description : Generates the 1099 history records for a yr/company from
+#                 the 1099 Payment and Beg Balance records, launches Print and Inquiry
+#                 based on the created BPS1099GEN data.
+#
+#    Note : the tracing option was hidden per PBA request, but the code is available
+#           if for debugging we turn it on.
+######################################################################################
+
+$ACTION
+
+#others avant_ouvre ; OUVRE ;titre;debut; avant_choix
+
+Case ACTION
+    When "INIT"         : Gosub INIT
+    When "DEBUT"        : Gosub DEBUT
+    When "EXEC"         : Gosub EXEC
+    When "BOUTON"       : Gosub BOUTON
+    When "SETBOUT"      : Gosub SETBOUT
+    When "OK"           : GOK=1
+    When "END"          : GOK=0 : FIN=1
+    When "CONTROLE"     : Gosub CONTROLE
+    When "TERMINE"      : Gosub TERMINE
+Endcase
+
+Return
+
+######################################################################################
+$INIT
+## Source Records
+If clalev([F:B9P]) = 0 : Local File BPS1099PAY    [B9P] : Endif # Supplier 1099 Payments
+If clalev([F:BBB]) = 0 : Local File BP1099BEGBAL  [BBB] : Endif # Supplier 1099 Beginning Balance (BBB to distinguish better between B9P and B9B)
+If clalev([F:BX9]) = 0 : Local File BOX1099       [BX9] : Endif # 1099 Box definition text/ lower limit
+If clalev([F:B9M]) = 0 : Local File BPS1099MNT    [B9M] : Endif # Supplier 1099 Box text
+
+## Target Create new records in B9G
+If clalev([F:B9G]) = 0 : Local File BPS1099GEN    [B9G] : Endif # Supplier 1099 Generation
+
+#Support Tables
+If clalev([F:BPS]) = 0 : Local File BPSUPPLIER    [BPS] : Endif # Supplier
+If clalev([F:CPY]) = 0 : Local File COMPANY       [CPY] : Endif # Company
+If clalev([F:BPA]) = 0 : Local File BPADDRESS     [BPA] : Endif # BpAddress
+If clalev([F:TCY]) = 0 : Local File TABCOUNTRY    [TCY] : Endif # Country
+
+Local Mask BPS1099GEN [B9G]
+Local Integer OK, STAT
+Local Char    TIT(50)
+
+#Trace title - mess: "1099 forms"
+TIT = mess(80,122,1)
+
+#Clean form
+Raz [M]
+Return
+
+######################################################################################
+$DEBUT
+# Set UI DEFAULTS
+
+#Year - Match other 1099 code default
+[M:B9G]THEYEAR = year(date$)
+If month(date$) < 6
+    [M:B9G]THEYEAR -= 1
+Endif
+
+# UI DEFAULT that wont display if in INIT, OUVRE or TITRE
+[M:B9G]THECPY = GDEFSOC  #Let AM_THECPY display settings
+# For address values and captions
+Call LECTURE("CPY",GDEFSOC,"") From CONTOBJ #Set Country
+Call AM_THECPY(GDEFSOC)
+
+Return
+
+######################################################################################
+$CONTROLE
+ If GOK < 1  FIN=1 Endif
+Return
+
+######################################################################################
+$BOUTON
+# Only code for 1- Generate, other buttons are screen/action driven
+Case BOUT
+   When "1"  :   Gosub EXEC                                                         # Generate
+Endcase
+
+Return
+
+
+$SETBOUT
+######################################################################################
+# Based on user selected Company and Year disable PRINT/VIEW ("234") buttons
+#  no records exist to report on.
+#
+# Avail Buttons:  1) Generate, 2) Print 1099,  3) Print 1096,  4) View
+#######################################################
+
+Filter [F:B9G] Where YR1099 = [M:B9G]THEYEAR and CPY = [M:B9G]THECPY
+Look [F:B9G]B9G0 First
+If fstat
+  #No Records for this year
+  Call VIREBOUT(CHMEN,"234") From GOBJET
+Endif
+
+
+Filter [F:B9G]
+
+Return
+
+
+$EXEC
+######################################################################################
+# Handle the Trace file.
+# Call create record function
+# Display messge on records created
+#######################################################
+If !GSERVEUR and [M:B9G]TRACE = 2
+    Call OUVRE_TRACE(TIT) From LECFIC
+Endif
+
+Gosub CREATE_RECORDS
+
+# Display what is in the table
+If [M:B9G]TRACE = 2
+    Filter [F:B9G] Where YR1099 = [M:B9G]THEYEAR and CPY = [M:B9G]THECPY
+    For [F:B9G]
+        Call ECR_TRACE("Supplier:"-[F:B9G]BPSNUM-"   Form:"-num$([F:B9G]FRM1099)-"   Box:"-[F:B9G]BOX1099,0) From GESECRAN
+    Next
+    Filter [F:B9G]
+Endif
+
+#Finished, now alert user to records created
+ If !GSERVEUR and [M:B9G]TRACE = 2
+
+     Call ECR_TRACE(" ",0) From GESECRAN
+
+     Call ECR_TRACE(num$(TRACECOUNT ) - mess(103,141,1),0) From GESECRAN # "records created"
+
+     Call FERME_TRACE From LECFIC
+
+     Call LEC_TRACE   From LECFIC
+ Endif
+
+ If !GSERVEUR and [M:B9G]TRACE = 1
+     Call ECR_TRACE(num$(TRACECOUNT ) - mess(103,141,1),0) From GESECRAN  # "records created"
+ Endif
+
+Return
+
+
+$CREATE_RECORDS
+#######################################################################################
+# In a transaction:
+# Group the 1099Payment[B9P] records for a total yearly payment and then add the beg balance [BBB]
+# Save this information as historical in a 1099Generation [B9G] file
+# Dont check for Active(Enabled) since CALC should have.
+# Includes 4 sections:
+## Section 1 - Create years Summary supplier records from 1099 payment records
+## Section 2 -  Add BegBal to generated [B9G] supplier summary records [ by insert or update].
+## Section 3 - Delete Amounts less then lower limit (except LOWLIM = 0)
+## Section 4 - Add Text type boxes
+#######################################################
+Local Decimal  SUMAMT1099, VARBEGBAL
+Local Integer VARFRM
+Local Char VARBPS, VARBOX , VARPAYNUM
+
+TRACECOUNT = 0
+GOK = 1
+Raz VARFRM, VARBPS, VARBOX , VARPAYNUM #rs- do we need this?
+
+# Clear out this year/company data on Generate table, then re-create
+Trbegin [F:B9G]
+Delete [F:B9G] Where YR1099 = [M:B9G]THEYEAR and CPY = [M:B9G]THECPY
+If fstat = 1
+    #locking problem; should never happen so no msg, user can re-try.
+    Rollback
+    Return
+Endif
+Commit
+
+#Display default "Processing...." progress dialog message while calculating
+Call TEMPON ("O") From GESECRAN
+
+Trbegin [F:B9G]
+
+#Set same filter for source tables
+# [F:B9P] Dont collect 0 lines or "None" lines allowable in B9P but not for reported.
+Filter [F:B9P] Where YR1099 = [M:B9G]THEYEAR and CPY = [M:B9G]THECPY and  FRM1099 > 1 and AMT1099 <> 0 Order By Key B9P1
+Filter [F:BBB] Where YR1099 = [M:B9G]THEYEAR and CPY = [M:B9G]THECPY and  FRM1099 > 1 and BEGBAL  <> 0 Order By Key B9B1
+Filter [F:BX9] Where YR1099 = [M:B9G]THEYEAR and CPY = [M:B9G]THECPY #delete performance
+Filter [F:B9M] Where YR1099 = [M:B9G]THEYEAR and CPY = [M:B9G]THECPY #append performance
+
+##
+## Section 1 - Create years Summary supplier records from 1099 payment records
+##
+For [F:B9P]B9P1
+    #if new record - write the old one out
+    If  VARBPS <> '' and ( VARBPS <>  [F:B9P]BPSNUM or VARFRM <> [F:B9P]FRM1099 or VARBOX <>  [F:B9P]BOX1099)
+        Gosub WRITE_BPG
+             If GOK=0 : Break :Endif
+        #Clear accumulation
+        SUMAMT1099 = 0
+    Endif
+
+    # Collect new record information
+    VARBPS =  [F:B9P]BPSNUM
+    VARFRM =  [F:B9P]FRM1099
+    VARBOX =  [F:B9P]BOX1099
+
+    #Accumulation
+    SUMAMT1099 += [F:B9P]AMT1099
+Next
+If  GOK and (VARBPS <> ''): Gosub WRITE_BPG : Endif   # Write out last record left from loop if not blank
+
+Filter [F:B9P]     # Clear
+If  GOK=0 Goto  CREATE_RECORDS_END :Endif
+
+##
+## Section 2 -  Add BegBal to generated [B9G] supplier summary records [ by insert or update].
+##
+For [F:BBB]B9B1
+    Readlock [F:B9G]B9G0 = [M:B9G]THEYEAR;[M:B9G]THECPY;[F:BBB]BPSNUM;[F:BBB]FRM1099;[F:BBB]BOX1099
+    If !fstat
+        #Generation record exists; add beginning balance to existing amount and update.
+        [F:B9G]AMT1099 += [F:BBB]BEGBAL
+        Rewrite [F:B9G]
+        If fstat
+              GOK=0 : Call FSTA("B9G") From GLOCK : Break
+        Endif #fstat
+    Else
+        # Record not there so insert a generate BegBal record
+        Raz [F:B9G]
+        [F:B9G]YR1099  = [M:B9G]THEYEAR
+        [F:B9G]BPSNUM  = [F:BBB]BPSNUM
+        [F:B9G]CPY     = [M:B9G]THECPY
+        [F:B9G]FRM1099 = [F:BBB]FRM1099
+        [F:B9G]BOX1099 = [F:BBB]BOX1099
+        [F:B9G]AMT1099 = [F:BBB]BEGBAL
+
+        Write [F:B9G]
+        If fstat
+           GOK=0 : Call FSTA("B9G") From GLOCK : Break
+        Else
+           TRACECOUNT += 1
+        Endif
+    Endif
+Next
+
+Filter [F:BBB]    # Clear
+If  GOK=0 Goto  CREATE_RECORDS_END :Endif
+
+##
+## Section 3 - Delete Amounts less then lower limit (except LOWLIM = 0)
+##
+#The two loops above separately calculate the final 1099amt
+# the BB could add or append, but only for its BBB rows.
+# So here loop again to remove records that dont meet the minimum limit for the Box.
+# Delete from [B9G], since we cant delete from Link itself.
+Link [B9G] With [F:BX9]BX90 = [F:B9G]FRM1099;[F:B9G]BOX1099
+& As [LB9G]
+& Where ([B9G]AMT1099 < [F:BX9]LOWLIM or [F:BX9]LOWLIM =0) and
+&    ([B9G]YR1099 = [M:B9G]THEYEAR and [B9G]CPY =[M:B9G]THECPY) # Performance
+
+For [F:LB9G]
+    Delete [B9G] Where BPSNUM = [F:LB9G]BPSNUM and FRM1099=[F:LB9G]FRM1099 and BOX1099=[F:LB9G]BOX1099
+    If fstat
+      GOK=0 : Call FSTA("B9G") From GLOCK : Break
+    Else
+      TRACECOUNT -= 1
+    Endif
+Next
+
+Filter [F:B9G]    # Clear
+If  GOK=0 Goto  CREATE_RECORDS_END :Endif
+
+
+##
+## Section 4 - Add Text type box definitions (existing in B9M) to generated [B9G] supplier summary records [Insert only]
+##           - Insert text only for a form if the supplier has summary records that passed the lower limit purge above.
+##           - Dont want text records for Suppliers without an Amount for that Form (use index B9G2 - has no BOX1099)
+
+#Link [F:B9M] - need BOX1099.BOXTYP to determine if a B9M record is a checkbox type, if it has a "No" [TXTFLD value, so we don't include it.
+#             treat it like a blank.
+Link [F:B9M] With [F:BX9]BX90 = [F:B9M]FRM1099;[F:B9M]BOX1099
+& As [LB9M]
+& Where [B9M]YR1099 = [M:B9G]THEYEAR and [B9M]CPY =[M:B9G]THECPY # Performance
+
+For [F:LB9M]
+    If !([F:BX9]BOXTYP = 3 and [F:B9M]TXTFLD = "1") #Skip Type (3)Checkbox with a ("1")No value, since they are like a blank.
+      Read [F:B9G]B9G2 = [M:B9G]THEYEAR;[M:B9G]THECPY;[F:B9M]BPSNUM;[F:B9M]FRM1099
+      If !fstat
+        #A Generation record exists for Supplier's Form ; so INSERT a TXTFLD record to generation file.
+        Raz [F:B9G]
+        [F:B9G]YR1099  = [M:B9G]THEYEAR
+        [F:B9G]BPSNUM  = [F:B9M]BPSNUM
+        [F:B9G]CPY     = [M:B9G]THECPY
+        [F:B9G]FRM1099 = [F:B9M]FRM1099
+        [F:B9G]BOX1099 = [F:B9M]BOX1099
+        [F:B9G]TXTFLD  = [F:B9M]TXTFLD
+
+        Write [F:B9G]
+        If fstat
+           GOK=0 : Call FSTA("B9G") From GLOCK : Break
+        Else
+           TRACECOUNT += 1
+        Endif
+      Endif
+    Endif
+Next
+
+Filter [F:B9M]   # Clear
+Filter [F:BX9]
+If  GOK=0 Goto  CREATE_RECORDS_END :Endif
+
+#done
+
+$CREATE_RECORDS_END
+# Finish off transaction at end
+If GOK
+    Commit
+    GOK = 1
+Else
+    Rollback
+Endif
+
+Call TEMPOFF From GESECRAN
+
+Return
+
+$WRITE_BPG
+######################################################################################
+# Create [B9G] Genaration record from Pmt record
+# Called from loop and end of loop to get last record
+#######################################################
+Raz [F:B9G]
+[F:B9G]YR1099 =  [M:B9G]THEYEAR
+[F:B9G]BPSNUM =  VARBPS
+[F:B9G]CPY =     [M:B9G]THECPY
+[F:B9G]FRM1099 = VARFRM
+[F:B9G]BOX1099 = VARBOX
+[F:B9G]AMT1099 = SUMAMT1099
+
+Write [F:B9G]
+If fstat
+    GOK=0 : Call FSTA("B9G") From GLOCK
+Else
+    TRACECOUNT += 1
+Endif
+
+Return
+
+
+$TERMINE
+######################################################################################
+# Close out trace and inform user of records created
+#######################################################
+# ?? same thing in EXEC and TERMINE
+ If !GSERVEUR and [M:B9G]TRACE = 2
+
+     Call ECR_TRACE(" ",0) From GESECRAN
+     # records created
+     Call ECR_TRACE(num$(TRACECOUNT ) - mess(103,141,1),0) From GESECRAN # "records created"
+
+     Call FERME_TRACE From LECFIC
+     TRA=1
+ Endif
+
+ If !GSERVEUR and [M:B9G]TRACE = 1
+     Call MESSAGE(num$(TRACECOUNT ) - mess(103,141,1)) From GESECRAN  # "records created"
+ Endif
+Return
+
+
+Subprog AM_THECPY(VALEUR)
+######################################################################################
+# Default the company and address fields for the primary address.
+# and set captions of controls with evaluated titles
+################################################
+Variable Char VALEUR()
+
+
+# [F:CPY] should be read already by Action on THECPY
+Read [BPA]BPA0=2;[F:CPY]CPY;[F:CPY]BPAADD
+If fstat = 0
+    [M:B9G] = [F:CPY] #Default COMPANY fields that match the screen (Name FedID)
+    [M:B9G]= [F:BPA]  #Default company's default ADDRESS fields that match the screen.
+
+    #103113.sn
+    #Both tables have a field named CRN ([F:CPY]CRN & [F:BPA]CRN). But [F:CPY]CRN must take precedence.
+    [M:B9G]CRN = [F:CPY]CRN
+    #103113.en
+
+    #Separate captions like Company Address screen
+    [M:B9G]BPAADDLIG1= [F:BPA]BPAADDLIG(0)
+    [M:B9G]BPAADDLIG2= [F:BPA]BPAADDLIG(1)
+    [M:B9G]BPAADDLIG3= [F:BPA]BPAADDLIG(2)
+    #Explicit since unfortunately Array data are not always mapping first to non-array control
+    [M:B9G]TEL = [F:BPA]TEL(0)     #First one is phone
+    [M:B9G]WEB = [F:BPA]WEB(0)     #First one is e-mail
+Endif
+
+#Need this for Evaluated Titles of Address fields depending on [F:TCY]Addrnam(x)
+Call LECTURE("TCY", [F:CPY]CRY,"") From CONTOBJ #Set Country of the Company
+Affzo [M:B9G]
+
+End
+
+
+Subprog C_THECPY(VALEUR)
+######################################################################################
+# Verify Company selected has 1099 enabled.
+# Set Buttons depending on existing records in SETBOUT
+################################################
+Variable Char    VALEUR()
+
+If VALEUR <> "" and func AFNC.PARAM("DCLFEES",VALEUR) <> "3"
+    GMESSAGE = mess(77,122,1)  #"Company not defined to process 1099s"
+    mkstat = 2
+    End
+Endif
+
+End
+
+Subprog C_CRN(VALEUR)
+######################################################################################
+# If company requires CRN then display error to user if  empty value
+################################################
+Variable Char    VALEUR()
+
+If vireblc(VALEUR,2)=""
+ Call LECTURE("TCY",[M]CRY,"") From CONTOBJ
+ If !fstat & dim([F:TCY]CRNOBL)>0 & [F:TCY]CRNOBL=2
+  GMESSAGE = mess(10,123,1) : # Zone obligatoire
+  mkstat = 2 : End
+ Endif
+Endif
+End
+
+Subprog AM_THEYEAR(VALEUR)
+######################################################################################
+# Unusual but necessary to set the field to itself
+# if we dont do this then $SETBOUT will have the previous
+# not the current value entered for the year and the buttons
+# will incorrectly be enabled/disabled
+################################################
+Variable Decimal VALEUR
+
+[M:B9G]THEYEAR = VALEUR
+End
+

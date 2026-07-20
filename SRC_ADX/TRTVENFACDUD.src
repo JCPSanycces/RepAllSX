@@ -1,0 +1,238 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+#########################################################################
+# TRTVENFACC : Calcul de la facture - Sous-pro relatifs aux échéances
+#------------------------------------------------------------------------
+# En cas de modification : verifier le report sur TRTTAXUSA
+#########################################################################
+
+
+#########################################################################
+# Creation des echeances
+# Mettre dans CREATION
+#########################################################################
+Subprog CRE_ECHEANCES
+Local Integer RELANCE, RELEVE
+Local Integer RET  # FGR 20/11/2014 : X3SUIVI104151
+Local Char LEGIS(GLONADI)
+
+  # hb le 23/12/98 : les échéances doivent être générées même si l'on n'a pas les tiers
+  # If GMODU(3)=1 End : Endif
+  #Call LECTURE("BPC",[F:SIH]BPR,"") From CONTOBJ
+  If [F:BPC]BPCNUM<>[F:SIH]BPR
+    Read [BPC]BPC0=[F:SIH]BPR
+    If fstat : Raz [F:BPC] : Endif
+  Endif
+  If dim([F:BPC]FUPTYP)>0 & [F:BPC]FUPTYP=1
+    RELANCE = 1
+  Else
+    RELANCE = 2
+  Endif
+  If dim([F:BPC]SOIPER)>0 & [F:BPC]SOIPER=1
+    RELEVE = 1
+  Else
+    If !clalev([F:TPT]) Local File TABPAYTERM [TPT] Endif
+    #- X3Suivi 71937 Multi-législation -#
+    Call GETLEG([F:SIH]CPY,"G",LEGIS) From DEVSUB
+    If LEGIS='' : Call GETLEG([F:SIH]CPY,"T",LEGIS) From DEVSUB : Endif
+    #Read [TPT]TPT0=[F:SIH]PTE;1
+    Call LEC_TPT_LEG(LEGIS,[F:SIH]PTE,1,RET) From TRTLECLEG
+    If RET
+      RELEVE = 1
+    Else
+      RELEVE = [F:TPT]SOIFLG
+    Endif
+  Endif
+  # A voir en V150 : Pb division /0
+  Call CREECHE(1,RELEVE,RELANCE,len(mess(0,510,1))) From SUBBIH
+  GPOINT="CALECHE" : Gosub ENTREE From EXEFNC
+End
+
+#########################################################################
+# Suppression des echeances
+# Mettre dans ANNULE
+#########################################################################
+Subprog SUP_ECHEANCES
+
+# hb le 23/12/98 : les échéances doivent être générées même si l'on n'a pas les tiers
+# If GMODU(3)=1 End : Endif
+
+##DBA le 23/01/03 : Historisation des échéances supprimées
+Local Char CRITSUPPR (250)
+
+If clalev([F:DUD])=0 : Local File GACCDUDATE [DUD] : Endif
+##DBA le 23/01/03 : Historisation des échéances supprimées
+CRITSUPPR="TYP='"+[F:SIH]GTE+"' & NUM='"+[F:SIH]NUM+"'"
+Call HISTOSUPPR (CRITSUPPR) From MODECHE
+Delete [DUD] Where TYP=[F:SIH]GTE & NUM=[F:SIH]NUM
+If fstat=1 : GOK=-1 : GLOCK="$GACCDUDATE" : Endif
+End
+
+
+#########################################################################
+# recherche et stockage des acomptes sur les cdes de la facture
+# mettre dans INICRE et INIMOD
+#------------------------------------------------------------------------
+# mise a jour du tableau des acomptes dans SIV
+# mise a jour des echeances acomptes *SO (a deduire , deduit)
+# pas de mise a jour des echeances de la facture (se fera en validation)
+#########################################################################
+Subprog AFF_ACOMPTES (TRT)
+Value Integer TRT
+Local Integer JLS, JLL, JLZ, JLF, JLA
+Local Decimal ACOMPTES, ENLEVER
+Local Char    ZNOCDE (30) (0..dim([F:SIV]INSORDNUM)-1)
+Local Integer ZDUDLIG     (0..dim([F:SIV]INSORDNUM)-1)
+Local Decimal ZAPRENDRE   (0..dim([F:SIV]INSORDNUM)-1)
+Local Decimal ZPRIS       (0..dim([F:SIV]INSORDNUM)-1)
+
+If clalev([F:DUD])=0 : Local File GACCDUDATE [DUD] : Endif
+#------------------------------------------------------------------------
+# on enleve les acomptes déjà affectés a la facture
+If sum([F:SIV]INSATI)<>0
+  For JLS=0 To dim([F:SIV]INSORDNUM)-1
+    If [F:SIV]INSATI(JLS)<>0
+
+      Readlock [DUD]DUD0="*SO";[F:SIV]INSORDNUM(JLS);1;[F:SIV]INSLIN(JLS)
+      If fstat=1
+        GOK=-1
+        GLOCK="$"+"GACCDUDATE"-"*SO"-[F:SIV]INSORDNUM(JLS)-"1"-num$([F:SIV]INSLIN(JLS))
+        Break
+      Endif
+      If fstat
+        GOK=0
+        Call RSTA ("DUD","*SO"+[F:SIV]INSORDNUM(JLS)+"1"+num$([F:SIV]INSLIN(JLS))) From GLOCK
+        Break
+      Endif
+
+      [F:DUD]DINAMT -= [F:SIV]INSATI(JLS)
+      [F:DUD]IBDAMT += [F:SIV]INSATI(JLS)
+
+      Rewrite [DUD]
+      If fstat<>0 : GOK=0 : Call FSTA ("DUD") From GLOCK : Break : Endif
+
+    Endif
+  Next JLS
+  If GOK<1 : End : Endif
+
+  Raz [F:SIV]PAM, [F:SIV]INSATI, [F:SIV]INSORDNUM, [F:SIV]INSLIN
+Endif
+
+# -- pour une suppression de facture : on sort ici ----------------------
+If TRT=2 : End : Endif
+
+#------------------------------------------------------------------------
+# on cherche les acomptes des cdes de chaque lignes
+# stockage de la reference des acomptes trouves
+# selection uniquement des acomptes de la meme devise que la facture
+# (pas de problemes d'arrondis de conversion (seront affectés par la compta.)
+Raz JLZ
+For JLL=0 To [M:SIH4]NBLIG-1
+  If JLZ=dim([F:SIV]INSORDNUM) : Break : Endif
+  If [M:SIH4]SOHNUM(JLL)<>""
+    JLA = find([M:SIH4]SOHNUM(JLL),ZNOCDE)
+    If !JLA
+      Filter [DUD] Where TYP="*SO" & NUM=[M:SIH4]SOHNUM(JLL) & LIG=1
+&                        & CPY=[F:SIH]CPY & CUR=[F:SIH]CUR & IBDAMT>0
+&            Order By Key DUD0
+      For [DUD]
+        If JLZ=dim([F:SIV]INSORDNUM) : Break : Endif
+        JLZ += 1
+        ZNOCDE(JLZ-1)   =[F:DUD]NUM
+        ZDUDLIG(JLZ-1)  =[F:DUD]DUDLIG
+        ZAPRENDRE(JLZ-1)=[F:DUD]IBDAMT
+        GPOINT="AFFACOMPTE" : Gosub ENTREE From EXEFNC
+      Next
+      Filter [DUD]
+    Endif
+  Endif
+Next JLL
+#------------------------------------------------------------------------
+# affectation des acomptes (4 maxi) a concurrence du TTC de la facture
+# les acomptes ne sont pas selectionnes en fonction des codes taxes
+Raz ZPRIS
+ACOMPTES=[F:SIH]AMTATI
+If JLZ<>0
+  For JLA=0 To dim([F:SIV]INSORDNUM)-1
+    If ACOMPTES=0 : Break : Endif : # le montant de la facture est couvert par les acomptes
+    If ACOMPTES>ZAPRENDRE(JLA)
+                ZPRIS(JLA)=ZAPRENDRE(JLA)
+    Else        ZPRIS(JLA)=ACOMPTES
+    Endif
+    ACOMPTES -= ZPRIS(JLA)
+  Next JLA
+  For JLA=0 To dim([F:SIV]INSORDNUM)-1
+    If ZPRIS(JLA)<>0
+
+      Readlock [DUD]DUD0="*SO";ZNOCDE(JLA);1;ZDUDLIG(JLA)
+      If fstat=1
+        GOK=-1
+        GLOCK="$"+"GACCDUDATE"-"*SO"-ZNOCDE(JLA)-"1"-num$(ZDUDLIG(JLA))
+        Break
+      Endif
+      If fstat
+        GOK=0
+        Call RSTA ("DUD","*SO"+ZNOCDE(JLA)+"1"+num$(ZDUDLIG(JLA))) From GLOCK
+        Break
+      Endif
+#     on modifie l'echeance acompte
+      [F:DUD]DINAMT += ZPRIS(JLA)
+      [F:DUD]IBDAMT -= ZPRIS(JLA)
+      Rewrite [DUD]
+      If fstat<>0 : GOK=0 : Call FSTA ("DUD") From GLOCK : Break : Endif
+
+#     on garni un poste du tableau des acomptes de la facture
+      [F:SIV]PAM(JLA)       = [F:DUD]PAM
+      [F:SIV]INSATI(JLA)    = ZPRIS(JLA)
+      [F:SIV]INSORDNUM(JLA) = [F:DUD]NUM
+      [F:SIV]INSLIN(JLA)    = [F:DUD]DUDLIG
+    Else : Break
+    Endif
+  Next JLA
+  If GOK<1 : End : Endif
+
+Endif
+
+End
+
+
+#########################################################################
+#########################################################################
+# Point d'entrée DATEECHE appelé depuis la création d'une facture       #
+#########################################################################
+#########################################################################
+$MOD_DATE_ECHE
+Local Date    WSTRDUDDAT
+Local Integer WINVTYP, WSIHORI
+Local Char    WSOHNUM(GLONVCR), WSDHNUM(GLONVCR)
+
+#---------------------------------------------------------------------#
+# Variables utilisables par le point d'entrée                         #
+#                                                                     #
+# WSTRDUDDAT  : Date départ échéance à modifier                       #
+# WINVTYP     : Type de facture                                       #
+# WSIHORI     : Origine de document                                   #
+# WSOHNUM     : N° de la 1ère commande si facture de commande         #
+# WSDHNUM     : N° de la 1ère livraison si facture de livraison       #
+#---------------------------------------------------------------------#
+Raz WSTRDUDDAT
+WINVTYP    = [F:SIH]INVTYP
+WSIHORI    = [F:SIV]SIHORI
+WSTRDUDDAT = [F:SIH]STRDUDDAT
+If WSIHORI = 2
+    WSOHNUM = [F:SIV]SIHORINUM
+Elsif WSIHORI = 3
+    WSDHNUM = [F:SIV]SIHORINUM
+# 107888 : Scheduled invoices : (LD:10/05/16)
+# For the moment, we manage only scheduled invoices from order
+# This will have to be changed when we'll manage other scheduled invoices
+Elsif WSIHORI = 10 & [F:SIV]SIHORITYP=10
+    WSOHNUM = [F:SIV]SIHORINUM
+# 107888 : Scheduled invoices : (LD:10/05/16)
+Endif
+
+GPOINT="DATEECHE" : Gosub ENTREE From EXEFNC
+
+[F:SIH]STRDUDDAT = WSTRDUDDAT
+
+Return
+

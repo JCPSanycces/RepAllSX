@@ -1,0 +1,327 @@
+#<AdxTL>@(#)4.0.0.0 $Revision$
+###############################################################
+# PROCEDURES COMMUNES AU CALCUL DES RETENUES SUR FACTURES     #
+# ET AU CALCUL DES RETENUES SUR REGLEMENTS                    #
+###############################################################
+# V1.0.0 - 17/02/2000 - NG - Creation                         #
+# V1.0.3 - 24/03/2000 - NG - Modifications                    #
+###############################################################
+
+
+###################################################
+# APPEL A L'OBJET GERANT LES FACTURES FOURNISSEUR #
+###################################################
+
+GBIDC2="" : GBIDC3=""
+Call OBJET ("BIS",GBIDC2,GBIDC3) From GOBJET
+End
+
+
+####################################################
+# SOUS-PROG DE MISE-A-JOUR DES MOUVEMENTS RETENUES #
+####################################################
+
+Subprog MAJ_RITMVT (NUMPIECE,SIGNE)
+Value Char NUMPIECE # numero de piece
+Value Integer SIGNE # sens du mouvement
+
+
+# VARIABLES LOCALES
+
+If clalev([F:PIH])=0 : Local File PINVOICE [PIH] : Endif # facture
+If clalev([F:RTM])=0 : Local File RITMVT   [RTM] : Endif # mouvements retenues
+
+Local Integer NUMRET        # numero retenue
+Local Char CODRET(10)       # code retenue
+Local Decimal RITBAS,RITAMT # base et montant retenue
+Local Integer ANNEE         # annee (date comptable)
+
+# ON SE POSITIONNE SUR LA PIECE CONCERNEE
+
+Call LECTURE("BIS",NUMPIECE,"") From CONTOBJ
+If fstat
+ GOK=0 : Call RSTA ("PIH",NUMPIECE) From GLOCK : End
+Endif
+[L]ANNEE=year([F:PIH]ACCDAT) # annee de la date comptable
+
+# SENS REEL DE MOUVEMENT SELON QUE L'ON A UNE FACTURE, UN AVOIR, ...
+
+If [F:PIH]INVTYP=2 | [F:PIH]INVTYP=4 : SIGNE*=-1 : Endif # Avoir ou Note de débit
+
+ # MISE A JOUR DES MOUVEMENTS RETENUES
+ For NUMRET=0 To [F:PIH]RITNBR-1 # boucle sur les retenues appliquees au fournisseur
+  [L]CODRET=[F:PIH]RITCOD(NUMRET) # code retenue
+  [L]RITBAS=[F:PIH]RITBAS(NUMRET) # base retenue
+  [L]RITAMT=[F:PIH]RITAMT(NUMRET) # montant retenue
+  Readlock [F:RTM]RTM0=[F:PIH]BPR;[L]CODRET;[F:PIH]CPY;[L]ANNEE
+  If fstat=1
+   GOK=-1 : GLOCK="$RITMVT"-[F:PIH]BPR-[L]CODRET-[F:PIH]CPY-num$([L]ANNEE) : Break
+  Elsif fstat
+   If SIGNE=1 & [L]RITBAS>0 & [L]RITAMT>0
+    [F:RTM]BPR=[F:PIH]BPR       # tiers (fournisseur)
+    [F:RTM]RITCOD=[L]CODRET     # retenue (code)
+    [F:RTM]CPY=[F:PIH]CPY       # societe
+    [F:RTM]ANN=[L]ANNEE         # annee civile
+    [F:RTM]BASANN=[L]RITBAS     # base facturee annuelle
+    [F:RTM]AMTANN=[L]RITAMT     # montant facture annuel
+    Write [F:RTM]
+    If fstat
+     GOK=0 : Call FSTA ("RTM") From GLOCK : End
+    Endif
+    # JFL 02/08/2007 - Point d'entrée MAJRTZ
+    GPOINT = "MAJRTZ" : Gosub ENTREE From EXEFNC
+   Endif
+  Else
+   [F:RTM]BASANN+=([F:PIH]RITBAS(NUMRET)*SIGNE) # MAJ base facturee annuelle
+   [F:RTM]AMTANN+=([F:PIH]RITAMT(NUMRET)*SIGNE) # MAJ montant facture annuel
+   If [F:RTM]BASANN=0 and [F:RTM]AMTANN=0 Then  # l'enreg. est inutile
+    Delete [F:RTM]RTM0=[F:PIH]BPR;[L]CODRET;[F:PIH]CPY;[L]ANNEE
+    If fstat=1 | fstat>5
+     GOK=0 : Call RSTA ("RTM",[F:PIH]BPR-[L]CODRET-[F:PIH]CPY-num$([L]ANNEE)) From GLOCK : End
+    Endif
+    GPOINT = "DELRTZ" : Gosub ENTREE From EXEFNC
+   Else
+    Rewrite [F:RTM]
+    If fstat
+     GOK=0 : Call FSTA ("RTM") From GLOCK : End
+    Endif
+    # JFL 02/08/2007 - Point d'entrée MAJRTZ
+    GPOINT = "MAJRTZ" : Gosub ENTREE From EXEFNC
+   Endif
+
+  Endif
+
+ Next NUMRET
+
+End
+
+
+#####################################################################
+# SOUS-PROG DE CALCUL DU MONTANT DE LA RETENUE (SELON METH DE CALC) #
+#####################################################################
+
+Subprog MONTANT_RETENUE (CODRET,CODBPR,CODSOC,ACCDAT,PRVRITBAS,FACCUR,
+&                        RITBASFAC,RITAMTFAC,RTZCUR,RITBASRTZ,RITAMTRTZ)
+Value Char CODRET          # code retenue
+Value Char CODBPR          # code tiers
+Value Char CODSOC          # code société
+Value Date ACCDAT          # date comptable
+Value Decimal PRVRITBAS    # base precedemment calculee
+Value Char FACCUR          # devise de facture
+Variable Decimal RITBASFAC # base en devise de facture
+Variable Decimal RITAMTFAC # montant retenue en devise de facture
+Value Char RTZCUR          # devise de ritenzione
+Variable Decimal RITBASRTZ # base en devise de ritenzione
+Variable Decimal RITAMTRTZ # montant retenue en devise de ritenzione
+
+# VARIABLES LOCALES
+
+If clalev([F:RTZ])=0 : Local File RITENZIONE [RTZ] : Endif # codes retenues
+
+Local Decimal MINAMTFAC,MINAMTRTZ # montant mini en dev fac, dev rtz
+Local Decimal MAXBAS              # base maxi (au-dela, pas de retenue)
+Local Decimal BASEFACT, MONTFACT  # base & mt facturee (base & mt deja facturee)
+Local Integer OK                  # statut de retour
+Local Integer NUMSEUIL            # Bug 22527
+
+GPE = 0
+GPOINT = "STRCALRTZ" : Gosub ENTREE From EXEFNC
+If GPE=1 : End : Endif
+
+
+# RECHERCHE DE LA FICHE RETENUE
+Call LECTURE ("RTZ",CODRET,"") From CONTOBJ # Lecture fiche retenue
+
+# TAUX D'ABATTEMENT DE LA BASE LIE A LA RETENUE
+
+If [F:RTZ]BASRAT > 0 Then
+ [L]RITBASFAC*=((100-[F:RTZ]BASRAT)/100) # base abattue en devise facture
+ Call ARRDEV ([L]RITBASFAC,[L]FACCUR) From TRTDIV # arrondi de la base
+Endif
+
+# CONVERSION DE LA BASE VERS LA DEVISE DE RITENZIONE
+
+If [L]FACCUR<>[L]RTZCUR Then
+ Call CONVERT ([L]FACCUR,[L]RTZCUR,"",0,[0/0/0],[L]RITBASFAC,[L]RITBASRTZ,OK) From TRTDEV
+Else
+ [L]RITBASRTZ=[L]RITBASFAC # devises identiques (pas de conversion)
+Endif
+
+# CALCUL DU MONTANT DE LA RETENUE
+
+If [L]RITBASFAC=0
+ [L]RITAMTFAC=0 : [L]RITAMTRTZ=0 : # Base nulle => Montant nul
+Else # Calcul...
+
+ Case [F:RTZ]MET
+
+  When 1: #---------------------- Taux simple ----------------------#
+   [L]RITAMTFAC=[L]RITBASFAC*([F:RTZ]RAT(0)/100) # mt retenue
+  When 2: #------------------- Taux par tranches -------------------#
+   [L]NUMSEUIL=0
+   While [F:RTZ]BKT(NUMSEUIL)<>0 and [L]RITBASRTZ>[F:RTZ]BKT(NUMSEUIL)
+    [L]NUMSEUIL+=1 # on passe ds la tranche superieure
+   Wend
+   [L]RITAMTFAC=[L]RITBASFAC*([F:RTZ]RAT(NUMSEUIL)/100) # mt retenue
+  When 3: #---------------- Taux par seuil mini-maxi ---------------#
+   Call GET_BASEFACT ([L]CODRET,[L]CODBPR,[L]CODSOC,[L]ACCDAT,[L]BASEFACT) From RTZCALCOM
+   [L]MAXBAS = [F:RTZ]BKT(1) # base maxi
+   [L]RITBASRTZ = min([L]BASEFACT-[L]PRVRITBAS+[L]RITBASRTZ,[L]MAXBAS)
+   [L]RITAMTRTZ = [L]RITBASRTZ*([F:RTZ]RAT(0)/100)
+   Call ARRDEV ([L]RITAMTRTZ,[L]RTZCUR) From TRTDIV
+   [L]MINAMTRTZ = [F:RTZ]BKT(0) # montant mini en devise de ritenzione
+   Call GET_MONTFACT ([L]CODRET,[L]CODBPR,[L]CODSOC,[L]ACCDAT,[L]MONTFACT) From RTZCALCOM
+   # Bug 18739 : Dans le cas d'une modification, ce calcul ne tenait pas compte de l'ancienne retenue.
+   #[L]RITAMTRTZ = max([L]RITAMTRTZ,[L]MINAMTRTZ) - [L]MONTFACT
+   [L]RITAMTRTZ = max([L]RITAMTRTZ,[L]MINAMTRTZ) - [L]MONTFACT + [L]PRVRITBAS*([F:RTZ]RAT(0)/100)
+   [L]RITBASRTZ -= ([L]BASEFACT-[L]PRVRITBAS)
+   If [L]RITAMTRTZ>0
+    If [L]FACCUR<>[L]RTZCUR Then # conversion vers devise de facture
+     Call CONVERT ([L]RTZCUR,[L]FACCUR,"",0,[0/0/0],[L]RITAMTRTZ,[L]RITAMTFAC,OK) From TRTDEV
+    Else
+     [L]RITAMTFAC=[L]RITAMTRTZ # devises identiques
+    Endif
+   # inutile de calculer RITBASFAC
+   Else
+    [L]RITAMTRTZ=0 : [L]RITAMTFAC=0
+   Endif
+
+ Endcase
+
+ If [F:RTZ]MET<>3
+  # ARRONDI DU MONTANT DE LA RETENUE EN DEVISE DE FACTURE
+  # CONVERSION DU MONTANT CALCULE : DEV. FACT. -> DEV. RTZ.
+  Call ARRDEV ([L]RITAMTFAC,[L]FACCUR) From TRTDIV
+  If [L]RITAMTFAC=0
+   [L]RITBASFAC=0 : [L]RITBASRTZ=0 : [L]RITAMTRTZ=0
+  Elsif [L]FACCUR<>[L]RTZCUR Then
+   Call CONVERT ([L]FACCUR,[L]RTZCUR,"",0,[0/0/0],[L]RITAMTFAC,[L]RITAMTRTZ,OK) From TRTDEV
+  Else
+   [L]RITAMTRTZ=[L]RITAMTFAC # devises identiques (pas de conversion)
+  Endif
+ Endif
+
+Endif
+GPOINT = "ENDCALRTZ" : Gosub ENTREE From EXEFNC
+End
+
+
+########################################################
+# SOUS-PROG DE RECUPERATION DE LA BASE (DEJA) FACTUREE #
+########################################################
+
+Subprog GET_BASEFACT (CODRET,CODBPR,CODSOC,ACCDAT,BASEFACT)
+Value Char CODRET         # code retenue
+Value Char CODBPR         # code tiers
+Value Char CODSOC         # code société
+Value Date ACCDAT         # date comptable
+Variable Decimal BASEFACT # base facturee sur l'annee
+
+If clalev([F:RTM])=0 : Local File RITMVT [RTM] : Endif # mouvements retenues
+
+Read [F:RTM]RTM0=CODBPR;CODRET;CODSOC;year(ACCDAT) # lecture fiche mvt
+
+If fstat<>0
+ BASEFACT=0
+Else
+ BASEFACT=[F:RTM]BASANN # base facturee annuelle
+Endif
+End
+
+
+#######################################################
+# SOUS-PROG DE RECUPERATION DU MONTANT (DEJA) FACTURE #
+#######################################################
+
+Subprog GET_MONTFACT (CODRET,CODBPR,CODSOC,ACCDAT,MONTFACT)
+Value Char CODRET         # code retenue
+Value Char CODBPR         # code tiers
+Value Char CODSOC         # code société
+Value Date ACCDAT         # date comptable
+Variable Decimal MONTFACT # base facturee sur l'annee
+
+If clalev([F:RTM])=0 : Local File RITMVT [RTM] : Endif # mouvements retenues
+
+Read [F:RTM]RTM0=CODBPR;CODRET;CODSOC;year(ACCDAT) # lecture fiche mvt
+If fstat<>0
+ MONTFACT=0
+Else
+ MONTFACT=[F:RTM]AMTANN # base facturee annuelle
+Endif
+End
+
+
+
+##############################################
+# SOUS-PROG D'AFFICHAGE DE MESSAGES DE DEBUG #
+##############################################
+
+Subprog DEBUG_MSG (TEX,DEBUG_MODE) # messages d'info. si mode debug actif
+Value Char TEX           # message
+Value Integer DEBUG_MODE # status debug_mode
+
+If DEBUG_MODE=2 : Call MESSAGE (TEX) From GESECRAN : Endif
+
+End
+
+
+#############################################################
+# SOUS-PROG DE TEST DE LA VALIDITE TEMPORELLE D'UNE RETENUE #
+#############################################################
+
+Subprog APPLICABLE (RITCOD,DATFAC,OK)
+Value Char RITCOD   # code retenue
+Value Date DATFAC   # date de facture
+Variable Integer OK # applicable oui/non
+
+If clalev([F:RTZ])=0 : Local File RITENZIONE [RTZ] : Endif # retenues
+
+Call LECTURE ("RTZ",RITCOD,"") From CONTOBJ
+
+If [F:RTZ]STRDAT=[0/0/0]
+ OK = [F:RTZ]ENDDAT=[0/0/0] or [F:RTZ]ENDDAT>=DATFAC
+Else
+ OK = [F:RTZ]STRDAT<=DATFAC & ([F:RTZ]ENDDAT=[0/0/0] or [F:RTZ]ENDDAT>=DATFAC)
+Endif
+End
+
+
+##########################################################
+# SS-PROG DE REMISE A ZERO DES MONTANTS ET BASES CALCULES
+##########################################################
+
+Subprog RAZ_AMTBAS (RITNBR,RITBAS,RITAMT)
+Value Decimal RITNBR
+Variable Decimal RITBAS()
+Variable Decimal RITAMT()
+
+For I=0 To [L]RITNBR-1
+ RITBAS(I)=0
+ RITAMT(I)=0
+Next I
+End
+
+
+##########################################################
+# SS-PROG DE SUPPRESSION DES RETENUES ENTIEREMENT NULLES
+##########################################################
+
+Subprog NETTOYAGE (RITNBR,RITCOD,RITBAS,RITAMT,RITBASDED,RITAMTDED)
+Variable Decimal RITNBR      # Nb de retenues
+Variable Char RITCOD()       # Codes retenues
+Variable Decimal RITBAS()    # Bases
+Variable Decimal RITAMT()    # Montants
+Variable Decimal RITBASDED() # Bases reglees
+Variable Decimal RITAMTDED() # Montants regles
+
+I=0
+While (I<[L]RITNBR)
+ If RITBAS(I)=0 & RITAMT(I)=0 & RITBASDED(I)=0 & RITAMTDED(I)=0 Then
+  Dela I RITCOD,RITBAS,RITAMT,RITBASDED,RITAMTDED
+  RITNBR-=1
+ Else
+  I+=1
+ Endif
+Wend
+End
+

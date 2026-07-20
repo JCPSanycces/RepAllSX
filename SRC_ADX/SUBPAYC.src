@@ -1,0 +1,1198 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$
+#################################################################
+#
+# Issue X3-107197 - 2018-09-12 by CBO : PARAMETER AND ACTIVITY CODE
+# 2017.10.11 CBO X3-59200 SDD activity code not always tested
+# 2018.07.27 Bader X3-99013 _READ_DFLT_BIDNUM: support Swiss QR/ISR bills
+#
+#################################################################
+
+## GPROG    = Traitement
+## GWINDOW  = Ecran de saisie
+Subprog CTL_CRE_REG
+Local Char PARAMETRE(30)(1..2)
+Local Char VAL_EUR(10)
+Local Char PROG_SPE(GLONADC)
+PARAMETRE(1) = "C"
+Call TRTSPE(nomap,"PAYPROCTL",PROG_SPE) From SUBACT
+Call SAISIE_CHAR(VAL_EUR,PARAMETRE,"FPAYPROCTL","SUBPAYC",PROG_SPE) From GSAISIE
+
+End
+
+$ACTION
+Case ACTION
+ When "OUVRE"        : Gosub OUVRE
+ When "DEBUT"        : Gosub DEBUT
+ When "SETBOUT"      : Gosub SETBOUT
+ When "CRE"          : Gosub CREATION : GOK = 1 : FIN = 1
+ When "SEL_TABLE"    : Gosub SEL_TABLE # Issue X3-6418
+ When "VERF_TABLE"   : Gosub VERF_TABLE # Issue X3-6418
+ When "OK"
+  FIN = 1
+  GOK = 1   : # Pour enchaîner
+ When "END"
+  FIN = 1
+  GOK = 0   : # Pour s'arrêter
+Endcase
+Return
+
+$OUVRE
+Onerrgo ERREUR From CONTROLE
+If !clalev([F:TP2])  : Local File TMPPAYDUD2 [TP2]  : Endif : # Table temporaire - Entêtes de règlement
+If !clalev([F:TPD2]) : Local File TMPPAYDUD  [TPD2] : Endif : # Table temporaire - Lignes de règlement
+If !clalev([F:DUD])  : Local File GACCDUDATE [DUD]  : Endif
+If !clalev([F:TCU])  : Local File TABCUR     [TCU]  : Endif
+If !clalev([F:TPY])  : Local File TABPAYTYP  [TPY]  : Endif
+If !clalev([F:CPY])  : Local File COMPANY    [CPY]  : Endif
+If !clalev([F:CDA])  : Local File GACCDENCOD [CDA]  : Endif
+If !clalev([F:TCY])  : Local File TABCOUNTRY [TCY]  : Endif # Issue X3-6418
+If dim(GSDDMGT) > 0 and GSDDMGT = [V]CST_AYES # Issue X3-59200
+  If !clalev([F:MDT])  : Local File MANDATE    [MDT]  : Endif # Issue X3-21320
+Endif # End Issue X3-59200
+
+Onerrgo
+If GERREUR : GERREUR=0 : FIN=1 : Return : Endif
+
+Local Char    DEP(10)
+Local Char    BAN(GLONBAN)
+Local Char    DEVREG(GLONCUR)
+Local Char    ZONE(20)
+Local Char    DENCOD(GLONCDA)
+Local Integer NBREG
+Local Integer NOL, SIGN
+Local Integer NBECH, DELAI, STAT
+Local Integer AA, JJ, MM
+Local Integer FLGDEP
+Local Decimal MONTREG                   : # Montant du règlement (en devise de règlement)
+Local Decimal MONTLOC
+Local Decimal TOTGENLOC                 : # Total général en devise locale (devise société)
+Local Decimal ARD, TAUX_ESC, MONT_ESC
+Local Decimal AMTLOCLIN, RITLOCLIN
+Local Integer NBLI, EFFACE, DEPASS, T
+Local Integer SIGN2, IPTTYP
+Local Char    RTZCUR(GLONCUR), DEVLED(GLONCUR), PLAN(GLONCOA)
+Global Integer GAFF_FMT # Isue X3-4141
+Local Integer CALL_PT : Raz CALL_PT
+If dim(GNBENTREE)>0 & GNBENTREE>0 & find("SUBPAYC",GENTSTD(1..GNBENTREE)) : CALL_PT=1 : Endif
+Return
+
+$SETBOUT
+CHBOU +="C"
+CHBOU +="A"
+CHBOU +="F"
+Return
+
+$DEBUT
+Call TEMPOFF From GESECRAN
+If dim([M:PCL]RITAMT)>0
+ Call PARAM("","RTZCUR",[L]RTZCUR) From ADOVAL : # Devise ritenzione
+Endif
+Raz [M:PCL] : Raz nolign
+[M:PCL] = [M:DIA] : TOTGENLOC = 0
+Call SETCUR(1,[M:DIA]CPY,DEVLED) From CPTDIV
+Call SETMAINREF([M:DIA]CPY,GTYPGEN,GTYPANA) From CPTDIV
+Call LECPLAN([M:DIA]CPY, GTYPGEN,PLAN) From CPTDIV
+Local Char CRITFCY(255)
+CRITFCY = "1=1"
+If [M:DIA]ALLFCY=1
+ [L]CRITFCY -= "& FCY='"+[M:DIA]FCY+"'"
+Endif
+
+# GRNA 02.08.11 - add sorting with Order By via Filter
+Gosub PAY_SORT From SUBPAYS
+For [TP2] Where UIDUSR=adxpid
+ Call LEC_CPY([F:TP2]CPY) From CPTLEC
+ Call LEC_TPY_LEG([F:CPY]LEG,[F:TP2]PAYTYP) From CPTLEC
+ GAFF_FMT = 0 # Isue X3-4141
+ # Pour rappel des critères en en-tête du masque de contrôle
+ NBECH = 0 : MONTREG = 0 : MONTLOC = 0
+ If [M:DIA]CURPAY<>"" : DEVREG=[M:DIA]CURPAY
+ Else                 : Call ELEMNO(";",3,DEVREG) From PAYPROPAL2
+ Endif
+ For [TPD2]TPD0 Where CPY=[M:DIA]CPY & PAYTYP=[F:TP2]PAYTYP & GRPCRI=[F:TP2]GRPCRI & evalue(CRITFCY)
+&                   & FLG=[F:TP2]FLG & UIDUSR=adxpid
+  Read [DUD]DUD1 = [F:TPD2]ACCNUM;[F:TPD2]DUDLIG
+  If fstat
+   GOK = 0 : Call ECR_TRACE(mess(150,192,1)-"GACCDUDATE"-":"-num$([F:TPD2]ACCNUM)-num$([F:TPD2]DUDLIG),1) From GESECRAN : Break 2
+  Endif
+  NBLI += 1
+  Gosub TESTLIG
+  If DEPASS : DEPASS = 0 : EFFACE = 0 : Break 2 : Endif
+  nolign += 1
+  [M:PCL]DACBID(nolign-1) = [F:TPY]DACBID   # Issue X3-4141
+  [M:PCL]GRPCRI(nolign-1) = [F:TP2]GRPCRI
+  [M:PCL]ACCNUM(nolign-1) = [F:TPD2]ACCNUM
+  [M:PCL]DUDLIG(nolign-1) = [F:TPD2]DUDLIG
+  [M:PCL]DEP(nolign-1)    = [F:DUD]DEP
+  [M:PCL]FLG(nolign-1)    = [F:TP2]FLG
+  [M:PCL]DISDAT(nolign-1) = [F:TPD2]DISDAT # PRD04B.n
+  # GRNA 02.08.11
+  If dim([M:PCL]BPRNAM)>0
+   [M:PCL]BPRNAM(nolign-1) = [F:TP2]BPRNAM
+  Endif
+  If dim([M:DIA]SELDEF)>0 & dim([M:PCL]SELEC)>0
+   [M:PCL]SELEC(nolign-1)  = [M:DIA]SELDEF
+  Endif
+  # Tiers payeur
+  Call ELEMNO(";",2,[M:PCL]BPRPAY(nolign-1)) From PAYPROPAL2
+  # Date de l'échéance (Date théorique)
+  [M:PCL]DUDDAT(nolign-1) = [F:DUD]DUDDAT
+  # Type, n° facture et devise de l'échéance proposée en règlement
+  [M:PCL]TYP(nolign-1) = [F:DUD]TYP
+  [M:PCL]NUM(nolign-1) = [F:DUD]NUM
+  [M:PCL]CUR(nolign-1) = [F:DUD]CUR
+  Call LEC_TCU([F:DUD]CUR) From CPTLEC
+  ARD=[F:TCU]CURRND
+  # Montant de l'échéance proposée en règlement (en devise d'échéance [M:PCL]CUR(nolign-1)...)
+  [M:PCL]AMTCUR(nolign-1) = [F:DUD]AMTCUR-[F:DUD]PAYCUR-[F:DUD]TMPCUR
+  [M:PCL]OAMTCUR(nolign-1) = [F:DUD]AMTCUR-[F:DUD]PAYCUR-[F:DUD]TMPCUR
+  ## Demande SDR : La colonne 'Solde' est par défaut égale à la colonne 'Montant'. La seule différence peut venir du
+  ## fait que l'on ne souhaite pas règler en totalité l'échéance : si on modifie la colonne 'Montant', la colonne
+  ## 'Solde' doit afficher le montant initial proposé de l'échéance - le montant qu'on veut règler
+  [M:PCL]SOLDE(nolign-1) = [M:PCL]AMTCUR(nolign-1)
+
+  #SAM 97414 angre 14.07.14
+  Local Char PTE(30)
+  Local Char ORINUM(GLONVCR)
+  [M:PCL]PAYMETH(nolign-1) = [F:DUD]PAM
+  #get the payment term and the original document
+  Call PTEORIDOC(PTE, ORINUM) From PAYDEPLIB2
+  [M:PCL]ORINUM(nolign-1) = ORINUM
+  [M:PCL]PTE(nolign-1) = PTE
+
+  # Montant (éventuel) de l'escompte
+  Gosub CODE_ESCOMPTE From PAYPROPAL2
+  Raz [L]MONT_ESC
+  FLGDEP = 0
+  If GDEPMGTMOD = 1 | GDEPMGTMOD = 5
+   Call FLGDEP([F:DUD]CPY,[F:DUD]DEP,FLGDEP) From PAYDEPLIB2
+  Endif
+  Local Integer CAL_ESCAGIO : CAL_ESCAGIO = 0
+  If dim(CALL_PT)>0 & CALL_PT
+   GPOINT = "CAL_ESCAGIO" : Gosub ENTREE From EXEFNC
+  Endif
+  If ((CAL_ESCAGIO=2) or ([F:TPY]SNS=1 & [F:DUD]SNS=-1) or ([F:TPY]SNS=2 & [F:DUD]SNS=1)) & !find([F:DUD]TYP,"*SO","*PO")
+   Raz DELAI, TAUX_ESC
+   Call ESC_AGIO([L]DEP,[M:PCL]AMTCUR(nolign-1),[M:DIA]ACCDAT,[F:DUD]DUDDAT,DELAI,[L]TAUX_ESC,[L]MONT_ESC,[F:DUD]ACCNUM,[F:DUD]DUDLIG) From TRTDIV
+   If ([L]TAUX_ESC<0 & GDIV(2)="") or ([L]TAUX_ESC>0 & GDIV(5)="") : [L]TAUX_ESC=0 : Endif
+  Endif
+  [M:PCL]DEPLTI(nolign-1) = [L]DELAI
+  [M:PCL]DEPRAT(nolign-1) = [L]TAUX_ESC
+
+  If [L]TAUX_ESC <> 0
+   If [L]TAUX_ESC>0 and DELAI<0 : [L]MONT_ESC *= -1 : Endif
+   [L]MONT_ESC = arr([L]MONT_ESC,ARD)
+  Endif
+
+  Gosub RECH_DENCOD
+  Call SNSPAYECH([F:CDA]ACCSNS,[F:TPY]SNS,[F:DUD]SNS,[L]SIGN) From SUBPAY2
+  [M:PCL]SIGN(nolign-1) = [L]SIGN
+  Gosub RECH_IPTTYP
+  Call SIGN2([F:CDA]ACCSNS,[F:TPY]SNS,[F:DUD]ACCNUM,[F:DUD]DUDLIG,[L]IPTTYP,[L]SIGN2) From PAYDIV
+
+  [M:PCL]SIGN2(nolign-1) = [L]SIGN2
+
+  [M:PCL]AMTDEP(nolign-1) = -[L]MONT_ESC*[L]SIGN
+  If dim([M:PCL]EARDISFLG)>0 & FLGDEP
+   [M:PCL]EARDISFLG(nolign-1) = 2
+  Endif
+  If [M:PCL]AMTDEP(nolign-1) = 0 : Raz [M:PCL]DISDAT(nolign-1) : Endif # PRD04B.n
+  # Champ AMTLIN invisible : contient montant échéance +/- esc/agio (correspond à [PYD]AMTLIN)
+  [M:PCL]AMTLIN(nolign-1) = [M:PCL]AMTCUR(nolign-1)+([M:PCL]AMTDEP(nolign-1)*-1)
+  # Devise règlement et montants en devise règlement (champs invisibles)
+  [M:PCL]CURPYH(nolign-1) = DEVREG
+  [M:PCL]AMTLIN2(nolign-1) = [M:PCL]AMTLIN(nolign-1)
+
+  ## Et la ritenzione...
+  If dim([M:PCL]RITAMT)>0
+   [M:PCL]RITAMT(nolign-1) = -[F:TPD2]RITAMT
+
+   If [M:PCL]CUR(nolign-1)=[L]RTZCUR : [M:PCL]RITAMT2(nolign-1) = [M:PCL]RITAMT(nolign-1)*[L]SIGN2
+   Else
+    Call CONVERT([L]RTZCUR,[M:PCL]CUR(nolign-1),DEVLED,[F:TPY]RATTYP,[M:DIA]ACCDAT,[M:PCL]RITAMT(nolign-1)*[L]SIGN2,
+&                [M:PCL]RITAMT2(nolign-1),[L]STAT) From TRTDEV
+    If [L]STAT
+     # Pas de cours de devise [L]RTZCUR -> [M:PCL]CUR(nolign-1)
+     Call ECR_TRACE(mess(16,114,1)-[L]RTZCUR-"->"-[M:PCL]CUR(nolign-1)-"("+format$("D:"+GFMDAT,[M:DIA]ACCDAT)-")",1) From GESECRAN
+     GOK=0 : Break 2
+    Endif
+   Endif
+   [M:PCL]AMTLIN2(nolign-1) += [M:PCL]RITAMT2(nolign-1)
+  Endif
+  ## Fin ritenzione...
+
+  # Gestion du champ Devise si transaction SEPA : doit être à EUR, et donc éventuellement conversion du montant
+  Call LEC_TPY_LEG([F:CPY]LEG,[F:TP2]PAYTYP) From CPTLEC
+  If [F:TPY]EPACDTTRF=G_OUI & GCURSHR<>DEVREG
+   [M:PCL]CURPYH(nolign-1)=GCURSHR
+  Endif
+
+  If [M:PCL]CURPYH(nolign-1)<>[M:PCL]CUR(nolign-1)
+   Call CONVERT([M:PCL]CUR(nolign-1),[M:PCL]CURPYH(nolign-1),DEVLED,[F:TPY]RATTYP,[M:DIA]ACCDAT,[M:PCL]AMTLIN2(nolign-1),
+&               [M:PCL]AMTLIN2(nolign-1),STAT) From TRTDEV
+   If STAT
+    # Pas de cours de devise [M:PCL]CUR(nolign-1)-> [M:PCL]CURPYH(nolign-1)
+    Call ECR_TRACE(mess(16,114,1)-[M:PCL]CUR(nolign-1)-"->"-[M:PCL]CURPYH(nolign-1)-"("+format$("D:"+GFMDAT,[M:DIA]ACCDAT)-")",1) From GESECRAN
+    GOK=0 : Break 2
+   Endif
+  Endif
+  MONTREG += [M:PCL]AMTLIN2(nolign-1)*[L]SIGN2
+  Call CONVERT([M:PCL]CUR(nolign-1),DEVLED,DEVLED,[F:TPY]RATTYP,
+&              [M:DIA]ACCDAT,[M:PCL]AMTLIN(nolign-1),AMTLOCLIN,[L]STAT) From TRTDEV
+  If [L]STAT
+   # Pas de cours de devise [M:PCL]CUR(nolign-1) -> DEVLED
+   Call ECR_TRACE(mess(16,114,1)-[M:PCL]CUR(nolign-1)-"->"-DEVLED-"("+format$("D:"+GFMDAT,[M:DIA]ACCDAT)-")",1) From GESECRAN
+   GOK=0 : Break 2
+  Endif
+
+  If [M]SELEC(nolign-1)=2
+   [M]AMTLOCLIN(nolign-1) = [L]AMTLOCLIN*[L]SIGN2
+  Else
+   Diszo [M]AMTCUR,AMTDEP,SOLDE
+  Endif
+
+  # GRNA 03.08.11
+  Gosub PAYC_AMTLOC From SUBPAYS
+
+  MONTLOC   += [M]AMTLOCLIN(nolign-1)
+  TOTGENLOC += [M]AMTLOCLIN(nolign-1)
+
+  ## Ritenzione...
+  If dim([M:PCL]RITAMT)>0 & [M]SELEC(nolign-1)=2
+   Call CONVERT([M:PCL]CUR(nolign-1),DEVLED,DEVLED,[F:TPY]RATTYP,
+&               [M:DIA]ACCDAT,[M:PCL]RITAMT(nolign-1),RITLOCLIN,[L]STAT) From TRTDEV
+   If [L]STAT
+    # Pas de cours de devise [M:PCL]CUR(nolign-1) -> DEVLED
+    Call ECR_TRACE(mess(16,114,1)-[M:PCL]CUR(nolign-1)-"->"-DEVLED-"("+format$("D:"+GFMDAT,[M:DIA]ACCDAT)-")",1) From GESECRAN
+    GOK=0 : Break 2
+   Endif
+   [M]RITLOCLIN(nolign-1) = [L]RITLOCLIN*[L]SIGN2
+   MONTLOC   += [M]RITLOCLIN(nolign-1)
+   TOTGENLOC += [M]RITLOCLIN(nolign-1)
+  Endif
+  ## Fin ritenzione
+
+  # Site de l'échéance proposée
+  [M:PCL]FCYLIN(nolign-1) = [F:DUD]FCY
+  # Collectif de l'échéance proposée
+  [M:PCL]SAC(nolign-1) = [F:DUD]SAC
+  Read [GAC]GAC1 = PLAN;[F:DUD]SAC
+  If !fstat :[M:PCL]SACACC(nolign-1)=[F:GAC]ACC : Else : Raz[M:PCL]SACACC(nolign-1): Endif
+  #Code Adresse du Tiers
+  # X3-21320
+  If dim(GSDDMGT)>0 & GSDDMGT=2 & [F:TPY]EPACDTTRF=2 & [F:TPY]SNS=2
+   Call LEC_MDT([F:DUD]CPY,[F:DUD]UMRNUM) From CPTLEC
+   [M:PCL]BPAPAY(nolign-1) = [F:MDT]BPCADD
+  Else
+   [M:PCL]BPAPAY(nolign-1) = [F:DUD]BPAPAY
+  Endif
+
+  # Banque
+  If [M:PCL]POO=""
+   Gosub RECH_BAN From PAYPROPAL2
+   If [L]BAN<>""
+    Call LEC_BAN([L]BAN) From CPTLEC
+    [M:PCL]BANLIN(nolign-1)  = [L]BAN
+   Endif
+  Endif
+  # Transaction règlement
+  [M:PCL]PAYTYP(nolign-1) = [F:TP2]PAYTYP
+  [M:PCL]TYPLIN(nolign-1) = 2 : # Ligne échéances
+  NBECH += 1
+ Next
+ If GOK<1 : Break : Endif
+
+ If dim(CALL_PT)>0 & CALL_PT :
+  GPOINT = "AFTDUDLIN" : Gosub ENTREE From EXEFNC
+ Endif
+
+ If NBECH>0 & MONTREG>0
+  # Pour la ligne du règlement, la colonne 'SOLDE' ([M]AMTLIN) est exprimée en devise de règlement
+  NBLI += 1
+  Gosub TESTLIG
+  If DEPASS : DEPASS = 0 : EFFACE = 0 : Break : Endif
+  nolign += 1
+  [M:PCL]FLG(nolign-1)    = [F:TP2]FLG
+  [M:PCL]GRPCRI(nolign-1) = [F:TP2]GRPCRI
+  [M:PCL]PAYTYP(nolign-1) = [F:TP2]PAYTYP
+  # MABON - FQ57657 - 07/10/09 - Gestion des champs SEPA
+  Call LEC_TPY_LEG([F:CPY]LEG,[F:TP2]PAYTYP) From CPTLEC
+  If [F:TPY]EPACDTTRF=G_OUI Then
+   [M:PCL]CUR(nolign-1)    = GCURSHR
+  Else
+   [M:PCL]CUR(nolign-1)    = [L]DEVREG
+  Endif
+  # Fin MABON
+  # GRNA 18.08.11
+  If [M:DIA]SELDEF=2
+   [M:PCL]AMTCUR(nolign-1) = [L]MONTREG
+   [M:PCL]FLGCRE(nolign-1) = 2
+   [M:PCL]NUM(nolign-1)    = mess(204,117,1) : # Règlement à générer
+  Else
+   [M:PCL]AMTCUR(nolign-1) = 0
+   [M:PCL]FLGCRE(nolign-1) = 1
+   [M:PCL]NUM(nolign-1)    = mess(205,117,1) : # Ne pas générer
+  Endif
+  [M:PCL]AMTLOC(nolign-1) = [L]MONTLOC
+  [M:PCL]TYPLIN(nolign-1) = 1 : # Ligne règlement
+  [M:PCL]SELEC(nolign-1)  = 0
+  [M:PCL]SOLDE(nolign-1)  = 0
+  # Date échéance du règlement
+  If [F:TPY]DUDFLG=2
+   Call ELEMNO(";",9,ZONE) From PAYPROPAL2
+   AA=val(mid$(ZONE,1,4)) : MM = val(mid$(ZONE,5,2)) : JJ = val(mid$(ZONE,7,2))
+   [M:PCL]DUDDAT(nolign-1) = gdat$(JJ,MM,AA)
+  Elsif [F:TPY]DUDFLG<>2
+   [M:PCL]DUDDAT(nolign-1) = [M:DIA]ACCDAT
+  Endif
+  If [M:DIA]FCYPAY<>""                     :# site imposé
+   [M:PCL]FCYLIN(nolign-1) = [M:DIA]FCYPAY
+  Elsif [M:DIA]ALLFCY=1                    :# 1 seul site
+   [M:PCL]FCYLIN(nolign-1) = [M:DIA]FCY
+  Endif
+  If [M:PCL]FCYLIN(nolign-1) = ""
+   [M:PCL]FCYLIN(nolign-1) = [F:DUD]FCY
+  Endif
+  [M:PCL]BANLIN(nolign-1) = [M:PCL]BAN
+  # Collectif
+  If [M:DIA]SACPAY<>""                     :# collectif imposé
+   [M:PCL]SAC(nolign-1) = [M:DIA]SACPAY
+   Read [GAC]GAC1 = PLAN;[M:DIA]SACPAY
+   If !fstat
+    [M:PCL]SACACC(nolign-1)=[F:GAC]ACC
+    [M:PCL]SACPAYACC=[F:GAC]ACC
+   Else
+    Raz [M:PCL]SACACC(nolign-1)
+    Raz [M:PCL]SACPAYACC
+   Endif
+  Elsif [M:DIA]SAC<>""                     :# 1 seul collectif
+   [M:PCL]SAC(nolign-1) = [M:DIA]SAC
+   Read [GAC]GAC1 = PLAN;[M:DIA]SAC
+   If !fstat
+    [M:PCL]SACACC(nolign-1)=[F:GAC]ACC
+    [M:DI1]SACACC=[F:GAC]ACC
+   Else
+    Raz [M:PCL]SACACC(nolign-1)
+    Raz [M:DI1]SACACC
+   Endif
+  Elsif !([M:DIA]PAYSAC=2 | [M:DIA]PAYDUD=2) :# 1 collectif/règlt ou 1 échéance/règlt
+   Call ELEMNO(";",8,[M:PCL]SAC(nolign-1)) From PAYPROPAL2
+  Endif
+  If [M:PCL]SAC(nolign-1) = ""
+   [M:PCL]SAC(nolign-1) = [F:DUD]SAC
+  Endif
+
+  NBREG += 1
+  If dim(CALL_PT)>0 & CALL_PT
+   GPOINT = "AFTPAYLIN" : Gosub ENTREE From EXEFNC
+  Endif
+  # Une ligne vide pour séparer les règlements proposés (plus lisible)
+  NBLI += 1
+  Gosub TESTLIG
+  If DEPASS : DEPASS = 0 : EFFACE = 0 : Break : Endif
+  nolign += 1 : # Une ligne blanche...
+  [M]TYPLIN(nolign-1) = 0 : # Une ligne blanche...
+  [M]SELEC(nolign-1) = 0 : # Une ligne blanche...
+ Endif
+Next
+Filter [TP2]  # GRNA 11.08.11
+If !NBREG | !GOK : GOK=0 : FIN=1 : Return : Endif
+
+If [M:DIA]SELDEF=2  # GRNA 18.08.11
+ [M:PCL]NBRPAY = NBREG
+ [M:PCL]TOTAMTCPY = TOTGENLOC
+Endif
+
+[M:PCL]NBLIG = nolign
+Affzo [M:PCL]
+Return
+
+$TESTLIG
+EFFACE = 0 : DEPASS = 0
+If NBLI >= dim([M]SELEC)
+ DEPASS = 1
+ ## Affichage message 'Tableau plein' + on efface toutes les lignes qui suivent le dernier réglement à générer (dernière ligne blanche)
+ For T = NBLI-1 To 1 Step -1
+  If [M]SELEC(T) <> 0
+   EFFACE = 1
+   Dela T,1 [M:PCL]NBLIG
+  Else
+   Break
+  Endif
+ Next
+ Call MESSAGE(mess(26,100,1)) From GESECRAN : # Tableau plein
+ If GTRACE<>"" & NBREG>0
+  Call ECR_TRACE(mess(26,100,1)-":"-mess(217,117,1),1) From GESECRAN :
+  # Tableau plein : Tous les règlements n'ont pas pu être générés,  relancez la proposition automatique !
+  NBREG=0
+ Endif
+Endif
+Return
+
+$RECH_DENCOD
+Case [F:DUD]TYP
+ When "*SO","*PO" : [L]DENCOD   = GDIV(1)
+ When Default     : [L]DENCOD   = GDIV(0)
+Endcase
+If [L]TAUX_ESC<0 | ([L]TAUX_ESC=0 & [L]MONT_ESC<0)
+ [L]DENCOD = GDIV(2)
+Elsif [L]TAUX_ESC>0 | ([L]TAUX_ESC=0 & [L]MONT_ESC>0)
+ [L]DENCOD = GDIV(5)
+Endif
+Call LEC_CDA_LEG([F:CPY]LEG,[L]DENCOD) From CPTLEC
+Return
+
+$RECH_IPTTYP
+Case [F:DUD]TYP
+ When "*SO"   : [L]IPTTYP = 1
+ When "*PO"   : [L]IPTTYP = 2
+ When Default : [L]IPTTYP = 3
+Endcase
+Return
+
+
+$CREATION
+Call DEBTRANS From GLOCK
+Gosub TR_CREAT
+If GOK<1 : [L]OK = 0 : Endif
+REP = ""
+Return
+
+$TR_CREAT
+If dim(CALL_PT)>0 & CALL_PT
+ GPE = 0
+ GPOINT = "BEFWRITPD" : Gosub ENTREE From EXEFNC
+ If GPE=1 : Return : Endif
+Endif
+GOK = 1
+Trbegin [TPD2], [TP2]
+For NOL=0 To [M]NBLIG-1
+ If [M:PCL]TYPLIN(NOL)=2
+  Filter [TPD2] Where CPY=[M:PCL]CPY & PAYTYP=[M:PCL]PAYTYP(NOL) & GRPCRI=[M:PCL]GRPCRI(NOL) & FLG=[M:PCL]FLG(NOL)
+&                   & ACCNUM=[M:PCL]ACCNUM(NOL) & DUDLIG=[M:PCL]DUDLIG(NOL) & evalue(CRITFCY) & UIDUSR=adxpid
+  Read [TPD2]TPD0 First
+  Filter [TPD2]
+  If !fstat
+   If [M:PCL]SELEC(NOL) = 1
+    [F:TPD2]FLGCRE = 1
+   Else
+    [F:TPD2]FLGCRE = 2
+   Endif
+   [F:TPD2]AMTCUR = [M:PCL]AMTCUR(NOL)
+   [F:TPD2]AMTDEP = ([M:PCL]AMTDEP(NOL)*-1)
+   [F:TPD2]DEPRAT = [M:PCL]DEPRAT(NOL)
+   [F:TPD2]DEPLTI = [M:PCL]DEPLTI(NOL)
+   If dim([M:PCL]EARDISFLG)>0
+    [F:TPD2]EARDISFLG = [M:PCL]EARDISFLG(NOL)
+   Endif
+
+   ##YYFIN_X3_18111_FEB_PAYPROPAL_BID            X3-21320 (récupération)
+   If dim([M:PCL]BIDNUM)>0
+    [F:TPD2]BID = [M:PCL]BIDNUM(NOL)
+   Endif
+   ##YYFIN_X3_18111_End                          X3-21320 (récupération)
+
+   # Issue X3_26148
+   If dim([M:PCL]BIDCRY)>0
+    [F:TPD2]BIDCRY = [M:PCL]BIDCRY(NOL)
+   Endif
+   # End issue X3_26148
+
+   If [F:TPD2]UIDUSR=0
+    [F:TPD2]UIDUSR = adxpid
+   Endif
+   If dim(CALL_PT)>0 & CALL_PT :
+    GPOINT = "BEFWRITPD2" : Gosub ENTREE From EXEFNC
+   Endif
+   Rewrite [TPD2]
+   If fstat
+    GOK=0 : Call FSTA("TPD2") From GLOCK : Break
+   Endif
+  Endif
+ Elsif [M:PCL]TYPLIN(NOL)=1
+  Read [TP2]TP20 = [M:PCL]CPY ; [M:PCL]PAYTYP(NOL) ; [M:PCL]GRPCRI(NOL) ; [M:PCL]FLG(NOL) ; adxpid
+  If !fstat
+   [F:TP2]FLGCRE = [M:PCL]FLGCRE(NOL)
+   If [F:TP2]UIDUSR=0
+    [F:TP2]UIDUSR = adxpid
+   Endif
+   Rewrite [TP2]
+   If fstat
+    GOK=0 : Call FSTA("TPD2") From GLOCK : Break
+   Endif
+  Endif
+ Endif
+Next
+If GOK=0 : Goto AB_TR_CREAT : Endif
+Commit
+Return
+
+$ROLL_TR_CREAT
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR_CREAT : Endif
+
+$AB_TR_CREAT
+Rollback
+Return
+
+# Issue X3-6418
+$SEL_TABLE
+Case COUZON
+ When "BIDNUM"    : Gosub S_BIDNUM    : # RIB
+Endcase
+
+Return
+
+
+$VERF_TABLE
+Case COUZON
+ When "BIDNUM"    : Gosub V_BIDNUM    : # RIB
+Endcase
+
+Return
+
+$S_BIDNUM
+Local Char CRYA(GLONCRY),CRYB(GLONCRY)
+Local Integer OKA
+
+#Clic droit: Sélection du Rib
+If [M:PCL]BPRPAY(nolign-1) = ""
+  OK=0
+  Return
+Endif
+If not([M:PCL]SELEC(nolign-1) = [V]CST_AYES and ([M:PCL]DACBID(nolign-1) = 1 or [M:PCL]DACBID(nolign-1) = 2))
+  OK=0
+  Return
+Endif
+
+Onerrgo ERREUR From CONTROLE
+If !clalev([F:BID]) : Local File BID [BID] : Endif
+Onerrgo
+If GERREUR : GERREUR=0 : OK=0 : Return : Endif
+Local Integer I
+Local Char FMTBID(30)
+
+ OBJET=""
+ CRITERE = "BPATYP=1 & BPANUM='"+[M]BPRPAY(nolign-1)+"'"
+#CRITERE -= "& BPAADD ='"+[M]BPAPAY(nolign-1)+"'"
+ FMTBID = "30X"
+
+#Parcourir le Pays(CRY) de tous les RIB de la liste : si différents alors le format reste à 30X
+#sinon on prend celui du RIB : FMTBID
+CRYA=[M]BIDCRY(nolign-1)
+CRYB=[M]BIDCRY(nolign-1)
+OKA=1
+For [BID]BID0 Where evalue(CRITERE)
+ CRYA=[F:BID]CRY
+ If CRYA<>CRYB : OKA=0: Break : Endif
+ CRYB=CRYA
+Next
+If OKA
+ Call LEC_TCY([M]BIDCRY(nolign-1)) From CPTLEC
+ If !fstat
+  FMTBID = [F:TCY]BIDFMT
+ Endif
+Endif
+
+Call TITOBJ("BID","",TIT(0)) From CONTOBJ
+
+ NBCOL=9
+ COL(1)  = "CRY"                        : TIT(1)  = "BIDCRY"
+# COL(2)  = "format$(GFMT, BIDNUM)"      : TIT(2)  = "BIDNUM"
+ COL(2)  = "format$('30X', BIDNUM)"      : TIT(2)  = "BIDNUM"
+ COL(3)  = "mess([F:BID]BIDNUMFLG,1,1)" : TIT(3)  = mess(1166,196,1)
+ COL(4)  = "BPAADD"                     : TIT(4)  = mess(33,102,1) # Adresse du RIB
+ COL(5)  = "mess([F:BID]ACCNONREI,1,1)" : TIT(5)  = mess(250,117,1) : COLTYP(4)=1 # Non résident
+ COL(6)  = "PAB1"                       : TIT(6)  = "PAB1"
+ COL(7)  = "PAB2"                       : TIT(7)  = "PAB2"
+ COL(8)  = "BPANUM"                     : TIT(8)  = mess(31,105,1)
+ COL(9)  = "CUR"                        : TIT(9)  = "CUR"
+
+Onerrgo CHUT From CONTROLE
+If !clalev([F:AMZ]) : Local File AMSKZON [AMZ] : Endif
+Onerrgo
+If GERREUR : GERREUR=0 : OK=0 : Return : Endif
+For I=1 To NBCOL
+ Read [AMZ]CODE = "PAY2";TIT(I)
+ If fstat=0
+  Call TEXTE([F:AMZ]INTIT,TIT(I)) From OBJDIV
+ Endif
+Next I
+Read [AMZ]CODE = "PAYPROCTL";TIT(2)
+If fstat=0
+ Call TEXTE([F:AMZ]INTIT,TIT(2)) From OBJDIV
+Endif
+
+SIZCOL=160 : SIZLIG=80 : START="BIDNUM" : ORDRE="BIDNUM;BPAADD"
+Default File [BID]
+
+Return
+
+$V_BIDNUM
+
+[M:PCL]BIDCRY(nolign-1) = [F:BID]CRY
+Affzo [M:PCL]BIDCRY(nolign-1)
+
+#Gosub SET_PAB
+#Gosub SET_VII From VISUBID
+
+Return
+
+$SET_PAB
+[M]PAB1=[F:BID]PAB1
+If dim([M:PAY1]PAB1)>0 : Affzo [PAY1]PAB1 : Else Affzo [PAY2]PAB1 : Endif
+[M]PAB2=[F:BID]PAB2
+If dim([M:PAY1]PAB2)>0 : Affzo [PAY1]PAB2 : Else Affzo [PAY2]PAB2 : Endif
+Return
+
+# End Issue X3-6418
+
+##########################################################################
+## Etiquette ajoutée par le superviseur 27/05/2003 16:42:41 (PP)
+##########################################################################
+Subprog AS_FCY(VALEUR)
+Variable Char    VALEUR()
+End
+
+Subprog C_FCY(VALEUR)
+Variable Char    VALEUR()
+End
+
+
+
+##########################################################################
+## Etiquette ajoutée par le superviseur 23/06/2003 15:11:52 (PP)
+##########################################################################
+Subprog AS_SELEC(VALEUR)
+Variable Integer    VALEUR()
+Gosub SETNOL
+If find([M]TYPLIN(NOL),0,1) : # Ligne vide ou ligne correspondant au règlement
+ mkstat = 1 : End
+Endif
+End
+
+Subprog AM_SELEC(VALEUR)
+Variable Integer    VALEUR()
+Gosub SETNOL
+[M]SELEC(NOL) = VALEUR
+Gosub MAJ_SOLDE
+Gosub MAJ_TOTAL
+If [M]SELEC(NOL) = 1
+ Diszo [M]AMTCUR(NOL), AMTDEP(NOL), SOLDE(NOL)
+Else
+ Actzo [M]AMTCUR(NOL), AMTDEP(NOL), SOLDE(NOL)
+Endif
+
+# Issue X3-6418
+If VALEUR = [V]CST_AYES and ([M:PCL]DACBID(NOL) = 1 or [M:PCL]DACBID(NOL) = 2)
+  Actzo [M:PCL]BIDNUM(nolign-1)
+Else
+  Grizo [M:PCL]BIDNUM(nolign-1)
+Endif
+# End Issue X3-6418
+End
+
+
+$MAJ_SOLDE
+Local Integer I, STAT, SIGN2, IPTTYP
+Local Decimal MONTREG
+Local Decimal ARD, TAUX_ESC, MONT_ESC
+Local Char    DENCOD(GLONCDA), DEVLED(GLONCUR)
+
+Call SETCUR(1,[M:DIA]CPY,DEVLED) From CPTDIV
+Call LEC_CPY([M:DIA]CPY) From CPTLEC
+I = find(1,[M]TYPLIN(NOL+1..[M]NBLIG-1))
+If I
+ SIGN2 = 1
+ If clalev([F:DUD])=0 : Local File GACCDUDATE [DUD] : Endif
+ Read [DUD]DUD1 = [M]ACCNUM(NOL);[M]DUDLIG(NOL)
+ If !fstat
+  TAUX_ESC = [M]DEPRAT(NOL) : MONT_ESC = [M]AMTDEP(NOL)
+  Gosub RECH_DENCOD
+  Gosub RECH_IPTTYP
+  Call LEC_TPY_LEG([F:CPY]LEG,[M]PAYTYP(I+NOL)) From CPTLEC
+  Call SIGN2([F:CDA]ACCSNS,[F:TPY]SNS,[F:DUD]ACCNUM,[F:DUD]DUDLIG,[L]IPTTYP,[L]SIGN2) From PAYDIV
+ Endif
+ MONTREG = [M:PCL]AMTCUR(I+NOL)
+ # MABON - FQ57657 - 07/10/09 - Gestion du champ Devise : doit être à EUR, et donc éventuellement conversion du montant
+ If [M]SELEC(NOL)=1 & [M:PCL]CUR(NOL)<>[M:PCL]CUR(I+NOL) & [M:PCL]CURPYH(NOL)<>[M:PCL]CUR(I+NOL) Then
+   Call CONVERT([M:PCL]CUR(I+NOL),[M:PCL]CUR(NOL),[M:PCL]CURPAY,[F:TPY]RATTYP,[M:PCL]ACCDAT,MONTREG,
+&               MONTREG,[L]STAT) From TRTDEV
+   If [L]STAT Then
+     # Pas de cours de devise [F:DUD]CUR -> [F:PYH]CUR
+     Call ECR_TRACE(mess(16,114,1)-[F:DUD]CUR-"->"-[F:PYH]CUR-"("+format$("D:"+GFMDAT,[F:PYH]ACCDAT)-")",1) From GESECRAN
+     GOK=0
+   Endif
+ Endif
+ If [M]SELEC(NOL)=1 : # On vient de retirer l'échéance
+  MONTREG -= [M:PCL]AMTLIN2(NOL)*SIGN2
+  If MONTREG = 0 & [M:PCL]AMTCUR(I+NOL) <> 0
+   [M:PCL]NBRPAY -= 1
+   [M:PCL]FLGCRE(I+NOL) = 1
+   [M:PCL]NUM(I+NOL) = mess(205,117,1) : # Ne pas générer
+  Endif
+ Elsif [M]SELEC(NOL)=2 : # On vient de (re)sélectionner l'échéance
+  MONTREG += [M:PCL]AMTLIN2(NOL)*SIGN2
+  If MONTREG <> 0 & [M:PCL]AMTCUR(I+NOL) = 0
+   [M:PCL]NBRPAY += 1
+   [M:PCL]FLGCRE(I+NOL) = 2
+   [M:PCL]NUM(I+NOL) = mess(204,117,1) : # Règlement à générer
+  Endif
+ Endif
+ # MABON - FQ57657 - 07/10/09 - Gestion du champ Devise : doit être à EUR, et donc éventuellement conversion du montant
+ If [M]SELEC(NOL)=2 & [M:PCL]CUR(NOL)<>[M:PCL]CUR(I+NOL) & [M:PCL]CURPYH(NOL)<>[M:PCL]CUR(I+NOL) Then
+   Call CONVERT([M:PCL]CUR(NOL),[M:PCL]CUR(I+NOL),[M:PCL]CURPAY,[F:TPY]RATTYP,[M:PCL]ACCDAT,MONTREG,
+&               MONTREG,[L]STAT) From TRTDEV
+   If [L]STAT Then
+     # Pas de cours de devise [F:DUD]CUR -> [F:PYH]CUR
+     Call ECR_TRACE(mess(16,114,1)-[F:DUD]CUR-"->"-[F:PYH]CUR-"("+format$("D:"+GFMDAT,[F:PYH]ACCDAT)-")",1) From GESECRAN
+     GOK=0
+   Endif
+ Endif
+ [M:PCL]AMTCUR(I+NOL) = MONTREG
+ Affzo NBRPAY : Affzo [M]AMTCUR(I+NOL) : Affzo [M]NUM(I+NOL)
+Endif
+Return
+
+$MAJ_TOTAL
+Local Char DEVLED(GLONCUR)
+Call SETCUR(1,[M:DIA]CPY,DEVLED) From CPTDIV
+## On remet à jour [M]AMTLOCLIN et [M]RITLOCLIN pour que le total soit correct... (un *sum est fait dans l'écran)
+If [M]SELEC(NOL)=1
+ [M:PCL]AMTLOCLIN(NOL) = 0
+ If dim([M:PCL]RITLOCLIN(0))>0
+  [M:PCL]RITLOCLIN(NOL) = 0
+ Endif
+Else
+ Local Decimal AMTLOCLIN, RITLOCLIN
+ Call LEC_CPY([M:PCL]CPY) From CPTLEC
+ Call CONVERT([M:PCL]CUR(nolign-1),[F:CPY]ACCCUR,[F:CPY]ACCCUR,[F:TPY]RATTYP,
+&             [M:DIA]ACCDAT,[M:PCL]AMTLIN(nolign-1),AMTLOCLIN,[L]STAT) From TRTDEV
+ If [L]STAT
+  # Pas de cours de devise [M:PCL]CUR(nolign-1) -> [F:CPY]ACCCUR
+  GMESSAGE  = mess(16,114,1)-[M:PCL]CUR(nolign-1)-"->"-[F:CPY]ACCCUR-"("+format$("D:"+GFMDAT,[M:DIA]ACCDAT)-")"
+  mkstat = 2 : Return
+ Endif
+
+ [M]AMTLOCLIN(NOL) = [L]AMTLOCLIN*[M]SIGN2(NOL)
+
+ If dim([M:PCL]RITAMT)>0
+  Call CONVERT([M:PCL]CUR(nolign-1),DEVLED,DEVLED,[F:TPY]RATTYP,
+&              [M:DIA]ACCDAT,[M:PCL]RITAMT(nolign-1),RITLOCLIN,[L]STAT) From TRTDEV
+  If [L]STAT
+   # Pas de cours de devise [M:PCL]CUR(nolign-1) -> [F:CPY]ACCCUR
+   GMESSAGE  = mess(16,114,1)-[M:PCL]CUR(nolign-1)-"->"-[F:CPY]ACCCUR-"("+format$("D:"+GFMDAT,[M:DIA]ACCDAT)-")"
+   mkstat = 2 : Return
+  Endif
+  [M]RITLOCLIN(NOL) = [L]RITLOCLIN*[M]SIGN2(NOL)
+ Endif
+Endif
+
+# GRNA 18.08.11
+[M]TOTAMTCPY = sigma(0,[M]NBLIG-1,[M]AMTLOCLIN(indcum)*([M:PCL]SELEC(indcum)=2))
+If dim([M]RITLOCLIN(0))>0
+ [M]TOTAMTCPY += sigma(0,[M]NBLIG-1,[M]RITLOCLIN(indcum)*([M:PCL]SELEC(indcum)=2))
+Endif
+Affzo TOTAMTCPY
+Return
+
+
+Subprog AV_NUM(VALEUR)
+Variable Char    VALEUR()
+End
+
+Subprog AS_AMTCUR(VALEUR)
+Variable Decimal VALEUR
+Gosub SETNOL
+If [M]TYPLIN(NOL)=1
+ mkstat = 2 : End
+Elsif [M]SELEC(NOL)<>2
+ mkstat = 2 : End
+Endif
+End
+
+Subprog C_AMTCUR(VALEUR)
+Variable Decimal VALEUR
+Gosub SETNOL
+Read [DUD]DUD1 = [M]ACCNUM(NOL);[M]DUDLIG(NOL)
+If !fstat & VALEUR>[F:DUD]AMTCUR-[F:DUD]PAYCUR-[F:DUD]TMPCUR
+ # Montant supérieur au montant restant à règler
+ GMESSAGE = mess(206,117,1)
+ mkstat=2 : End
+Endif
+End
+
+
+Subprog AM_AMTCUR(VALEUR)
+Variable Decimal VALEUR
+Local Decimal MONTANT
+Gosub SETNOL
+MONTANT = VALEUR+([M:PCL]AMTDEP(NOL)*-1)
+Gosub MAJ_AMTLIN2
+[M:PCL]SOLDE(NOL) = [M:PCL]OAMTCUR(NOL)-VALEUR
+If [M:PCL]SOLDE(NOL)=0
+ [M:PCL]SOLDE(NOL)=[M:PCL]OAMTCUR(NOL)
+Endif
+Affzo [M:PCL]SOLDE(NOL)
+End
+
+Subprog AS_AMTDEP(VALEUR)
+Variable Decimal VALEUR
+Gosub SETNOL
+If [M]TYPLIN(NOL)=1
+ mkstat = 1 : End
+Elsif [M]SELEC(NOL)<>2
+ mkstat = 2 : End
+Elsif [M]DEP(NOL)=""
+ mkstat = 2 : End
+Endif
+End
+
+Subprog AM_AMTDEP(VALEUR)
+Variable Decimal VALEUR
+Local Decimal MONTANT
+Gosub SETNOL
+MONTANT = [M:PCL]AMTCUR(NOL)+(VALEUR*-1)
+Gosub MAJ_AMTLIN2
+End
+
+$MAJ_AMTLIN2
+Local Integer STAT
+Local Decimal MONTREG, AMTLOCLIN
+Local Decimal OAMTLIN2
+Local Char    DEVLED(GLONCUR)
+Call SETCUR(1,[M:DIA]CPY,DEVLED) From CPTDIV
+Call LEC_CPY([M:DIA]CPY) From CPTLEC
+Call LEC_TPY_LEG([F:CPY]LEG,[M:PCL]PAYTYP(NOL)) From CPTLEC
+# Solde => Champ AMTLIN (correspond à [PYD]AMTLIN)
+OAMTLIN2 = [M:PCL]AMTLIN2(NOL)
+[M:PCL]AMTLIN(NOL) = MONTANT
+[M:PCL]AMTLIN2(NOL) = [M:PCL]AMTLIN(NOL)
+If dim([M:PCL]RITAMT2)>0
+ [M:PCL]AMTLIN2(NOL) += [M:PCL]RITAMT2(NOL) * [M:PCL]SIGN(NOL)
+Endif
+If [M:PCL]CURPYH(NOL)<>[M:PCL]CUR(NOL)
+ Call CONVERT([M:PCL]CUR(NOL),[M:PCL]CURPYH(NOL),DEVLED,[F:TPY]RATTYP,[M:DIA]ACCDAT,[M:PCL]AMTLIN2(NOL),
+&             [M:PCL]AMTLIN2(NOL),STAT) From TRTDEV
+ If STAT
+  # Pas de cours de devise [M:PCL]CUR(NOL)-> [M:PCL]CURPYH(NOL)
+  Call ECR_TRACE(mess(16,114,1)-[M:PCL]CUR(NOL)-"->"-[M:PCL]CURPYH(NOL)-"("+format$("D:"+GFMDAT,[M:DIA]ACCDAT)-")",1) From GESECRAN
+  Return
+ Endif
+Endif
+I = find(1,[M]TYPLIN(NOL+1..[M]NBLIG-1))
+If I
+ # NB : [M:PCL]AMTCUR(I+NOL) est le montant du règlement en devise du règlement (ça correspond à la somme des montants
+ # des échéances imputées au règlement convertis en devise règlement (Somme des [M:PCL]AMTLIN2 des lignes correspondant
+ # aux échéances de règlement
+ [M:PCL]AMTCUR(I+NOL) = [M:PCL]AMTCUR(I+NOL)-(OAMTLIN2*[M]SIGN2(NOL))+([M:PCL]AMTLIN2(NOL)*[M]SIGN2(NOL))
+ Affzo [M]AMTCUR(I+NOL)
+Endif
+Call CONVERT([M:PCL]CUR(NOL),[F:CPY]ACCCUR,[F:CPY]ACCCUR,[F:TPY]RATTYP,
+&            [M:DIA]ACCDAT,[M:PCL]AMTLIN(NOL),AMTLOCLIN,[L]STAT) From TRTDEV
+If [L]STAT
+ # Pas de cours de devise [M:PCL]CUR(NOL) -> [F:CPY]ACCCUR
+ Call ECR_TRACE(mess(16,114,1)-[M:PCL]CUR(NOL)-"->"-[F:CPY]ACCCUR-"("+format$("D:"+GFMDAT,[M:DIA]ACCDAT)-")",1) From GESECRAN
+ Return
+Endif
+
+[M]AMTLOCLIN(NOL) = [L]AMTLOCLIN*[M]SIGN2(NOL)
+
+# GRNA 18.08.11
+[M]TOTAMTCPY = sigma(0,[M]NBLIG-1,[M]AMTLOCLIN(indcum)*([M:PCL]SELEC(indcum)=2))
+If dim([M]RITLOCLIN(0))>0
+ [M]TOTAMTCPY += sigma(0,[M]NBLIG-1,[M]RITLOCLIN(indcum)*([M:PCL]SELEC(indcum)=2))
+Endif
+Affzo TOTAMTCPY
+Return
+
+
+$SETNOL
+Local Integer NOL
+NOL = nolign-1
+Return
+
+
+
+Subprog C_NBLIG
+End
+
+
+Subprog AV_RITAMT(VALEUR)
+Variable Decimal VALEUR
+GFMT = "NPz3:"+GDEVFMT
+If ((func AFNC.ACTIV("KIT") and func AFNC.PARAM("RTZPRW",[M:PCL]CPY)<>"2") or func AFNC.ACTIV("KIT") = 0) and
+&  ((func AFNC.ACTIV("KAG") and func AFNC.PARAM("ARGRTZ",[M:PCL]CPY)<>"2") or func AFNC.ACTIV("KAG") = 0)# Issue X3-107197
+ GFMT = "-NPz3:"+GDEVFMT
+Endif
+End
+
+
+######################################################################################
+Subprog IB_NBLIG
+
+# Invoice tunnel
+If !clalev ([F:PIL]) Local File BPSINVLIG [PIL] Endif
+If !clalev ([F:SIL]) Local File BPCINVLIG [PIL] Endif
+
+GBOUT1 -= [M]NUM(nolign-1)
+Raz [M]INVTYP(nolign-1)
+If [M]NUM(nolign-1)<>""
+  Look [PIL]PIL0(1)=[M]NUM(nolign-1)
+  If !fstat
+    [M]INVTYP(nolign-1) = "BIS" : End
+  Endif
+  Look [PIH]PIH0=[M]NUM(nolign-1)
+  If !fstat
+    [M]INVTYP(nolign-1) = "PIH" : End
+  Endif
+  Look [SIL]SIL0(1)=[M]NUM(nolign-1)
+  If !fstat
+    [M]INVTYP(nolign-1) = "BIC" : End
+  Endif
+  Look [SIH]SIH0=[M]NUM(nolign-1)
+  If !fstat
+    [M]INVTYP(nolign-1) = "SIH" : End
+  Endif
+Endif
+Raz GBOUT1
+End
+
+# Issue X3-4141
+
+Subprog D_BIDNUM(VALEUR)
+Variable Char    VALEUR()
+
+  If [M:PCL]FLGCRE(nolign-1) <> 2 and [M:PCL]NUM(nolign-1) <> ""
+    If [M:DI1]ALLTPY = [V]CST_AYES or ([M:DI1]ALLTPY <> [V]CST_AYES and ([M:PCL]DACBID(nolign-1) = 1 or [M:PCL]DACBID(nolign-1) = 2))
+      Chgfmt [M:PCL]BIDCRY(nolign-1) With "K:" + num$(GLONCRY) + "#"
+      GAFF_FMT = 1
+      Chgfmt [M:PCL]IBAN(nolign-1) With "K:4#"
+      If GFMT = ""
+        GFMT = num$(GLONBID) + "#"
+      Endif
+
+      # Issue X3-6418
+      If VALEUR = "" and ([M:PCL]DACBID(nolign-1) = 1 or [M:PCL]DACBID(nolign-1) = 2)
+        # Issue X3-21320
+        If dim(GSDDMGT)>0 & GSDDMGT=2 & [M:PCL]SIGN2(nolign-1)=1
+          Call LEC_CPY([M:DIA]CPY) From CPTLEC
+          Call LEC_TPY_LEG([F:CPY]LEG,[M:PCL]PAYTYP(nolign-1)) From CPTLEC
+          If  [F:TPY]EPACDTTRF=2 and [F:TPY]SNS = 2
+            Read [DUD]DUD1 = [M:PCL]ACCNUM(nolign-1);[M:PCL]DUDLIG(nolign-1)
+            Call LEC_MDT([F:DUD]CPY,[F:DUD]UMRNUM) From CPTLEC
+            VALEUR = [F:MDT]BIDNUM
+            Call IBAN([M:PCL]BIDCRY(nolign-1), VALEUR, [M:PCL]IBAN(nolign-1)) From TRTBPA
+            Affzo [M:PCL]BIDCRY(nolign-1), IBAN(nolign-1)
+          Else
+            Gosub _READ_DFLT_BIDNUM
+          Endif
+        Else
+        # Else Issue X3-21320
+          Gosub _READ_DFLT_BIDNUM
+        Endif
+        # End Issue X3-21320
+      Endif
+      # End Issue X3-6418
+
+      # BIDNUM's chgfmt done in W2PPROPAL traitment
+      # Issue X3-4137
+      If [M:PCL]DACBID(nolign-1) = 1 or [M:PCL]DACBID(nolign-1) = 2
+        If VALEUR = ""
+          Chgstl[M:PCL]NBLIG(nolign-1) With "TDBRED"
+        Else
+          Chgstl[M:PCL]NBLIG(nolign-1) With ""
+        Endif
+      Endif
+      # End Issue X3-4137
+    Else
+      [M:PCL]BIDCRY(nolign-1) = ""
+      [M:PCL]IBAN(nolign-1) = ""
+      [M:PCL]BIDNUM(nolign-1) = ""
+
+      Chgfmt [M:PCL]BIDCRY(nolign-1) With "-K:" + num$(GLONCRY) + "#"
+      Chgfmt [M:PCL]IBAN(nolign-1) With "-K:4#"
+      Chgfmt [M:PCL]BIDNUM(nolign-1) With "-K:" + num$(GLONBID) + "#"
+      GFMT = "" # It's done to shunt AV_BIDNUM's chgfmt in W2PPROPAL traitment
+      # BIDNUM's chgfmt done in W2PPROAL traitment
+
+    Endif
+  Else
+    If GAFF_FMT
+      [M:PCL]BIDCRY(nolign-1) = ""
+      Affzo [M:PCL]BIDCRY(nolign-1)
+    Else
+      Chgfmt [M:PCL]BIDNUM(nolign-1) With "-K:" + num$(GLONBID) + "#"
+      GFMT = "" # It's done to shunt AV_BIDNUM's chgfmt in W2PPROPAL traitment
+    Endif
+  Endif
+
+End
+
+Subprog AV_BIDNUM(VALEUR)
+Variable Char    VALEUR()
+
+  If [M:PCL]FLGCRE(nolign-1) <> 2 and [M:PCL]NUM(nolign-1) <> ""
+    If [M:DI1]ALLTPY = [V]CST_AYES or ([M:DI1]ALLTPY <> [V]CST_AYES and ([M:PCL]DACBID(nolign-1) = 1 or [M:PCL]DACBID(nolign-1) = 2))
+
+      # Issue X3-4137
+      If [M:PCL]DACBID(nolign-1) = 1 or [M:PCL]DACBID(nolign-1) = 2
+        If VALEUR = ""
+          Chgstl[M:PCL]NBLIG(nolign-1) With "TDBRED"
+        Else
+          Chgstl[M:PCL]NBLIG(nolign-1) With ""
+        Endif
+      Endif
+    Endif
+  Endif
+End
+# End Issue X3-4141
+
+# Issue X3-4137
+Subprog AP_BIDNUM(VALEUR)
+Variable Char    VALEUR()
+
+  If [M:PCL]FLGCRE(nolign-1) <> 2 and [M:PCL]NUM(nolign-1) <> ""
+    If ([M:PCL]DACBID(nolign-1) =  1 or [M:PCL]DACBID(nolign-1) = 2)
+      If VALEUR = ""
+        Chgstl[M:PCL]NBLIG(nolign-1) With "TDBRED"
+      Else
+        Chgstl[M:PCL]NBLIG(nolign-1) With ""
+      Endif
+    Else
+      GFMT = "" # It's done to shunt AV_BIDNUM's chgfmt in W2PPROPAL traitment
+    Endif
+  Else
+    [M:PCL]BIDCRY(nolign-1) = ""
+  Endif
+
+End
+# End Issue X3-4137
+
+# Issue X3-6418
+
+Subprog AS_BIDNUM(VALEUR)
+Variable Char    VALEUR()
+
+  # for empty or total line
+  If not([M:PCL]SELEC(nolign-1) = [V]CST_AYES and ([M:PCL]DACBID(nolign-1) = 1 or [M:PCL]DACBID(nolign-1) = 2))
+    Grizo [M:PCL]BIDNUM(nolign-1)
+  Endif
+
+  # Issue X3-21320
+  If dim(GSDDMGT)>0 & GSDDMGT=2 & [M:PCL]SIGN2(nolign-1)=1
+   Call LEC_CPY([M:DIA]CPY) From CPTLEC
+   Call LEC_TPY_LEG([F:CPY]LEG,[M:PCL]PAYTYP(nolign-1)) From CPTLEC
+   If [F:TPY]EPACDTTRF=2
+    mkstat = 2
+   Endif
+  Endif
+  # End issue X3-21320
+End
+
+Subprog AM_BIDNUM(VALEUR)
+Variable Char    VALEUR()
+# X3-99013 2018-07-27 Bader begin
+If (dim(GSWIPAYBVR) > 0 and GSWIPAYBVR = 2) or (dim(GSWIPAYQR) > 0 and GSWIPAYQR = 2) Then # parameter "Swiss ISR/QR checks in payments" = yes?
+    Gosub AM_BIDNUM From PAYPROPAL2SWI
+    If mkstat : End : Endif
+Endif
+# X3-99013 2018-07-27 Bader end
+
+#X3-21320 LS start
+If VALEUR <>""
+ If clalev([F:BID])=0 : Local File BID [BID] : Endif
+ # Is the bidnum exist for the bpartner ?
+ Filter [BID] Where BPATYP=1 & BPANUM=[M:PCL]BPRPAY(nolign-1) & BIDNUM=VALEUR
+ Look [BID]BID0 First
+ Filter [BID]
+ If fstat
+  # The bidnum does not exist.
+  # Does the partner have any bidnum ?
+  Filter [BID] Where BPATYP=1 & BPANUM=[M:PCL]BPRPAY(nolign-1)
+  Look [BID]BID0 First
+  Filter [BID]
+  If !fstat
+   # The bpartner has some bidnum, then you have to fill the bidnum with one of them
+   GMESSAGE = mess(27,199,1)
+   mkstat = 2 : End
+  Endif
+ Endif
+Endif
+#X3-21320 LS end
+
+  If VALEUR = ""
+    [M:PCL]IBAN(nolign-1) = ""
+  Else
+    Call IBAN([M:PCL]BIDCRY(nolign-1), VALEUR, [M:PCL]IBAN(nolign-1)) From TRTBPA # Issue X3-6418
+  Endif
+  Affzo [M:PCL]IBAN(nolign-1)
+
+  If VALEUR <> [M:PCL]BIDNUM(nolign-1)
+    Gosub _DISPATCH_BIDNUM
+  Endif
+End
+
+# When an IBAN is selected, it must be put on the common other lines of payment
+$_DISPATCH_BIDNUM
+Local Integer I
+
+  # Dispatch the IBAN to the back
+  I = nolign
+  While I < [M:PCL]NBLIG
+    If [M:PCL]FLGCRE(I) = 2 or [M:PCL]NUM(I) = ""
+      Break
+    Endif
+
+    If [M:PCL]SELEC(I) = [V]CST_AYES
+      [M:PCL]BIDCRY(I) = [M:PCL]BIDCRY(nolign-1)
+      [M:PCL]IBAN(I) = [M:PCL]IBAN(nolign-1)
+      [M:PCL]BIDNUM(I) = VALEUR
+      Affzo [M:PCL]BIDCRY(I), IBAN(I), BIDNUM(I)
+    Endif
+    I += 1
+  Wend
+
+  # Dispatch the IBAN to the top
+  I = nolign - 2
+  While I >= 0
+    If [M:PCL]FLGCRE(I) = 2 or [M:PCL]NUM(I) = ""
+      Break
+    Endif
+
+    If [M:PCL]SELEC(I) = [V]CST_AYES
+      [M:PCL]BIDCRY(I) = [M:PCL]BIDCRY(nolign-1)
+      [M:PCL]IBAN(I) = [M:PCL]IBAN(nolign-1)
+      [M:PCL]BIDNUM(I) = VALEUR
+      Affzo [M:PCL]BIDCRY(I), IBAN(I), BIDNUM(I)
+    Endif
+    I -= 1
+  Wend
+
+Return
+
+$_READ_DFLT_BIDNUM
+# X3-99013 2018-07-27 Bader begin
+  If (dim(GSWIPAYBVR) > 0 and GSWIPAYBVR = 2) or (dim(GSWIPAYQR) > 0 and GSWIPAYQR = 2) Then # parameter "Swiss ISR/QR checks in payments" = yes?
+      Gosub D_BIDNUM From PAYPROPAL2SWI
+  Endif
+
+  If VALEUR = ""      # no QR or ISR BIDNUM found > do standard
+# X3-99013 2018-07-27 Bader end
+      Filter [BID] Where BPATYP = 1 and BPANUM = [M:PCL]BPRPAY(nolign - 1) and BPAADD = [M:PCL]BPAPAY(nolign - 1) and BIDNUMFLG = 2
+      Read [BID]BID2 First
+
+      If fstat = 0
+        [M:PCL]BIDCRY(nolign-1) = [F:BID]CRY
+        VALEUR = [F:BID]BIDNUM
+        Call IBAN([M:PCL]BIDCRY(nolign-1), VALEUR, [M:PCL]IBAN(nolign-1)) From TRTBPA
+        Affzo [M:PCL]BIDCRY(nolign-1), IBAN(nolign-1)
+      Endif
+      Filter [BID]
+# X3-99013 2018-07-27 Bader begin
+  Endif
+# X3-99013 2018-07-27 Bader end
+Return
+# End Issue X3-6418
+

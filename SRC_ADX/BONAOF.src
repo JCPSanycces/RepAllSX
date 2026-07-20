@@ -1,0 +1,260 @@
+#<AdxTL>@(#)7.0.0.0 $Revision$
+#########################################################################
+# BONAOF : Impression du bon d'appel d'offre                            #
+# --------------------------------------------------------------------- #
+# Chargement des paramètres et mise à jour de l'indicateur d'impression #
+#########################################################################
+
+$ACTION
+Case ACTION
+  When "CONTPRT" : Gosub CONTPRT
+Endcase
+Return
+
+#########################################################################
+
+#-----------------------------------------#
+# Contrôle destination (choix imprimante) #
+# --------------------------------------- #
+#  Préchargement du nombre de copies      #
+#  Par défaut provient des destinations   #
+#-----------------------------------------#
+$CONTPRT
+#------ Préchargement si contexte gestion de commandes d'achat -----#
+If GFONCTION="GESPQH" & clalev([M:PQH1])
+  If !find([M:RPT]IMPRIME,1,3,4)
+    [M:RPT]NBRCPY=max([M:PQH1]COPNBR,1) : # Nombre de copies
+  Else
+    [M:RPT]NBRCPY=0 : # pas de copie pour prévisu, message, fichier
+  Endif
+Endif
+#-----
+Return
+
+#########################################################################
+
+Subprog IMPRIME(NBPAR,PARAMETRE)
+Value    Integer NBPAR
+Variable Char    PARAMETRE()()
+#-----
+Call EXEC(NBPAR,PARAMETRE)
+#-----
+End
+
+#########################################################################
+
+Subprog EXEC(NBPAR,PARAMETRE)
+Value    Integer NBPAR
+Variable Char    PARAMETRE()()
+#-----
+Gosub OUVRE   : # Ouverture des tables
+If GERREUR  GERREUR=0 : End : Endif
+#-----
+Gosub DECLARE : # Déclaration des variables locales
+#-----
+[L]CRITERE = "1=1"
+For I=1 To NBPAR
+  J=instr(1,[L]PARAMETRE(I),"=")
+  If J
+    [L]PARAM  = left$([L]PARAMETRE(I),J-1)
+    Call GETPARAM([L]PARAM,NBPAR,PARAMETRE,[L]VALEUR) From ETAT
+    Case [L]PARAM
+      When "X3ETA"           : [L]ETAT     = [L]VALEUR
+      When "__REQUETE"       : [L]NUMREQ   = val([L]VALEUR)
+      When "sitedeb"         : [L]CRITERE -= "& PQHFCY>='"+[L]VALEUR+"'"
+      When "sitefin"         : [L]CRITERE -= "& PQHFCY<='"+[L]VALEUR+"'"
+      When "fournisseurdeb"  : [L]CRITERE -= "& BPSNUM>='"+[L]VALEUR+"'"
+      When "fournisseurfin"  : [L]CRITERE -= "& BPSNUM<='"+[L]VALEUR+"'"
+      When "appeldeb"        : [L]CRITERE -= "& PQHNUM>='"+[L]VALEUR+"'"
+      When "appelfin"        : [L]CRITERE -= "& PQHNUM<='"+[L]VALEUR+"'"
+# -- Bug 45845
+      When "datedeb"     : [L]DATREFD = [L]VALEUR
+      When "datefin"     : [L]DATREFF  = [L]VALEUR
+
+      When "codimp"          : [L]CRITERE -= "& PRNFLG=" +num$([L]VALEUR)
+                               [L]IMPR     = val([L]VALEUR)
+      When "numedt"          : [L]PARAMETRE(I) = "numedt="+num$([L]NUMREQ)
+      When "usr"             : [L]PARAMETRE(I) = "usr="+GUSER
+      When "etat"            : [L]PARAMETRE(I) = "etat="+[L]ETAT
+    Endcase
+  Endif
+Next
+# Issue 89114 - 2013-04-04 by SR : etat enchaine
+Look [ARM]ARM0 = [L]NUMREQ;GUSER;[F:ARP]RPTCOD;1
+If !fstat
+  # Enreg trouvé, car lancement enchainé
+  # On bloque la boucle
+  End
+  #On laisse GOK=1 sinon l'état ne sort pas
+Endif
+
+#-----
+Filter [PQF] Where evalue([L]CRITERE)
+Gosub TRT_PQF
+End
+
+#########################################################################
+
+$TRT_PQF
+Raz WNUMLIG
+Default File [PQF]
+For [PQF] PQF0
+# -- Bug 45845
+  Gosub TRT_PQH
+  If PQH_PRENDRE
+      Call DEBTRANS From GLOCK
+      If [L]IMPR=1
+        Gosub TR1
+      Else
+        Gosub TR2
+      Endif
+  Endif
+Next
+Return
+
+##########################################################################
+
+$TR1
+Trbegin [PQF] , [ARM], [TPRPT]
+#----- Mise à jour table appel d'offre fournisseur si demande d'impression -----#
+If [L]IMPR = 1
+ Readlock [PQF] PQF0 Curr
+ If fstat = 1 : GOK = -1 : GLOCK = "$PQUOTATF" : Goto ROLL_TR1
+ Elsif fstat  : GOK = 0 : Call RSTA("PQF","*") From GLOCK : Goto AB_TR1
+ Endif
+ [F:PQF]PRNFLG = 2
+ Rewrite [PQF]
+ If fstat=1
+  GOK=-1 : GLOCK="$PQUOTATF"-[F:PQF]PQHNUM
+  Goto ROLL_TR1
+ Elsif fstat
+  GOK=0 : Call RSTA("PQUOTATF",[F:PQF]PQHNUM) From GLOCK : Goto AB_TR1
+ Endif
+Endif
+#----- Création d'un enregistrement dans la table AREPORTM -----#
+WNUMLIG += 1
+Raz [F:ARM]
+[F:ARM]USR    = GUSER
+[F:ARM]RPTCOD = [F:ARP]RPTCOD
+[F:ARM]NUMREQ = [L]NUMREQ
+[F:ARM]NUMLIG = WNUMLIG
+[F:ARM]CLEA1  = [F:PQF]PQHNUM
+[F:ARM]CLEA2  = [F:PQF]BPSNUM
+[F:ARM]CREDAT = date$
+Write [F:ARM]
+If fstat : GOK = 0 : Call FSTA("ARM") From GLOCK : Goto AB_TR1 : Endif
+#-----
+
+# Issue 110704
+# Issue 110704 - 2015-12-22 by RICAR : Updating the parameters
+If [L]CKPO = 1
+ Gosub ALIM_TMPPRPT
+ If GOK = 0 : Goto AB_TR1 : Endif
+Endif
+# End issue 110704
+
+Commit
+Return
+
+$ROLL_TR1
+Rollback : Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+
+$AB_TR1
+Rollback
+Return
+
+##########################################################################
+
+$TR2
+Trbegin [ARM], [TPRPT]
+#----- Création d'un enregistrement dans la table AREPORTM -----#
+WNUMLIG += 1
+Raz [F:ARM]
+[F:ARM]USR    = GUSER
+[F:ARM]RPTCOD = [F:ARP]RPTCOD
+[F:ARM]NUMREQ = [L]NUMREQ
+[F:ARM]NUMLIG = WNUMLIG
+[F:ARM]CLEA1  = [F:PQF]PQHNUM
+[F:ARM]CLEA2  = [F:PQF]BPSNUM
+[F:ARM]CREDAT = date$
+Write [F:ARM]
+If fstat : GOK = 0 : Call FSTA("ARM") From GLOCK : Goto AB_TR2 : Endif
+#-----
+
+# Issue 110704
+# Issue 110704 - 2015-12-22 by RICAR : Updating the parameters
+If [L]CKPO = 1
+ Gosub ALIM_TMPPRPT
+ If GOK = 0 : Goto AB_TR2 : Endif
+Endif
+# End issue 110704
+
+Commit
+Return
+
+$ROLL_TR2
+Rollback : Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR2 : Endif
+
+$AB_TR2
+Rollback
+Return
+
+###########################################################################
+
+$OUVRE
+Local File PQUOTATF [PQF], AREPORTM [ARM], PQUOTAT [PQH]
+# BRBAN 25/11/2014 - 97101
+Local File TMPPRPT    [TPRPT]
+
+Return
+
+$DECLARE
+Local Char    CRITERE(255), PARAM(30) , VALEUR(30) , ETAT(GLONARP)
+Local Integer WNUMLIG, NUMREQ, IMPR, I, J, PQH_PRENDRE
+Local Date    DATREFD, DATREFF
+Local Integer CKPO : [L]CKPO = 0
+Local Char    PREPQHNUM(GLONVCR) : [L]PREPQHNUM = ""
+
+If func AFNC.ACTIV("KPO")
+  [L]CKPO = 1
+Endif
+
+Return
+#########################################################################
+# -- Bug 45845
+#########################################################################
+$TRT_PQH
+# Par défaut, on prend la l'enregistrement
+PQH_PRENDRE = 1
+
+# Lecture de l'entête d'appel d'offre PQH
+Read [PQH]PQH0 = [PQF]PQHNUM
+If fstat
+   PQH_PRENDRE = 0
+Else
+# Test si la date est de retour est comprise dans les bornes
+    If [PQH]PQHDAT >=  gdat$(01,01,1800) and
+& (([L]DATREFD>=  gdat$(01,01,1800) and [PQH]PQHDAT < [L]DATREFD) or ([L]DATREFF>=  gdat$(01,01,1800) and [PQH]PQHDAT > [L]DATREFF))
+      PQH_PRENDRE = 0
+    Endif
+Endif
+Return
+#########################################################################
+$ALIM_TMPPRPT
+
+If [L]PREPQHNUM <> [F:PQH]PQHNUM
+  Raz [F:TPRPT]
+
+  [F:TPRPT] = [F:ARM]
+  [F:TPRPT]VCRNUM = [F:PQH]PQHNUM
+
+  Write [F:TPRPT]
+  If fstat : GOK=0 : Call FSTA("TPRPT") From GLOCK : Endif
+Endif
+[L]PREPQHNUM = [F:PQH]PQHNUM
+
+Return
+#########################################################################
+

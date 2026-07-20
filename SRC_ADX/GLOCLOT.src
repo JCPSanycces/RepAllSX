@@ -1,0 +1,2119 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+################################################################################
+#    CLOTURE SOCIETE AMORTISSEMENTS
+#
+#    Création le : 27/09/2007
+#-------------------------------------------------------------------------------
+# PROGRAMMES ACTIONS :
+#-------------------------------------------------------------------------------
+#    Modifications :
+#    MWA - 04.09.2018 X3-104535 Parameters linked to activity code
+#    MDJ - 06.03.2015 FQ79662 : Posting type depending on the value of the parameter DEFPSTTYP
+#    GLE - 06.03.2014 FQ97426 : Changement de la gestion des licences
+#    MDJ - 13.02.2014 FQ96817 : Calcul cumul subvention réintégré NOK (FQ73778 en V5)
+#    MWA - 12.02.2014 FQ96429 : Adaptation du code relatif au champ GRTFLG qui n'existe plus dans la table CONTEXT
+#    GLE - 20.12.2013 FQ95251 : Optimisation du traitement
+#    CBO - 14.10.2013 FQ91644 : Appel de PARAM from ADOVAL
+#    GLE - 22.02.2013 FQ87713 : Prise en compte d'une date de fin éventuelle dans la création des plans de production
+#    CBO - 08.10.2012 FQ67615 : low value asset
+#    GLE - 24.09.2012 FQ84727 : Flux non générés si plusieurs plans suivant les flux dans un même contexte
+#    MWA - 05.07.2012 FQ80825 : Arrêt redémarrage des modes roumains
+#    GLE - 23.04.2012 FQ81751 : DEPREC des biens "1er bien de la concession" supprimés à tort
+#    GLE - 29.03.2012 FQ81180 : Correction suite FQ80757 pour SQL Server
+#    GLE - 14.03.2012 FQ80757 : Optimisation de la suppression des DEPREC pour les biens sortis dans l'exercice
+#    CBO - 12.03.2012 FQ80246 : GFMDAT4 au lieu de DD[/]MM[/]YYYY
+#    MWA - 08.08.2011 FQ75597 : Suppression de l'alimentation du plafond de reprise de dépréciation
+#    GLE - 30.06.2011 FQ74668 : Pas d'evt. FASMTC suite à clôture exe. pour un bien déprécié
+#    GBO - 09.02.2011 FQ67577 : Pologne - Modernisation
+#    GBO - 23.12.2010 FQ70142 : Remplacement EXTISSFLG=G_NON par EXTISSFLG<>G_OUI
+#    GLE - 12.11.2010 FQ66894 : Optimisation de la génération des flux
+#    GLE - 03.06.2010 FQ59941 : Gestion des modes russes
+#    GLE - 18.05.2010 FQ64478 : Correction des sources - génération événement Actualisation de subvention
+#    GLE - 11.02.2010 FQ54343 : Gestion des concessions
+#    GLE - 29.01.2010 FQ62087 : Le compteur des biens sortis dans la trace du traitement était faux
+#    GLE - 02.10.2009 FQ58364 : Optimisation de la clôture : une seule mise à jour du bien par contexte
+#    MWA - 28.07.2008 FQ46680 : Nouvelles règles de TVA 2008
+################################################################################
+Local Char VALBOUT(30)
+Local Char PARBOUT(250)(1..10)
+VALBOUT = "12"
+Call TRAITE_CHAR(VALBOUT,PARBOUT,"","FASCLOTURE","DFASCLO",3, "") From GTRAITE
+End
+
+#-------------------------------------------------------------------------------
+$CLOTURER
+
+Local Integer LTBCNX(1..GMAXCNXC,0..GTBCNX)
+Local Integer N_E, N_I, RERROR
+Local Integer LRETENTECLC, LNBSLEEP, LFASCNT, LFASMAX
+
+  If !clalev([M:FPC]) : Local Mask FASPARCPY [FPC] : Endif
+
+  If !GSERVEUR Then
+    Call OUVRE_TRACE(mess(50,GML_MSGCAL,1)) From LECFIC : # Clôture
+  Endif
+  # ------------------------------
+  Call ECR_TRACE(mess(62,GML_MSGCAL,1),0) From GESECRAN : # COMPTE RENDU TRAITEMENT DE CLOTURE
+  # ------------------------------
+  # Mise à  jour du compteur NOMBCO avec le nombre de biens à prendre en compte dans le cumul
+  # On calcule le nombre de biens non sortis pour une CIG, et immédiatement on interromp la
+  # clôture si la limite est dépassée.
+  Call FASCNT(LFASCNT,RERROR) From TRTLIC
+  If RERROR Then
+    RERROR = -1
+    Call ECR_TRACE(mess(136,7770,1),1) From GESECRAN
+    Return
+  Endif
+  #
+  #Call NOMBRE(1, LFASMAX) From GLOCK : # FQ97426
+  LFASMAX = func TRTLIC.GET_FASMAX()  : # FQ97426
+  NIVDEP = func TRTLIC.FASRAT(LFASMAX, LFASCNT)
+  If NIVDEP = 2 Then
+    Call ECR_TRACE(mess(111,7770,1)-mess(112,7770,1),1) From GESECRAN
+    RERROR = -1
+    Return
+  Endif
+  #
+  Call ECR_TRACE("\"+mess(73,7771,1)-":"-mess(max([M:FAST]FLGSIM,1),1,1),0) From GESECRAN : # Simulation
+  #>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  Repeat
+    LRETENTECLC = 0
+    LNBSLEEP    = 0
+    #>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    For N_E = 1 To [M:FAST]NBCPY
+      If [M:FAST]CLC(N_E-1) = G_OUI
+&        and (([M:FAST]CODRETCLC(N_E-1)= 0 and [M:FAST]NBRTRY(N_E-1) <> -1)
+&          or ([M:FAST]CODRETCLC(N_E-1)=-3 and [M:FAST]NBRTRY(N_E-1) > 0)) Then
+        #------------------------------
+        # Si la société est à clôturer
+        # ET qu'une tentative de clôture n'a pas déjà été réalisée
+        # OU qu'une tentative de calcul a été réalisée
+        #       ET qu'elle a échoué parce qu'il n'a pas été possible de locker les tables FXDASSETS ou CONTEXT
+        #       ET que le nombre d'essais de calcul restant à  tenter est > 0
+        #------------------------------
+        Call INIT_CNX_ACLOTURER ([M:FAST]CPY(N_E-1), LTBCNX, GVML_TCNOCLO)
+
+        # Chargement du masque de travail contenant le paramétrage comptable de la société
+        Call LOAD_FASPARCPY([M:FAST]CPY(N_E-1),"",G_NON,RERROR) From GLOFCYCPY
+        If RERROR : Call ECR_TRACE([M:FAST]CPY(N_E-1)-mess(198,105,1)-num$(RERROR),1) From GESECRAN : Break : Endif
+
+        #------------------------------
+        For N_I = [M:FAST]CNXBEG(N_E-1) To [M:FAST]CNXEND(N_E-1)
+          If [M:FAST]TYPCLCG(N_I-1) <> GVML_TCNOCLO Then
+            LTBCNX([M:FAST]CNXG(N_I-1), GTBCNXTCLC) = [M:FAST]TYPCLCG(N_I-1) : # Type de clôture
+            LTBCNX([M:FAST]CNXG(N_I-1), GTBCNXEXE)  = GVML_TECOURA           : # Exercice à clôturer
+          Endif
+          #------------------------------
+          # Suite de la boucle
+        Next N_I
+        #------------------------------
+        If [M:FAST]CODRETCLC(N_E-1) = -3 and LNBSLEEP < 4 Then
+          # Si précédemment la clôture a échoué parce qu'on n'a pas pu verrouiller FXDASSETS ou CONTEXT
+          # on attend 1 minute avant de tenter de recalculer la société.
+          # Si au cours d'un REPEAT on a déjà  attendu 3 minutes, on ne met plus de temporisation
+          If !GSERVEUR
+           Call TEMPON(mess(79,GML_MSGCAL,1)-[M:FAST]CPY(N_E-1)) From GESECRAN
+          Endif
+          #
+          Sleep 60
+          LNBSLEEP += 1
+          #
+          If !GSERVEUR
+           Call TEMPOFF() From GESECRAN
+          Endif
+          #
+        Endif
+
+        Call ECR_TRACE("",0) From GESECRAN
+        Call ECR_TRACE(mess(22,GML_MSGCAL,1)-[M:FAST]CPY(N_E-1)-[M:FAST]ZCPY(N_E-1),0) From GESECRAN : # Société :
+        Call TRACE_CNX ([M:FAST]CPY(N_E-1), LTBCNX, RERROR)
+
+        #------------------------------
+        # Avant de cloturer le(s) contexte(s), il faut regarder si il existe des sorties prévisionnelles
+        # dont la date de sortie est comprise dans l'exercice/période à clore.
+        # Si c'est le cas, il faut "annuler" ces sorties en effaçant les informations relatives à la sortie
+        Call TRAITE_SORTIE_PREV ([M:FAST]CPY(N_E-1), LTBCNX, [M:FAST]FLGSIM, RERROR)
+        #------------------------------
+        # Avant de cloturer le(s) contexte(s), il faut regarder s'il existe des modifications de gestion
+        # des flux au niveau des contextes
+        # Si c'est le cas, il faut mettre à jour le flag FLGCNXFLX des biens
+        For N_I = 1 To GMAXCNXC
+          If LTBCNX(N_I, GTBCNXTCLC) <> GVML_TCNOCLO Then
+            Call UPD_WAI_TRT([M:FAST]CPY(N_E-1),N_I,1,"*","FLU",RERROR) From UPDWAITRT
+          Endif
+        Next
+        #------------------------------
+        If RERROR = 0 Then
+          Call CLOTURE_SOCIETE ([M:FAST]CPY(N_E-1), LTBCNX, [M:FAST]FLGSIM, RERROR)
+          # Si la société courante a été clôturée, actualisation des valeurs globales
+          If ( GCOUSOC = [M:FAST]CPY(N_E-1) ) Then
+            Raz GCOUSOC
+            Call ACTION_CPY([M:FAST]CPY(N_E-1)) From GLOFCYCPY
+          Endif
+        Endif
+        #------------------------------
+        [M:FAST]NBRTRY(N_E-1)   -= 1
+        [M:FAST]CODRETCLC(N_E-1) = RERROR : RERROR = 0
+        If [M:FAST]CODRETCLC(N_E-1) = -3 and [M:FAST]NBRTRY(N_E-1)>0 Then
+          LRETENTECLC += 1
+        Elsif [M:FAST]CODRETCLC(N_E-1) = 0 Then
+          [M:FAST]NBRTRY(N_E-1) = -1
+        Endif
+        #------------------------------
+      Endif
+      #------------------------------
+      # Suite de la boucle
+    Next N_E
+    #<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+    # Suite de la boucle
+  Until LRETENTECLC = 0
+  #<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+  If !GSERVEUR Then
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+  Endif
+  #------------------------------
+
+Return
+
+################################################################################
+# REALISATION DE LA CLOTURE
+################################################################################
+
+########################################
+Subprog TRAITE_SORTIE_PREV (PCPY, PTBCNX, FLGSIM, RERROR)
+Value    Char    PCPY
+Value    Integer PTBCNX(1..,0..)
+Value    Shortint FLGSIM
+Variable Integer RERROR
+
+Global   Char    GFILTRE_FAS(250)
+
+Local    Char    LLOCK(200)
+Local    Integer LTBCNX(1..GMAXCNXC,0..GTBCNX)
+Local    Char    SREQUETE(250), SLSTPLNCPY(250)(GMAXCNXC)
+Local    Integer N_I, N_E, N_Z, N_Y, LUNBIEN
+Local    Date    LDATE(GMAXCNXC), LDATCNXCPY(GMAXCNXC,0..2)
+Local    Integer LLSTCNXCPY(GMAXCNXC)
+
+  If PCPY <> "" Then
+    If clalev([F:FAS])  = 0 : Local File FXDASSETS   [FAS]  : Endif : # Bien comptables
+    If clalev([F:DEP])  = 0 : Local File DEPREC      [DEP]  : Endif : # Plans d'amortissements
+    If clalev([F:CNX])  = 0 : Local File CONTEXT     [CNX]  : Endif : # Contextes
+    If clalev([F:FIS])  = 0 : Local File FISCYEAR    [FIS]  : Endif : # Exercices
+    #------------------------------
+    Raz SLSTPLNCPY
+    Raz LLSTCNXCPY
+    Raz LDATCNXCPY
+    RERROR   = 0   : # /!\ Ne jamais remettre à zéro RERROR dans ce sous-programme /!\
+    Call INIT_CNX_ACLOTURER (PCPY, LTBCNX, GVML_TCNOCLC)
+    SREQUETE = ""
+    N_E      = 0
+    N_Z      = 0
+    LUNBIEN  = G_NON
+    For N_I = 1 To GMAXCNXC
+      # ------------------------------
+      Read[CNX]CNX0=PCPY;N_I
+      If fstat Then
+        # On ne fait rien du tout si le contexte n'est pas géré sur la société
+      Else
+        Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=LTBCNX(N_I, GTBCNXEXE)
+        Read [FIS]FIY1 Last
+        Filter [FIS]
+        # ------------------------------
+        # On planque tous les contextes gérés sur la société
+        For N_Y = 1 To [F:CNX]NBPLC
+          If SLSTPLNCPY(N_Z) <> "" Then
+            SLSTPLNCPY(N_Z) += '|'
+          Endif
+          SLSTPLNCPY(N_Z)   += 'DPRPLN='-num$([F:CNX]PLNCAA(N_Y-1))
+          # ------------------------------
+          # Suite de la boucle
+        Next N_Y
+        SLSTPLNCPY(N_Z)   = "("+SLSTPLNCPY(N_Z)+")"
+        LLSTCNXCPY(N_Z)   = N_I
+        LDATCNXCPY(N_Z,0) = [F:FIS]DATENDFIY
+        LDATCNXCPY(N_Z,1) = [F:FIS]DATENDPER([F:FIS]INDCURPER-1)
+        N_Z              += 1
+        # ------------------------------
+        If PTBCNX(N_I, GTBCNXTCLC) <> GVML_TCNOCLO Then
+          # ------------------------------
+          LTBCNX(N_I, GTBCNXTCLC)   = GVML_TCCLCPR              : # Type de calcul
+          LTBCNX(N_I, GTBCNXEXE)    = [F:FIS]STAFIY             : # Exercice de début calcul (courant ou suivant)
+          LTBCNX(N_I, GTBCNXCLS)    = G_OUI                     : # Boolean calcul optimisé
+          LTBCNX(N_I, GTBCNXEVE)    = [F:FIS]EVTCREFLG          : # Gestion des événements
+          LTBCNX(N_I, GTBCNXCSO)    = G_OUI                     : # Calcul société
+          # ------------------------------
+          LDATE(N_E) = [F:FIS]DATENDPER([F:FIS]INDCURPER-1)
+          N_E       += 1
+          # ------------------------------
+        Endif
+      Endif
+      # ------------------------------
+      # Suite de la boucle
+    Next N_I
+
+    If N_E>0
+     Local Date L_DATMAX : L_DATMAX=max(LDATE)
+     SREQUETE = "ISSDAT<=L_DATMAX"
+    Endif
+
+    #------------------------------
+    If SREQUETE <> "" Then
+      SREQUETE = "EXTISSFLG=G_OUI and ("+SREQUETE+")"
+    Endif
+    #------------------------------
+    Trbegin [FAS], [DEP]
+    Filter [FAS] Where CPY=PCPY & evalue(SREQUETE)
+    For [FAS]FAS1
+      # En-tête trace "Annulation des sorties prévisionnelles"
+      If LUNBIEN = G_NON
+       Gosub TRACE_ENTETE_ANNUL_ISS_PREV
+      Endif
+      LUNBIEN  = G_OUI : # Positionné à  G_OUI dès qu'il y a au moins un bien en sortie prévisionnelle
+      # ------------------------------
+      LLOCK = func GLOBIENS.GET_KEY_FXDASSETS ([F:FAS]AASREF)
+      If func GLOBIENS.LOCK_SYMBOLE ("FAS", [F:FAS]CPY, LLOCK, 0) = 0 Then
+        # On n'arrive pas à  locker : on sort d'ici en erreur
+        RERROR = -3
+        Break
+      Endif
+      # ------------------------------
+      # Emission des infos dans la trace
+      Gosub TRACE_BIEN_ANNUL_ISS_PREV
+      # ------------------------------
+      # On réinitialise toutes les rubriques relatives à  la sortie
+      Raz [F:FAS]IVCSALISS
+      Raz [F:FAS]ISSDAT
+      Raz [F:FAS]EXTISSFLG
+      Raz [F:FAS]ISSTYP
+      Raz [F:FAS]ISSAMT
+      Raz [F:FAS]PYBVATTYP
+      Raz [F:FAS]ISSVATRAT
+      Raz [F:FAS]BUY
+      # ------------------------------
+      [F:FAS]UPDUSR = GUSER
+      [F:FAS]UPDDAT = date$
+      # ------------------------------
+      Rewrite [FAS]
+      # ------------------------------
+      Call UNLOCK_SYMBOLE ("FAS", [F:FAS]CPY, LLOCK) From GLOBIENS
+      # ------------------------------
+      # Suite de la boucle
+    Next
+    Filter [FAS]
+    #------------------------------
+    If LUNBIEN = G_OUI Then
+      Gosub TRACE_BASTAB_ANNUL_ISS_PREV
+    Endif
+
+    If ( RERROR = 0 ) and ( FLGSIM <> G_OUI ) Then
+      Commit
+    Else
+      Rollback
+    Endif
+    #------------------------------
+  Endif
+End
+
+########################################
+Subprog CLOTURE_SOCIETE (PCPY, PTBCNX, FLGSIM, RERROR)
+Value    Char     PCPY
+Value    Integer  PTBCNX(1..,0..)
+Value    Shortint FLGSIM
+Variable Integer  RERROR
+
+Local    Char    LNIVTRACE(1)
+Local    Char    SREQUETE(250)
+Local    Integer NBBIENCLC                                          : # Nombre de biens calculés
+Local    Integer NBEVTGENE                                          : # Nombre d'événements générés
+Local    Integer N_I, N_E, LERROR
+Local    Char    LDPMSA(GLONDPM)                                    : # Mode "Sans Amortissement"
+Local    Char    LDPMUO(GLONDPM)                                    : # Mode "UO"
+Local    Integer NB_JOURS, NB_WEEK, NB_MOIS                         : # Pondérations calculées
+Local    Decimal NB_YEAR                                            : # Pondérations calculées
+
+Local    Char    SREQ(250)                                          : # Conditions de contextes (plans gérés)
+Local    Integer LNBDAT      : LNBDAT      = 4                      : # Dimensionnement des dates
+Local    Integer LDT_DEBEXO  : LDT_DEBEXO  = 0                      : # Date début exercice
+Local    Integer LDT_FINEXO  : LDT_FINEXO  = 1                      : # Date fin exercice
+Local    Integer LDT_DEBPCO  : LDT_DEBPCO  = 2                      : # Date début période courante
+Local    Integer LDT_FINPCO  : LDT_FINPCO  = 3                      : # Date fin période courante
+Local    Date    LDATCRT(0..LNBDAT)                                 : # Dates sur l'exercice courant
+Local    Date    LDATNXT(0..LNBDAT)                                 : # Dates sur l'exercice suivant
+Local    Integer LNBINT      : LNBINT      = 3                      : # Dimensionnement des entiers
+Local    Integer LIN_PNDJO   : LIN_PNDJO   = 0                      : # Pondération en jours
+Local    Integer LIN_PNDSE   : LIN_PNDSE   = 1                      : # Pondération en semaine
+Local    Integer LIN_PNDMO   : LIN_PNDMO   = 2                      : # Pondération en mois
+Local    Integer LINTCRT(0..LNBINT)                                 : # Entiers sur l'exercice courant
+Local    Integer LINTNXT(0..LNBINT)                                 : # Entiers sur l'exercice
+Local    Integer LNBPLN      : LNBPLN      = G301NBPLNFC            : # Nombre maximum de plan par contexte
+Global   Integer LDIMLSTPLN  : LDIMLSTPLN  = 2
+Global   Integer LIN_PLAN    : LIN_PLAN    = 0                      : # Numéro de plan
+Global   Integer LIN_FLUX    : LIN_FLUX    = 1                      : # Flux géré (G_OUI/G_NON)
+Global   Integer LIN_FLACC   : LIN_FLACC   = 2                      : # Flux par compte géré (G_OUI/G_NON)
+Local    Integer LLSTPLN (0..LNBPLN, 0..LDIMLSTPLN)                 : # Liste des plans gérés sur le contexte
+Global   Integer LDIMLSTCPLN : LDIMLSTCPLN = 1
+Global   Integer LIN_FLTXS   : LIN_FLTXS   = 0                      : # Flux par liasse géré ("" ou not "")
+Local    Char    LLSTCPLN(15)(0..LNBPLN, 0..LDIMLSTCPLN)            : # Liste des plans gérés sur le contexte (partie char)
+Local    Integer LGRTPRVUPD, CDRET                                  : # Paramètre de remise en cause subvention ant.
+Local    Integer LGRT                                               : # Code activité GRT  X3-104535
+Local    Char    LPARAM                                             : # Paramètre de remise en cause subvention ant.
+Local    Char    TXTPROG(40)
+Local    Integer NBBCO, NBBCO_TRT, LOK
+Local    Integer NBDELRNW                                           : # Nombre d'opérations de renouvellement supprimées FQ54343
+Local    Integer WSV_LVATYP, WSV_LVALIM                             : # FQ67615
+Local    Integer I_SUB                                              : # Numéro du plan de subvention FQ95251
+Local    Integer FAS_CLOSED                                         : # Indique si le bien traité est considéré comme clôturé dans la période FQ95251
+
+# Déclaration des colonnes du tableau de compte rendu
+Local    Integer LCRCOL1  : LCRCOL1  = 20 : # Bien
+Local    Integer LCRCOL2  : LCRCOL2  = 12 : # Plan
+Local    Integer LCRCOL3  : LCRCOL3  = 10 : # Fin exercice
+Local    Integer LCRCOL4  : LCRCOL4  = 10 : # Fin période
+Local    Integer LCRCOL5  : LCRCOL5  = 14 : # Cumul amortissements
+Local    Integer LCRCOL6  : LCRCOL6  = 14 : # Cumul aides fiscales
+Local    Integer LCRCOL7  : LCRCOL7  = 14 : # Cumul période
+Local    Integer LCRCOL8  : LCRCOL8  = 14 : # Amort. comptab.
+Local    Integer LCRLINE  : LCRLINE  = LCRCOL1+LCRCOL2+LCRCOL3+LCRCOL4+LCRCOL5+LCRCOL6+LCRCOL7+LCRCOL8+9
+Local    Char    LCRCHAR(LCRLINE)         : # Chaine de compte rendu
+
+Local    Integer L_CNXTRT  (1..G300MAX)     # Contextes à  clôturer
+Local    Integer L_NBBCOCLO(1..G300MAX)     # Nombre de BCO clôturés par contexte
+Local    Integer L_NBBCOSOR(1..G300MAX)     # Nombre de BCO sortis par contexte
+Local    Char    LMESSAGE(250)
+Local    Integer LBCOENCOURS
+Local    Integer ISSEXE                     # Indicateur de bien sorti dans l'exercice FQ54343
+
+  If G_ACTKRU = G_OUI : Gosub INIT_VAR From GLOCLOTRU : Endif : # FQ59941
+  If G_ACTDRO = G_OUI : Gosub INIT_VAR From GLOCLOTRO : Endif : # FQ80825
+
+  If PCPY <> "" Then
+    RERROR = 0   : # /!\ Ne jamais remettre à zéro RERROR dans ce sous-programme /!\
+    # ------------------------------
+    Raz SREQ, LDATCRT, LDATNXT, LLSTPLN, LLSTCPLN
+    # ------------------------------
+    Call DPM(GVML_MANOAMT, LDPMSA) From TRTFAS                      : # On récupère le code "SANS AMORTISSEMENT"
+    Call DPM(GVML_MAUNITO, LDPMUO) From TRTFAS                      : # On récupère le code "UO"
+    # ------------------------------
+    If clalev([F:FAS])  = 0 : Local File FXDASSETS     [FAS]  : Endif : # Bien comptables
+    If clalev([F:DEP])  = 0 : Local File DEPREC        [DEP]  : Endif : # Plans d'amortissements (courant)
+    If clalev([F:DEPS]) = 0 : Local File DEPREC        [DEPS] : Endif : # Plans d'amortissements (suivant)
+    #If clalev([F:DEPW]) = 0 : Local File DEPREC        [DEPW] : Endif : # Plans d'amortissements (compteur) FQ62087 FQ95251 obsolète
+    If clalev([F:CNX])  = 0 : Local File CONTEXT       [CNX]  : Endif : # Contextes
+    If clalev([F:FIS])  = 0 : Local File FISCYEAR      [FIS]  : Endif : # Exercices (courant)
+    If clalev([F:FISS]) = 0 : Local File FISCYEAR      [FISS] : Endif : # Exercices (suivant)
+    If clalev([F:CPY])  = 0 : Local File COMPANY       [CPY]  : Endif : # Société
+    If clalev([F:LOF])  = 0 : Local File LAYOUTFAS     [LOF]  : Endif : # Dépenses
+    If clalev([F:FLU])  = 0 : Local File FXDLIFL       [FLU]  : Endif : # Flux FQ66894
+    If G_ACTCCN = G_OUI
+      If clalev([F:CCN])  = 0 : Local File CONCESSION  [CCN]  : Endif : # Contrats de concession FQ54343
+      If clalev([F:RPR])  = 0 : Local File CCNRPR      [RPR]  : Endif : # Provisions de renouvellement FQ54343
+    Endif
+    # ------------------------------
+    Read [CPY]CPY0=PCPY
+    #------------------------
+    # Lockage société
+    If func GLOBIENS.LOCK_SYMBOLE ("CNX", PCPY, "", 0) = 0 Then
+      RERROR = -3
+    Endif
+    If func GLOBIENS.LOCK_SYMBOLE ("FAS", PCPY, "", 0) = 0 Then
+      RERROR = -3
+    Endif
+    #------------------------
+    If RERROR = 0 Then
+      # Début de transaction
+      Trbegin [FAS], [DEP], [DEPS], [FIS], [FISS], [LOF]
+      #------------------------
+      # FQ91644
+      Call PARAM(PCPY,"NIVTRACE",LNIVTRACE) From ADOVAL
+      GNIVTRACE = val(LNIVTRACE)
+
+      If GNIVTRACE<>0
+       Call ECR_TRACE("",0) From GESECRAN
+       Call ECR_TRACE(mess(47,GML_MSGCAL,1)-num$(GNIVTRACE),0) From GESECRAN : # Niveau de trace :
+      Endif
+      #------------------------ FQ95251
+      # X3-104535 Call PARAM(PCPY,"GRTPRVUPD",LPARAM) From ADOVAL
+      LGRT = func AFNC.ACTIV("GRT")
+      If LGRT = G_OUI
+        Call PARAM(PCPY,"GRTPRVUPD",LPARAM) From ADOVAL
+        LGRTPRVUPD = val(LPARAM)
+      Endif
+      #------------------------
+      SREQUETE = 'AASREF<>""'
+      #-------------------------------------------------------------------------
+      # Faire trace pour imprimer les contextes clôturés
+      If GNIVTRACE > 0 Then
+        Gosub TRACE_ENTETE_BIEN
+      Endif
+      #-------------------------------------------------------------------------
+      NBBIENCLC = 0
+      NBEVTGENE = 0
+      # ------------------------------
+      # C'est là  qu'il faut faire le boulot sur le bien
+      For N_I = 1 To GMAXCNXC
+        If PTBCNX(N_I, GTBCNXTCLC) <> GVML_TCNOCLO Then
+          # ------------------------------------------------------------
+          # Mise à  jour de la liste des contextes calculés pour la trace statistique
+          L_CNXTRT(N_I)=1
+          # ------------------------------------------------------------
+          Read[CNX]CNX0=PCPY;N_I
+          # ------------------------------
+          SREQ = func GLOCLOT.GET_CONDITION_DEP()
+          If SREQ = "" Then
+            RERROR = -2 : # pas de conditions sur les plans du contexte. c'est pas normal on arrête !
+            Break
+          Endif
+          # ------------------------------
+          Call ALIM_PLN(LLSTPLN, LLSTCPLN) From GLOCLOT
+          # ------------------------------
+          Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=PTBCNX(N_I, GTBCNXEXE)
+          Read [FIS]FIY1 Last
+          Filter [FIS]
+          LDATCRT(LDT_DEBEXO) = [F:FIS]DATSTRFIY
+          LDATCRT(LDT_FINEXO) = [F:FIS]DATENDFIY
+          LDATCRT(LDT_DEBPCO) = [F:FIS]DATSTRPER([F:FIS]INDCURPER-1)
+          LDATCRT(LDT_FINPCO) = [F:FIS]DATENDPER([F:FIS]INDCURPER-1)
+          LINTCRT(LIN_PNDJO)  = [F:FIS]NBRDAYPER([F:FIS]INDCURPER-1)
+          LINTCRT(LIN_PNDSE)  = [F:FIS]NBRWEKPER([F:FIS]INDCURPER-1)
+          LINTCRT(LIN_PNDMO)  = [F:FIS]NBRMONPER([F:FIS]INDCURPER-1)
+          # ------------------------------
+          If PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX Then
+            Filter [FISS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=GVML_TESUIV
+            Read [FISS]FIY1 Last
+            Filter [FISS]
+            LDATNXT(LDT_DEBEXO) = [F:FISS]DATSTRFIY
+            LDATNXT(LDT_FINEXO) = [F:FISS]DATENDFIY
+            LDATNXT(LDT_DEBPCO) = [F:FISS]DATSTRPER([F:FISS]INDCURPER-1)
+            LDATNXT(LDT_FINPCO) = [F:FISS]DATENDPER([F:FISS]INDCURPER-1)
+            LINTNXT(LIN_PNDJO)  = [F:FISS]NBRDAYPER([F:FISS]INDCURPER-1)
+            LINTNXT(LIN_PNDSE)  = [F:FISS]NBRWEKPER([F:FISS]INDCURPER-1)
+            LINTNXT(LIN_PNDMO)  = [F:FISS]NBRMONPER([F:FISS]INDCURPER-1)
+          Else
+            Filter [FISS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=PTBCNX(N_I, GTBCNXEXE)
+            Read [FISS]FIY1 Last
+            Filter [FISS]
+            LDATNXT(LDT_DEBEXO) = [F:FISS]DATSTRFIY
+            LDATNXT(LDT_FINEXO) = [F:FISS]DATENDFIY
+            LDATNXT(LDT_DEBPCO) = [F:FISS]DATSTRPER([F:FISS]INDCURPER)
+            LDATNXT(LDT_FINPCO) = [F:FISS]DATENDPER([F:FISS]INDCURPER)
+            LINTNXT(LIN_PNDJO)  = [F:FISS]NBRDAYPER([F:FISS]INDCURPER)
+            LINTNXT(LIN_PNDSE)  = [F:FISS]NBRWEKPER([F:FISS]INDCURPER)
+            LINTNXT(LIN_PNDMO)  = [F:FISS]NBRMONPER([F:FISS]INDCURPER)
+          Endif
+
+          # ------------------------------------------------------------
+          Filter [FAS] Where CPY=PCPY &evalue(SREQUETE)
+          Raz NBBCO, NBBCO_TRT
+          TXTPROG = mess(106,GML_MSGCAL,1)
+          NBBCO   = rowcount([FAS])
+
+          If !GSERVEUR
+            Call OUVRE_BOITE(TXTPROG, NBBCO) From GESECRAN
+            Call SET_BOITE(TXTPROG, NBBCO) From GESECRAN
+          Endif
+          # ------------------------------------------------------------
+          For [FAS]FAS1
+            # ------------------------------
+            NBBCO_TRT += 1
+            FAS_CLOSED = G_NON : # FQ95251
+            # ------------------------------
+            # Bien en cours ?
+            If [F:FAS]GACACN=GVML_NIENCOU | [F:FAS]IASACN=GVML_NIENCOU
+             LBCOENCOURS=G_OUI
+            Else
+             LBCOENCOURS=G_NON
+            Endif
+            # ------------------------------
+            If !GSERVEUR
+              TXTPROG    = mess(105,GML_MSGCAL,1)-': '-[F:FAS]CPY-'/'-[F:FAS]AASREF+'['+num$(NBBCO_TRT)+'/'+num$(NBBCO)+']'
+              Call AFF_BOITE(TXTPROG,NBBCO_TRT,LOK) From GESECRAN
+            Endif
+            # ------------------------------ FQ54343
+            # Déterme si le bien est sorti à une date antérieure au nouvel exercice en tenant compte du cas particulier
+            # du bien sorti mais 1er bien de la concession. En effet, si le bien est en concession avec
+            # un type d'apport "1er bien de la concession", le bien continue a s'amortir (IFRIC12) et
+            # la suppression de ses DEPREC et de ses provisions CCNRPR doit se faire lorsque la fin effective
+            # de son contrat de concession est antérieure à la date de début du nouvel exercice.
+            [L]ISSEXE = G_NON
+            If [F:FAS]ISSDAT<>[0/0/0] and [F:FAS]ISSDAT<=LDATCRT(LDT_FINEXO) and [F:FAS]EXTISSFLG<>G_OUI
+              # Sortie définitive antérieure au nouvel exercice
+              If G_ACTCCN = G_OUI and [F:FAS]OWNTYP = GVML_TDCONCE and [F:FAS]CCNETRTYP = GVML_NA1ERBC Then
+                # "1er bien de la concession"
+                # Lecture du contrat de concession pour avoir sa date de fin effective
+                Read [F:CCN]CCN0=[F:FAS]CCNREF
+                If fstat
+                  RERROR = -1
+                  Call ECR_TRACE([F:FAS]AASREF-mess(783,7773,1)-[F:FAS]CCNREF-num$(fstat),1) From GESECRAN
+                Endif
+                If [F:CCN]REAENDCCN<>[0/0/0] and [F:CCN]REAENDCCN<LDATNXT(LDT_DEBEXO)
+                  [L]ISSEXE = G_OUI
+                Endif
+              Else
+                [L]ISSEXE = G_OUI
+              Endif
+            Endif
+            #
+            For N_E = 0 To LNBPLN
+              If LLSTPLN(N_E,LIN_PLAN) = 0 Then
+                # La liste des plans est renseignée à  partir de 0 sans trou. Quand on a 0,
+                # c'est qu'il n'y a plus de plan derrière : on peut donc arrêter ici
+                Break
+              Endif
+              # ------------------------------------------------------------
+              LDEP_FSTAT  = 0
+              LDEPS_FSTAT = 0
+              Raz [F:DEP]
+              Raz [F:DEPS]
+              # -------------------------
+              Read [DEP]DEP0=[F:FAS]AASREF;LLSTPLN(N_E,LIN_PLAN);LDATCRT(LDT_FINEXO);LDATCRT(LDT_FINPCO)
+              If fstat Then
+                # (A) Si on passe ici c'est qu'il n'y a pas de ligne dans l'exercice et période courante.
+                # Seul le cas d'un bien sorti dans un exercice antérieur pour ce plan peut expliquer cette
+                # situation, et dans ce cas ce n'est pas une erreur. Sinon, c'est pas bon.
+                LDEP_FSTAT  = fstat
+                LDEPS_FSTAT = fstat
+
+                If not([F:FAS]ISSDAT<>[0/0/0] and [F:FAS]EXTISSFLG<>G_OUI and [F:FAS]ISSDAT<[F:FIS]DATSTRFIY)
+                  RERROR = -1
+                  Call ECR_TRACE(mess(193,7770,1)-'A'-[F:FAS]AASREF-format$("D:"+GFMDAT4,LLSTPLN(N_E,LIN_PLAN))
+&                               -format$("D:"+GFMDAT4,LDATCRT(LDT_FINEXO))-format$("D:"+GFMDAT4,LDATCRT(LDT_FINPCO))-num$(fstat),1)
+&                 From GESECRAN : # Enregistrement d'amortissement non trouvé
+                Endif
+              Else
+                Read [DEPS]DEP0=[F:FAS]AASREF;LLSTPLN(N_E,LIN_PLAN);LDATNXT(LDT_FINEXO);LDATNXT(LDT_FINPCO)
+                If fstat Then
+                  LDEPS_FSTAT = fstat
+                Endif
+              Endif
+              If LDEP_FSTAT Then
+                # cf (A) ci-dessus
+              Else
+                # ------------------------------------------------------------ FQ95251
+                If [F:DEP]STRDPRDAT<=LDATCRT(LDT_FINPCO)
+                  # Si le biens est commencé d'amortir dans la période clôturée ou une période antérieure, on le prend en compte dans le
+                  # compteur des biens clôturés
+                  FAS_CLOSED = G_OUI
+                Endif
+                # ------------------------------------------------------------
+                If PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOPE Then
+                  # CLOTURE PERIODE
+                  Gosub ACTION_CLOTURE_PERIODE
+                  #
+                  If [F:DEPS]DEPSTA=GVML_SCNOCAL Then
+                    [F:FAS]FLGCLC           = G_OUI      : # Après une clôture exercice, les biens sont à recalculer...
+                    [F:FAS]FLGCNXCLC(N_I-1) = GVML_RCOUI : # ...pour les plans du contexte traité.
+                  Endif
+                  #
+                  # FQ58364 : déplacement de la mise à jour du bien en dehors de la boucle sur les plans
+                  #
+                Elsif PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX Then
+                  # CLOTURE EXERCICE
+                  #If LDEPS_FSTAT <> 0 & [F:FAS]ISSDAT<>[0/0/0] & [F:FAS]ISSDAT<=[F:DEP]FIYENDDAT
+                  If LDEPS_FSTAT <> 0 and [L]ISSEXE = G_OUI : # FQ54343
+                    # Si le bien est sorti dans l'exercice en cours de clôture, on ne fait rien
+                  Else
+                    Gosub ACTION_CLOTURE_PERIODE
+                    Gosub ACTION_CLOTURE_EXERCICE
+                  Endif
+                  # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ FQ96817
+                  # Mise à jour du montant de réintégration de subvention sur le bien
+                  If [F:DEP]DPRPLN = G301SUB
+                     Call UPD_CRBGRACUM([F:FAS]CPY, [F:FAS]AASREF, [F:DEP]DPRCUM, [F:DEP]ENDDPE,[F:DEP]EXCDPR, RERROR )
+                  Endif
+                  # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                  # Traitement de la régularisation de TVA
+                  If [F:DEP]DPRPLN = G301CPT Then
+                    # 1°) Contexte Comptable/Fiscal
+                    # FQ 46680 : Nouvelles règles de TVA
+                    # [F:FAS]VATREGCUM += [F:FAS]VATREGAMT
+                    # [F:FAS]VATREGAMT  = 0
+                    Call CLORE_EXE_FAS_TVA ( [F:FAS]CPY, G301CPT, LDATCRT(LDT_DEBEXO), LDATCRT(LDT_FINEXO) )
+                  Endif
+                  #
+                  If [F:DEP]DPRPLN = G301IAS Then
+                    # 2°) Contexte IAS/IFRS
+                    # FQ 46680 : Nouvelles règles de TVA
+                    # [F:FAS]IASREGCUM += [F:FAS]IASVATREG
+                    # [F:FAS]IASVATREG  = 0
+                    Call CLORE_EXE_FAS_TVA ( [F:FAS]CPY, G301IAS,  LDATCRT(LDT_DEBEXO), LDATCRT(LDT_FINEXO))
+                  Endif
+                  #
+                  #If [L]ISSEXE = G_NON or [F:DEPS]DEPSTA=GVML_SCNOCAL Then : # FQ54343
+                  # FQ80825 : Dans le cas d'un arrêt-redémarrage, le plan doit obligatoirement être recalculé dans la période.
+                  #           Le traitement GLOCLOTRO positionne les champs DEPSTA, FLGCLC et FLGCNXCLC correctement, il ne faut
+                  #           rien faire ici.
+                  #           Dans le cas contraire, le champ [F:FAS]FLGCNXCLC(N_I-1) aura obligatoirement pour valeur GVML_RCNON puisque
+                  #           c'est une condition pour pouvoir effectuer une clôture exercice
+                  If ([L]ISSEXE = G_NON or [F:DEPS]DEPSTA=GVML_SCNOCAL) and ([F:FAS]FLGCNXCLC(N_I-1) <> GVML_RCOUI) Then
+                    [F:FAS]FLGCLC           = G_OUI : # Après une clôture exercice, les biens sont à recalculer...
+                    [F:FAS]FLGCNXCLC(N_I-1) = GVML_RCCLO : # ...pour les plans du contexte traité.
+                  Endif
+                  # FQ54343
+                  If [L]ISSEXE = G_NON and G_ACTCCN = G_OUI and N_E = G301CPT and [F:FAS]OWNTYP = GVML_TDCONCE
+                    If [F:FAS]RNWVALFLG = G_OUI
+                      # Remise à zéro de la valeur de renouvellement et du flag de forçage
+                      [F:FAS]RNWVAL    = 0
+                      [F:FAS]RNWVALFLG = G_NON
+                    Endif
+                  Endif
+                  #
+                  # FQ58364 : déplacement de la mise à jour du bien en dehors de la boucle sur les plans
+                  #
+                  # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                Endif
+                # ------------------------------------------------------------------------------------------
+                If G_ACTKRU = G_OUI : Gosub TRAITE_PLN From GLOCLOTRU : Endif : # FQ59941
+                If G_ACTDRO = G_OUI : Gosub TRAITE_PLN From GLOCLOTRO : Endif : # FQ80825
+                # ------------------------------------------------------------------------------------------
+                Gosub GENERE_FLUX
+                # ------------------------------------------------------------------------------------------
+              Endif
+              # ------------------------------------------------------------
+              If GNIVTRACE > 0 Then
+                If !LDEPS_FSTAT Then
+                  Gosub TRACE_TABLEAU_BIEN
+                Else
+                  If GNIVTRACE > 1 Then
+                    Gosub TRACE_BIEN_FINI
+                  Endif
+                Endif
+              Endif
+              # ------------------------------------------------------------------------------------------
+              # Le statut de clôture est toujours mis à jour même pour les biens totalement amortis
+              If !LDEP_FSTAT
+               [F:DEP]DEPSTA    = GVML_SCCLOS
+               Rewrite [DEP]
+               If fstat Then
+                 RERROR = -1
+                 Call FSTA("DEP") From GLOCK
+                 Call ECR_TRACE(mess(27,GML_MSGCAL,1)-num$([F:DEP]DPRPLN)-[F:FAS]AASREF,1) From GESECRAN : # Erreur réécriture du plan :
+                 # On ne s'arrête pas dans ce cas d'erreur pour détecter les éventuelles autres
+                 # erreurs dans la suite des biens
+               Endif
+              Endif
+              #
+              If !LDEPS_FSTAT Then
+                [F:DEPS]LSTCLODAT = LDATCRT(LDT_FINPCO)
+                Rewrite [DEPS]
+                If fstat Then
+                  RERROR = -1
+                  Call FSTA("DEPS") From GLOCK
+                  Call ECR_TRACE(mess(27,GML_MSGCAL,1)-num$([F:DEPS]DPRPLN)-[F:FAS]AASREF,1) From GESECRAN : # Erreur réécriture du plan :
+                  # On ne s'arrête pas dans ce cas d'erreur pour détecter les éventuelles autres
+                  # erreurs dans la suite des biens
+                Endif
+              Endif
+              #
+              # FQ95251 : déplacement de la maj des dépenses liées aux biens subventionnés en dehors de la boucle sur les plans
+              #
+              # ------------------------------
+              #
+              # FQ58364 : déplacement de la suppression des DEPREC en dehors de la boucle sur les plans
+              #
+              # ------------------------------
+              # Suite de la boucle sur les plans
+            Next N_E
+            #------------------------ # FQ66894
+            # Les flux devront être générés après une clôture exercice si le contexte gère au moins un flux
+            If PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX
+              Call MAJFLGCNXFLX("[F:FAS]","[F:CNX]",N_I,num$(GVML_FLXNOTG)) From TRTFAS
+            Else # FQ84727 : sinon on considère qu'ils sont générés pour le contexte
+              Call MAJFLGCNXFLX("[F:FAS]","[F:CNX]",N_I,num$(GVML_FLXGENE)) From TRTFAS
+            Endif
+            #------------------------ # FQ95251
+            # Traitement de maj des dépenses liées aux biens subventionnés
+            # si plan d'un contexte subventionné
+            I_SUB=find(G301SUB,[F:CNX]PLNCAA)
+            If I_SUB > 0
+              # X3-104535 If LGRTPRVUPD = G_NON  & (PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX)
+              If LGRT & LGRTPRVUPD = G_NON  & (PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX)
+                Call UPD_DEP_SUBV([F:FAS]CPY, [F:FAS]AASREF, LERROR)
+                If LERROR < 0
+                  RERROR = LERROR
+                  Call ECR_TRACE(mess(127,GML_MSGCAL,1)-'G'-num$(LLSTPLN(N_E,LIN_PLAN))-[F:LOF]CODLOF-':'-LMESSAGE,1) From GESECRAN : # Erreur maj dép. subv du plan :
+                Endif
+              Endif
+            Endif
+            #------------------------ # FQ81751
+            # Dans le cas de la clôture exercice, suppression des DEPREC futurs des biens sortis dans l'exercice
+            # pour les biens en concession. Pour les autres type de bien la suppression est faite globalement
+            # à la fin du traitement de la société. On traite le cas des biens en concession à part car
+            # un bien en concession même sorti peut continuer à s'amortir si c'est le 1er bien de la concession
+            # et si la date de fin de contrat effective n'est pas atteinte.
+            If  ([F:FAS]OWNTYP = GVML_TDCONCE) and (PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX) and ([L]ISSEXE = G_OUI) Then
+              Delete [DEP] Where AASREF=[F:FAS]AASREF and CPY=[F:FAS]CPY and CNX=[F:CNX]CNX and FIYSTRDAT>LDATCRT(LDT_FINEXO)
+              # On teste le code activité G_ACTCCN ci-dessous car la table RPR n'existe que s'il est à Oui
+              If  [F:CNX]CNX = G300CPFI and G_ACTCCN = G_OUI Then
+                Delete [RPR] Where AASREF=[F:FAS]AASREF and FIYSTRDAT>LDATCRT(LDT_FINEXO)
+              Endif
+            Endif
+            #
+            # FQ58364 : déplacement de la mise à jour du bien en dehors de la boucle sur les plans
+            If !LDEP_FSTAT
+              If G_ACTKRU = G_OUI : Gosub TRAITE_FAS From GLOCLOTRU : Endif : # FQ59941
+              If G_ACTDRO = G_OUI : Gosub TRAITE_FAS From GLOCLOTRO : Endif : # FQ80825
+
+              Rewrite [FAS]
+              If fstat Then
+                RERROR = -1
+                Call FSTA("FAS") From GLOCK
+                Call ECR_TRACE(mess(28,GML_MSGCAL,1)-'A'-[F:FAS]AASREF,1) From GESECRAN : # Erreur de réécriture du bien :
+                # On ne s'arrête pas dans ce cas d'erreur pour détecter les éventuelles autres
+                # erreurs dans la suite des biens
+              Endif
+            Endif
+            # Incrémentation du compteur de biens traités
+            # Pas d'erreur, on incrémente
+            # Erreur, il y aura un rollback, on remet le compteur de biens clos pour la société à 0
+            If RERROR=0
+             Gosub INCR_CPT_STAT
+            Else
+             Raz L_NBBCOCLO
+            Endif
+            # ------------------------------
+            # Suite de la boucle sur les biens
+          Next
+          Filter [FAS]
+
+          # ------------------------------ FQ95251
+          # Mise à jour du flag FLGSTATXS -> passage à "Flux définitif" pour la société et le contexte traités FQ66894
+          If PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX
+            Update [F:FLU]
+&           Where CPY=PCPY and CNX=[F:CNX]CNX and FLGSTATXS=GVML_TXSPRO and FIYSTRDAT=LDATCRT(LDT_DEBEXO)
+&                          and (PERSTRDAT=[0/0/0] or PERSTRDAT=LDATCRT(LDT_DEBPCO))
+&           With FLGSTATXS=GVML_TXSDEF
+          Else
+            Update [F:FLU]
+&           Where CPY=PCPY and CNX=[F:CNX]CNX and FLGSTATXS=GVML_TXSPRO and FIYSTRDAT=LDATCRT(LDT_DEBEXO)
+&                          and PERSTRDAT=LDATCRT(LDT_DEBPCO)
+&           With FLGSTATXS=GVML_TXSDEF
+          Endif
+
+          If !GSERVEUR
+            Call FERME_BOITE From GESECRAN
+          Endif
+
+          #------------------------ # FQ80757 : optimisation de la suppression
+          # Dans le cas de la clôture exercice, suppression des DEPREC futurs des biens sortis dans l'exercice
+          # Les contrôles sur le comptabilisation des périodes ouvertes dans l'exercice suivant en comptabilisation
+          # définitives sont fais au lancement de la clôture. On ne les refait donc pas ici.
+          # Remarque : les tests LDATCRT(LDT_DEBEXO)<>[0/0/0] et LDATCRT(LDT_FINEXO)<>[0/0/0] sont là pour
+          # sécuriser le Delete, en temps normal ils sont toujours vrais.
+          If  PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX
+            Gosub DEL_DEPREC_ISS
+          Endif
+
+          # ------------------------------------------------------------ FQ54343
+          # Suppression des opérations de renouvellement terminées lorsque le module concession est à Oui, le contexte traité
+          # est le Comptable et Fiscal, le contexte gère les concessions avec le mode de gestion à "Renouvellement"
+          If G_ACTCCN = G_OUI and [F:CNX]CNX = G300CPFI and [F:CNX]CCNFLG = G_OUI and [F:CNX]CCNMOD = GVML_GCRNW
+            Call DEL_RNWPREP([F:CPY]CPY,NBDELRNW,LERROR) From GLOCCN
+            If LERROR <> 0
+              RERROR = LERROR
+              # "Erreur lors de la suppression des opérations de renouvellement terminées"
+              Call ECR_TRACE(mess(770,7773,1)-num$(RERROR),1) From GESECRAN
+              Break
+            Endif
+          Endif
+        Endif
+        #------------------------
+        # Maj des subventions liées au biens du contexte subventionné
+        # FQ96429
+        #If [F:CNX]GRTFLG(0) = G_OUI  &  (PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX)
+        If find(G301SUB, [F:CNX]PLNCAA) > 0  and (PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX)
+           Gosub CALCUL_REINTEGRATION_SUBV
+           If LERROR < 0
+             RERROR = LERROR
+             # mess130-Erreur mise à jour cumuls réintégration subv. sur la subvention
+             Call ECR_TRACE(mess(130,GML_MSGCAL,1)-'G'-num$([F:GRT]GRAREF)-num$([F:CNX]CNX)-':'-LMESSAGE,1) From GESECRAN
+           Endif
+        Endif
+        # ------------------------------
+        # Suite de la boucle sur les contextes
+      Next N_I
+      # ------------------------------
+      NBBIENCLC += 1
+      #------------------------
+      If GNIVTRACE > 0 Then
+        Gosub TRACE_FERME_BIEN
+      Endif
+      #------------------------
+      If RERROR = 0 Then
+        # MAJ des contextes
+        Call MAJ_CNX (PCPY, PTBCNX, RERROR)
+        If RERROR = 0 Then
+          # Mise à  jour "Bien sorti dans exercice antérieur"
+          Call MAJ_ISSFIYPRE(PCPY, RERROR)
+        Endif
+        # ------------------------------------------------------------
+      Endif
+      #------------------------ FQ54343
+      GPOINT="ENDCPYCLO" : Gosub ENTREE From EXEFNC : #CHECK IGNORE_LINE
+      #------------------------
+      If ( RERROR = 0 ) and ( FLGSIM <> G_OUI ) Then
+        Commit
+      Else
+        Rollback
+        If ( RERROR <> 0 )
+          Call ECR_TRACE(mess(48,GML_MSGCAL,1),1) From GESECRAN : # Traitement annulé
+        Endif
+      Endif
+    Endif
+    # ------------------------------
+    # Délockage société
+    Call UNLOCK_SYMBOLE ("CNX", PCPY, "") From GLOBIENS
+    Call UNLOCK_SYMBOLE ("FAS", PCPY, "") From GLOBIENS
+    # ------------------------------
+    # Ajout infos statistiques dans la trace
+    If RERROR=0
+     Gosub TRACE_CPT_STAT
+    Endif
+  Endif
+
+End
+
+#-------------------------------------------------------------------------------
+$ACTION_CLOTURE_PERIODE
+
+  #---------------------------------
+  # Toute clôture période
+  #---------------------------------
+
+  #-> Changement de méthode avec passage en mode résiduel si dépréciation ou reprise de
+  #   dépréciation sur la période close
+  #-> Changement de méthode avec passage en mode résiduel si le classement est passé
+  #   à "Bien détenu pour la vente" dans l'exercice courant à une date inférieure ou égale
+  #   à la date de fin de période courante, pour le cas où le classement serait annulé par la suite
+  #   Uniquement pour les plans IAS.
+  If ([F:DEP]IML <> 0 or [F:DEP]IMLRVE <> 0 )
+& or ([F:FAS]SALCLSDAT<>[0/0/0] & [F:FAS]SALCLSDAT <= LDATCRT(LDT_FINPCO) & [F:CNX]PLNSTD(find([F:DEP]DPRPLN,[F:CNX]PLNCAA)-1) = GVML_NPIAS) Then
+    Local Integer LRTRN
+    # FQ74668 : le calcul a déjà  mis à jour le mode en résiduel sur le DEPREC suivant. Il faut donc passer à MTC_NRSD_RSD
+    # la classe DEPS avec le mode de DEP
+    Local Char WDPM(GLONDPM) : WDPM = [F:DEPS]DPM : # Sauvegarde du mode stocké sur la période suivante
+    [F:DEPS]DPM = [F:DEP]DPM
+    Call MTC_NRSD_RSD("FAS", "DEPS", G_OUI, [F:DEPS]PERSTRDAT, LRTRN) From TRTFAS
+    If ( LRTRN > 20 ) Then
+      RERROR = -1
+      Call ECR_TRACE(mess(107,7773,1)-"FASMTC -"+num$(LRTRN),1) From GESECRAN
+    Elsif LRTRN > 0 Then
+      RERROR = -1
+      Call ECR_TRACE(mess(7,21,1)-mess(181,7770,1)-[F:FAS]AASREF-mess([F:DEP]DPRPLN,3101,1)-num$(LRTRN),1) From GESECRAN
+    Elsif LRTRN = 0 Then
+      # FQ74668 : le passage en résiduel s'est bien effectué
+    Elsif LRTRN = -1 Then
+      # FQ74668 : le mode était déjà  résiduel, on ne fait rien
+    Endif
+    [F:DEPS]DPM = WDPM : # FQ74668
+  Endif
+
+  #-> Détermination du plafond de Reprise de Dépréciation
+# FQ75597
+#  If (  ( abs([F:DEP]NBVT) > abs([F:DEP]NBV) )  and
+#&       ( [F:DEP]IMLBLC + [F:DEP]IML - [F:DEP]IMLRVE - [F:DEP]IMLRVETRF ) <> 0 ) Then
+#    [F:DEPS]IMLRVELIM = [F:DEP]NBVT - [F:DEP]NBV
+#  Else
+#    [F:DEPS]IMLRVELIM = 0
+#  Endif
+
+
+  #---------------------------------
+  # Autres
+  #---------------------------------
+
+  #> zones techniques
+
+  #Fq67577-Pologne
+  If G_ACTKPL=G_OUI
+   Gosub ACTION_CLOTURE_PERIODE From GLOCLOTPL
+  Endif
+
+Return
+
+#-------------------------------------------------------------------------------
+$ACTION_CLOTURE_EXERCICE
+Return
+
+# FQ80757 : Suppression massive des DEPREC pour les biens sortis dans l'exercice
+# FQ81180 : Remplacement de D1 par DEPREC
+#-------------------------------------------------------------------------------
+$DEL_DEPREC_ISS
+  # Requête sur clause WHERE
+  Local Integer LIR
+  Local Char LREQ(250)(1..100)
+  Local Char LREQDAT (50)
+
+  # Enregistrements DEPREC à supprimer
+  LIR = 1
+  LREQ(LIR) = "DEPREC.CPY_0 = '"+PCPY+"'"
+  LIR += 1
+  LREQ(LIR) = " and DEPREC.CNX_0 = '"+num$([F:CNX]CNX)+"'"
+  LIR += 1
+  Call CAL_REQ_DAT (LDATCRT(LDT_FINEXO), LREQDAT)  From GLOBB9
+  LREQ(LIR) = " and DEPREC.FIYSTRDAT_0 > "+LREQDAT
+  LIR += 1
+  LREQ(LIR) = " and exists (select 'X' from "+nomap+".FXDASSETS F1 where"
+  # -- Clause WHERE du EXISTS
+  LIR += 1
+  LREQ(LIR) = " ("
+  LIR += 1
+  LREQ(LIR) = " F1.AASREF_0 = DEPREC.AASREF_0"
+  # DEBUT FQ81751
+  LIR += 1
+  LREQ(LIR) = " and F1.OWNTYP_0 <> "+num$(GVML_TDCONCE)
+  # FIN FQ81751
+  LIR += 1
+  Call CAL_REQ_DAT (LDATCRT(LDT_DEBEXO), LREQDAT)  From GLOBB9
+  LREQ(LIR) = " and F1.ISSDAT_0 between "+LREQDAT
+  LIR += 1
+  Call CAL_REQ_DAT (LDATCRT(LDT_FINEXO), LREQDAT)  From GLOBB9
+  LREQ(LIR) = " and "+LREQDAT
+  LIR += 1
+  LREQ(LIR) = " )"
+  # -- Fin clause WHERE du EXISTS
+  LIR += 1
+  LREQ(LIR) = " )"
+
+  # Delete sur table selon requête
+  Call CAL_DELTAB (nomap, "DEPREC", LREQ, LIR) From GLOBI9
+Return
+
+# Eléments de trace pour les annulations de sorties prévisionnelles
+#-------------------------------------------------------------------------------
+$TRACE_ENTETE_ANNUL_ISS_PREV
+ Local Integer L_LNGLIG    : L_LNGLIG    = 73
+ Local Char    L_CARLIG    : L_CARLIG    = "*"
+ Local Char    L_CARSEPVER : L_CARSEPVER = "*"
+ Local Char    L_CHAPTIT(40) : L_CHAPTIT   = mess(116,GML_MSGCAL,1) # "Sorties prévisionnelles annulées"
+ Local Char    L_TITCOL1     : L_TITCOL1   = mess(117,GML_MSGCAL,1) # "Référence bien"
+ Local Char    L_TITCOL2     : L_TITCOL2   = mess(118,GML_MSGCAL,1) # "Désignation"
+ Local Char    L_TITCOL3     : L_TITCOL3   = mess(119,GML_MSGCAL,1) # "Sortie prévue"
+
+ Local Char    L_LIGNE(L_LNGLIG)
+
+ Call ECR_TRACE("",0) From GESECRAN
+ L_LIGNE  = L_CHAPTIT : Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+ L_LIGNE  = string$(L_LNGLIG, L_CARLIG) : Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+ L_LIGNE  = L_CARSEPVER + space$(1) + L_TITCOL1 + space$(20-len(left$(L_TITCOL1,20)))
+ L_LIGNE += L_CARSEPVER + space$(1) + L_TITCOL2 + space$(31-len(left$(L_TITCOL2,31)))
+ L_LIGNE += L_CARSEPVER + space$(1) + L_TITCOL3 + space$(15-len(left$(L_TITCOL3,15)))
+ L_LIGNE += L_CARSEPVER
+ Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+ L_LIGNE = string$(L_LNGLIG, L_CARLIG) : Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+
+Return
+
+#-------------------------------------------------------------------------------
+$TRACE_BIEN_ANNUL_ISS_PREV
+ Local Integer L_LNGLIG    : L_LNGLIG    = 73
+ Local Char    L_CARLIG    : L_CARLIG    = "*"
+ Local Char    L_CARSEPVER : L_CARSEPVER = "*"
+
+ Local Char    L_LIGNE(L_LNGLIG)
+
+ L_LIGNE  = L_CARSEPVER + space$(1) + left$([F:FAS]AASREF,20)  + space$(20-len(left$([F:FAS]AASREF,19)))
+ L_LIGNE += L_CARSEPVER + space$(1) + left$([F:FAS]AASDES1,30) + space$(31-len(left$([F:FAS]AASDES1,30)))
+ L_LIGNE += L_CARSEPVER + space$(1) + format$("D:" + GFMDAT4,[F:FAS]ISSDAT) + space$(15-len(format$("D:" + GFMDAT4,[F:FAS]ISSDAT)))
+ L_LIGNE += L_CARSEPVER
+ Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+
+Return
+
+#-------------------------------------------------------------------------------
+$TRACE_CPT_STAT
+ Local Integer I_CNX
+
+ Local Integer L_LNGLIG    : L_LNGLIG    = 46
+ Local Char    L_CARLIG    : L_CARLIG    = "*"
+ Local Char    L_CARSEPVER : L_CARSEPVER = "*"
+ Local Char    L_CHAPTIT(40) : L_CHAPTIT   = mess(120,GML_MSGCAL,1) # "Résultat de la clôture"
+ Local Char    L_TITCOL1     : L_TITCOL1   = mess(066,GML_MSGCAL,1) # "Contextes"
+ Local Char    L_TITCOL2     : L_TITCOL2   = mess(121,GML_MSGCAL,1) # "Biens clos"
+ Local Char    L_TITCOL3     : L_TITCOL3   = mess(122,GML_MSGCAL,1) # "Biens sortis"
+
+ Local Char    L_LIGNE(L_LNGLIG)
+
+ Call ECR_TRACE("",0) From GESECRAN
+ L_LIGNE  = L_CHAPTIT : Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+ L_LIGNE  = string$(L_LNGLIG, L_CARLIG) : Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+ L_LIGNE  = L_CARSEPVER + L_TITCOL1  + space$(18-len(left$(L_TITCOL1,18)))
+ L_LIGNE += L_CARSEPVER + L_TITCOL2  + space$(11-len(left$(L_TITCOL2,11)))
+ L_LIGNE += L_CARSEPVER + L_TITCOL3  + space$(13-len(left$(L_TITCOL3,13)))
+ L_LIGNE += L_CARSEPVER
+ Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+ L_LIGNE  = string$(L_LNGLIG, L_CARLIG) : Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+ For I_CNX=1 To G300MAX
+  If L_CNXTRT(I_CNX)=1
+   L_LIGNE = L_CARSEPVER + left$(mess(I_CNX,3100,1),18)+space$(18-len(left$(mess(I_CNX,3100,1),18)))
+   L_LIGNE+= L_CARSEPVER + space$(1)   + space$(9-len(num$((L_NBBCOCLO(I_CNX))))) + num$((L_NBBCOCLO(I_CNX)))+space$(1)
+   L_LIGNE+= L_CARSEPVER + space$(1)   + space$(11-len(num$((L_NBBCOSOR(I_CNX))))) + num$((L_NBBCOSOR(I_CNX)))+space$(1)
+   L_LIGNE+= L_CARSEPVER
+   Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+  Endif
+ Next I_CNX
+ L_LIGNE  = string$(L_LNGLIG, L_CARLIG) : Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+ Call ECR_TRACE("",0) From GESECRAN
+Return
+
+#-------------------------------------------------------------------------------
+$TRACE_BASTAB_ANNUL_ISS_PREV
+ Local Integer L_LNGLIG    : L_LNGLIG    = 73
+ Local Char    L_CARLIG    : L_CARLIG    = "*"
+ Local Char    L_CARSEPVER : L_CARSEPVER = "*"
+
+ Local Char    L_LIGNE(L_LNGLIG)
+ L_LIGNE  = string$(L_LNGLIG, L_CARLIG) : Call ECR_TRACE(L_LIGNE,0) From GESECRAN
+
+Return
+
+#-------------------------------------------------------------------------------
+$TRACE_ENTETE_BIEN
+  LCRCHAR  = string$(LCRLINE, '*') : Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+  LCRCHAR  = "*"+left$(mess(86,GML_MSGCAL,1)+string$(LCRCOL1, ' '), LCRCOL1)
+  LCRCHAR += "*"+left$(mess(87,GML_MSGCAL,1)+string$(LCRCOL2, ' '), LCRCOL2)
+  LCRCHAR += "*"+left$(mess(88,GML_MSGCAL,1)+string$(LCRCOL3, ' '), LCRCOL3)
+  LCRCHAR += "*"+left$(mess(89,GML_MSGCAL,1)+string$(LCRCOL4, ' '), LCRCOL4)
+  LCRCHAR += "*"+left$(mess(90,GML_MSGCAL,1)+string$(LCRCOL5, ' '), LCRCOL5)
+  LCRCHAR += "*"+left$(mess(91,GML_MSGCAL,1)+string$(LCRCOL6, ' '), LCRCOL6)
+  LCRCHAR += "*"+left$(mess(92,GML_MSGCAL,1)+string$(LCRCOL7, ' '), LCRCOL7)
+  LCRCHAR += "*"+left$(mess(144,GML_MSGCAL,1)+string$(LCRCOL8, ' '), LCRCOL8)
+  LCRCHAR += "*"
+  Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+  LCRCHAR  = string$(LCRLINE, '*') : Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+Return
+
+#-------------------------------------------------------------------------------
+$TRACE_FERME_BIEN
+  LCRCHAR  = string$(LCRLINE, '*') : Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+Return
+
+#-------------------------------------------------------------------------------
+$TRACE_TABLEAU_BIEN
+  LCRCHAR  = "*"+left$([F:FAS]AASREF+string$(LCRCOL1, ' '), LCRCOL1)
+  LCRCHAR += "*"+left$(mess(LLSTPLN(N_E,LIN_PLAN),GML_NPLAN,1)+string$(LCRCOL2, ' '), LCRCOL2)
+  LCRCHAR += "*"+left$(format$("D:" + GFMDAT4, [F:DEPS]FIYENDDAT)+string$(LCRCOL3, ' '), LCRCOL3)
+  If [F:DEPS]PERENDDAT <> [0/0/0] Then
+    LCRCHAR += "*"+left$(format$("D:" + GFMDAT4, [F:DEPS]PERENDDAT)+string$(LCRCOL4, ' '), LCRCOL4)
+  Else
+    LCRCHAR += "*"+string$(LCRCOL4, ' ')
+  Endif
+  LCRCHAR += "*"+func GLOBIENS.AX3_RIGHT(string$(LCRCOL5, ' ')+num$([F:DEPS]DPRCUM), LCRCOL5)
+  LCRCHAR += "*"+func GLOBIENS.AX3_RIGHT(string$(LCRCOL6, ' ')+num$([F:DEPS]ALWCUM), LCRCOL6)
+  LCRCHAR += "*"+func GLOBIENS.AX3_RIGHT(string$(LCRCOL7, ' ')+num$([F:DEPS]PERCLOCUM), LCRCOL7)
+  LCRCHAR += "*"+func GLOBIENS.AX3_RIGHT(string$(LCRCOL8, ' ')+num$([F:DEPS]PSTDPE+[F:DEPS]PSTEXC), LCRCOL8)
+  LCRCHAR += "*"
+  Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+Return
+
+#-------------------------------------------------------------------------------
+$TRACE_BIEN_FINI
+  LCRCHAR  = "*"+left$([F:FAS]AASREF+string$(LCRCOL1, ' '), LCRCOL1)
+  LCRCHAR += "*"+left$(mess(LLSTPLN(N_E,LIN_PLAN),GML_NPLAN,1)+string$(LCRCOL2, ' '), LCRCOL2)
+  LCRCHAR += "*"+string$(LCRCOL3, ' ')
+  LCRCHAR += "*"+string$(LCRCOL4, ' ')
+  LCRCHAR += "*"+string$(LCRCOL5, ' ')
+  LCRCHAR += "*"+string$(LCRCOL6, ' ')
+  LCRCHAR += "*"+string$(LCRCOL7, ' ')
+  LCRCHAR += "*"+left$(mess(94,GML_MSGCAL,1)+string$(LCRCOL8, ' '), LCRCOL8)
+  LCRCHAR += "*"
+  Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+Return
+
+########################################
+Subprog TRACE_CNX (PSOCIETE, PTBCNX, RERROR)
+# Envoi les info contextes.
+# RERROR=-1 en cas d'échec, RERROR=0 sinon
+Value    Char    PSOCIETE
+Value    Integer PTBCNX(1..,0..)
+Variable Integer RERROR
+
+# Déclaration des colonnes du tableau de compte rendu
+Local    Integer LCRCOL1  : LCRCOL1  = 18 : # Contextes
+Local    Integer LCRCOL2  : LCRCOL2  = 10 : # Exercice
+Local    Integer LCRCOL3  : LCRCOL3  = 22 : # Type clôture
+Local    Integer LCRCOL4  : LCRCOL4  = 10 : # Exercice début et fin
+Local    Integer LCRCOL5  : LCRCOL5  = 10 : # Période début et fin
+Local    Integer LCRLINE  : LCRLINE  = LCRCOL1+LCRCOL2+LCRCOL3+LCRCOL4+LCRCOL5+6
+Local    Char    LCRCHAR(LCRLINE)         : # Chaine de compte rendu
+
+Local    Integer N_I
+
+  #------------------------------------
+  If clalev([F:CNX])=0  : Local File CONTEXT    [CNX]  : Endif        : # Contextes
+  If clalev([F:FIS])=0  : Local File FISCYEAR   [FIS]  : Endif        : # Exercice (courant)
+  If clalev([F:FISS])=0 : Local File FISCYEAR   [FISS] : Endif        : # Exercice (suivant)
+  #------------------------------------
+  LCRCHAR = string$(LCRLINE, '*') : Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+  LCRCHAR  = "*"+string$(LCRCOL1, ' ')+"*"+string$(LCRCOL2, ' ')+"*"+string$(LCRCOL3, ' ')+"*"
+  LCRCHAR += left$(mess(63,GML_MSGCAL,1)+string$(LCRCOL4, ' '), LCRCOL4)+"*"
+  LCRCHAR += left$(mess(64,GML_MSGCAL,1)+string$(LCRCOL5, ' '), LCRCOL5)+"*"
+  Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+  LCRCHAR  = "*"+left$(mess(66,GML_MSGCAL,1)+string$(LCRCOL1, ' '), LCRCOL1)+"*"
+  LCRCHAR += left$(mess(63,GML_MSGCAL,1)+string$(LCRCOL2, ' '), LCRCOL2)+"*"
+  LCRCHAR += left$(mess(85,GML_MSGCAL,1)+string$(LCRCOL3, ' '), LCRCOL3)+"*"
+  LCRCHAR += left$(mess(68,GML_MSGCAL,1)+string$(LCRCOL4, ' '), LCRCOL4)+"*"
+  LCRCHAR += left$(mess(68,GML_MSGCAL,1)+string$(LCRCOL5, ' '), LCRCOL5)+"*"
+  Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+  LCRCHAR  = "*"+string$(LCRCOL1, ' ')+"*"+string$(LCRCOL2, ' ')+"*"+string$(LCRCOL3, ' ')+"*"
+  LCRCHAR += left$(mess(69,GML_MSGCAL,1)+string$(LCRCOL4, ' '), LCRCOL4)+"*"
+  LCRCHAR += left$(mess(69,GML_MSGCAL,1)+string$(LCRCOL5, ' '), LCRCOL5)+"*"
+  Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+  LCRCHAR = string$(LCRLINE, '*') : Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+  #------------------------------------
+  For [CNX]CNX0 Where CPY=PSOCIETE
+    If [F:CNX]NBPLC > 0 Then
+      If PTBCNX([F:CNX]CNX, GTBCNXTCLC) <> GVML_TCNOCLO Then
+        #------------------------------------
+        Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=GVML_TECOURA
+        Read [FIS]FIY1 Last
+        Filter [FIS]
+        Filter [FISS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=GVML_TESUIV
+        Read [FISS]FIY1 Last
+        Filter [FISS]
+        #------------------------------------
+        LCRCHAR  = "*"
+        LCRCHAR += left$(mess([F:CNX]CNX,GML_NCONTEXT,1)+string$(LCRCOL1, ' '), LCRCOL1)+"*"
+        LCRCHAR += left$(mess(PTBCNX([F:CNX]CNX, GTBCNXEXE),GML_TYPEXERC,1)+string$(LCRCOL2, ' '), LCRCOL2)+"*" : # REVENIR
+        LCRCHAR += left$(mess(PTBCNX([F:CNX]CNX, GTBCNXTCLC),GML_TYPDECL0,1)+string$(LCRCOL3, ' '), LCRCOL3)+"*"
+        LCRCHAR += left$(format$("D:" + GFMDAT4, [F:FIS]DATSTRFIY)+string$(LCRCOL4, ' '), LCRCOL4)+"*"
+        LCRCHAR += left$(format$("D:" + GFMDAT4, [F:FIS]DATSTRPER([F:FIS]INDCURPER-1))+string$(LCRCOL5, ' '), LCRCOL5)+"*"
+        Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+
+        LCRCHAR  = "*"
+        LCRCHAR += string$(LCRCOL1, ' ')+"*"
+        LCRCHAR += string$(LCRCOL2, ' ')+"*"
+        LCRCHAR += string$(LCRCOL3, ' ')+"*"
+        LCRCHAR += left$(format$("D:" + GFMDAT4, [F:FIS]DATENDFIY)+string$(LCRCOL4, ' '), LCRCOL4)+"*"
+        LCRCHAR += left$(format$("D:" + GFMDAT4, [F:FIS]DATENDPER([F:FIS]INDCURPER-1))+string$(LCRCOL5, ' '), LCRCOL5)+"*"
+        Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+        #------------------------------------
+      Endif
+    Endif
+    #------------------------------------
+    # Suite de la boucle
+  Next
+  #------------------------------------
+  LCRCHAR = string$(LCRLINE, '*') : Call ECR_TRACE(LCRCHAR,0) From GESECRAN
+  #------------------------------------
+End
+
+########################################
+Subprog MAJ_CNX (PSOCIETE, PTBCNX, RERROR)
+# Envoi les info contextes.
+# RERROR=-1 en cas d'échec, RERROR=0 sinon
+Value    Char    PSOCIETE
+Value    Integer PTBCNX(1..,0..)
+Variable Integer RERROR
+
+Local    Integer N_I
+Local    Char    SREQUETE(250)
+Local    Integer LLSTPLN(0..G301NBPLNFC, 0..LDIMLSTPLN)               : # Liste des plans gérés sur le contexte
+Local    Char    LLSTCPLN(15)(0..G301NBPLNFC, 0..LDIMLSTCPLN)         : # Liste des plans gérés sur le contexte (partie char)
+Local    Integer NB_JOURS
+Local    Integer NB_MOIS
+Local    Integer NB_WEEK
+Local    Decimal NB_YEAR
+Local    Integer INDIC_SUIVANT2
+
+  #------------------------------------
+  If clalev([F:CNX])=0  : Local File CONTEXT    [CNX]  : Endif        : # Contextes
+  If clalev([F:CNXA])=0 : Local File CONTEXT    [CNXA] : Endif        : # Contextes
+  If clalev([F:FIS])=0  : Local File FISCYEAR   [FIS]  : Endif        : # Exercice
+  #------------------------------------
+  #--FQ79662 récupération du type de comptabilisation par défaut
+  Local Char DEFTYPPST(15)
+  Call PARAM(PSOCIETE, "DEFPSTTYP", DEFTYPPST) From ADOVAL
+  #------------------------------------
+  For [CNX]CNX0 Where CPY=PSOCIETE
+    #------------------------------------
+    If [F:CNX]NBPLC > 0 and PTBCNX([F:CNX]CNX, GTBCNXTCLC) <> GVML_TCNOCLO Then
+      Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=PTBCNX([F:CNX]CNX, GTBCNXEXE)
+      Read [FIS]FIY1 First
+      Filter [FIS]
+
+      # Plan de production : report dans la période qu'on clôture du prévu dans le réalisé si le réalisé vaut 0
+      If [F:CNX]FLGCNXUO = G_OUI
+          Gosub REPORT_PREVU_REALISE
+          If RERROR = -1
+            Break
+          Endif
+      Endif
+
+      #------------------------------------
+      If PTBCNX([F:CNX]CNX, GTBCNXTCLC) = GVML_TCCLOPE Then
+        #------------------------------------
+        # CLOTURE PERIODE
+        #------------------------------------
+        # Ancienne période courante
+        [F:FIS]STAPER([F:FIS]INDCURPER-1) = GVML_SPCLOSE
+        [F:FIS]INDCURPER                 += 1
+        # Nouvelle période courante
+        [F:FIS]STAPER([F:FIS]INDCURPER-1) = GVML_SPCOURA
+
+        # Si rien n'était précisé (période fermée), on met par défaut le type de comptabilisation de la période qu'on clôture
+        If [F:FIS]TYPPST([F:FIS]INDCURPER-1) = 0
+          [F:FIS]TYPPST([F:FIS]INDCURPER-1) = [F:FIS]TYPPST([F:FIS]INDCURPER-2)
+          Endif
+        Rewrite [FIS]
+        If fstat Then
+          Call ECR_TRACE ("MAJ_CNX 1"-[F:FIS]CPY-num$([F:FIS]CNX)-[F:FIS]DATSTRFIY-":"-num$(fstat),1) From GESECRAN
+          RERROR = -1
+          Break
+        Endif
+      Else
+        #------------------------------------
+        # CLOTURE EXERCICE
+        #------------------------------------
+        # L'exercice courant prend le status CLOS
+        [F:FIS]STAFIY                     = GVML_TEPREC
+        [F:FIS]STAPER([F:FIS]INDCURPER-1) = GVML_SPCLOSE
+        # L'exercice clos n'a plus de période courante
+        [F:FIS]INDCURPER                  = 0
+        # FQ67615
+        WSV_LVATYP = [F:FIS]LVATYP
+        WSV_LVALIM = [F:FIS]LVALIM
+
+        Rewrite [FIS]
+        If fstat Then
+          Call ECR_TRACE ("MAJ_CNX 2"-[F:FIS]CPY-num$([F:FIS]CNX)-[F:FIS]DATSTRFIY-":"-num$(fstat),1) From GESECRAN
+          RERROR = -1
+          Break
+        Endif
+        #------------------------------------
+        # L'exercice suivant prend le status COURANT
+        Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=GVML_TESUIV
+        Read [FIS]FIY1 First
+        Filter [FIS]
+        [F:FIS]STAFIY                     = GVML_TECOURA
+        [F:FIS]INDCURPER                  = 1
+        [F:FIS]STAPER([F:FIS]INDCURPER-1) = GVML_SPCOURA
+
+        #FQ79662 Si rien n'était précisé (période fermée), on met par défaut "comptabilisation provisoire"
+        #FQ79662 If [F:FIS]TYPPST([F:FIS]INDCURPER-1) = 0
+        #FQ79662   [F:FIS]TYPPST([F:FIS]INDCURPER-1) = GVML_TPSTPRO
+        #FQ79662 Endif
+
+        #--FQ79662
+        # Désormais on se base sur la valeur du paramètre DEFPSTTYP (type de comptabilisation par défaut)
+        # si le paramètre n'est pas renseigné et que le type de comptabilisation n'est pas déjà "Réel" :
+        # on met "Simulation"
+        If  ( [F:FIS]TYPPST([F:FIS]INDCURPER-1) <> GVML_TPSTDEF )
+          If DEFTYPPST <> ""
+            [F:FIS]TYPPST([F:FIS]INDCURPER-1) = val(DEFTYPPST)
+          Else
+            [F:FIS]TYPPST([F:FIS]INDCURPER-1) = GVML_TPSTPRO
+          Endif
+        Endif #--/FQ79662
+
+        # FQ67615
+        If [F:FIS]LVATYP <= GVML_GLVAAUC
+          [F:FIS]LVATYP = WSV_LVATYP
+          If [F:FIS]LVATYP = 0
+            [F:FIS]LVATYP = GVML_GLVAAUC
+          Endif
+          [F:FIS]LVALIM = WSV_LVALIM
+        Endif
+        WSV_LVATYP = [F:FIS]LVATYP
+        WSV_LVALIM = [F:FIS]LVALIM
+
+        Rewrite [FIS]
+        If fstat Then
+          Call ECR_TRACE ("MAJ_CNX 3"-[F:FIS]CPY-num$([F:FIS]CNX)-[F:FIS]DATSTRFIY-":"-num$(fstat),1) From GESECRAN
+          RERROR = -1
+          Break
+        Endif
+        #------------------------------------
+        # L'exercice SUIVANT2 prend le status SUIVANT s'il existe
+        INDIC_SUIVANT2 = G_NON
+        Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=GVML_TESUIV2
+        Read [FIS]FIY1 First
+        Filter [FIS]
+        If !fstat Then
+          INDIC_SUIVANT2 = G_OUI
+          [F:FIS]STAFIY  = GVML_TESUIV
+          # FQ67615
+          If [F:FIS]LVATYP <= GVML_GLVAAUC
+            [F:FIS]LVATYP = WSV_LVATYP
+            If [F:FIS]LVATYP = 0
+              [F:FIS]LVATYP = GVML_GLVAAUC
+            Endif
+            [F:FIS]LVALIM = WSV_LVALIM
+          Endif
+          WSV_LVATYP = [F:FIS]LVATYP
+          WSV_LVALIM = [F:FIS]LVALIM
+
+          Rewrite [FIS]
+          If fstat Then
+            Call ECR_TRACE ("MAJ_CNX 4"-[F:FIS]CPY-num$([F:FIS]CNX)-[F:FIS]DATSTRFIY-":"-num$(fstat),1) From GESECRAN
+            RERROR = -1
+            Break
+          Endif
+        Endif
+        #------------------------------------
+        # Recherche de l'exercice après l'ancien exercice suivant ou suivant2 pour créer le nouveau SUIVANT
+        # ou SUIVANT2 => le premier pour lequel STAFIY=0
+        Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=0
+        Read [FIS]FIY1 First
+        Filter [FIS]
+        #------------------------------------
+        If fstat Then
+          # Aucun exercice n'est défini après l'exercice courant (le nouveau) :
+          # faut le créer à partir de l'ancien suivant ou suivant2 selon le même découpage
+          If INDIC_SUIVANT2 = G_NON Then
+            Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=GVML_TECOURA
+          Else
+            Filter [FIS] Where CPY=[F:CNX]CPY and CNX=[F:CNX]CNX and STAFIY=GVML_TESUIV
+          Endif
+          #------------------------------------
+          Read [FIS]FIY1 Last
+          Filter [FIS]
+          # Le début du nouvel exercice c'est le lendemain de la fin de l'ancien
+          [F:FIS]DATSTRFIY = [F:FIS]DATENDFIY+1
+          # La fin du nouvel exercice c'est la même fin que l'ancien plus 1 an
+          [F:FIS]DATENDFIY = gdat$(  day([F:FIS]DATENDFIY),
+&                                    month([F:FIS]DATENDFIY),
+&                                    year([F:FIS]DATENDFIY) +1
+&                                 )
+          #------------------------------------
+          If INDIC_SUIVANT2 = G_NON Then
+             [F:FIS]STAFIY    = GVML_TESUIV
+          Else
+             [F:FIS]STAFIY    = GVML_TESUIV2
+          Endif
+          #------------------------------------
+          [F:FIS]INDCURPER = 1
+          [F:FIS]STAPER(0) = GVML_SPFERME : # Période non ouverte
+          [F:FIS]TYPPST(0) = 0            : # Pas de type de comptabilisation
+          # La début première période c'est forcément le début d'exercice
+          [F:FIS]DATSTRPER([F:FIS]INDCURPER-1) = [F:FIS]DATSTRFIY
+          #------------------------------------
+          For N_I = 2 To [F:FIS]NBRPER
+            [F:FIS]STAPER(N_I-1) = GVML_SPFERME : # Période non ouverte
+            [F:FIS]TYPPST(N_I-1) = 0            : # Pas de type de comptabilisation
+            #------------------------------------
+            # On attaque à la deuxième période
+            # La date de début de période COURANTE, c'est la même date que l'exercice passé plus 1 an
+            [F:FIS]DATSTRPER(N_I-1) = gdat$(  day([F:FIS]DATSTRPER(N_I-1)),
+&                                             month([F:FIS]DATSTRPER(N_I-1)),
+&                                             year([F:FIS]DATSTRPER(N_I-1)) +1
+&                                          )
+            #------------------------------------
+            # La date de fin de période PRECEDENTE, c'est la veille de la date de début de période COURANTE
+            # qu'on vient de calculer
+            [F:FIS]DATENDPER(N_I-2) = gdat$(  day([F:FIS]DATSTRPER(N_I-1)) -1,
+&                                             month([F:FIS]DATSTRPER(N_I-1)),
+&                                             year([F:FIS]DATSTRPER(N_I-1))
+&                                          )
+            #------------------------------------
+            # Suite de la boucle
+          Next N_I
+          #------------------------------------
+          # La fin de la dernière période c'est forcément la fin d'exercice
+          [F:FIS]DATENDPER([F:FIS]NBRPER-1)    = [F:FIS]DATENDFIY
+          #------------------------------------
+          For N_I = 1 To [F:FIS]NBRPER
+            Call CALCUL_NB_D_M_W_Y ([F:FIS]DATSTRPER(N_I-1), [F:FIS]DATENDPER(N_I-1),
+&                                   NB_JOURS, NB_MOIS, NB_WEEK, NB_YEAR) From GLOBIENS
+            # On recalcule le poids des jour, mois et semaines des périodes en fonction des date
+            # du nouvel exercice. Les poids ne sont affectés QUE s'ils n'étaient pas à zéro dans
+            # l'exercice utilisé comme modèle pour la création (l'ancien exercice SUIVANT)
+            If [F:FIS]NBRMONPER(N_I-1) <> 0 Then
+              [F:FIS]NBRMONPER(N_I-1) = NB_MOIS
+            Endif
+            If [F:FIS]NBRDAYPER(N_I-1) <> 0 Then
+              [F:FIS]NBRDAYPER(N_I-1) = NB_JOURS
+            Endif
+            If [F:FIS]NBRWEKPER(N_I-1) <> 0 Then
+              [F:FIS]NBRWEKPER(N_I-1) = NB_WEEK
+            Endif
+          Next N_I
+          #------------------------------------
+          # Remise à 0 du flag "Exercice de mise en oeuvre de la norme"
+          If [F:CNX]FIYITSSTD=G_OUI Then
+            [F:CNX]FIYITSSTD=G_NON
+            Rewrite [F:CNX]
+            If fstat Then
+              Call ECR_TRACE ("MAJ_CNX 5"-[F:FIS]CPY-num$([F:FIS]CNX)-[F:FIS]DATSTRFIY-":"-num$(fstat),1) From GESECRAN
+              RERROR = -1
+              Break
+            Endif
+          Endif
+          #------------------------------------
+          # Report du nouveau découpage dans les plans de production
+          If [F:CNX]FLGCNXUO = G_OUI
+            Gosub MAJ_PPL
+            If RERROR = -1
+              Break
+            Endif
+          Endif
+
+          # FQ67615
+          If [F:FIS]LVATYP <= GVML_GLVAAUC
+            [F:FIS]LVATYP = WSV_LVATYP
+            If [F:FIS]LVATYP = 0
+              [F:FIS]LVATYP = GVML_GLVAAUC
+            Endif
+            [F:FIS]LVALIM = WSV_LVALIM
+          Endif
+          WSV_LVATYP = [F:FIS]LVATYP
+          WSV_LVALIM = [F:FIS]LVALIM
+
+          #------------------------------------
+          Write [FIS]
+          If fstat Then
+            Call ECR_TRACE ("MAJ_CNX 6"-[F:FIS]CPY-num$([F:FIS]CNX)-[F:FIS]DATSTRFIY-":"-num$(fstat),1) From GESECRAN
+            RERROR = -1
+            Break
+          Endif
+        Else
+          # Il y a un exercice défini au-delà du suivant2, on ne le redécoupe pas mais on met à jour son statut
+          [F:FIS]STAFIY    = GVML_TESUIV2
+
+          # FQ67615
+          If [F:FIS]LVATYP <= GVML_GLVAAUC
+            [F:FIS]LVATYP = WSV_LVATYP
+            If [F:FIS]LVATYP = 0
+              [F:FIS]LVATYP = GVML_GLVAAUC
+            Endif
+            [F:FIS]LVALIM = WSV_LVALIM
+          Endif
+          WSV_LVATYP = [F:FIS]LVATYP
+          WSV_LVALIM = [F:FIS]LVALIM
+
+          #------------------------------------
+          Rewrite [FIS] Curr
+          If fstat Then
+            Call ECR_TRACE ("MAJ_CNX 7"-[F:FIS]CPY-num$([F:FIS]CNX)-[F:FIS]DATSTRFIY-":"-num$(fstat),1) From GESECRAN
+            RERROR = -1
+            Break
+          Endif
+          #------------------------------------
+        Endif
+        #------------------------------------
+      Endif
+      #------------------------------------
+    Endif
+    #------------------------------------
+  Next
+  #------------------------------------
+End
+
+########################################
+# Mise à jour des Plans de Production
+# de la société et du contexte
+$MAJ_PPL
+
+  Local Integer N_I
+  Local Decimal LRSDQTY, LEXTQTY
+
+  If !clalev([F:PLH])  : Local File PROPLNH [PLH] : Endif : # Plans de production - en-tête
+  If !clalev([F:PLP])  : Local File PROPLN  [PLP] : Endif : # Plans de production - ligne
+
+  #For [PLH] Where CPY=[F:CNX]CPY : # FQ87713
+  # On ne traite que les plans de production sans date de fin ou ayant une date de fin supérieure au début
+  # du nouvel exercice créé dans MAJ_CNX
+  For [PLH] Where (CPY=[F:CNX]CPY) and ((PPLENDDAT0 =  [0/0/0])
+&                                   or ((PPLENDDAT0 <> [0/0/0]) and PPLENDDAT0 >= [F:FIS]DATSTRFIY))
+    N_I = 0
+
+    # Lecture de la dernière période de l'exercice précédent du plan pour avoir le résiduel et le prévu
+    Read [PLP]PPL0=[F:PLH]PROPLN;[F:FIS]DATSTRPER(0)-1;[F:FIS]DATSTRPER(0)-1
+    If fstat
+      Call ECR_TRACE ("MAJ_PPL 1"-[F:PLH]PROPLN-format$("DD2",[F:FIS]DATSTRPER(0)-1)-format$("DD2",[F:FIS]DATSTRPER(0)-1)-":"-num$(fstat),1) From GESECRAN
+      RERROR=-1
+      Break
+    Endif
+
+    LRSDQTY = [F:PLP]RSDQTY
+    LEXTQTY = [F:PLP]EXTQTY
+
+    # Découpage de l'exercice du plan de production à l'image de l'exercice précédent
+    #For [PLP]PPL0 Where PROPLN=[F:PLH]PROPLN and FIYENDDAT=[F:FIS]DATSTRPER(0)-1
+    For [PLP]PPL0 Where PROPLN=[F:PLH]PROPLN and FIYENDDAT=[F:FIS]DATSTRPER(0)-1 With Stability : # FQ87713
+      If ([F:PLH]PPLENDDAT0 <> [0/0/0] and [F:PLH]PPLENDDAT0 < [F:FIS]DATSTRPER(N_I))
+        # La date de fin du plan de production est atteinte, on ne crée pas d'enregistrement au-delà : # FQ87713
+        Break
+      Endif
+
+      [F:PLP]PROPLN    = [F:PLH]PROPLN
+      [F:PLP]FIYSTRDAT = [F:FIS]DATSTRFIY
+      [F:PLP]FIYENDDAT = [F:FIS]DATENDFIY
+      [F:PLP]PERSTRDAT = [F:FIS]DATSTRPER(N_I)
+      [F:PLP]PERENDDAT = [F:FIS]DATENDPER(N_I)
+
+      [F:PLP]RSDQTY    = LRSDQTY - LEXTQTY : # mise à jour du résiduel
+      If [F:PLP]RSDQTY < 0 : [F:PLP]RSDQTY = 0 : Endif
+
+      LRSDQTY          = [F:PLP]RSDQTY
+      LEXTQTY          = [F:PLP]EXTQTY
+
+      Write [PLP]
+      If fstat
+        Call ECR_TRACE ("MAJ_PPL 2"-[F:PLP]PROPLN-format$("DD2",[F:PLP]FIYENDDAT)-format$("DD2",[F:PLP]PERENDDAT)-":"-num$(fstat),1) From GESECRAN
+        RERROR=-1
+        Break
+      Endif
+
+      N_I += 1
+    Next
+  Next
+
+  If clalev([F:PLH])  : Close File [PLH] : Endif : # Plans de production - en-tête
+  If clalev([F:PLP])  : Close File [PLP] : Endif : # Plans de production - ligne
+Return
+
+########################################
+# Mise à jour des Plans de Production
+# de la société et du contexte
+$REPORT_PREVU_REALISE
+  If !clalev([F:PLH])  : Local File PROPLNH [PLH] : Endif : # Plans de production - en-tête
+  If !clalev([F:PLP])  : Local File PROPLN  [PLP] : Endif : # Plans de production - ligne
+
+  For [PLH] Where CPY=[F:CNX]CPY and ( PPLENDDAT0 >= [F:FIS]DATSTRPER([F:FIS]INDCURPER-1) or PPLENDDAT0 = [0/0/0] )
+    # Lecture de la période courante de l'exercice du plan
+    Read [PLP]PPL0=[F:PLH]PROPLN;[F:FIS]DATENDFIY;[F:FIS]DATENDPER([F:FIS]INDCURPER-1)
+    If fstat
+      Call ECR_TRACE ("REPORT_PREVU_REALISE 1"-[F:PLH]PROPLN-format$("DD2",[F:FIS]DATENDFIY)-format$("DD2",[F:FIS]DATENDPER([F:FIS]INDCURPER-1))-":"-num$(fstat),1) From GESECRAN
+      RERROR=-1
+      Break
+    Endif
+
+    If [F:PLP]CPLQTY = 0
+      # Report du prévu dans le réalisé
+      [F:PLP]CPLQTY = [F:PLP]EXTQTY
+
+      Rewrite [F:PLP] Curr
+      If fstat
+        Call ECR_TRACE ("REPORT_PREVU_REALISE 2"-[F:PLH]PROPLN-format$("DD2",[F:FIS]DATENDFIY)-format$("DD2",[F:FIS]DATENDPER([F:FIS]INDCURPER-1))-":"-num$(fstat),1) From GESECRAN
+        RERROR=-1
+        Break
+      Endif
+    Endif
+  Next
+
+  If clalev([F:PLH])  : Close File [PLH] : Endif : # Plans de production - en-tête
+  If clalev([F:PLP])  : Close File [PLP] : Endif : # Plans de production - ligne
+Return
+
+# Gestion de la liste gauche des biens sortis
+# dans un exercice antérieur.
+#################################################################
+# Mise à jour de la zone ISSFIYPRE pour les biens d'une société
+#================================================================
+Subprog MAJ_ISSFIYPRE(PCPY, RERR)
+Value    Char    PCPY
+Variable Integer RERR
+
+  If !clalev([F:WFAS]) : Local File FXDASSETS [WFAS] : Endif
+  If !clalev([F:WCNX]) : Local File CONTEXT   [WCNX] : Endif
+  If !clalev([F:WFIS]) : Local File FISCYEAR  [WFIS] : Endif
+
+
+  Local Char    L_REQUETE(255)
+  Local Integer L_IS_BCO_PRE
+  Local Integer I_CNX
+  Local Date    TRUEISSDAT  : # Date de sortie, soit ISSDAT soit pour un bien "1er bien de la concession" la fin effective de son contrat FQ54343
+
+  Local Date    L_STRFIYCOU(1..G300MAX)
+  Local Date    L_ENDFIYCOU(1..G300MAX)
+  Local Date    L_STRPERCOU(1..G300MAX)
+  Local Date    L_ENDPERCOU(1..G300MAX)
+  Local Integer CDRET
+
+  Call GET_CPY_DAT(PCPY,L_STRFIYCOU,L_ENDFIYCOU,L_STRPERCOU,L_ENDPERCOU,CDRET) From GLOBIENS
+
+  L_REQUETE="CPY=PCPY & ISSDAT<>[0/0/0] & ISSFIYPRE<>G_OUI"
+  Filter [WFAS] Where evalue(L_REQUETE)
+  GOK=1
+
+  For [WFAS]
+    # Pour chaque bien : on regarde si la date de sortie est inférieure à la date de début d'exercice de tous les
+    # contextes.
+    L_IS_BCO_PRE = G_OUI
+
+    # FQ54343 : traitement particulier pour les biens en concession "1er bien de la concession"
+    If G_ACTCCN = G_OUI and [F:WFAS]OWNTYP = GVML_TDCONCE and [F:WFAS]CCNETRTYP = GVML_NA1ERBC Then
+      # Le bien est "1er bien de la concession"
+      # Lecture du contrat de concession pour avoir sa date de fin effective
+      Read [F:CCN]CCN0=[F:WFAS]CCNREF
+      If fstat
+        GOK=0
+        RERR=fstat
+        Call ECR_TRACE([F:WFAS]AASREF-mess(783,7773,1)-[F:WFAS]CCNREF-num$(fstat),1) From GESECRAN
+        Break
+      Endif
+      If [F:CCN]REAENDCCN<>[0/0/0]
+        TRUEISSDAT = [F:CCN]REAENDCCN
+      Else
+        # Pas de date effective sur le contrat
+        TRUEISSDAT = [0/0/0]
+      Endif
+    Else
+      # Le bien n'est pas en concession ou pas "1er bien de la concession"
+      [L]TRUEISSDAT = [F:WFAS]ISSDAT
+    Endif
+
+    For I_CNX=1 To G300MAX
+      #If L_STRFIYCOU(I_CNX)<>[0/0/0] & [F:WFAS]ISSDAT>=L_STRFIYCOU(I_CNX) : # FQ54343
+      If L_STRFIYCOU(I_CNX)<>[0/0/0] & ([L]TRUEISSDAT=[0/0/0] or [L]TRUEISSDAT>=L_STRFIYCOU(I_CNX))
+        L_IS_BCO_PRE = G_NON
+        Break
+      Endif
+    Next I_CNX
+
+    # Bien sorti dans un exercice antérieur pour tous les contextes, on positionne le flag ISSFIYPRE à G_OUI
+
+    If L_IS_BCO_PRE = G_OUI
+     [F:WFAS]ISSFIYPRE = G_OUI
+     Rewrite [F:WFAS]
+     If fstat
+      GOK=0
+      RERR=fstat
+      Break
+     Endif
+    Endif
+  Next
+
+  Filter [WFAS]
+  If !GOK
+  Else
+  Endif
+End
+
+########################################
+Funprog GET_CONDITION_DEP ()
+#
+# Rend la condition sur DEPREC pour les plan gérés du contexte
+# Implique que [F:CNX] soit chargé
+# Rend "" si aucun plan n'est géré (mais c'est pas bien normal de se retrouver dans ce cas !)
+Local    Integer N_I
+Local    Char    SREQUETE(250)
+  SREQUETE = ""
+  For N_I = 0 To [F:CNX]NBPLC-1
+    If SREQUETE <> "" Then
+      SREQUETE = SREQUETE + '|'
+    Endif
+    SREQUETE              = SREQUETE + 'DPRPLN='+num$([F:CNX]PLNCAA(N_I))
+    #------------------------------------
+    # Suite de la boucle
+  Next N_I
+End SREQUETE
+
+########################################
+Subprog ALIM_PLN (RLSTPLN, RLSTCPLN)
+Variable Integer RLSTPLN(0..,0..)           : # Liste des plans gérés sur le contexte
+Variable Char    RLSTCPLN()(0..,0..)        : # Liste des plans gérés sur le contexte
+#
+# Alimente les structures LSTPLN et LSTCPLN concernant les plans du contexte
+Local    Integer N_I, N_E
+
+  Raz RLSTPLN, RLSTCPLN
+  N_E = 0
+  For N_I = 0 To [F:CNX]NBPLC-1
+    RLSTPLN(N_E,LIN_PLAN) = [F:CNX]PLNCAA(N_I)
+    If [F:CNX]FLUTRATXS(N_I) <> "" or [F:CNX]FLUTRAACC(N_I) = G_OUI Then
+      RLSTPLN(N_E,LIN_FLUX) = G_OUI
+    Else
+      RLSTPLN(N_E,LIN_FLUX) = G_NON
+    Endif
+    If dim(LIN_FLACC)>0 Then
+      RLSTPLN(N_E,LIN_FLACC)  = [F:CNX]FLUTRAACC(N_I)
+      RLSTCPLN(N_E,LIN_FLTXS) = [F:CNX]FLUTRATXS(N_I)
+    Endif
+    N_E += 1
+    #------------------------------------
+    # Suite de la boucle
+  Next N_I
+End
+
+#-------------------------------------------------------------------------------
+# Compteurs mal alimentés (remplacement classe FIYWS [trop longue] par FIYS).
+# Fonction d'incrémentation des compteurs
+#-------------------------------------------------------------------------------
+$INCR_CPT_STAT
+  #------------------------------------
+  # Test sur la date de début d'amortissement
+  #------------------------------------
+  # FQ95251 Suppression de la relecture de DEPREC, trop coûteuse en temps. Remplacement par l'indicateur FAS_CLOSED
+  ## FQ62087
+  #Filter [DEPW] Where AASREF=[F:FAS]AASREF and CNX=[F:CNX]CNX and PERENDDAT=LDATCRT(LDT_FINPCO) and STRDPRDAT<=LDATCRT(LDT_FINPCO)
+  #If rowcount([DEPW]) > 0
+  # L_NBBCOCLO([F:CNX]CNX)+=1
+  #Endif
+  #Filter [DEPW]
+  If FAS_CLOSED = G_OUI
+   L_NBBCOCLO([F:CNX]CNX)+=1
+  Endif
+
+  #------------------------------------
+  # Test sur la date de sortie
+  #------------------------------------
+  # FQ62087 : remplacement de DATDEBPER, DATFINPER, DATDEBEX et DATFINEX par le tableau LDATCRT()
+  If [F:FAS]ISSDAT<>[0/0/0]
+   If PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOPE
+    If (([F:FAS]ISSDAT >= LDATCRT(LDT_DEBPCO)) & ([F:FAS]ISSDAT <= LDATCRT(LDT_FINPCO)))
+     L_NBBCOSOR([F:CNX]CNX)+=1
+    Endif
+   Else
+    If (([F:FAS]ISSDAT >= LDATCRT(LDT_DEBEXO)) & ([F:FAS]ISSDAT <= LDATCRT(LDT_FINEXO)))
+      L_NBBCOSOR([F:CNX]CNX)+=1
+    Endif
+   Endif
+  Endif
+Return
+
+########################################
+Subprog INIT_CNX_ACLOTURER (PSOCIETE, PTBCNX, PTYPCLC)
+# Initialise les contextes à clôturer
+Value Char PSOCIETE
+Variable Integer PTBCNX(1..,0..)
+Value Integer PTYPCLC
+
+Local Integer N_I
+
+  Call VIDE_LISTE_CNX_ACLOTURER (PTBCNX, GVML_TCNOCLC)
+  If PTYPCLC <> GVML_TCNOCLC Then
+    If clalev([F:CNX])  = 0 : Local File CONTEXT     [CNX]  : Endif : # Contextes
+    #------------------------------
+    For [CNX]CNX0 Where CPY=PSOCIETE
+      If [F:CNX]NBPLC > 0 Then
+        If GNIVTRACE > 2 Then
+          # 14 Contexte à calculer :
+          # 15 Type de calcul :
+          Call ECR_TRACE(mess(14,GML_MSGCAL,1)-num$([F:CNX]CNX)-mess(15,GML_MSGCAL,1)-num$(PTYPCLC),0) From GESECRAN
+        Endif
+        #--------------------
+        PTBCNX([F:CNX]CNX, GTBCNXTCLC) = PTYPCLC
+      Endif
+      #--------------------
+      # Suite de la boucle
+    Next CNX0
+  Endif
+End
+
+########################################
+Subprog VIDE_LISTE_CNX_ACLOTURER (PTBCNX, PCODECNX)
+Variable Integer PTBCNX(1..,0..)
+Value Integer PCODECNX
+
+Local Integer N_I
+
+  Raz PTBCNX
+  For N_I = 1 To GMAXCNXC
+    PTBCNX(N_I, GTBCNXTCLC) = PCODECNX          : # Type de calcul
+    PTBCNX(N_I, GTBCNXEXE)  = GVML_TECOURA      : # Exercice calculé (courant/suivant)
+    PTBCNX(N_I, GTBCNXCLS)  = G_NON             : # Calcul optimisé
+    PTBCNX(N_I, GTBCNXEVE)  = G_NON             : # Création des événements exercice non périodique
+    PTBCNX(N_I, GTBCNXCSO)  = G_NON             : # Calcul société
+    #------------------------------
+    # Suite de la boucle
+  Next N_I
+End
+
+#-------------------------------------------------------------------------------
+# Génère les flux liasse et compte pour le bien et le plan courant
+#-------------------------------------------------------------------------------
+$GENERE_FLUX
+  If (!LDEP_FSTAT) and (LLSTPLN(N_E,LIN_FLUX) = G_OUI) and ([F:FAS]ISSFIYPRE <> G_OUI) Then
+    If val(mid$([F:FAS]FLGCNXFLX, N_I, 1)) = GVML_FLXNOTG  # FQ66894
+      # On gère les flux sur le plan
+      # clôture période
+      #    - Soit clôture période dans l'exercice
+      #    - Soit clôture de la dernière période de l'exercice (dans ce cas c'est clôture exercice)
+      If LLSTCPLN(N_E,LIN_FLTXS) <> "" Then
+        # Suivi flux par liasse
+        Call GENERE_FLUX (LLSTPLN(N_E,LIN_PLAN), GML_TFPLIASS, LLSTCPLN(N_E,LIN_FLTXS), GVML_TXSDEF, LERROR)  From TRTFLUX
+        If LERROR < 0 Then
+          RERROR = LERROR
+          Call GERE_MSG_ERREUR_FLUX(RERROR, LMESSAGE) From TRTFLUX
+          Call ECR_TRACE(mess(108,GML_MSGCAL,1)-'A'-num$(LLSTPLN(N_E,LIN_PLAN))-[F:FAS]AASREF-':'-LMESSAGE,1) From GESECRAN : # Erreur réécriture du plan :
+          # On ne s'arrête pas dans ce cas d'erreur pour détecter les éventuelles autres
+          # erreurs dans la suite des biens
+        Endif
+      Endif
+
+      If LLSTPLN(N_E,LIN_FLACC) = G_OUI Then
+        # Suivi flux par compte
+        Call GENERE_FLUX (LLSTPLN(N_E,LIN_PLAN), GML_TFCOMPTE, "", GVML_TXSDEF, LERROR)  From TRTFLUX
+        If LERROR < 0 Then
+          RERROR = LERROR
+          Call GERE_MSG_ERREUR_FLUX(RERROR, LMESSAGE) From TRTFLUX
+          Call ECR_TRACE(mess(108,GML_MSGCAL,1)-'B'-num$(LLSTPLN(N_E,LIN_PLAN))-[F:FAS]AASREF-':'-LMESSAGE,1) From GESECRAN : # Erreur réécriture du plan :
+          # On ne s'arrête pas dans ce cas d'erreur pour détecter les éventuelles autres
+          # erreurs dans la suite des biens
+        Endif
+      Endif
+
+      # FQ84727 : déplacement ce cette mise à jour car si plusieurs plans d'un même contextes suivent
+      #           des flux, seul le premier plan sera traité
+      ## On positionne le flag d'optimisation à "flux générés" FQ66894
+      #[F:FAS]FLGCNXFLX=func GLOFUNC.SETRNGSTR([F:FAS]FLGCNXFLX, N_I, num$(GVML_FLXGENE))
+    Else
+      # Mise à jour du flag FLGSTATXS -> passage à "Flux définitif" FQ66894
+      Update [F:FLU]
+&     Where AASREF=[F:FAS]AASREF and DPRPLN=LLSTPLN(N_E,LIN_PLAN) and FIYSTRDAT=LDATCRT(LDT_DEBEXO) and PERSTRDAT=LDATCRT(LDT_DEBPCO)
+&     With FLGSTATXS=GVML_TXSDEF
+      If PTBCNX(N_I, GTBCNXTCLC) = GVML_TCCLOEX
+        Update [F:FLU]
+&       Where AASREF=[F:FAS]AASREF and DPRPLN=LLSTPLN(N_E,LIN_PLAN) and FIYSTRDAT=LDATCRT(LDT_DEBEXO) and PERSTRDAT=[0/0/0]
+&       With FLGSTATXS=GVML_TXSDEF
+      Endif
+    Endif
+  Endif
+Return
+
+#******************************************************************************
+#*              MAJ CODE FORCAGE DES DEPENSES SUBVENTIONNEES                  *
+#******************************************************************************
+Subprog UPD_DEP_SUBV(PCPY, PAASREF, RERROR)
+Value    Char    PCPY
+Value    Char    PAASREF
+Variable Integer RERROR
+If !clalev([F:WFAS]) : Local File FXDASSETS  [WFAS] : Endif
+If !clalev([F:LOF])  : Local File LAYOUTFAS  [LOF]  : Endif
+
+Filter [LOF] Where (AASREF=PAASREF & FLGGRA = G_OUI & AMTGRA <> 0)
+For [LOF]
+  [F:LOF]FLGAMTGRA = G_OUI
+  Rewrite [F:LOF]
+  If fstat
+    GOK=0
+    RERROR= -1
+    Break
+  Endif
+Next
+Filter [LOF]
+
+End
+
+#******************************************************************************
+#*              MAJ MONTANT REINTEGRATION SUBVENTIONS SUR LES BIENS           *
+#*** 1-mise à jour du montant de réintégration cumulé                         *
+#*** 2-remise à zéro du montant de réintégration exercice                     *
+#******************************************************************************
+Subprog UPD_CRBGRACUM( PCPY, PAASREF, MDPRCUM, MENDDPE, MEXCDPR, RERROR )
+Value    Char        PCPY
+Value    Char        PAASREF
+Value    Decimal     MDPRCUM
+Value    Decimal     MENDDPE
+Value    Decimal     MEXCDPR
+
+Variable Integer   RERROR
+Local Decimal WCRBGRAAMT
+Local Decimal WCRBGRACUM
+
+WCRBGRAAMT =  MENDDPE + MEXCDPR
+WCRBGRACUM =  MDPRCUM
+
+[F:FAS]CRBGRAAMT = WCRBGRAAMT    #FQ96817
+[F:FAS]CRBGRACUM +=WCRBGRAAMT    #FQ96817
+
+
+#FQ96817    Update [FAS]
+#FQ96817&     Where CPY= PCPY and AASREF = PAASREF
+#FQ96817&     With  CRBGRAAMT = WCRBGRAAMT
+#FQ96817    If ( fstat )
+#FQ96817      RERROR = -1
+#FQ96817    Endif
+
+End
+
+#******************************************************************************
+#*             REMONTEE DU CUMUL DE REINTEGRATION SUR LES SUBVENTIONS         *
+#******************************************************************************
+$CALCUL_REINTEGRATION_SUBV
+Local  Decimal WFCRBCUM, WGCRBCUM
+Local  Decimal WRESCRB
+Local  Decimal WTOTCRB, WTOTGRAAMT
+Local  Integer LERROR
+Local  Integer LCDRET
+Local  Char    LCDINT
+Local  Char    SINVPLN
+Global Char    GREASON
+Global Decimal G_GRAAMT
+Global Decimal G_MAXGRAAMT
+Global Decimal G_INVGRAAMT
+Global Decimal G_REAGRAAMT
+Global Decimal G_CRBGRAAMT
+Global Decimal G_CRBGRACUM
+
+  If clalev([F:GRT])=0    : Local File GRANTS         [GRT]    : Endif
+  If clalev([F:GRTS])=0   : Local File GRANTS         [GRTS]   : Endif
+
+#FQ-96817  Filter [GRT] Where (GRASTA=GVML_SUBENC & CPY =[F:CNX]CPY  & INVPLN <> "") Order By INVPLN Asc
+#FQ-96817  For [GRT]
+#FQ-96817    WTOTGRAAMT +=[F:GRT]GRAAMT
+#FQ-96817  Next
+#FQ-96817 Filter[GRT]
+
+#FQ-96817  SINVPLN=""
+
+  Filter [GRT] Where (GRASTA=GVML_SUBENC & CPY =[F:CNX]CPY  & INVPLN <> "") Order By INVPLN Asc
+  For [GRT] With Stability
+
+      [F:GRTS] = [F:GRT]
+      WFCRBCUM=0
+      WTOTGRAAMT=0  #FQ-96817
+      # calcul du montant de réintégration pour chaque subvention liée au projet d'investissement
+      #------------------------------------------------------------------
+      Filter[FAS] Where INVPLN = [F:GRT]INVPLN
+      For [FAS]
+         WFCRBCUM += [F:FAS]CRBGRACUM
+         WTOTGRAAMT +=[F:GRT]GRAAMT  #FQ-96817
+      Next
+      Filter [FAS]
+      [F:GRT]CRBGRAAMT=0
+      If WTOTGRAAMT <> 0
+         WGCRBCUM  =   WFCRBCUM*([F:GRT]GRAAMT/WTOTGRAAMT)
+         Call GET_MNT_ARRONDI(WGCRBCUM   ,[F:GRT]CUR,WGCRBCUM   ) From GLOBIENS
+         [F:GRT]CRBGRACUM=WGCRBCUM
+      Endif
+      Rewrite[GRT]
+      If fstat <>0
+        GOK = 0 : Call FSTA("GRT") From GLOCK : Break
+      Endif
+      #-------------------------------------------------------------
+      # Génération d'un évènement de type "Actualisation de Subvention"
+      #------------------------------------------------------------------
+      If [F:GRT]CRBGRAAMT <> [F:GRTS]CRBGRAAMT     or
+&        [F:GRT]CRBGRACUM <> [F:GRTS]CRBGRACUM
+        # FQ96429
+        LCDINT= "GRTCRT"+num$(G301CPT)
+        G_GRAAMT         = [F:GRT]GRAAMT    - [F:GRTS]GRAAMT
+        G_MAXGRAAMT      = [F:GRT]MAXGRAAMT - [F:GRTS]MAXGRAAMT
+        G_INVGRAAMT      = [F:GRT]INVGRAAMT - [F:GRTS]INVGRAAMT
+        G_REAGRAAMT      = [F:GRT]REAGRAAMT - [F:GRTS]REAGRAAMT
+        G_CRBGRAAMT      = [F:GRT]CRBGRAAMT - [F:GRTS]CRBGRAAMT
+        G_CRBGRACUM      = [F:GRT]CRBGRACUM - [F:GRTS]CRBGRACUM
+        GREASON = mess(93,7771,1)
+        #Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,date$,LCDRET)  From GENEVE : # FQ64478 : paramètre manquant
+        Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,date$,LDATCRT(LDT_FINPCO),LCDRET)  From GENEVE
+        If (LCDRET > 20 )
+          GOK = 0
+          Call FSTA("EVEGRT") From GLOCK
+        Endif
+        If find(G301IAS, [M:FPC]DPRPLNCNX) > 0
+          #  Evénement de création IAS
+          LCDINT= "GRTCRT"+num$(G301IAS)
+          Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,date$,LDATCRT(LDT_FINPCO),LCDRET)  From GENEVE
+          If (LCDRET > 20 ) Then
+            GOK = 0
+            Call FSTA("EGRTCRT") From GLOCK
+          Endif
+        Endif
+      Endif
+
+   Next
+Filter[GRT]
+
+If GOK=0
+   LERROR = -1
+Endif
+
+Return
+
+
+#******************************************************************************
+Subprog CLORE_EXE_FAS_TVA ( PSOC, PPLN , PDTDBEX, PDTFNEX )
+#
+# - Objet  : Cloture exercice de FXDASSETS pour les informations  relatives à la TVA
+#
+# FQ 46680 : Nouvelles règles de TVA
+#
+Value  Char      PSOC
+Value  Integer   PPLN
+Value  Date      PDTDBEX
+Value  Date      PDTFNEX
+
+  If ( PPLN = G301CPT ) Then
+    # --  Plan Comptable
+
+    # Biens sortis dans l'exercice
+    If ( [F:FAS]ISSDAT <> [0/0/0] and [F:FAS]ISSDAT >= PDTDBEX and [F:FAS]ISSDAT <= PDTFNEX ) Then
+      If ([F:FAS]ISSVATRAT <> 0 ) Then
+        [F:FAS]DEDCOEF = 1.
+      Else
+        [F:FAS]DEDCOEF = 0.
+      Endif
+    Endif
+    # Durée résiduelle
+    If ([F:FAS]VATRSD > 0 ) Then : [F:FAS]VATRSD -= 1 : Endif
+    # Entretien des cumuls PCG
+    [F:FAS]VATREGCUM  -= [F:FAS]VATREGAMT
+    [F:FAS]VATREGCUM  += [F:FAS]VATREGDED
+    [F:FAS]VATREGAMT   = 0
+    [F:FAS]VATREGDED   = 0
+    # RAZ des indicateurs de régul annuel et globale
+    [F:FAS]VATYEAFLG   = G_NON
+    [F:FAS]ASJCOEFGLO  = G_NON
+    [F:FAS]TAXCOEFGLO  = G_NON
+    [F:FAS]ADMCOEFGLO  = G_NON
+    # Coefficients futurs alimentent les coef. de référence et les coef. annuels
+    [F:FAS]ASJCOER     = [F:FAS]ASJCOEF
+    [F:FAS]TAXCOER     = [F:FAS]TAXCOEF
+    [F:FAS]ADMCOER     = [F:FAS]ADMCOEF
+    [F:FAS]DEDCOER     = [F:FAS]DEDCOEF
+    ###[F:FAS]ASJCOE      = [F:FAS]ASJCOEF
+    ###[F:FAS]TAXCOE      = [F:FAS]TAXCOEF
+    ###[F:FAS]ADMCOE      = [F:FAS]ADMCOEF
+    ###[F:FAS]DEDCOE      = [F:FAS]DEDCOEF
+    # Mise à jour des secteurs d'activité de la société
+    Call CLORE_EXE_SECTEURS_TVA (PSOC)
+  Endif
+
+  If ( PPLN = G301IAS ) Then
+    # -- Plan IAS/IFRS
+    # Entretien des cumuls IAS
+    [F:FAS]IASREGCUM  -= [F:FAS]IASVATREG
+    [F:FAS]IASREGCUM  += [F:FAS]VATREGDEDI
+    [F:FAS]IASVATREG   = 0
+    [F:FAS]VATREGDEDI  = 0
+  Endif
+
+End
+
+#******************************************************************************
+Subprog CLORE_EXE_SECTEURS_TVA ( PSOC )
+#
+# - Objet  : Cloture des secteurs TVA de la société
+#            Si coéfficient provisoire et définitif sont différents
+#              Le coefficent définitif devient coefficient provisoire
+#              Le flag coefficient définitif est déforcé
+#            sinon
+#              On laisse en l'état si coef provisoire est à 1. ou à 0.
+#              sinon on déforce
+#            finsi
+#
+# FQ 46680 : Nouvelles règles de TVA
+#
+#
+Value  Char   PSOC
+
+  If clalev([F:SEA]) =0  : Local File SECACT  [SEA]  : Endif  : # secteurs d'activité
+
+  Filter [SEA] Where CPY=PSOC
+  #>>>>
+  For [SEA]SEA0
+    If ( [F:SEA]TAXCOEINI <> [F:SEA]TAXCOEDEF ) Then
+      [F:SEA]TAXCOEINI = [F:SEA]TAXCOEDEF
+      [F:SEA]TAXCOEFLG = G_NON
+    Else
+      If ( [F:SEA]TAXCOEDEF <> 1. and [F:SEA]TAXCOEDEF <> 0. ) Then
+        [F:SEA]TAXCOEFLG = G_NON
+      Endif
+    Endif
+    Rewrite [SEA]
+  Next
+  #<<<<
+  Filter [SEA]
+
+End
+
+####################################################################################################
+$ERR_TEST
+ Infbox [F:FAS]AASREF
+ Resume
+Return
+

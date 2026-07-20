@@ -1,0 +1,3117 @@
+#<AdxTL>@(#)9.0.0.0 $Revision$
+#------------------------------------------------------------------------#
+# MTKAUTLIB                                                SR Juin2000   #
+#  revu durant l'été 2003 pour modélisation/stockisation                 #
+#                                                                        #
+# Bibliotheque de traitements liés à la création automatique de suivis   #
+# Les informations nécessaires à la création des suivis se passent par   #
+# l'intermédiaire d'écrans invisibles : MTOK (opérations) MTMK (matières)#
+#                                       MTIK (articles lancés)           #
+# Principaux traitements :                                               #
+#       - CRE_GRPMKI   : boucle de création de déclarations de prod      #
+#      appelle CRE_MKI : création d'une déclaration de production        #
+#       - CRE_GRPMKO   : boucle de création de suivis opérations         #
+#      appelle CRE_MKO : Création du suivi d'une opération               #
+#       - CRE_GRPMKM : boucle de création de suivis matières             #
+#      appelle CRE_MKM : Création du suivi d'une matière                 #
+# V130 : On suppose que l'on se trouve à l'intérieur d'une transaction   #
+#------------------------------------------------------------------------#
+#####################################################################
+#------------------------------------------------------------------------#
+#             Sous-programme  CRE_GRPMKI                                 #
+#Sous-programmes de création automatique de déclarations de prod         #
+#On passe par une classe [M:MTIK] invisible                              #
+#On traite un ensemble d'articles ou de gammes                           #
+# En 150: selon transaction on peut traiter les articles déjà soldés     #
+#Les valeurs de TYPTRT possibles dans ce contexte sont                   #
+#           1,3 : On veut suivre un ensemble d'articles lancés           #
+#           5,7 : On veut suivre un ensemble de nomenclatures            #
+#------------------------------------------------------------------------#
+Subprog CRE_GRPMKI
+Gosub OPEN_FILE
+Case [M:MTIK]TYPTRT
+    When 1,3 :
+              Case [M:MTIK]ITMFLTFLG
+                   When 2 : Filter [F:MFI] Where MFGNUM = [M:MTIK]MFGNUM & MFITRKFLG = 5 &
+&                                   ITMSTA <> 4
+                   When 3 : Filter [F:MFI] Where MFGNUM = [M:MTIK]MFGNUM  &
+&                                   ITMSTA <> 4
+                   When Default : Filter [F:MFI] Where MFGNUM = [M:MTIK]MFGNUM & MFITRKFLG <> 5 &
+&                                   ITMSTA <> 4
+               Endcase
+              #point d'entrée  pour filtre spécifique à la place du filtre standard demande 33732
+               GPOINT = "BENMFIFLT" : Gosub ENTREE From EXEFNC
+               For [F:MFI]
+                   [M:MTIK]ITMTRKLIN += 1
+                   [M:MTIK]WLINUM    += 1
+                   Call CRE_MKI
+                   If GOK < 1 : Break : Endif
+                   Call DELSTOENTW(-1,-1,"MTIK",1,1,[M:MTIK]MFGFCY,1,"") From STKENT
+               Next
+               Filter [F:MFI]
+    When 5,7 : Read [F:BOH]BOH0 = [M:MTIK]ITMREF;[M:MTIK]BOMALT;2
+               If !fstat
+                   [M:MTIK]ITMTYP     = 1
+                   [M:MTIK]ITMTRKLIN += 1
+                   [M:MTIK]WLINUM    += 1
+                   Call CRE_MKI
+                   If GOK < 1 : End : Endif
+                   Call DELSTOENTW(-1,-1,"MTIK",1,1,[M:MTIK]MFGFCY,1,"") From STKENT
+                   # sr 04.02 gestion des sous-produits  demande 9469
+                   [M:MTIK]CPLQTY    = [F:MKI]CPLQTY
+                   [M:MTIK]UOMCPLQTY = [F:MKI]UOMCPLQTY
+                   Raz [M:MTIK]LOT
+
+                   Call RECHERCHE_SOUS_PRODUIT([M:MTIK]ITMREF)
+               Endif
+Endcase
+End
+
+
+####################################################################
+# sr 04.02 gestion des sous-produits demande 9469
+Subprog RECHERCHE_SOUS_PRODUIT(LITM)
+Value Char LITM
+
+Local    Integer WTYPMVT
+Local    Decimal WDIS
+Local    Integer NOL2
+Local    Integer WRET
+
+Local File BOMD [BOD] Where ITMREF = LITM & BOMALT = [M:MTIK]BOMALT & BOMALTTYP = 2 &
+&                   (BOMSTRDAT = [0/0/0] | (BOMSTRDAT <> [0/0/0] & BOMSTRDAT <= [M:MTIK]IPTDAT)) &
+&                   (BOMENDDAT = [0/0/0] | (BOMENDDAT <> [0/0/0] & BOMENDDAT >= [M:MTIK]IPTDAT))
+# lecture premier enregistrement
+Read [BOD]BOD0 First                      # 10.02 Performances
+
+# tant qu'y en a !
+While !fstat
+   If [F:ITM]ITMREF <> [F:BOD]CPNITMREF
+      Read [F:ITM]ITM0 = [F:BOD]CPNITMREF
+      If fstat : Goto NEXTBOD : Endif
+   Endif
+ # article avec statut non actif
+   If [F:ITM]ITMSTA > 1
+       Goto NEXTBOD
+   Endif
+ # lecture article site
+   If [F:ITF]ITMREF <> [F:BOD]CPNITMREF | [F:ITF]STOFCY <> [M:MTIK]MFGFCY
+      Read [ITF]ITF0=[F:BOD]CPNITMREF;[M:MTIK]MFGFCY
+      If fstat : Goto NEXTBOD : Endif
+   Endif
+   Call LECITV2([F:ITF]STOFCY,[F:ITF]ITMREF,WRET) From MFGLIB
+   # Issue 72149 - 2011-03-08 by CCC : test du code retour de LECITV2
+   If WRET : Goto NEXTBOD : Endif
+   Call STODISTOT("",0,7,"",WDIS) From STKLIB
+ # si article fantôme descente par récursivité
+   If ([F:ITM]PHAFLG = 2) & WDIS = 0
+          Call RECHERCHE_SOUS_PRODUIT([F:ITM]ITMREF)
+   Else
+      If [F:BOD]CPNTYP = 4
+            Local    Decimal WQTY, WDIS, WQTYN, WQTYNA, WQTYB, WQTYBA, WLIEN
+            Local    Decimal WBASQTY
+            Local    Integer WLIKQTYCOD
+            Local    Decimal WLIKQTY
+            Local    Integer WQTYRND
+            Local    Decimal WLSCA
+            Local    Char    WSTU(GLONUOM)
+
+            WQTY         = [M:MTIK]CPLQTY
+            WSTU         = [F:ITM]STU
+            WBASQTY      = [F:BOH]BASQTY
+            WLIKQTYCOD   = [F:BOD]LIKQTYCOD
+            WLIKQTY      = [F:BOD]LIKQTY
+            WQTYRND      = [F:BOD]QTYRND
+            WSCA         = [F:BOD]SCA
+            If  WQTY  = 0
+                WLIEN = 0
+            Else
+                Call LIKQTY(WQTY,WSTU,WBASQTY,WLIKQTYCOD,WLIKQTY,WQTYRND,
+&                           WSCA,WQTYN,WQTYNA,WQTYB,WQTYBA) From MFGLIB
+                WLIEN = WQTYBA
+            Endif
+            Call QTEARR(WLIEN, [F:ITM]STU) From TRTDIV
+            If WLIEN <> 0
+              [M:MTIK]ITMTYP     = 2
+              [M:MTIK]CSTFLG     = [F:BOD]CSTFLG
+              [M:MTIK]ITMREF     = [F:BOD]CPNITMREF
+              [M:MTIK]ITMTRKLIN += 1
+              [M:MTIK]WLINUM    += 1
+              Call CRE_MKI
+              If GOK < 1 : Break : Endif
+              Call DELSTOENTW(-1,-1,"MTIK",1,1,[M:MTIK]MFGFCY,1,"") From STKENT
+            Endif
+      Endif
+    Endif
+$NEXTBOD
+   Read [BOD]BOD0 Next             # 10.02 Performances
+Wend
+End
+
+#####################################################################
+#On traite un article
+#Selon TYPTRT :
+#        1,3  : article d'OF
+#        5,7  : nomenclature
+#####################################################################
+Subprog CRE_MKI
+Local Integer WRETOUR, WSOLDE, J, I
+Local Integer WOPECLENBR, WITMCLENBR, WMATCLENBR
+Local Decimal WCOEFF, WALLREJQTY
+Local Char    WMSGSUI(250)
+Local Char    WCCE(15)
+Local Decimal LQTA, LSHT, PRI
+Local Integer LNBR, LNBJ, WRET
+Local Char    WLOT(GLONLOT)
+Local Integer SAVNOLIGN # Issue 87936 - 2013-02-12 by CCC
+SAVNOLIGN=nolign
+#
+
+Case [M:MTIK]TYPTRT
+     When 1,3 :
+#        If [M:MTIK]TYPTRT = 1 & ([F:MFI]EXTQTY - [F:MFI]CPLQTY < 0 ): End : Endif
+        If [F:ITM]ITMREF <> [F:MFI]ITMREF
+           Read [ITM]ITM0 = [F:MFI]ITMREF
+           If fstat : Call RSTA("ITM",[F:MFI]ITMREF) From GLOCK : End : Endif # GH 17/09/2015 bug 110557 RSTA added
+        Endif
+        If [F:ITF]ITMREF <> [F:MFI]ITMREF | [F:ITF]STOFCY <> [F:MFI]MFGFCY
+           Read [ITF]ITF0 = [F:MFI]ITMREF;[F:MFI]MFGFCY
+           If fstat : Call RSTA("ITF",[F:MFI]ITMREF-[F:MFI]MFGFCY) From GLOCK : End : Endif # GH 17/09/2015 bug 110557 RSTA added
+        Endif
+
+    When 5,7 :
+        If [M:MTIK]ITMTYP <> 2
+            If [F:ITM]ITMREF <> [F:BOH]ITMREF
+               Read [ITM]ITM0 = [F:BOH]ITMREF
+               If fstat : Call RSTA("ITM",[F:BOH]ITMREF) From GLOCK : End : Endif # GH 17/09/2015 bug 110557 RSTA added
+            Endif
+            If [F:ITF]ITMREF <> [F:BOH]ITMREF | [F:ITF]STOFCY <> [M:MTIK]MFGFCY
+               Read [ITF]ITF0 = [F:BOH]ITMREF;[M:MTIK]MFGFCY
+               If fstat : Call RSTA("ITF",[F:BOH]ITMREF-[M:MTIK]MFGFCY) From GLOCK : End : Endif # GH 17/09/2015 bug 110557 RSTA added
+            Endif
+        Endif
+Endcase
+
+# Issue 65478 - 2010-07-08 by CCC : Contrôle existence fiche article-dépôt
+If  clalev([F:ITW])
+& & dim([M:MTIK]WRH)>0 & [M:MTIK]WRH<>"" & GWRHOBY=2
+& & ([F:ITW]ITMREF<>[F:ITM]ITMREF | [F:ITW]WRH<>[M:MTIK]WRH)
+    Read [F:ITW]ITW0=[F:ITM]ITMREF;[M:MTIK]WRH
+    If fstat
+       Call RSTA("ITW",[F:ITM]ITMREF-[M:MTIK]WRH) From GLOCK : End # GH 17/09/2015 bug 110557 RSTA added
+    Endif
+Endif
+
+# Issue 103013 - 2015-03-02 by CCC : If this product has already been issued on the same WO
+#                                    and issue price adjusment activated => error
+If func MFGLIB.CTLMATISS([M:MTIK]MFGFCY,[M:MTIK]MFGNUM,[M:MTIK]IPTDAT,[F:ITM]ITMREF,0,GMESSAGE)
+    Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+    Raz GMESSAGE
+    GOK = 0
+    End
+Endif
+
+Call LECSRU([M:MTIK]MFGFCY,[F:ITM]TCLCOD,5,[M:MTIK]TRSCOD,"",WRET) From STKLIB
+
+# FQ 43013 le code LOT est alimenté par ALISTOWORK cf plus loin
+# FQ 43013 en automatique pas de lot manuel
+# FQ 43013 If find([M:MTIK]TYPTRT,1,5)
+# FQ 43013   If [F:ITM]LOTMGTCOD <> 1 & [F:ITM]LOTCOU = "" : End : Endif
+# FQ 43013 Endif
+
+#Création enregistrement suivi decl prod
+Raz [F:MKI]
+If find([M:MTIK]TYPTRT,1,5)
+    [F:MKI] = [M:MTIK]
+    If [M:MTIK]TYPTRT = 1
+        Call CHARG_CCE("MTIK",0,"MFI",0,[F:MFI]MFGNUM,[F:MFI]MFGLIN,0,"") From TRTX3CPT
+    Endif
+Endif
+If find([M:MTIK]TYPTRT,1,3) : [F:MKI]        = [F:MFI]
+                              [F:MKI]PRODTYP = 1
+
+Else                        : # sr 04.02 gestion des sous-produits demande 9469
+                              If [M:MTIK]ITMTYP <> 2
+                                  [F:MKI]        = [F:BOH]
+                              Endif
+                              [F:MKI]STU     = [F:ITM]STU
+                              [F:MKI]UOM     = [F:ITM]STU
+                              [F:MKI]PRODTYP = 2
+Endif
+If !find([M:MTIK]TYPTRT,1,5)
+    [F:MKI] = [M:MTIK]
+Endif
+If GIMPORT & [M:MTIK]TYPTRT = 7 & [M:MTIK]ITMTYP = 2
+    [F:MKI]STU     = [F:ITM]STU
+    [F:MKI]UOM     = [F:ITM]STU
+Endif
+#
+# sr 02.02 demande 12850 prendre en compte le statut "soumis à controle"
+If  [M:MTIK]TYPTRT = 1
+    [F:MKI]CPLQTY = [F:MFI]EXTQTY * [M:MTIK]WCOEFF
+    Call QTEARR([F:MKI]CPLQTY,[F:MKI]STU) From TRTDIV
+    [F:MKI]STU = [F:ITM]STU
+# sr 04.02 gestion des sous_produits demande 9469
+Elsif [M:MTIK]TYPTRT = 5 | ([M:MTIK]TYPTRT = 7 & GIMPORT)
+    If [M:MTIK]ITMTYP <> 2
+        Call RECH_COEFF([M:MTIK]OPEUOM, [F:MKI]STU, WCOEFF) From MFGLIB
+        If WCOEFF = 0 : WCOEFF = 1 : Endif
+        [F:MKI]CPLQTY = [M:MTIK]CPLQTY * WCOEFF
+        Call QTEARR([F:MKI]CPLQTY,[F:MKI]STU) From TRTDIV
+    Else
+
+        Local    Decimal WQTY, WDIS, WQTYN, WQTYNA, WQTYB, WQTYBA, WLIEN
+        Local    Decimal WBASQTY
+        Local    Integer WLIKQTYCOD
+        Local    Decimal WLIKQTY
+        Local    Integer WQTYRND
+        Local    Decimal WLSCA
+        Local    Char    WSTU(GLONUOM)
+
+        WQTY         = [M:MTIK]CPLQTY
+        WSTU         = [F:ITM]STU
+        WBASQTY      = [F:BOH]BASQTY
+        WLIKQTYCOD   = [F:BOD]LIKQTYCOD
+        WLIKQTY      = [F:BOD]LIKQTY
+        WQTYRND      = [F:BOD]QTYRND
+        WSCA         = [F:BOD]SCA
+        If  WQTY  = 0
+            WLIEN = 0
+        Else
+            Call LIKQTY(WQTY,WSTU,WBASQTY,WLIKQTYCOD,WLIKQTY,WQTYRND,
+&                       WSCA,WQTYN,WQTYNA,WQTYB,WQTYBA) From MFGLIB
+            WLIEN = WQTYBA
+        Endif
+        [F:MKI]CPLQTY    = WLIEN
+        Call QTEARR([F:MKI]CPLQTY, [F:MKI]STU) From TRTDIV
+
+        # mm 93049 03.2014 - Seulement en cas de sous-produit
+        [F:MKI]UOMSTUCOE = 1
+    Endif
+Endif
+If  [F:MKI]UOMSTUCOE = 0 : [F:MKI]UOMSTUCOE = 1 : Endif
+#
+[F:MKI]UOMCPLQTY = [F:MKI]CPLQTY / [F:MKI]UOMSTUCOE        # llc 07.03 19073
+Call QTEARR([F:MKI]UOMCPLQTY,[F:MKI]UOM) From TRTDIV
+[F:MKI]CREDAT = date$
+[F:MKI]CREUSR = GUSER
+[F:MKI]EXPNUM = [C]EXPORT
+Raz [F:MKI]UPDDAT
+Raz [F:MKI]UPDUSR
+#point d'entrée  pour mise à jour de tables spécifiques liées à [MKI] sr 01.02 demande 12361
+GPOINT = "BENMKIMAJ" : Gosub ENTREE From EXEFNC
+#
+Write [F:MKI]
+If fstat
+   GOK = 0 : Call FSTA("MKI") From GLOCK : End
+Endif
+If [F:MKI]PRODTYP = 1
+    #----- MISE à jour statistiques ligne suivi article lancé -----#
+    Call VALSTA("MKI",1) From SUBPS2
+    If GOK < 1 : Goto END_CRE_MKI : Endif
+Endif
+If [F:MKI]ITMTYP <> 2
+    [M:MTIK]WCPLQTY    += [F:MKI]CPLQTY
+Endif
+
+#conso des matières selon transaction
+# sr 04.02 gestion des sous-produits demande 9469
+If ([M:MTIK]MATFLG = 3 | [M:MTIK]MATFLG = 4 & [M:MTIK]WMATOK <> 2) &
+&  !find([M:MTIK]TYPTRT,1,5) & [M:MTIK]ITMTYP <> 2
+   Local Char WTYPSUIVI(3) : WTYPSUIVI = "ITM"
+   Call CONSO_MATIERE(WTYPSUIVI)
+   If GOK < 1 : Goto END_CRE_MKI : Endif
+Endif
+
+#---------------------------------------------------------#
+# Ecriture des sections de la ligne article               #
+#---------------------------------------------------------#
+Gosub MAJMKI_CPTANALIN
+If GOK<1 : Goto END_CRE_MKI : Endif
+
+#
+#Maj Stock
+Raz [M:STW]
+[M:STW]STOFCY = [F:MKI]MFGFCY
+[M:STW]TRSTYP = 5
+[M:STW]VCRTYP = 15
+[M:STW]VCRNUM = [F:MKI]MFGTRKNUM
+[M:STW]VCRLIN = [F:MKI]ITMTRKLIN
+[M:STW]ITMREF = [F:MKI]ITMREF # Article
+[M:STW]MVTDES = [M:MTIK]MVTDES
+[M:STW]PJT    = [F:MKI]PJT
+[M:STW]TRSFAM = [M:MTIK]TRSFAM
+[M:STW]TRSCOD = [M:MTIK]TRSCOD
+[M:STW]IPTDAT = [F:MKI]IPTDAT
+# 11.06 demande 38306
+[M:STW]ENTCOD = [M:MTIK]ENTCOD
+[M:STW]CCECOD = "STKEOF"
+If [F:MKI]PRODTYP = 1
+      [M:STW]VCRTYPORI = 10
+      [M:STW]VCRNUMORI = [F:MKI]MFGNUM
+      [M:STW]VCRLINORI = [F:MKI]MFGLIN
+Endif
+[M:STW]CUR = GLOCALDEV
+[M:STW]BPRNUM = ""
+
+Raz PRI, [M:VALW]
+PRI = func STKVAL.DEFPRIMKI(!(find([M:MTIK]TYPTRT,1,5))*[M:MTIK]WSTOSEQ)
+[M:STW]PRIORDH  = PRI
+
+[M:STW]TRAFLG   = 2                        : # Trace normal
+
+#
+If find([M:MTIK]TYPTRT,1,5)
+    # sr 07.03 on est en automatique derrière une plan de suivi des temps import ou pas
+    Gosub LOAD_ENTW
+    If GOK>0
+        Call ALISTOWORK(9,0,LQTA,LSHT,LNBR,LNBJ,WRET) From STKINT
+    Else
+        Raz [M:ENTW]
+    Endif
+Else
+    # on est en saisie ou en import d'un plan de production
+    If GIMPORT
+       # sr 09.05 on  est en import de production
+        [M:MTIK]WLINUM      = [F:MKI]ITMTRKLIN
+    Endif
+    Call ALISTOWORK(2,[M:MTIK]WSTOSEQ,LQTA,LSHT,LNBR,LNBJ,WRET) From STKINT
+Endif
+
+# Si premier suivi et lot à réserver au premier suivi le récupérer là
+WLOT = [M:STW]LOT
+
+If GOK
+    Call MAJ_STOCK From STKMAJ
+Endif
+
+If GOK < 1
+    Call STKFREQCQ("MTIK",[M:MTIK]MFGFCY,0,[M:MTIK]ITMREF,"","A",[M:MTIK]QUAFLG,[M:MTIK]QUAFRE) From STKACT
+    TRA = 1
+    WMSGSUI = mess(150,193,1)
+    Call ECR_TRACE(WMSGSUI,1) From GESECRAN
+    Goto END_CRE_MKI
+Endif
+Call STKFREQCQ("MTIK",[M:MTIK]MFGFCY,0,[M:MTIK]ITMREF,"","V",[M:MTIK]QUAFLG,[M:MTIK]QUAFRE) From STKACT
+#
+If [F:MKI]ITMTYP <> 2
+    [M:MTIK]WREJCPLQTY += [M:STW]RRRQTY
+    [M:MTIK]WQUACPLQTY += [M:STW]QQQQTY
+Endif
+If find ([M:MTIK]TYPTRT,1,3)
+    #Maj Article lancé
+       Readlock [F:MFI]MFI0 = [F:MKI]MFGNUM;[F:MKI]MFGLIN
+       If fstat=1  GOK=-1 : GLOCK="$MFGITM"-[F:MKI]ITMREF : Goto END_CRE_MKI
+       Elsif fstat GOK=0  : Call RSTA("MFI",[F:MKI]ITMREF) From GLOCK : Goto END_CRE_MKI
+       Endif
+       WSOLDE = [F:MFI]MFITRKFLG
+       [F:MFI]CPLQTY += [F:MKI]CPLQTY
+       Call QTEARR([F:MFI]CPLQTY,[F:MFI]STU) From TRTDIV
+       [F:MFI]REJCPLQTY += [M:STW]RRRQTY
+       Call QTEARR([F:MFI]REJCPLQTY,[F:MFI]STU) From TRTDIV
+       [F:MFI]QUACPLQTY += [M:STW]QQQQTY
+       Call QTEARR([F:MFI]QUACPLQTY,[F:MFI]STU) From TRTDIV
+       [F:MFI]RMNEXTQTY = [F:MFI]EXTQTY - [F:MFI]CPLQTY
+       If [F:MFI]RMNEXTQTY < 0 : [F:MFI]RMNEXTQTY = 0 : Endif
+       Call QTEARR([F:MFI]RMNEXTQTY,[F:MFI]STU) From TRTDIV
+# mise à jour du flag solde selon différents cas
+        If    [M:MTIK]CLEFLG = 2 & [F:MFI]MFITRKFLG < 5:#on solde une ligne
+              # CCC (10/01/08) DM 44021
+              #[F:MFI]TRKLAST = [F:MTK]MFGTRKDAT
+              [F:MFI]MFITRKFLG = 5
+              WITMCLENBR += 1
+              [M:MTIK]WITMCLENBR += 1
+        Elsif [M:MTIK]CLEFLG = 1 & [F:MFI]MFITRKFLG = 5 :#on désolde une ligne
+              # CCC (10/01/08) DM 44021
+              #Raz [F:MFI]TRKLAST
+              [F:MFI]MFITRKFLG = 4
+              WITMCLENBR -= 1
+              [M:MTIK]WITMCLENBR -= 1
+        Elsif [M:MTIK]CLEFLG = 1 & [F:MFI]MFITRKFLG < 4 :#une ligne passe à "encours"
+              [F:MFI]MFITRKFLG = 4
+        Elsif [M:MTIK]CLEFLG = 3                        :#calcul auto du statut de la ligne
+              If [F:MFI]RMNEXTQTY = 0 : [F:MFI]MFITRKFLG = 5
+                                        WITMCLENBR += 1
+                                        [M:MTIK]WITMCLENBR += 1
+              Else                    : [F:MFI]MFITRKFLG = 4
+              Endif
+              # sr 12.02 demande 16844
+              GPOINT = "MFICLEMAJ"
+              Gosub  ENTREE From EXEFNC
+        Endif
+
+        If    [F:MFI]MFITRKFLG = 4 : [F:MFI]ITMSTA    = 2
+        Elsif [F:MFI]MFITRKFLG = 5 : [F:MFI]ITMSTA    = 3
+                                    [F:MFI]RMNEXTQTY = 0
+        Endif
+        # CCC (10/01/08) DM 44021
+        If [F:MFI]TRKFIRST = "00/00/00"
+          #[F:MFI]TRKFIRST = [M:MTIK]IPTDAT
+          # selon paramètre général, on récupère le LOT au premier suivi
+          If [F:ITM]LOTMGTCOD > 1 & [F:MFI]LOT = "" & GLOTMGT = 4 & WLOT <> ""
+             [F:MFI]LOT = WLOT
+          Endif
+        Endif
+        If [F:MFI]TRKLAST<[M:MTIK]IPTDAT
+           [F:MFI]TRKLAST   = [M:MTIK]IPTDAT
+        Endif
+        If [F:MFI]TRKLASTC<date$
+           [F:MFI]TRKLASTC  = date$
+        Endif
+        If [F:MFI]TRKFIRST>[M:MTIK]IPTDAT | [F:MFI]TRKFIRST = "00/00/00"
+            [F:MFI]TRKFIRST = [M:MTIK]IPTDAT
+        Endif
+        If [F:MFI]TRKFIRSTC>date$ | [F:MFI]TRKFIRSTC = "00/00/00"
+            [F:MFI]TRKFIRSTC = date$
+        Endif
+        Rewrite [F:MFI]
+        If fstat
+          GOK = 0 : Call FSTA("MFI") From GLOCK : Goto END_CRE_MKI
+        Endif
+#Maj encours et mvts article
+#Si la ligne était soldée et le reste on ne met pas à jour l'encours ni  l'en commande
+        If WSOLDE <> 5 | [F:MFI]MFITRKFLG <> 5
+
+
+           # MTO - mise à jour des affectations
+           Call MAJ_MTO("C", [F:MKI]CPLQTY) From MTKMTOLIB
+           If GOK < 1 : Goto END_CRE_MKI : Endif
+
+           Gosub TRT_WIP From SUBMTKC
+           If GOK < 1 : Goto END_CRE_MKI : Endif
+
+           # 79966
+           Gosub MAJMFGHEAD From MFGLIB
+
+#Si la ligne était soldée et qu'on la désolde il faut d'abord réajuster l'en commande
+           If WSOLDE = 5 & [F:MFI]MFITRKFLG < 5
+              Local Integer STA : STA = 0
+              Call LECITV([F:MFI]MFGFCY,[F:MFI]ITMREF,"",STA) From STKLIB
+              If GOK <> 1 | STA > 1 : Goto END_CRE_MKI : Endif
+              Update [ITV] Where ITMREF = [F:MFI]ITMREF & STOFCY = [F:MFI]MFGFCY
+&                  With ORDSTO += ([F:MFI]EXTQTY - [F:MFI]CPLQTY)+[F:MKI]CPLQTY
+           Endif
+           Gosub TRT_MVT From SUBMTKC
+           If GOK < 1 : Goto END_CRE_MKI : Endif
+        Endif
+# ----------------- TEST LLC 150 Gestion a la commande
+#Si production pour une commande allocation automatique pour celle-ci
+#        If [F:MFI]FMI = 5 & [F:MFI]VCRTYPORI = 2
+#          Call MAJ_ALLOCATION("C",[F:MKI]CPLQTY,[F:MKI]ITMTRKLIN)
+#&              From SUBMTKC
+#            If GOK < 1 : Goto END_CRE_MKI : Endif
+#        Endif
+        #----- MISE à jour statistiques ligne article lancé -----#
+        Call VALSTA("MFI",1) From SUBPS2
+        If GOK < 1 : Goto END_CRE_MKI : Endif
+Endif
+
+Raz WMSGSUI
+Case [M:MTIK]TYPTRT
+     When 1,3    :  WMSGSUI = mess(128,190,1)+" : "+[F:MKI]MFGNUM - [F:MKI]ITMREF
+                    Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+     When 5,7    :  WMSGSUI = mess(129,190,1)+" : "+[F:MKI]ITMREF - "/" - num$([F:MKI]BOMALT)
+                    TRA = 1
+                    Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+Endcase
+WMSGSUI = "          "+mess(118,190,1) -num$([F:MKI]CPLQTY)- [F:MKI]STU
+Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+[M:MTIK]WNBITM    += 1
+
+GPOINT = "CUSTRTSUP" : Gosub ENTREE From EXEFNC # FQ 54077 selon FILUS NA5AD-X01.n
+
+$END_CRE_MKI
+nolign=SAVNOLIGN    # Issue 87936 - 2013-02-12 by CCC
+End
+
+#####################################################################
+$MAJMKI_CPTANALIN
+
+If dim(WI)<1  Local Integer WI : Endif
+
+# CCC (2009-09-10) Bug 57425 : INISEC peut casser la classe [F:CAL]
+If !clalev([F:CAL2]) : Local File CPTANALIN [CAL2] : Endif
+
+Raz [F:CAL2]
+[F:CAL2]ABRFIC="MKI"
+[F:CAL2]VCRNUM=[F:MKI]MFGTRKNUM
+[F:CAL2]VCRLIN=[F:MKI]ITMTRKLIN
+[F:CAL2]ANALIG=1
+
+For WI=1 To max(GNBCOA,2)
+    [F:CAL2]LED(WI-1)=GLEDSOC(WI)
+    [F:CAL2]COA(WI-1)=GCOA(WI)
+Next WI
+
+# Issue 77417 - 2012-02-01 by CCC
+#For WI=1 To max(GNBDIE,GOPTCANA)
+For WI=1 To GNBDIE
+    [F:CAL2]DIE(WI-1)=GDIE(WI)
+    [F:CAL2]CCE(WI-1)=evalue("[M:MTIK]CCE"+num$(WI))
+    If [F:CAL2]CCE(WI-1)=""
+        Raz WCCE
+        Call INISEC(WCCE,"MKIAUT", WI) From TRTX3CPT
+        [F:CAL2]CCE(WI-1) = WCCE
+    Endif
+Next WI
+#-----
+Write [CAL2]
+If fstat  GOK=0 : Call FSTA("CAL2") From GLOCK : Return : Endif
+
+Return
+
+#####################################################################
+#------------------------------------------------------------------------#
+#                 Sous-programme CRE_GRPMKO                              #
+#Sous-programmes de création automatique de suivis opérations            #
+#On passe par une classe [M:MTOK] invisible                              #
+#On traite un ensemble d'opérations                                      #
+#On ne traite pas les opérations déjà soldées                            #
+#Les valeurs de TYPTRT possibles dans ce contexte sont :                 #
+#           1 : On veut suivre toutes les opérations liées à un OF       #
+#           5 : On veut suivre toutes les opérations d'une gamme         #
+#------------------------------------------------------------------------#
+Subprog CRE_GRPMKO
+Gosub OPEN_FILE
+Case [M:MTOK]TYPTRT
+    When 1   :
+               # FQ 77545 GA 11/2011 éviter les Filter, ou ajout de la Raz
+               #Filter [F:MFO] Where MFGNUM = [M:MTOK]MFGNUM & MFOTRKFLG <> 5
+               For [F:MFO] Where MFGNUM = [M:MTOK]MFGNUM & MFOTRKFLG <> 5
+                   Call CRE_MKO
+                   If GOK < 1 : Break : Endif
+               Next
+               #Filter [F:MFO]
+    When 5   :
+               # FQ 77545 GA 11/2011 éviter les Filter, ou ajout de la Raz
+               #Filter [F:ROO] Where ITMREF = [M:MTOK]ITMREF & ROUALT = [M:MTOK]ROUALT
+               For [F:ROO] Where ITMREF = [M:MTOK]ITMREF & ROUALT = [M:MTOK]ROUALT
+                   Call CRE_MKO
+                   If GOK < 1 : Break : Endif
+               Next
+Endcase
+End
+
+#####################################################################
+#On traite une opération ou un poste (classe [F:MFO], [F:ROO] ou [F:MWS] en ligne)
+#Selon TYPTRT :
+#        1,2  : Opération d'OF
+#        5,6  : Opération de gamme
+#        9    : Temps divers sur un poste
+#        10   : Suivi sur OF    d'une opération non prévue
+#        11   : Suivi sur gamme d'une opération non prévue
+#####################################################################
+Subprog CRE_MKO
+Local Integer WRETOUR, WRET, J
+Local Char    WMSGSUI(250), WNUMTEX(12)
+Local Char    WCCE(15)
+Local Integer WOPECLENBR, WITMCLENBR, WMATCLENBR
+
+# llc 09.02 15971
+Local Decimal WUNTTIM, WCPLQTY
+#
+Case [M:MTOK]TYPTRT
+    When 1,2 :
+        #On ne prend pas les opérations exclues ou  commandées ou  sous-traitées
+        If [F:MFO]OPESTA > 5 : End : Endif
+        Read [F:MWS]WST0 = [F:MFO]EXTWST;[F:MFO]MFGFCY
+        If fstat | [F:MWS]WSTTYP = 3 : End : Endif
+        Read [F:SCH]SCH0 = [F:MFO]MFGNUM;[F:MFO]OPENUM;[F:MFO]OPESPLNUM
+        If !fstat [M:MTOK]MFGMST = [F:SCH]MFGMST : Endif
+        # V 150 lire l'encours de charge pour récupérer l'affaire
+        Read [F:OPS]OPS1=[F:MFO]MFGNUM;[F:MFO]OPENUM;[F:MFO]OPESPLNUM
+        If fstat : Raz [F:OPS] : Endif
+
+        #Création enregistrement suivi opé
+        Raz [F:MKO]
+        [M:MTOK]OPETRKLIN += 1
+        [F:MKO]            = [F:MFO]
+        [F:MKO]PJT         = [F:OPS]PJT
+        [F:MKO]TIMTYP      = 1
+        [F:MKO]OPEWORCOE   = 1
+        If [F:MFO]OPENUM   = [M:MTOK]OPENUM
+            [F:MKO]        = [M:MTOK]
+            If [F:MKO]CPLWST = "" : [F:MKO]CPLWST = [F:MFO]EXTWST : Endif
+            If [M:MTOK]TYPTRT = 1
+               [F:MKO]CPLQTY  = [M:MTOK]CPLQTY * [F:MFO]OPESTUCOE
+               Call QTEARR([F:MKO]CPLQTY,[F:MKO]OPEUOM) From TRTDIV
+               [F:MKO]REJCPLQTY = [M:MTOK]REJCPLQTY * [F:MFO]OPESTUCOE
+               Call QTEARR([F:MKO]REJCPLQTY,[F:MKO]OPEUOM) From TRTDIV
+            Endif
+        Else
+           [F:MKO]ITMREF = [M:MTOK]ITMREF
+           [F:MKO]ROUALT = [M:MTOK]ROUALT
+
+           If [F:BTS]OPEUOMTYP=2 : # US : # GH 24/10/2014 bug 86675
+               If [F:MFG]MFGNUM <> [F:MFO]MFGNUM
+                  Read [MFG]MFG0 = [F:MFO]MFGNUM
+               Endif
+              [F:MKO]OPEUOM = [F:MFG]STU
+           Endif
+
+           # 10.06 demande 38192
+           # [F:MKO]OPEWORCOE = [F:MFO]OPESTUCOE   # GH 14/10/2014 bug 103168
+           If [F:MKO]OPEUOM = [F:MFO]OPEUOM
+              [F:MKO]OPEWORCOE = 1
+           Else
+              [F:MKO]OPEWORCOE = [F:MFO]OPESTUCOE
+           Endif
+
+           # sr le calcul des qtés pour les opés non suivies n'était pas OK 06.01
+           # 10.06 demande 38192 on applique le coeff sur la quantité prévue sans conversion d'unité
+           #[F:MKO]CPLQTY = [F:MFO]EXTQTY * [M:MTOK]WCOEFF
+           # GH 24/10/2014 bug 86675 => WCPLQTY  = [F:MKO]CPLQTY * [F:MKO]OPEWORCOE
+           WCPLQTY = [F:MFO]EXTQTY * [M:MTOK]WCOEFF
+           [F:MKO]CPLQTY = [F:MFO]EXTQTY * [M:MTOK]WCOEFF / [F:MKO]OPEWORCOE
+           Call QTEARR([F:MKO]CPLQTY,[F:MKO]OPEUOM) From TRTDIV
+
+           # CCC (2009-04-27) Bug 54310 : Pas de quantité rejetée sur les opérations non suivies. C'est uniquement l'opération borne qui possède cette qté
+           #[F:MKO]REJCPLQTY = [F:MFO]EXTQTY  * [M:MTOK]WCOEFF1
+           #Call QTEARR([F:MKO]REJCPLQTY,[F:MKO]OPEUOM) From TRTDIV
+           [F:MKO]REJCPLQTY=0
+
+#           Call CALCUL_QTY([M:MTOK]CPLQTY,[M:MTOK]OPEUOM,[F:MKO]CPLQTY,[F:MKO]OPEUOM,GBIDD1) From TRTX3
+#           Call CALCUL_QTY([M:MTOK]REJCPLQTY,[M:MTOK]OPEUOM,[F:MKO]REJCPLQTY,[F:MKO]OPEUOM,GBIDD1) From TRTX3
+           [F:MKO]CPLWST    = [F:MFO]EXTWST
+           # CCC (24/04/08) Bug 47082
+           # EXTUNTTIM est un temps par unité d'oeuvre et CPLQTY la qté réalisée en unité d'oeuvre
+           #[F:MKO]CPLOPETIM = ([F:MFO]EXTUNTTIM * [F:MKO]OPEWORCOE) * [F:MKO]CPLQTY
+           # GH 24/10/2014 bug 86675
+           #[F:MKO]CPLOPETIM = [F:MFO]EXTUNTTIM * [F:MKO]CPLQTY
+           [F:MKO]CPLOPETIM = [F:MFO]EXTUNTTIM * WCPLQTY
+           # Issue 88561 & 88611 - 2013-03-13 by CCC
+           Case [F:MFO]ROOTIMCOD
+                When 1 : #[F:MKO]CPLOPETIM = [F:MFO]EXTUNTTIM * [F:MKO]CPLQTY # GH 24/10/2014 bug 86675
+                         [F:MKO]CPLOPETIM = [F:MFO]EXTUNTTIM * WCPLQTY
+                When 2 : If [F:MFO]CAD <> 0
+                             If [F:MFO]EFF=0
+                                #[F:MKO]CPLOPETIM = [F:MKO]CPLQTY / [F:MFO]CAD # GH 24/10/2014 bug 86675
+                                [F:MKO]CPLOPETIM = WCPLQTY / [F:MFO]CAD
+                             Else
+                                #[F:MKO]CPLOPETIM = [F:MKO]CPLQTY / [F:MFO]CAD / ([F:MFO]EFF / 100) # GH 24/10/2014 bug 86675
+                                [F:MKO]CPLOPETIM = WCPLQTY / [F:MFO]CAD / ([F:MFO]EFF / 100)
+                             Endif
+                         Endif
+                When 3 : # Issue 112286 - 2015-12-01 by BEEBE : when OP tracking is fixed time tracking only when status < in process
+                         If [F:MFO]OPESTA < 4
+                             [F:MKO]CPLOPETIM = [F:MFO]EXTOPETIM
+                         Else
+                             [F:MKO]CPLOPETIM = 0
+                         Endif
+           Endcase
+           [F:MKO]CPLSETTIM = [F:MFO]EXTSETTIM - [F:MFO]CPLSETTIM
+            # 11.06 demande 38402
+           [F:MKO]CPLOPETIM = func TRTX3.ARRTYP("","","TIH",[F:MKO]CPLOPETIM)
+           [F:MKO]CPLSETTIM = func TRTX3.ARRTYP("","","TIH",[F:MKO]CPLSETTIM)
+           [F:MKO]CPLLAB    = [F:MFO]EXTLAB
+         Endif
+        #-- duplication du texte lie a l'opé de l'OF
+        If [M:MTOK]MKOTEX <>""
+           [F:MKO]MKOTEX = [M:MTOK]MKOTEX
+           If left$([F:MKO]MKOTEX,3)="MKO"
+              Call CRE_CLOB([F:MKO]MKOTEX,GOK) From TRTX3TEX
+           Elsif left$([F:MKO]MKOTEX,3)="MFO"
+              Call DUP_CLOB("MKO",[F:MKO]MKOTEX,GOK) From TRTX3TEX
+           Endif
+        Endif
+        If [F:MFO]OPENUM = [M:MTOK]OPENUM : [F:MKO]DACMST   = [M:MTOK]DACMST
+        Else                                [F:MKO]DACMST   = 1
+                                            [F:MKO]OPEBORNE = [M:MTOK]OPENUM
+        Endif
+
+    When 5,6 :
+        If [F:ROO]OPENUM = [M:MTOK]OPENUM & [F:ROO]RPLIND <> [M:MTOK]RPLIND
+           End
+        Endif
+        Read [F:MWS]WST0 = [F:ROO]WST;[F:ROO]FCY
+        If fstat | [F:MWS]WSTTYP = 3 : End : Endif
+        Read [F:ROS]ROS0 = [F:ROO]FCY;[F:ROO]ITMREF;[F:ROO]ROUALT;[F:ROO]OPENUM
+        If !fstat [M:MTOK]MFGMST = [F:ROS]MFGMST : Endif
+        #Création enregistrement suivi opé
+        Raz [F:MKO]
+        [M:MTOK]OPETRKLIN += 1
+        [F:MKO]            = [F:ROO]
+        [F:MKO]ROUOPENUM   = [F:MKO]OPENUM
+        [F:MKO]TIMTYP      = 2
+        [F:MKO]MFGFCY      = [F:ROO]FCY
+        # sr 08.02 1.4.0 récup éventuelle de la formule
+        If [F:ROO]OPESTUFOR <> ""
+           Read [F:TFO]TFO0=2;[F:ROO]OPESTUFOR
+           If !fstat
+               # se repositionner éventuellement sur l'article produit
+               If [F:ITM]ITMREF <> [F:ROO]ITMREF
+                   Read [F:ITM]ITM0 = [F:ROO]ITMREF
+                   If fstat : Raz [F:ITM] : Endif
+               Endif
+               If [F:ITF]ITMREF <> [F:ROO]ITMREF | [F:ITF]STOFCY <> [F:ROO]FCY
+                   Read [F:ITF]ITF0 = [F:ROO]ITMREF;[F:ROO]FCY
+                   If fstat : Raz [F:ITF] : Endif
+               Endif
+               If evalue([F:TFO]FORFOR) <> 0
+                   [F:MKO]OPEWORCOE = evalue([F:TFO]FORFOR)
+               Elsif [F:ROO]OPESTUCOE <> 0
+                   [F:MKO]OPEWORCOE = [F:ROO]OPESTUCOE
+               Else
+                    [F:MKO]OPEWORCOE = 1
+               Endif
+           Else
+            [F:MKO]OPEWORCOE = [F:ROO]OPESTUCOE
+           Endif
+        Else
+           [F:MKO]OPEWORCOE = [F:ROO]OPESTUCOE
+        Endif
+        If [F:MKO]OPENUM   = [M:MTOK]OPENUM
+           [F:MKO]         = [M:MTOK]
+           If [F:MKO]CPLWST = "" : [F:MKO]CPLWST = [F:MFO]EXTWST : Endif
+           If [M:MTOK]TYPTRT = 5
+              [F:MKO]CPLQTY  = [M:MTOK]CPLQTY * [F:MKO]OPEWORCOE
+              Call QTEARR([F:MKO]CPLQTY,[F:MKO]OPEUOM) From TRTDIV
+              [F:MKO]REJCPLQTY = [M:MTOK]REJCPLQTY * [F:MKO]OPEWORCOE
+              Call QTEARR([F:MKO]REJCPLQTY,[F:MKO]OPEUOM) From TRTDIV
+           Endif
+        Else
+        # 09.06 le calcul des qtés pour les opés non suivies n'était pas OK demande 37849
+           [F:MKO]CPLQTY = ([M:MTOK]CPLQTY/[M:MTOK]OPESTUCOE) * [F:ROO]OPESTUCOE
+           Call QTEARR([F:MKO]CPLQTY,[F:MKO]OPEUOM) From TRTDIV
+           [F:MKO]REJCPLQTY = ([M:MTOK]REJCPLQTY/[M:MTOK]OPESTUCOE) * [F:ROO]OPESTUCOE
+           Call QTEARR([F:MKO]REJCPLQTY,[F:MKO]OPEUOM) From TRTDIV
+
+#           Call CALCUL_QTY([M:MTOK]CPLQTY,[M:MTOK]OPEUOM,[F:MKO]CPLQTY,[F:MKO]OPEUOM,GBIDD1) From TRTX3
+#           Call CALCUL_QTY([M:MTOK]REJCPLQTY,[M:MTOK]OPEUOM,[F:MKO]REJCPLQTY,[F:MKO]OPEUOM,GBIDD1) From TRTX3
+           [F:MKO]CPLWST    = [F:ROO]WST
+           # sr 11.01 demande 11468 Tenir compte du type de temps
+           Case [F:ROO]ROOTIMCOD
+                When 1 : [F:MKO]CPLOPETIM = [F:ROO]OPETIM * [F:MKO]CPLQTY
+                         If [F:ROO]BASQTY<>0
+                            [F:MKO]CPLOPETIM = [F:MKO]CPLOPETIM / [F:ROO]BASQTY
+                         Endif
+                When 2 : # llc 02.02 13175
+                         If [F:ROO]CAD <> 0
+                             [F:MKO]CPLOPETIM = [F:MKO]CPLQTY / [F:ROO]CAD
+                         Endif
+                When 3 : [F:MKO]CPLOPETIM = [F:ROO]OPETIM
+           Endcase
+           [F:MKO]CPLSETTIM = [F:ROO]SETTIM - [F:MFO]CPLSETTIM
+           [F:MKO]CPLSETTIM = func TRTX3.ARRTYP("","","TIH",[F:MKO]CPLSETTIM)
+           [F:MKO]CPLOPETIM = func TRTX3.ARRTYP("","","TIH",[F:MKO]CPLOPETIM)
+           [F:MKO]CPLLAB    = [F:ROO]LABWST
+           [F:MKO]EMPNUM    = [M:MTOK]EMPNUM
+           If [F:ROH]ITMREF<>[F:ROO]ITMREF | [F:ROH]ROUALT<>[F:ROO]ROUALT
+               Raz [ROH]
+               Read [ROH]ROH0=[F:ROO]ITMREF;[F:ROO]ROUALT;[F:ROO]FCY
+           Endif
+           [F:MKO]TIMUOMCOD = [F:ROH]TIMUOMCOD
+       Endif
+        #-- duplication du texte lie a l'opé de la gamme
+        If [M:MTOK]MKOTEX <>""
+           [F:MKO]MKOTEX = [M:MTOK]MKOTEX
+           If left$([F:MKO]MKOTEX,3)="MKO"
+              Call CRE_CLOB([F:MKO]MKOTEX,GOK) From TRTX3TEX
+           Endif
+        Endif
+
+        If [F:ROO]OPENUM = [M:MTOK]OPENUM : [F:MKO]DACMST   = [M:MTOK]DACMST
+        Else                                [F:MKO]DACMST   = 1
+                                            [F:MKO]OPEBORNE = [M:MTOK]OPENUM
+        Endif
+
+    When 9,10,11:
+         #Création enregistrement suivi opé
+         Raz [F:MKO]
+         [M:MTOK]OPETRKLIN += 1
+         [F:MKO]            = [M:MTOK]
+         Case [M:MTOK]TYPTRT
+              When 9  :  [F:MKO]TIMTYP      = 3
+              When 10 :  [F:MKO]TIMTYP      = 1
+              When 11 :  [F:MKO]TIMTYP      = 2
+         Endcase
+         # Issue 95329 GA 09/2014
+         # Issue 107012 by BEEBE 17-09-2015: for unexpected operations ROUOPENUM may not be set by OPENUM
+         # If [F:MKO]ROUOPENUM=0 [F:MKO]ROUOPENUM=[F:MKO]OPENUM Endif
+Endcase
+If [M:MTOK]EMPNUM<>0  [F:MKO]EMPNUM = [M:MTOK]EMPNUM Endif  # FQ 64948 GA 05/2010 dans tous les cas
+[F:MKO]MFGTRKNUM = [M:MTOK]MFGTRKNUM
+[F:MKO]OPETRKLIN = [M:MTOK]OPETRKLIN
+# CCC (2010-05-19) Bug 64901 : autoriser saisie des temps négatifs
+#If [F:MKO]CPLSETTIM < 0 : [F:MKO]CPLSETTIM = 0 : Endif
+[F:MKO]IPTDAT    = [M:MTOK]IPTDAT
+[F:MKO]DACDAT    = date$
+[F:MKO]DACHOU    = left$(time$,2)+mid$(time$,4,2)
+[F:MKO]CREDAT    = date$
+[F:MKO]CREUSR    = GUSER
+[F:MKO]EXPNUM    = [C]EXPORT
+If [F:MKO]REJCPLQTY <> 0 & [F:MKO]TABREJQTY(0) = 0
+   [F:MKO]TABREJQTY(0)  =  [F:MKO]REJCPLQTY
+Endif
+Raz [F:MKO]UPDUSR
+Raz [F:MKO]UPDDAT
+#point d'entrée  pour mise à jour de tables spécifiques liées à [MKO] sr 01.02 demande 12361
+GPOINT = "BENMKOMAJ" : Gosub ENTREE From EXEFNC
+#
+Write [F:MKO]
+If fstat
+   GOK = 0 : Call FSTA("MKO") From GLOCK
+   End
+Endif
+#
+If [F:MKO]TIMTYP = 1
+    #----- MISE à jour statistiques ligne suivi opé -----#
+    Call VALSTA("MKO",1) From SUBPS2
+    If GOK < 1 : End : Endif
+Endif
+
+# Issue 75998 - 2011-09-05 by CCC : Les sections doivent être alimentées avant de créer les WIPCOST
+#---------------------------------------------------------#
+# Ecriture des sections de la ligne operation              #
+#---------------------------------------------------------#
+Gosub MAJMKO_CPTANALIN
+If GOK<1 : End : Endif
+
+GMESSAGE=""
+Call OPETRK_NEW(WRET) From MWIPLIB   # (TB) Intégration WIP
+If WRET > 0
+   If GMESSAGE<>""  : # GH 02/2016 bug 108954 to add the error in the log file
+      Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+      Raz GMESSAGE
+   Endif
+   GOK = 0 : End
+Endif
+
+#---------
+# 02.07 39933 # FQ 71589 GA 02/2011 ajout Raz GPE sinon effet de bord des autres PE
+# PE permettant d'inhiber la mise à jour de l'opération
+GPOINT = "CRE_CPLMFO" : Raz GPE
+Gosub  ENTREE From EXEFNC
+#---------
+If find([M:MTOK]TYPTRT,1,2) & !GPE
+        #Maj Opération
+        Readlock [F:MFO]MFO0 = [F:MKO]MFGNUM;[F:MKO]OPENUM;[F:MKO]OPESPLNUM
+        If fstat=1  GOK=-1 : GLOCK="$MFGOPE"-num$([F:MKO]OPENUM) : End
+        Elsif fstat GOK=0  : Call RSTA("MFO",num$([F:MKO]OPENUM)) From GLOCK : End
+        Endif
+        # llc 09.02 15971
+        If [F:MFO]EXTQTY > 0
+            WUNTTIM = [F:MFO]EXTOPETIM / [F:MFO]EXTQTY
+        Endif
+        #lecture WORKSTATIO
+        Read [F:MWS]WST0 = [F:MKO]CPLWST;[F:MKO]MFGFCY
+        If fstat : Raz [F:MWS] : Endif
+# llc 03.01 multi-exemplaire
+#        If [F:MFO]CPLWST <> [F:MKO]CPLWST :  [F:MFO]CPLWSTNBR += 1 : Endif
+        [F:MFO]CPLWSTNBR = [F:MFO]EXTWSTNBR
+        If [F:MFO]CPLWST = "" : [F:MFO]CPLWST = [F:MKO]CPLWST : Endif
+        If [F:MFO]CPLLAB = "" : [F:MFO]CPLLAB = [F:MKO]CPLLAB : Endif
+        # CCC (24/04/08) Bug 47082
+        #[F:MFO]CPLQTY    += [F:MKO]CPLQTY    # * [F:MKO]OPEWORCOE
+        #[F:MFO]REJCPLQTY += [F:MKO]REJCPLQTY # * [F:MKO]OPEWORCOE
+        # GH 14/10/2014 Bug 103168
+        [F:MFO]CPLQTY    += [F:MKO]CPLQTY    * [F:MKO]OPEWORCOE
+        [F:MFO]REJCPLQTY += [F:MKO]REJCPLQTY * [F:MKO]OPEWORCOE
+        [F:MFO]CPLSETTIM += [F:MKO]CPLSETTIM
+        [F:MFO]CPLOPETIM += [F:MKO]CPLOPETIM
+        If [F:MFO]CPLUNTTIM = 0 : [F:MFO]CPLUNTTIM = WUNTTIM                    # llc 09.02 15971
+        Else [F:MFO]CPLUNTTIM = avg(WUNTTIM,[F:MFO]CPLUNTTIM)                   # llc 09.02 15971
+        Endif
+        # CCC (10/01/08) DM 44021
+        #If [F:MFO]TRKFIRST = "00/00/00" : [F:MFO]TRKFIRST = [M:MTOK]IPTDAT : Endif
+        If [F:MFO]TRKLAST<[M:MTOK]IPTDAT
+           [F:MFO]TRKLAST   = [M:MTOK]IPTDAT
+        Endif
+        If [F:MFO]TRKLASTC<date$
+           [F:MFO]TRKLASTC  = date$
+        Endif
+        If [F:MFO]TRKFIRST>[M:MTOK]IPTDAT | [F:MFO]TRKFIRST = "00/00/00"
+            [F:MFO]TRKFIRST = [M:MTOK]IPTDAT
+        Endif
+        If [F:MFO]TRKFIRSTC>date$ | [F:MFO]TRKFIRSTC = "00/00/00"
+            [F:MFO]TRKFIRSTC = date$
+        Endif
+        # mise à jour du flag solde selon différents cas
+        #Si CLEFLG = 3 on suit les opérations en automatique (sans saisie écran)
+        #L'indicateur de solde doit être évalué.
+        If     [M:MTOK]CLEFLG = 2 & [F:MFO]MFOTRKFLG < 5:#on solde une ligne
+               # CCC (10/01/08) DM 44021
+               #[F:MFO]TRKLAST = [M:MTOK]IPTDAT
+               [F:MFO]OPESTA = 5
+               [F:MFO]MFOTRKFLG = 5
+               [M:MTOK]WOPECLENBR += 1
+        Elsif  [M:MTOK]CLEFLG = 1 & [F:MFO]MFOTRKFLG = 5 :#on désolde une ligne
+               [F:MFO]OPESTA = 4
+               # CCC (10/01/08) DM 44021
+               #Raz [F:MFO]TRKLAST
+               [F:MFO]MFOTRKFLG = 4
+               [M:MTOK]WOPECLENBR -= 1
+        Elsif  [M:MTOK]CLEFLG = 1 & [F:MFO]MFOTRKFLG < 4 :#une ligne passe à "encours"
+               [F:MFO]OPESTA    = 4
+               [F:MFO]MFOTRKFLG = 4
+        Elsif  [M:MTOK]CLEFLG = 3
+               Raz WRET
+               Call CONT_SOLDE_OPE([F:MFO]MFGFCY,[F:MFO]CPLWST, [F:MFO]CPLQTY ,
+&                                   [F:MFO]EXTQTY, WRET) From MFGLIBO
+               If WRET = 1
+                   # CCC (10/01/08) DM 44021
+                   #[F:MFO]TRKLAST = [M:MTOK]IPTDAT
+                   [F:MFO]OPESTA = 5
+                   [F:MFO]MFOTRKFLG = 5
+                   If [F:MWS]WSTTYP <> 3 : [M:MTOK]WOPECLENBR += 1 : Endif
+               Else
+                   [F:MFO]OPESTA    = 4
+                   [F:MFO]MFOTRKFLG = 4
+               Endif
+        Endif
+        Gosub MAJ_SUIVANTE From SUBMTKC
+        If GOK < 1 : End : Endif
+        Filter [MFI] Where MFGNUM = [F:MFO]MFGNUM
+        Read [F:MFI]MFI0 First
+        If !fstat
+           Call UPDATE_OWX("M",[F:MFI]PJT) From MFGLIBO
+        Endif
+        Filter [MFI]
+        #point d'entrée  pour mise à jour de zones spécifiques de la table [MFO] sr 08.02 demande 15547
+        GPOINT = "BENMFOMAJ" : Gosub ENTREE From EXEFNC
+        Rewrite [F:MFO]
+        If fstat
+           GOK = 0 : Call FSTA("MFO") From GLOCK : End
+        Endif
+        #----- MISE à jour statistiques ligne suivi opé -----#
+        Call VALSTA("MFO",1) From SUBPS2
+        If GOK < 1 : End : Endif
+        If [F:MFO]MFOTRKFLG = 5 & [F:MWS]WSTTYP = 3
+           Local Integer WPREC : WPREC = [F:MFO]OPENUM
+           Raz WOPECLENBR
+           Gosub CTR_SOLDE From FUNMFGS
+           [M:MTOK]WOPECLENBR += WOPECLENBR
+        Endif
+Endif
+#Maj du fichier WORKSTATIO
+Readlock [F:MWS]WST0 = [F:MKO]CPLWST;[F:MKO]MFGFCY
+If !fstat
+    WCPLHOU = [F:MKO]CPLOPETIM
+    If [F:MKO]TIMUOMCOD = 2 : WCPLHOU = WCPLHOU / 60 : Endif
+    [F:MWS]CPLHOUTIM += func TRTX3.ARRTYP("","","TIH",WCPLHOU)
+    Rewrite [F:MWS]
+    If fstat
+       GOK = 0 : Call FSTA("MWS") From GLOCK : End
+    Endif
+Endif
+#Maj éventuelle du fichier réponses fiche technique Attention pour suivi sur opé borne demande 32348
+If [M:MTOK]TECCRD <> "" & [F:MKO]OPENUM   = [M:MTOK]OPENUM
+   Gosub MAJ_TECCRD
+   If GOK = 0 : End : Endif
+Endif
+Local Char WTYPSUIVI(3)
+#conso des matières selon transaction et si qté réalisée et si nomenclature renseignée
+If ([M:MTOK]MATFLG = 3 | [M:MTOK]MATFLG = 4 & [M:MTOK]WMATOK <> 2) &
+&   [M:MTOK]CPLQTY <> 0 & [M:MTOK]BOMNUM <> "" &
+&   !find([M:MTOK]TYPTRT,1,5)
+   WTYPSUIVI = "OPE"
+   Call CONSO_MATIERE(WTYPSUIVI)
+   If GOK < 1 : End : Endif
+Endif
+#déclaration de production selon transaction et si qté réalisée et si nomenclature renseignée
+#et si opération de production
+If ([M:MTOK]ITMFLG = 3 | ([M:MTOK]ITMFLG = 4 & [M:MTOK]WITMOK <> 2)) &
+&   [M:MTOK]CPLQTY <> 0 & [M:MTOK]BOMNUM <> ""  & [M:MTOK]MFGMST = 2 &
+&   !find([M:MTOK]TYPTRT,1,5)
+   WTYPSUIVI = "OPE"
+   Call DECL_PRODUCTION(WTYPSUIVI)
+   If GOK < 1 : End : Endif
+Endif
+Raz WMSGSUI
+Case [M:MTOK]TYPTRT
+     When 1,2,10 :  WMSGSUI = mess(112,190,1)+" : "+[F:MKO]MFGNUM - num$([F:MKO]OPENUM) - [F:MKO]CPLWST
+                    If [M:MTOK]TYPTRT = 10 : WMSGSUI -= mess(125,190,1) : Endif
+                    TRA = 1
+                    Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+     When 5,6,11 :  WMSGSUI = mess(122,190,1)+" : "+[F:MKO]ITMREF - num$([F:MKO]OPENUM) - [F:MKO]CPLWST
+                    If [M:MTOK]TYPTRT = 11  : WMSGSUI -= mess(125,190,1) : Endif
+                    TRA = 1
+                    Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+     When 9      :  WMSGSUI = mess(114,190,1)+" : "+[F:MKO]CPLWST
+                    TRA = 1
+                    Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+Endcase
+If [M:MTOK]TYPTRT <> 9
+   WMSGSUI = "          "+mess(118,190,1)-num$([F:MKO]CPLQTY)-[F:MKO]OPEUOM-
+&            mess(119,190,1)-num$([F:MKO]REJCPLQTY)-[F:MKO]OPEUOM
+   Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+   WMSGSUI = "          "+mess(120,190,1)-num$([F:MKO]CPLSETTIM)-mess([F:MKO]TIMUOMCOD,301,1)-
+&            mess(121,190,1)-num$([F:MKO]CPLOPETIM)-mess([F:MKO]TIMUOMCOD,301,1)
+   Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+Else
+   WMSGSUI = "          "+mess(121,190,1)-num$([F:MKO]CPLOPETIM)-mess([F:MKO]TIMUOMCOD,301,1)
+   Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+Endif
+
+[M:MTOK]WNBOPE += 1 : # GH 17/09/2015 bug 110557
+End
+
+###################################################################################
+$MAJMKO_CPTANALIN
+
+If dim(WI)<1  Local Integer WI : Endif
+
+# CCC (2009-09-10) Bug 57425 : INISEC peut casser la classe [F:CAL]
+If !clalev([F:CAL2]) : Local File CPTANALIN [CAL2] : Endif
+
+Raz [F:CAL2]
+[F:CAL2]ABRFIC="MKO"
+[F:CAL2]VCRNUM=[F:MKO]MFGTRKNUM
+[F:CAL2]VCRLIN=[F:MKO]OPETRKLIN
+[F:CAL2]CPLCLE=[F:MKO]CPLWST
+[F:CAL2]ANALIG=1
+
+For WI=1 To max(GNBCOA,2)
+    [F:CAL2]LED(WI-1)=GLEDSOC(WI)
+    [F:CAL2]COA(WI-1)=GCOA(WI)
+Next WI
+
+#-----
+Case [M:MTOK]TYPTRT
+    When 1,2,5,6 :
+        # Issue 77417 - 2012-02-01 by CCC
+        #For WI=1 To max(GNBDIE,GOPTCANA)
+        For WI=1 To GNBDIE
+            [F:CAL2]DIE(WI-1)=GDIE(WI)
+            [F:CAL2]CCE(WI-1)=evalue("[M:MTOK]CCE"+num$(WI))
+            If find([M:MTOK]TYPTRT,1,5)
+                If [F:CAL2]CCE(WI-1)=""
+                    Raz WCCE
+                    Call INISEC(WCCE,"MKOB", WI) From TRTX3CPT
+                    [F:CAL2]CCE(WI-1) = WCCE
+                Endif
+            Endif
+        Next WI
+     When 9,10,11 :
+        Read [MWS]WST0=[F:MKO]CPLWST;[F:MKO]MFGFCY
+        # Issue 77417 - 2012-02-01 by CCC
+        #For WI=1 To max(GNBDIE,GOPTCANA)
+        For WI=1 To GNBDIE
+            [F:CAL2]DIE(WI-1)=GDIE(WI)
+            [F:CAL2]CCE(WI-1)=evalue("[M:MTOK]CCE"+num$(WI))
+            If [F:CAL2]CCE(WI-1)=""
+                Raz WCCE
+                Call INISEC(WCCE,"MKOB", WI ) From TRTX3CPT
+                [F:CAL2]CCE(WI-1) = WCCE
+            Endif
+        Next WI
+Endcase
+#-----
+Write [CAL2]
+If fstat  GOK=0 : Call FSTA("CAL2") From GLOCK : Return : Endif
+#
+
+If [F:MKO]CPLLAB = "" : Return : Endif
+# Poste secondaire : l'enregistrement peut ne pas exister
+Raz [F:CAL2]
+[F:CAL2]ABRFIC="MKO"
+[F:CAL2]VCRNUM=[F:MKO]MFGTRKNUM
+[F:CAL2]VCRLIN=[F:MKO]OPETRKLIN
+[F:CAL2]CPLCLE=[F:MKO]CPLLAB
+[F:CAL2]ANALIG=1
+#-----
+For WI=1 To max(GNBCOA,2)
+    [F:CAL2]LED(WI-1)=GLEDSOC(WI)
+    [F:CAL2]COA(WI-1)=GCOA(WI)
+Next WI
+
+Case [M:MTOK]TYPTRT
+    When 1,2,5,6,9,10,11 :
+        # lecture poste main d'oeuvre pour section de valo (contenant les CCE)(28/09)
+        Read [MWS]WST0=[F:MKO]CPLLAB;[F:MKO]MFGFCY
+        # Issue 77417 - 2012-02-01 by CCC
+        #For WI=1 To max(GNBDIE,GOPTCANA)
+        For WI=1 To GNBDIE
+            [F:CAL2]DIE(WI-1)=GDIE(WI)
+            [F:CAL2]CCE(WI-1)=evalue("[M:MTOK]LABCCE"+num$(WI))
+            If find ([M:MTOK]TYPTRT,1,5,9,10,11)
+                If [F:CAL2]CCE(WI-1)= ""
+                    Raz WCCE
+                    Call INISEC(WCCE,"MKOLABB",WI) From TRTX3CPT
+                    [F:CAL2]CCE(WI-1) = WCCE
+                Endif
+            Endif
+        Next WI
+Endcase
+
+Write [CAL2]
+If fstat  GOK=0 : Call FSTA("CAL2") From GLOCK : Return : Endif
+
+Return
+###################################################################################
+$MAJ_TECCRD
+#Enregistrement des réponses pour la fiche technique associée à l'opération
+If clalev([F:MTA])<= 0 : Local File MTKCRDASW [MTA] : Endif
+If clalev([F:QLW])<= 0 : Local File QLYWRK [QLW] : Endif
+Filter [F:QLW] Where PRONUM = adxuid(1) & LINNUM = [M:MTOK]WLINUM & VCRTYP = 12
+Look [F:QLW]QLW0 First
+If fstat :
+# 10.06 demande 28860
+#   If GCTLFICTEC < 3 : Return
+#   Else : GOK = 0
+#          Filter [F:QLW]
+#          Call ERREUR(mess(23,190,1)-num$([M:MTOK]WLINUM)) From GESECRAN
+#          Return
+#   Endif
+    Filter [F:QLW]   # FQ 64125 GA 05/2010 il manque le Raz du Filter
+    Return
+Endif
+For [F:QLW]
+    Raz [F:MTA]
+        [F:MTA]= [F:QLW]
+        [F:MTA]MFGTRKNUM = [F:MKO]MFGTRKNUM
+        [F:MTA]OPETRKLIN = [F:MKO]OPETRKLIN
+# 12.06 demande 38821
+        [F:MTA]OPENUM    = [F:MKO]OPENUM
+        [F:MTA]MFGNUM    = [F:MKO]MFGNUM
+        [F:MTA]EXPNUM    = [C]EXPORT
+        #point d'entrée [MTA] Issue 83469 GA 08/2012
+        GPOINT = "BEFWRIMTA" : Gosub ENTREE From EXEFNC
+        Write [F:MTA]
+        If fstat
+           GOK = 0 : Call FSTA("MTA") From GLOCK : Break
+        Endif
+Next
+Filter [F:QLW]
+Delete [F:QLW] Where PRONUM = adxuid(1) & LINNUM = [M:MTOK]WLINUM
+If GOK = 0 : GLOCK = "$"+"QLYWRK" : Endif
+Return
+
+######################################################################################
+#Consommation des matières en automatique suite à suivi des temps ou decl prod
+#On a en amont une classe [M:MTOK] ou [M:MTIK]
+#On passe par un masque de travail [M:MTMK] pour appeler le traitement standard CRE_GRPMKM
+Subprog CONSO_MATIERE(LTYPSUIVI)
+Value Char    LTYPSUIVI
+
+
+Raz [M:MTMK]
+[M:MTMK]CODMAJ    = "C"
+[M:MTMK]CODTRS    = 1
+Case LTYPSUIVI
+    When "OPE" :
+        [M:MTMK]          = [F:MKO]
+        [M:MTMK]IPTDAT    = [M:MTOK]IPTDAT
+        [M:MTMK]MFGFCY    = [M:MTOK]MFGFCY
+        [M:MTMK]WRH       = [M:MTOK]WRH
+        [M:MTMK]MATTRKLIN = [M:MTOK]WNBMAT
+        [M:MTMK]STOCODMAN = [M:MTOK]STOCODMAN
+        [M:MTMK]CONSMAT   = [M:MTOK]CONSMAT
+        [M:MTMK]BOMNUM    = [M:MTOK]BOMNUM
+        [M:MTMK]BOMALT    = [M:MTOK]BOMALT
+        [M:MTMK]CPLWST    = [M:MTOK]CPLWST
+        [M:MTMK]MFGMST    = [M:MTOK]MFGMST
+        [M:MTMK]TRSFAM    = [M:MTOK]TRSFAMS
+        [M:MTMK]ENTCOD    = [M:MTOK]ENTCODS
+        [M:MTMK]TRSCODS   = [M:MTOK]TRSCODS
+        [M:MTMK]MATFLTFLG = [M:MTOK]MATFLTFLG
+        Case [M:MTOK]TYPTRT
+            When 2   :  [M:MTMK]TYPTRT = 2
+                        #Calcul du coefficient de réalisation de l'opération
+                        [M:MTMK]WCOEFF = ([F:MKO]CPLQTY * [F:MKO]OPEWORCOE) / [F:MFO]EXTQTY
+                        # CCC (09/12/08) Bug 50667 : le coef ne doit pas être arrondi sinon les qtés calculées sont fausses
+                        # Ce sont les quantités qui sont arrondies
+                        ## sr 01.02 demande 12597
+                        #[M:MTMK]WCOEFF = arr([M:MTMK]WCOEFF,0.00000001)
+                        #
+                        # Issue 77503 - 2011-11-03 by CCC : Idem bug 69266
+                        # Dans le cas d'un article utilisé pour plusieurs produits, le prorata avec la quantité totale de l'OF sera nécessaire
+                        [M:MTMK]WCOEFF2 = [F:MKO]CPLQTY / [F:MFG]EXTQTY
+                        [M:MTMK]CLEFLG = 3
+            When 6   :  [M:MTMK]TYPTRT = 6
+                 # 09.06 demande 37849 tenir compte du coeff US-UO
+            # 10.06 demande 38192 tenir compte du coeff US-UO suite
+            If [F:MKO]OPEUOM = [F:ROO]OPEUOM
+               [M:MTMK]CPLQTY     = [F:MKO]CPLQTY / [F:ROO]OPESTUCOE
+            Else
+               [M:MTMK]CPLQTY     = [F:MKO]CPLQTY
+            Endif
+        Endcase
+        Call CRE_GRPMKM
+        If GOK < 1 : End : Endif
+        [M:MTOK]WMATCLENBR   += [M:MTMK]WMATCLENBR
+        [M:MTOK]WNBMAT       += [M:MTMK]WNBMAT
+    When "ITM" :
+        [M:MTMK]          = [F:MKI]
+        [M:MTMK]IPTDAT    = [M:MTIK]IPTDAT
+        [M:MTMK]MFGFCY    = [M:MTIK]MFGFCY
+        [M:MTMK]WRH       = [M:MTIK]WRH
+        [M:MTMK]MATTRKLIN = [M:MTIK]WNBMAT
+        [M:MTMK]STOCODMAN = [M:MTIK]STOCODMAN
+        [M:MTMK]CONSMAT   = [M:MTIK]CONSMAT
+        [M:MTMK]BOMNUM    = [M:MTIK]ITMREF
+        [M:MTMK]BOMALT    = [M:MTIK]BOMALT
+        [M:MTMK]TRSFAM    = [M:MTIK]TRSFAMS
+        [M:MTMK]ENTCOD    = [M:MTIK]ENTCODS
+        [M:MTMK]TRSCODS   = [M:MTIK]TRSCODS
+        [M:MTMK]MATFLTFLG = [M:MTIK]MATFLTFLG
+        # 11.05 demande 33356
+        If [F:MFG]MFGNUM <> [F:MFI]MFGNUM
+           Read [F:MFG]MFG0 = [F:MFI]MFGNUM
+           If fstat : Raz [F:MFG] : Endif
+        Endif
+        Case [M:MTIK]TYPTRT
+            When 3   :  [M:MTMK]TYPTRT = 3
+# CCC (12/01/09) Bug 48415 : Le calcul de la quantité à consommer doit se faire par rapport à la quantité à produire pour
+#                            la ligne de produit concernée
+                        [M:MTMK]WCOEFF = [F:MKI]CPLQTY / [F:MFI]EXTQTY
+                        # Issue 69266 - 2010-11-19 by CCC : Dans le cas d'un article utilisé pour plusieurs produits, le prorata avec la quantité totale de l'OF sera nécessaire
+                        [M:MTMK]WCOEFF2 = [F:MKI]CPLQTY / [F:MFG]EXTQTY
+                        #
+                        [M:MTMK]CLEFLG = 3
+            When 7   :  [M:MTMK]TYPTRT = 7
+                        [M:MTMK]USEQTY = [F:MKI]CPLQTY
+        Endcase
+        Call CRE_GRPMKM
+        If GOK < 1 : End : Endif
+        [M:MTIK]WMATCLENBR   += [M:MTMK]WMATCLENBR
+        [M:MTIK]WNBMAT       += [M:MTMK]WNBMAT
+Endcase
+End
+
+######################################################################################
+#Déclarations de production liées à une opération d'Of ou de gamme
+#On a en amont une classe [M:MTOK]
+#On passe par un masque de travail MTIK pour appeler le traitement standard CRE_GRPMKI
+Subprog DECL_PRODUCTION(LTYPSUIVI)
+Value Char    LTYPSUIVI
+Raz [M:MTIK]
+
+[M:MTIK]CODMAJ    = "C"
+[M:MTIK]CODTRS    = 1
+Case LTYPSUIVI
+    When "OPE" :
+        [M:MTIK]          = [F:MKO]
+        [M:MTIK]IPTDAT    = [M:MTOK]IPTDAT
+        [M:MTIK]MFGFCY    = [M:MTOK]MFGFCY
+        [M:MTIK]WRH       = [M:MTOK]WRH
+        [M:MTIK]ITMTRKLIN = [M:MTOK]WNBITM
+        [M:MTIK]ITMREF    = [M:MTOK]BOMNUM
+        [M:MTIK]BOMALT    = [M:MTOK]BOMALT
+        [M:MTIK]CCEDEF    = [M:MTOK]CCEDEF
+        [M:MTIK]ENTCOD    = [M:MTOK]ENTCOD
+        [M:MTIK]PRNCOD    = [M:MTOK]PRNCOD
+        [M:MTIK]PRNNBRFLG = [M:MTOK]PRNNBRFLG
+        [M:MTIK]TRSCOD    = [M:MTOK]TRSCOD
+        [M:MTIK]TRSFAM    = [M:MTOK]TRSFAM
+        [M:MTIK]ITMFLTFLG = [M:MTOK]ITMFLTFLG
+        Case [M:MTOK]TYPTRT
+            When 2   :  [M:MTIK]TYPTRT = 1
+                        #Calcul du coefficient de réalisation de l'opération
+                        [M:MTIK]WCOEFF    = ([F:MKO]CPLQTY * [F:MKO]OPEWORCOE) / [F:MFO]EXTQTY
+                        # CCC (09/12/08) Bug 50667 : le coef ne doit pas être arrondi sinon les qtés calculées sont fausses
+                        # Ce sont les quantités qui sont arrondies
+                        ## sr 01.02 demande 12597
+                        #[M:MTIK]WCOEFF = arr([M:MTIK]WCOEFF,0.00000001)
+                        #
+                        If [F:MKO]REJCPLQTY <> 0
+                            [M:MTIK]WCOEFF2   = ([F:MKO]REJCPLQTY * [F:MKO]OPEWORCOE) / [F:MFO]EXTQTY
+                            # CCC (09/12/08) Bug 50667 : le coef ne doit pas être arrondi sinon les qtés calculées sont fausses
+                            # Ce sont les quantités qui sont arrondies
+                            ## sr 01.02 demande 12597
+                            #[M:MTIK]WCOEFF2 = arr([M:MTIK]WCOEFF2,0.00000001)
+                            #
+                        Else
+                            [M:MTIK]WCOEFF2   = 0
+                        Endif
+                        [M:MTIK]CLEFLG    = 3
+            When 6   :  [M:MTIK]TYPTRT    = 5
+                        # 08.06 demande 37100 tenir compte du coeff US-UO
+                # 10.06 demande 38192 tenir compte du coeff US-UO suite
+                If [F:MKO]OPEUOM = [F:ROO]OPEUOM
+                    [M:MTIK]CPLQTY     = [F:MKO]CPLQTY / [F:ROO]OPESTUCOE
+                    [M:MTIK]REJCPLQTY = [F:MKO]REJCPLQTY  / [F:ROO]OPESTUCOE
+                Else
+                    [M:MTIK]CPLQTY     = [F:MKO]CPLQTY
+                    [M:MTIK]REJCPLQTY = [F:MKO]REJCPLQTY
+                Endif
+        Endcase
+        Call CRE_GRPMKI
+        If GOK = 1
+            [M:MTOK]WITMCLENBR   += [M:MTIK]WITMCLENBR
+            [M:MTOK]WNBITM       += [M:MTIK]WNBITM
+            [M:MTOK]WCPLQTY      += [M:MTIK]WCPLQTY
+            [M:MTOK]WREJCPLQTY   += [M:MTIK]WREJCPLQTY
+            [M:MTOK]WQUACPLQTY   += [M:MTIK]WQUACPLQTY
+        Endif
+Endcase
+End
+
+##########################################################################
+#------------------------------------------------------------------------#
+#                 Sous-programme CRE_GRPMKM                              #
+#Sous-programmes de création automatique de suivis matières              #
+#On passe par une classe [M:MTMK] invisible                              #
+#On traite un ensemble de matières                                       #
+#en 150 : selon transaction,on peut traiter les matières déjà soldées    #
+#Les valeurs de TYPTRT possibles dans ce contexte sont :                 #
+#            1 : On veut suivre toutes les matières liées à un OF        #
+#            2 : On veut suivre les matières liées à une opération       #
+#                Si cette opération est une étape de production on suivra#
+#                en même temps les matières avec numéro d'opération = 0  #
+#            3 : On veut suivre les matières liées à un article lancé    #
+#          5,7 : On veut suivre toutes les matières d'une nomenclature   #
+#            6 : On veut suivre les matières d'une nomenclature filtrées #
+#                sur une opération                                       #
+#------------------------------------------------------------------------#
+Subprog CRE_GRPMKM
+Gosub OPEN_FILE
+# Issue 105604 - 2015-02-18 by JUSYN : Working with decimal quantity instead of only integer Quantities.
+#                                      Needed roundings will occur in following procedures.
+# Local Integer WQTY : WQTY = [M:MTMK]CPLQTY
+Local Decimal WQTY : WQTY = [M:MTMK]CPLQTY
+
+Case [M:MTMK]TYPTRT
+    When 1 :
+             Case [M:MTMK]MATFLTFLG
+                 When 2 : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & MFMTRKFLG = 5 &
+&                                 MATSTA <> 4  & CPNTYP <> 5
+                 When 3 : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM &
+&                                 MATSTA <> 4  & CPNTYP <> 5
+                 When Default : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & MFMTRKFLG <> 5 &
+&                                 MATSTA <> 4  & CPNTYP <> 5
+             Endcase
+            #point d'entrée  pour filtre spécifique à la place du filtre standard demande 33732
+             GPOINT = "BENMFMFLT" : Gosub ENTREE From EXEFNC
+             # 03.05 Performances
+             For [F:MFM]MFM0
+                   [M:MTMK]MKMTEX     = [F:MFM]MFMTEX
+#                  [M:MTMK]MATTRKLIN += 1                 # sr demande 16931
+                  Call CRE_MKM("",WQTY)
+                  If GOK < 1 : Break : Endif
+             Next
+             Filter [F:MFM]
+    When 2 :
+        If [M:MTMK]MFGMST    <> 2
+            Case [M:MTMK]MATFLTFLG
+                 When 2 :  Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & BOMOPE = [M:MTMK]OPENUM & MFMTRKFLG = 5 &
+&                                MATSTA <> 4 & CPNTYP <> 5
+                 When 3 :  Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & BOMOPE = [M:MTMK]OPENUM &
+&                                MATSTA <> 4 & CPNTYP <> 5
+                 When Default :  Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & BOMOPE = [M:MTMK]OPENUM & MFMTRKFLG <> 5 &
+&                                MATSTA <> 4 & CPNTYP <> 5
+            Endcase
+        Else
+            Case [M:MTMK]MATFLTFLG
+                When 2 : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & find(BOMOPE,[M:MTMK]OPENUM,0)
+&                              & MFMTRKFLG = 5 & MATSTA <> 4 & CPNTYP <> 5
+                When 3 : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & find(BOMOPE,[M:MTMK]OPENUM,0)
+&                               & MATSTA <> 4 & CPNTYP <> 5
+                When Default : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & find(BOMOPE,[M:MTMK]OPENUM,0)
+&                              & MFMTRKFLG <> 5 & MATSTA <> 4 & CPNTYP <> 5
+            Endcase
+        Endif
+        #point d'entrée  pour filtre spécifique à la place du filtre standard demande 33732
+        GPOINT = "BENMFMFLT" : Gosub ENTREE From EXEFNC
+        # 11.02 Performances 2
+        For [F:MFM]MFM3
+             [M:MTMK]MKMTEX     = [F:MFM]MFMTEX
+#            [M:MTMK]MATTRKLIN += 1                       # sr demande 16931
+            Call CRE_MKM("",WQTY)
+            If GOK < 1 : Break : Endif
+        Next
+        Filter [F:MFM]
+    When 3   :
+            Case [M:MTMK]MATFLTFLG
+                When 2 : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & (find(MFGLIN,0,[M:MTMK]MFGLIN)) &
+&                                     MFMTRKFLG = 5 & MATSTA <> 4 & CPNTYP <> 5
+                When 3 : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & (find(MFGLIN,0,[M:MTMK]MFGLIN)) &
+&                                   MATSTA <> 4 & CPNTYP <> 5
+                When Default : Filter [F:MFM] Where MFGNUM = [M:MTMK]MFGNUM & (find(MFGLIN,0,[M:MTMK]MFGLIN)) &
+&                                     MFMTRKFLG <> 5 & MATSTA <> 4 & CPNTYP <> 5
+            Endcase
+            #point d'entrée  pour filtre spécifique à la place du filtre standard demande 33732
+            GPOINT = "BENMFMFLT" : Gosub ENTREE From EXEFNC
+            # 03.05 Performances
+            For [F:MFM]MFM0
+                [M:MTMK]MKMTEX     = [F:MFM]MFMTEX
+#               [M:MTMK]MATTRKLIN += 1                # sr demande 16931
+                Call CRE_MKM("",WQTY)
+                If GOK < 1 : Break : Endif
+            Next
+            Filter [F:MFM]
+    When 5,6,7 :
+        Call CRE_GRPMKMBOD([M:MTMK]BOMNUM,[M:MTMK]BOMNUM,WQTY)
+Endcase
+If GOK < 1 :  End : Endif
+End
+
+#########################################################################################
+#On traite une nomenclature on passe par ce traitement intermédiaire à cause des fantômes
+Subprog CRE_GRPMKMBOD(LITM1,LITM2,LQTY)
+Value   Char    LITM1,LITM2
+Value   Decimal LQTY
+
+# Issue 78519 save previous BOH
+Local Char     WBOHITMREF(GLONITM) : WBOHITMREF = [F:BOH]ITMREF
+Local Shortint WBOHBOMALT          : WBOHBOMALT = [F:BOH]BOMALT
+
+# lecture entete nomenclature
+Read [BOH]BOH0=LITM1;[M:MTMK]BOMALT;2
+If fstat : End : Endif
+
+# lecture liens
+Case [M:MTMK]TYPTRT
+     When 5,7 :
+# FQ 77545 GA 11/2011 risque avec ce Local File
+# GH 13/05/2014 bug 99616 Local File à faire car CRE_MKM appelle ce subprog récursivement pour les fantômes sans stock disponible
+      Local File BOMD [BOD] Where ITMREF = [F:BOH]ITMREF & BOMALT = [F:BOH]BOMALT & BOMALTTYP = 2 &
+&                                 (BOMSTRDAT = [0/0/0] | (BOMSTRDAT <> [0/0/0] & BOMSTRDAT <= [M:MTMK]IPTDAT)) &
+&                                 (BOMENDDAT = [0/0/0] | (BOMENDDAT <> [0/0/0] & BOMENDDAT >= [M:MTMK]IPTDAT)) &
+&                                 !find(CPNTYP,4,5,6) & LIKQTY <> 0
+     When 6 :
+        If [M:MTMK]MFGMST    <> 2
+# FQ 77545 GA 11/2011 risque avec ce Local File
+# GH 13/05/2014 bug 99616 Local File à faire car CRE_MKM appelle ce subprog récursivement pour les fantômes sans stock disponible
+           Local File BOMD [BOD] Where ITMREF = [F:BOH]ITMREF & BOMALT = [F:BOH]BOMALT & BOMALTTYP = 2 &
+&                                      (BOMSTRDAT = [0/0/0] | (BOMSTRDAT <> [0/0/0] & BOMSTRDAT <= [M:MTMK]IPTDAT)) &
+&                                      (BOMENDDAT = [0/0/0] | (BOMENDDAT <> [0/0/0] & BOMENDDAT >= [M:MTMK]IPTDAT)) &
+&                                      CPNOPE = [M:MTMK]OPENUM & !find(CPNTYP,4,5,6) & LIKQTY <> 0
+        Else
+# FQ 77545 GA 11/2011 risque avec ce Local File
+# GH 13/05/2014 bug 99616 Local File à faire car CRE_MKM appelle ce subprog récursivement pour les fantômes sans stock disponible
+            Local File BOMD [BOD] Where ITMREF = [F:BOH]ITMREF & BOMALT = [F:BOH]BOMALT & BOMALTTYP = 2 &
+&                                       (BOMSTRDAT = [0/0/0] | (BOMSTRDAT <> [0/0/0] & BOMSTRDAT <= [M:MTMK]IPTDAT)) &
+&                                       (BOMENDDAT = [0/0/0] | (BOMENDDAT <> [0/0/0] & BOMENDDAT >= [M:MTMK]IPTDAT)) &
+&                                       find(CPNOPE,[M:MTMK]OPENUM,0) & !find(CPNTYP,4,5,6) & LIKQTY <> 0
+        Endif
+Endcase
+
+Read [BOD]BOD0 First
+While !fstat
+    GPE=0
+    GPOINT="BEFBODMKM"
+    Gosub ENTREE From EXEFNC
+    If GPE=0
+        [M:MTMK]MKMTEX     = [F:BOD]BOMTEXNUM
+    #   [M:MTMK]MATTRKLIN += 1                   # sr demande 16931
+        Call CRE_MKM(LITM2,LQTY)
+    Endif
+    If GOK < 1 : Break : Endif
+    Read [BOD]BOD0 Next                          # 10.02 Performances
+Wend
+Filter [BOD]
+
+# Issue 78519 restore previous BOH
+Read [BOH]BOH0=WBOHITMREF;WBOHBOMALT;2
+If fstat : Raz [F:BOH] : Endif
+End
+
+########################################################################
+#On traite une matière
+#Selon TYPTRT  :
+#      1,2,3,4 : On suit une matière d'OF (1,2,3 en automatique derrière un autre plan)
+#      5,6,7,8 : On suit une matière de nomenclature (5,6,7 en automatique derrière un autre plan)
+#      12      : On suit une matière non prévue sur un Of
+#      13      : On suit une matière non prévue sur une nomenclature
+#      14      : On réintègre une matière d'OF
+#      15      : On réintègre une matière d'OF non prévue
+#      16      : On réintègre une matière de nomenclature
+#      17      : On réintègre une matière de nomenclature non prévue
+#Pour le suivi sur nomenclature on doit passer en paramètre la nomenclature
+#principale à cause des fantômes
+########################################################################
+Subprog CRE_MKM(LITM,LQTY)
+Value        Char LITM
+Value        Decimal LQTY
+Local        Char WMSGSUI(250), WNUMTEX(12)
+Local        Integer WRETOUR, WRET, J, I
+Local        Char    WCCE(15)
+Local        Decimal WQTY, WDIS, WQTYN, WQTYNA, WQTYB, WQTYBA, WLIEN
+Local        Decimal WBASQTY
+Local        Integer WLIKQTYCOD
+Local        Decimal WLIKQTY
+Local        Integer WQTYRND
+Local        Decimal WLSCA
+Local        Char    WSTU(GLONUOM)     # llc 01.02 UOM
+Local        Integer WCUNFLG
+Local        Integer WTYPMVT, WMOD
+Local        Integer WNO_REAJUST
+Local        Decimal LQTA, LSHT
+Local        Integer LNBR, LNBJ, LRET
+Local        Decimal WALLQTY, WALLQTYSHT, WWALLQTY,WWSHTQTY
+Local        Char    WORI(5) : WORI = "MTMK"
+Local        Integer WSTOSEQ
+Local        Char    WCRITERE (255)    # 55296 mm 05.09 GSTOCOU
+
+Raz WNO_REAJUST
+
+Global Integer GTITRE
+#Récupération de la valeur du code activité titre
+Call LECACT("TIT",GTITRE) From TRTX3
+# Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle ou stock insuffisant
+Local Integer WNO_CTLMKMNUL, WNO_CTLMKMSTO : WNO_CTLMKMSTO=0
+#
+If [M:MTMK]TYPTRT <> 4 | [M:MTMK]USEQTY <> 0
+    Case [M:MTMK]TYPTRT
+        When 1,2,3,4 :
+    # sr 01.03 récupérer l'emplacement préférentiel si suivi automatique demande 16931
+              If find([M:MTMK]TYPTRT,1,2,3)
+                 [M:MTMK]LOCPREF = [F:MFM]LOC
+              Endif
+         #Lecture éventuelle de article et article-site
+            If [F:ITM]ITMREF <> [F:MFM]ITMREF
+               Read [F:ITM]ITM0 = [F:MFM]ITMREF
+               If fstat GOK=0  : Call RSTA("ITM",[F:MFM]ITMREF) From GLOCK : End : Endif
+            Endif
+            If [F:ITF]ITMREF <> [F:MFM]ITMREF | [F:ITF]STOFCY <> [F:MFM]MFGFCY
+               Read [F:ITF]ITF0 = [F:MFM]ITMREF;[F:MFM]MFGFCY
+               If fstat GOK=0  : Call RSTA("ITF",[F:MFM]ITMREF-[F:MFM]MFGFCY) From GLOCK : End : Endif
+            Endif
+            If find([M:MTMK]TYPTRT,1,2,3) & [F:ITF]CUNFLG = 2
+               If [F:MFM]ALLSTA > 3 : Gosub REC_LOC From SUBMTKB
+               Else
+                    Filter [F:STO] Where STOFCY = [F:ITF]STOFCY & ITMREF = [F:ITF]ITMREF & CUNLOKFLG = 1
+                    # 03.05 Performances
+                    Read [F:STO]STO3 First
+                    If fstat WCUNFLG = 2 : Endif
+                    Filter [F:STO]
+               Endif
+            Endif
+            If WCUNFLG = 2 : End : Endif
+        When 5,6,7,8 :
+         # lecture composant
+            If [F:ITM]ITMREF <> [F:BOD]CPNITMREF
+                Read [ITM]ITM0=[F:BOD]CPNITMREF
+                If fstat : Call RSTA("ITM",[F:BOD]CPNITMREF) From GLOCK : End : Endif
+            Endif
+        # article non géré en stock
+#            If ([F:ITM]PHAFLG <> 2 & [F:ITM]STOMGTCOD = 1)        # (pb fantômes)
+#                End
+#            Endif
+        # FQ 66415 GA 08/2010 PE consommation article non renouvelé
+            GPE=0 : GPOINT = "BENMFMCTL" : Gosub ENTREE From EXEFNC
+        # article avec statut non actif
+            If [F:ITM]ITMSTA > 1 & !GPE
+                End
+            Endif
+        # lecture article site
+            If [F:ITF]ITMREF <> [F:BOD]CPNITMREF | [F:ITF]STOFCY <> [M:MTMK]MFGFCY
+                Read [ITF]ITF0=[F:BOD]CPNITMREF;[M:MTMK]MFGFCY
+                If fstat GOK=0  : Call RSTA("ITF",[F:BOD]CPNITMREF-[M:MTMK]MFGFCY) From GLOCK : End : Endif
+            Endif
+
+        # article non géré en stock
+            If ([F:ITM]PHAFLG <> 2 & [F:ITF]STOMGTCOD = 1)        # (pb fantômes)
+                End
+            Endif
+
+            # sr 04.02 Problèmes Perf
+            If find([M:MTMK]TYPTRT,5,6,7) & [F:ITF]CUNFLG = 2
+                   Filter [F:STO] Where STOFCY = [F:ITF]STOFCY & ITMREF = [F:ITF]ITMREF & CUNLOKFLG = 1
+&                             Order By Key STO3
+                   Read [F:STO]STO3 First
+                   If fstat WCUNFLG = 2 : Endif
+                   Filter [F:STO]
+            Endif
+            If WCUNFLG = 2 : End : Endif
+        When 12,13 :
+         #Lecture éventuelle de article et article-site
+            If [F:ITM]ITMREF <> [M:MTMK]ITMREF
+               Read [F:ITM]ITM0 = [M:MTMK]ITMREF
+               If fstat GOK=0  : Call RSTA("ITM",[M:MTMK]ITMREF) From GLOCK : End : Endif
+            Endif
+            If [F:ITF]ITMREF <> [M:MTMK]ITMREF | [F:ITF]STOFCY <> [M:MTMK]MFGFCY
+               Read [F:ITF]ITF0 = [M:MTMK]ITMREF;[M:MTMK]MFGFCY
+               If fstat GOK=0  : Call RSTA("ITF",[M:MTMK]ITMREF-[M:MTMK]MFGFCY) From GLOCK : End : Endif
+            Endif
+            If [F:ITF]CUNFLG = 2
+                   # sr 04.02 Problèmes Perf
+                   Filter [F:STO] Where STOFCY = [F:ITF]STOFCY & ITMREF = [F:ITF]ITMREF & CUNLOKFLG = 1
+&                             Order By Key STO3
+                   Read [F:STO]STO3 First
+                   If fstat WCUNFLG = 2 : Endif
+                   Filter [F:STO]
+            Endif
+            If WCUNFLG = 2 : End : Endif
+        When 14,15,16,17 :
+         #Réintégration de composants sr 07.01
+         #Lecture éventuelle de article et article-site
+            If [F:ITM]ITMREF <> [M:MTMK]ITMREF
+               Read [F:ITM]ITM0 = [M:MTMK]ITMREF
+               If fstat GOK=0  : Call RSTA("ITM",[M:MTMK]ITMREF) From GLOCK : End : Endif
+            Endif
+            If [F:ITF]ITMREF <> [M:MTMK]ITMREF | [F:ITF]STOFCY <> [M:MTMK]MFGFCY
+               Read [F:ITF]ITF0 = [M:MTMK]ITMREF;[M:MTMK]MFGFCY
+               If fstat GOK=0  : Call RSTA("ITF",[M:MTMK]ITMREF-[M:MTMK]MFGFCY) From GLOCK : End : Endif
+            Endif
+    Endcase
+
+    # Issue 103013 - 2015-03-02 by CCC : If this component has already been produced on the same WO
+    #                                    and issue price adjusment activated => error
+    If func MFGLIB.CTLMATISS([M:MTMK]MFGFCY,[M:MTMK]MFGNUM,[M:MTMK]IPTDAT,[F:ITM]ITMREF,1,GMESSAGE)
+        Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+        Raz GMESSAGE
+        GOK = 0
+        End
+    Endif
+
+    Call LECSRU([M:MTMK]MFGFCY,[F:ITM]TCLCOD,6,[M:MTMK]TRSCODS,"",WRET) From STKLIB
+
+    # Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle ou stock insuffisant
+    GPE=0 : GPOINT = "CTLMKMNUL" : Gosub ENTREE From EXEFNC
+    WNO_CTLMKMNUL=GPE
+
+    #Selon transaction, on ne suit pas les matières dont le mode de déstockage est manuel
+    If [F:ITF]STOCOD = 1 & [M:MTMK]STOCODMAN = 2 : End : Endif
+    #Contrôle stock et éventuellement calcul qté si suivi nomenclature
+    If find([M:MTMK]TYPTRT,5,6,7)
+            # lecture cumuls stocks
+            Call LECITV2([M:MTMK]MFGFCY,[F:BOD]CPNITMREF,WRET) From MFGLIB
+            # Issue 72149 - 2011-03-08 by CCC : test du code retour de LECITV2
+            If WRET : GOK = 0 : End : Endif
+            If find([M:MTMK]TYPTRT,5,6,7)
+                # calcul quantité
+                WQTY         = LQTY
+                WSTU         = [F:ITM]STU
+                WBASQTY      = [F:BOH]BASQTY
+                WLIKQTYCOD   = [F:BOD]LIKQTYCOD
+                WLIKQTY      = [F:BOD]LIKQTY
+                WQTYRND      = [F:BOD]QTYRND
+                WSCA         = [F:BOD]SCA
+                Call LIKQTY(WQTY,WSTU,WBASQTY,WLIKQTYCOD,WLIKQTY,WQTYRND,
+&                       WSCA,WQTYN,WQTYNA,WQTYB,WQTYBA) From MFGLIB
+                WLIEN = WQTYBA
+                # si sous-produit
+                If [F:BOD]CPNTYP = 4 :  End : Endif
+                # composant normal
+                Call STODISTOT("",0,7,"",WDIS) From STKLIB
+                # si article fantôme descente par récursivité
+                If ([F:ITM]PHAFLG = 2) & (WDIS = 0)
+                   Call CRE_GRPMKMBOD([F:ITM]ITMREF,[M:MTMK]BOMNUM,WLIEN)
+                   End
+                Endif
+            Endif
+    Endif
+
+    # si suivi automatique et stock négatif interdit , contrôle que le stock n'est pas à 0
+    #si stock à 0 on l'écrit dans la trace
+    If find([M:MTMK]TYPTRT,1,2,3,5,6,7)
+         If [F:ITM]NEGSTO <> 2
+             Call LECITV2([M:MTMK]MFGFCY,[F:ITF]ITMREF,WRET) From MFGLIB
+             # Issue 72149 - 2011-03-08 by CCC : test du code retour de LECITV2
+             If WRET : GOK = 0 : End : Endif
+             Call STODISTOT("",0,[F:SRU]AUZSTA,"",WDIS) From STKLIB
+             If find([M:MTMK]TYPTRT,1,2,3) & find([F:MFM]ALLSTA,4,5)
+                Call CTLALL([F:MFM]MFGFCY,10,[F:MFM]MFGNUM,[F:MFM]MFGLIN,[F:MFM]BOMSEQ,6,[M:MTMK]TRSCODS,
+&           "",1,WALLQTY,WALLQTYSHT,LRET) From STKALL
+                WDIS += WALLQTY
+             Elsif find([M:MTMK]TYPTRT,1,2,3) & find([F:MFM]ALLSTA,2,3)
+                 WDIS += [F:MFM]ALLQTY
+             Endif
+             If WDIS <= 0
+               # Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle ou stock insuffisant
+               GPE=0 : GPOINT = "CTLMKMSTO" : Gosub ENTREE From EXEFNC
+               WNO_CTLMKMSTO=GPE
+                Case [M:MTMK]TYPTRT
+                     When 1,2,3 :
+                          WMSGSUI =  mess(202,190,1)-":"- [F:MFM]MFGNUM - num$([F:MFM]BOMOPE) -[F:MFM]ITMREF - mess(204,190,1)
+                          Gosub CRE_MKM_TRA
+                     When 5,6,7 :
+                          WMSGSUI =  mess(203,190,1)-":"-[M:MTMK]BOMNUM - num$([M:MTMK]BOMNUM) -[M:MTMK]ITMREF - mess(204,190,1)
+                          Gosub CRE_MKM_TRA
+                Endcase
+                # Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle ou stock insuffisant
+                If !WNO_CTLMKMNUL & !WNO_CTLMKMSTO End Endif
+             Endif
+        Endif
+        #Création enregistrement suivi mat
+        [M:MTMK]MATTRKLIN += 1
+    Endif
+Endif
+
+# si ligne pas exclue on créé un suivi
+If [M:MTMK]TYPTRT <> 4 | [M:MTMK]WEXCMAT <> 2
+    Raz [F:MKM]
+    [F:MKM]MATTRKLIN = [M:MTMK]MATTRKLIN
+    [F:MKM]MFGTRKNUM = [M:MTMK]MFGTRKNUM
+    [F:MKM]CUMMATSUI = 0
+    [F:MKM]IPTDAT    = [M:MTMK]IPTDAT
+    Case [M:MTMK]TYPTRT
+      When 1,2,3,4,14 :
+        [F:MKM]          = [F:MFM]
+        [F:MKM]OPENUM    = [F:MFM]BOMOPE
+        If [F:MKM]OPENUM <> 0 & [F:MKM]CPLWST = ""
+            Filter [F:MFO] Where MFGNUM = [F:MKM]MFGNUM & OPENUM = [F:MKM]OPENUM
+            Read [F:MFO]MFO0 First
+            If !fstat [F:MKM]CPLWST = [F:MFO]EXTWST : Endif
+            Filter [F:MFO]
+        Endif
+        [F:MKM]MFMITMREF = [F:MKM]ITMREF
+        If [F:MFM]MFGLIN <> 0
+            Read [F:MFI]MFI0 = [F:MFM]MFGNUM;[F:MFM]MFGLIN
+            If !fstat
+               [F:MKM]BOMNUM  = [F:MFI]ITMREF
+               [F:MKM]BOMALT  = [F:MFI]BOMALT
+               [F:MKM]PJT     = [F:MFI]PJT
+            Endif
+        Else
+            Filter [F:MFI] Where MFGNUM = [F:MFM]MFGNUM
+            Read [F:MFI]MFI0 First
+            If !fstat
+               [F:MKM]BOMNUM  = [F:MFI]ITMREF
+               [F:MKM]BOMALT  = [F:MFI]BOMALT
+               [F:MKM]PJT     = [F:MFI]PJT
+            Endif
+            Filter [F:MFI]
+        Endif
+       #Réintégration de composants sr 07.01
+        If [M:MTMK]TYPTRT = 14 : [F:MKM]MATTYP = 3 : Else : [F:MKM]MATTYP    = 1 : Endif
+        If find([M:MTMK]TYPTRT,1,2,3)
+            #Si mode de conso = immédiat on consomme tout ce qui reste. Idem si forfait
+            If [M:MTMK]CONSMAT= 1 | [F:MFM]LIKQTYCOD = 2
+               [F:MKM]USEQTY = [F:MFM]RETQTY - [F:MFM]USEQTY
+               If [F:MKM]USEQTY < 0 : [F:MKM]USEQTY = 0 : Endif
+            Else
+                If GCUMMAT = 2 & [F:MFG]ITMLINNBR > 1 & [F:MFM]MFGLIN=0
+                    # Issue 69266 - 2010-11-19 by CCC : Dans le cas d'un article utilisé pour plusieurs produits, le prorata avec la quantité totale de l'OF sera nécessaire
+                    [F:MKM]USEQTY    = [F:MFM]RETQTY * [M:MTMK]WCOEFF2
+                Else
+                    [F:MKM]USEQTY    = [F:MFM]RETQTY * [M:MTMK]WCOEFF
+                Endif
+
+                # Issue 72529 - 2011-03-21 by CCC : Arrondi en fonction de [F:MFM]QTYRND
+                [F:MKM]USEQTY = func ARRQTY([F:MKM]USEQTY,[F:MFM]QTYRND,[F:MFM]STU)
+
+               If [F:MFM]USEQTY + [F:MKM]USEQTY > [F:MFM]RETQTY & [M:MTMK]CONSMAT = 2
+                  [F:MKM]USEQTY = [F:MFM]RETQTY - [F:MFM]USEQTY
+               Endif
+               If [F:MKM]USEQTY < 0 : [F:MKM]USEQTY = 0 : Endif
+            Endif
+            Read [CAL] CAL0="MFM";0;[F:MFM]MFGNUM;[F:MFM]MFGLIN;[F:MFM]BOMSEQ;[F:MFM]ITMREF;1
+            If !fstat
+                For I=1 To max(GNBDIE,GOPTCANA)
+                    J=find([F:CAL]DIE(I-1),GDIE(1..GNBDIE))
+                    If J
+                      Assign "[M:MTMK]CCE"+num$(J) With [F:CAL]CCE(I-1)
+                    Endif
+                Next I
+            Endif
+
+            # 06.06 demande 35761
+            GPOINT = "BENMKMMOD" : Gosub ENTREE From EXEFNC
+        Else
+         [F:MKM]        = [M:MTMK]
+#        [F:MKM]USEQTY  = [M:MTMK]USEQTY
+        Endif
+        Call QTEARR([F:MKM]USEQTY,[F:MFM]STU) From TRTDIV
+        # Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle
+        # En suivi depuis le plan de conso ou la réintégration on peut avoir 0 en qté
+        # en automatique c'est interdit
+      # 02.07 Demande 39622
+        If !find([M:MTMK]TYPTRT,4,14) & [F:MKM]USEQTY = 0 & !WNO_CTLMKMNUL : [M:MTMK]MATTRKLIN -= 1 : End  : Endif
+        [F:MKM]MFMEXTQTY = [F:MFM]RETQTY
+        #---------------------------------------------#
+        # duplication texte si pas accès a ce dernier #
+        #---------------------------------------------#
+        #-- duplication du texte lie a la matière de l'OF
+        If [M:MTMK]MKMTEX <>""
+           [F:MKM]MKMTEX = [M:MTMK]MKMTEX
+           If left$([F:MKM]MKMTEX,3)="MKM"
+              Call CRE_CLOB([F:MKM]MKMTEX,GOK) From TRTX3TEX
+           Elsif left$([F:MKM]MKMTEX,3)="MFM"
+              Call DUP_CLOB("MKM",[F:MKM]MKMTEX,GOK) From TRTX3TEX
+           Endif
+        Endif
+
+      When 5,6,7,8,16 :
+            #Création enregistrement suivi mat
+            [F:MKM]          = [F:BOD]
+            [F:MKM]STU       = [F:ITM]STU
+            [F:MKM]BOMNUM    = LITM
+            [F:MKM]ITMREF    = [F:BOD]CPNITMREF
+            [F:MKM]MFGFCY    = [M:MTMK]MFGFCY
+            [F:MKM]MFMITMREF = [F:MKM]ITMREF
+            [F:MKM]STU       = [F:ITM]STU
+            [F:MKM]OPENUM    = [F:BOD]CPNOPE
+            [F:MKM]MATTYP    = 2
+            If [M:MTMK]TYPTRT = 8
+               [F:MKM]    = [M:MTMK]
+            Else
+                [F:MKM]CPLWST = [M:MTMK]CPLWST
+                [F:MKM]USEQTY = WLIEN
+            Endif
+            #Réintégration de composants sr 07.01
+            If [M:MTMK]TYPTRT = 16 : [F:MKM]MATTYP = 4 : Else : [F:MKM]MATTYP    = 2 : Endif
+
+            If [F:MKM]USEQTY < 0 : [F:MKM]USEQTY = 0 : Endif
+            Call QTEARR([F:MKM]USEQTY,[F:MKM]STU) From TRTDIV
+            # Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle
+            # 02.07 Demande 39622
+            If [M:MTMK]TYPTRT <> 16 & [F:MKM]USEQTY = 0 & !WNO_CTLMKMNUL : [M:MTMK]MATTRKLIN -= 1 : End  : Endif
+            #-- duplication du texte lie a la matière de l'OF
+            If [M:MTMK]MKMTEX <>""
+               [F:MKM]MKMTEX = [M:MTMK]MKMTEX
+               If left$([F:MKM]MKMTEX,3)="MKM"
+                  Call CRE_CLOB([F:MKM]MKMTEX,GOK) From TRTX3TEX
+               Endif
+            Endif
+
+        When 12,13,15,17 :
+            # CCC (20/09/07) Bug 42971 : Positionner systématiquement MFI pour les CCE
+            If [M:MTMK]MFGLIN <> 0
+                Read [F:MFI]MFI0 = [M:MTMK]MFGNUM;[M:MTMK]MFGLIN
+            Else
+                Filter [F:MFI] Where MFGNUM = [M:MTMK]MFGNUM
+                Read [F:MFI]MFI0 First
+                Filter [F:MFI]
+            Endif
+            [F:MKM]            = [M:MTMK]
+            [F:MKM]STU         = [F:ITM]STU
+            If [M:MTMK]TYPTRT  = 12
+                [F:MKM]MATTYP  = 1
+            Elsif [M:MTMK]TYPTRT = 13
+                [F:MKM]MATTYP  = 2
+            Elsif [M:MTMK]TYPTRT = 15
+                [F:MKM]MATTYP  = 3
+            Else
+                [F:MKM]MATTYP  = 4
+            Endif
+
+    Endcase
+    [F:MKM]WRH     = [M:MTMK]WRH
+    [F:MKM]LOCPREF = [M:MTMK]LOCPREF
+    [F:MKM]LOTPREF = [M:MTMK]LOTPREF
+    [F:MKM]STAPREF = [M:MTMK]STAPREF
+    If [F:MKM]LOCPREF = "" : [F:MKM]LOCPREF = "*" : Endif
+    If [F:MKM]LOTPREF = "" : [F:MKM]LOTPREF = "*" : Endif
+    #If [F:MKM]STAPREF = "" : [F:MKM]STAPREF = "A" : Endif
+    If [F:ITM]STOMGTCOD = 3 : [F:MKM]TYPQTY = 1 : Else [F:MKM]TYPQTY = 2 : Endif
+
+    # Issue 107513/US3 GA 05/2015 : ECC for [F:MKM] table MFGMATTRK
+    If dim([M:MTMK]ECCVALMAJ)>0 & dim([F:MKM]ECCVALMAJ)>0
+       If [M:MTMK]ECCVALMAJ<>""   [F:MKM]ECCVALMAJ=[M:MTMK]ECCVALMAJ
+       Else                       [F:MKM]ECCVALMAJ=[F:MFM]ECCVALMAJ       Endif
+    Endif
+
+    [F:MKM]CREDAT    = date$
+    [F:MKM]CREUSR    = GUSER
+    [F:MKM]EXPNUM    = [C]EXPORT
+    Raz [F:MKM]UPDUSR
+    Raz [F:MKM]UPDDAT
+    If find([M:MTMK]TYPTRT,1,2,3,4,14)
+            Readlock [F:MFM]MFM0 = [F:MKM]MFGNUM;[F:MKM]MFGLIN;[F:MKM]BOMSEQ;[F:MKM]ITMREF
+            If fstat=1  GOK=-1 : GLOCK="$MFGMAT"-[F:MKM]ITMREF : End
+            Elsif fstat GOK=0  : Call RSTA("MFM",[F:MKM]ITMREF) From GLOCK : End
+            Endif
+    Endif
+    WWQTY = [F:MKM]USEQTY
+    Call QTEARR([F:MKM]USEQTY,[F:MKM]STU) From TRTDIV
+
+    # Issue 75312 - 2011-07-25 by CCC : Déplacé pour se trouver avant l'écriture des STJ et MWI
+    #----- Ecriture des sections de la ligne matiere -----#
+    Gosub MAJMKM_CPTANALIN
+    If GOK<1 : End : Endif
+
+    If [M:MTMK]TYPTRT <> 4 | [F:MKM]USEQTY <> 0
+        #Maj Stock
+        # dissocier les suivis manuels (avec écran [MBM]) des suivis automatiques.
+        # en automatique, Dissocier les suivis sur OF alloués des suivis sur OF non alloués ou  sur nomenclature
+        # la centrale de pesée doit être vue comme un suivi manuel
+        # sr 03.06 On remplace ENRSTOALL par MAJALLORI seulement en direct en 140 et pour tous les suivis en 150
+        Case [M:MTMK]TYPTRT
+            When 4,8,12,13  :    If !GIMPORT
+                                            Gosub LOAD_STW
+                                            Gosub LOAD_ALP
+                                            Raz LQTA,LSHT,LNBR,LNBJ,LRET, WSTOSEQ
+                                            If GFONC1 <> "FUNSCA"
+                                               WSTOSEQ =  [M:MBM]WSTOSEQ(nolign-1)
+                                            Else
+                                               WSTOSEQ =  [F:MKM]MATTRKLIN
+                                            Endif
+                                            If [F:MFM]ALLSTA > 1
+                                                Call MAJALLORI(WSTOSEQ,LRET) From STKALL
+                                                If LRET : GOK = 0 : Endif
+                                                WWALLQTY = [M:ALP]DESQTY
+                                                WWSHTQTY = [M:ALP]DESQTYSHT
+                                            Endif
+                                            Call ALISTOWORK(3,WSTOSEQ,LQTA,LSHT,LNBR,LNBJ,LRET) From STKINT
+                                            If LRET : GOK = 0 : End : Endif
+                                 Else
+                                            If !find([F:MKM]MATTRKLIN,[M:SOW]WSTOSEQ)
+                                                Gosub LOAD_SOW_SORTIE
+                                            Endif
+                                            Gosub LOAD_STW
+                                            Gosub LOAD_ALP
+                                            Raz LQTA,LSHT,LNBR,LNBJ,LRET
+                                            If [M:MTMK]TYPTRT = 4 & [F:MFM]ALLSTA > 1  & [F:MFM]MFMTRKFLG < 5
+                                               Call MAJALLORI([F:MKM]MATTRKLIN,LRET) From STKALL
+                                               If LRET : GOK = 0 : Endif
+                                               WWALLQTY = [M:ALP]DESQTY
+                                               WWSHTQTY = [M:ALP]DESQTYSHT
+                                           Endif
+                                           Call ALISTOWORK(3,[F:MKM]MATTRKLIN,LQTA,LSHT,LNBR,LNBJ,LRET) From STKINT
+                                           If LRET : GOK = 0 : End : Endif
+                                            # si stock négatif interdit, on limite la quantité au minimum sortable
+                                            If [F:ITM]NEGSTO <> 2
+                                                If [F:MKM]USEQTY  > LQTA
+                                                    [F:MKM]USEQTY = LQTA
+                                                    WNO_REAJUST   = 1
+                                                Endif
+                                            Endif
+                                  Endif
+            When 1,2,3,5,6,7 :    Gosub LOAD_SOW_SORTIE
+# Issue 88037 - 2013-02-25 by CCC
+#                                  Gosub LOAD_STW
+#                                  Gosub LOAD_ALP
+                                  Raz LQTA,LSHT,LNBR,LNBJ,LRET
+                                  If find([M:MTMK]TYPTRT,1,2,3) & [F:MFM]ALLSTA > 1  & [F:MFM]MFMTRKFLG < 5
+                                         Gosub LOAD_ALP
+                                         Call MAJALLORI([F:MKM]MATTRKLIN,LRET) From STKALL
+                                         If LRET : GOK = 0 : Endif
+                                         WWALLQTY = [M:ALP]DESQTY
+                                         WWSHTQTY = [M:ALP]DESQTYSHT
+                                  Endif
+                                  Gosub LOAD_STW
+                                  Call ALISTOWORK(3,[F:MKM]MATTRKLIN,LQTA,LSHT,LNBR,LNBJ,LRET) From STKINT
+                                  If LRET : GOK = 0 : End : Endif
+# Ne doit pas arriver. La qté est bien calculée dans LOAD_SOW_SORTIE
+#                                # si stock négatif interdit, on limite la quantité au minimum sortable
+#                                  If [F:ITM]NEGSTO <> 2
+#                                     If [F:MKM]USEQTY  > LQTA
+#                                        [F:MKM]USEQTY = LQTA
+#                                        WNO_REAJUST   = 1
+#                                     Endif
+#                                  Endif
+            When 14,15,16,17   :  If [F:MKM]USEQTY <> 0
+                                     Gosub LOAD_STW
+                                     Call ALISTOWORK(2,[M:MTMK]WSTOSEQ,LQTA,LSHT,LNBR,LNBJ,LRET) From STKINT
+                                     If LRET : GOK = 0 : End : Endif
+                                  Endif
+        Endcase
+
+        # Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle ou stock insuffisant
+        # maj des stocks si quantité <> 0.
+        If [F:MKM]USEQTY <> 0 & LRET = 0 & !WNO_CTLMKMSTO
+            Call MAJ_STOCK() From STKMAJ
+            If GOK < 1 : End  : Endif
+        Else
+            Case [M:MTMK]TYPTRT
+                 When 1,2,3,4,12 :
+                    # FQ 43237 message d'erreur pour les imports
+                    WMSGSUI =  mess(202,190,1)-":"-[F:MFM]MFGNUM-num$([F:MFM]BOMOPE)-[F:MFM]ITMREF-mess(204,190,1)
+                    Gosub CRE_MKM_TRA
+                    # 100766 - 2014-11-13 by mm
+                    If ![F:MKM]USEQTY
+                      [M:MTMK]USEQTY = [F:MKM]USEQTY
+                    Endif
+                    # Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle
+                    If !WNO_CTLMKMNUL
+                      [M:MTMK]MATTRKLIN -= 1
+                      # Issue 81162 - 2012-06-18 by CCC : Supprimer les sections ana qui ne servent plus
+                      Gosub DELMKM_CPTANALIN
+                      End
+                    Endif
+                 When 5,6,7,8 :
+                    # FQ 43237 message d'erreur pour les imports
+                    WMSGSUI =  mess(123,190,1)-":"-[F:MKM]BOMNUM+"/"+num$([F:MKM]BOMALT)-num$([F:MKM]OPENUM)-[F:MKM]ITMREF-mess(204,190,1)
+                    Gosub CRE_MKM_TRA
+                    # Issue 94219 GA 11/2013  autoriser la génération de suivis avec qté nulle
+                    If !WNO_CTLMKMNUL
+                      [M:MTMK]MATTRKLIN -= 1
+                      # Issue 81162 - 2012-06-18 by CCC : Supprimer les sections ana qui ne servent plus
+                      Gosub DELMKM_CPTANALIN
+                      End
+                    Endif
+            Endcase
+        Endif
+    Endif
+    #point d'entrée  pour mise à jour de tables spécifiques liées à [MKM] sr 01.02 demande 12361
+    GPOINT = "BENMKMMAJ" : Gosub ENTREE From EXEFNC
+    #
+    Write [F:MKM]
+    If fstat
+       GOK = 0 : Call FSTA("MKM") From GLOCK : End
+    Endif
+    If [F:MKM]MATTYP = 1
+        #----- MISE à jour statistiques ligne suivi matière -----#
+        Call VALSTA("MKM",1) From SUBPS2
+        If GOK < 1 : End : Endif
+    Endif
+
+    # 55296 mm 05.09
+    #----recherche du stocou, avant toute suppression d'allocation-----#
+    If GFONC1 = "FUNSCA"
+        # en cas de redressement négatif : nouvelle quantité allouée après la pesée = qté allouée - qté pesée
+        # exprimé en US si article non titré, en UA si titré
+        [M:MTMK]ALLQTY -= [M:MTMK]USEQTY
+        # si aucune quantité allouée, pas d'enregistrement dans STOALL
+        If [M:MTMK]ALLQTY >0
+            Raz GSTOCOU,GSEQSTA
+            Raz WCRITERE
+            WCRITERE="STOFCY=GSCA1MFGFCY & VCRNUM=[M:MTMK]MFGNUM & ITMREF=[M:MTMK]ITMREF"
+            WCRITERE+=" & VCRTYP=10 & VCRSEQ=[M:MTMK]BOMSEQ & VCRLIN=[M:MTMK]MFGLIN"
+            # Si article titré
+            If [F:MFM]STOMGTCOD = 3
+                WCRITERE += " & QTYSTUACT=[M:MTMK]ALLQTY"
+            Else
+                WCRITERE += " & QTYSTU=[M:MTMK]ALLQTY"
+            Endif
+            Filter [STA] Where evalue(WCRITERE)
+                Read [F:STA]STA2 First
+                If !fstat
+                    GSTOCOU= [F:STA]STOCOU
+                    GSEQSTA= [F:STA]SEQ
+                Endif
+            Filter [STA]
+        Else
+            # en cas de redressement négatif : on a consommé toute la quantité allouée
+            # peut se produire en cas de redressement au lot, si on ne pèse pas en dernier un lot partiellement alloué.
+            Call RECH_STOCOU()
+        Endif
+    Endif
+
+    # Issue 75312 - 2011-07-25 by CCC : Déplacé pour se trouver avant l'écriture des STJ et MWI
+#    #----- Ecriture des sections de la ligne matiere -----#
+#    Gosub MAJMKM_CPTANALIN
+#    If GOK<1 : End : Endif
+
+Endif
+#
+#exclusion d'une matière à l'OF
+If [M:MTMK]TYPTRT = 4 & [M:MTMK]WEXCMAT = 2
+   # exclusion de la matière sur l'OF
+   Readlock [F:MFM]MFM0 = [M:MTMK]MFGNUM;[M:MTMK]MFGLIN;[M:MTMK]BOMSEQ;[M:MTMK]ITMREF
+   If fstat=1  GOK=-1 : GLOCK="$MFGMAT"-[F:MKM]ITMREF : End
+   Elsif fstat GOK=0  : Call RSTA("MFM",[F:MKM]ITMREF) From GLOCK : End
+   Endif
+   [F:MFM]MATSTA = 4
+   # normalement il n'y a pas d'allocation sur cette matière
+   Raz [F:MFM]ALLQTY,[F:MFM]SHTQTY
+   Update [F:MFG] Where MFGNUM = [F:MFM]MFGNUM With MATLINNBR -= 1
+   If fstat : GOK = 0 : End : Endif
+   If [F:MFM]MFGLIN <> 0
+       Read [F:MFI]MFI0 = [F:MFM]MFGNUM;[F:MFM]MFGLIN
+       If fstat : GOK=0: Call RSTA("MFI",num$([M:MTK3]MFGLIN(nolign-1))) From GLOCK : End : Endif  # llc 05.02 incohérence
+   Else
+       Filter [F:MFI] Where MFGNUM = [F:MFM]MFGNUM
+       Read [F:MFI]MFI0 First
+       Filter [F:MFI]
+       If fstat : GOK=0: Call RSTA("MFI",num$([M:MTK3]MFGLIN(nolign-1))) From GLOCK : End : Endif  # llc 05.02 incohérence
+   Endif
+   Call UPDATE_MFX("M", [F:MFI]PJT,[F:MFI]BOMALT, 0) From MFGLIBM
+   Rewrite [F:MFM]
+   If fstat
+      GOK = 0 : Call FSTA("MFM") From GLOCK : End
+   Endif
+
+   #----- MISE à jour statistiques ligne matière -----#
+   If [F:MKM]MATTYP = 1
+       Call VALSTA("MFM",1) From SUBPS2
+       If GOK < 1 : End : Endif
+   Endif
+Else
+    If find([M:MTMK]TYPTRT,1,2,3,4,14)
+        #si matière soldée on réinitialise à 0 les qtés allouées et en rupture
+        #On supprime toutes les allocs liées à cette matière(si il en reste)
+        #si matière non soldée , on réajuste les qtés allouées et en rupture
+        # mise à jour du flag solde selon différentes valeur de [M:MTMK]CLEFLG
+        #Si [M:MTMK]CLEFLG = 3 c'est que l'on suit les matières en automatique TYPTRT = 1 ou 2 ou 3
+        #la valeur de l'indicateur de solde doit être calculée
+        # si on est en réintégration et que USEQTY passe à 0, la matière reste quand même à "en cours" et la
+        # date de début de suivi n'est pas réinitialisée car une réintégration n'est pas une suppression de suivi.
+        If [M:MTMK]TYPTRT = 14 : [F:MFM]USEQTY -= [F:MKM]USEQTY
+        Else                   : [F:MFM]USEQTY += [F:MKM]USEQTY
+        Endif
+        If [F:MFM]USEQTY < 0 : [F:MFM]USEQTY = 0 : Endif
+        If     [M:MTMK]CLEFLG = 2 & [F:MFM]MFMTRKFLG < 5:#on solde une ligne
+               [F:MFM]MFMTRKFLG = 5
+               # CCC (10/01/08) DM 44021
+               #[F:MFM]TRKLAST = [F:MTK]MFGTRKDAT
+               If [F:MFM]ALLQTY <> 0 | [F:MFM]SHTQTY <> 0
+                   Gosub SUPALL_OF From SUBMTKC
+                   If GOK < 1 : End : Endif
+                   Raz [F:MFM]ALLQTY,[F:MFM]SHTQTY
+               Endif
+               [M:MTMK]WMATCLENBR += 1
+        Elsif  [M:MTMK]CLEFLG = 1 & [F:MFM]MFMTRKFLG = 5 :#on désolde une ligne
+               [F:MFM]MFMTRKFLG = 4
+               # CCC (10/01/08) DM 44021
+               #Raz [F:MFM]TRKLAST
+               # On réalloue si besoin
+               If [F:MFM]RETQTY > [F:MFM]USEQTY & [F:MFM]ALLSTA > 1
+                  If [M:MTMK]TYPTRT = 14 : WQTY = [F:MKM]USEQTY   : Endif
+                  Gosub CREALL_OF From SUBMTKC
+                  If GOK < 1 : End : Endif
+               Endif
+               # mise à jour des qtés allouée et en rupture
+               If [F:MFM]ALLSTA > 1
+                   [F:MFM]ALLQTY += WWALLQTY
+                   [F:MFM]SHTQTY += WWSHTQTY
+               Endif
+               [M:MTMK]WMATCLENBR -= 1
+        Elsif  [M:MTMK]CLEFLG = 1
+               If  [F:MFM]MFMTRKFLG < 4         :#une ligne passe à "encours"
+                   [F:MFM]MFMTRKFLG = 4
+               Endif
+               # si réintégration sur matière allouée, on alloue pour la qté réintégrée
+               If [M:MTMK]TYPTRT = 14  & [F:MFM]ALLSTA > 1
+                    WQTY = [F:MKM]USEQTY
+                    Gosub CREALL_OF From SUBMTKC
+                    If GOK < 1 : End : Endif
+               Endif
+               If [F:MFM]ALLSTA > 1
+                   If [M:MTMK]TYPTRT = 14
+                       [F:MFM]ALLQTY += WWALLQTY
+                       [F:MFM]SHTQTY += WWSHTQTY
+                   Else
+                       [F:MFM]ALLQTY -= WWALLQTY
+                       [F:MFM]SHTQTY -= WWSHTQTY
+                   Endif
+               Endif
+        Elsif  [M:MTMK]CLEFLG = 3
+               Raz WRET
+               Call CONT_SOLDE_MAT([F:MFM]MFGFCY, [F:MFM]ITMREF,[F:MFM]USEQTY, [F:MFM]RETQTY, WRET)
+&               From MFGLIBM
+                If  WRET = 1                    :# On solde une ligne
+                    [F:MFM]MFMTRKFLG = 5
+                    # 05.06
+                    If [F:MFM]ALLQTY <> 0 | [F:MFM]SHTQTY <> 0
+                        Gosub SUPALL_OF From SUBMTKC
+                        If GOK < 1 : End : Endif
+                        Raz [F:MFM]ALLQTY,[F:MFM]SHTQTY
+                    Endif
+                    [M:MTMK]WMATCLENBR+=1
+               Else [F:MFM]MFMTRKFLG = 4        :#une ligne passe à "encours"
+                    If [F:MFM]ALLSTA > 1
+                        [F:MFM]ALLQTY -= WWALLQTY
+                        [F:MFM]SHTQTY -= WWSHTQTY
+                    Endif
+               Endif
+        Endif
+        If    [F:MFM]MFMTRKFLG = 4 : [F:MFM]MATSTA = 2
+        Elsif [F:MFM]MFMTRKFLG = 5 : [F:MFM]MATSTA = 3
+        Endif
+        # CCC (10/01/08) DM 44021
+        #If [F:MFM]TRKFIRST = "00/00/00" : [F:MFM]TRKFIRST = [M:MTMK]IPTDAT : Endif
+        #If [F:MFM]MFMTRKFLG = 5 : [F:MFM]TRKLAST = [M:MTMK]IPTDAT : Endif
+        If [F:MFM]TRKLAST<[M:MTMK]IPTDAT
+           [F:MFM]TRKLAST   = [M:MTMK]IPTDAT
+        Endif
+        If [F:MFM]TRKLASTC<date$
+           [F:MFM]TRKLASTC  = date$
+        Endif
+        If [F:MFM]TRKFIRST>[M:MTMK]IPTDAT | [F:MFM]TRKFIRST = "00/00/00"
+            [F:MFM]TRKFIRST = [M:MTMK]IPTDAT
+        Endif
+        If [F:MFM]TRKFIRSTC>date$ | [F:MFM]TRKFIRSTC = "00/00/00"
+            [F:MFM]TRKFIRSTC = date$
+        Endif
+        If [F:MFM]MFGLIN <> 0
+           Read [F:MFI]MFI0 = [F:MFM]MFGNUM;[F:MFM]MFGLIN
+           If fstat : GOK=0: Call RSTA("MFI",num$([M:MTK3]MFGLIN(nolign-1))) From GLOCK : End : Endif  # llc 05.02 incohérence
+        Else
+           Filter [F:MFI] Where MFGNUM = [F:MFM]MFGNUM
+           Read [F:MFI]MFI0 First
+           Filter [F:MFI]
+           If fstat : GOK=0: Call RSTA("MFI",num$([M:MTK3]MFGLIN(nolign-1))) From GLOCK : End : Endif  # llc 05.02 incohérence
+        Endif
+        Call UPDATE_MFX("M", [F:MFI]PJT,[F:MFI]BOMALT, 0) From MFGLIBM
+        Rewrite [F:MFM]
+        If fstat
+           GOK = 0 : Call FSTA("MFM") From GLOCK : End
+        Endif
+
+        #----- MISE à jour statistiques ligne matière -----#
+        If [F:MKM]MATTYP = 1
+            Call VALSTA("MFM",1) From SUBPS2
+            If GOK < 1 : End : Endif
+        Endif
+    Endif
+Endif
+
+Raz WMSGSUI
+If [M:MTMK]TYPTRT = 4 & [M:MTMK]WEXCMAT = 2
+    WMSGSUI =  mess(212,190,1)+" : "+[F:MFM]MFGNUM - num$([F:MFM]BOMOPE) -[F:MFM]ITMREF
+Else
+    If find([M:MTMK]TYPTRT,4,14) & [M:MTMK]USEQTY = 0
+          WMSGSUI =  mess(213,190,1)+" : "+[F:MKM]MFGNUM - num$([F:MKM]OPENUM) -[F:MKM]ITMREF
+    Elsif find ([M:MTMK]TYPTRT,1,2,3,4,12)
+        WMSGSUI =  mess(113,190,1)+" : "+[F:MKM]MFGNUM - num$([F:MKM]OPENUM) -[F:MKM]ITMREF -
+&              mess(124,190,1) - num$([F:MKM]USEQTY) - [F:MKM]STU
+        If [M:MTMK]TYPTRT = 12 : WMSGSUI -= mess(126,190,1) : Endif
+        If WNO_REAJUST = 1  : WMSGSUI -= mess(186,190,1) : Endif
+    Elsif find([M:MTMK]TYPTRT,14,15)
+        WMSGSUI =  mess(145,190,1)+" : "+[F:MKM]MFGNUM - num$([F:MKM]OPENUM) -[F:MKM]ITMREF -
+&              mess(146,190,1) - num$([F:MKM]USEQTY) - [F:MKM]STU
+        If [M:MTMK]TYPTRT = 15 : WMSGSUI -= mess(126,190,1) : Endif
+    Elsif find([M:MTMK]TYPTRT,16,17)
+        WMSGSUI =  mess(198,190,1)+" : "+[F:MKM]BOMNUM+"/"+num$([F:MKM]BOMALT)-num$([F:MKM]OPENUM)-[F:MKM]ITMREF -
+&              mess(146,190,1) - num$([F:MKM]USEQTY) - [F:MKM]STU
+        If [M:MTMK]TYPTRT = 17 : WMSGSUI -= mess(126,190,1) : Endif
+
+    Else
+        WMSGSUI =  mess(123,190,1)+" : "+[F:MKM]BOMNUM+"/"+num$([F:MKM]BOMALT)-num$([F:MKM]OPENUM)-[F:MKM]ITMREF -
+&              mess(124,190,1) - num$([F:MKM]USEQTY) - [F:MKM]STU
+        If [M:MTMK]TYPTRT = 13 : WMSGSUI -= mess(126,190,1) : Endif
+        If WNO_REAJUST = 1  : WMSGSUI -= mess(186,190,1) : Endif
+    Endif
+    [M:MTMK]WNBMAT    += 1
+Endif
+TRA = 1
+If WNO_REAJUST = 1
+    Call ECR_TRACE(WMSGSUI,-1) From GESECRAN
+Else
+    Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+Endif
+End
+
+$CRE_MKM_TRA
+GPOINT="BENMKMTRA" : Gosub ENTREE From EXEFNC : ## GH 01/02/12 demande 79149
+If WMSGSUI="" : Return : Endif
+If !GIMPORT
+ Call ECR_TRACE(WMSGSUI,-1) From GESECRAN
+Else
+ Call ECR_TRACE(WMSGSUI,1) From GESECRAN
+Endif
+Return
+
+######################################################################
+$DELMKM_CPTANALIN
+If !clalev([F:CAL2]) : Local File CPTANALIN [CAL2] : Endif
+
+Delete [CAL2] Where [F:CAL2]ABRFIC="MKM"
+&                 & [F:CAL2]VCRNUM=[F:MKM]MFGTRKNUM
+&                 & [F:CAL2]VCRLIN=[F:MKM]MATTRKLIN
+&                 & [F:CAL2]ANALIG=1
+
+Return
+
+######################################################################
+$MAJMKM_CPTANALIN
+If dim(WI)<1  Local Integer WI : Endif
+
+# CCC (2009-09-10) Bug 57425 : INISEC peut casser la classe [F:CAL]
+If !clalev([F:CAL2]) : Local File CPTANALIN [CAL2] : Endif
+
+Raz [F:CAL2]
+[F:CAL2]ABRFIC="MKM"
+[F:CAL2]VCRNUM=[F:MKM]MFGTRKNUM
+[F:CAL2]VCRLIN=[F:MKM]MATTRKLIN
+[F:CAL2]ANALIG=1
+
+For WI=1 To max(GNBCOA,2)
+    [F:CAL2]LED(WI-1)=GLEDSOC(WI)
+    [F:CAL2]COA(WI-1)=GCOA(WI)
+Next WI
+#-----
+Case [M:MTMK]TYPTRT
+    When 1,2,3,4,14 :
+        # Issue 77417 - 2012-02-01 by CCC
+        #For WI=1 To max(GNBDIE,GOPTCANA)
+        For WI=1 To GNBDIE
+            [F:CAL2]DIE(WI-1)=GDIE(WI)
+            [F:CAL2]CCE(WI-1)=evalue("[M:MTMK]CCE"+num$(WI))
+            If [F:CAL2]CCE(WI-1)=""
+                Raz WCCE
+                Call INISEC(WCCE,"MKMAUT", WI) From TRTX3CPT
+               [F:CAL2]CCE(WI-1) = WCCE
+            Endif
+        Next WI
+    When 5,6,7,8,12,13,15,16,17 :
+        # Issue 77417 - 2012-02-01 by CCC
+        #For WI=1 To max(GNBDIE,GOPTCANA)
+        For WI=1 To GNBDIE
+            Raz WCCE
+            Call INISEC(WCCE,"MKMAUT", WI) From TRTX3CPT
+            [F:CAL2]CCE(WI-1) = WCCE
+            [F:CAL2]DIE(WI-1) = GDIE(WI)  # FQ 75957 GA 09/2011
+        Next WI
+#-----
+Endcase
+
+Write [CAL2]
+If fstat  GOK=0 : Call FSTA("CAL2") From GLOCK : Return : Endif
+
+Return
+
+######################################################################
+#Dans le cas d'une déclaration automatique de production (en suivi des temps)
+# sr 08.05 on ne vient plus là pour l'import
+$LOAD_ENTW
+Local Decimal WTOTQTY,WAAAQTY, WQQQQTY, WRRRQTY,WNOL, WOVF
+Local Integer J, WSLO_N, I, WRET
+Local Shortint WWRET
+Local Char    WCCE(GLONCCE), WLBEFMT(GLONARP)
+# 04.07 Demande 40809
+Local Char    WSTADEF(GLONSTA), WSTAA(GLONSTA), WSTAQ(GLONSTA), WSTAR(GLONSTA)
+[M:MTIK]QUAFLG = [F:ITF]QUAFLG
+Call STKFREQCQ("MTIK",[M:MTIK]MFGFCY,0,[M:MTIK]ITMREF,"","S",[M:MTIK]QUAFLG,[M:MTIK]QUAFRE) From STKACT
+Call STKINISTA(WSTADEF,"",[M:MTIK]QUAFLG) From STKACT              # hcb V6CQ
+Raz [M:ENTW]
+
+# calcul des quantités en A,Q,R
+If  find([M:MTIK]TYPTRT,1,3)
+    WTOTQTY = [F:MKI]CPLQTY
+    WRRRQTY = [F:MFI]EXTQTY * [M:MTIK]WCOEFF2
+    Call QTEARR(WRRRQTY,[F:MKI]STU) From TRTDIV
+# 04.07 Demande 40809
+#    If [F:ITM]QUAFLG > 1
+     If left$(WSTADEF,1) = "Q"
+        WQQQQTY = WTOTQTY - WRRRQTY
+        Call QTEARR(WQQQQTY,[F:MKI]STU) From TRTDIV
+    Endif
+    WAAAQTY = WTOTQTY - WQQQQTY - WRRRQTY
+Elsif [M:MTIK]TYPTRT = 5 | ([M:MTIK]TYPTRT = 7 & GIMPORT & [M:MTIK]ITMTYP = 2)
+    If [M:MTIK]ITMTYP <> 2
+        Call RECH_COEFF([M:MTIK]OPEUOM, [F:MKI]STU, WCOEFF) From MFGLIB
+        If WCOEFF = 0 : WCOEFF = 1 : Endif
+        WTOTQTY = [F:MKI]CPLQTY
+        Call QTEARR(WTOTQTY,[F:MKI]STU) From TRTDIV
+        WRRRQTY = [M:MTIK]REJCPLQTY * WCOEFF
+        Call QTEARR(WRRRQTY,[F:MKI]STU) From TRTDIV
+# 04.07 Demande 40809
+#       If [F:ITM]QUAFLG > 1
+        If left$(WSTADEF,1) = "Q"
+            WQQQQTY = WTOTQTY - WRRRQTY
+            Call QTEARR(WQQQQTY,[F:MKI]STU) From TRTDIV
+        Endif
+    Else
+
+        Local    Decimal WQTY, WDIS, WQTYN, WQTYNA, WQTYB, WQTYBA, WLIEN
+        Local    Decimal WBASQTY
+        Local    Integer WLIKQTYCOD
+        Local    Decimal WLIKQTY
+        Local    Integer WQTYRND
+        Local    Decimal WLSCA
+        Local    Char    WSTU(GLONUOM)
+
+        WTOTQTY      = [F:MKI]CPLQTY
+
+        WQTY         = [M:MTIK]REJCPLQTY
+        WSTU         = [F:ITM]STU
+        WBASQTY      = [F:BOH]BASQTY
+        WLIKQTYCOD   = [F:BOD]LIKQTYCOD
+        WLIKQTY      = [F:BOD]LIKQTY
+        WQTYRND      = [F:BOD]QTYRND
+        WSCA         = [F:BOD]SCA
+        If  WQTY  = 0
+            WLIEN = 0
+        Else
+            Call LIKQTY(WQTY,WSTU,WBASQTY,WLIKQTYCOD,WLIKQTY,WQTYRND,
+&                       WSCA,WQTYN,WQTYNA,WQTYB,WQTYBA) From MFGLIB
+            WLIEN = WQTYBA
+        Endif
+        WRRRQTY = WLIEN
+        Call QTEARR(WRRRQTY, [F:MKI]STU) From TRTDIV
+
+        WQTY         = [M:MTIK]WQUACPLQTY
+        WSTU         = [F:ITM]STU
+        WBASQTY      = [F:BOH]BASQTY
+        WLIKQTYCOD   = [F:BOD]LIKQTYCOD
+        WLIKQTY      = [F:BOD]LIKQTY
+        WQTYRND      = [F:BOD]QTYRND
+        WSCA         = [F:BOD]SCA
+        If  WQTY  = 0
+            WLIEN = 0
+        Else
+            Call LIKQTY(WQTY,WSTU,WBASQTY,WLIKQTYCOD,WLIKQTY,WQTYRND,
+&                       WSCA,WQTYN,WQTYNA,WQTYB,WQTYBA) From MFGLIB
+            WLIEN = WQTYBA
+        Endif
+        WQQQQTY  = WLIEN
+        Call QTEARR(WQQQQTY, [F:MKI]STU) From TRTDIV
+    Endif
+    WAAAQTY = WTOTQTY - WQQQQTY - WRRRQTY
+    [F:MKI]UOMSTUCOE = 1
+Endif
+If  [F:MKI]UOMSTUCOE = 0 : [F:MKI]UOMSTUCOE = 1 : Endif
+
+# Issue 68382 - 2010-10-19 by CCC : Vérifier que les statuts sont autorisés dans la règle de gestion
+WSTAA="A"
+WSTAQ="Q"
+WSTAR="R"
+# Si statut R interdit mais quantité rejetée>0
+If WRRRQTY>0 & [F:SRU]AUZSTA<4
+    GOK=0
+    Call ECR_TRACE([M:MTIK]MFGNUM-[M:MTIK]ITMREF-":"-mess(251,190,1),1) From GESECRAN
+    Return
+Endif
+# Si statut R obligatoire mais quantité rejetée=0
+If WRRRQTY=0 & [F:SRU]AUZSTA=4
+    GOK=0
+    Call ECR_TRACE([M:MTIK]MFGNUM-[M:MTIK]ITMREF-":"-mess(250,190,1),1) From GESECRAN
+    Return
+Endif
+Case left$(WSTADEF,1)
+    When "A" : WSTAA = WSTADEF
+    When "Q" : WSTAQ = WSTADEF
+    When "R" : WSTAR = WSTADEF
+Endcase
+Raz WWRET
+If WAAAQTY<>0 & WSTAA<>WSTADEF
+    Call STKCTRSTA(WSTAA, [F:SRU]AUZSST, [M:MTIK]QUAFLG, 1, [M:MTIK]QUAFRE, WWRET) From STKACT
+Endif
+If !WWRET & WQQQQTY<>0 & WSTAQ<>WSTADEF
+    Call STKCTRSTA(WSTAQ, [F:SRU]AUZSST, [M:MTIK]QUAFLG, 1, [M:MTIK]QUAFRE, WWRET) From STKACT
+Endif
+If !WWRET & WRRRQTY<>0 & WSTAR<>WSTADEF
+    Call STKCTRSTA(WSTAR, [F:SRU]AUZSST, [M:MTIK]QUAFLG, 1, [M:MTIK]QUAFRE, WWRET) From STKACT
+Endif
+If WWRET
+    GOK=0
+    Call ECR_TRACE([M:MTIK]MFGNUM-[M:MTIK]ITMREF-":"-mess(234,184,1)-mess(365,199,1),1) From GESECRAN
+    Return
+Endif
+# récupération du format d'étiquette
+If [F:MKI]UOM = [F:ITM]STU
+#   --------------------------------------------------------#
+#   L'unité est l'unité de stock                            #
+#   --------------------------------------------------------#
+    WLBEFMT = [F:ITM]STULBEFMT
+Else
+#   --------------------------------------------------------#
+#   L'unité est une unité de conditionnement                #
+#   --------------------------------------------------------#
+    For I=0 To dim([F:ITM]PCU)-1
+       If [F:MKI]UOM = [F:ITM]PCU(I)
+          WLBEFMT = [F:ITM]LBEFMT(I)
+          Break
+       Endif
+    Next I
+Endif
+
+#Remplissage de l'écran de travail stock
+nolign = 0
+If WAAAQTY <> 0
+    nolign += 1
+    [M:ENTW]ITMREF(nolign-1)       = [F:MKI]ITMREF
+
+  # Issue 92767 - 2018-07-02 by STLIG : Copy versions
+    If (find([M:MTIK]TYPTRT,1,3))
+      [M:ENTW]ECCVALMAJ(nolign-1) = [F:MFI]ECCVALMAJ
+      [M:ENTW]ECCVALMIN(nolign-1) = [F:MFI]ECCVALMIN
+    Endif
+
+    [M:ENTW]STA(nolign-1)          = WSTAA
+    [M:ENTW]QTYSTU(nolign-1)       = WAAAQTY
+    [M:ENTW]PCU(nolign-1)          = [F:MKI]UOM
+    [M:ENTW]QTYPCU(nolign-1)       = [M:ENTW]QTYSTU(nolign-1) / [F:MKI]UOMSTUCOE
+    Call QTEARR([M:ENTW]QTYPCU(nolign-1),[M:ENTW]PCU(nolign-1)) From TRTDIV
+    [M:ENTW]PCUSTUCOE(nolign-1)    = [F:MKI]UOMSTUCOE
+    [M:ENTW]WLOCSEQ(nolign-1) = 1
+    [M:ENTW]WRH(nolign-1)          = [F:MKI]WRH
+    Gosub STK_INILOC From STKLOC
+    If [F:ITF]LOCMGTCOD > 1
+    # Récupération type emplacement par défaut de l'art-site pour le type mouvement
+    # sr 10.05 demande 32411
+        WNOL = nolign
+       #--- Bug 72649 ajout paramètre emplacement
+       Call STKSUGTLO([M:ENTW]WLOCSEQ(nolign-1),5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&                     [M:ENTW]STA(nolign-1),[M:ENTW]LOCTYP(nolign-1),"","",[M:MTIK]WRH,[M:ENTW]LOC(nolign-1)) From STKLOC
+       If mkstat = 2 mkstat = 0 Endif
+    # Récupération de l'emplacement par défaut de l'art-site pour le type mouvement
+    # sr 10.05 demande 32411
+        WNOL = nolign
+       Call STKSUGEMP([M:ENTW]WLOCSEQ(nolign-1),5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&                     [M:ENTW]STA(nolign-1),[M:ENTW]LOCTYP(nolign-1),[M:ENTW]LOC(nolign-1),"","","",[M:MTIK]WRH) From STKLOC
+       If mkstat = 2 mkstat = 0 Endif
+       If [M:ENTW]LOC(nolign-1) = ""
+          GOK=0
+          Call ECR_TRACE([M:STW]VCRNUMORI-[M:ENTW]ITMREF(nolign-1)-":"-mess(17,196,1),1) From GESECRAN
+          Return
+       Endif
+    Endif
+    # sr 05.05
+    If [M:MTIK]LOC <> ""
+        Read [F:STC]STC0 = [F:MKI]MFGFCY;[M:MTIK]LOC
+        If fstat : Raz [F:STC] : Endif
+        WNOL = nolign
+        Call STKCTREMP(WNOL,5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&               [M:ENTW]STA(nolign-1),[F:STC]LOCTYP,[F:STC]LOC,"",0,WWRET,WOVF,"","",[F:STC]WRH) From STKLOC
+        If !mkstat
+           [M:ENTW]LOC(nolign-1) = [M:MTIK]LOC
+           [M:ENTW]LOCTYP(nolign-1) = [F:STC]LOCTYP
+           [M:ENTW]WRH(nolign-1) = [F:STC]WRH
+        Endif
+    Endif
+
+    If [M:MTIK]PRNCOD = 2 & WLBEFMT <> ""
+        [M:ENTW]LBEFMT(nolign-1) = WLBEFMT
+        If int([M:ENTW]QTYPCU(nolign-1))=[M:ENTW]QTYPCU(nolign-1)
+           [M:ENTW]LBENBR(nolign-1) = [M:ENTW]QTYPCU(nolign-1)
+        Else
+           [M:ENTW]LBENBR(nolign-1) = int([M:ENTW]QTYPCU(nolign-1))+1
+        Endif
+    Endif
+    If [F:ITM]LOTMGTCOD = 1
+        [M:ENTW]NUMLIGLOT(nolign-1) = -1
+    Else
+        [M:ENTW]NUMLIGLOT(nolign-1) = 0
+    Endif
+    If [M:MTIK]PALNUM <> "" : [M:ENTW]PALNUM(nolign-1) = [M:MTIK]PALNUM : Endif
+    If [M:MTIK]CTRNUM <> "" : [M:ENTW]CTRNUM(nolign-1) = [M:MTIK]CTRNUM : Endif
+Endif
+If WQQQQTY <> 0
+    nolign += 1
+    [M:ENTW]ITMREF(nolign-1)       = [F:MKI]ITMREF
+    # 04.07 Demande 40809
+    [M:ENTW]STA(nolign-1)          = WSTAQ
+    [M:ENTW]QLYCTLFLG              = [F:SRU]QLYCTLFLG
+    [M:ENTW]QTYSTU(nolign-1)       = WQQQQTY
+    [M:ENTW]PCU(nolign-1)          = [F:MKI]UOM
+    [M:ENTW]QTYPCU(nolign-1)       = [M:ENTW]QTYSTU(nolign-1) / [F:MKI]UOMSTUCOE
+    Call QTEARR([M:ENTW]QTYPCU(nolign-1),[M:ENTW]PCU(nolign-1)) From TRTDIV
+    [M:ENTW]PCUSTUCOE(nolign-1)    = [F:MKI]UOMSTUCOE
+    [M:ENTW]WLOCSEQ(nolign-1) = 2
+    [M:ENTW]WRH(nolign-1)          = [F:MKI]WRH
+    Gosub STK_INILOC From STKLOC
+    If [F:ITF]LOCMGTCOD > 1
+    # Récupération type emplacement par défaut de l'art-site pour le type mouvement
+    # sr 10.05 demande 32411
+        WNOL = nolign
+       #--- Bug 72649 ajout paramètre emplacement
+       Call STKSUGTLO([M:ENTW]WLOCSEQ(nolign-1),5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&                     [M:ENTW]STA(nolign-1),[M:ENTW]LOCTYP(nolign-1),"","",[M:MTIK]WRH,[M:ENTW]LOC(nolign-1)) From STKLOC
+       If mkstat = 2 mkstat = 0 Endif
+    # Récupération de l'emplacement par défaut de l'art-site pour le type mouvement
+    # sr 10.05 demande 32411
+        WNOL = nolign
+       Call STKSUGEMP([M:ENTW]WLOCSEQ(nolign-1),5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&                     [M:ENTW]STA(nolign-1),[M:ENTW]LOCTYP(nolign-1),[M:ENTW]LOC(nolign-1),"","","",[M:MTIK]WRH) From STKLOC
+       If mkstat = 2 mkstat = 0 Endif
+       If [M:ENTW]LOC(nolign-1) = ""
+          GOK=0
+          Call ECR_TRACE([M:STW]VCRNUMORI-[M:ENTW]ITMREF(nolign-1)-":"-mess(17,196,1),1) From GESECRAN
+          Return
+       Endif
+    Endif
+    # sr 05.05
+    If [M:MTIK]LOC <> "" & WAAAQTY = 0
+        Read [F:STC]STC0 = [F:MKI]MFGFCY;[M:MTIK]LOC
+        If fstat : Raz [F:STC] : Endif
+        WNOL = nolign
+        Call STKCTREMP(WNOL,5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&               [M:ENTW]STA(nolign-1),[F:STC]LOCTYP,[F:STC]LOC,"",0,WWRET,WOVF,"","",[F:STC]WRH) From STKLOC
+        If !mkstat
+           [M:ENTW]LOC(nolign-1) = [M:MTIK]LOC
+           [M:ENTW]LOCTYP(nolign-1) = [F:STC]LOCTYP
+           [M:ENTW]WRH(nolign-1) = [F:STC]WRH
+        Endif
+    Endif
+
+    If [M:MTIK]PRNCOD = 2 & WLBEFMT <> ""
+        [M:ENTW]LBEFMT(nolign-1) = WLBEFMT
+        If int([M:ENTW]QTYPCU(nolign-1))=[M:ENTW]QTYPCU(nolign-1)
+           [M:ENTW]LBENBR(nolign-1) = [M:ENTW]QTYPCU(nolign-1)
+        Else
+           [M:ENTW]LBENBR(nolign-1) = int([M:ENTW]QTYPCU(nolign-1))+1
+        Endif
+    Endif
+
+    If [F:ITM]LOTMGTCOD = 1
+        [M:ENTW]NUMLIGLOT(nolign-1) = -1
+    Else
+        [M:ENTW]NUMLIGLOT(nolign-1) = 0
+    Endif
+    If [M:MTIK]PALNUM <> "" : [M:ENTW]PALNUM(nolign-1) = [M:MTIK]PALNUM : Endif
+    If [M:MTIK]CTRNUM <> "" : [M:ENTW]CTRNUM(nolign-1) = [M:MTIK]CTRNUM : Endif
+Endif
+If WRRRQTY <> 0
+    nolign += 1
+    [M:ENTW]ITMREF(nolign-1)       = [F:MKI]ITMREF
+    [M:ENTW]STA(nolign-1)          = WSTAR
+    [M:ENTW]QTYSTU(nolign-1)       = WRRRQTY
+    [M:ENTW]PCU(nolign-1)          = [F:MKI]UOM
+    [M:ENTW]QTYPCU(nolign-1)       = [M:ENTW]QTYSTU(nolign-1) / [F:MKI]UOMSTUCOE
+    Call QTEARR([M:ENTW]QTYPCU(nolign-1),[M:ENTW]PCU(nolign-1)) From TRTDIV
+    [M:ENTW]PCUSTUCOE(nolign-1)    = [F:MKI]UOMSTUCOE
+    [M:ENTW]WLOCSEQ(nolign-1) = 3
+    [M:ENTW]WRH(nolign-1)          = [F:MKI]WRH
+    Gosub STK_INILOC From STKLOC
+    If [F:ITF]LOCMGTCOD > 1
+    # Récupération type emplacement par défaut de l'art-site pour le type mouvement
+    # sr 10.05 demande 32411
+        WNOL = nolign
+       #--- Bug 72649 ajout paramètre emplacement
+       Call STKSUGTLO([M:ENTW]WLOCSEQ(nolign-1),5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&                     [M:ENTW]STA(nolign-1),[M:ENTW]LOCTYP(nolign-1),"","",[M:MTIK]WRH,[M:ENTW]LOC(nolign-1)) From STKLOC
+       If mkstat = 2 mkstat = 0 Endif
+    # Récupération de l'emplacement par défaut de l'art-site pour le type mouvement
+    # sr 10.05 demande 32411
+        WNOL = nolign
+       Call STKSUGEMP([M:ENTW]WLOCSEQ(nolign-1),5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&                     [M:ENTW]STA(nolign-1),[M:ENTW]LOCTYP(nolign-1),[M:ENTW]LOC(nolign-1),"","","",[M:MTIK]WRH) From STKLOC
+       If mkstat = 2 mkstat = 0 Endif
+       If [M:ENTW]LOC(nolign-1) = ""
+          GOK=0
+          Call ECR_TRACE([M:STW]VCRNUMORI-[M:ENTW]ITMREF(nolign-1)-":"-mess(17,196,1),1) From GESECRAN
+          Return
+       Endif
+    Endif
+    # sr 05.05
+    If [M:MTIK]LOC <> "" & WQQQQTY = 0 & WAAAQTY = 0
+        Read [F:STC]STC0 = [F:MKI]MFGFCY;[M:MTIK]LOC
+        If fstat : Raz [F:STC] : Endif
+        WNOL = nolign
+        Call STKCTREMP(WNOL,5,[F:BTS]TRSCOD,[F:MKI]MFGFCY,[F:MKI]ITMREF,[F:MKI]UOM,[M:ENTW]QTYPCU(nolign-1),
+&               [M:ENTW]STA(nolign-1),[F:STC]LOCTYP,[F:STC]LOC,"",0,WWRET,WOVF,"","",[F:STC]WRH) From STKLOC
+        If !mkstat
+           [M:ENTW]LOC(nolign-1) = [M:MTIK]LOC
+           [M:ENTW]LOCTYP(nolign-1) = [F:STC]LOCTYP
+           [M:ENTW]WRH(nolign-1) = [F:STC]WRH
+        Endif
+    Endif
+    If [M:MTIK]PRNCOD = 2 & WLBEFMT <> ""
+        [M:ENTW]LBEFMT(nolign-1) = WLBEFMT
+        If int([M:ENTW]QTYPCU(nolign-1))=[M:ENTW]QTYPCU(nolign-1)
+           [M:ENTW]LBENBR(nolign-1) = [M:ENTW]QTYPCU(nolign-1)
+        Else
+           [M:ENTW]LBENBR(nolign-1) = int([M:ENTW]QTYPCU(nolign-1))+1
+        Endif
+    Endif
+
+    If [F:ITM]LOTMGTCOD = 1
+        [M:ENTW]NUMLIGLOT(nolign-1) = -1
+    Else
+        [M:ENTW]NUMLIGLOT(nolign-1) = 0
+    Endif
+    If [M:MTIK]PALNUM <> "" : [M:ENTW]PALNUM(nolign-1) = [M:MTIK]PALNUM : Endif
+    If [M:MTIK]CTRNUM <> "" : [M:ENTW]CTRNUM(nolign-1) = [M:MTIK]CTRNUM : Endif
+Endif
+[M:ENTW]NBLIG = nolign
+
+If [M:MTIK]QUAFRE<>0
+    Call STKFREQCQ("MTIK",[M:MTIK]MFGFCY,0,[M:MTIK]ITMREF,"","F",[M:MTIK]QUAFLG,[M:MTIK]QUAFRE) From STKACT
+Endif
+
+#infos lot
+nolign = 0
+If [M:ENTW]NBLIG <> 0 & [F:ITM]LOTMGTCOD <> 1
+   nolign += 1
+   [M:ENTW]LOT(nolign-1)          = [F:MKI]LOT
+   If [M:ENTW]LOT(nolign-1) <> ""
+        Filter [F:STL] Where ITMREF = [M:ENTW]ITMREF(nolign-1) & LOT = [M:ENTW]LOT(nolign-1)
+        Read [F:STL]STL0 Last
+        If !fstat
+            If [F:ITM]LOTMGTCOD = 4
+                  WSLO_N = val([F:STL]SLO)
+                  WSLO_N += 1
+                  [M:ENTW]SLO(nolign-1)     = format$("N0:5",WSLO_N)
+            Endif
+            [M:ENTW]POT(nolign-1)     = [F:STL]POT
+            [M:ENTW]ACT(nolign-1)     = [F:STL]ACT
+            [M:ENTW]REFPER(nolign-1)  = [F:STL]REFPER
+            [M:ENTW]SHL(nolign-1)     = [F:STL]SHL
+            [M:ENTW]SHLDAT(nolign-1)  = [F:STL]SHLDAT
+        Else
+            If [F:ITM]LOTMGTCOD = 4
+                  [M:ENTW]SLO(nolign-1) = format$("N0:"+num$(GLONSLO),1)     # hcb 50151
+#                 [M:ENTW]SLO(nolign-1) = "00001"                            # hcb 50151
+            Endif
+            [M:ENTW]POT(nolign-1) = [F:ITM]DEFPOT
+           # [M:ENTW]ACT(nolign-1) = [F:ITM]DEFACT # UI pas géré
+            If [F:ITM]EXYMGTCOD <> 1
+                 [M:ENTW]REFPER(nolign-1) = [F:MKI]IPTDAT
+                 [M:ENTW]SHL(nolign-1)    = [F:ITM]SHL
+                 Call CALPER([F:ITM]EXYMGTCOD,[F:MKI]IPTDAT,[F:ITM]SHL,[F:ITM]SHLUOM,"",[M:ENTW]SHLDAT(nolign-1)) From STKLIB
+            Endif
+        Endif
+        # sr 05.05
+        If [F:ITM]LOTMGTCOD = 4 & [M:MTIK]SLO <> "" : [M:ENTW]SLO(nolign-1) = [M:MTIK]SLO : Endif
+        Filter [F:STL]
+   Else
+        If [F:ITM]LOTMGTCOD = 4
+            [M:ENTW]SLO(nolign-1) = format$("N0:"+num$(GLONSLO),1)     # hcb 50151
+#           [M:ENTW]SLO(nolign-1) = "00001"                            # hcb 50151
+        Endif
+   Endif
+
+    # récupération numéro de pièce ou compteur
+    If [F:SRU]LOTSUPINH = 3
+       [M:ENTW]GESLOT(nolign-1)  = "V"
+    Else
+       [M:ENTW]GESLOT(nolign-1)  = "C"
+    Endif
+
+   [M:ENTW]NBLIGLOT = 1
+
+   #point d'entrée  demande 53457
+   GPOINT = "BENENTLOT"
+   Gosub ENTREE From EXEFNC
+Endif
+
+Return
+
+
+######################################################
+$LOAD_ALP
+Raz [M:ALP]ALLQTY,[M:ALP]ALLQTYSHT
+Raz [M:ALP]DESQTY,[M:ALP]DESQTYSHT
+Raz [M:ALP]ALLDAT
+
+[M:ALP]VCRTYP     = 12
+[M:ALP]VCRNUM     = [F:MKM]MFGTRKNUM
+[M:ALP]VCRLIN     = [F:MKM]MATTRKLIN
+[M:ALP]VCRSEQ     = [F:MKM]BOMSEQ
+[M:ALP]STOFCY     = [F:MKM]MFGFCY
+[M:ALP]ITMREF     = [F:MKM]ITMREF
+[M:ALP]QTY        = [F:MKM]USEQTY
+[M:ALP]TYPQTY     = 2
+[M:ALP]BESDAT     = [F:MKM]IPTDAT
+If [F:MKM]MATTYP = 1
+    [M:ALP]VCRTYPORI  = 10
+    [M:ALP]VCRNUMORI  = [F:MKM]MFGNUM
+# 02.07 39832
+    If dim([M:MTK3]CUMMATSUI) > 0 & [M:MTK3]CUMMATSUI(nolign-1) = 1
+       [M:ALP]VCRLINORI = [F:MFM]MFGLIN
+       [M:ALP]VCRSEQORI = [F:MFM]BOMSEQ
+    Else
+       [M:ALP]VCRLINORI = [F:MKM]MFGLIN
+       [M:ALP]VCRSEQORI = [F:MKM]BOMSEQ
+    Endif
+    Case [F:MFM]ALLSTA
+        When 1:      [M:ALP]ALLTYPORI = 0
+        When 2,3:    [M:ALP]ALLTYPORI = 1    # allocation globale
+        When 4,5:    [M:ALP]ALLTYPORI = 2    # allocation détaillée
+    Endcase
+Endif
+# FQ 54469 ajout Maj [M:ALP]MVTDES
+If dim([M:MTMK]MVTDES)>0 & [M:MTMK]MVTDES<>""
+   [M:ALP]MVTDES = [M:MTMK]MVTDES
+Elsif dim([M:MTK3]MVTDES(nolign-1))>0 & [M:MTK3]MVTDES(nolign-1)<>""
+   [M:ALP]MVTDES = [M:MTK3]MVTDES(nolign-1)
+Else
+  Raz [M:ALP]MVTDES
+Endif
+
+Return
+
+
+######################################################
+#-----------------------------------------------------------------------#
+# Chargement écran travail pour interface maj stock                     #
+#-----------------------------------------------------------------------#
+$LOAD_STW
+Local Char WBOMNUM(GLONVCR)
+
+Raz [M:STW]
+[M:STW]STOFCY    = [F:MKM]MFGFCY
+If WORI = "MTMK"
+    If find([M:MTMK]TYPTRT,14,15,16,17)
+        [M:STW]TRSTYP    = 19
+    Else
+        [M:STW]TRSTYP    = 6
+    Endif
+Else
+        [M:STW]TRSTYP    = 6
+Endif
+
+[M:STW]VCRTYP    = 12
+[M:STW]VCRNUM    = [F:MKM]MFGTRKNUM
+[M:STW]VCRLIN    = [F:MKM]MATTRKLIN
+[M:STW]ITMREF    = [F:MKM]ITMREF
+[M:STW]CCECOD    = "STKSOF"
+Case WORI
+    When "MTK3" :
+        [M:STW]TRSFAM    = [F:MTS]TRSFAMS
+        [M:STW]TRSCOD    = [F:MTS]TRSCODS
+        [M:STW]ENTCOD    = [F:MTS]ENTCODS
+        [M:STW]MVTDES    = [M:MTK3]MVTDES(nolign-1)
+        [M:STW]IPTDAT    = [F:MTK]MFGTRKDAT
+        [M:STW]VCRTYPORI = 10
+        [M:STW]VCRNUMORI = [F:MKM]MFGNUM
+# 02.07 39832
+        If [M:MTK3]CUMMATSUI(nolign-1) = 1
+           [M:STW]VCRLINORI = [F:MFM]MFGLIN
+           [M:STW]VCRSEQORI = [F:MFM]BOMSEQ
+        Else
+           [M:STW]VCRLINORI = [F:MKM]MFGLIN
+           [M:STW]VCRSEQORI = [F:MKM]BOMSEQ
+        Endif
+        [M:STW]PJT       = [F:MKM]PJT
+    When "MTMK" :
+        [M:STW]TRSFAM    = [M:MTMK]TRSFAM
+        [M:STW]TRSCOD    = [M:MTMK]TRSCODS
+        [M:STW]MVTDES    = [M:MTMK]MVTDES
+        [M:STW]ENTCOD    = [M:MTMK]ENTCOD
+        [M:STW]IPTDAT    = [M:MTMK]IPTDAT
+        [M:STW]VCRSEQORI = [F:MKM]BOMSEQ
+        If find([M:MTMK]TYPTRT,1,2,3,4,12,14,15)
+            [M:STW]VCRTYPORI = 10
+            [M:STW]VCRNUMORI = [F:MKM]MFGNUM
+            [M:STW]VCRLINORI = [F:MKM]MFGLIN
+            [M:STW]PJT       = [F:MKM]PJT
+        Else
+            Raz WBOMNUM
+            WBOMNUM          = [F:MKM]BOMNUM
+            [M:STW]VCRNUMORI = WBOMNUM
+            [M:STW]VCRLINORI = [F:MKM]BOMALT
+        Endif
+Endcase
+[M:STW]TRAFLG   = 2                        : # Trace normal
+[M:STW]CUR = GLOCALDEV
+[M:STW]BPRNUM = ""
+
+Return
+
+######################################################
+# on vient ici en solde/cloture et suivi de sous-traitance et suivi standard si cumul des matières au suivi
+# on remplit le buffer invisible [MTMK]
+$LOAD_MTMK
+[M:MTMK]TYPTRT  = 1
+[M:MTMK]TRSCODS = [F:MTS]TRSCODS
+[M:MTMK]TRSFAM  = [F:MTS]TRSFAMS
+[M:MTMK]ENTCOD  = [F:MTS]ENTCODS
+[M:MTMK]STAPREF = [F:MKM]STAPREF
+[M:MTMK]LOTPREF = [F:MKM]LOTPREF
+[M:MTMK]LOCPREF = [F:MKM]LOCPREF
+[M:MTMK]IPTDAT  = [F:MKM]IPTDAT
+# Issue 107513/US3 GA 05/2015 : ECC for [F:MKM] table MFGMATTRK
+If dim([M:MTMK]ECCVALMAJ)>0 & dim([F:MKM]ECCVALMAJ)>0
+   [M:MTMK]ECCVALMAJ=[F:MKM]ECCVALMAJ
+Endif
+If dim([M:MTMK]ECCVALMIN)>0 & dim([F:MKM]ECCVALMIN)>0
+   [M:MTMK]ECCVALMIN=[F:MKM]ECCVALMIN
+Endif
+Return
+
+#####################################################
+$LOAD_SOW_SORTIE
+#On vient ici en déstockage automatique derriere un plan opératoire ou de production ou en import
+#En 150 on ne passe plus par les allocs techniques
+Local Integer WRUP
+Local Decimal WDIMQTY
+Raz LQTA,LSHT,LNBR,LNBJ,LRET
+Raz [M:SOW]
+Raz [M:ALP]ALLQTY
+[M:ALP]TRSTYP     = 6
+[M:ALP]TRSCOD     = [M:MTMK]TRSCODS
+If find([M:MTMK]TYPTRT,1,2,3,4)
+    [M:ALP]VCRTYP     = 10
+    [M:ALP]VCRNUM     = [F:MKM]MFGNUM
+    [M:ALP]VCRLIN     = [F:MFM]MFGLIN    # 02.07 39832
+    [M:ALP]VCRSEQ     = [F:MFM]BOMSEQ    # 02.07 39832
+    [M:ALP]STOLOC     = [F:MFM]LOC
+Elsif find([M:MTMK]TYPTRT,5,6,7,8)       # Issue 95843 GA 01/2014 pour STKSOR
+    [M:ALP]VCRTYP     = 12               # pour charger [F:ITG]ALLRULMFG
+Endif
+[M:ALP]STOFCY     = [F:MKM]MFGFCY
+[M:ALP]ITMREF     = [F:MKM]ITMREF
+[M:ALP]QTY        = [F:MKM]USEQTY
+[M:ALP]TYPQTY     = 2
+[M:ALP]STA        = [M:MTMK]STAPREF
+[M:ALP]LOT        = [M:MTMK]LOTPREF
+[M:ALP]WRH        = [M:MTMK]WRH
+[M:ALP]LOC        = [M:MTMK]LOCPREF
+[M:ALP]PCU        = [F:ITM]STU
+[M:ALP]PCUSTUCOE  = 1
+[M:ALP]TYPQTY     = 2
+[M:ALP]BESDAT     = [M:MTMK]IPTDAT
+# sr 08.05 demande 29188
+[M:ALP]PECSCOLOC  = 1
+If [F:MKM]CPLWST <> ""
+   If [F:MWS]WST <> [F:MKM]CPLWST | [F:MWS]WCRFCY <> [F:MKM]MFGFCY
+       Read [F:MWS]WST0 = [F:MKM]CPLWST;[F:MKM]MFGFCY
+       If fstat : Raz [F:MWS] : Endif
+   Endif
+    If [F:MWS]WSTTYP = 3
+        [M:ALP]PECSCOLOC  = 2
+    Endif
+Endif
+[M:ALP]PECPLFLOC  = 2
+If dim([M:MTMK]WRH)>0 [M:ALP]WRH=[M:MTMK]WRH Endif
+# Issue 107513/US3 GA 05/2015 : ECC for [M:MTMK] table MFGMATTRK
+If dim([M:MTMK]ECCVALMAJ)>0 & dim([M:ALP]ECCVALMAJ)>0
+   [M:ALP]ECCVALMAJ=[M:MTMK]ECCVALMAJ
+Endif
+#
+Raz LRET
+WRUP = [F:ITM]NEGSTO - 1
+# En auto on passe toujours 0 à LRUP car on ne veut pas les ruptures
+# On récupère d'abord les allocs détail de la ligne matière d'OF
+If find([M:MTMK]TYPTRT,1,2,3,4) & find([F:MFM]ALLSTA,4,5)   & [F:MFM]MFMTRKFLG < 5
+    Call ALLSTOSORW("",[F:MKM]MATTRKLIN,0,0,1,0,LRET) From STKSOR
+Endif
+# si la quantité issue des allocs OF est insuffisante ou pas d'alloc
+If  [M:ALP]ALLQTY < [F:MKM]USEQTY
+    # Issue 77719 - 2011-11-10 by CCC
+    If find([M:MTMK]TYPTRT,1,2,3,4)
+        [M:ALP]VCRTYP     = 12
+        Raz [M:ALP]VCRNUM
+        Raz [M:ALP]VCRLIN
+        Raz [M:ALP]VCRSEQ
+    Endif
+    [M:ALP]QTY = [F:MKM]USEQTY - [M:ALP]ALLQTY
+    Raz [M:ALP]ALLQTY, [M:ALP]ALLQTYSHT
+    # Issue 75324 - 2011-10-12 by CCC : indiquer la quantité allouée en global pour la détermination auto
+    If find([M:MTMK]TYPTRT,1,2,3,4) & find([F:MFM]ALLSTA,2,3)   & [F:MFM]MFMTRKFLG < 5
+        [M:ALP]ALLQTY = [F:MFM]ALLQTY
+    Endif
+    Call GENSTOSORW("",[F:MKM]MATTRKLIN,0,WRUP,"C",LRET) From STKSOR
+    # Issue 88037 - 2013-02-25 by CCC
+    [M:ALP]QTY-=[M:ALP]ALLQTY+[M:ALP]ALLQTYSHT
+    If [M:ALP]QTY<>0
+        WNO_REAJUST   = 1
+        [F:MKM]USEQTY=[F:MKM]USEQTY - [M:ALP]QTY
+    Endif
+Endif
+Return
+
+######################################################################
+# 55296 mm 05.09
+# Recherche de la ligne stock correspondantes aux
+# caractéristiques du mouvement de stock
+Subprog RECH_STOCOU
+Local Integer  J
+Local Integer  WPCURUL
+Local Decimal  WPCUSTUCOE
+Local Char     WPCU(GLONUOM)
+
+If [F:ITM]ITMREF <> [M:MTMK]ITMREF
+    Read [F:ITM]ITM0 = [M:MTMK]ITMREF
+    If fstat : End : Endif
+Endif
+If [F:ITM]STU = [M:MTMK]PCU : End : Endif    # lot en US, on conserve la valeur du chrono de stock de la ligne de stock
+
+# quel est le type de mode de déstockage de l'UC ?
+For J=0 To dim([F:ITM]PCU)-1
+    If [F:ITM]PCU(J) = [M:MTMK]PCU
+        WPCURUL = [F:ITM]PCURUL(J)
+        Break
+    Endif
+Next
+
+Case  WPCURUL
+    When 1:  # déconditionnement
+            WPCU = [F:ITM]STU
+            WPCUSTUCOE =1
+    When 2:  # rompu
+            WPCU = [F:ITM]PCU(J)
+            # composant non titré : coef = qté totale - qté consommée
+            # Si article titré
+            If [F:MFM]STOMGTCOD = 3
+                WPCUSTUCOE =[M:MTMK]QTYSTUACT - [M:MTMK]USEQTY
+            Else
+                WPCUSTUCOE =[M:MTMK]QTYSTU - [M:MTMK]USEQTY
+            Endif
+    When 3: # fractionnement : STOCOU inchangé
+            End
+Endcase
+
+
+
+Raz GSTOCOU
+# recherche des caractéristiques de la ligne de stock dans STOJOU
+Filter [STJ] Where VCRNUM=[M:MTMK]MFGTRKNUM & VCRNUMORI=[M:MTMK]MFGNUM & ITMREF=[M:MTMK]ITMREF & QTYSTU=-[M:MTMK]USEQTY & REGFLG=1
+    Read [F:STJ]STJ0 First
+    Columns [STO] (STOCOU)
+    Filter [STO] Where ITMREF    = [M:MTMK]ITMREF
+&                & STOFCY    = GSCA1MFGFCY
+&                & LOT       = [F:STJ]LOT
+&                & SLO       = [F:STJ]SLO
+&                & LOC       = [F:STJ]LOC
+&                & BPSLOT    = [F:STJ]BPSLOT
+&                & PALNUM    = [F:STJ]PALNUM
+&                & CTRNUM    = [F:STJ]CTRNUM
+&                & STA       = [F:STJ]STA
+&                & PCU       = WPCU
+&                & PCUSTUCOE = WPCUSTUCOE
+&                & SERNUM    = [F:STJ]SERNUM
+    If [F:STJ]SERNUM<>""
+        Read [STO] STO5 First
+    Elsif [F:STJ]LOT="" & [F:STJ]PALNUM <>""
+        Read [STO] STO1 First
+    Else
+        Read [STO] STO3 First
+    Endif
+    If !fstat
+        GSTOCOU = [F:STO]STOCOU
+    Endif
+    Filter [STO]
+    Columns [STO]
+Filter [STJ]
+
+End
+
+######################################################################
+$OPEN_FILE
+If clalev([M:OPSK])=0 : Local Mask OPSK      [OPSK] : Endif  # masque encours charge
+If clalev([M:ORDK])=0 : Local Mask ORDK      [ORDK] : Endif  # pour générer encours
+If clalev([M:STW])=0  : Local Mask STOWORK   [STW]  : Endif  # masque STOCK
+If clalev([M:SVW])=0  : Local Mask STOVALWORK [SVW] : Endif
+If clalev([M:VALW])=0 : Local Mask STOVALW    [VALW] : Endif
+If clalev([M:ENTW])=0 : Local Mask STOENTW   [ENTW] : Endif  # masque de travail entrée
+If clalev([M:SOW])=0  : Local Mask STOSORW   [SOW]  : Endif  # masque de travail sorties
+If clalev([M:ALP])=0  : Local Mask ALLPAR    [ALP]  : Endif  # masque de travail sorties
+If clalev([F:ITM])<=0 : Local File ITMMASTER  [ITM] : Endif
+If clalev([F:ITF])<=0 : Local File ITMFACILIT [ITF] : Endif
+If clalev([F:ITV])<=0 : Local File ITMMVT     [ITV] : Endif
+If clalev([F:ITG])<=0 : Local File ITMCATEG   [ITG] : Endif
+If clalev([F:MFG])<=0 : Local File MFGHEAD    [MFG] : Endif
+If clalev([F:MFI])<=0 : Local File MFGITM     [MFI] : Endif
+If clalev([F:MFM])<=0 : Local File MFGMAT     [MFM] : Endif
+If clalev([F:MFO])<=0 : Local File MFGOPE     [MFO] : Endif
+If clalev([F:MTK])<=0 : Local File MFGHEADTRK [MTK] : Endif
+If clalev([F:MKI])<=0 : Local File MFGITMTRK  [MKI] : Endif
+If clalev([F:MKO])<=0 : Local File MFGOPETRK  [MKO] : Endif
+If clalev([F:MKM])<=0 : Local File MFGMATTRK  [MKM] : Endif
+If clalev([F:STA])<=0 : Local File STOALL     [STA] : Endif  # allocations
+If clalev([F:STO])<=0 : Local File STOCK      [STO] : Endif  # Fichier stock
+If clalev([F:STL])<=0 : Local File STOLOT     [STL] : Endif
+If clalev([F:STS])<=0 : Local File STOSER     [STS] : Endif  # Fichier n° de série
+If clalev([F:ORD])<=0 : Local File ORDERS     [ORD] : Endif
+If clalev([F:TMA])<=0 : Local File TABMAT     [TMA] : Endif
+If clalev([F:STC])<=0 : Local File STOLOC     [STC] : Endif
+If clalev([F:TCU])<=0 : Local File TABCUR     [TCU] : Endif
+If clalev([F:ROH])<=0 : Local File ROUTING    [ROH] : Endif
+If clalev([F:ROS])<=0 : Local File ROUSCD     [ROS] : Endif
+If clalev([F:ROO])<=0 : Local File ROUOPE     [ROO] : Endif
+If clalev([F:TRO])<=0 : Local File TABROUALT  [TRO] : Endif
+If clalev([F:SCH])<=0 : Local File SCHEDULING [SCH] : Endif
+If clalev([F:MWS])<=0 : Local File WORKSTATIO [MWS] : Endif
+If clalev([F:MTA])<=0 : Local File MTKCRDASW  [MTA] : Endif
+If clalev([F:QLW])<=0 : Local File QLYWRK     [QLW] : Endif
+If clalev([F:BOH])<=0 : Local File BOM        [BOH] : Endif
+If clalev([F:BOD])<=0 : Local File BOMD       [BOD] : Endif
+If clalev([F:TFO])<=0 : Local File TABFOR     [TFO] : Endif
+If clalev([F:SRU])<=0 : Local File TABSTORUL  [SRU] : Endif
+If clalev([F:OPS])<=0 : Local File OPERATIONS [OPS] : Endif
+If clalev([F:CAL])<=0 : Local File CPTANALIN  [CAL] : Endif
+If clalev([F:MTS])<=0 : Local File MFGTRS     [MTS] : Endif   # FQ 65989 GA 07/2010 pb en export dans SUBMTKA
+If GWRHACT=2
+   If !clalev([F:WRH])  Local File WAREHOUSE  [WRH] : Endif
+   If !clalev([F:ITW])  Local File ITMWRH     [ITW] : Endif
+Endif
+
+Gosub OPEN_MTO       From MTOLINKLIB # V6 affectations
+Return
+
+#**
+#* ARRQTY : Arrondi une quantité selon le paramètre PQTYRND (au plus proche, supérieure, inférieure)
+#*
+#* @param PQTY    = Quantité à arrondir
+#* @param PQTYRND = 1: Au plus proche; 2-Supérieure; 3-Inférieure (voir menu local 293)
+#* @param PUOM    = Unité donnant le nombre de décimales
+#*!
+Funprog ARRQTY(PQTY,PQTYRND,PUOM)
+Value Decimal PQTY
+Value Integer PQTYRND
+Value Char    PUOM
+
+Local    Decimal WQTY, WRKN0, WRKN1
+
+If clalev([F:TUN]) = 0 : Local File TABUNIT [TUN] : Endif
+If PUOM <> "" & PUOM<>[F:TUN]UOM
+    Read [TUN]TUN0 = PUOM : If fstat Raz [F:TUN] Endif
+Endif
+
+WRKN0 =  PQTY*10^[F:TUN]UOMDEC
+WRKN1 = (PQTY*10^[F:TUN]UOMDEC - int(WRKN0))
+Case PQTYRND
+  When 2 :  # Arrondi supérieur
+    If WRKN1 <> 0
+        WQTY = (WRKN0 - WRKN1 + 1)*10^-[F:TUN]UOMDEC
+    Else
+        WQTY = (WRKN0 - WRKN1)*10^-[F:TUN]UOMDEC
+    Endif
+
+  When 3 : # arrondi inférieur
+    WQTY = (WRKN0 - WRKN1)*10^-[F:TUN]UOMDEC
+
+  When Default :
+    WQTY = arr(PQTY,10^-[F:TUN]UOMDEC)
+Endcase
+
+End WQTY
+

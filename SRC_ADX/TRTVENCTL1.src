@@ -1,0 +1,1929 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+###################################################################################
+#      TRAITEMENTS de CONTROLE dans les VENTES                                    #
+###################################################################################
+
+
+# 101874 : V9 : Taxe code control
+# -------------------------------------------------------------------------------------------#
+# Fonction de contrôle des taxes pour les documents ventes effectuant une valorisation       #
+# -------------------------------------------------------------------------------------------#
+# Cette fonction utilise les masques SIH pour charger la classe CTLVAT de contrôle des taxes
+# Chargement de la classe CTLVAT à partir des masques [M:SIHx]
+# Appel de la methode de contrôle attachée à la classe CTLVAT
+# Exploitation des paramètres de sorties de la classe CTLVAT avec ecriture d'une trace
+# -------------------------------------------------------------------------------------------#
+Funprog CTLVAT(WNOMTRACE,WOUVTRACE)
+Variable Char    WNOMTRACE
+Variable Integer WOUVTRACE
+
+WOUVTRACE = 0
+
+Local Integer WRET : WRET=0
+Local Integer WRETCTLVAT : WRETCLTVAT=0 : # Variable erreur ctrl de taxe
+
+# Si pas de contrôle selon paramètre on sort de la fonction
+If GCTLTAX<=1 End WRET Endif
+
+Local Instance CTLVAT   Using C_CTLVAT
+
+# --- l’espace disponible avant NewInstance
+H1 = freeheap/1024
+
+CTLVAT = NewInstance C_CTLVAT
+
+Local Integer WERRITM : # Flag permettant de savoir si on détecte des erreurs sur les lignes
+Local Integer WERRSFI : # Flag permettant de savoir si on détecte des erreurs sur les éléments
+Local Char    WMESSA(250)
+
+#Dbgaff
+# --- Chargement des paramètres dans la classe CTLVAT
+Gosub LOADPARAM_CTLVAT
+If WRET>=[V]CST_AERROR
+  FreeGroup CTLVAT
+  End WRET
+Endif
+
+# --- Appel de la méthode de contrôle de taxe
+Raz WMESSA
+WRET = fmet CTLVAT.CTLVAT
+If WRET >= [V]CST_AERROR
+  Call LOG_ERROR(CTLVAT, WNOMTRACE, WOUVTRACE)
+  FreeGroup CTLVAT
+  End WRET
+Endif
+
+# --- Aucune erreur
+If sum(WERRITM, WERRSFI, CTLVAT.VACBPRFLG, CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITMFLG, CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VATFLG)=0
+#Infbox "Aucune erreur"
+  WRET=0
+  FreeGroup CTLVAT
+  End WRET
+Endif
+
+# --- Au moins une erreur
+# --- Il y a une trace d'erreur
+# --- Exploitation des paramètres de sortie de la classe CTLVAT pour écrire la trace
+#Infbox "Au moins une erreur"
+
+# WERRITM<>0          : Erreur non détectable par le controle de la classe CTLVAT
+#   Niveau de taxe 1 à vide ou code taxe 1 à vide
+#   Niveau de taxe 2 ou 3 renseigné mais code taxe 2 ou 3 à vide
+# WERRSFI<>0          : Erreur non détectable par le controle de la classe CTLVAT
+#   Niveau de taxe 1 à vide
+# CTLVAT.VACBPRFLG<>0 : Erreur ramenée par le controle de la classe CTLVAT
+# --> Pour ces 3 cas, il y a au moins une erreur bloquante (si paramètre positionné)
+If sum(WERRITM, WERRSFI, CTLVAT.VACBPRFLG)<>0
+  WRETCTLVAT=[V]CST_AERROR
+Endif
+# CTLVAT.VACITMFLG<>0 : Erreur ramenée par le controle de la classe CTLVAT
+# CTLVAT.VATFLG<>0    : Erreur ramenée par le controle de la classe CTLVAT
+# --> Pour les 2 cas restant, ce n'est pas forcément une erreur bloquante (si paramètre positionné)
+#     dans le cas où cela concerne uniquement un élt de facturation et que l'on utilise EXETAX, on ne doit pas bloquer
+#     on positionne WRETCTLVAT dans la boucle de trt des articles et des elts
+
+Gosub TRTERR_CTLVAT
+WRET=WRETCTLVAT
+If WRET>=[V]CST_AERROR
+  FreeGroup CTLVAT
+  End WRET
+Endif
+
+FreeGroup CTLVAT
+
+H2 = freeheap/1024
+
+End WRET
+
+# ----------------------------------------------- #
+# Chargement des paramètres dans la classe CTLVAT #
+# ----------------------------------------------- #
+$LOADPARAM_CTLVAT
+
+Local Integer WI, WJ
+Local Integer WIND_VACITM, WIND_VAT
+
+Local Integer WLINE
+
+CTLVAT.VCRNUM=[M:SIH0]NUM
+
+# A voir le default ...
+Case [M:SIH0]ORICLC
+  When "GESSQH"
+    CTLVAT.VCRTYP=1
+  When "GESSOH"
+    CTLVAT.VCRTYP=20
+  When "GESSDH", "GESSDHF"
+    CTLVAT.VCRTYP=2
+  When ""
+    CTLVAT.VCRTYP=4
+Endcase
+
+CTLVAT.LEG=GCURLEG
+CTLVAT.CPY=GSOCIETE
+CTLVAT.FCY=[M:SIH0]SALFCY
+CTLVAT.DAT=[M:SIH0]INVDAT
+
+CTLVAT.VACBPR=[M:SIH1]VACBPR
+CTLVAT.VACBPRFLG=0              : # Faire mieux
+If CTLVAT.VACBPR="" CTLVAT.VACBPRFLG=1 Endif
+
+WIND_VACITM=1
+WIND_VAT=1
+
+# ------------------------------------------ #
+# Boucle sur les lignes                      #
+# ------------------------------------------ #
+# - Pour alimenter le tableau des niveaux à contrôler
+# - Pour alimenter le tableau des taxes à contrôler
+Gosub LOADPARAM_CTLVAT_ITM
+If WRET>=[V]CST_AERROR
+  Return
+Endif
+
+# ------------------------------------------ #
+# Boucle sur les éléments                    #
+# ------------------------------------------ #
+# - Pour alimenter le tableau des niveaux à contrôler
+# - Pour alimenter le tableau des taxes à contrôler
+Gosub LOADPARAM_CTLVAT_SFI
+If WRET>=[V]CST_AERROR
+  Return
+Endif
+#Dbgaff
+# Faire mieux
+For WI = 1 To maxtab(CTLVAT.C_VACITM)
+  If CTLVAT.C_VACITM(WI) <> null Then
+    CTLVAT.C_VACITM(WI).VACITMFLG = 0
+    #Call ECR_TRACE("CTLVAT niveau de taxe="-CTLVAT.C_VACITM(WI).VACITM,0) From GESECRAN
+  Endif
+Next I
+
+# Faire mieux
+For WI = 1 To maxtab(CTLVAT.C_VAT)
+  If CTLVAT.C_VAT(WI) <> null Then
+    CTLVAT.C_VAT(WI).VATFLG = 0
+    #Call ECR_TRACE("CTLVAT Code de taxe="-CTLVAT.C_VAT(WI).VAT,0) From GESECRAN
+  Endif
+Next I
+
+WRET=0
+
+#Call FERME_TRACE From LECFIC
+#Call LEC_TRACE From LECFIC
+
+Return
+
+
+# --------------------------------------------------------------- #
+# Chargement des paramètres dans la classe CTLVAT pour les lignes #
+# --------------------------------------------------------------- #
+# --------------------------------------------------------------- #
+# Boucle sur les lignes                                           #
+# --------------------------------------------------------------- #
+# - Pour alimenter le tableau des niveaux à contrôler             #
+# - Pour alimenter le tableau des taxes à contrôler               #
+# --------------------------------------------------------------- #
+$LOADPARAM_CTLVAT_ITM
+
+For WI=0 To dim([M:SIH4]ITMREF)-1
+    If [M:SIH4]ITMREF(WI)="" & WI=dim([M:SIH4]ITMREF)-1 Break Endif
+    If [M:SIH4]ITMREF(WI)="" & sigma(WI+1, dim([M:SIH4]ITMREF)-1,[M:SIH4]ITMREF(indcum)) = "" Break Endif
+
+#If WI=3 [M:SIH4]VAT1(WI)="TP3" : Endif
+
+    # --- Chargement des niveaux de taxe dans la classe CTLVAT
+    # Niveau 1
+    If [M:SIH4]VACITM1(WI)<>""
+        WJ=find([M:SIH4]VACITM1(WI),CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If !WJ
+            If CTLVAT.C_VACITM(WIND_VACITM) = null
+              WRET = fmet CTLVAT.ADDLINE("C_VACITM",WIND_VACITM)
+              If WRET = [V]CST_ANOTDEFINED
+                #--The insertion was not possible
+                WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VACITM","CTLVAT"), [V]CST_AERROR)
+                Return
+              Endif
+              WIND_VACITM=WRET
+            Endif
+            CTLVAT.C_VACITM(WIND_VACITM).VACITM=[M:SIH4]VACITM1(WI)
+            WIND_VACITM += 1
+        Endif
+    Else
+        WERRITM=1
+    Endif
+
+    # Niveau 2
+    If [M:SIH4]VACITM2(WI)<>""
+        WJ=find([M:SIH4]VACITM2(WI),CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If !WJ
+            If CTLVAT.C_VACITM(WIND_VACITM) = null
+              WRET = fmet CTLVAT.ADDLINE("C_VACITM",WIND_VACITM)
+              If WRET = [V]CST_ANOTDEFINED
+                #--The insertion was not possible
+                WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VACITM","CTLVAT"), [V]CST_AERROR)
+                Return
+              Endif
+              WIND_VACITM=WRET
+            Endif
+            CTLVAT.C_VACITM(WIND_VACITM).VACITM=[M:SIH4]VACITM2(WI)
+            WIND_VACITM += 1
+        Endif
+    Endif
+
+    # Niveau 3
+    If [M:SIH4]VACITM3(WI)<>""
+        WJ=find([M:SIH4]VACITM3(WI),CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If !WJ
+            If CTLVAT.C_VACITM(WIND_VACITM) = null
+              WRET = fmet CTLVAT.ADDLINE("C_VACITM",WLINE)
+              If WRET = [V]CST_ANOTDEFINED
+                #--The insertion was not possible
+                WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VACITM","CTLVAT"), [V]CST_AERROR)
+                Return
+              Endif
+              WIND_VACITM=WRET
+            Endif
+            CTLVAT.C_VACITM(WIND_VACITM).VACITM=[M:SIH4]VACITM3(WI)
+            WIND_VACITM += 1
+        Endif
+    Endif
+
+    # --- Chargement des codes taxe dans la classe CTLVAT
+    # Code 1
+    If [M:SIH4]VAT1(WI)<>""
+        WJ=find([M:SIH4]VAT1(WI),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If !WJ
+            If CTLVAT.C_VAT(WIND_VAT) = null
+              WRET = fmet CTLVAT.ADDLINE("C_VAT",WLINE)
+              If WRET = [V]CST_ANOTDEFINED
+                #--The insertion was not possible
+                WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VAT","CTLVAT"), [V]CST_AERROR)
+                Return
+              Endif
+              WIND_VAT=WRET
+            Endif
+            CTLVAT.C_VAT(WIND_VAT).VAT   =[M:SIH4]VAT1(WI)
+            CTLVAT.C_VAT(WIND_VAT).VATTYP=1
+            WIND_VAT += 1
+        Elsif CTLVAT.C_VAT(WJ).VATTYP=2
+            # On raz VALTYP car un code taxe ne peut être de type TVA et de type Para/Spé
+            CTLVAT.C_VAT(WJ).VATTYP=0
+        Endif
+    Else
+        WERRITM=1
+    Endif
+
+    # Code 2
+    If [M:SIH4]VAT2(WI)<>""
+        WJ=find([M:SIH4]VAT2(WI),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If !WJ
+            If CTLVAT.C_VAT(WIND_VAT) = null
+              WRET = fmet CTLVAT.ADDLINE("C_VAT",WLINE)
+              If WRET = [V]CST_ANOTDEFINED
+                #--The insertion was not possible
+                WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VAT","CTLVAT"), [V]CST_AERROR)
+                Return
+              Endif
+              WIND_VAT=WRET
+            Endif
+            CTLVAT.C_VAT(WIND_VAT).VAT=[M:SIH4]VAT2(WI)
+            CTLVAT.C_VAT(WIND_VAT).VATTYP=2
+            WIND_VAT += 1
+        Elsif CTLVAT.C_VAT(WJ).VATTYP=1
+            # On raz VALTYP car un code taxe ne peut être de type TVA et de type Para/Spé
+            CTLVAT.C_VAT(WJ).VATTYP=0
+        Endif
+    Elsif [M:SIH4]VACITM2(WI)<>""
+        WERRITM=1
+    Endif
+
+    # Code 3
+    If [M:SIH4]VAT3(WI)<>""
+        WJ=find([M:SIH4]VAT3(WI),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If !WJ
+            If CTLVAT.C_VAT(WIND_VAT) = null
+              WRET = fmet CTLVAT.ADDLINE("C_VAT",WLINE)
+              If WRET = [V]CST_ANOTDEFINED
+                #--The insertion was not possible
+                WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VAT","CTLVAT"), [V]CST_AERROR)
+                Return
+              Endif
+              WIND_VAT=WRET
+            Endif
+            CTLVAT.C_VAT(WIND_VAT).VAT=[M:SIH4]VAT3(WI)
+            CTLVAT.C_VAT(WIND_VAT).VATTYP=2
+            WIND_VAT += 1
+        Elsif CTLVAT.C_VAT(WJ).VATTYP=1
+            # On raz VALTYP car un code taxe ne peut être de type TVA et de type Para/Spé
+            CTLVAT.C_VAT(WJ).VATTYP=0
+        Endif
+    Elsif [M:SIH4]VACITM3(WI)<>""
+        WERRITM=1
+    Endif
+Next WI
+
+WRET=0
+
+#Infbox "LOADPARAM_CTLVAT_ITM"-num$(WERRITM)
+
+Return
+
+# --------------------------------------------------------------- #
+# Chargement des paramètres dans la classe CTLVAT pour les lignes #
+# --------------------------------------------------------------- #
+# --------------------------------------------------------------- #
+# Boucle sur les éléments                                         #
+# --------------------------------------------------------------- #
+# - Pour alimenter le tableau des niveaux à contrôler             #
+# - Pour alimenter le tableau des taxes à contrôler               #
+# --------------------------------------------------------------- #
+$LOADPARAM_CTLVAT_SFI
+
+Local Integer WCTLSFI
+
+# Pour essayer de ne contrôler que les élts ayant une valeur
+# --> On essaie d'abord de charger la valeur des élts
+# On essaie de charger ce qui manquerait dans SIHX
+Local Integer  WNBXFNUM : WNBXFNUM=dim([M:SIHX]XFNUM)-1
+Gosub CHARGE_COMPLEMENT_SIHX
+
+# Elts dont la règle de taxe est taux mini ou taux maxi
+# Recherche du code taxe
+Local Char    WTAXMINI(GLONVAT), WTAXMAXI(GLONVAT)
+Local Integer WMINI,WMAXI
+# Issue X3-56607 - 2017-09-28 by CPO : Erroneous tax control on sales invoicing element with tax rule “Maximum rate”
+#WMINI=find([M:SIHV]VATRUL(0..WNBXFNUM),3)
+#WMAXI=find([M:SIHV]VATRUL(0..WNBXFNUM),2)
+Raz WMINI, WMAXI
+WMINI=find(3,[M:SIHV]VATRUL(0..WNBXFNUM))
+WMAXI=find(2,[M:SIHV]VATRUL(0..WNBXFNUM))
+# End issue X3-56607
+# Il existe au moins un élt dont la règle de taxe est taux mini ou taux maxi
+If WMINI | WMAXI
+    # Recherche du nombre de tva
+    Local Integer  WNBXVTAX : WNBXVTAX=dim([M:SIHX]XVTAX)-1
+    Local Integer WTVA : WTVA = 0
+    Local Integer WMAXPOSWTVA : [L]WMAXPOSWTVA = -1 # Issue X3-56607 - 2017-09-28 by CPO : Erroneous tax control on sales invoicing element with tax rule “Maximum rate”
+    For WJ=0 To WNBXVTAX
+      If [M:SIHX]XVTAX(WJ)="" Break Endif
+      # Issue X3-56607 - 2017-09-28 by CPO : Erroneous tax control on sales invoicing element with tax rule "Maximum rate"
+      #If [M:SIHX]XVTYP(WJ) = 1 WTVA += 1 Endif
+      If [M:SIHX]XVTYP(WJ) = 1 : WTVA += 1 : WMAXPOSWTVA = WJ Endif
+      # End issue X3-56607
+    Next
+    # --- Taux mini : On prend le code taxe ayant le plus petit montant (montant HT)
+    # ATTENTION, si une TVA est incohérente, elle n'est pas chargée dans le tableau des taxes
+    # si son montant HT correspondait au plus petit montant on ne va pas prendre cette taxe
+    # on prend le code taxe valide ayant le plus petit montant
+    # --> Du coup, cela n'a pas de sens de contrôler ce type d'élt ...
+    # A laisser pour l'instant
+    If WTVA>0 & WMINI
+        # Issue X3-56607 - 2017-09-28 by CPO : Erroneous tax control on sales invoicing element with tax rule “Maximum rate”
+        #--The WTVA only counts the number of VAT taxes, not the max index
+        #WJ=find(min([M:SIHX]XVNOT(0..WTVA-1)),[M:SIHX]XVNOT(0..WTVA-1))-1
+        #WTAXMINI=[M:SIHX]XVTAX(WJ)
+        WJ=0
+        WJ=find(min([M:SIHX]XVNOT(0..WMAXPOSWTVA)),[M:SIHX]XVNOT(0..WMAXPOSWTVA))
+        If WJ>0
+          WTAXMINI=[M:SIHX]XVTAX(WJ-1)
+        Endif
+        # End issue X3-56607
+    Endif
+    # --- Taux maxi : On prend le code taxe ayant le plus grand montant (montant HT)
+    # ATTENTION, si une TVA est incohérente, elle n'est pas chargée dans le tableau des taxes
+    # si son montant HT correspondait au plus grand montant on ne va pas prendre cette taxe
+    # on prend le code taxe valide ayant le plus grand montant
+    # --> Du coup, cela n'a pas de sens de contrôler ce type d'élt ...
+    # A laisser pour l'instant
+    If WTVA>0 & WMAXI
+        # Issue X3-56607 - 2017-09-28 by CPO : Erroneous tax control on sales invoicing element with tax rule “Maximum rate”
+        #--The WTVA only counts the number of VAT taxes, not the max index
+        #WJ=find(max([M:SIHX]XVNOT(0..WTVA-1)),[M:SIHX]XVNOT(0..WTVA-1))-1
+        #WTAXMAXI=[M:SIHX]XVTAX(WJ)
+        WJ=0
+        WJ=find(max([M:SIHX]XVNOT(0..WMAXPOSWTVA)),[M:SIHX]XVNOT(0..WMAXPOSWTVA))
+        If WJ>0
+          WTAXMAXI=[M:SIHX]XVTAX(WJ-1)
+        Endif
+        # End issue X3-56607
+    Endif
+Endif
+
+#Dbgaff
+
+Local Char WMESSA(255)
+
+#If GTRACE = ""
+#  Call OUVRE_TRACE(mess(837,197,1)) From LECFIC
+#  WOUVTRACE = 1
+#Endif
+#WNOMTRACE = GTRACE
+
+For WI=0 To WNBXFNUM
+
+    If [M:SIHV]XFNUM(WI)=0 Break Endif
+
+# Pour les tests
+#If [M:SIHV]XFNUM(WI)=15 [M:SIHV]VACITM(WI)="LD" Endif
+#If [M:SIHV]XFNUM(WI)=30 [M:SIHV]XFTAX(WI)="LD04" Endif
+#If [M:SIHV]XFNUM(WI)= 4 [M:SIHV]XFTAX(WI)=""    Endif
+#If [M:SIHV]XFNUM(WI)= 5 [M:SIHV]VATRUL(WI)=2    Endif
+#If [M:SIHV]XFNUM(WI)= 20 [M:SIHV]VACITM(WI)="LD" Endif
+#If [M:SIHV]XFNUM(WI)= 6 Dbgaff Endif
+
+    WCTLSFI=1
+    # Traitement des particularités :
+
+    # On exclut du contrôle les élt dt base de calcul = "Montant TTC"
+    If [M:SIHV]CLCBAS(WI)=2 WCTLSFI=0 Endif
+
+    # On exclut du contrôle les élt dt règle de taxe  = "Ventilation"
+    If [M:SIHV]VATRUL(WI)=5  WCTLSFI=0 Endif
+
+    # On exclut du contrôle les élt dt règle de taxe  = "Produit"
+    # Les taxes sont déjà chargées avec les lignes : Inutile de charger les taxes
+    If [M:SIHV]VATRUL(WI)=1  WCTLSFI=0 Endif
+
+    # Elt dt règle de taxe  = "Taux maxi" : Il faut déterminer le taux
+    If [M:SIHV]VATRUL(WI)=2
+    # --- Taux maxi (on utilise la taxe du plus grand montant)
+        [M:SIHV]XFTAX(WI)=WTAXMAXI
+    Endif
+    # Elt dt règle de taxe  = "Taux mini" : Il faut déterminer le taux
+    # --- Taux min (on utilise la taxe du plus petit montant)
+    If [M:SIHV]VATRUL(WI)=3
+        [M:SIHV]XFTAX(WI)=WTAXMINI
+    Endif
+
+    # On essaie d'exclure du contrôle les élt qui n'ont pas de valeur :
+    # Elts d'éclatements
+    If [M:SIHV]INVFOOBRD(WI)<>0
+        # On ne connait pas encore leur valeur mais on connait la valeur de l'élément éclaté
+        # Recherche de l'élément éclaté : S'il n'a pas de valeur on exclut l'élément d'éclatemet
+        WJ=find([M:SIHV]INVFOOBRD(WI),[M:SIHV]XFNUM(0..WNBXFNUM))
+        If WJ
+            If sum([M:SIHV]XFDTAAMT(WJ-1), [M:SIHV]XFNOTL(WJ-1), [M:SIHV]XFATIL(WJ-1))=0 WCTLSFI=0 Endif
+        Endif
+    Else
+        If sum([M:SIHV]XFDTAAMT(WI), [M:SIHV]XFNOTL(WI), [M:SIHV]XFATIL(WI))=0 WCTLSFI=0 Endif
+    Endif
+
+
+    If WCTLSFI=1
+
+    WMESSA=mess(523,197,1)-":"-num$([M:SIHV]XFNUM(WI))-[M:SIHV]XFSHO(WI)-mess(766,197,1)-":"-num$([M:SIHX]DACINV(WI))
+
+#    Call ECR_TRACE(WMESSA,0) From GESECRAN
+#    Call ECR_TRACE("regle de taxe="-num$([M:SIHV]VATRUL(WI))-"niveau de taxe="-[M:SIHV]VACITM(WI)-"Code de taxe="-[M:SIHV]XFTAX(WI),0) From GESECRAN
+
+
+      # --- Chargement du niveau de taxe dans la classe CTLVAT
+      # Niveau 1
+      If [M:SIHV]VACITM(WI)<>""
+          WJ=find([M:SIHV]VACITM(WI),CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+          If !WJ
+              If CTLVAT.C_VACITM(WIND_VACITM) = null
+                WRET = fmet CTLVAT.ADDLINE("C_VACITM",WIND_VACITM)
+                If WRET = [V]CST_ANOTDEFINED
+                  #--The insertion was not possible
+                  WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VACITM","CTLVAT"), [V]CST_AERROR)
+                  Return
+                Endif
+                WIND_VACITM=WRET
+              Endif
+              CTLVAT.C_VACITM(WIND_VACITM).VACITM=[M:SIHV]VACITM(WI)
+              WIND_VACITM += 1
+          Endif
+      Elsif find([M:SIHV]VATRUL(WI),2,3,4)
+      # Niveau 1 non renseigné et règle de taxe "Taux maxi", "Taux mini", "Taux fixe"
+      # On a une erreur
+          # Issue X3-56607 - 2017-09-28 by CPO : Erroneous tax control on sales invoicing element with tax rule “Maximum rate”
+          #--We only trigger an error if no VAT for this particular line (for the rules 2 and 3, the tax was set earlier; for rule 4, there has to be an VACITM(WJ), hence the 'or' test)
+          #WERRSFI=1
+          If [M:SIHV]VATRUL(WI)=4 or [M:SIHV]XFTAX(WI)=""
+              WERRSFI=1
+          Endif
+          # End issue X3-56607
+      Endif
+
+      # --- Chargement du code taxe dans la classe CTLVAT
+      # Code 1
+      If [M:SIHV]XFTAX(WI)=""
+          WJ=find(GEXETAX,CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+          If !WJ
+              If CTLVAT.C_VAT(WIND_VAT) = null
+                WRET = fmet CTLVAT.ADDLINE("C_VAT",WLINE)
+                If WRET = [V]CST_ANOTDEFINED
+                  #--The insertion was not possible
+                  WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VAT","CTLVAT"), [V]CST_AERROR)
+                  Return
+                Endif
+                WIND_VAT=WRET
+              Endif
+              CTLVAT.C_VAT(WIND_VAT).VAT=GEXETAX
+              WIND_VAT += 1
+          Endif
+      Else
+          WJ=find([M:SIHV]XFTAX(WI),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+          If !WJ
+              If CTLVAT.C_VAT(WIND_VAT) = null
+                WRET = fmet CTLVAT.ADDLINE("C_VAT",WLINE)
+                If WRET = [V]CST_ANOTDEFINED
+                  #--The insertion was not possible
+                  WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VAT","CTLVAT"), [V]CST_AERROR)
+                  Return
+                Endif
+                WIND_VAT=WRET
+              Endif
+              CTLVAT.C_VAT(WIND_VAT).VAT=[M:SIHV]XFTAX(WI)
+              CTLVAT.C_VAT(WIND_VAT).VATTYP=1
+              WIND_VAT += 1
+          Elsif CTLVAT.C_VAT(WJ).VATTYP=2
+              # On raz VALTYP car un code taxe ne peut être de type TVA et de type Para/Spé
+              CTLVAT.C_VAT(WJ).VATTYP=0
+          Endif
+      Endif
+    Endif
+Next WI
+
+WRET=0
+
+#Infbox "LOADPARAM_CTLVAT_SFI"-num$(WERRSFI)
+
+Return
+
+# --------------------------------------------------------------- #
+# Chargement complémentaire SIHX                                  #
+# --------------------------------------------------------------- #
+# Pour essayer de ne contrôler que les élts ayant une valeur      #
+# --> On essaie d'abord de charger la valeur des élts             #
+# (valeur chargées au moment du calcul qui est fait après le ctrl #
+# --------------------------------------------------------------- #
+# ATTENTION IL FAUDRA PEUT ETRE FAIRE UN RAZ de SIHX XFDTAAMT ET UN RAZ de SIHV APRES
+$CHARGE_COMPLEMENT_SIHX
+
+Local Integer  WI, RF, STAT
+Local Decimal  WMT2, COEFDEVISE
+
+If [M:SIH0]CUR<>GSYSCUR
+  # manip pour recuperer coefficient ( mt devise dossier * coefficient = mt devise facture )
+  Call CONVERT(GSYSCUR,[M:SIH0]CUR,GLOCALDEV,[M:SIH0]CHGTYP,[M:SIH0]INVDAT,1000000.00,WMT2,STAT) From TRTDEV
+  If STAT=0 & WMT2<>0
+    COEFDEVISE=WMT2/1000000.00
+  Else
+    COEFDEVISE=1
+  Endif
+Endif
+If [F:TCU]CUR<>[M:SIH0]CUR
+  Read [TCU]TCU0=[M:SIH0]CUR
+Endif
+
+# chgt à partir des montants saisis en pied
+For WI=0 To dim([M:SIH2]INVDTA)-1
+  If [M:SIH2]INVDTA(WI)<>0
+    RF=find([M:SIH2]INVDTA(WI),[M:SIHX]XFNUM(0..WNBXFNUM-1))
+    If RF
+       [M:SIHX]XFDTAAMT(RF-1)=[M:SIH2]INVDTAAMT(WI)
+    Endif
+  Endif
+Next WI
+
+# transfert dans SIHV (écran SIHX après saisie ne doit pas être modifié par le calcul
+[M:SIHV]=[M:SIHX]
+
+# initialisation dans tableau des montants saisis en pied dans XF
+Raz [M:SIHV]XFNOTP, [M:SIHV]XFSMIP
+
+# chgt des valeurs par défaut
+For WI=0 To WNBXFNUM
+  If [M:SIHV]PROCOD(WI)=2   : # si pied non modifiable on charge la valeur par défaut
+    [M:SIHV]XFDTAAMT(WI)=[M:SIHV]DEFVAL(WI)
+    If [M:SIHV]AMTCOD(WI)=2  : # si c'est un montant on passe en devise de la facture
+      [M:SIHV]XFDTAAMT(WI)=arr([M:SIHV]XFDTAAMT(WI)*COEFDEVISE,[F:TCU]CURRND)
+    Endif
+  Endif
+
+  # A voir plus tard : Raz si sélection sur taxe
+Next WI
+
+Return
+
+# ----------------------------------------------- #
+# Traitement des erreurs du controle des taxes    #
+# ----------------------------------------------- #
+$TRTERR_CTLVAT
+
+Local Integer WI, WJ
+Local Integer WKO, WITMKO, WELTKO, WELTKO1, WTVAKO, WPARAKO
+Local Char    WMESSA(255), WMESSA1(255), WMESSA2(255)
+Local Integer WCOLOR
+
+# Si ctrl non bloquant, faire apparaitre les erreurs en vert
+# Si ctrl bloquant,     faire apparaitre les erreurs en rouge
+If GCTLTAX=2 WCOLOR=-1 Else WCOLOR=1 Endif
+
+WOUVTRACE=1
+# --- Ecriture de la trace
+# Contrôle des taxes
+If GTRACE = ""
+  Call OUVRE_TRACE(mess(837,197,1)) From LECFIC
+  WOUVTRACE = 2
+Endif
+WNOMTRACE = GTRACE
+
+# Flag err : 0:Aucune (titre à afficher) / 1:Au moins une (titre déjà affiché)
+WKO=0
+
+# Affichage du  n° de document
+WMESSA1=mess(837,197,1)
+If CTLVAT.VCRNUM<>""
+#    WMESSA1=mess(837,197,1)-"\"+mess(CTLVAT.VCRTYP,476,1)-":"-CTLVAT.VCRNUM
+    WMESSA1-="\"+mess(CTLVAT.VCRTYP,476,1)-":"-CTLVAT.VCRNUM
+Endif
+
+# Régime de taxe
+If CTLVAT.VACBPR=""
+    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+    #  Régime de taxe non renseigné
+    Call ECR_TRACE(mess(620,197,1)-mess(841,197,1),WCOLOR) From GESECRAN
+Elsif CTLVAT.VACBPRFLG=1
+    # Régime avec une erreur
+    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+    Call ECR_TRACE(CTLVAT.VACBPRMSG,WCOLOR) From GESECRAN
+Endif
+
+WTVAKO=0 : WPARAKO=0
+
+If sum(WERRITM, CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITMFLG, CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VATFLG)<>0
+    # Traitement des erreurs du controle des taxes pour les lignes
+    Gosub TRTERR_CTLVAT_ITM
+    If WKO WRETCTLVAT=[V]CST_AERROR Endif
+Endif
+
+If sum(WERRSFI, WERRITM, CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITMFLG, CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VATFLG)<>0
+    # Traitement des erreurs du controle des taxes pour les éléments
+    Gosub TRTERR_CTLVAT_SFI
+    If WELTKO1 WRETCTLVAT=[V]CST_AERROR Endif
+Endif
+
+If WOUVTRACE = 2
+  Call FERME_TRACE From LECFIC
+#  WOUVTRACE = 0
+Endif
+
+#Local Integer WOK
+#WOK=1
+#If GCTLTAX=1
+#    Call OUINON (mess(849,197,1), WOK) From GESECRAN
+#Elsif GCTLTAX=2
+#    Call ERREUR (mess(849,197,1)) From GESECRAN
+#Endif
+#
+#Call LEC_TRACE   From LECFIC
+#
+#If WOK=1 WRET=1 Endif
+Return
+
+# ------------------------------------------------------------  #
+# Traitement des erreurs du controle des taxes pour les lignes  #
+# ------------------------------------------------------------- #
+$TRTERR_CTLVAT_ITM
+Local Integer WLINE
+
+#Infbox "TRTERR_CTLVAT_ITM"
+
+# Au moins une erreur sur les lignes, il faut faire la boucle
+For WI=0 To dim([M:SIH4]ITMREF)-1
+    If [M:SIH4]ITMREF(WI)="" & WI=dim([M:SIH4]ITMREF)-1 Break Endif
+    If [M:SIH4]ITMREF(WI)="" & sigma(WI+1, dim([M:SIH4]ITMREF)-1,[M:SIH4]ITMREF(indcum)) = "" Break Endif
+
+    # Flag err article : 0:Aucune(titre à afficher) / 1:Au moins une (titre déjà affiché)
+    WITMKO=0
+    Case CTLVAT.VCRTYP
+      When 1
+        WLINE=[M:SIH4]SQDLIN(WI)
+      When 20
+        WLINE=[M:SIH4]SOPLIN(WI)
+      When 2
+        WLINE=[M:SIH4]SDDLIN(WI)
+      When 4
+        WLINE=[M:SIH4]SIDLIN(WI)
+    Endcase
+    If WLINE<>0
+        WMESSA=mess(18,197,1)-":"-num$(WI+1)-num$(WLINE)-mess(80,197,1)-":"-[M:SIH4]ITMREF(WI)-[M:SIH4]ITMDES1(WI)
+    Else
+        WMESSA=mess(18,197,1)-":"-num$(WI+1)-mess(80,197,1)-":"-[M:SIH4]ITMREF(WI)-[M:SIH4]ITMDES1(WI)
+    Endif
+
+    # ----------- LES NIVEAUX ------------------
+    # Niveau 1
+    If [M:SIH4]VACITM1(WI)=""
+        # Niveau de taxe 1 non renseigné
+        WTVAKO=1
+        If WITMKO=0
+            If WKO=0
+                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+            Endif
+            WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+        Endif
+        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-mess(841,197,1),WCOLOR) From GESECRAN
+    Else
+        WJ=find([M:SIH4]VACITM1(WI),CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If WJ=0
+            # Niveau non trouvé dans le tableau
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Niveau de taxe 1 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VACITM(WJ).VACITMFLG=1
+            # Niveau avec une erreur
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+CTLVAT.C_VACITM(WJ).VACITMMSG,WCOLOR) From GESECRAN
+        Endif
+    Endif
+
+    # Niveau 2
+    If [M:SIH4]VACITM2(WI)<>""
+        WJ=find([M:SIH4]VACITM2(WI),CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If WJ=0
+            # Niveau non trouvé dans le tableau
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Niveau de taxe 2 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VACITM(WJ).VACITMFLG=1
+            # Niveau avec une erreur
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+CTLVAT.C_VACITM(WJ).VACITMMSG,WCOLOR) From GESECRAN
+        Endif
+    Endif
+
+    # Niveau 3
+    If [M:SIH4]VACITM3(WI)<>""
+        WJ=find([M:SIH4]VACITM3(WI),CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If WJ=0
+            # Niveau non trouvé dans le tableau
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Niveau de taxe 3 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VACITM(WJ).VACITMFLG=1
+            # Niveau avec une erreur
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+CTLVAT.C_VACITM(WJ).VACITMMSG,WCOLOR) From GESECRAN
+        Endif
+    Endif
+
+    # ----------- LES CODES ------------------
+    # Code 1
+    If [M:SIH4]VAT1(WI)=""
+        # Code taxe 1 non renseigné
+        WTVAKO=1
+        If WITMKO=0
+            If WKO=0
+                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+            Endif
+            WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+        Endif
+        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-[M:SIH4]VACITM1(WI)-":"-mess(840,197,1)-"1"-mess(841,197,1),WCOLOR) From GESECRAN
+    Else
+        WJ=find([M:SIH4]VAT1(WI),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If WJ=0
+            # Code taxe non trouvé dans le tableau
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Code taxe 1 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-[M:SIH4]VACITM1(WI)-":"-mess(840,197,1)-"1"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATFLG=1
+            # Code avec une erreur
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-[M:SIH4]VACITM1(WI)-":"-CTLVAT.C_VAT(WJ).VATMSG,WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATTYP<>1
+            # Cette taxe n'est pas de type TVA
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-[M:SIH4]VACITM1(WI)-":"-mess(840,197,1)-"1"-":"-CTLVAT.C_VAT(WJ).VAT-":"-mess(11,119,1),WCOLOR) From GESECRAN
+        Endif
+    Endif
+
+    # Code 2
+    If [M:SIH4]VAT2(WI)<>""
+        WJ=find([M:SIH4]VAT2(WI),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If WJ=0
+            # Code taxe non trouvé dans le tableau
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Code taxe 2 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-[M:SIH4]VACITM2(WI)-":"-mess(840,197,1)-"2"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATFLG=1
+            # Code avec une erreur
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-[M:SIH4]VACITM2(WI)-":"-CTLVAT.C_VAT(WJ).VATMSG,WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATTYP=1
+            # Code taxe 2 Cette taxe n'est pas de type parafiscale ou spéciale
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-[M:SIH4]VACITM2(WI)-":"-mess(840,197,1)-"2"-":"-CTLVAT.C_VAT(WJ).VAT-":"-mess(850,197,1),WCOLOR) From GESECRAN
+        Endif
+    Elsif [M:SIH4]VACITM2(WI)<>""
+        # Niveau de taxe sans code taxe associé
+        WPARAKO=1
+        If WITMKO=0
+            If WKO=0
+                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+            Endif
+            WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+        Endif
+        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-[M:SIH4]VACITM2(WI)-":"-mess(842,197,1),WCOLOR) From GESECRAN
+    Endif
+
+    # Code 3
+    If [M:SIH4]VAT3(WI)<>""
+        WJ=find([M:SIH4]VAT3(WI),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If WJ=0
+            # Code taxe non trouvé dans le tableau
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Code taxe 3 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-[M:SIH4]VACITM3(WI)-":"-mess(840,197,1)-"3"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATFLG=1
+            # Code avec une erreur
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-[M:SIH4]VACITM3(WI)-":"-CTLVAT.C_VAT(WJ).VATMSG,WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATTYP=1
+            # Code taxe 3 Cette taxe n'est pas de type parafiscale ou spéciale
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-[M:SIH4]VACITM3(WI)-":"-mess(840,197,1)-"3"-":"-CTLVAT.C_VAT(WJ).VAT-":"-mess(850,197,1),WCOLOR) From GESECRAN
+        Endif
+    Elsif [M:SIH4]VACITM3(WI)<>""
+        # Niveau de taxe sans code taxe associé
+        WPARAKO=1
+        If WITMKO=0
+            If WKO=0
+                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+            Endif
+            WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+        Endif
+        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-[M:SIH4]VACITM3(WI)-":"-mess(842,197,1),WCOLOR) From GESECRAN
+    Endif
+Next WI
+
+Return
+
+# ---------------------------------------------------------------- #
+# Traitement des erreurs du controle des taxes pour les éléments   #
+# ---------------------------------------------------------------- #
+$TRTERR_CTLVAT_SFI
+
+#Infbox "TRTERR_CTLVAT_SFI"
+
+## Au moins une erreur sur les éléments, il faut faire la boucle
+Local Integer  WNBXFNUM : WNBXFNUM=dim([M:SIHX]XFNUM)-1
+For WI=0 To WNBXFNUM
+
+    If [M:SIHV]XFNUM(WI)=0 Break Endif
+
+    WCTLSFI=1
+
+    # Traitement des particularités :
+
+    # On exclut du contrôle les élt dt base de calcul = "Montant TTC"
+    If [M:SIHV]CLCBAS(WI)=2 WCTLSFI=0 Endif
+
+    # On exclut du contrôle les élt dt règle de taxe  = "Ventilation"
+    If [M:SIHV]VATRUL(WI)=5  WCTLSFI=0 Endif
+
+    # On essaie d'exclure du contrôle les élt qui n'ont pas de valeur :
+    If [M:SIHV]INVFOOBRD(WI)<>0
+        # Elts d'éclatements :
+        # On ne connait pas encore leur valeur mais on connait la valeur de l'élément éclaté
+        # Recherche de l'élément éclaté : S'il n'a pas de valeur on exclut l'élément d'éclatemet
+        WJ=find([M:SIHV]INVFOOBRD(WI),[M:SIHV]XFNUM(0..WNBXFNUM))
+        If WJ
+            If sum([M:SIHV]XFDTAAMT(WJ-1), [M:SIHV]XFNOTL(WJ-1), [M:SIHV]XFATIL(WJ-1))=0 WCTLSFI=0 Endif
+        Endif
+    Else
+        If sum([M:SIHV]XFDTAAMT(WI), [M:SIHV]XFNOTL(WI), [M:SIHV]XFATIL(WI))=0 WCTLSFI=0 Endif
+    Endif
+
+    # Flag err elt : 0:Aucune(titre à afficher) / 1:Au moins une (titre déjà affiché)
+    WELTKO=0
+    WMESSA=mess(523,197,1)-":"-string$(3-len(num$([M:SIHV]XFNUM(WI))),"")+"("+num$([M:SIHV]XFNUM(WI))+")"-[M:SIHV]XFSHO(WI)+string$(12-len([M:SIHV]XFSHO(WI))," ")+mess(766,197,1)-":"-num$([M:SIHX]
+& DACINV(WI))
+
+    If WCTLSFI=1
+        # Elt dt règle de taxe  = "Produit"
+        If [M:SIHV]VATRUL(WI)=1
+            # Si au moins un code taxe 1 est erroné au niveau des lignes, l'élément est en erreur
+            If WTVAKO=1
+                If WELTKO=0
+                    If WKO=0
+                        WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                        If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                    Endif
+                    Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                Endif
+                Call ECR_TRACE(string$(7," ")+mess(843,197,1)-":"-mess(844,197,1),WCOLOR) From GESECRAN
+                # Si Elt regroupé, on mentionne dans la trace l'Elt de regroupement
+                If WELTKO=0 & [M:SIHX]INVFOOGRU(WI)<>0
+                    Call ECR_TRACE(string$(7," ")+mess(847,197,1)-":"-num$([M:SIHX]INVFOOGRU(WI)),0) From GESECRAN
+                Endif
+                WELTKO=1
+            Endif
+            # Elt soumis aux taxes parafiscales ou spéciales
+            # Si au moins un code taxe 2 ou 3 est erroné au niveau des lignes, l'élément est en erreur
+            If [M:SIHV]EXCTAXRUL(WI)=2 | [M:SIHV]SPETAXRUL(WI)=2
+                If WPARAKO=1
+                    If WELTKO=0
+                        If WKO=0
+                            WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                            If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                        Endif
+                        WELTKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                    Endif
+                   Call ECR_TRACE(string$(7," ")+mess(846,197,1)-":"-mess(844,197,1),WCOLOR) From GESECRAN
+                Endif
+            Endif
+        Else
+            # Elément à contrôler
+
+            # ----------- LE NIVEAU ------------------
+            # Elt dt règle de taxe  = "Taux fixe"
+            If [M:SIHV]VATRUL(WI)=4
+                If [M:SIHV]VACITM(WI)=""
+                    # Niveau de taxe non renseigné
+                    If WELTKO=0
+                        If WKO=0
+                            WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                            If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                        Endif
+                        Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                    Endif
+                    Call ECR_TRACE(string$(7," ")+mess(839,197,1)-mess(841,197,1),WCOLOR) From GESECRAN
+                    # Si Elt regroupé, on mentionne dans la trace l'Elt de regroupement
+                    If WELTKO=0 & [M:SIHX]INVFOOGRU(WI)<>0
+                        Call ECR_TRACE(string$(7," ")+mess(847,197,1)+":"+num$([M:SIHX]INVFOOGRU(WI)),0) From GESECRAN
+                    Endif
+                    WELTKO=1
+                Elsif [M:SIHV]VACITM(WI)<>""
+                    WJ=find([M:SIHV]VACITM(WI),CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+                    If WJ=0
+                        # Niveau non trouvé dans le tableau
+                        # A VOIR : Si on utilise GEXETAX & GWRNEXETAX=1
+                        # Peut-être ne faut-il rien mettre dans la trace, ne mettre  dans la trace que si GWRNEXETAX=2
+                        # If [M:SIHV]XFTAX(WI)<>"" & [M:SIHV]XFTAX(WI)=GEXETAX & GWRNEXETAX=2
+                        #
+                        If WELTKO=0
+                            If WKO=0
+                                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                            Endif
+                            WELTKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                        Endif
+                        # C'est une erreur bloquante ssi on utilise pas GEXETAX
+                        If WELTKO1=0 & !([M:SIHV]XFTAX(WI)<>"" & [M:SIHV]XFTAX(WI)=GEXETAX)
+                            WELTKO1=1
+                        Endif
+            # A VOIR MESSAGE         # Niveau de taxe : Problème lors du contrôle
+                        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-":"-mess(838,197,1),WCOLOR) From GESECRAN
+                    Elsif CTLVAT.C_VACITM(WJ).VACITMFLG=1
+                        # Niveau avec une erreur
+                        # A VOIR : Si on utilise GEXETAX & GWRNEXETAX=1
+                        # Peut-être ne faut-il rien mettre dans la trace, ne mettre  dans la trace que si GWRNEXETAX=2
+                        # If [M:SIHV]XFTAX(WI)<>"" & [M:SIHV]XFTAX(WI)=GEXETAX & GWRNEXETAX=2
+                        #
+                        If WELTKO=0
+                            If WKO=0
+                                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                            Endif
+                            WELTKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                        Endif
+                        # C'est une erreur bloquante ssi on utilise pas GEXETAX
+                        If WELTKO1=0 & !([M:SIHV]XFTAX(WI)<>"" & [M:SIHV]XFTAX(WI)=GEXETAX)
+                            WELTKO1=1
+                        Endif
+                        Call ECR_TRACE(string$(7," ")+CTLVAT.C_VACITM(WJ).VACITMMSG,WCOLOR) From GESECRAN
+                    Endif
+                Endif
+            Endif
+
+            # ----------- LE CODE ------------------
+            If [M:SIHV]XFTAX(WI)<>"" & [M:SIHV]XFTAX(WI)=GEXETAX & GWRNEXETAX=2
+                # MIS EN COMMENTAIRE
+                # C'est RECHVATFOOT qui alimente avec GEXETAX si pas de taxe
+                # On ne sait pas dire si le code taxe exo vient de la détermination ou du paramètre ...
+
+                # Code taxe = Code taxe exonéré
+                # Soit cela vient de la détermination des taxes
+                # Soit cela vient de l'alimentation avec GEXETAX (la détermination n'a rien donné)
+                # --> Affichage d'un message dans la trace selon paramètre WRNEXETAX (Avertissement utilisation EXETAX)
+                # Pour savoir dans cas on est, il faut refaire la détermination des taxes
+                # Si elle ne donne rien,   il faut mettre le warning
+                # Si elle renvoit GEXETAX, ne pas mettre le warning
+                Local Char    ZVAT (GLONVAT) (0..2)
+                Call RECHVATFOOT(1,[M:SIH0]BPCINV,[M:SIHV]XFNUM(WI),"SIHX",ZVAT) From TRTX3
+                If ZVAT(0)=""
+                    If WELTKO=0
+                        If WKO=0
+                            WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                            If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                        Endif
+                        WELTKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                    Endif
+                    If [M:SIHV]VATRUL(WI)=4
+                        # Elt en taux fixe       : On donne le niveau dans la trace
+                        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-":"-[M:SIHV]VACITM(WI)-":"-mess(840,197,1)-mess(841,197,1)-":"-mess(845,197,1)-":"-GEXETAX,-1) From GESECRAN
+                    Else
+                        # Elt en taux mini, maxi : l'élt n'a pas de niveau : On ne le donne pas dans la trace
+    # A VOIR METTRE DANS LA TRACE TAUX MINI TAUX MAXI
+                        Call ECR_TRACE(string$(7," ")+mess(840,197,1)-mess(841,197,1)-":"-mess(845,197,1)-":"-GEXETAX,-1) From GESECRAN
+                    Endif
+                Endif
+            Endif
+#            If [M:SIHV]XFTAX(WI)="" & GEXETAX<>""
+#                # Code taxe non renseigné
+#                # On l'alimente avec GEXETAX (code taxe exonéré)
+#        # A VOIR MESSAGE
+#                If GWRNEXETAX=2
+#                    # Affichage d'un message dans la trace selon paramètre WRNEXETAX (Avertissement utilisation EXETAX)
+#                    If WELTKO=0
+#                        If WKO=0
+#                            WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+#                            If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+#                        Endif
+#                        WELTKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+#                    Endif
+#                    If [M:SIHV]VATRUL(WI)=4
+#                        # Elt en taux fixe       : On donne le niveau dans la trace
+#                        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-":"-[M:SIHV]VACITM(WI)-":"-mess(840,197,1)-mess(841,197,1)-":"-mess(845,197,1)-":"-GEXETAX,0) From GESECRAN
+#                    Else
+#                        # Elt en taux mini, maxi : l'élt n'a pas de niveau : On ne le donne pas dans la trace
+#    # A VOIR METTRE DANS LA TRACE TAUX MINI TAUX MAXI
+#                        Call ECR_TRACE(string$(7," ")+mess(840,197,1)-mess(841,197,1)-":"-mess(845,197,1)-":"-GEXETAX,0) From GESECRAN
+#                    Endif
+#                Endif
+#                [M:SIHV]XFTAX(WI)=GEXETAX
+#            Endif
+            If [M:SIHV]XFTAX(WI)=""
+                # Code taxe non renseigné
+                If WELTKO=0
+                    If WKO=0
+                        WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                        If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                    Endif
+                    Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                Endif
+                If [M:SIHV]VATRUL(WI)=4
+                    # Elt en taux fixe       : On donne le niveau dans la trace
+                    Call ECR_TRACE(string$(7," ")+mess(839,197,1)-":"-[M:SIHV]VACITM(WI)-":"-mess(840,197,1)-mess(841,197,1),WCOLOR) From GESECRAN
+                Else
+                    # Elt en taux mini, maxi : l'élt n'a pas de niveau : On ne le donne pas dans la trace
+                    Call ECR_TRACE(string$(7," ")+mess(840,197,1)-mess(841,197,1),WCOLOR) From GESECRAN
+                Endif
+                # Si Elt regroupé, on mentionne dans la trace l'Elt de regroupement
+                If WELTKO=0 & [M:SIHX]INVFOOGRU(WI)<>0
+                    Call ECR_TRACE(string$(7," ")+mess(847,197,1)+":"+num$([M:SIHX]INVFOOGRU(WI)),0) From GESECRAN
+                Endif
+                WELTKO=1
+                WELTKO1=1 : # C'est une erreur bloquante
+            Endif
+            If [M:SIHV]XFTAX(WI)<>""
+                WJ=find([M:SIHV]XFTAX(WI),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+                If WJ=0
+                    # Code taxe non trouvé dans le tableau
+                    If WELTKO=0
+                        If WKO=0
+                            WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                            If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                        Endif
+                        WELTKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                    Endif
+        # A VOIR MESSAGE         # Code taxe : Problème lors du contrôle
+                    If [M:SIHV]VATRUL(WI)=4
+                        # Elt en taux fixe       : On donne le niveau dans la trace
+                        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-":"-[M:SIHV]VACITM(WI)-":"-mess(840,197,1)-mess(838,197,1),WCOLOR) From GESECRAN
+                    Else
+                        # Elt en taux mini, maxi : l'élt n'a pas de niveau : On ne le donne pas dans la trace
+                        Call ECR_TRACE(string$(7," ")+mess(840,197,1)-"1"-mess(838,197,1),WCOLOR) From GESECRAN
+                    Endif
+                    WELTKO1=1 : # C'est une erreur bloquante
+                Elsif CTLVAT.C_VAT(WJ).VATFLG=1
+                    # Code avec une erreur
+                    If WELTKO=0
+                        If WKO=0
+                            WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                            If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                        Endif
+                        Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                    Endif
+                    If [M:SIHV]VATRUL(WI)=4
+                        # Elt en taux fixe       : On donne le niveau dans la trace
+                        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-":"-[M:SIHV]VACITM(WI)-":"-CTLVAT.C_VAT(WJ).VATMSG,WCOLOR) From GESECRAN
+                    Else
+                        # Elt en taux mini, maxi : l'élt n'a pas de niveau : On ne le donne pas dans la trace
+                        Call ECR_TRACE(string$(7," ")+CTLVAT.C_VAT(WJ).VATMSG,WCOLOR) From GESECRAN
+                    Endif
+                    # Si Elt regroupé, on mentionne dans la trace l'Elt de regroupement
+                    If WELTKO=0 & [M:SIHX]INVFOOGRU(WI)<>0
+                        Call ECR_TRACE(string$(7," ")+mess(847,197,1)+":"+num$([M:SIHX]INVFOOGRU(WI)),0) From GESECRAN
+                    Endif
+                    WELTKO=1
+                    WELTKO1=1 : # C'est une erreur bloquante
+                Elsif CTLVAT.C_VAT(WJ).VATTYP<>1
+                    # Cette taxe n'est pas de type TVA
+                    If WELTKO=0
+                        If WKO=0
+                            WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                            If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                        Endif
+                        WELTKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+                    Endif
+                    If [M:SIHV]VATRUL(WI)=4
+                        # Elt en taux fixe       : On donne le niveau dans la trace
+                        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-":"-[M:SIHV]VACITM(WI)-":"-mess(840,197,1)-":"-CTLVAT.C_VAT(WJ).VAT-":"-mess(11,119,1),WCOLOR) From GESECRAN
+                    Else
+                        # Elt en taux mini, maxi : l'élt n'a pas de niveau : On ne le donne pas dans la trace
+                        Call ECR_TRACE(string$(7," ")+mess(840,197,1)-":"-CTLVAT.C_VAT(WJ).VAT-":"-mess(11,119,1),WCOLOR) From GESECRAN
+                    Endif
+                    WELTKO1=1 : # C'est une erreur bloquante
+                Endif
+            Endif
+        Endif
+    Endif
+Next WI
+
+Return
+
+#######################################################################################
+Subprog LOG_ERROR(ZOBJECT, WNOMTRACE, WOUVTRACE)
+Variable Instance ZOBJECT Using OBJECT
+Variable Char    WNOMTRACE
+Variable Integer WOUVTRACE
+
+Local Integer NI, ASTATUS
+Local Instance CTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+
+
+WOUVTRACE=1
+# --- Ecriture de la trace
+# Contrôle des taxes
+If GTRACE = ""
+  Call OUVRE_TRACE(mess(837,197,1)) From LECFIC
+  WOUVTRACE = 2
+Endif
+WNOMTRACE = GTRACE
+
+#Call OUVRE_TRACE("Trace à TOTO pour test!!!") From LECFIC
+  # --------------------------------------------------------------
+  CTX = NewInstance [ZCTX] With =[V]CST_C_NAME_CLASS_CONTEXT
+  ASTATUS = fmet ZOBJECT._AERROR(CTX, CST_ANO)
+  # --------------------------------------------------------------
+  Call ECR_TRACE(string$(40, "*") + "BEGIN ERROR LOGS NB=" + num$(maxtab(CTX.AERROR)),0) From GESECRAN
+  For NI = 1 To maxtab(CTX.AERROR)
+    If CTX.AERROR(NI) <> null
+      Call ECR_TRACE("----->Error(" + num$(NI) + ")=" + num$(CTX.AERROR(NI).PRO) -
+&                       num$(CTX.AERROR(NI).NUM) -
+&                       num$(CTX.AERROR(NI).STA) -
+&                       num$(CTX.AERROR(NI).MES)
+&                      ,0) From GESECRAN
+    Endif
+  Next NI
+  # --------------------------------------------------------------
+  Call ECR_TRACE(string$(40, "*") + "END ERROR LOGS",0) From GESECRAN
+  #FreeInstance [ZCTX]
+  FreeGroup CTX
+
+If WOUVTRACE = 2
+  Call FERME_TRACE From LECFIC
+#  WOUVTRACE = 0
+Endif
+
+End
+
+# -------------------------------------------------------------------------------------------#
+# Fonction de contrôle des taxes pour les commandes ouvertes                                 #
+# -------------------------------------------------------------------------------------------#
+# Cette fonction utilise les masques SOI pour charger la classe CTLVAT de contrôle des taxes
+# les commandes ouvertes ne sont pas valorisées, [M:SIHx] ne sont pas chargés, on ne peut pas utiliser la fonction CTLTAX
+# Chargement de la classe CTLVAT à partir du masque [M:SOI]
+# Appel de la methode de contrôle attachée à la classe CTLVAT
+# Exploitation des paramètres de sorties de la classe CTLVAT avec ecriture d'une trace
+Funprog CTLVATSOI(WNOMTRACE,WOUVTRACE)
+Variable Char    WNOMTRACE
+Variable Integer WOUVTRACE
+
+WOUVTRACE = 0
+
+Local Integer WRET : WRET=0
+# Si pas de contrôle selon paramètre on sort de la fonction
+If GCTLTAX<=1 End WRET Endif
+
+Local Instance CTLVAT   Using C_CTLVAT
+
+# --- l’espace disponible avant NewInstance
+H1 = freeheap/1024
+
+CTLVAT = NewInstance C_CTLVAT
+
+Local Integer WERRITM : # Flag permettant de savoir si on détecte des erreurs sur les lignes
+Local Integer WERRSFI : # Flag permettant de savoir si on détecte des erreurs sur les éléments
+Local Char    WMESSA(250)
+
+#Dbgaff
+# --- Chargement des paramètres dans la classe CTLVAT
+Gosub LOADPARAM_CTLVAT_SOI
+If WRET>=[V]CST_AERROR
+  FreeGroup CTLVAT
+  End WRET
+Endif
+
+# --- Appel de la méthode de contrôle de taxe
+Raz WMESSA
+WRET = fmet CTLVAT.CTLVAT
+If WRET >= [V]CST_AERROR
+  Call LOG_ERROR(CTLVAT, WNOMTRACE, WOUVTRACE)
+  FreeGroup CTLVAT
+  End WRET
+Endif
+
+# --- Aucune erreur
+If sum(WERRITM, WERRSFI, CTLVAT.VACBPRFLG, CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITMFLG, CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VATFLG)=0
+#Infbox "Aucune erreur"
+  WRET=0
+  FreeGroup CTLVAT
+  End WRET
+Endif
+
+# --- Au moins une erreur
+# --- Exploitation des paramètres de sortie de la classe CTLVAT pour écrire la trace
+
+#Infbox "Au moins une erreur"
+
+Gosub TRTERR_CTLVAT_SOI
+If WRET>=[V]CST_AERROR
+  FreeGroup CTLVAT
+  End
+Endif
+
+FreeGroup CTLVAT
+
+H2 = freeheap/1024
+
+End WRET
+
+
+# -------------------------------------------------------------------------------------- #
+# Chargement des paramètres dans la classe CTLVAT pour le contrôle des commandes ouvertes#
+# -------------------------------------------------------------------------------------- #
+$LOADPARAM_CTLVAT_SOI
+
+Local Integer WI, WJ
+Local Integer WIND_VACITM, WIND_VAT
+
+Local Integer WRET
+
+Local Integer WLINE
+
+CTLVAT.VCRTYP=13
+CTLVAT.VCRNUM=[M:SOI1]SOHNUM
+
+CTLVAT.LEG=GCURLEG
+CTLVAT.CPY=GSOCIETE
+CTLVAT.FCY=[M:SOI1]SALFCY
+CTLVAT.DAT=[M:SOI1]ORDDAT
+
+CTLVAT.VACBPR=[M:SOI1]VACBPR
+CTLVAT.VACBPRFLG=0              : # Faire mieux
+
+WIND_VACITM=1
+WIND_VAT=1
+
+# ------------------------------------------ #
+# Boucle sur les lignes                      #
+# ------------------------------------------ #
+# - Pour alimenter le tableau des niveaux à contrôler
+# - Pour alimenter le tableau des taxes à contrôler
+Gosub LOADPARAM_CTLVAT_ITM_SOI
+If WRET>=[V]CST_AERROR
+  Return
+Endif
+
+# ------------------------------------------ #
+# Boucle sur les éléments                    #
+# ------------------------------------------ #
+# - Pour alimenter le tableau des niveaux à contrôler
+# - Pour alimenter le tableau des taxes à contrôler
+# Il n'y a pas d'éléments de facturation à vérifier pour les lignes de commandes ouvertes
+#Gosub LOADPARAM_CTLVAT_SFI
+#If WRET>=[V]CST_AERROR
+#  Return
+#Endif
+
+# Faire mieux
+For WI = 1 To maxtab(CTLVAT.C_VACITM)
+  If CTLVAT.C_VACITM(WI) <> null Then
+    CTLVAT.C_VACITM(WI).VACITMFLG = 0
+    #Call ECR_TRACE("CTLVAT niveau de taxe="-CTLVAT.C_VACITM(WI).VACITM,0) From GESECRAN
+  Endif
+Next I
+
+# Faire mieux
+For WI = 1 To maxtab(CTLVAT.C_VAT)
+  If CTLVAT.C_VAT(WI) <> null Then
+    CTLVAT.C_VAT(WI).VATFLG = 0
+    #Call ECR_TRACE("CTLVAT Code de taxe="-CTLVAT.C_VAT(WI).VAT,0) From GESECRAN
+  Endif
+Next I
+
+WRET=0
+
+#Call FERME_TRACE From LECFIC
+#Call LEC_TRACE From LECFIC
+
+Return
+
+
+# ------------------------------------------------------------------------------------------ #
+# Chargement des paramètres dans la classe CTLVAT pour une ligne article de commande ouverte #
+# ------------------------------------------------------------------------------------------ #
+# --------------------------------------------------------------- #
+# - Pour alimenter le tableau des niveaux à contrôler             #
+# - Pour alimenter le tableau des taxes à contrôler               #
+# --------------------------------------------------------------- #
+$LOADPARAM_CTLVAT_ITM_SOI
+
+# --- Chargement des niveaux de taxe dans la classe CTLVAT
+# Niveau 1
+If [M:SOI1]VACITM1<>""
+    WJ=find([M:SOI1]VACITM1,CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+    If !WJ
+        If CTLVAT.C_VACITM(WIND_VACITM) = null
+          WRET = fmet CTLVAT.ADDLINE("C_VACITM",WIND_VACITM)
+          If WRET = [V]CST_ANOTDEFINED
+            #--The insertion was not possible
+            WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VACITM","CTLVAT"), [V]CST_AERROR)
+            Return
+          Endif
+          WIND_VACITM=WRET
+        Endif
+        CTLVAT.C_VACITM(WIND_VACITM).VACITM=[M:SOI1]VACITM1
+        WIND_VACITM += 1
+    Endif
+Else
+    WERRITM=1
+Endif
+
+# Niveau 2
+If [M:SOI1]VACITM2<>""
+    WJ=find([M:SOI1]VACITM2,CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+    If !WJ
+        If CTLVAT.C_VACITM(WIND_VACITM) = null
+          WRET = fmet CTLVAT.ADDLINE("C_VACITM",WIND_VACITM)
+          If WRET = [V]CST_ANOTDEFINED
+            #--The insertion was not possible
+            WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VACITM","CTLVAT"), [V]CST_AERROR)
+            Return
+          Endif
+          WIND_VACITM=WRET
+        Endif
+        CTLVAT.C_VACITM(WIND_VACITM).VACITM=[M:SOI1]VACITM2
+        WIND_VACITM += 1
+    Endif
+Endif
+
+# Niveau 3
+If [M:SOI1]VACITM3<>""
+    WJ=find([M:SOI1]VACITM3,CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+    If !WJ
+        If CTLVAT.C_VACITM(WIND_VACITM) = null
+          WRET = fmet CTLVAT.ADDLINE("C_VACITM",WLINE)
+          If WRET = [V]CST_ANOTDEFINED
+            #--The insertion was not possible
+            WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VACITM","CTLVAT"), [V]CST_AERROR)
+            Return
+          Endif
+          WIND_VACITM=WRET
+        Endif
+        CTLVAT.C_VACITM(WIND_VACITM).VACITM=[M:SOI1]VACITM3
+        WIND_VACITM += 1
+    Endif
+Endif
+
+# --- Chargement des codes taxe dans la classe CTLVAT
+# Code 1
+If [M:SOI1]VAT(0)<>""
+    WJ=find([M:SOI1]VAT(0),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+    If !WJ
+        If CTLVAT.C_VAT(WIND_VAT) = null
+          WRET = fmet CTLVAT.ADDLINE("C_VAT",WLINE)
+          If WRET = [V]CST_ANOTDEFINED
+            #--The insertion was not possible
+            WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VAT","CTLVAT"), [V]CST_AERROR)
+            Return
+          Endif
+          WIND_VAT=WRET
+        Endif
+        CTLVAT.C_VAT(WIND_VAT).VAT   =[M:SOI1]VAT(0)
+        CTLVAT.C_VAT(WIND_VAT).VATTYP=1
+        WIND_VAT += 1
+    Elsif CTLVAT.C_VAT(WJ).VATTYP=2
+        # On raz VALTYP car un code taxe ne peut être de type TVA et de type Para/Spé
+        CTLVAT.C_VAT(WJ).VATTYP=0
+    Endif
+Else
+    WERRITM=1
+Endif
+
+# Code 2
+If [M:SOI1]VAT(1)<>""
+    WJ=find([M:SOI1]VAT(1),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+    If !WJ
+        If CTLVAT.C_VAT(WIND_VAT) = null
+          WRET = fmet CTLVAT.ADDLINE("C_VAT",WLINE)
+          If WRET = [V]CST_ANOTDEFINED
+            #--The insertion was not possible
+            WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VAT","CTLVAT"), [V]CST_AERROR)
+            Return
+          Endif
+          WIND_VAT=WRET
+        Endif
+        CTLVAT.C_VAT(WIND_VAT).VAT=[M:SOI1]VAT(1)
+        CTLVAT.C_VAT(WIND_VAT).VATTYP=2
+        WIND_VAT += 1
+    Elsif CTLVAT.C_VAT(WJ).VATTYP=1
+        # On raz VALTYP car un code taxe ne peut être de type TVA et de type Para/Spé
+        CTLVAT.C_VAT(WJ).VATTYP=0
+    Endif
+Elsif [M:SOI1]VACITM2<>""
+    WERRITM=1
+Endif
+
+# Code 3
+If [M:SOI1]VAT(2)<>""
+    WJ=find([M:SOI1]VAT(2),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+    If !WJ
+        If CTLVAT.C_VAT(WIND_VAT) = null
+          WRET = fmet CTLVAT.ADDLINE("C_VAT",WLINE)
+          If WRET = [V]CST_ANOTDEFINED
+            #--The insertion was not possible
+            WRET = fmet CTLVAT.ASETERROR ("", func ASYRFNC.MES2(mess(266,133,1),"C_VAT","CTLVAT"), [V]CST_AERROR)
+            Return
+          Endif
+          WIND_VAT=WRET
+        Endif
+        CTLVAT.C_VAT(WIND_VAT).VAT=[M:SOI1]VAT(2)
+        CTLVAT.C_VAT(WIND_VAT).VATTYP=2
+        WIND_VAT += 1
+    Elsif CTLVAT.C_VAT(WJ).VATTYP=1
+        # On raz VALTYP car un code taxe ne peut être de type TVA et de type Para/Spé
+        CTLVAT.C_VAT(WJ).VATTYP=0
+    Endif
+Elsif [M:SOI1]VACITM3<>""
+    WERRITM=1
+Endif
+
+WRET=0
+
+#Infbox "LOADPARAM_CTLVAT_ITM"-num$(WERRITM)
+
+Return
+
+
+# -------------------------------------------------------------------------- #
+# Traitement des erreurs du controle des taxes pour les commandes ouvertes   #
+# -------------------------------------------------------------------------- #
+$TRTERR_CTLVAT_SOI
+
+Local Integer WI, WJ
+Local Integer WKO, WITMKO, WELTKO, WTVAKO, WPARAKO
+Local Char    WMESSA(255), WMESSA1(255), WMESSA2(255)
+Local Integer WCOLOR
+
+# Si ctrl non bloquant, faire apparaitre les erreurs en vert
+# Si ctrl bloquant,     faire apparaitre les erreurs en rouge
+If GCTLTAX=2 WCOLOR=-1 Else WCOLOR=1 Endif
+
+WOUVTRACE=1
+# --- Ecriture de la trace
+# Contrôle des taxes
+If GTRACE = ""
+  Call OUVRE_TRACE(mess(837,197,1)) From LECFIC
+  WOUVTRACE = 2
+Endif
+WNOMTRACE = GTRACE
+
+# Flag err : 0:Aucune (titre à afficher) / 1:Au moins une (titre déjà affiché)
+WKO=0
+
+# Affichage du  n° de document
+WMESSA1=mess(837,197,1)
+If CTLVAT.VCRNUM<>""
+#    WMESSA1=mess(837,197,1)-"\"+mess(CTLVAT.VCRTYP,476,1)-":"-CTLVAT.VCRNUM
+    WMESSA1-="\"+mess(CTLVAT.VCRTYP,476,1)-":"-CTLVAT.VCRNUM
+Endif
+
+# Régime de taxe
+If CTLVAT.VACBPR=""
+    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+    #  Régime de taxe non renseigné
+    Call ECR_TRACE(mess(620,197,1)-mess(841,197,1),WCOLOR) From GESECRAN
+Elsif CTLVAT.VACBPRFLG=1
+    # Régime avec une erreur
+    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+    Call ECR_TRACE(CTLVAT.VACBPRMSG,WCOLOR) From GESECRAN
+Endif
+
+WTVAKO=0 : WPARAKO=0
+
+If sum(WERRITM, CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITMFLG, CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VATFLG)<>0
+    # Traitement des erreurs du controle des taxes pour la ligne de commande ouverte
+    Gosub TRTERR_CTLVAT_ITM_SOI
+Endif
+
+#If sum(WERRSFI, WERRITM, CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITMFLG, CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VATFLG)<>0
+#    # Traitement des erreurs du controle des taxes pour les éléments
+#    Gosub TRTERR_CTLVAT_SFI
+#Endif
+
+If WOUVTRACE = 2
+  Call FERME_TRACE From LECFIC
+#  WOUVTRACE = 0
+Endif
+
+#Local Integer WOK
+#WOK=1
+#If GCTLTAX=1
+#    Call OUINON (mess(849,197,1), WOK) From GESECRAN
+#Elsif GCTLTAX=2
+#    Call ERREUR (mess(849,197,1)) From GESECRAN
+#Endif
+#
+#Call LEC_TRACE   From LECFIC
+#
+#If WOK=1 WRET=1 Endif
+Return
+
+# -------------------------------------------------------------------------------  #
+# Traitement des erreurs du controle des taxes pour une ligne de commande ouverte  #
+# -------------------------------------------------------------------------------- #
+$TRTERR_CTLVAT_ITM_SOI
+
+#Infbox "TRTERR_CTLVAT_ITM"
+
+    # Flag err article : 0:Aucune(titre à afficher) / 1:Au moins une (titre déjà affiché)
+    WITMKO=0
+# A VOIR MESSAGE : AJOUTER LA LIGNE
+    WMESSA=mess(18,197,1)-":"-num$([M:SOI1]SOPLIN)-mess(80,197,1)-":"-[M:SOI1]ITMREF-[M:SOI1]ITMDES
+
+    # ----------- LES NIVEAUX ------------------
+    # Niveau 1
+    If [M:SOI1]VACITM1=""
+        # Niveau de taxe 1 non renseigné
+        WTVAKO=1
+        If WITMKO=0
+            If WKO=0
+                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+            Endif
+            WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+        Endif
+        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-mess(841,197,1),WCOLOR) From GESECRAN
+   Else
+        WJ=find([M:SOI1]VACITM1,CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If WJ=0
+            # Niveau non trouvé dans le tableau
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Niveau de taxe 1 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VACITM(WJ).VACITMFLG=1
+            # Niveau avec une erreur
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+CTLVAT.C_VACITM(WJ).VACITMMSG,WCOLOR) From GESECRAN
+        Endif
+    Endif
+
+    # Niveau 2
+    If [M:SOI1]VACITM2<>""
+        WJ=find([M:SOI1]VACITM2,CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If WJ=0
+            # Niveau non trouvé dans le tableau
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Niveau de taxe 2 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VACITM(WJ).VACITMFLG=1
+            # Niveau avec une erreur
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+CTLVAT.C_VACITM(WJ).VACITMMSG,WCOLOR) From GESECRAN
+        Endif
+    Endif
+
+    # Niveau 3
+    If [M:SOI1]VACITM3<>""
+        WJ=find([M:SOI1]VACITM3,CTLVAT.C_VACITM(1..maxtab(CTLVAT.C_VACITM)).VACITM)
+        If WJ=0
+            # Niveau non trouvé dans le tableau
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Niveau de taxe 3 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VACITM(WJ).VACITMFLG=1
+            # Niveau avec une erreur
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+CTLVAT.C_VACITM(WJ).VACITMMSG,WCOLOR) From GESECRAN
+        Endif
+    Endif
+
+    # ----------- LES CODES ------------------
+    # Code 1
+    If [M:SOI1]VAT(0)=""
+        # Code taxe 1 non renseigné
+        WTVAKO=1
+        If WITMKO=0
+            If WKO=0
+                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+            Endif
+            WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+        Endif
+        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-[M:SOI1]VACITM1-":"-mess(840,197,1)-"1"-mess(841,197,1),WCOLOR) From GESECRAN
+    Else
+        WJ=find([M:SOI1]VAT(0),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If WJ=0
+            # Code taxe non trouvé dans le tableau
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Code taxe 1 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-[M:SOI1]VACITM1-":"-mess(840,197,1)-"1"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATFLG=1
+            # Code avec une erreur
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-[M:SOI1]VACITM1-":"-CTLVAT.C_VAT(WJ).VATMSG,WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATTYP<>1
+            # Cette taxe n'est pas de type TVA
+            WTVAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"1"-":"-[M:SOI1]VACITM1-":"-mess(840,197,1)-"1"-":"-CTLVAT.C_VAT(WJ).VAT-":"-mess(11,119,1),WCOLOR) From GESECRAN
+        Endif
+    Endif
+
+    # Code 2
+    If [M:SOI1]VAT(1)<>""
+        WJ=find([M:SOI1]VAT(1),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If WJ=0
+            # Code taxe non trouvé dans le tableau
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Code taxe 2 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-[M:SOI1]VACITM2-":"-mess(840,197,1)-"2"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATFLG=1
+            # Code avec une erreur
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-[M:SOI1]VACITM2-":"-CTLVAT.C_VAT(WJ).VATMSG,WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATTYP=1
+            # Code taxe 2 Cette taxe n'est pas de type parafiscale ou spéciale
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-[M:SOI1]VACITM2-":"-mess(840,197,1)-"2"-":"-CTLVAT.C_VAT(WJ).VAT-":"-mess(850,197,1),WCOLOR) From GESECRAN
+        Endif
+    Elsif [M:SOI1]VACITM2<>""
+        # Niveau de taxe sans code taxe associé
+        WPARAKO=1
+        If WITMKO=0
+            If WKO=0
+                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+            Endif
+            WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+        Endif
+        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"2"-":"-[M:SOI1]VACITM2-":"-mess(842,197,1),WCOLOR) From GESECRAN
+    Endif
+
+    # Code 3
+    If [M:SOI1]VAT(2)<>""
+        WJ=find([M:SOI1]VAT(2),CTLVAT.C_VAT(1..maxtab(CTLVAT.C_VAT)).VAT)
+        If WJ=0
+            # Code taxe non trouvé dans le tableau
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+# A VOIR MESSAGE         # Code taxe 3 : Problème lors du contrôle
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-[M:SOI1]VACITM3-":"-mess(840,197,1)-"3"-":"-mess(838,197,1),WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATFLG=1
+            # Code avec une erreur
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-[M:SOI1]VACITM3-":"-CTLVAT.C_VAT(WJ).VATMSG,WCOLOR) From GESECRAN
+        Elsif CTLVAT.C_VAT(WJ).VATTYP=1
+            # Code taxe 3 Cette taxe n'est pas de type parafiscale ou spéciale
+            WPARAKO=1
+            If WITMKO=0
+                If WKO=0
+                    WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                    If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+                Endif
+                WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+            Endif
+            Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-[M:SOI1]VACITM3-":"-mess(840,197,1)-"3"-":"-CTLVAT.C_VAT(WJ).VAT-":"-mess(850,197,1),WCOLOR) From GESECRAN
+        Endif
+    Elsif [M:SOI1]VACITM3<>""
+        # Niveau de taxe sans code taxe associé
+        WPARAKO=1
+        If WITMKO=0
+            If WKO=0
+                WKO=1 : Call ECR_TRACE(WMESSA1,0) From GESECRAN
+                If CTLVAT.VACBPR<>"" Call ECR_TRACE(mess(1109,196,1)-":"-CTLVAT.VACBPR, 0) From GESECRAN Endif
+            Endif
+            WITMKO=1 : Call ECR_TRACE(WMESSA, 0) From GESECRAN
+        Endif
+        Call ECR_TRACE(string$(7," ")+mess(839,197,1)-"3"-":"-[M:SOI1]VACITM3-":"-mess(842,197,1),WCOLOR) From GESECRAN
+    Endif
+
+Return
+
+# 101874
+

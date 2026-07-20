@@ -1,0 +1,653 @@
+#<AdxTL>@(#)5.0.0.0 $Revision$
+
+End
+
+############################################################################
+#  SIXGASA : pour traitements de bascule Integrale --> X3                  #
+############################################################################
+#                                                                          #
+# Subprog SIXGASA                                                          #
+#     Reprise de l'historique purement analytique                          # 
+#  => Création de pièces comptables X3 de type analytique en état définitif#
+#                                                                          #
+# PREREQUIS :                                                              #
+# ***********                                                              #
+#   - Les tables de base et de paramétrage ont dues être intégrées         #
+#     et contrôlées                                                        #
+#   - Les types de pièces et les compteurs de numérotation ont dues être   #
+#     définis (on livre des types de pièces associés à des codes           #
+#     compteurs documents mais le paramétrage doit être accepté ou         #
+#     modifié en fonction des besoins                                      #
+#                                                                          #
+# Les OD purement analytiques sont reprises en devise locale               #
+#                                                                          #
+############################################################################
+
+Gosub SI_CONTEXT From SIXFONCTION
+
+Local File SIPARX3  [SPX]
+Read [SPX] First
+Call EXEC From SIXGASA
+
+End
+
+
+#########################################################################
+Subprog EXEC
+
+If !clalev([F:XGAA]) : Local File =SI_DOSSIER+".XIHISANA"    [XGAA]  : Endif  # Historique analytique
+If !clalev([F:XAA2]) : Local File =SI_DOSSIER+".XIHISANA"    [XAA2]  : Endif  # Historique analytique
+
+If !clalev([F:SPX])  : Local File =SI_DOSSIER+".SIPARX3"     [SPX]   : Endif  # Paramétrage migration
+If !clalev([F:SPJ])  : Local File =SI_DOSSIER+".SIPARJOU"    [SPJ]   : Endif  # Paramétrage migration
+
+Read [SPX] First
+Read [SPJ] First
+
+Filter [XGAA] Where FLGREP<>2
+Read [XGAA]IND0 First
+Filter [XGAA]
+If fstat : End : Endif 
+
+Local Integer WOUV_TRACE
+If GTRACE = ""
+ # Historique analytique
+ Call OUVRE_TRACE("SIXGASA : "+SI_MES(196)) From LECFIC         
+ WOUV_TRACE=1
+Endif
+
+Onerrgo TRT_ERR
+
+#---- Historique analytique => Création écritures analytiques définitives ------#
+Call ECR_TIME(SI_MES(196)-"=>"-SI_MES(131)) From DOSSUB
+
+If [F:SPX]OPTANA<>2
+ ## L'option 'Reprise analytique' n'a pas été demandée
+ Call ECR_TRACE(SI_MES(198),1) From GESECRAN : Goto FIN_GAS
+Endif
+
+If [F:SPJ]JOU=""
+ # Type de pièce - Paramètre non défini
+ Call ECR_TRACE(mess(10,105,1)-":"-mess(141,105,1),1) From GESECRAN : Goto FIN_GAS
+Endif
+
+Call SI_GASA
+If GOK<>1 : Goto FIN_GAS : Endif
+
+
+$FIN_GAS
+Onerrgo 
+If WOUV_TRACE=1
+ Call FERME_TRACE From LECFIC
+ Call LEC_TRACE   From LECFIC
+Endif
+End
+
+$TRT_ERR
+Call ECR_TRACE( "ligne"-num$(errl)-":"-errm-errmes$(errn), 1) From GESECRAN
+Resume
+
+
+######################################################################################
+## Traitement historique purement analytique
+######################################################################################
+Subprog SI_GASA
+
+If !clalev([F:XGAA]) : Local File =SI_DOSSIER+".XIHISANA"     [XGAA]  : Endif  # Historique analytique
+If !clalev([F:XAA2]) : Local File =SI_DOSSIER+".XIHISANA"     [XAA2]  : Endif  # Historique analytique
+
+Gosub OUVFIC
+Gosub DECLARE
+If STAT : End : Endif
+
+SI_SUBPRG = "SIXGASA"
+SI_TABLE  = "XIHISANA"
+Gosub SI_CRITSUP From SIXFONCTION
+
+CRITERE="1=1"
+
+Call VARGLOBANA(MESSA,STAT) From SIXGAS
+If STAT
+ ## Nb d'axes définis dans l'Intégrale pas cohérent avec le dimensionnement du code activité ANA => On arrête
+ Call ECR_TRACE(MESSA,1) From GESECRAN : End
+Endif
+
+Read [XSOC]  First
+If !fstat
+ [L]DEVLOC = [F:XSOC]DVSIPC
+Endif
+Read [XSO1]  First
+
+## Qu'une société forcément...
+Read [CPY]CPY0 First
+If !fstat
+ [L]SOCIETE   = [F:CPY]CPY
+ [L]SITE      = [F:CPY]MAIFCY
+ [L]ORIGINE   = "H"
+ [L]DATPREMEX = [F:CPY]STRPER
+ If [L]DATPREMEX = [0/0/0]
+  # Date début premier exercice non définie
+  Call ECR_TRACE(SI_MES(132),1) From GESECRAN : End
+ Endif
+ Call GETSOC([L]SITE) From DEVSUB
+ Call LEC_COA(2,[F:SPX]CPY,[L]COAANA) From SIXCPY
+Endif
+
+ 
+NBJOUANA = 0
+For [XGAA]IND0(1)
+ Read [XJRN]IND0 = [F:XGAA]CODJRN
+ If !fstat & [F:XJRN]TYPJRN="L"
+  NBJOUANA += 1
+  TBJOUANA(NBJOUANA) = [F:XGAA]CODJRN
+ Endif
+Next
+
+Filter [XGAA] Where evalue(CRITERE) & FLGREP<>2 & NATMVT<>"I" & find(CODJRN,TBJOUANA(1..NBJOUANA)) & X3DAT>=[L]DATPREMEX
+&                   Order By Key CLE = CODJRN ; X3DAT ; NUMECRHIS ; NUMVTL
+
+## Parcours des écritures de l'historique analytique par code journal/date début période/numéro pièce : 
+## une transaction par couple code journal/date écriture
+
+Call ECR_TRACE("",0) From GESECRAN 
+
+For [XGAA]CLE(2)
+ ## On exclut les pièces d'A-nouveaux (sauf celle qui correspond au premier exercice repris).
+ ## La seule manière de reconnaître les pièces d'A-nouveaux analytiques est de se baser sur le libellé de
+ ## l'écriture. Le libellé commence par "Reprise des soldes au" suivi de la date de génération de l'A-nouveau
+ ## => Reprise des écritures ana associées à une date égale à la date début premier exercice repris et quel
+ ##    que soit le libelle ET celle qui sont > à [L]DATPREMEX mais qui ne commencent pas par 
+ ##    "Reprise des soldes au" (pour exclure les A-nouveaux analytiques générés sur l'exercice suivant le
+ ##    premier exercice repris
+ If [F:XGAA]X3DAT=[L]DATPREMEX or ([F:XGAA]X3DAT>[L]DATPREMEX and left$([F:XGAA]LIBECR,21)<>"Reprise des soldes au")
+  Call DEBTRANS From GLOCK
+  # Reprise Journal ... ; Période ...
+  Call ECR_TRACE(SI_MES(135)-mess(13,105,1)-[F:XGAA]CODJRN-";"-mess(59,116,1)-format$(GFMDAT,[F:XGAA]X3DAT),0) From GESECRAN
+  Call ECR_TRACE(string$(70,"-"),0) From GESECRAN 
+  Gosub TR_PCE
+  Call ECR_TRACE("",0) From GESECRAN 
+ Endif
+Next
+End
+
+
+$TR_PCE
+
+Trbegin [HAE], [DAE], [DAA], [XGAA], [PER]
+
+ Gosub OUV_PER
+
+ Gosub PIECE : # Une pièce par code journal/date début période pour les écritures purement ana
+ 
+ Gosub CLO_PER
+
+ If GOK>0 & SI_SIMU<>2
+  Commit
+ Else
+  Rollback
+  If STAT | GOK<1
+   # Journal... ; Période ...
+   Call ECR_TRACE(mess(13,105,1)-[F:XGAA]CODJRN-";"-mess(59,116,1)-format$(GFMDAT,[F:XGAA]X3DAT)-":"-SI_MES(139),0) From GESECRAN
+   Return
+  Endif
+ Endif
+Return
+
+
+$PIECE
+STAT = 0 : SPSTAT = 0
+JOURNAL  = [F:XGAA]CODJRN 
+OKDEV = 0 : [L]DEVPCE=[L]DEVLOC : # Reprise en devise locale
+Gosub RAZPCE
+Gosub LIGNE
+If GOK<1 : Return : Endif
+Return
+
+$RAZPCE
+Raz TOTDEB, TOTCDT, TOTDEBLOC, TOTCDTLOC
+Raz [M:HAE0], [M:HAE1], [M:HAE2], [M:VTL], [M:VT2]
+Return
+
+
+$LIGNE
+For [XGAA]CLE(3)
+
+ Call AFFBOITE([F:XGAA]CODJRN-format$("D:"+GFMDAT4,[F:XGAA]DATECR)) From SUBSIM
+
+ DATCPT   = [F:XGAA]DATECR
+
+ NOL = [M:HAE2]NBLIG
+ [M:HAE2]ACC1(NOL) = func SIXFONCTION.SI_COR("XIPLACBGNR",[F:XGAA]CPTVTL,"GACCOUNT","")
+ Call LEC_GAC([M:HAE2]ACC1(NOL),[L]COAANA) From CPTLEC
+ Call LEC_CPY(SOCIETE) From CPTLEC
+ [M:HAE2]FCYLIN(NOL) = [F:CPY]MAIFCY
+ [M:HAE2]DES(NOL) = [F:XGAA]LIBECR
+ 
+ If [F:XGAA]SENECR = "C"
+  [M:HAE2]CDT(NOL)  = [F:XGAA]MNTDBTFRS
+  [L]TOTCDT    += [M:HAE2]CDT(NOL)
+  [L]TOTCDTLOC += [F:XGAA]MNTDBTFRS
+  Assign "[M]AMT"+num$(GTYPANA)+"("+num$(NOL)+")" With [F:XGAA]MNTDBTFRS
+  Assign "[M]AMTFRC"+num$(GTYPANA)+"("+num$(NOL)+")" With [F:XGAA]MNTDBTFRS
+ Elsif [F:XGAA]SENECR = "D"
+  [M:HAE2]DEB(NOL) = [F:XGAA]MNTDBTFRS
+  [L]TOTDEB += [M:HAE2]DEB(NOL)
+  [L]TOTDEBLOC += [F:XGAA]MNTDBTFRS
+  Assign "[M]AMT"+num$(GTYPANA)+"("+num$(NOL)+")" With [F:XGAA]MNTDBTFRS
+  Assign "[M]AMTFRC"+num$(GTYPANA)+"("+num$(NOL)+")" With [F:XGAA]MNTDBTFRS
+ Endif
+ Assign "[M]AMTFLG"+num$(GTYPANA)+"("+num$(NOL)+")" With 1
+
+ Gosub INICNACCE
+ [F:XGAA]FLGREP = 2
+ Rewrite [F:XGAA]
+ If fstat
+  # Erreur d'écriture
+  Call ECR_TRACE("XIHISANA"-mess(26,125,1)-func SIXFONCTION.FSTATMSG(fstat)-[L]JOURNAL-format$(GFMDAT,[L]DATCPT)-num$([F:XGAA]NUMECRHIS)-num$([F:XGAA]NUMVTL),1) From GESECRAN
+  GOK = 0 : Break
+ Endif
+
+ [M:HAE2]NBLIG += 1
+
+ ## Trop de lignes => On crée la pièce et on passe par un compte d'attente
+
+ If [M:HAE2]NBLIG>=MAXECT
+  Gosub VALPCE
+  If GOK<1 : Break : Endif
+  STAT = 0 : SPSTAT = 0
+  Raz [M:HAE0], [M:HAE1], [M:HAE2], [M:VTL], [M:VT2]
+  Raz [M:HAE2]NBLIG
+  NOL = [M:HAE2]NBLIG
+ Endif
+
+Next : # For [XGAA]CLE(3) (parcours des écritures analytiques d'un même code journal/date début période)
+
+If GOK<1 : Return : Endif
+
+## Création de la pièce (forcément la dernière du groupe)
+If [M:HAE2]NBLIG>0
+ Gosub VALPCE
+ If GOK<1 : Return: Endif
+Endif
+If GOK<1 : Return: Endif
+Return
+
+
+$VALPCE
+Gosub EN_TETE
+SI_TABLE = "GACCENTRY"
+Gosub SI_BEFWRI From SIXFONCTION
+Call CONTROLE(STAT,MESSA) From CPTBATCH
+If STAT
+ Gosub MESSAGE From CPTAUTO
+ GOK = 0 : Call ECR_TRACE(MESSA,1) From GESECRAN : Return
+Endif
+If SI_SIMU=2
+ Call ECR_TRACE(mess(40,107,1)-"sur"-[M:HAE0]TYP-[M:HAE0]NUM-"au"-format$("D:"+GFMDAT4,[M:HAE0]ACCDAT)-"pour"-num$(TOTDEB)-[M:HAE1]CUR,0) From GESECRAN 
+ Return
+Endif
+Call VALPIECER(STAT,MESSA) From CPTBATCH
+If STAT
+ Call ECR_TRACE(MESSA,1) From GESECRAN
+ GOK = 0 : Return
+Endif
+If GOK<1 : Return : Endif 
+Call ECR_TRACE(mess(40,107,1)-[F:HAE]TYP-[F:HAE]NUM-format$("D:"+GFMDAT4,[F:HAE]ACCDAT),0) From GESECRAN 
+Return
+
+$EN_TETE
+# Infos en-tête
+[M:HAE0]CPY    = [L]SOCIETE
+[M:HAE0]FCY    = [L]SITE
+[M:HAE0]NUM    = ""
+## On génère la pièce sur le type de pièce qui a comme journal par défaut le code du journal courant
+[L]TYPPCE = ""
+[M:HAE0]JOU = func SIXFONCTION.SI_COR("XIJRN",[F:XGAA]CODJRN,"GJOURNAL","")
+Call LEC_JOU_LEG([F:CPY]LEG,[M:HAE0]JOU) From CPTLEC
+If [L]TYPPCE = ""
+ Read [SPJ]SPJ0 = [F:SPX]CLE;[M:HAE0]JOU
+ If !fstat
+  [L]TYPPCE = [F:SPJ]GTE
+ Else
+  # Type de pièce non défini (Journal...)
+  Call ECR_TRACE(mess(27,110,1)-"("+mess(13,105,1)-[F:XGAA]CODJRN+")",1) From GESECRAN
+  GOK = 0 : Return
+ Endif
+Endif
+[M:HAE0]TYP    = [L]TYPPCE
+Case [L]ORIGINE
+ When "H"
+  [M:HAE0]ACCDAT = [F:XGAA]X3DAT
+ When "B"
+  [M:HAE0]ACCDAT = [F:XGAA]DATECR
+Endcase
+
+Call GETPERSOC([L]SOCIETE,GTYPANA,[F:XGAA]DATECR,EXERCICE,PERIODE) From CPTSUB
+[M:HAE0]FIY    = EXERCICE
+[M:HAE0]PER    = PERIODE
+
+[M:HAE1]ENTDAT = [M:HAE0]ACCDAT
+[M:HAE1]DUDDAT = [M:HAE0]ACCDAT
+[M:HAE1]VALDAT = [M:HAE0]ACCDAT
+[M:HAE1]RVS    = 1
+[M:HAE1]REFSIM = ""
+[M:HAE0]CAT    = 1 : # Réel
+If [L]ORIGINE = "H" 
+ [M:HAE0]STA = 2 : # Historique => définitif
+Else
+ [M:HAE0]STA = 1 : # Brouillard => Provisoire
+Endif
+If [L]ORIGINE = "B" 
+ [M:HAE1]DESVCR = SI_MES(175)-num$([F:XGAA]NUMLOT)-format$(GFMDAT,[F:XGAA]DATSAILOT)
+Else
+ [M:HAE1]DESVCR = SI_MES(175)
+Endif
+[M:HAE1]CUR    = func SIXFONCTION.SI_COR("XIDVS",[L]DEVPCE,"TABCUR","")
+# Gestion de cours  sous CONTROLE de CPTBATCH
+
+# Ecritures Intégrale
+[M:HAE1]REF    = SI_MES(136)
+[M:HAE1]REFINT = "INTEG"-"ANA"
+
+If dim ([M:HAE1]FLGDAS)>0 
+ [M:HAE1]FLGDAS = 1
+Endif
+If dim([F:GTE]FUP)>0 
+ [M:HAE1]FLGFUP = 1
+Endif
+[M:HAE1]FLGPAZ = 1
+## Toutes les pièces (même le premier AN repris) doivent avoir un FLGREP<>2 de manière à ce que les écritures
+## rattachées puissent être lettrées dans X3
+[M:HAE1]FLGREP = 1
+[M:HAE1]ORIMOD = 2
+
+
+# V6
+[M:HAE0]DACDIA = [L]SCHEMA
+## Initialisation masque de référence [HAEF]
+Call INIMSKFMT3([M:HAE0]FCY,1,[L]SCHEMA,[M:HAE0]TYP,[M:HAE0]ACCDAT,STAT) From SUBGASA
+For I=1 To [M:HAEF]NBRLED
+ Assign "[M:HAE1]COA("+num$(I-1)+")" With [M:HAEF]COA(I-1)
+ Assign "[M:HAE2]COA("+num$(I-1)+")" With [M:HAEF]COA(I-1)
+Next
+Return
+
+
+$INICNACCE
+REPART_ANA = 0
+Filter [XAA2] Where CODJRN=[L]JOURNAL & DATECR=[L]DATCPT & NUMECRHIS=[F:XGAA]NUMECRHIS
+Read [XAA2] Last 
+Filter [XAA2]
+If !fstat & [F:XAA2]NUMVTL>1
+ REPART_ANA = 1
+Endif
+FIRSTVENT = 1
+
+If !REPART_ANA
+ Gosub LECCNA
+ If [M:HAE2]ACC1(NOL)<>""
+  [M:HAE2]QTY(NOL) = arr([F:XGAA]QTE,AROQTE)
+  ## Le sous-programme INICCE va initialiser [M:HAE2]CCE1, [M:HAE2]CCE2,...
+  Call INICCE([F:XGAA]SECANA,"[M:HAE2]CCE",NOL) From SIXGAS
+ Endif
+ [F:XGAA]FLGREP = 2
+ Rewrite [F:XGAA]
+ If fstat
+  # Erreur d'écriture
+  Call ECR_TRACE("XIHISANA"-mess(26,125,1)-func SIXFONCTION.FSTATMSG(fstat)-[L]JOURNAL-format$(GFMDAT,[L]DATCPT)-num$([F:XGAA]NUMECRHIS),1) From GESECRAN
+  GOK = 0 : Return
+ Endif
+Else
+ Gosub LECCNA
+ If [M:HAE2]ACC1(NOL)<>""
+  ## Parcours de toutes les répartitions analytiques
+  For [XGAA]CLE
+   Gosub VENTILE
+   If GOK<1 : Break : Endif
+  Next
+  If GOK<1 : Return : Endif
+ Endif
+Endif
+Return
+
+$LECCNA
+If !FIRSTVENT : Return : Endif
+#Call LEC_GAC([M:HAE2]ACC1(NOL),[L]COAANA) From CPTLEC
+#If fstat
+# Read [XPCG]IND0 = [M:HAE2]ACC1(NOL)
+# If fstat
+#  Call LEC_GAC([M:HAE2]ACC1(NOL),[L]COAANA) From CPTLEC
+#  Call LEC_COA([L]COAANA) From CPTLEC
+#  Call INIACCFMT([F:COA]COA) From SETGLBCOA
+#  [L]COASTD = [L]COAANA : Gosub CRE_GAC_GEN From SIXGAC
+# Endif
+#Endif
+Call LEC_GAC([M:HAE2]ACC1(NOL),[L]COAANA) From CPTLEC
+If dim([F:ACC]UOM)>0
+ [M:HAE2]UOM(NOL) = [F:GAC]UOM
+ If [F:ACC]UOM<>""
+  Call LECTURE("TUN",[F:GAC]UOM,"") From CONTOBJ
+  AROQTE = 10^(-[F:TUN]UOMDEC)
+ Endif
+Endif
+FIRSTVENT = 0
+Return
+
+$VENTILE
+If [M:VT2]PTVENT+1>=dim([M:VT2]TBAMT)
+ # Trop ventilations analytiques
+ Call ECR_TRACE([M:HAE0]TYP-[M:HAE0]NUM-num$(nolign)-mess(79,117,1),1) From GESECRAN
+ GOK = 0 : Return
+Endif
+[M:VT2]PTVENT += 1
+If [M:HAE2]PTV(NOL)=0 
+ [M:HAE2]PTV(NOL) = [M:VT2]PTVENT
+Endif
+[M:HAE2]PTF(NOL) = [M:VT2]PTVENT
+[M:HAE2]DSP(NOL) = "$"
+Call INICCE([F:XGAA]SECANA,"[M:VT2]TBCCE",[M:VT2]PTVENT) From SIXGAS
+
+[M:VT2]TBAMT([M:VT2]PTVENT) = [F:XGAA]MNTDBTFRS
+
+If dim([M:VT2]TBLOC)>0
+ [M:VT2]TBLOC([M:VT2]PTVENT) = [F:XGAA]MNTDBTFRS
+Endif
+If dim([M:VT2]TBRPT)>0
+ [M:VT2]TBRPT([M:VT2]PTVENT) = [F:XGAA]MNTDBTFRS
+Endif
+
+[M:VT2]TBQTY([M:VT2]PTVENT) = arr([F:XGAA]QTE,AROQTE)
+[M:HAE2]QTY(NOL) = arr(sum([M:VT2]TBQTY([M:HAE2]PTV(NOL)..[M:HAE2]PTF(NOL))),AROQTE)
+[F:XGAA]FLGREP = 2
+Rewrite [F:XGAA]
+If fstat
+ # Erreur d'écriture
+ Call ECR_TRACE("XIHISANA"-mess(26,125,1)-func SIXFONCTION.FSTATMSG(fstat)-[L]JOURNAL-format$(GFMDAT,[L]DATCPT)-num$([F:XGAA]NUMECRHIS),1) From GESECRAN
+ GOK = 0 : Return
+Endif 
+Return
+
+
+$SENS_ECR    
+If [M:HAE2]DEB(NOL)<>0                             : SNSECR=1
+Elsif [M:HAE2]CDT(NOL)<>0                          : SNSECR=-1
+Elsif evalue("[M]AMTFRC"+num$(GTYPANA)+"(NOL)")>0  : SNSECR=1
+Elsif evalue("[M]AMTFRC"+num$(GTYPANA)+"(NOL)")<0  : SNSECR=-1
+Else                                               : SNSECR=1
+Endif
+Return
+
+$OUV_PER
+## NB : Les exercices sont créés dans X3 avec le statut 'ouvert' de manière à pouvoir relancer la clôture
+## dans X3. Par contre, les périodes de chaque exercice correspondant à des périodes/exercices clôturés
+## dans l'Intégrale sont créées dans X3 avec le statut 'fermé' (pour ne pas pouvoir saisir de nvelles
+## pièces sur cette période)
+## Ici, on va ouvrir temporairement la période sur laquelle on va reprendre les pièces de manière à ne pas
+## bloquer avec 'Période fermée'... On refermera la période juste avant à la fin de la transaction...
+OKCLOPER = 0
+Call GETPERSOC([L]SOCIETE,GTYPANA,[F:XGAA]X3DAT,EXE2,PERIO2) From CPTSUB
+Read [PER]PER0 = [L]SOCIETE;GTYPANA;EXE2;PERIO2
+If !fstat & [F:PER]PERSTA=3
+ OKCLOPER = 1
+ [F:PER]PERSTA    = 2
+ Rewrite [PER]
+ If fstat
+  If [L]ORIGINE = "H"
+   # Erreur d'écriture
+   Call ECR_TRACE("PERIOD"-mess(26,125,1)-func SIXFONCTION.FSTATMSG(fstat)-[F:XGAA]CODJRN-format$(GFMDAT,[F:XGAA]X3DAT),1) From GESECRAN
+   GOK = 0 : Return
+  Else
+   # Erreur d'écriture
+   Call ECR_TRACE("PERIOD"-mess(26,125,1)-func SIXFONCTION.FSTATMSG(fstat)-num$([F:XGAA]NUMLOT)-format$(GFMDAT,[F:XGAA]DATSAILOT),1) From GESECRAN
+   GOK = 0 : Return
+  Endif
+ Endif
+Endif
+Return
+
+$CLO_PER
+## On referme la période si elle a été ouverte temporairement pour la reprise des écritures Intégrale
+If OKCLOPER
+ Read [PER]PER0 = [L]SOCIETE;GTYPANA;EXE2;PERIO2
+ If !fstat
+  [F:PER]PERSTA    = 3
+  [F:PER]PERANASTA = 3
+  Rewrite [PER]
+  If fstat
+   If [L]ORIGINE = "H"
+    # Erreur d'écriture
+    Call ECR_TRACE("PERIOD"-mess(26,125,1)-func SIXFONCTION.FSTATMSG(fstat)-[F:XGAA]CODJRN-format$(GFMDAT,[F:XGAA]X3DAT),1) From GESECRAN
+    GOK = 0 : Return
+   Else
+    # Erreur d'écriture
+    Call ECR_TRACE("PERIOD"-mess(26,125,1)-func SIXFONCTION.FSTATMSG(fstat)-num$([F:XGAA]NUMLOT)-format$(GFMDAT,[F:XGAA]DATSAILOT),1) From GESECRAN
+    GOK = 0 : Return
+   Endif
+  Endif
+ Endif
+Endif
+Return
+
+
+
+$OUVFIC
+## Tables Intégrale
+If !clalev([F:XSOC]) : Local File =SI_DOSSIER+".XISOC"        [XSOC]  : Endif  # Société Intégrale
+If !clalev([F:XSO1]) : Local File =SI_DOSSIER+".XISOCDIV1"    [XSO1]  : Endif  # Paramètres Société Intégrale
+If !clalev([F:XGAC]) : Local File =SI_DOSSIER+".XIPLACBGNR"   [XGAC]  : Endif  # Comptes généraux
+If !clalev([F:XPCG]) : Local File =SI_DOSSIER+".XIPLACBGNR"   [XPCG]  : Endif  # Comptes généraux
+If !clalev([F:XBPC]) : Local File =SI_DOSSIER+".XICLT"        [XBPC]  : Endif  # Clients
+If !clalev([F:XBPS]) : Local File =SI_DOSSIER+".XIFOU"        [XBPS]  : Endif  # Fournisseurs
+If !clalev([F:XPCG]) : Local File =SI_DOSSIER+".XIPLACBANA"   [XPAN]  : Endif  # Sections analytiques
+If !clalev([F:XJRN]) : Local File =SI_DOSSIER+".XIJRN"        [XJRN]  : Endif  # Journaux comptables
+
+## Tables X3
+If !clalev([F:HAE])  : Local File =SI_DOSSIER+".GACCENTRY"    [HAE]   : Endif  # En-tête pièces comptables
+If !clalev([F:DAE])  : Local File =SI_DOSSIER+".GACCENTRYD"   [DAE]   : Endif  # Lignes de pièces comptables
+If !clalev([F:DAA])  : Local File =SI_DOSSIER+".GACCENTRYA"   [DAA]   : Endif  # Lignes analytiques
+If !clalev([F:DUD])  : Local File =SI_DOSSIER+".GACCDUDATE"   [DUD]   : Endif  # Echéances
+If !clalev([F:CPY])  : Local File =SI_DOSSIER+".COMPANY"      [CPY]   : Endif  # Sociétés
+If !clalev([F:FCY])  : Local File =SI_DOSSIER+".FACILITY"     [FCY]   : Endif  # Sites
+If !clalev([F:JOU])  : Local File =SI_DOSSIER+".GJOURNAL"     [JOU]   : Endif  # Journaux
+If !clalev([F:GDE])  : Local File =SI_DOSSIER+".GDIAENTRY"    [GDE]   : Endif  # Transaction
+If !clalev([F:GTE])  : Local File =SI_DOSSIER+".GTYPACCENT"   [GTE]   : Endif  # Types de pièces
+If !clalev([F:GCM])  : Local File =SI_DOSSIER+".GACM"         [GCM]   : Endif  # Modèles comptables
+If !clalev([F:COA])  : Local File =SI_DOSSIER+".GCOA"         [COA]   : Endif  # Codes Plans
+If !clalev([F:GAC])  : Local File =SI_DOSSIER+".GACCOUNT"     [GAC]   : Endif  # Comptes
+If !clalev([F:DIE])  : Local File =SI_DOSSIER+".GDIE"         [DIE]   : Endif  # Sections analytiques
+If !clalev([F:CCE])  : Local File =SI_DOSSIER+".CACCE"        [CCE]   : Endif  # Sections analytiques
+If !clalev([F:PER])  : Local File =SI_DOSSIER+".PERIOD"       [PER]   : Endif  # Périodes
+If !clalev([F:FIY])  : Local File =SI_DOSSIER+".FISCALYEAR"   [FIY]   : Endif  # Exercices
+If !clalev([F:BPC])  : Local File =SI_DOSSIER+".BPCUSTOMER"   [BPC]   : Endif  # Clients
+If !clalev([F:BPS])  : Local File =SI_DOSSIER+".BPSUPPLIER"   [BPS]   : Endif  # Fournisseurs
+If !clalev([F:BPR])  : Local File =SI_DOSSIER+".BPARTNER"     [BPR]   : Endif  # Tiers
+If !clalev([F:TVT])  : Local File =SI_DOSSIER+".TABVAT"       [TVT]   : Endif  # Taux de taxes
+If !clalev([F:TCU])  : Local File =SI_DOSSIER+".TABCUR"       [TCU]   : Endif  # Devises
+If !clalev([F:TUN])  : Local File =SI_DOSSIER+".TABUNIT"      [TUN]   : Endif  # Unités
+If !clalev([F:TPT])  : Local File =SI_DOSSIER+".TABPAYTERM"   [TPT]   : Endif  # Conditions de paiement
+Return
+
+
+$DECLARE
+
+Local Mask GACCENTFMT  [HAEF]        # Ouverture du masque pour diverses informations
+Local Mask GACCENTW    [HAEW]        # Ouverture du masque pour la gérer les lignes de pièces comtpables.
+Local Mask SAICURLED   [SCL]         # Ouverture du masque pour la gestion des devises
+
+
+Local Mask GACCENT0 [HAE0], GACCENT1 [HAE1], GACCENT2 [HAE2], VENTILE [VTL], VENTILE2 [VT2]
+ 
+Local Char    DEVLOC(GLONCUR)     : # Devise locale (CODIFICATION DEVISE DE l'INTEGRALE : le transcodage sera
+                                    # fait à la fin au moment de la création de l'en-tête de pièce (init [M:HAE1]CUR))     
+Local Char    DEVPCE(GLONCUR)     : # Devise dans laquelle va être générée la pièce X3 (CODIFICATION DEVISE 
+                                    # DE l'INTEGRALE. Plus facile pour les lectures/filtres tables Intégrale)
+Local Char    SOCIETE(GLONCPY)    : # Code société
+Local Char    SITE(GLONFCY)       : # Code site
+Local Char    TYPPCE(GLONGTE)     : # Type de pièce dans lequel va être générée la pièce X3
+Local Char    JOURNAL(GLONJOU)    : # Code journal pièce dans l'Intégrale
+Local Char    TYPPIECE(2)         : # Type de pièce dans l'Intégrale
+Local Char    NUMPIECE(8)         : # Numéro de pièce dans l'Intégrale
+Local Char    MESSA(250)          : # Message
+Local Char    ORIGINE(1)          : # Origine de l'écriture (H:Historique   B:Brouillard)
+Local Char    TIERS(GLONBPR)      : # Code tiers
+Local Char    TYPTIERS(1)         : # Type de tiers
+Local Char    DEVISE(GLONCUR)     : # Code devise
+Local Char    COMP0(10), COMP1(10): # Complément "0" (technique)
+Local Char    SECTION(GLONCCE)    : # Section analytique
+Local Date    DATPREMEX           : # Date début premier exercice
+Local Date    DATCPT              : # Date écriture dans l'Intégrale 
+Local Date    LASTDCLVAT          : # Date dernière déclaration TVA
+Local Integer OKDEV               : # Si 1:on génére la pièce en devise 0:génération en devise locale
+Local Integer NBDEV               : # Nombre devises mouvementés pour une pièce Intégrale
+Local Integer MULTIDEV            : # Si 1:Pièce intégrale muti-devise ; O:mono-devise
+Local Integer EQUILIBRE           : # Si 1:le groupe d'écritures est équilibré en devise locale
+Local Integer EQUIDEV             : # 1:Equilibre contrôlé en devise XXX
+Local Integer MAXECT              : # Nombre maximum de lignes d'écritures d'une pièce X3
+Local Integer SPSTAT, STAT        : # Statut erreur
+Local Integer AXE                 : # Numéro d'axe analytique
+Local Integer REPART_ANA          : # Si 1:l'écriture contient une répartition ana (imputations de X sections sur le même axe)
+Local Integer LASTNUMECR          : # Dernier n°écriture traité dans un groupe d'écritures ayant même journal/date écriture
+Local Integer NBECH, XNBECH       : # Nombre d'échéaces associées à une ligne auxiliarisée
+Local Integer NBECT               : # Nombre d'écritures
+Local Integer OKCLOPER            : # Si 1 =la période a été ouverte le temps de la reprise, il faut la refermer
+Local Integer LOT                 : # Numéro de lot
+Local Integer FIRSTVENT
+Local Integer CAS
+Local Integer NOL, NOLI
+Local Integer PASSE
+Local Integer SNSECR              : # Signe écriture (1:Débit : -1:Crédit)
+Local Integer SIGN
+Local Decimal COURS, COURDEV
+Local Decimal ARRONDI
+Local Decimal EXERCICE, PERIODE : # Exercice, periode
+Local Decimal EXE2, PERIO2      : # Exercice, periode
+Local Decimal TOTDEB, TOTCDT
+Local Decimal TOTDEBLOC, TOTCDTLOC
+Local Decimal TOTAMTCUR
+Local Decimal AROQTE
+Local Char    TDEVISE(GLONCUR)(1..99) : # Table des devises mouvementées pour une pièce
+Local Integer VU
+Local Integer NBSEUIL
+Local Integer STAT : STAT = 0
+Local Integer BIDON
+
+
+#TestCP
+Local Decimal SOMDEBORG, SOMDEBDES,SOMCDTORG, SOMCDTDES    # Saupoudrage
+Local Char   TBSEC(GLONCCE)(1..9)                          # Sections analytique pour les écart d'arrondis
+
+Local Integer NBJOUANA
+Local Char TBJOUANA(GLONJOU)(1..100)
+
+#V6
+Local Char  COASTD(GLONCOA),COAANA(GLONCOA)
+Local Char  SCHEMA(GLONGDE)        : # Transaction de saisie comptable
+Read [SPX] First
+[L]SCHEMA = [F:SPX]DACDIAANA
+Call LEC_GDE([L]SCHEMA) From CPTLEC
+GSCHEMA=[L]SCHEMA
+Return
+
+
+
+

@@ -1,0 +1,347 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ 
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#STCAH - 2017-04-25 - REQUIREMENT nnn - US nnn
+#Handling all public methods for DEMCONGEESS_CSTD
+############################################################################################################
+$METHODS
+Case [L]AMETHOD
+  When "CONSLTACUR"               : Gosub CONSLTACUR
+  When "EXEWORKFLOW_DCGMOD"       : Gosub EXEWORKFLOW_ESSDCGMOD
+Endcase
+Return
+
+############################################################################################################
+$OPERATIONS
+Case [L]AOPERATION
+  When "CANREQ"       : Gosub CANCEL_REQUEST
+  When "DEL_ATT"      : Gosub DELETE_ATTACHMENT
+Endcase
+Return
+############################################################################################################
+$DEMCONGE_VALID
+#Manage  Duplication on collections - mobile only
+Return
+############################################################################################################
+$CANCEL_REQUEST
+##Keys from representation (Record instance)
+##1. REFNUM
+##2. UID
+
+#Parameters
+#1. RETUID - Integer
+
+#Set return value
+[L]ARET_VALUE = [V]CST_AOK
+
+Gosub CANCEL_REQUEST_CLASSIC
+
+Return
+
+
+$CANCEL_REQUEST_CLASSIC
+Local Integer UPD_OK : UPD_OK = 2
+Local Integer READSTATUS
+Local Integer WRKFLOWSTAT
+Local Integer STAREQ
+Local Char INF_MSG(250)
+Local Integer DEM_NUM
+Local Char VREFNUM(GLONEML) : VREFNUM = REFNUM
+Local Integer VUID : VUID = UID
+Local Integer TRANSACTION_PENDING
+Local Integer RETUID
+TRANSACTION_PENDING = adxlog
+
+
+Local File DEMCONGE [DCGE]
+Local File DEMCONGE [DCGC]
+Local File DEMCONGE [DCGN]
+Local File TIMEMP   [TIP3]
+
+Read [F:DCGE]DCG3 = REFNUM;UID
+If fstat : Return : Endif
+  STAREQ = [F:DCGE]STA
+  If find([F:DCGE]STA,4,5,6,7)
+    # 4 - Rejected
+    # 5 - Cancellation request
+    # 6 - Cancellation accepted
+    # 7 - Cancellation rejected
+
+    [L]ARET_VALUE = fmet this.ASETERROR("", mess(0017,10727,1)+": (" + mess(0002,10743,1) +", " + mess(0003,10743,1) + ")", [V]CST_AWARNING)
+    Return
+  Endif
+
+ #------------------------------
+  If TRANSACTION_PENDING=0
+    Trbegin [DCGC],[DCGE],[DCGN]
+  Endif
+
+
+#Update existing records so that the workflow does not get triggered again
+Local File DEMCONGE [DCG5]
+Update [DCG5] Where REFNUM=REFNUM & WRK>"" With WRK=""
+LogicClose File [DCG5]
+
+  Raz [F:DCGC],[F:DCGN]
+  [F:DCGC] = [F:DCGE]
+  [F:DCGN] = [F:DCGE]
+
+  Delete [F:DCGE]
+  If fstat
+    [L]ARET_VALUE = fmet this.ASETERROR("", mess(179,10720,1), [V]CST_AERROR)
+      Gosub HANDLE_TRANS
+      Return
+  Endif
+
+  If UPD_OK = 2
+    [F:DCGC]UID *= -1
+    [F:DCGC]WRK = ""
+    Case [DCGC]STA
+      When 2 : [F:DCGC]CHRONO =num$(-adxuid(2)) : # Demande
+      When 5 : [F:DCGC]CHRONO2=num$(-adxuid(2)) : # Demande d'annulation
+    Endcase
+    [F:DCGC]UPDDAT = date$
+    [F:DCGC]UPDUSR = GACTX.USER
+    [F:DCGC]UPDNUM += 1
+
+    Write [F:DCGC]
+    If fstat
+      [L]ARET_VALUE = fmet this.ASETERROR("", mess(180,10720,1), [V]CST_AERROR)
+      Gosub HANDLE_TRANS
+      Return
+    Endif
+  Endif
+
+
+  If STAREQ <> 2 #Do not create new record if the old transaction was only requested
+    Raz [F:DCGN]
+    [F:DCGN] = [F:DCGE]
+    [F:DCGN]UPDDAT = date$
+    [F:DCGN]UPDUSR = GACTX.USER
+    [F:DCGN]UID    = uniqid([TIP3])
+    [F:DCGN]STA    = 5 : # Cancellation Request
+    #[F:DCGN]UPDNUM += 2
+    [F:DCGN]WRK    = "M"
+    [F:DCGN]WRKFLG = 2 #FRLAA X3-67505 2018-03-01
+    [F:DCGN]CHRONO = ""
+    [F:DCGN]CHRONO2 = ""
+
+    Write [F:DCGN]
+    If fstat
+      [L]ARET_VALUE = fmet this.ASETERROR("", mess(181,10720,1), [V]CST_AERROR)
+      Gosub HANDLE_TRANS
+      Return
+    Endif
+    #Set the new UID
+    RETUID = [F:DCGN]UID
+  Endif
+
+  Gosub UPDATE_OBSOLETE_WRKFLW
+  Gosub HANDLE_TRANS #Update status not checked - new workflow will be created but not blocking
+
+If RETUID <> 0
+  #Trigger workflow
+  Local Instance I_DEMCONGEESSWRK Using C_DEMCONGEESS
+  I_DEMCONGEESSWRK = NewInstance C_DEMCONGEESS AllocGroup null
+  [L]ARET_VALUE  = fmet I_DEMCONGEESSWRK.AREAD([F:DCGN]REFNUM,[F:DCGN]UID)
+  If [L]ARET_VALUE  = [V]CST_AOK Then
+     [L]ARET_VALUE  = fmet I_DEMCONGEESSWRK.EXEWORKFLOW_DCGMOD()
+  Endif
+    FreeGroup I_DEMCONGEESSWRK
+Endif
+
+
+LogicClose File [DCGE]
+LogicClose File [DCGC]
+LogicClose File [DCGN]
+LogicClose File [TIP3]
+Return
+
+
+$HANDLE_TRANS
+If TRANSACTION_PENDING=0
+  If [L]ARET_VALUE = [V]CST_AERROR
+    Rollback
+  Else
+    Commit
+  Endif
+Endif
+Return
+
+
+$WORKFLOW_UPDATE_STAT
+Local Integer REQNUM,TYPEVT,STAT
+Local Char    CODEVT(30)
+Local Char    MSG(250),CLEOBJ(250)
+Local Char    OPERAT(30)
+
+
+OPERAT="M"       : # Modification
+TYPEVT=2         : # Object based event
+CODEVT="ESSDCG"     : # The object is DCG
+
+#FRLAA X3-82396 2018-03-14 - START
+CLEOBJ=I_DEMCONGEESSW.REFNUM+"~"+num$(I_DEMCONGEESSW.UID)
+#If func AFNC.ACTIV("GLM")>0
+#  CLEOBJ=[F:DCG]REFNUM+"~"+num$([F:DCG]UID)
+#Else
+#  CLEOBJ=[F:DCGN]REFNUM+"~"+num$([F:DCGN]UID)
+#Endif
+#CLEOBJ=[F:DCGN]REFNUM
+#FRLAA X3-82396 2018-03-14 - END
+
+Return
+
+$EXEC_WORKFLOW
+STAT = func ASYRWRKCLASSIC.WORKFLOW(this.ACTX,TYPEVT,CODEVT,OPERAT,CLEOBJ,REQNUM,MSG)
+Return
+
+
+
+$UPDATE_OBSOLETE_WRKFLW
+#-------DEM_NUM must be declared and set before-----#
+Local Integer J
+Local File AWRKHISSUI [AWS3]
+
+Filter [F:AWS3] Where VALCTX1 = VREFNUM and VALCTX4 = num$(VUID) Order By CHRONO Desc
+For [F:AWS3]
+  #If [F:AWS3]FLGSIG = 3 #Cancel even if previously signed
+    [F:AWS3]FLGSIG = 1 : #Cancel workflow
+    Rewrite [F:AWS3]
+    If fstat : Break : Endif
+  #Endif
+ Next
+
+LogicClose File [F:AWS3]
+Return
+
+
+$DELETE_ATTACHMENT
+Local File ABLOB [ABB8]
+Local File DEMCONGE [DCG9]
+[L]ARET_VALUE = [V]CST_AOK
+
+Read [F:DCG9]DCG3 = REFNUM;UID
+If !fstat
+  #Test if file exist  -AVOID.ABLOB always return blank
+  Read [ABB8]ABB0 = "PJ_EML";"DCG~"+REFNUM+"~"+num$(DEM);num$(UID);"001"
+  If fstat = [V]CST_AOK
+    Local Integer RET_STAT
+    Local Char    RET_MSG(255)
+    Local Integer DEM
+    DEM = [F:DCG9]DEM
+    Call REMOVE_FILE("DCG",REFNUM,DEM,UID,RET_MSG, RET_STAT) From PRHPORATT_SOA
+    [L]ARET_VALUE  = fmet this.ASETERROR("TCH_ATTACH",RET_MSG,RET_STAT)
+    If RET_STAT = [V]CST_AINFO
+      Raz this.TCH_ATTACH
+    Endif
+  Endif
+Endif
+LogicClose File [DCG9]
+LogicClose File [ABB8]
+Return
+
+
+$CONSLTAPRO
+[L]ARET_VALUE = [V]CST_AOK
+If func AFNC.ACTIV("GLM")=0 : Return : Endif
+
+#Clearing of balance class - CTRLTAESS
+Gosub CLEAR_BALANCE_CLASSES
+
+Gosub UPDATE_BALANCE_VARIABLES From DEMLTAESS_CSTD_EVT
+#Get CTR in context
+#From DEMCONGE, DEMCONGEESS
+If this.CTRNUM <> AVOID.ACHAR #Set variables
+  Gosub SET_DCG_DATES_DEM From DEMLTAESS_CSTD_EVT
+  If DCG_START = [0/0/0] or DCG_END = [0/0/0]
+    [L]ARET_VALUE = fmet this.ASETERROR("",mess(00033,11691,1),[V]CST_AINFO)
+    Return
+  Else
+    #Reset filter date to be used
+    PLVEFILTER = DCG_END
+    Filter [F:HRCTR2] Where REFNUM = this.REFNUM and CTRNUM = this.CTRNUM and CTRDAT = this.CTRDAT
+    Read [F:HRCTR2] First
+    If fstat = [V]CST_AOK
+      Gosub ADD_BALANCE_CLASS_UPDATE From DEMLTAESS_CSTD_EVT
+    Endif
+  Endif
+Else
+  #Need contract date (start and end date) to display projected balances
+  [L]ARET_VALUE = fmet this.ASETERROR("",mess(00033,11691,1),[V]CST_AINFO)
+Endif
+Return
+
+
+$CONSLTACUR
+[L]ARET_VALUE = [V]CST_AOK
+If func AFNC.ACTIV("GLM")=0 : Return : Endif
+If this.TCH_BALDAT = AVOID.ADATE
+  ASTATUS = fmet this.ASETERROR("",mess(00036,11691,1),[V]CST_AERROR)
+  Return
+Endif
+#Clearing of balance class - CTRLTAESS
+Gosub CLEAR_BALANCE_CLASSES
+
+Gosub UPDATE_BALANCE_VARIABLES From DEMLTAESS_CSTD_EVT
+#Get CTR in context
+#From DEMCONGE, DEMCONGEESS
+PLVEFILTER            = this.TCH_BALDAT
+LVEACTONLY            = this.TCH_BALACT
+CURR_NATURE_EVENT     = this.TCH_BALTIM
+If this.TCH_BALCTR <> AVOID.ACHAR #Set variables
+  #Only show current contract balances
+  Filter [F:HRCTR2] Where REFNUM = this.TCH_BALEML and CTRNUM = this.TCH_BALCTR and CTRDAT = this.TCH_BALDTR
+  Read [F:HRCTR2] First
+  Filter [F:HRCTR2]
+  If fstat = [V]CST_AOK
+    Gosub ADD_BALANCE_CLASS_UPDATE From DEMLTAESS_CSTD_EVT
+  Endif
+Else
+  #Show balance for all active cotracts
+  Filter [F:HRCTR2] Where REFNUM = this.TCH_BALEML and XITDAT = [0/0/0]
+    For [F:HRCTR2]CTR0
+      this.BALLEG = func DIVPAYE_SOA.GET_LEG_CTR([F:HRCTR2]REFNUM, [F:HRCTR2]CTRNUM, [F:HRCTR2]CTRDAT, 1)
+      PGCURLEG =  this.BALLEG
+      Gosub ADD_BALANCE_CLASS_UPDATE From DEMLTAESS_CSTD_EVT
+  Next
+  Filter [F:HRCTR2]
+Endif
+Return
+
+$CLEAR_BALANCE_CLASSES
+#Clearing of balance class
+If this.CTRLTAESS <> null
+  For I = 1 To maxtab(this.CTRLTAESS)
+    OK=fmet this.ADELLINE("CTRLTAESS", 1)
+  Next
+Endif
+Return
+
+
+$TRIGGER_WORKFLOW
+Local Char    OPERAT(30)
+OPERAT="M"       : # Modification
+Gosub WORKFLOW_UPDATE_STAT
+Gosub EXEC_WORKFLOW
+Return
+
+$EXEWORKFLOW_ESSDCGMOD
+Local Char    OPERAT(30)
+Local Integer REQNUM,TYPEVT,STAT
+Local Char    CODEVT(30)
+Local Char    MSG(250),CLEOBJ(250)
+[L]ARET_VALUE = [V]CST_AOK
+
+OPERAT="M"       : # Modification
+TYPEVT=2         : # Object based event
+CODEVT="ESSDCG"     : # The object is ESSDCG
+
+CLEOBJ = this.REFNUM+"~"+num$(this.UID)
+
+
+Gosub EXEC_WORKFLOW
+[L]ARET_VALUE = STAT
+
+Return
+#FRLAA X3-82396 2018-03-14 - END
+

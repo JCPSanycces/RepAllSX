@@ -1,0 +1,390 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+# Issue X3-107197 - 2018-09-12 by CBO : PARAMETER AND ACTIVITY CODE
+
+## <PP ARG> Taxes provinciales Argentines.
+## Les taxes provinciales Argentines sont calculées UNIQUEMENT dans le cas des factures clients (factures tiers et
+## factures de vente)
+## Taxes de sortie = d'où ça part => ce sera par rapport à la province du site
+## Taxes d'entrée  = où ça va => ce sera par rapport à la province du client
+Subprog CALTAXEPROV(CAS,DATREF,REGIME,DEVISE,SIT,ADRSIT,TIERS,ADRTIERS,BASE,TAXES,MONTANT,MONTDED,EXEAMTPRV,TYPREG,STAT)
+Value    Integer CAS              : # Cas d'appel (1:Facture tiers client  2:Factures ventes 3:Factures tiers fourn 4:Factures achats )
+Value    Date    DATREF           : # Date
+Value    Char    REGIME()         : # Régime
+Value    Char    DEVISE()         : # Devise
+Value    Char    SIT              : # Site
+Value    Char    ADRSIT()         : # Code adresse site. Si vide, on va le chercher dans la fiche site
+Value    Char    TIERS            : # Tiers
+Value    Char    ADRTIERS()       : # Code adresse client. Si vide, on va le chercher dans la fiche client
+Value    Decimal BASE             : # Base (HT)
+Variable Char    TAXES()(1..)     : # Codes des taxes provinciales
+Variable Decimal MONTANT(1..)     : # Montant des taxes
+Variable Decimal MONTDED(1..)     : # Montant déductible
+Variable Decimal EXEAMTPRV(1..)   : # Montant exonération : # <PP ARG EXETAX>
+Variable Integer TYPREG           : # Type de régime
+Variable Integer STAT             : # Statut de retour
+
+If func AFNC.ACTIV("KAG") = 0 : End : Endif
+
+If CAS = 1
+ If clalev([F:SIL])=0 : Local File BPCINVLIG  [SIL] : Endif
+Elsif CAS = 2
+ If clalev([F:SID])=0 : Local File SINVOICED  [SID] : Endif
+Endif
+If CAS=1 | CAS=2
+ If clalev([F:BPC])=0 : Local File BPCUSTOMER [BPC] : Endif
+Endif
+
+If clalev([F:TVT])=0 : Local File TABVAT    [TVT] : Endif
+If clalev([F:TRA])=0 : Local File TABRATVAT [TRA] : Endif
+If clalev([F:TCU])=0 : Local File TABCUR    [TCU] : Endif
+If clalev([F:ADI])=0 : Local File ATABDIV   [ADI] : Endif
+If clalev([F:TVB])=0 : Local File TABVACBPR [TVB] : Endif
+
+Local Char    TAXRCP(GLONVAT), TAXISS(GLONVAT)
+Local Integer NBOTHTAX
+
+Local Char OTHTAX(GLONVAT)(1..2)
+
+If CAS=1 | CAS=2
+ Call LECTURE("BPC",TIERS,"") From CONTOBJ
+ If [F:BPC]AGTSATTAX<>2
+  Raz TAXES, MONTANT, MONTDED
+  End
+ Endif
+Endif
+
+## <PP ARG EXETAX>
+Local Char SOCIETE(GLONCPY)
+Call LECTURE("FCY",SIT,"") From CONTOBJ
+SOCIETE = [F:FCY]LEGCPY
+If func AFNC.PARAM("ARGTAX",SOCIETE)<>"2"
+ Raz TAXES, MONTANT, MONTDED
+ End
+Endif
+## <Fin PP ARG>
+
+Call TAXEPROV(CAS,REGIME,SIT,ADRSIT,TIERS,ADRTIERS,TAXRCP,TAXISS,NBOTHTAX,OTHTAX)
+TAXES(1) = TAXRCP
+TAXES(2) = TAXISS
+For X=1 To NBOTHTAX
+ TAXES(X+2) = OTHTAX(X)
+Next
+
+Gosub CAL_TAXE
+End
+
+
+$CAL_TAXE
+## TYPREG = 1 : Normal, il faut appliquer les taxes
+## TYPREG = 2 : Export, il ne faut pas appliquer les taxes
+## TYPREG = 3 : Suspension de taxes, il ne faut pas appliquer les taxes
+## TYPREG = 4 : CEE, cas spécial selon achat/vente
+
+## STAT = 0 : RAS TVB
+## STAT = 1 : Un code taxe n'existe pas
+## STAT = 2 : Y'a pas de taux applicable
+## STAT = 3 : Type de base incorrect
+## STAT = 4 : Il y a 2 taxes de type TVA
+## STAT = 5 : Code régime inexistant
+## STAT = 6 : Société ou site inexistant
+## STAT = 7 : Taxes de régime différents
+
+Local Integer NBTAXE
+NBTAXE = 4
+
+Local Libelle TYPTAX(1..NBTAXE)
+Local Libelle BASVAT(1..NBTAXE)
+Local Char    TAX(GLONVAT), COMPANY(GLONCPY)
+Local Decimal TAUX1, TAUX2, MONTANT1, MONTANT2, BASTVA, BASTAX
+Local Integer NTVA, I
+
+Raz MONTANT , MONTDED , TYPREG , STAT
+Call LECTURE("TCU",DEVISE,"") From CONTOBJ
+
+I = find(SIT,GSITE(1..GNBSITE))
+If I
+ COMPANY = GSOCSITE(I)
+Else
+ STAT = 6 : Return
+Endif
+
+Call LEC_CPY(COMPANY) From CPTLEC
+
+# Lecture des taxes
+REGIME = ""
+For I=1 To NBTAXE
+ If TAXES(I)<>""
+  Call LEC_TVT_LEG([F:CPY]LEG,TAXES(I)) From CPTLEC
+  If fstat : STAT = 1 : Break : Endif
+  TYPTAX(I) = [F:TVT]VATTYP
+  BASVAT(I) = [F:TVT]VATBAS
+  If REGIME=""
+   REGIME = [F:TVT]VATVAC
+  Elsif REGIME<>[F:TVT]VATVAC
+   STAT = 7 : Break
+  Endif
+ Endif
+Next I
+If STAT : Return : Endif
+
+# Type de régime applicable
+If REGIME=""
+ TYPREG = 1 : # Par défaut "normal"
+Else
+ Call GETSOC(SIT) From DEVSUB
+ Call LEC_TVB(GCURLEG,REGIME) From CPTLEC
+ If fstat or [F:TVB]ENAFLG<>2 : STAT = 5 : Return : Endif
+ TYPREG = [F:TVB]REGVAC
+Endif
+Gosub CALNORM
+End
+
+
+$CALNORM
+# Calcul à partir d'un montant HT
+# On commence par les taxes parafiscales
+BASTVA = BASE
+For I=1 To NBTAXE
+ TAX    = TAXES(I)
+ BASTAX = BASE
+ If TAX<>""
+  Gosub CALCUL
+  If STAT : Break : Endif
+  MONTANT(I) = MONTANT1
+  MONTDED(I) = MONTANT2
+ Endif
+Next I
+If STAT : Return : Endif
+Return
+
+
+$CALCUL
+Gosub LECTAX
+Call RNDTVA(BASTAX,TAUX1,[F:TCU]CURRND,MONTANT1) From SUBTVT
+## <PP ARG EXETAX>
+Gosub EXONERATION
+## <Fin PP ARG>
+# Pour le montant déductible, quelle option ?
+MONTANT2 = arr(MONTANT1*TAUX2/100,[F:TCU]CURRND)
+Return
+
+
+$LECTAX
+# Cas particulier société ??
+Call LEC_TVT_LEG([F:CPY]LEG,TAX) From CPTLEC
+Filter [TRA] Where CPY=COMPANY & VAT=TAX & STRDAT<=DATREF & LEG=[F:TVT]LEG
+Read [TRA]TRA0 Last
+If fstat>2
+# sinon on se rabat sur le code dossier
+ Filter [TRA] Where CPY="" & VAT=TAX & STRDAT<=DATREF & LEG=[F:TVT]LEG
+ Read [TRA]TRA0 Last
+ If fstat>2 : STAT = 2 : Return : Endif
+Endif
+TAUX1 = [F:TRA]VATRAT
+TAUX2 = [F:TRA]DEDRAT
+Return
+
+
+# <PP ARG EXETAX>
+$EXONERATION
+If CAS>3 : Return : Endif : # Exonérations gérées uniquement côté clients
+If MONTANT1=0 : EXEAMTPRV(I) = 0 : Endif
+## En gestion des exonérations, on accepte par exemple d'avoir pour un client, une société et un code taxe de type TVA
+## un taux éxonération de 10% et d'avoir pour tous les autres codes taxes de type TVA un taux d'éxonération de 20%. Dans
+## ce cas, on pourra réaliser ce paramétrage en ne spécifiant pas de code taxe pour le second cas.
+## Par conséquent, on tient compte de la priorité à donner pour la recherche de l'exonération :
+## 1 °) On regarde d'abord s'il y a une exonération pour le client qui est spécifique à la société et au code taxe
+If clalev([F:TEX])=0 : Local File TABVATEXE [TEX] : Endif
+Filter [TEX] Where BPCNUM = [L]TIERS
+&                & CPY = [L]SOCIETE & VAT=[L]TAX
+&                & (STRDAT=[0/0/0] | STRDAT<=[L]DATREF) & (ENDDAT=[0/0/0] | ENDDAT>=[L]DATREF)
+Read [TEX]TEX0 First
+If fstat
+ ## 2°) On regarde alors s'il y a une exonération pour le client qui est spécifique à la société (=pour un client,
+ ## et une société une éxonération s'applique pour toute une catégorie de taxe)
+ Filter [TEX] Where BPCNUM = [L]TIERS
+&              &    CPY = [L]SOCIETE & VAT="" & VATTYP = TYPTAX(I)
+&                 & (STRDAT=[0/0/0] | STRDAT<=[L]DATREF) & (ENDDAT=[0/0/0] | ENDDAT>=[L]DATREF)
+ Read [TEX]TEX0 First
+ If fstat
+  If func AFNC.ACTIV("KAG") and func AFNC.PARAM("ARGEXO",[L]SOCIETE)="2"# Issue X3-107197
+   ## 3°) On regarde alors s'il y a une exonération pour le client qui est spécifique au code taxe mais valable pour toutes
+   ## les sociétés
+   Filter [TEX] Where BPCNUM = [L]TIERS
+&                   & CPY = "" & VAT=[L]TAX
+&                   & (STRDAT=[0/0/0] | STRDAT<=[L]DATREF) & (ENDDAT=[0/0/0] | ENDDAT>=[L]DATREF)
+   Read [TEX]TEX0 First
+   If fstat
+    ## 4°) On regarde alors s'il y a une exonération pour le client qui est spécifique qui est s'applique pour toute une
+    ## catégorie de taxes et pour toutes les sociétés
+    Filter [TEX] Where BPCNUM = [L]TIERS
+&                    & CPY = "" & VAT="" & VATTYP = TYPTAX(I)
+&                    & (STRDAT=[0/0/0] | STRDAT<=[L]DATREF) & (ENDDAT=[0/0/0] | ENDDAT>=[L]DATREF)
+    Read [TEX]TEX0 First
+   Endif
+  Endif
+ Endif
+Endif
+If BASTAX>=[F:TEX]TSDMIN & ([F:TEX]TSDMAX=0 | BASTAX<=[F:TEX]TSDMAX)
+ EXEAMTPRV(I) = arr(MONTANT1*[F:TEX]EXERAT/100,[F:TCU]CURRND)
+ MONTANT1 = MONTANT1 - EXEAMTPRV(I)
+Endif
+Return
+## <Fin PP ARG>
+
+
+Subprog ERR_CALTAXE(STAT,MESSA)
+Value Integer STAT
+Variable Char MESSA()
+Case STAT
+ When 1 : MESSA = mess(37,119,1) : # Un code taxe n'existe pas
+ When 2 : MESSA = mess(38,119,1) : # Il n'y a aucun taux applicable
+ When 3 : MESSA = mess(39,119,1) : # Type de base incorrecte
+ When 4 : MESSA = mess(40,119,1) : # Il y a deux taxes de type TVA
+ When 5 : MESSA = mess(41,119,1) : # Code régime inexistant
+ When 6 : MESSA = mess(21,104,1) : # Société ou site inexistant
+ When 7 : MESSA = mess(42,119,1) : # Taxes de régimes différents
+Endcase
+End
+
+
+Subprog TAXEPROV(CAS,REGIME,SIT,ADRSIT,TIERS,ADRTIERS,TAXRCP,TAXISS,NBOTHTAX,TAXOTH)
+Value    Integer CAS           : # Cas d'appel (1:Facture Ventes  2:Factures achats)
+Value    Char    REGIME()      : # Code régime
+Value    Char    SIT()         : # Code site
+Variable Char    ADRSIT()      : # Code adresse site. Si vide, on va le chercher dans la fiche site
+Value    Char    TIERS()       : # Code client
+Variable Char    ADRTIERS()    : # Code adresse client. Si vide, on va le chercher dans la fiche client
+Variable Char    TAXRCP()      : # Code taxe entrée (Type application 'entrée')
+Variable Char    TAXISS()      : # Taxe sortie (Type application 'sortie')
+Variable Integer NBOTHTAX      : # Nombre de taxes provinciales (Type application 'toujours') auquel le tiers est soumis (max 2)
+Variable Char    TAXOTH()(1..) : # Autres taxes provinciales (Type application 'toujours')
+
+If func AFNC.ACTIV("KAG") = 0 : End : Endif
+
+If clalev([F:BPA])=0 : Local File BPADDRESS [BPA] : Endif
+If clalev([F:TVT])=0 : Local File TABVAT    [TVT] : Endif
+If clalev([F:FCY])=0 : Local File FACILITY  [FCY] : Endif
+
+Local Integer VU, NB_OTHTAX
+Local Integer WRET :#--CPO 71937 TVT et multi-lég
+Local Char WLEG(GLONADI) :#--CPO 71937 TVT et multi-lég
+
+NB_OTHTAX = 2
+
+#--CPO 71937 TVT et multi-lég
+If [F:FCY]FCY<>SIT
+Read [F:FCY]FCY0=SIT
+If fstat Raz [F:FCY] Endif
+Endif
+WLEG=[F:FCY]LEG
+#--/CPO
+
+## on commence par s'occuper de la taxe d'entrée. Elle est calculée par rapport à la province d'où va la marchandise
+## (lieu de réception de la marchandise)
+## On a une taxe d'entrée ssi :
+##     1°) la province de reception de la marchandise est associée à un type d'application 'Entrée'
+##     2°) le client est agent de perception pour la province ([F:BPC]FLGSATTAX=2)
+##     3°) la sociéte est agent de perception pour la province (=elle est définie dans le code taxe provinciale)
+TAXRCP = ""
+If ADRTIERS = ""
+ Read [BPC]BPC0 = TIERS
+ If !fstat
+  ADRTIERS = [F:BPC]BPAINV
+ Endif
+Endif
+If ADRTIERS <> ""
+ Read [BPA]BPA0 = 1 ; TIERS ; ADRTIERS
+ If !fstat & [F:BPA]SAT<>""
+  If CAS=1 | CAS=2 : # Ventes
+   Read [ADI]CODE = 364 ; [F:BPA]SAT
+   If !fstat & [F:ADI]N1 = 1 : # Sur la province d'où va la marchandise, on a bien un impôt 'Ingresos Brutos' type 'entrée'
+    VU = find([F:ADI]CODE,[F:BPC]SATTAX(0..dim([F:BPC]SATTAX)-1))
+    # On a une taxe entrée ssi le client est bien agent de perception pour la province ([F:BPC]FLGSATTAX(VU-1))=2
+    If VU & [F:BPC]FLGSATTAX(VU-1)=2
+     #--CPO 71937 TVT et multi-lég
+     #Filter [TVT] Where VATTYP=4 & SAT=[F:BPA]SAT & VATVAC=REGIME
+     #Read [TVT]TVT0 First
+     Filter [TVT] Where VATTYP=4 & SAT=[F:BPA]SAT & VATVAC=REGIME & (LEG=WLEG | LEG="") Order By Key MACLE=VAT Asc;LEG Desc
+     Read [TVT]MACLE First
+ #--CPO
+     Filter [TVT]
+     If !fstat
+      TAXRCP = [F:TVT]VAT
+     Endif
+    Endif
+   Endif
+  Endif
+ Endif
+Endif
+
+
+## on s'occupe maintenant de la taxe d'entrée sortie. Elle est calculée par rapport à la province d'où sort la marchandise
+## On a une taxe de sortie ssi :
+##     1°) la province d'où sort la marchandise (province du site à la ligne) est associée à un type d'application 'Sortie'
+##     2°) le client est agent de perception pour la province ([F:BPC]FLGSATTAX=2)
+##     3°) la sociéte est agent de perception pour la province (=elle est définie dans le code taxe provinciale)
+TAXISS = ""
+If ADRSIT = ""
+ Read [FCY]FCY0 = SIT
+ If !fstat
+  ADRSIT = [F:FCY]BPAADD
+ Endif
+Endif
+If ADRSIT <> ""
+ Read [BPA]BPA0 = 3 ; SIT ; ADRSIT
+ If !fstat & [F:BPA]SAT<>""
+  If CAS=1 | CAS=2 : # Ventes
+   Read [ADI]CODE = 364 ; [F:BPA]SAT
+   If !fstat & [F:ADI]N1 = 2 : # Sur la province d'où sort la marchandise, on a bien un impôt 'Ingresos Brutos' type 'sortie'
+    VU = find([F:ADI]CODE,[F:BPC]SATTAX(0..dim([F:BPC]SATTAX)-1))
+    # On a une taxe sortie ssi le client est bien agent de perception pour la province ([F:BPC]FLGSATTAX(VU-1))=2
+    If VU & [F:BPC]FLGSATTAX(VU-1)=2
+     #--CPO 71937 TVT et multi-lég
+     #Filter [TVT] Where VATTYP=4 & SAT=[F:BPA]SAT & VATVAC=REGIME
+     #Read [TVT]TVT0 First
+     Filter [TVT] Where VATTYP=4 & SAT=[F:BPA]SAT & VATVAC=REGIME & (LEG=WLEG | LEG="") Order By Key MACLE=VAT Asc;LEG Desc
+     Read [TVT]MACLE First
+ #--CPO
+     Filter [TVT]
+     If !fstat
+      TAXISS = [F:TVT]VAT
+     Endif
+    Endif
+   Endif
+  Endif
+ Endif
+Endif
+
+
+## Enfin on s'occupe des autres taxes provinciales (type application 'toujours'). Ces autres taxes provinciales sont
+## calculées quelle que soit la province de sortie ou d'entrée de la marchandise.
+## Ces autres taxes provinciales sont calculées ssi
+##     1°) le client est agent de perception pour la province ([F:BPC]FLGSATTAX=2)
+##     2°) la sociéte est agent de perception pour la province (=elle est définie dans le code taxe provinciale)
+## Il a été convenu que la gestion de deux autres taxes provinciales type 'toujours' sera suffisant. En d'autres termes,
+## cela signifie qu'un client pourra être assujetti à deux taxes provinciales type 'Toujours' au maximum
+NBOTHTAX = 0
+ If CAS=1 | CAS=2 : # Ventes
+ For [ADI]CODE Where NUMTAB = 364 & N1 = 3
+  VU = find([F:ADI]CODE,[F:BPC]SATTAX(0..dim([F:BPC]SATTAX)-1))
+  ## On a une autre taxe provinciale ssi le client est bien agent de perception pour la province associée à un type
+  ## d'application 'Toujours' ([F:BPC]FLGSATTAX(VU-1))=2
+  If VU & [F:BPC]FLGSATTAX(VU-1)=2
+   #--CPO 71937 TVT et multi-lég
+   #Filter [TVT] Where VATTYP=4 & SAT=[F:ADI]CODE & VATVAC=REGIME
+   #Read [TVT]TVT0 First
+   Filter [TVT] Where VATTYP=4 & SAT=[F:ADI]CODE & VATVAC=REGIME & (LEG=WLEG | LEG="") Order By Key MACLE=VAT Asc;LEG Desc
+   Read [TVT]MACLE First
+   #--/CPO
+   If !fstat
+    NBOTHTAX += 1
+    TAXOTH(NBOTHTAX) = [F:TVT]VAT
+   Endif
+   Filter [TVT]
+  Endif
+  If NBOTHTAX = 2 : Break : Endif
+ Next
+Endif
+End
+

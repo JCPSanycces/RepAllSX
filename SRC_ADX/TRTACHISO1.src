@@ -1,0 +1,747 @@
+#<AdxTL>@(#)7.0.0.0 $Revision$
+###########################################################################
+# TRTACHISO1   Traitements lié à la gestion multi-société    module ACHAT #
+# ----------------------------------------------------------------------- #
+# Action                                                                  #
+#   - DIVGENSOH       : Mise à jour commande ventes inter-sociétés        #
+# Sous-programme                                                          #
+#   - DIVGENSOH       : Création, suppression commande ventes             #
+# Gosub                                                                   #
+#   - GENSOH_CDE      : Création, suppression commande classique ventes   #
+#   - GENSOH_CONTRAT  : Création, suppression commande ouverte ventes     #
+#   - UPDATE_INTERSITE: Màj tables achats après appel GENSOH              #
+# Fonctions                                                               #
+#   - ISOFLG          : Indicateur inter-sociétés (renvoi 1=Non, 2=Oui)   #
+#   - CTLMAJISO       : Contrôle si mise à jour autorisée (0=Non, 1=Oui)  #
+###########################################################################
+
+
+#################################################################################
+# DIVGENSOH : Action utilisée dans les règles de Workflow signature             #
+# ----------------------------------------------------------------------------- #
+# Paramètres de l'action :                                                      #
+#   NUM     : Numéro de commande d'achat                                        #
+#   CODTRT  : Code traitement (Code mise à jour)                                #
+#              "C" = Création                                                   #
+#,             "A" = Suppression                                                #
+#   FLGMSG  : Indicateur message                                                #
+#              0 = Pas de message                                               #
+#              1 = Message écran                                                #
+#              2 = Dans GMESSAGE                                                #
+#              3 = Ecriture trace                                               #
+#################################################################################
+
+#################################################################################
+# DIVGENSOH : S/P Mise à jour commande vente inter-sociétés        MBT 09/04/09 #
+# ----------------------------------------------------------------------------- #
+# Subprog DIVGENSPH (WNUMDOC,WMAJCOD,WMSGFLG)                                   #
+#   Sous-programme appelé par l'action DIVGENSOH.                               #
+#   Cette action est utilisée par le workflow des signatures.                   #
+#   Il n'y a pas forcément de transaction en cours et la commande d'achat       #
+#     devra être mise à jour dans ce sous-programme.                            #
+# ----------------------------------------------------------------------------- #
+#   WNUMDOC : Numéro de la commande d'achat                                     #
+#   WMAJCOD : Code de mise à jour                                               #
+#             "C" = Création de la commande ventes après signature              #
+#             "A" = Suppression de la commande vente après annulation signature #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,         #
+#                                          1 = erreur à l'écran (Call ERREUR),  #
+#                                          2 = GMESSAGE + GERR positionnés,     #
+#                                          3 = message dans une trace)          #
+#################################################################################
+Subprog DIVGENSOH(WNUMDOC,WMAJCOD,WMSGFLG)
+Value    Char     WNUMDOC
+Value    Char     WMAJCOD
+Value    Integer  WMSGFLG
+#----- Variables locales -----#
+Local    Char     WSYMBOLE(30)
+Local    Integer  WRET
+Local    Integer  WPOPLIN
+Local    Libelle  WADXLOG
+Local    Char     WMSG(200)
+Local Integer SAV_GOK                : [L]SAV_GOK      =GOK
+# Issue 77927 - 2011-11-18 by VPO : perte du contexte workflow si cde inter-site
+Gosub SAV_CTX_WRK
+#----- Si pas de trace ouverte, on n'écrit pas dans la trace -----#
+If GTRACE="" & [L]WMSGFLG=3  [L]WMSGFLG=2 : Endif
+#----- Test présence module ventes -----#
+If GMODU(6)<>2  End : Endif
+#----- Test si numéro de commande d'achat renseigné -----#
+If [L]WNUMDOC="" | !find([L]WMAJCOD,"C","A")
+  [L]WRET=1 : Gosub TRT_ERR : End
+Endif
+#----- Lecture de la commande d'achat -----#
+If !clalev([F:POH])  Local File PORDER [POH] : Endif
+If [F:POH]POHNUM<>[L]WNUMDOC
+  Read [POH] POH0=[L]WNUMDOC
+  If fstat  [L]WRET=2 : Gosub TRT_ERR : End : Endif
+Endif
+#----- Si commande non inter-sociétés ou sans flux autorisé -----#
+If [F:POH]SALFCY=""  End : Endif
+#----- Si commande de vente existe et création -----#
+If [L]WMAJCOD="C" & [F:POH]OCNNUM<>""  End : Endif
+#----- Si suppression -----#
+If [L]WMAJCOD="A"
+  #----- Si pas de commande de vente -----#
+  If [F:POH]OCNNUM=""   End : Endif
+  #----- Vérification si suppression commande vente autorisée -----#
+  If [F:POH]POHTYP=1
+    Call CTLMAJSOH("A",[F:POH]OCNNUM,[L]WRET) From TRTVENISOC
+    If [L]WRET<>0  [L]WFRET=7 : GOK=0 : Gosub TRT_ERR : End : Endif
+  Endif
+  #----- La vérification pour la commande ouverte est faite plus bas -----#
+Endif
+#-----
+[L]WSYMBOLE="POH"+[L]WNUMDOC
+Lock=[L]WSYMBOLE
+If fstat  [L]WRET=6 : Gosub TRT_ERR : End : Endif
+#-----
+Local File PORDERQ  [POQ] : # Il faut réouvrir à cause du "Link" workflow
+If !adxlog  [L]WADXLOG=0  Else  [L]WADXLOG=1 : Endif
+#-----
+If [F:POH]POHTYP=1
+  Gosub GENSOH_CDE     : # Commande classique
+Else
+  Gosub GENSOH_CONTRAT : # Commande ouverte
+Endif
+#-----
+Unlock=[L]WSYMBOLE
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+# Issue 77927 - 2011-11-18 by VPO : perte du contexte workflow si cde inter-site
+Gosub RESTORE_CTX_WRK
+End
+
+#-----------------------------------------------------------------#
+# sauvegarde du contexte workflow #
+#-----------------------------------------------------------------#
+$SAV_CTX_WRK
+Local Integer WSAV_CTX_WRK  : [L]WSAV_CTX_WRK=1
+If clalev([F:AWS2])
+  If clalev([F:AWSZ])=0 : Local File AWRKHISSUI [AWSZ] : Endif
+  [F:AWSZ]=[F:AWS2]
+Endif
+
+If clalev([F:AWA])
+  If clalev([F:AWAZ])=0  : Local File AWRKPAR    [AWAZ]  : Endif
+  [F:AWAZ]=[F:AWA]
+Endif
+
+If clalev([F:AWF])
+  If clalev([F:AWFZ])=0  : Local File AWRKPARF   [AWFZ]  : Endif
+  [F:AWFZ]=[F:AWF]
+Endif
+
+If clalev([F:AWH])
+  If clalev([F:AWHZ])=0  : Local File AWRKPARH   [AWHZ]  : Endif
+  [F:AWHZ]=[F:AWH]
+Endif
+
+If clalev([F:AWV])
+  If clalev([F:AWVZ])=0  : Local File AWRKREGVAL [AWVZ]  : Endif
+  [F:AWVZ]=[F:AWV]
+Endif
+
+Return
+
+#-----------------------------------------------------------------#
+# restauration du contexte workflow #
+#-----------------------------------------------------------------#
+$RESTORE_CTX_WRK
+If dim([L]WSAV_CTX_WRK)<=0 : Return : Endif
+If [L]WSAV_CTX_WRK<>1 : Return : Endif
+
+If clalev([F:AWSZ])
+  [F:AWS2]=[F:AWSZ]
+Endif
+
+If clalev([F:AWAZ])
+  [F:AWA]=[F:AWAZ]
+Endif
+
+If clalev([F:AWFZ])
+  [F:AWF]=[F:AWFZ]
+Endif
+
+If clalev([F:AWHZ])
+  [F:AWH]=[F:AWHZ]
+Endif
+
+If clalev([F:AWVZ])
+  [F:AWV]=[F:AWVZ]
+Endif
+Return
+
+#-----------------------------------------------------------------#
+# Traitement màj de la commande classique de vente inter-sociétés #
+#-----------------------------------------------------------------#
+$GENSOH_CDE
+#----- Variables locales -----#
+Local  Char     SAV_GABREV(5)  : SAV_GABREV =GABREV
+Local  Char     SAV_GPTRNUM(3) : SAV_GPTRNUM=GPTRNUM
+Local  Integer  SAV_GIMPORT    : SAV_GIMPORT=GIMPORT
+Local  Integer  SAV_NOLIGN     : SAV_NOLIGN =nolign
+Local  Char     SAV_GREP       : SAV_GREP   =GREP
+#-----
+Local  Libelle  WCONTEXTE
+Local  Libelle  WMSKPOXFLG(4)
+Local  Char     ABREV(5)
+#----- Est-on dans le contexte de la gestion de commande ? -----#
+If clalev([M:POH0]) &
+&  clalev([M:POH1]) &
+&  clalev([M:POH2]) &
+&  clalev([M:POH3]) &
+&  [M:POH0]POHNUM=[L]WNUMDOC
+  If GTRACE<>""
+    [L]WMSGFLG=3 : # On force la trace si on est dans la gestion des commandes
+    # Issue 107945 - 2015-05-04 by SR
+    If dim(GPURTRACE)>0 :  GPURTRACE = 2 : Endif
+  Endif
+  [L]WCONTEXTE=1
+  Gosub SAUV_GLOB From TRTX3GLOB
+  #----- Traitement de la commande de vente -----#
+  Gosub GENSOH
+  #-----
+  Gosub REST_GLOB From TRTX3GLOB
+Else
+  GIMPORT=1
+  [L]WCONTEXTE=0
+  #----- Ouverture masques écran et/ou sauvegarde écrans origine -----#
+  If !clalev([M:POH0])
+     Local Mask "POH0" [POH0]
+  Else
+     Local Mask "POH0" [POX0] : [M:POX0]=[M:POH0] : [L]WMSKPOXFLG(0)=1
+  Endif
+  If !clalev([M:POH1])
+     Local Mask "POH1" [POH1]
+  Else
+    # X3-26914 by RBA 20-04-2017
+    #Local Mask "POH1" [POX1] : [M:POX1]=[M:POH1] : [L]WMSKPOXFLG(1)=1
+    Local Mask "POH1" [POX1] : Raz [M:POX1] : Transmask [M:POH1] To [M:POX1] : [L]WMSKPOXFLG(1)=1
+    #/ X3-26914 by RBA 20-04-2017
+  Endif
+  If !clalev([M:POH2])
+     Local Mask "POH2" [POH2]
+  Else
+    # X3-26914 by RBA 20-04-2017
+    #Local Mask "POH2" [POX2] : [M:POX2]=[M:POH2] : [L]WMSKPOXFLG(2)=1
+    Local Mask "POH2" [POX2] : Raz [M:POX2] : Transmask [M:POH2] To [M:POX2] : [L]WMSKPOXFLG(2)=1
+    #/ X3-26914 by RBA 20-04-2017
+  Endif
+  If !clalev([M:POH3])
+     Local Mask "POH3" [POH3]
+  Else
+    # X3-26914 by RBA 20-04-2017
+    #Local Mask "POH3" [POX3] : [M:POX3]=[M:POH3] : [L]WMSKPOXFLG(3)=1
+    Local Mask "POH3" [POX3] : Raz [M:POX3] : Transmask [M:POH3] To [M:POX3] : [L]WMSKPOXFLG(3)=1
+    #/ X3-26914 by RBA 20-04-2017
+  Endif
+  #-----
+  Raz [M:POH0], [M:POH1], [M:POH2], [M:POH3]
+  ABREV ="POH"
+  GABREV="POH"
+  Gosub DEFVAR  From GOBJET
+  WINPROG="WGOPOH"
+  # sr 02.12 Demande 80297
+  # Issue 81372 - 2012-05-04 by SR
+  Call ISWINDOWOK (nomap,"OPOH") From INTRUTILB
+  Gosub OUVRE   From WOPOH
+  OK=1
+  ACTION="OUVRE" : Gosub ACTION  From GOBJSUB
+  If OK
+    #----- Chargement de la commande d'achat -----#
+    CLECUR=1
+    nolign=1
+    [M:POH0]=[F:POH]
+    [M:POH1]=[F:POH]
+    [M:POH2]=[F:POH]
+    [M:POH3]=[F:POH]
+    Gosub SET_CLE From GOBJSUB
+    ACTION="LIENS" : Gosub ACTION  From GOBJSUB
+    #----- Traitement de la commande de vente -----#
+    Gosub GENSOH
+    #-----
+  Else
+    [L]WRET=11 : Gosub TRT_ERR
+  Endif
+  #-----
+  ACTION="FERME" : Gosub ACTION From GOBJSUB
+  If [L]WMSKPOXFLG(0)=1
+    [M:POH0] = [M:POX0]
+    Close Local Mask [POX0]
+  Else
+    Close Local Mask [POH0]
+  Endif
+  If [L]WMSKPOXFLG(1)=1
+    # X3-26914 by RBA 20-04-2017
+    #[M:POH1] = [M:POX1]
+    Transmask [M:POX1] To [M:POH1]
+    #/ X3-26914 by RBA 20-04-2017
+    Close Local Mask [POX1]
+  Else
+    Close Local Mask [POH1]
+  Endif
+  If [L]WMSKPOXFLG(2)=1
+    # X3-26914 by RBA 20-04-2017
+    #[M:POH2] = [M:POX2]
+    Transmask [M:POX2] To [M:POH2]
+    #/ X3-26914 by RBA 20-04-2017
+    Close Local Mask [POX2]
+  Else
+    Close Local Mask [POH2]
+  Endif
+  If [L]WMSKPOXFLG(3)=1
+    # X3-26914 by RBA 20-04-2017
+    #[M:POH3] = [M:POX3]
+    Transmask [M:POX3] To [M:POH3]
+    #/ X3-26914 by RBA 20-04-2017
+    Close Local Mask [POX3]
+  Else
+    Close Local Mask [POH3]
+  Endif
+Endif
+#-----
+GABREV =SAV_GABREV
+GPTRNUM=SAV_GPTRNUM
+GIMPORT=SAV_GIMPORT
+GREP   =SAV_GREP
+nolign =SAV_NOLIGN
+Return
+
+
+#-----------------------------------------------------------#
+# Création ou suppression de la commande classique de vente #
+#-----------------------------------------------------------#
+$GENSOH
+#-----
+If [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Endif
+#-----
+$TR_GENSOH1
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Call GENSOH([L]WMAJCOD,1,[L]WRET) From TRTVENISOC
+If GPURTRACE=1  GPURTRACE=2  : Endif
+If GOK=-1  Goto ROLL_GENSOH1 : Endif
+If GOK=0   Goto AB_GENSOH1   : Endif
+#-----
+Gosub UPDATE_INTERSITE From TRTACHISO1
+If GOK=-1  Goto ROLL_GENSOH1 : Endif
+If GOK=0   Gosub TRT_ERR : Goto AB_GENSOH1 : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+Return
+#-----
+$ROLL_GENSOH1
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  Return  Else  Goto TR_GENSOH1 : Endif
+Else
+  Return
+Endif
+#-----
+$AB_GENSOH1
+If [L]WADXLOG=0
+  Rollback
+Endif
+Return
+
+
+#---------------------------------------------------------------#
+# Traitement màj de la commande ouverte de vente inter-sociétés #
+#---------------------------------------------------------------#
+$GENSOH_CONTRAT
+#-----
+If !clalev([F:POC])  Local File PORDERC    [POC]  : Endif
+If !clalev([F:SOH])  Local File SORDER     [SOH]  : Endif
+If !clalev([F:SOC])  Local File SORDERC    [SOC]  : Endif
+If !clalev([F:SOP])  Local File SORDERP    [SOP]  : Endif
+If !clalev([F:BPD])  Local File BPDLVCUST  [BPD]  : Endif
+If !clalev([F:REP])  Local File SALESREP   [REP]  : Endif
+If !clalev([F:ITM])  Local File ITMMASTER  [ITM]  : Endif
+If !clalev([F:ITS])  Local File ITMSALES   [ITS]  : Endif
+If !clalev([F:ITU])  Local File ITMBPC     [ITU]  : Endif
+If !clalev([F:ITF])  Local File ITMFACILIT [ITF]  : Endif
+If !clalev([F:PRS])  Local File PRICSTRUCT [PRS]  : Endif
+If !clalev([F:TVT])  Local File TABVAT     [TVT]  : Endif
+If !clalev([F:SPK])  Local File SPRICLINK  [SPK]  : Endif
+If !clalev([F:BPR])  Local File BPARTNER   [BPR]  : Endif
+If !clalev([F:BPR2]) Local File BPARTNER   [BPR2] : Endif
+If !clalev([F:BPC])  Local File BPCUSTOMER [BPC]  : Endif
+If !clalev([F:REP])  Local File SALESREP   [REP]  : Endif
+If !clalev([F:ITM])  Local File ITMMASTER  [ITM]  : Endif
+If !clalev([F:ITS])  Local File ITMSALES   [ITS]  : Endif
+If !clalev([F:ITU])  Local File ITMBPC     [ITU]  : Endif
+If !clalev([F:ITF])  Local File ITMFACILIT [ITF]  : Endif
+If !clalev([F:PRS])  Local File PRICSTRUCT [PRS]  : Endif
+If !clalev([F:TVT])  Local File TABVAT     [TVT]  : Endif
+If !clalev([F:SPK])  Local File SPRICLINK  [SPK]  : Endif
+# Issue 112632 - 2015-11-20 by SR
+If !clalev([F:PPC])  Local File PPRICCONF  [PPC] : Endif
+#-----
+If !clalev([M:SORW]) Local Mask SORW       [SORW] : Endif
+#-----
+If [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Endif
+#-----
+$TR_GENSOH2
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Case [L]WMAJCOD
+  When "A" : #----- Suppression
+    Raz [M:SORW]
+    [M:SORW]MAJCOD="A"
+    [M:SORW]SOHNUM=[F:POH]OCNNUM
+    #----- Vérification si suppression autorisée -----#
+    Call CTL_MAJ_SOH From TRTVENMSIT
+    If GOK=-1  Goto ROLL_GENSOH2 : Endif
+    If GOK=0   [L]WRET=7 : Gosub TRT_ERR : Goto AB_GENSOH2 : Endif
+    #----- Suppression contrat vente -----#
+    Call MAJ_SOH From TRTVENMSIT
+    If GOK=-1  Goto ROLL_GENSOH2 : Endif
+    If GOK=0   [L]WRET=7 : Gosub TRT_ERR : Goto AB_GENSOH2 : Endif
+    #-----
+  When "C" : #----- Création
+    Gosub OUVRE From WOPOC
+    Raz [M:SORW]
+    [M:SORW] = [F:POH]
+    # 95742 : PJT en inter société/inter site : (LD:21/04/16)
+    # Le PJT transite uniquement en intersite
+    If [F:POH]BETCPY=2
+        Raz [M:SORW]PJTH
+    Endif
+    # 95742 : PJT en inter société/inter site : (LD:21/04/16)
+    [M:SORW]MAJCOD="C"
+    [M:SORW]VLYDATCON=[F:POH]ENDDAT
+    #----- Contrôle sur le site de facturation qui doit être client
+    Read [BPR2] BPR2(2)=2;[F:POH]INVFCY
+    If fstat  Raz [F:BPR2] : Endif
+    [G:BPR2]currind=1 : [G:BPR2]currlen=0 : # Réinitialisation clé par défaut
+    If [F:BPR2]BPCFLG<>2
+      [L]WRET=10 : Gosub TRT_ERR : Goto AB_GENSOH2
+    Endif
+    #----- Recherche et contrôle du client facture -----#
+    Call RECBPCINV([F:POH]INVFCY,[F:POH]SALFCY,[M:SORW]BPCINV) From TRTVENISOC
+    If mkstat  GOK=0 : [L]WRET=7 : Gosub TRT_ERR : Goto AB_GENSOH2 : Endif
+    #----- Création entête contrat vente -----#
+    Call MAJ_SOH From TRTVENMSIT
+    If GOK=-1  Goto ROLL_GENSOH2 : Endif
+    If GOK=0   [L]WRET=7 : Gosub TRT_ERR : Goto AB_GENSOH2 : Endif
+    [F:POH]OCNNUM=[M:SORW]SOHNUM
+    #----- Création des lignes du contrat ventes -----#
+    For [POC] POC0 Where POHNUM=[L]WNUMDOC
+      Raz [M:SORW]
+      [M:SORW]MAJCOD    = "C"
+      [M:SORW]SOHNUM    = [F:POH]OCNNUM
+      [M:SORW]SOPLIN    = [F:POC]POPLIN
+      [M:SORW]ITMREF    = [F:POC]ITMREF
+      [M:SORW]STOFCY    = [F:POC]STOFCY
+      [M:SORW]SAU       = [F:POC]PUU
+      [M:SORW]EXTQTY    = [F:POC]EXTQTYPUU
+      [M:SORW]USEPLC    = [F:POC]USEPLC
+      [M:SORW]VLYDATITM = [F:POC]ENDDAT
+      [M:SORW]BPCORD    = [F:POH]BPCORD
+      [M:SORW]PRHFCY    = [F:POC]PRHFCY
+      [M:SORW]EECICT    = [F:POC]EECICT2    : # Bug 72215
+      [M:SORW]ICTCTY    = [F:POC]ICTCTY2    : # Bug 72215
+      [M:SORW]FFWNUM    = [F:POC]FFWNUM2    : # Bug 72215
+      [M:SORW]FFWADD    = [F:POC]FFWADD2    : # Bug 72215
+      # 95742 : PJT en inter société/inter site : (LD:21/04/16)
+      # Le PJT transite uniquement en intersite
+      If [F:POH]BETCPY=1
+          [M:SORW]PJT=[F:POC]PJT
+      Endif
+      # 95742 : PJT en inter société/inter site : (LD:21/04/16)
+      # Issue 112632 - 2015-11-20 by SR : Récupérer le code tarif
+      If [F:PPC]PLI<>[F:POC]PLI
+        Read [PPC] PPC0=[F:POC]PLI : If fstat  Raz [F:PPC] : Endif
+      Endif
+      If [F:POH]BETCPY=2  [M:SORW]PLI=[F:POC]PLI : Endif
+      # End issue 112632
+      Call MAJ_SOC From TRTVENMSIT
+      If GOK<1  Break : Endif
+    Next
+    If GOK=-1  Goto ROLL_GENSOH2 : Endif
+    If GOK=0   [L]WRET=7 : Gosub TRT_ERR : Goto AB_GENSOH2 : Endif
+    #-----
+Endcase
+#----- Mise à jour entête commande ouverte d'achat -----#
+Readlock [POH] POH0=[L]WNUMDOC
+If fstat=1
+  GOK=-1 : GLOCK="$PORDER"-[L]WNUMDOC
+  Goto ROLL_GENSOH2
+Elsif fstat
+  GOK=0  : Call RSTA("POH",[L]WNUMDOC) From GLOCK
+  [L]WRET=8 : Gosub TRT_ERR : Goto AB_GENSOH2
+Endif
+#-----
+Case [L]WMAJCOD
+  When "A" : #----- Suppression
+    [M:SORW]SOHNUM=[F:POH]OCNNUM
+    Raz [F:POH]OCNNUM
+    Raz [F:POH]OCNDAT
+    Raz [F:POH]OCNREM
+  When "C" : #----- Création
+    [F:POH]OCNNUM=[M:SORW]SOHNUM
+    [F:POH]OCNDAT=date$
+    [F:POH]OCNREM=mess(74,187,1)
+Endcase
+#----- Réécriture entête commande ouverte d'achat -----#
+Rewrite [POH]
+If fstat
+  GOK=0 : Call FSTA("POH")  From GLOCK
+  [L]WRET=9 : Gosub TRT_ERR : Goto AB_GENSOH2
+Endif
+#----- Contrat xxxxxxxxx supprimé/créé -----#
+If [L]WMSGFLG=3
+  [L]WMSG=mess(92,198,1)-[M:SORW]SOHNUM
+  If [L]WMAJCOD="A"
+    [L]WMSG-=mess(175,197,1)
+  Else
+    [L]WMSG-=mess(233,197,1)
+  Endif
+  Call ECR_TRACE([L]WMSG,0) From GESECRAN
+  If dim(GPURTRACE)>0 & GPURTRACE=1  GPURTRACE=2 : Endif
+Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+Return
+#-----
+$ROLL_GENSOH2
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  Return  Else  Goto TR_GENSOH2 : Endif
+Else
+  Return
+Endif
+#-----
+$AB_GENSOH2
+If [L]WADXLOG=0
+  Rollback
+Endif
+Return
+
+
+#----------------------------------------------------------------------#
+#                       Traitement des erreurs                         #
+# -------------------------------------------------------------------- #
+#  1 = WNUMDOC-WMAJDOC Paramètre non renseigné                         #
+#  2 = xxxxxxxxxx Commande introuvable !                               #
+#  3 = Erreur d'écriture sur le fichier PORDERQ xxxxxxxx 9999 1        #
+#  4 = Erreur d'écriture sur le fichier ORDERS 9 xxxxxxxx xxxxxx       #
+#  5 = Erreur d'écriture sur le fichier PORDER xxxxxxxx                #
+#  6 = $XXXXXXX xxxxxxxx Modification en cours sur un autre poste      #
+#  7 = Erreur transmise par le s/p ventes dans GMESSAGE avec GOK       #
+#  8 = Erreur d'accès sur le fichier PORDER xxxxxxxx                   #
+#  9 = Erreur d'ecriture sur le fichier PORDER xxxxxxxx                #
+# 10 = xxxxx Inter-sites : Le site n'est pas un tiers client           #
+# 11 = Erreur transmise par le SUBPOHA dans GMESSAGE avec GERR et OK=0 #
+#----------------------------------------------------------------------#
+$TRT_ERR
+#-----
+Case [L]WRET
+  When  1 : [L]WMSG="WNUMDOC-WMAJDOC"-mess(136,199,1)   : GOK=0
+  When  2 : [L]WMSG=[L]WNUMDOC-mess(359,197,1)          : GOK=0
+  When  3 : [L]WMSG=mess(13,100,1)-"PORDERQ"-[L]WNUMDOC-num$([L]WPOPLIN)-"1"
+  When  4 : [L]WMSG=mess(13,100,1)-"ORDERS"-num$([F:POQ]WIPTYP)-[F:POQ]WIPNUM-[F:POQ]ITMREF
+  When  5 : [L]WMSG=mess(13,100,1)-"PORDER"-[L]WNUMDOC
+  When  6 : [L]WMSG="$PORDER"-[L]WNUMDOC-mess(10,100,1) : GOK=0
+  When  7 : [L]WMSG=GMESSAGE : Raz GMESSAGE
+  When  8 : [L]WMSG=mess(12,100,1)-"PORDER"-[L]WNUMDOC
+  When  9 : [L]WMSG=mess(13,100,1)-"PORDER"-[L]WNUMDOC
+  When 10 : [L]WMSG=[F:POH]INVFCY-mess(258,194,1)       : GOK=0
+  When 11 : [L]WMSG=GMESSAGE : Raz GMESSAGE, GERR
+Endcase
+#-----
+Case [L]WMSGFLG
+  When  1 : If GOK=1
+              Call MESSAGE ([L]WMSG)    From GESECRAN
+            Else
+              Call ERREUR ([L]WMSG)     From GESECRAN
+            Endif
+  When  2 : If GOK=1
+              GMESSAGE=[L]WMSG : GERR=2
+            Else
+              GMESSAGE=[L]WMSG : GERR=1
+            Endif
+  When  3 : If GOK=1
+              Call ECR_TRACE([L]WMSG,0) From GESECRAN
+              If dim(GPURTRACE)>0 & GPURTRACE=1  GPURTRACE=2 : Endif
+            Else
+              If dim([L]WADXLOG)>0 & ![L]WADXLOG
+                Call ECR_TRACE([L]WMSG,1) From GESECRAN
+                If dim(GPURTRACE)>0 & GPURTRACE=1  GPURTRACE=2 : Endif
+              Else
+                GMESSAGE=[L]WMSG : GERR=1
+              Endif
+            Endif
+Endcase
+#-----
+Return
+
+
+#-------------------------------------------------------#
+# Mise à jour des tables achats après l'appel au GENSOH #
+#-------------------------------------------------------#
+$UPDATE_INTERSITE
+#-----
+If dim([L]WPOPLIN)<1  Local Integer WPOPLIN : Endif
+If dim([L]WRET)<1     Local Integer WRET    : Endif
+#-----
+For I=0 To [M:POH2]NBLIG-1
+  #----- Mise à jour ligne commande avec infos ligne vente -----#
+  Readlock [POQ] POQ0=[M:POH0]POHNUM;[M:POH2]POPLIN(I);1
+  If fstat=1
+    GOK=-1 : GLOCK="$PORDERQ"-[M:POH0]POHNUM-num$([M:POH2]POPLIN(I))-"1"
+    [L]WRET=3 : [L]WPOPLIN=[M:POH2]POPLIN(I) : Break
+  Elsif fstat
+    GOK=0 :  Call RSTA("POQ",[M:POH0]POHNUM-num$([M:POH2]POPLIN(I))-"1") From GLOCK
+    [L]WRET=3 : [L]WPOPLIN=[M:POH2]POPLIN(I) : Break
+  Endif
+  [F:POQ]LINOCNNUM=[M:POH2]LINOCNNUM(I)
+  [F:POQ]LINOCNDAT=[M:POH2]LINOCNDAT(I)
+  [F:POQ]OCNLIN   =[M:POH2]OCNLIN(I)
+  [F:POQ]OCNSEQ   =[M:POH2]OCNLIN(I)
+  Rewrite [POQ]
+  If fstat
+    [L]WRET=3 : [L]WPOPLIN=[M:POH2]POPLIN(I)
+    GOK=0 : Call FSTA("POQ") From GLOCK : Break
+  Endif
+ # Issue 111714 - 2015-10-23 by SR : zones pour cde de vente de contremarque (origine) et non pour cde vente Intersite(ARC)
+#  #----- Mise à jour pièce origine dans l'encours -----#
+#  If [F:POQ]WIPNUM<>""
+#    Update [ORD] Where WIPTYP=[F:POQ]WIPTYP
+#&                    & WIPNUM=[F:POQ]WIPNUM
+#&                    & ITMREF=[F:POQ]ITMREF
+#&                With  VCRTYPORI=2,
+#&                      VCRNUMORI=[M:POH2]LINOCNNUM(I),
+#&                      VCRLINORI=[M:POH2]OCNLIN(I),
+#&                      VCRSEQORI=[M:POH2]OCNLIN(I)
+#    If fstat
+#      [L]WRET=4 : GOK=0 : Call FSTA("ORD") From GLOCK : Break
+#    Endif
+#  Endif
+Next
+If GOK<1  Return : Endif
+#----- Mise à jour entête commande avec date et no commande vente -----#
+Update [POH] Where POHNUM=[M:POH0]POHNUM
+&            With  OCNNUM=[M:POH3]OCNNUM,
+&                  OCNDAT=[M:POH3]OCNDAT,
+&                  OCNREM=[M:POH3]OCNREM
+If fstat
+  [L]WRET=5 : GOK=0 : Call FSTA("POH") From GLOCK : Return
+Endif
+If [F:POH]POHNUM=[M:POH0]POHNUM
+  [F:POH]OCNNUM=[M:POH3]OCNNUM
+  [F:POH]OCNDAT=[M:POH3]OCNDAT
+  [F:POH]OCNREM=[M:POH3]OCNREM
+Endif
+#-----
+Return
+
+
+###########################################################################
+# Fonction ISOFLG cette fonction est appelée par les traitements :        #
+#   - de picking des besoins depuis les commandes SUBPPI                  #
+#   - de picking des besoins depuis plan achateur SUBPPI2                 #
+# ----------------------------------------------------------------------- #
+# Paramètres en entrée :                                                  #
+#   - WSITE1 : Site associé au fournisseur                                #
+#   - WSITE2 : Site de réception (site de stockage)                       #
+# Valeur restituée en sortie : Inter-sociétés ?                           #
+#   - 1=Non,  2=Oui                                                       #
+###########################################################################
+Funprog ISOFLG(WSITE1,WSITE2)
+Value Char WSITE1
+Value Char WSITE2
+#-----
+Local Integer WFLAG
+#-----
+If WSITE1="" | WSITE2="" | WSITE1=WSITE2
+  [L]WFLAG=1
+Else
+  If !clalev([F:FCY])  Local File FACILITY [FCY] : Endif
+  If [F:FCY]FCY<>WSITE1
+    Read [FCY] FCY0=WSITE1 : If fstat  Raz [FCY] : Endif
+  Endif
+  If [F:FCY]LEGCPY=""
+    [L]WFLAG=1
+  Else
+    Local Char WSOC1(GLONCPY) : [L]WSOC1=[F:FCY]LEGCPY
+    Read [FCY] FCY0=WSITE2 : If fstat  Raz [FCY] : Endif
+    If [F:FCY]LEGCPY<>[L]WSOC1
+      [L]WFLAG=2
+    Else
+      [L]WFLAG=1
+    Endif
+  Endif
+Endif
+End [L]WFLAG
+
+
+###################################################################
+# Fonction CTLMAJISO cette fonction est appelée par les règles de #
+#     workfow pour la gestion des signatures                      #
+# --------------------------------------------------------------- #
+# Paramètres en entrée :                                          #
+#   - WMAJCOD : Code mise à jour                                  #
+#         "A" = Suppression cde vente après annulation signature  #
+#         "M" = Modification cde vte (pas utilisé pour l'instant) #
+#         "S" = Solde commande vente (pas utilisé pour l'instant) #
+#   - WNUMDOC : Numéro de la commande d'achat                     #
+# Valeur restituée en sortie : Mise à jour autorisée ?            #
+#   - WFLAG                                                       #
+#           0 = Non                                               #
+#           1 = Oui, la mise à jour de la cde vente est autorisée #
+###################################################################
+Funprog CTLMAJISO(WMAJCOD,WNUMDOC)
+Value Char WMAJCOD
+Value Char WNUMDOC
+#-----
+Local Integer WFLAG : [L]WFLAG=1
+Local Integer WRET
+#-----
+If !find(WMAJCOD,"A","M","S")
+  [L]WFLAG=0
+Else
+  #----- Lecture de la commande d'achat -----#
+  If !clalev([F:POH])  Local File PORDER [POH] : Endif
+  If [F:POH]POHNUM<>[L]WNUMDOC
+    Read [POH] POH0=[L]WNUMDOC : If fstat   Raz [F:POH] : Endif
+  Endif
+  If [F:POH]SALFCY="" | [F:POH]OCNNUM=""
+    # Issue 82728 - 2013-06-04 by SR :Si pas Inersite c'est ok
+    [L]WFLAG=1
+  Else
+    Case [F:POH]POHTYP
+      When 1 : #----- Commande classique
+        Call CTLMAJSOH([L]WMAJCOD,[F:POH]OCNNUM,[L]WRET) From TRTVENISOC
+        If [L]WRET<>0  [L]WFLAG=0 : Endif
+      When 2 : #----- Commande ouverte
+        If !clalev([M:SORW])  Local Mask SORW [SORW] : Endif
+        Raz [M:SORW]
+        [M:SORW]MAJCOD=[L]WMAJCOD
+        [M:SORW]SOHNUM=[F:POH]OCNNUM
+        Call CTL_MAJ_SOH From TRTVENMSIT
+        If GMESSAGE<>""  [L]WFLAG=0 : Endif
+      When Default
+        [L]WFLAG=0
+    Endcase
+  Endif
+Endif
+End [L]WFLAG
+

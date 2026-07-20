@@ -1,0 +1,618 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+
+
+
+
+
+######################## ATTENTION : ce n'est pas une traitement à utiliser #############################################
+######################## CPO 22/10/2013 : J'ai juste commencé qque chose afin de tester la génération des tarifs ########
+
+
+#---J'ai remplacé
+#-------GACTxxx par appel à AFNC.ACTVI("xxx")
+#-------Enlevé les clalev sur [F]
+
+
+#-------Je suis incertain quand à l'exécution avec [M] (à priori cela pourrai marcher), mais clalev sur [M] ???
+
+
+
+
+
+
+########################################################################
+# GETPRI Renvoie le prix d'un article
+#        pour une certaine quantité et une méthode de valo donnée
+########################################################################
+Subprog GETPRI(LITM,LECCMAJ,LECCMIN,LFCY,LDAT,LQTY,LLOT,LSLO,LVLT,LPRI,LRET)
+Value    Char    LITM
+Value    Char    LECCMAJ
+Value    Char    LECCMIN
+Value    Char    LFCY
+Value    Date    LDAT
+Value    Decimal LQTY
+Value    Char    LLOT
+Value    Char    LSLO
+Value    Integer LVLT
+Variable Decimal LPRI
+Variable Integer LRET
+
+
+  Raz LRET
+
+  Local Integer WMET : WMET = LVLT
+  If clalev ([M:SDP])
+      Raz [M:SDP]
+  Else
+      Local Mask SAIDECPRI [SDP]    # Au moins nécessaire dans le cas de l'état valorisé au coût standard
+  Endif
+
+  Case [L]WMET
+      When 1 : Gosub TRT_DEF1  From STKVAL_SYRA    # Standard
+      When 2 : Gosub TRT_DEF2  From STKVAL_SYRA    # Standard actualisé
+      When 3 : Gosub TRT_DEF3  From STKVAL_SYRA    # Dernier prix
+      When 4 : Gosub TRT_DEF4  From STKVAL_SYRA    # PMP
+      When 5 : Gosub TRT_DEF5  From STKVAL_SYRA    # FIFO
+      When 6 : Gosub TRT_DEF6  From STKVAL_SYRA    # PM Lot
+      When 7 : LPRI=LORDPRI                        # Prix ordre
+      When 8 : Gosub TRT_DEF8  From STKVAL_SYRA    # LIFO
+      When 9 : Gosub TRT_DEF9  From STKVAL_SYRA    # Dernier prix d'achat
+      When 10: Gosub TRT_DEF10 From STKVAL_SYRA    # Standard budget
+      When 11: Gosub TRT_DEF11 From STKVAL_SYRA    # Standard simulé
+
+  Endcase
+
+End
+#------------------------------------------------------#
+# Prix standard (dernier de l'exercice comptable)      #
+#------------------------------------------------------#
+$TRT_DEF1
+
+  Local Integer WCSTTYP
+  WCSTTYP = 1
+  Gosub CALCSTD
+
+Return
+
+#-----------------------------------------------------------#
+# Prix standard actualisé (dernier de l'exercice comptable) #
+#-----------------------------------------------------------#
+$TRT_DEF2
+
+  Local Integer WCSTTYP
+  WCSTTYP = 2
+  Gosub CALCSTD
+
+Return
+#--------------#
+# Dernier prix #
+#--------------#
+$TRT_DEF3
+
+  Local File ITMMVT     [ITV]
+
+  # Issue 78601 - 2011-12-14 by CCC : utilisation de LITM au lieu de [F:ITM]ITMREF
+  If [F:ITV]ITMREF<>LITM | [F:ITV]STOFCY<>LFCY
+      Read [ITV]ITV0=LITM;LFCY
+      If fstat
+  # Issue 92377 - 2013-09-06 by CCC : this is not necessarily an error. If it's an error it has to be detected somewhere else
+  #        LRET = 2
+  #        Return
+          Raz [F:ITV]
+      Endif
+  Endif
+  # Si le document demandeur de prix est une réception,
+  # on récupère le dernier prix d'achat, sinon le dernier prix d'entrée
+  If clalev([M:SDP])
+      If clalev([M:SDP2]) & dim(LNUMVLT)>0 & LNUMVLT=1
+          Raz [M:SDP2]
+      Else
+          Raz [M:SDP]
+      Endif
+  Endif
+  If dim(LTYP)>0 & LTYP = 3
+      LPRI = [F:ITV]LASPURPRI
+      If evalue("clalev([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+          Assign "[M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"]PRI" With [F:ITV]LASPURPRI
+          Gosub PRI2SDP
+      Endif
+  Else
+      LPRI = [F:ITV]LASRCPPRI
+      If clalev([M:SDP2]) & dim(LNUMVLT)>0 & LNUMVLT=1
+          [M:SDP2]PRI = [F:ITV]LASRCPPRI
+      Elsif clalev([M:SDP])
+          [M:SDP]PRI = [F:ITV]LASRCPPRI
+      Endif
+      If evalue("clalev([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+          If AFNC.ACTIV("DECCST") #If GACTDECCST Pour l'instant en attendant de voir si pas rattachés au contexte
+              Call LOADSDPX("SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2"),"[F:ITV]","L",1)
+          Else
+              Gosub PRI2SDP
+          Endif
+      Endif
+  Endif
+
+Return
+#--------------------#
+# Prix moyen pondéré #
+#--------------------#
+$TRT_DEF4
+
+  # Attention: Si c'est positionné il ne faut pas relire
+  # car en régul de sortie on écrase les valeurs de PMP par ce qu'on attend
+  Local File ITMMVT [ITV]
+  If [F:ITV]ITMREF<>LITM | [F:ITV]STOFCY<>LFCY
+      Read [ITV] ITV0=LITM;LFCY
+      If fstat
+          # Si on est en entrée, c'est une création de lot
+          # sinon c'est qu'il y a une grosse erreur dans les stocks
+          Raz [F:ITV]
+      Endif
+  Endif
+  Default File [ITV]
+  Gosub CHARG_PM
+
+Return
+#-----------#
+# Prix FIFO #
+#-----------#
+$TRT_DEF5
+
+    Gosub CALCIFO
+
+Return
+#----------------#
+# Prix moyen lot #
+#----------------#
+$TRT_DEF6
+
+  Local File STOLOTFCY [SLF]
+  Local Decimal LLOTQTY
+  Raz LLOTQTY
+  If LLOT=""
+      Raz [F:SLF]
+      For [SLF] Where ITMREF=LITM & STOFCY=LFCY
+          Break
+      Next
+  Else
+      If [F:SLF]ITMREF<>LITM | [F:SLF]LOT<>LLOT | [F:SLF]SLO<>LSLO | [F:SLF]STOFCY<>LFCY
+          Read [SLF]SLF0=LITM;LLOT;LSLO;LFCY
+          If fstat
+              # Si on est en entrée, c'est une création de lot
+              # sinon c'est qu'il y a une grosse erreur dans les stocks
+              Raz [F:SLF]
+          Endif
+      Endif
+  Endif
+  Default File [SLF]
+  Gosub CHARG_PM
+
+Return
+#--------------------------------------------------------------------------------------------------
+$CHARG_PM
+
+  LPRI = [F]AVC
+  If evalue("clalev([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+    If dim(LNUMVLT)>0 & LNUMVLT=1
+        Raz [M:SDP2]
+    Else
+        Raz [M:SDP]
+    Endif
+    # Issue 92701 - 2013-10-23 by CCC : Utilisation de AVCBASAMT/qté au lieu de AVC
+    If [F]AVCBASQTY<>0 & [F]AVCBASAMT<>0
+        LPRI = [F]AVCBASAMT/[F]AVCBASQTY
+    Endif
+    If clalev([M:SDP2]) & dim(LNUMVLT)>0 & LNUMVLT=1
+        [M:SDP2]PRI = LPRI
+    Elsif clalev([M:SDP])
+        [M:SDP]PRI = LPRI
+    Endif
+    If AFNC.ACTIV("DECCST") #If GACTDECCST Pour l'instant en attendant de voir si pas rattachés au contexte
+        If [F]AVCBASQTY<>0 & [F]AVCBASAMT<>0    # Si on a une base montant=0 et le PMP <>0 => il faut prendre le PMP
+            Call LOADSDPX("SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2"),"[F]","A",1/[F]AVCBASQTY)
+        Else
+            Call LOADSDPX2("SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2"),"[F]","A","AVC",1)
+        Endif
+    Else
+        Gosub PRI2SDP
+    Endif
+  Endif
+
+Return
+#-----------------------#
+# Prix d'ordre          #
+#-----------------------#
+$TRT_DEF7
+
+    LPRI=LORDPRI
+    If clalev([M:SDP])
+        If clalev([M:SDP2]) & dim(LNUMVLT)>0 & LNUMVLT=1
+            Raz [M:SDP2]
+        Else
+            Raz [M:SDP]
+        Endif
+    Endif
+    If evalue("clalev([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+        Assign "[M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"]PRI" With LORDPRI
+        If AFNC.ACTIV("DECCST") & LLIGW>=0 #If GACTDECCST & LLIGW>=0 Pour l'instant en attendant de voir si pas rattachés au contexte
+            Call LOAD_VALX("SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2"),LLIGW) From SUBSDP
+        Else
+            Gosub PRI2SDP
+        Endif
+    Endif
+
+Return
+#-----------------------#
+# LIFO                  #
+#-----------------------#
+$TRT_DEF8
+
+    Gosub CALCIFO
+
+Return
+#--------------------------------------------------------#
+# Prix standard budget (dernier de l'exercice comptable) #
+#--------------------------------------------------------#
+$TRT_DEF10
+
+    Local Integer WCSTTYP
+    WCSTTYP = 3
+    Gosub CALCSTD
+
+Return
+#-----------------------------------------------------------#
+# Prix standard simulé (dernier de l'exercice comptable)    #
+#-----------------------------------------------------------#
+$TRT_DEF11
+
+    Local Integer WCSTTYP
+    WCSTTYP = 4
+    Gosub CALCSTD
+
+Return
+#--------------------------------------------------------------------------------------------------
+$CALCSTD
+  Local Shortint ANNEE
+  Local File ITMCOST [ITC]
+  #If !clalev([F:ITC])  Local File ITMCOST [ITC] : Endif
+
+  fstat = 1
+
+  # Dans le cas du calcul des coûts standards il faut privilégier le coût calculé par l'utilisateur
+  If dim(LUID)>0 & LUID<>0
+    Filter [ITC] Where STOFCY = LFCY
+&                    & ITMREF = LITM
+&                    & CSTTYP = WCSTTYP
+&                    & ITCSTRDAT<= LDAT & LDAT<=ITCENDDAT
+&                    & UID    = LUID
+&                  Order By Key ITC0
+    Read [ITC] First
+  Endif
+
+  If fstat
+    Filter [ITC] Where STOFCY = LFCY
+&                    & ITMREF = LITM
+&                    & CSTTYP = WCSTTYP
+&                    & ITCSTRDAT<= LDAT & LDAT<=ITCENDDAT
+&                    & UID    = 0
+&                Order By Key ITC0
+    Read [ITC] First
+Endif
+
+  If fstat    # Si le prix standard de l'année de la fin d'exercice en cours n'est pas trouvé, on essaie avec l'année précédente
+    Filter [ITC] Where STOFCY = LFCY
+&                    & ITMREF = LITM
+&                    & CSTTYP = WCSTTYP
+&                    & ITCSTRDAT<= LDAT
+&                    & UID    = 0
+&                Order By Key ITC2
+
+    Read [ITC]ITC2 Last
+  Endif
+
+  If !fstat
+#    LPRI = [F:ITC]VLTTOT
+#    If dim(LNUMVLT)>0 & LNUMVLT=1
+#        Raz [M:SDP2]
+#        [M:SDP2]PRI = LPRI
+#    Elsif clalev([M:SDP])
+#        Raz [M:SDP]
+#        [M:SDP]PRI = LPRI
+#    Endif
+    If evalue("clalev([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+        #If GACTDECCST Pour l'instant en attendant de voir si pas rattachés au contexte
+        #If func ASYRFNC.ACTIV("DECCST") = [V]CST_AYES # X3-38315 (Lcc-12/02/18)
+        If func ASYRFNC.ACTIV("DECCST") = [V]CST_TRUE
+&       | dim(LDETVAL)>0 & LDETVAL=1   # Issue 89527 - 2013-07-31 by CCC
+            Call LOADSDPX("SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2"),"[F:ITC]","",1)
+        Else
+            Gosub PRI2SDP
+        Endif
+    Endif
+  Else
+    LPRI = 0
+#    If dim(LNUMVLT)>0 & LNUMVLT=1
+#        Raz [M:SDP2]
+#    Elsif clalev([M:SDP])
+#        Raz [M:SDP]
+#    Endif
+  Endif
+
+  Filter [ITC]
+  Close Local File [ITC]
+
+Return
+#--------------------------------------------------------------------------------------------------
+$CALCIFO
+
+  If LQTY=0 : Return : Endif
+  Local File STOCOST [STP]
+
+  If dim(LQTYOFF)<=0 : Local Decimal LQTYOFF : LQTYOFF=0 : Endif
+  Local Decimal WQTE, WCUMM, WQTEOFF
+  #Local Decimal LDELTASTP(1+(GACTMAT+GACTMAC+GACTLAB+1+4+1)*GACTDECCST) #Pour l'instant en attendant de voir si pas rattachés au contexte
+  Local Decimal LDELTASTP(1+(AFNC.ACTIV("MAT")+AFNC.ACTIV("MAC")+AFNC.ACTIV("LAB")+1+4+1)*AFNC.ACTIV("DECCST"))
+  Local Integer I
+
+  [L]WQTE  = LQTY
+  Raz [L]WCUMM
+  Case [L]WMET
+      When 5:
+          Filter [STP] Where ITMREF=LITM & STOFCY=LFCY & QTYSTUACT>0
+      When 8:
+          Filter [STP] Where ITMREF=LITM & STOFCY=LFCY & QTYSTUACT>0 Order By Key STP0 Desc
+  Endcase
+
+  If clalev([M:SDP])
+      If clalev([M:SDP2]) & dim(LNUMVLT)>0 & LNUMVLT=1
+          Raz [M:SDP2]
+      Else
+          Raz [M:SDP]
+      Endif
+  Endif
+  Raz WQTEOFF
+  For [STP]
+    If WQTEOFF<LQTYOFF
+        If (LQTYOFF - WQTEOFF) >= [F:STP]QTYSTUACT
+            WQTEOFF += [F:STP]QTYSTUACT
+            [F:STP]QTYSTUACT = 0
+        Else
+            # L'offset est inférieur à l'élément de pile
+            #  => Décrémentation des montants de la pile
+            [F:STP]CST-=[F:STP]CST*(LQTYOFF - WQTEOFF)/[F:STP]QTYSTUACT   # Issue 83496 - 2012-08-09 by CCC
+            If AFNC.ACTIV("DECCST") #If GACTDECCST Pour l'instant en attendant de voir si pas rattachés au contexte
+                Call LOADVAR(LDELTASTP,"[F:STP]",0, "", (LQTYOFF - WQTEOFF)/[F:STP]QTYSTUACT, 0, 10^-GDECPRI) From STKVALECR
+                Call LOADFIC("[F:STP]",LDELTASTP, "", "CST", -1, 1) From STKVALECR
+            Endif
+            # => Décrémentation de la quantité dans la pile
+            [F:STP]QTYSTUACT -= (LQTYOFF - WQTEOFF)
+            WQTEOFF = LQTYOFF
+        Endif
+    Endif
+    If WQTEOFF=LQTYOFF & [F:STP]QTYSTUACT>0
+        If [L]WQTE > [F:STP]QTYSTUACT
+          [L]WCUMM += [F:STP]CST
+          [L]WQTE  -= [F:STP]QTYSTUACT
+          If evalue("clalev ([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+              If AFNC.ACTIV("DECCST") #If GACTDECCST Pour l'instant en attendant de voir si pas rattachés au contexte
+                  Call LOADSDPX("SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2"),"[F:STP]","",1)
+              Endif
+          Endif
+        Else
+          [L]WCUMM += [F:STP]CST*[L]WQTE/[F:STP]QTYSTUACT
+          If evalue("clalev ([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+              If AFNC.ACTIV("DECCST") #If GACTDECCST Pour l'instant en attendant de voir si pas rattachés au contexte
+                  Call LOADSDPX("SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2"),"[F:STP]","",[L]WQTE/[F:STP]QTYSTUACT)
+              Endif
+          Endif
+          [L]WQTE = 0
+          Break
+        Endif
+    Endif
+  Next
+  Filter [STP]
+  If [L]WQTE = 0 & LQTY<>0
+      LPRI = [L]WCUMM / LQTY
+      If evalue("clalev ([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+          Assign "[M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"]PRI" With [L]WCUMM / LQTY
+          If AFNC.ACTIV("DECCST") #If GACTDECCST Pour l'instant en attendant de voir si pas rattachés au contexte
+              Call PROSDP("SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2"), 1/LQTY)From SUBSDPCOM
+          Else
+              Gosub PRI2SDP
+          Endif
+      Endif
+  Else
+      LRET = 5
+  Endif
+
+Return
+#--------------#
+# Dernier prix #
+#--------------#
+$TRT_DEF9
+
+  Local File ITMMVT  [ITV]
+
+  # Issue 78601 - 2011-12-14 by CCC : utilisation de LITM au lieu de [F:ITM]ITMREF
+  If [F:ITV]ITMREF<>LITM | [F:ITV]STOFCY<>LFCY
+      Read [ITV]ITV0=LITM;LFCY
+      If fstat
+  # Issue 92377 - 2013-09-06 by CCC : this is not necessarily an error. If it's an error it has to be detected somewhere else
+  #        LRET = 2
+  #        Return
+          Raz [F:ITV]
+      Endif
+  Endif
+  If clalev([M:SDP])
+      If clalev([M:SDP2]) & dim(LNUMVLT)>0 & LNUMVLT=1
+          Raz [M:SDP2]
+      Else
+          Raz [M:SDP]
+      Endif
+  Endif
+  LPRI = [F:ITV]LASPURPRI
+  If clalev([M:SDP2]) & dim(LNUMVLT)>0 & LNUMVLT=1
+      [M:SDP2]PRI = [F:ITV]LASPURPRI
+  Elsif clalev([M:SDP])
+      [M:SDP]PRI = [F:ITV]LASPURPRI
+  Endif
+  If evalue("clalev([M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"])")
+      Gosub PRI2SDP
+  Endif
+
+Return
+###############################################################
+# Charge l'écran SDP à partir du fichier spécifié
+# !!! Attention !!! On fait une addition pour le cas de la pile FIFO
+###############################################################
+Subprog LOADSDP(PFIC, PREFIX, PCOE)
+Value Char PFIC
+Value Char PREFIX
+Value Decimal PCOE
+
+Call LOADSDPX2("SDP",PFIC, PREFIX, "CST", PCOE)
+
+End
+#--------------------------------------------------------------------------------------------------
+Subprog LOADSDPX(PABR,PFIC, PREFIX, PCOE)
+Value Char PABR
+Value Char PFIC
+Value Char PREFIX
+Value Decimal PCOE
+
+  Call LOADSDPX2(PABR,PFIC, PREFIX, "CST", PCOE)
+
+End
+#--------------------------------------------------------------------------------------------------
+Subprog LOADSDPX2(PABR,PFIC, PREFIX, SUFFIX, PCOE)
+Value Char PABR
+Value Char PFIC
+Value Char PREFIX
+Value Char SUFFIX
+Value Decimal PCOE
+
+  Local Char LOSUFFIX(len(SUFFIX))
+
+  # Pour pouvoir charger le coût standard du niveau
+  If SUFFIX="LEVCST"
+      LOSUFFIX = "LEV"
+  Elsif PREFIX="DEV"
+      LOSUFFIX = ""
+  Else
+      LOSUFFIX = SUFFIX
+  Endif
+
+  Local Integer I
+  #---- Matière ----#
+  For I=0 To AFNC.ACTIV("MAT")-1 #  For I=0 To GACTMAT-1 Pour l'instant en attendant de voir si pas rattachés au contexte
+      Assign "[M:"+PABR+"]MATCST(I)" With evalue("[M:"+PABR+"]MATCST(I)") + evalue(PFIC+PREFIX+"MAT"+SUFFIX+"(I)")*PCOE
+  Next
+
+  If evalue("dim("+PFIC+PREFIX+"OVEMAT"+LOSUFFIX+")")>0
+      Assign "[M:"+PABR+"]OVEMATCST" With evalue("[M:"+PABR+"]OVEMATCST") + evalue(PFIC+PREFIX+"OVEMAT"+LOSUFFIX+"")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"OVEMATTOT)")>0
+      Assign "[M:"+PABR+"]OVEMATCST" With evalue("[M:"+PABR+"]OVEMATCST") + evalue(PFIC+PREFIX+"OVEMATTOT")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"OVEMAT)")>0    # Issue 79517 - 2012-02-09 by CCC
+      Assign "[M:"+PABR+"]OVEMATCST" With evalue("[M:"+PABR+"]OVEMATCST") + evalue(PFIC+PREFIX+"OVEMAT")*PCOE
+  Endif
+
+  #---- Machine ----#
+  For I=0 To AFNC.ACTIV("MAC")-1 #  For I=0 To GACTMAC-1 Pour l'instant en attendant de voir si pas rattachés au contexte
+      Assign "[M:"+PABR+"]MACCST(I)" With evalue("[M:"+PABR+"]MACCST(I)") + evalue(PFIC+PREFIX+"MAC"+SUFFIX+"(I)")*PCOE
+  Next
+  If I>0 & evalue("dim([M:"+PABR+"]NBMAC)")>0
+      Assign "[M:"+PABR+"]NBMAC" With I-1
+  Endif
+
+  If evalue("dim("+PFIC+PREFIX+"OVEMAC"+LOSUFFIX+")")>0
+      Assign "[M:"+PABR+"]OVEMACCST" With evalue("[M:"+PABR+"]OVEMACCST") + evalue(PFIC+PREFIX+"OVEMAC"+LOSUFFIX+"")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"OVEMACTOT)")>0
+      Assign "[M:"+PABR+"]OVEMACCST" With evalue("[M:"+PABR+"]OVEMACCST") + evalue(PFIC+PREFIX+"OVEMACTOT")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"OVEMAC)")>0    # Issue 79517 - 2012-02-09 by CCC
+      Assign "[M:"+PABR+"]OVEMACCST" With evalue("[M:"+PABR+"]OVEMACCST") + evalue(PFIC+PREFIX+"OVEMAC")*PCOE
+  Endif
+
+  #---- Main d'oeuvre ----#
+  For I=0 To AFNC.ACTIV("LAB")-1 #  For I=0 To GACTLAB-1 Pour l'instant en attendant de voir si pas rattachés au contexte
+      Assign "[M:"+PABR+"]LABCST(I)" With evalue("[M:"+PABR+"]LABCST(I)") + evalue(PFIC+PREFIX+"LAB"+SUFFIX+"(I)")*PCOE
+  Next
+  If I>0 & evalue("dim([M:"+PABR+"]NBLAB)")>0
+      Assign "[M:"+PABR+"]NBLAB" With I-1
+  Endif
+
+  If evalue("dim("+PFIC+PREFIX+"OVELAB"+LOSUFFIX+")")>0
+      Assign "[M:"+PABR+"]OVELABCST" With evalue("[M:"+PABR+"]OVELABCST") + evalue(PFIC+PREFIX+"OVELAB"+LOSUFFIX+"")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"OVELABTOT)")>0
+      Assign "[M:"+PABR+"]OVELABCST" With evalue("[M:"+PABR+"]OVELABCST") + evalue(PFIC+PREFIX+"OVELABTOT")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"OVELAB)")>0    # Issue 79517 - 2012-02-09 by CCC
+      Assign "[M:"+PABR+"]OVELABCST" With evalue("[M:"+PABR+"]OVELABCST") + evalue(PFIC+PREFIX+"OVELAB")*PCOE
+  Endif
+
+  #---- /s-traitance ----#
+  If evalue("dim("+PFIC+PREFIX+"SCO"+SUFFIX+")")>0
+      Assign "[M:"+PABR+"]SCOCST" With evalue("[M:"+PABR+"]SCOCST") + evalue(PFIC+PREFIX+"SCO"+SUFFIX+"")*PCOE
+      Assign "[M:"+PABR+"]SCOTOT" With evalue("[M:"+PABR+"]SCOTOT") + evalue(PFIC+PREFIX+"SCO"+SUFFIX+"")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"SCOTOT)")>0
+      Assign "[M:"+PABR+"]SCOCST" With evalue("[M:"+PABR+"]SCOCST") + evalue(PFIC+PREFIX+"SCOTOT")*PCOE
+      Assign "[M:"+PABR+"]SCOTOT" With evalue("[M:"+PABR+"]SCOTOT") + evalue(PFIC+PREFIX+"SCOTOT")*PCOE
+  Endif
+  If evalue("dim("+PFIC+PREFIX+"OVESCO"+LOSUFFIX+")")>0
+      Assign "[M:"+PABR+"]OVESCOCST" With evalue("[M:"+PABR+"]OVESCOCST") + evalue(PFIC+PREFIX+"OVESCO"+LOSUFFIX+"")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"OVESCOTOT)")>0
+      Assign "[M:"+PABR+"]OVESCOCST" With evalue("[M:"+PABR+"]OVESCOCST") + evalue(PFIC+PREFIX+"OVESCOTOT")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"OVESCO)")>0    # Issue 79517 - 2012-02-09 by CCC
+      Assign "[M:"+PABR+"]OVESCOCST" With evalue("[M:"+PABR+"]OVESCOCST") + evalue(PFIC+PREFIX+"OVESCO")*PCOE
+  Endif
+
+  #---- /s-traitance ----#
+  If evalue("dim("+PFIC+PREFIX+"INVDTA"+SUFFIX+")")>0
+      Assign "[M:"+PABR+"]INVDTACST" With evalue("[M:"+PABR+"]INVDTACST") + evalue(PFIC+PREFIX+"INVDTA"+SUFFIX+"")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"INVDTACST)")>0
+      Assign "[M:"+PABR+"]INVDTACST" With evalue("[M:"+PABR+"]INVDTACST") + evalue(PFIC+PREFIX+"INVDTACST")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"INVDTATOT)")>0
+      Assign "[M:"+PABR+"]INVDTACST" With evalue("[M:"+PABR+"]INVDTACST") + evalue(PFIC+PREFIX+"INVDTATOT")*PCOE
+  Elsif evalue("dim("+PFIC+PREFIX+"INVDTA)")>0    # Issue 79517 - 2012-02-09 by CCC
+      Assign "[M:"+PABR+"]INVDTACST" With evalue("[M:"+PABR+"]INVDTACST") + evalue(PFIC+PREFIX+"INVDTA")*PCOE
+  Endif
+  End
+  $PRI2SDP
+      Local Char LSAVITM : Raz LSAVITM
+      If [F:ITM]ITMREF<>LITM
+          LSAVITM = [F:ITM]ITMREF
+          Read [ITM]ITM0 = LITM
+      Endif
+      Assign "[M:SDP"+string$(dim(LNUMVLT)>0&LNUMVLT=1,"2")+"]MATCST(max(0,[F:ITM]BRDCOD-1))" With LPRI
+      If LSAVITM<>""
+          Read [ITM]ITM0 = LSAVITM
+      Endif
+
+Return
+#--------------------------------------------------------------------------------------------------
+$ITCREAD
+  Local Shortint ANNEE
+  #If !clalev([F:ITC])  Local File ITMCOST [ITC] : Endif
+
+#WCSTTYP  for 1 and 2 only
+If fstat
+    Filter [ITC] Where STOFCY = PARAM.C_LINE(PLINEDOC).C_PPKD(1).PRHFCY
+&                    & ITMREF = [F:ITM]ITMREF
+&                    & CSTTYP = [L]CSTTYP
+&                    & ITCSTRDAT<= PARAM.DOCDAT & PARAM.DOCDAT <=ITCENDDAT
+&                    & UID    = 0
+&                Order By Key ITC0
+    Read [ITC] First
+Endif
+
+If fstat    # Si le prix standard de l'année de la fin d'exercice en cours n'est pas trouvé, on essaie avec l'année précédente
+    Filter [ITC] Where STOFCY = PARAM.C_LINE(PLINEDOC).C_PPKD(1).PRHFCY
+&                    & ITMREF = [F:ITM]ITMREF
+&                    & CSTTYP = [L]CSTTYP
+&                    & ITCSTRDAT<= PARAM.DOCDAT
+&                    & UID    = 0
+&                Order By Key ITC2
+
+    Read [ITC]ITC2 Last
+Endif
+
+Return
+

@@ -1,0 +1,222 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Class SHIPMENTD method's
+#######################################################################################
+#**!
+#* Sold a shipment line : set the pre-receipt qty to 0, the pre-receipt flag to yes and the sold flag to yes
+#* Sold the porder line if necessary
+#* parameters :
+#* instance : shipment line must be fill and open
+#* TYP : sold or desold the line : 1 for sold, 2 for unsold
+#* PRCPLINE : for shipment or pré-réception : 1 for shipment, 2 for pré-réception
+#* return : boolean
+#*!
+
+$SOLDSHIPLINE
+Local File ITMMASTER[ITM]
+Local Char REQUETE(255)(2)
+Local Integer BASE, WPOHCLE
+Local Decimal WSHIQTYSTU, WRCPQTYSTU, WQTYSTU
+Case GTYPDBA
+    When 1 : BASE=3 : # Oracle
+    When 2 : BASE=5 : # Sql
+    When 3 : BASE=2 : # Cisam
+    When 4 : BASE=4 : # DB2
+Endcase
+#controle
+If SHIPLINE = null
+  [L]ASTATUS = fmet this.ASETERROR ("", mess(18,9137,1), [V]CST_AERROR)
+  [L]ARET_VALUE = [L]ASTATUS
+Endif
+If TYP = 1 #solde
+  If PRCPLINE = 1 #shipment line
+    #Solde impossible si ligne pré-réceptionnée ou ligne réceptionnée
+    If SHIPLINE.PRCPQTYSTU<>AVOID.ADEC | SHIPLINE.RCPQTYSTU<> AVOID.ADEC
+      [L]ASTATUS = fmet this.ASETERROR ("", mess(556,194,1), [V]CST_AERROR)
+      [L]ARET_VALUE = [L]ASTATUS
+      Return
+    Endif
+   Else
+   #Solde impossible si ligne réceptionnée
+    If SHIPLINE.RCPQTYSTU<> AVOID.ADEC
+      [L]ASTATUS = fmet this.ASETERROR ("", mess(556,194,1), [V]CST_AERROR)
+      [L]ARET_VALUE = [L]ASTATUS
+      Return
+    Endif
+  Endif
+Elsif TYP = 2
+  If PRCPLINE = 1 #shipment line
+    #désolde impossible si ligne pré-réceptionnée
+    If SHIPLINE.PRCPQTYSTU<>AVOID.ADEC
+      [L]ASTATUS = fmet this.ASETERROR ("", mess(557,194,1), [V]CST_AERROR)
+      [L]ARET_VALUE = [L]ASTATUS
+      Return
+    Endif
+  Endif
+  #désolde de la ligne d'expédition ou ligne de pré-réception : impossible si qté réceptionnée
+  If SHIPLINE.RCPQTYSTU<>AVOID.ADEC
+    [L]ASTATUS = fmet this.ASETERROR ("", mess(557,194,1), [V]CST_AERROR)
+    [L]ARET_VALUE = [L]ASTATUS
+    Return
+  Endif
+Else
+  Return
+Endif
+#lecture de la commande
+Local Instance WPORDERQ Using C_PORDERQ
+WPORDERQ = NewInstance C_PORDERQ AllocGroup null
+If fmet WPORDERQ.AREAD(SHIPLINE.POHNUM, SHIPLINE.POPLIN, SHIPLINE.POQSEQ) = [V]CST_AOK
+  WQTESTU = WPORDERQ.QTYSTU
+Endif
+If TYP = 1
+  If PRCPLINE = 1   #shipment
+    #flag pré-réceptionné à Oui
+    SHIPLINE.PRCPFLG = CST_AYES
+  Endif
+  If PRCPLINE = 2 & SHIPLINE.PRCPQTY = 0
+      SHIPLINE.PRCPQTY = SHIPLINE.SHIQTY
+  Endif
+  #flag soldé à Oui
+  #Attention, laisser l'affectation du flag Soldé aprés l'affectation de la quantité
+  SHIPLINE.CLEFLG  = CST_AYES
+Else
+  If PRCPLINE = 1 & SHIPLINE.PRCPQTY = 0 #shipment
+    #flag pré-réceptionné à Non
+    SHIPLINE.PRCPFLG = CST_ANO
+  Endif
+  #flag soldé à Non
+  SHIPLINE.CLEFLG  = CST_ANO
+  #motif = vide
+  SHIPLINE.PRCPREN = AVOID.ACHAR
+  #quantité réintégrée à Non
+  SHIPLINE.QTYEXPFLG = CST_ANO
+Endif
+
+#Expédition qui est en trian d'être soldée
+If SHIPLINE.QTYEXPFLG = 1
+  WQTESTU -= SHIPLINE.SHIQTYSTU
+Endif
+
+
+#recalcul de la qté expédiable
+REQUETE(0) = "SELECT SUM(SHIQTYSTU_0)"
+REQUETE(1)=" from SHIPMENTD WHERE POHNUM_0='"+SHIPLINE.POHNUM+"'AND POPLIN_0 ="+num$(SHIPLINE.POPLIN)+ "AND POQSEQ_0 ="+num$(SHIPLINE.POQSEQ)
+& +" AND QTYEXPFLG_0 =1 AND SHIPNUM_0 <> '"+SHIPLINE.SHIPNUM+"'"
+
+For (Decimal WSHIQTYSTU) From num$(BASE) Sql REQUETE As [SSHIP]
+  WQTESTU = WQTESTU - [SSHIP]WSHIQTYSTU
+Next
+
+#Somme des qtés réceptionnées
+REQUETE(0) = "SELECT SUM(QTYSTU_0)"
+REQUETE(1)=" from PRECEIPTD WHERE POHNUM_0='"+SHIPLINE.POHNUM+"'AND POPLIN_0 ="+num$(SHIPLINE.POPLIN)+"AND POQSEQ_0 ="+num$(SHIPLINE.POQSEQ)
+& +" AND SHIPNUM_0 = ' '"
+
+For (Decimal WRCPQTYSTU) From num$(BASE) Sql REQUETE As [SRCP]
+  WQTESTU = WQTESTU - [SRCP]WRCPQTYSTU
+Next
+
+#get the POHCLE parameter
+WPOHCLE = fmet this.ACTX.APARAM.AGETVALNUM([V]CST_ALEVCPY, WPORDERQ.CPY, "POHCLE")
+#tolérance de reliquat de l'article
+
+If WPOHCLE=1     : # Solde si égalité ou supérieur
+  If TYP = 1
+    If WQTESTU <= 0  #solde si la quantité expédiable est inférieure a 0
+      #solde de la commande
+      SHIPLINE.POHCLE = 1     #solde de la commande
+      Goto FIN
+    Else
+      #on ne fait rien sur la commande
+      SHIPLINE.POHCLE = 0     #solde de la commande
+      Goto FIN
+    Endif
+  Elsif TYP = 2
+    #désolde de la commande
+    SHIPLINE.POHCLE = 2    #désolde de la commande
+    Goto FIN
+  Endif
+Elsif WPOHCLE=4 : # Solde suivant % tolérance
+  #lecture de l'article
+  Read [ITM]ITM0=WPORDERQ.ITMREF
+  If fstat Raz [F:ITM] : Endif
+  If TYP = 1
+    If abs((WQTESTU/WPORDERQ.QTYSTU)*100)<=[F:ITM]MINRMNPRC
+      #solde de la commande
+      SHIPLINE.POHCLE = TYP     #solde de la commande
+      Goto FIN
+    Else
+      #on ne fait rien sur la commande
+      SHIPLINE.POHCLE = 0     #solde de la commande
+      Goto FIN
+    Endif
+  Elsif TYP = 2
+    #désolde de la commande
+    SHIPLINE.POHCLE = 2      #désolde de la commande
+    Goto FIN
+  Endif
+Endif
+
+$FIN
+#libération des instances
+FreeGroup WPORDERQ
+Return
+
+#######################################################################################
+# Issue 111256 US3
+$_CALC_TOTAUX
+Local Decimal WQTYWEU, WQTYVOU
+Local Integer WSTAT
+If TYPCALC = 1       #calcul par conteneur
+  Local Instance WCONTAINER Using C_CONTAINER
+  Local Instance WTABCONTAINER Using C_TABCONTAINER
+  WCONTAINER = NewInstance C_CONTAINER AllocGroup null
+  WTABCONTAINER = NewInstance C_TABCONTAINER AllocGroup null
+  If fmet WCONTAINER.AREAD(this.CTRNUM) = [V]CST_AOK
+    WQTYWEU = WCONTAINER.CRRWEI
+    Call CONVERT_QTY(WCONTAINER.DSPWEU,this.APARENT.DSPWEU,WQTYWEU)From TRTX3
+    this.APARENT.CRRWEI += WQTYWEU
+    If fmet WTABCONTAINER.AREAD(WCONTAINER.TCTRNUM) = [V]CST_AOK
+      WQTYVOU = WTABCONTAINER.TCTRVOL
+      Call CONVERT_QTY(WTABCONTAINER.VOU,this.APARENT.DSPVOU,WQTYVOU)From TRTX3
+      this.APARENT.CRRVOL += WQTYVOU
+    Endif
+  Endif
+  FreeGroup WCONTAINER
+  FreeGroup WTABCONTAINER
+Else                  #calcul par somme des lignes de PO
+ #conversion du poids
+  WQTYWEU = this.QTYWEU
+  Call CONVERT_QTY(this.LINWEU,this.APARENT.DSPWEU,WQTYWEU)From TRTX3
+  this.APARENT.CRRWEI += WQTYWEU
+  #conversion du volume
+  WQTYVOU = this.QTYVOU
+  Call CONVERT_QTY(this.LINVOU,this.APARENT.DSPVOU,WQTYVOU)From TRTX3
+  this.APARENT.CRRVOL += WQTYVOU
+Endif
+Return
+# End issue 111256 US3
+#######################################################################################
+# Issue 15350 - 2016-12-06 by MAE
+#**
+#* Update the quantities of the line according to QTYTYPE
+#*!
+$_UPDQTYLIN
+
+Case QTYTYPE
+When "CST_RCP"      #Receipt
+  this.RCPQTYPUU = QTYPUU
+  this.RCPQTYSTU = QTYSTU
+  this.CLEFLG = CLEFLG
+When "CST_PRCP"     #pre-receipt
+  this.PRCPQTYPUU = QTYPUU
+  this.PRCPQTYSTU = QTYSTU
+  this.CLEFLG = CLEFLG
+When "CST_EXP"      #shipped
+
+When Default
+Endcase
+[L]ARET_VALUE = fmet this.AGETMAXERROR("")
+
+Return
+# End issue 15350
+

@@ -1,0 +1,1586 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Portal migration
+$AMIGPORT
+
+# Declaration for the log file generation
+Local Instance MYLOG Using C_ALOG
+Local Char LOGFILE_NAME(250)
+
+# Identifier of the portal to be analyzed
+Local Char IDENTIFIER(100)
+
+# Clob result and error code
+Local Integer ERR
+Local Clbfile WCLOB(10)
+Local Decimal TIM
+
+# Http header and body sent as response
+Local Clbfile RESHEAD(1)
+Local Clbfile RESBODY(1)
+
+# Node arrays to get the details of the integration return
+Local Instance  NODES(1..) Using C_ASYRJSO
+Local Instance  NODE  Using C_ASYRJSO
+
+# Counts of items menu, portal, and dashboards created or updated
+Local Integer NB1,NB2,NB3
+
+# Array storing the messages returned by the integration
+Local Integer INDEX
+Local Integer SEVERTAB(1..)
+Local Char MESSTAB(250)(1..)
+Local Integer TRACEDET : TRACEDET=0 : # 2 if log expected
+Local Char MESSA(200) : Local Integer STAVAL
+
+# Start timing
+#  Dbgaff
+  TIM=val(timestamp$)
+
+# Start a logfile
+  MYLOG=NewInstance With C_ALOG
+  ERR=fmet MYLOG.ABEGINLOG("Portal migration")
+  LOGFILE_NAME=fmet MYLOG.AGETNAME
+
+  If this.TYP=mess(2,63,1) : # User
+    IDENTIFIER=this.CLE
+  Else
+    IDENTIFIER="_"+this.CLE : # Trade code
+  Endif
+
+# Call the X3 meta data extraction
+  Call GENERATION(IDENTIFIER,MYLOG,TRACEDET,WCLOB,ERR,NB1,NB2,NB3)
+
+# Local log
+  If TRACEDET=2
+    Openo "/home/dbopp/tmp/myprocess.json",0 Using [JSO9]
+    Wrseq WCLOB Using [JSO9]
+    Openo Using [JSO9]
+  Endif
+
+# Call the javascript import procedure
+  If ERR=0
+    Call IMPORT(USR, WCLOB, RESHEAD, RESBODY) From AMIGSYRPORT
+    STAVAL=val(func AJSONLIB.GET_PROP(RESHEAD,"statusCode"))
+    MESSA=func AJSONLIB.GET_PROP(RESHEAD,"message")
+    If STAVAL=200
+      ERR=fmet this.ASETERROR("", func AFNC.MES1(mess(30,146,1),num$((val(timestamp$)-TIM)/1000)),[V]CST_AOK)
+      ERR=fmet this.ASETERROR("", func AFNC.MES3(mess(32,146,1),num$(NB1),num$(NB2),num$(NB3)),[V]CST_AOK)
+    Else
+      If RESBODY="[]"
+        ERR=fmet this.ASETERROR("", func AFNC.MES2(mess(31,146,1),num$(STAVAL),MESSA),[V]CST_AERROR)
+      Else
+        # Handle the errors returned by the javascript procedure
+        ERR = func ASYRJSONPARSE.PARSEJSON(GACTX,RESBODY,NODES,NODE)
+      Endif
+    Endif
+  Else
+    # Handle the errors returned by the javascript procedure
+    ERR = func ASYRJSONPARSE.PARSEJSON(GACTX,RESBODY,NODES,NODE)
+  Endif
+
+INDEX=1
+
+If ERR=0
+  If NODE<>null
+    Call PARSENODE(NODE, INDEX, SEVERTAB, MESSTAB)
+  Endif
+Else
+  ERR=fmet this.ASETERROR("","Error #"-num$(ERR)-"found",[V]CST_AERROR)
+Endif
+
+For I = 1 To maxtab(SEVERTAB)
+  ERR=fmet this.ASETERROR("","Error #"-MESSTAB(I),SEVERTAB(I))
+Next
+
+Return
+
+#########################################################
+# IMPORT
+# --------------
+# This action calls node.js module
+# module = 'syracuse-import/lib/jsonImport'
+# function = 'jsonImportFromJson'
+# arguments = options
+# mode = 'wait'
+# This action must store new dashboard in Syracuse.
+#########################################################
+Subprog IMPORT(USER, WCLOB, RESHEAD, RESBODY)
+Value Char USER()
+Value Clbfile WCLOB()
+Variable Clbfile RESHEAD()
+Variable Clbfile RESBODY()
+
+Blbfile BYTES(10)
+Call TEXT2BLOB (WCLOB, BYTES)
+
+Local Clbfile CLB(8)
+Local Integer COUNT
+COUNT = b64Encode(BYTES, CLB)
+
+Local Char MODULE(100)
+Local Char FONCTION(30)
+Local Char MODE(10)
+Local Clbfile ARGUMENTS(0)
+Local Char ENCODINGS(40)
+Local Integer CALLBACKINDEX
+Local Char RETURNS(50)
+
+Local Clbfile OPT(2)
+OPT = '{"importMode":"update","createSession":true}'
+
+
+MODULE = 'syracuse-import/lib/jsonImport'
+FONCTION = 'jsonImportFromJson'
+MODE = 'wait'
+ARGUMENTS = '"' + USER + '","' + CLB + '",' + OPT
+ENCODINGS = '0,1,0'
+CALLBACKINDEX = 0
+RETURNS = ''
+
+Call EXEC_JS(MODULE, FONCTION, MODE, ARGUMENTS, ENCODINGS, CALLBACKINDEX, RETURNS, RESHEAD, RESBODY) From ASYRWEBSER
+
+End
+
+#------------------------------------------------#
+# PARSENODE
+#------------------------------------------------#
+# 1 Info
+# 2 Warning
+# 3 Error
+# 4 Fatal error
+#---------------------------#
+Subprog PARSENODE(NODE, INDEX, SEVERTAB, MESSTAB)
+Variable Integer INDEX
+Variable Integer SEVERTAB(1..)
+Variable Char MESSTAB()(1..)
+Variable Instance  NODE  Using C_ASYRJSO
+
+Local Integer SEVERITY
+
+  If "" <> NODE.PRO
+
+    If NODE.PRO = "severity" and NODE.NEX.PRO = "message"
+
+      Case NODE.CNT
+         When '"info"' : SEVERITY=1
+         When '"warning"' : SEVERITY=2
+         When '"error"' : SEVERITY=3
+         When Default : SEVERITY=0
+      Endcase
+
+      SEVERTAB(INDEX) = SEVERITY
+      MESSTAB(INDEX) = NODE.NEX.CNT
+      INDEX = INDEX + 1
+
+    Endif
+  Endif
+
+  If null <> NODE.SUB
+      Call PARSENODE(NODE.SUB, INDEX, SEVERTAB, MESSTAB)
+  Endif
+
+  If null <> NODE.NEX
+      Call PARSENODE(NODE.NEX, INDEX, SEVERTAB, MESSTAB)
+  Endif
+
+End
+
+
+
+#####
+# TEMPORARY METHOD TO TRANSFORM TEXT TO BLOB
+#####
+Subprog TEXT2BLOB(TXT,RESULT)
+Value Clbfile TXT()
+Variable Blbfile RESULT ()
+
+Blbfile RESULT(10)
+Local Char PATH(255)
+PATH=filpath("tmp","","","")+"/TEXT2BLOB.txt"
+Openo PATH,0 Using [TST2]
+Wrseq TXT Using [TST2]
+Openo Using [TST2]
+Openi PATH,0 Using [TST1]
+Getseq 1, RESULT Using [TST1]
+Openi Using [TST1]
+End
+##########
+
+Subprog WRITEFILE(WCLOB, FICJSON)
+Value Clbfile WCLOB()
+Value Char FICJSON()
+
+  Openo FICJSON,0 Using [JSO]
+  Iomode adxifs "" Using [JSO]
+  Iomode adxirs "" Using [JSO]
+  Wrseq WCLOB Using [JSO]
+  Openo Using [JSO]
+
+End
+
+# Tool for migrating the V6 portal meta data
+# through generation of an import file that will be managed by Syracuse
+# The main parameter is the user code
+
+Subprog GENERATION(USER,MYLOG,TRACEDET,WCLOB,ERR,NBM,NBP,NBD)
+Value Char USER()
+Variable Instance MYLOG Using C_ALOG
+Variable Integer ERR
+Variable Integer NBM,NBP,NBD
+Value Integer TRACEDET
+Variable Clbfile WCLOB() : # The import file contents
+
+
+# Variables declaration
+Local Integer NBL      : # The number of languages
+Local Integer IL
+Local Integer I,J,K,L,M,N
+
+Local Char CRLF : CRLF=chr$(10)
+Local Char CHAINE(250)
+
+# Portal organization page variables
+Local Integer NBPORT            : # Total number of portlet entries found
+Local Char PORTLET(150)(1..200)
+Local Libelle NUMONG(1..200)
+Local Libelle NUMCOL(1..200)
+Local Libelle NUMPOR(1..200)
+Local Char TITPOR(20)(1..200)
+Local Char PARAMPORT(200)(1..200,1..5)
+Local Char VALPAR(100)(1..200,1..5)
+Local Char USR_PREFIX(100)
+Local Char ADM_PREFIX(100)
+Local Char MEN_PREFIX(100)
+Local Integer MAXPROF
+Local Char PROFIL(20)
+Local Integer CUR_LEVEL : # Current level for menu generation
+
+# Tables declaration
+  Local File ATEXTE
+  Local File AFONCTION
+  Local File ADOSSIER
+  Local File TABLAN
+  Local File APROFIL
+  Local File AMENUSER
+  Local File AUTILIS
+  Local File AOBJET
+  Local File ATEXTE [AZZ]
+  Local File APLSTD [AZS]
+  Local File ACLOB
+  Local File AMETUTI
+  Local File ACLASSE
+  Local File ASHW
+  Local File APTLVW
+  Local File PARSTA2
+  Local File ALISTEH
+  Local File APROCESSUS
+
+# Store the list of languages for generation, as well as their iso code
+Local Char TABLAN(3)(1..dim([ADS]LAN)), ISOLAN(10)(1..dim([ADS]LAN))
+Local Integer NBL
+Local Char LANGUE(20)
+
+  Read [ADS]DOSSIER=GACTX.AFOLDER
+  If fstat : ERR=2 : End : Endif
+  # If the iso language code is not defined, ignore the language
+  For [TLA] Where find([TLA]LAN,[ADS]LAN(0..[ADS]NBRLAN-1)) and LANISO<>""
+    NBL+=1
+    TABLAN(NBL)=[TLA]LAN : ISOLAN(NBL)=[TLA]LANISO
+  Next
+  # But if no language is set properly, propose at least English and French !!!
+  If NBL=0
+    NBL+=1 : TABLAN(NBL)="ENG" : LANISO(NBL)="en-US"
+    NBL+=1 : TABLAN(NBL)="FRA" : LANISO(NBL)="fr-FR"
+  Endif
+
+# Set NBENT to 1 to get a detail log that tests the references between items
+  Local Char ENTITIES(50)(1..3000) : Local Integer NBENT
+  NBENT=0
+
+  # For the moment, portal are generated only in French or English, we need to define how this will be managed
+  If GACTX.LAN="FRA" : LANGUE="fr-FR" : Else LANGUE="en-US" : Endif
+
+  MAXPROF=nbrecord([AFC])+100
+
+  # Check if the user or the trade code exists, get the menu profile code
+  If left$(USER,1)="_"
+    USR_PREFIX=right$(USER,2)
+    Read [AME]AME0=USR_PREFIX
+    ERR=(fstat<>0)
+    If ERR : End : Endif
+    PROFIL=[AME]PRFMEN
+    If PROFIL="" : ERR=2 : End : Endif
+    USR_PREFIX="AME_"+GACTX.AFOLDER+"_"+USR_PREFIX+"_"
+  Else
+    Read [AUS]CODUSR=USER
+    ERR=(fstat<>0)
+    If ERR : End : Endif
+    If [AUS]PRFMEN<>""
+      PROFIL=[AUS]PRFMEN
+    Elsif [AUS]CODMET<>""
+      Read [AME]AME0=[AUS]CODMET
+      PROFIL=[AME]PRFMEN
+    Else
+      ERR=2 : ERR
+    Endif
+    USR_PREFIX="USR_"+GACTX.AFOLDER+"_"+USER+"_"
+  Endif
+  Read [APF]APF1=PROFIL
+  ERR=(fstat<>0)
+  If ERR : End : Endif
+
+# Get the maximum reasonable dimension for menu buffer
+  Filter [AMU] Where CODPRF=PROFIL
+  MAXPROF=rowcount([AMU])+500
+  Filter [AMU]
+
+Local Integer NBFONC, LEV       : # Total number of entry menu found
+Local Integer NBFONCINI         : # Pointer on first item of a menu
+Local Integer FIRSTFAV          : # First entry corresponding to favorites
+Local Libelle TYPEFONC(1..MAXPROF),NIVFONC(1..MAXPROF),MAXNIVFONC
+Local Libelle DUPLICATES(1..MAXPROF) : # set to 1 if the entry was already found
+Local Char CODEFONC(30)(1..MAXPROF),PARAM(100)(1..MAXPROF),MENUFONC(20)(1..MAXPROF),TITREFONC(100)(1..MAXPROF)
+Local Char FONCMEN(30)(1..100),PARAMEN(100)(1..100)
+Local Char TEXTOTRANS(250)
+Local Integer IFCONVERGENCE_ONLY : # If set to 2, the generation creates only convergence links
+
+Local Char MENU_STACK(30)(1..100) : # Stack to manage 3 level functions
+Local Integer NB_STACK
+
+# Manage the super user profile code
+Local Char GSUPERX3(20)
+  GSUPERX3 = fmet GACTX.APARAM.AGETVALCHAR([V]CST_ALEVFOLD,"","ADMUSR")
+  If GSUPERX3="" : GSUPERX3="ADMIN" : Endif
+  ADM_PREFIX="USR_"+GACTX.AFOLDER+"_"+GSUPERX3+"_"
+  MEN_PREFIX="USR_"+GACTX.AFOLDER+"_"+PROFIL+"_"
+
+# Read the convergence flsg
+  IFCONVERGENCE_ONLY=fmet GACTX.APARAM.AGETUSERVALNUM("ACONVONLY")
+
+# Indicator set to 1 if the menu is the same than the standard ADMIN menu
+Local Libelle STDMEN(1..MAXPROF)
+
+Local Char IDFONC(50)(1..MAXPROF)
+# FIRST STEP : Fill the buffers
+
+# Get the definition of portal, returns ERR=3 if an error occurs
+  Call GET_POR(USER,NBPORT,PORTLET,NUMONG,NUMCOL,TITPOR,PARAMPORT,MYLOG,ERR)
+  If ERR : End : Endif
+
+# Read the standard profile list
+  Gosub READ_MENGEN
+
+# Read the favorite list
+  Gosub READ_MENFAV
+  NBM=NBFONC-1
+
+# SECOND STEP : Generate the JSON file
+
+# Write the header
+  Call HEADER(WCLOB,LANGUE) : # includes the opening "$items" : [ group
+
+# Flag for adding "," in the JSON list
+  L=0
+
+# Generate the menu entries
+  Gosub GENE_MENULIST
+
+# Trace the result
+  If TRACEDET=2
+    For I=1 To NBPORT
+      ERR=fmet MYLOG.APUTLINE("Portlet="+PORTLET(I)-"Onglet="+num$(NUMONG(I))-"Col="+num$(NUMCOL(I))-"titpor="+TITPOR(I)-"parampor="+PARAMPORT(I,1),0)
+    Next I
+    ERR=fmet MYLOG.APUTLINE(num$(NBPORT)-'items in the list',0)
+  Endif
+
+  Gosub GENE_PORTLIST
+
+  Gosub GENE_PORTLET
+
+  Gosub GENE_PAGES
+
+# Close the portlet array
+  Append WCLOB,"]"+CRLF
+
+
+# Close the section
+  Append WCLOB,"}"+CRLF
+
+# Close the logfile
+  ERR=fmet MYLOG.AENDLOG
+
+# Second logfile
+  If NBENT
+    Openo "/home/dbopp/tmp/links.tra",0 Using [TLA]
+    Iomode adxifs "" Using [TLA]
+    Iomode adxirs chr$(13)+chr$(10) Using [TLA]
+    For I=1 To NBENT-1
+      If pat(ENTITIES(I),"LNK *")
+        For J=1 To I-1
+          If pat(ENTITIES(J),"LNK *")=0 and right$(ENTITIES(J),instr(1,ENTITIES(J)+" "," ")+1)=right$(ENTITIES(I),5)
+            Wrseq ENTITIES(I)+";OK" Using [TLA]
+            Break
+          Endif
+        Next J
+        If J>=I : Wrseq ENTITIES(I)+";KO" Using [TLA] : Endif
+      Else
+        Wrseq ENTITIES(I) Using  [TLA]
+      Endif
+    Next I
+    Openo Using [TLA]
+  Endif
+
+ERR=0
+End
+
+#
+# Subprograms filling the fonction hierarchy buffers by analyzing the menus
+# Routine loading the user's menu
+
+$READ_MENGEN
+  MAXNIVFONC=1
+  NBFONC=1 : CODEFONC(1)="MENU" : PARAM(1)=[APF]MENDEP : NIVFONC(1)=1 : TYPEFONC(1)=1
+  STDMEN(1)=(PROFIL=GSUPERX3)
+  DUPLICATES(NBFONC)=0
+  J=1
+
+# First pass : fill the menu table
+  While J<=NBFONC
+    If TYPEFONC(J)=1
+      STDMEN(J)=(PROFIL=GSUPERX3)
+      For [AMU]MENCOD Where CODPRF=[APF]CODPRF and MENU=PARAM(J)
+        NBFONC+=1 : CODEFONC(NBFONC)=[AMU]FONCTION : NIVFONC(NBFONC)=NIVFONC(J)+1 : MENUFONC(NBFONC)=PARAM(J)
+        MAXNIVFONC=max(MAXNIVFONC,NIVFONC(J)+1)
+        K=0
+        If CODEFONC(NBFONC)="MENU"
+          TYPEFONC(NBFONC)=1
+          PARAM(NBFONC)=[AMU]CODMEN
+        Else
+          TYPEFONC(NBFONC)=2
+          If CODEFONC(NBFONC)="SYSTEME"
+            PARAM(NBFONC)=[AMU]ORDSYS
+          Else
+            Read [AFC]CODINT=CODEFONC(NBFONC)
+            K=find(CODEFONC(NBFONC),CODEFONC(1..NBFONC-1))
+            If fstat=0 and [AFC]VALEUR(0)="#"
+              PARAM(NBFONC)=[AMU]CODMEN
+            Endif
+          Endif
+        Endif
+        DUPLICATES(NBFONC)=0
+        If K
+          If PARAM(K)=PARAM(NBFONC)
+            DUPLICATES(NBFONC)=1
+          Endif
+        Endif
+        TITREFONC(NBFONC)=""
+        If [AMU]LIBMENU
+          Read [AZZ]NUMERO=GACTX.LAN;[AMU]LIBMENU
+          If fstat : Raz [AZZ] : Endif
+        Else
+          Read [AFC]CODINT=CODEFONC(NBFONC)
+          If fstat=0
+            Read [AZZ]NUMERO=GACTX.LAN;[AFC]LIBMENU
+          Endif
+          If fstat : Raz [AZZ] : Endif
+        Endif
+        If [AZZ]NUMERO
+          TITREFONC(NBFONC)="{"+num$([AZZ]NUMERO)+"}"
+          If find(CODEFONC(NBFONC),"AIMP","AMIEXE","EXEALH","CONSSTA")<>0 and PARAM(NBFONC)<>""
+            TITREFONC(NBFONC)-='('+PARAM(NBFONC)+')'
+          Endif
+        Else
+          TITREFONC(NBFONC)=[AMU]INTIT
+        Endif
+        TITREFONC(NBFONC)+=string$(vireblc(TITREFONC(NBFONC),2)="",CODEFONC(NBFONC)-PARAM(NBFONC))
+      Next
+    Endif
+    J+=1
+  Wend
+
+# Second pass if not "ADMIN" menu : checkout if the menus are standard (start with the lowest level)
+  If STDMEN(1)=0
+    For J=MAXNIVFONC To 1 Step -1
+      For K=1 To NBFONC
+        If TYPEFONC(K)=1 and NIVFONC(K)=J
+          # Check out if the menu K is standard or not
+          # Create a table with the entries of the menu, stop if a not standard submenu exists
+          # M stores the number of entries in the menu. If -1, a difference was found
+          M=0
+          For L=1 To NBFONC
+            If MENUFONC(L)=PARAM(K)
+              If TYPEFONC(L)=1 and STDMEN(L)=0
+                M=-1
+                Break
+              Endif
+              M+=1
+              FONCMEN(M)=CODEFONC(L)
+              PARAMEN(M)=PARAM(L)
+            Endif
+          Next L
+          If M>=0
+            N=0
+            For [AMU]MENCOD Where CODPRF=GSUPERX3 and MENU=PARAM(K)
+              N+=1
+              If N>M : M=-1 : Break : Endif
+              If [AMU]FONCTION<>FONCMEN(N) : M=-1 : Break : Endif
+              If [AMU]FONCTION<>"SYSTEME" and [AMU]CODMEN<>PARAMEN(N) : M=-1 : Break
+              Elsif [AMU]FONCTION="SYSTEME" and [AMU]ORDSYS<>PARAMEN(N) : M=-1 : Break
+              Endif
+            Next
+            If N<M : M=-1 : Endif
+          Endif
+          STDMEN(K)= (M>=0)
+        Endif
+      Next K
+    Next J
+  Endif
+
+  If TRACEDET=2
+    ER=fmet MYLOG.APUTLINE("Menu"-[APF]MENDEP,0)
+    For J=1 To NBFONC
+      ER=fmet MYLOG.APUTLINE(num$(J)+"/"+num$(NBFONC)-num$(TYPEFONC(NBFONC))
+&                   -'cod="'+CODEFONC(J)+'" param="'+PARAM(J)+'" tit="'+TITREFONC(J)
+&                   -'" lev='+num$(NIVFONC(J))+' men="'+MENUFONC(J)+'"'+string$(STDMEN(J),"/standard"),0)
+    Next J
+    ER=fmet MYLOG.APUTLINE(num$(NBFONC)-'lines found',0)
+    ER=fmet MYLOG.APUTLINE("",0)
+    Call HIERARCHY(1,[APF]MENDEP,1,NBFONC,CODEFONC,IDFONC,TYPEFONC,NIVFONC,PARAM,MENUFONC,TITREFONC,MYLOG)
+  Endif
+Return
+
+# Routine loading the favorite menus (by parsing a clob containing its XML description)
+$READ_MENFAV
+
+# Miscellaneous variable assignment
+  LEV=1
+  I=1
+  NBFONC+=1
+  FIRSTFAV=NBFONC
+
+# Read the favorite data clob(XML)
+  Read [ACB]ACB0="USERPREF";USER;"FAVORIS";""
+  If fstat : Return : Endif
+
+  TYPEFONC(NBFONC)=1 : MENUFONC(NBFONC)="FAV" : TITREFONC(NBFONC)="{146,6}" : NIVFONC(NBFONC)=1
+  CODEFONC(NBFONC)="MENU" : PARAM(NBFONC)=""
+  DUPLICATES(NBFONC)=0
+  STDMEN(NBFONC)=0
+  LEV+=1
+
+  # Call recursively all the nested levels
+  While I and ERR=0
+    Call TRAITE_MEN([ACB]CLOB,I,LEV,FIRSTFAV,ERR,NBFONC,TYPEFONC,NIVFONC,CODEFONC,IDFONC,PARAM,MENUFONC,TITREFONC,MYLOG)
+  Wend
+
+  # If an error occurs, consider that no favorites have been found
+  If ERR
+    NBFONC=FIRSTFAV-1
+  Endif
+
+# Check if duplicates exist on favorites
+  For I=FIRSTFAV To NBFONC
+    For J=1 To FIRSTFAV-1
+      If CODEFONC(J)=CODEFONC(I) and PARAM(J)=PARAM(I)and TYPEFONC(J)=TYPEFONC(I)
+        DUPLICATES(J)=1
+        Break
+      Endif
+    Next J
+  Next I
+
+  # Log if requested
+  If TRACEDET=2
+    If ERR=0
+      ER=fmet MYLOG.APUTLINE("Favorites"-PROFIL,0)
+      For I=FIRSTFAV To NBFONC
+        ER=fmet MYLOG.APUTLINE(num$(I)+"/"+num$(NBFONC)-num$(TYPEFONC(I))-'cod="'+CODEFONC(I)+'" param="'+PARAM(I)+'" tit="'+TITREFONC(I)+'" lev='+num$(NIVFONC(I))+' men="'+MENUFONC(I)+'"',0)
+      Next I
+      ER=fmet MYLOG.APUTLINE(num$(NBFONC-FIRSTFAV+1)-'lines found',0)
+      Call HIERARCHY(1,"FAV",FIRSTFAV,NBFONC,CODEFONC,IDFONC,TYPEFONC,NIVFONC,PARAM,MENUFONC,TITREFONC,MYLOG)
+    Else
+      ER=fmet MYLOG.APUTLINE("Favorites"-PROFIL-"Error code="+num$(ERR),1)
+    Endif
+  Endif
+
+Return
+
+# Decodes an XML favorite submenu (recursively)
+Subprog TRAITE_MEN(CLOB,IND,LEV,FIRSTFAV,ERR,NBFONC,TYPEFONC,NIVFONC,CODEFONC,IDFONC,PARAM,MENUFONC,TITREFONC,MYLOG)
+Variable Clbfile CLOB
+Variable Integer IND
+Variable Integer LEV
+Variable Integer ERR
+Value Integer FIRSTFAV
+Variable Integer NBFONC
+Variable Libelle TYPEFONC(1..),NIVFONC(1..)
+Variable Char CODEFONC()(1..), IDFONC()(1..), PARAM()(1..), MENUFONC()(1..), TITREFONC()(1..)
+Variable Instance MYLOG Using C_ALOG
+Local Integer I,J,K,L
+
+  While ERR=0
+    I=instr(IND,CLOB,"<MEN")
+    J=instr(IND,CLOB,"<FUN")
+    K=instr(IND,CLOB,"</MEN>")
+    If (LEV>10)
+      ERR=99 : Break
+    Endif
+
+    If I=0 and J=0 and K=0
+      If LEV>2
+        ERR=fmet MYLOG.APUTLINE("End of file",[V]CST_AERROR)
+        ERR=4
+      Else
+        IND=0
+      Endif
+      Break
+    Endif
+
+  # </MEN comes first
+    If (K<>0) and ((I<>0 and J<>0 and K<I and K<J) or (I<>0 and J=0 and K<I) or (J<>0 and I=0 and K<J) or (I=0 and J=0))
+      IND=K+6
+      LEV-=1
+      # If level is negative, error in men nesting
+      If LEV<2
+        ERR=fmet MYLOG.APUTLINE("Wrong menu's hierarchy",[V]CST_AERROR)
+        ERR=3
+      Endif
+      Break
+    Endif
+
+    NBFONC+=1
+
+  # MEN comes first
+    If (I<>0) and ((J<>0 and K<>0 and I<J and I<K) or (J<>0 and K=0 and I<J) or (K<>0 and J=0 and I<K) or (J=0 and K=0))
+      TYPEFONC(NBFONC)=1
+      IND=I+4
+      # The menu for the function is the last menu of previous level found
+      For J=NBFONC-1 To FIRSTFAV Step -1
+        If NIVFONC(J)=LEV-1 and TYPEFONC(J)=1
+          MENUFONC(NBFONC)=PARAM(J)
+          Break
+        Endif
+      Next
+
+  # FUN comes first
+    Elsif (J<>0) and ((K<>0 and I<>0 and J<K and J<I) or (K<>0 and I=0 and J<K) or (I<>0 and K=0 and J<I) or (I=0 and K=0))
+      TYPEFONC(NBFONC)=2
+      IND=J+4
+      # Get the menu for the function
+      K=instr(IND,CLOB,'MEN="')+5
+      L=instr(K,CLOB,'"')-1
+      If K=5 or L=-1
+        ERR=fmet MYLOG.APUTLINE("Menu not found"-num$(K)-num$(L),[V]CST_AERROR)
+        ERR=1
+        Break
+      Endif
+      MENUFONC(NBFONC)=seg$(CLOB,K,L)
+      If PARAM(FIRSTFAV)="" : PARAM(FIRSTFAV)=MENUFONC(NBFONC) : Endif
+      # Verify if the menu exist, otherwise use the last menu at the previous level
+      For J=NBFONC-1 To FIRSTFAV Step -1
+        If NIVFONC(J)=LEV-1 and TYPEFONC(J)=1 and PARAM(J)=MENUFONC(NBFONC)
+          Break
+        Endif
+      Next J
+      If J=0 : # Menu not found
+        For J=NBFONC-1 To FIRSTFAV Step -1
+          If NIVFONC(J)=LEV-1 and TYPEFONC(J)=1
+            MENUFONC(NBFONC)=PARAM(J)
+            Break
+          Endif
+        Next J
+      Endif
+    Endif
+
+    # Verify the level
+    K=instr(IND,CLOB,'NIV="')+5
+    L=instr(K,CLOB,'"')-1
+    If K=5 or L=-1 or val(seg$(CLOB,K,L))<>LEV-1
+      ERR=fmet MYLOG.APUTLINE("Inconsistent level"-num$(LEV-1)-num$(K)-num$(L)-num$(val(seg$(CLOB,K,L))),[V]CST_AERROR)
+      ERR=1
+      Break
+    Endif
+
+    NIVFONC(NBFONC)=LEV
+
+    # Get the title
+    K=instr(IND,CLOB,'C_')
+    If K=0
+      ERR=fmet MYLOG.APUTLINE("Title not found",[V]CST_AERROR)
+      ERR=2
+      Break
+    Endif
+    If pat(mid$(CLOB,K+2,5),'???="')=0
+      ERR=fmet MYLOG.APUTLINE("Incorrect title",[V]CST_AERROR)
+      ERR=2
+      Break
+    Endif
+    L=instr(K+7,CLOB,'"')-1
+    If L
+      TITREFONC(NBFONC)=seg$(CLOB,K+7,L)
+    Else
+      ERR=fmet MYLOG.APUTLINE("Incorrect title",[V]CST_AERROR)
+      ERR=2
+      Break
+    Endif
+
+    # Get the code
+    K=instr(IND,CLOB,'NAM="')
+    If K=0
+      ERR=fmet MYLOG.APUTLINE("Code not found",[V]CST_AERROR)
+      ERR=2
+      Break
+    Endif
+    L=instr(K+5,CLOB,'"')
+    If L
+      If TYPEFONC(NBFONC)=2
+        CODEFONC(NBFONC)=seg$(CLOB,K+5,L-1)
+      Else
+        CODEFONC(NBFONC)="MENU"
+        PARAM(NBFONC)=seg$(CLOB,K+5,L-1)
+      Endif
+    Else
+      ERR=fmet MYLOG.APUTLINE("Incorrect code",[V]CST_AERROR)
+      ERR=2
+      Break
+    Endif
+
+    If TYPEFONC(NBFONC)=1
+      LEV+=1
+      Call TRAITE_MEN(CLOB,IND,LEV,FIRSTFAV,ERR,NBFONC,TYPEFONC,NIVFONC,CODEFONC,IDFONC,PARAM,MENUFONC,TITREFONC,MYLOG)
+    Endif
+  Wend
+End
+
+
+# ROUTINE FILLING THE CLOB CONTAINING THE RESULT CLOB with the menus
+# L counts the number of entries written
+
+GENE_MENULIST
+  K=0
+
+# First loop on the users menus (level 2 only : goes on a portlet except if direct functions)
+  For J=1 To FIRSTFAV-1
+    Gosub ASSIGN_IDFONC
+    If NIVFONC(J)=2
+      # Menus
+      If TYPEFONC(J)=1
+        # an additional entry will be created
+        L+=1
+        Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"menuItem",'
+        Append WCLOB,'"linkType":"$dashboard",'
+
+        # Add the common definitions
+        Append WCLOB,'"dashboard":"'+IDFONC(J)+'",'
+        Append WCLOB,'"code":"'+IDFONC(J)+'",'
+        TEXTOTRANS=TITREFONC(J): Gosub TITLE_TRANS
+        Append WCLOB,','
+        Gosub DESC_TRANS
+        Append WCLOB,"}"
+        If NBENT : ENTITIES(NBENT)="DASH"-IDFONC(J) : NBENT+=1 : Endif
+      Else
+        Gosub LNKFUNC
+      Endif
+    Endif
+  Next J
+
+# Loop to search if functions exist at third level of the hierarchy
+# If they exist, prepare a list of the concerned menu to generate later portlets
+  For J=1 To FIRSTFAV-1
+    If NIVFONC(J)=3 and TYPEFONC(J)=1 and find(MENUFONC(J),MENU_STACK(1..NB_STACK))=0
+      NB_STACK+=1
+      MENU_STACK(NB_STACK)=MENUFONC(J)
+    Endif
+  Next J
+
+# Loop to assign IDFONC for the favorites (fixes the issue #1055)
+  For J=FIRSTFAV To NBFONC
+    Gosub ASSIGN_IDFONC
+  Next J
+
+# Second loop on the final functions (including favorites)
+  For J=1 To NBFONC
+    If TYPEFONC(J)=2 and ((NIVFONC(J)>2) or J>=FIRSTFAV)and DUPLICATES(J)=0
+      Gosub LNKFUNC
+    Endif
+  Next J
+Return
+
+# IDFUNC assignment
+$ASSIGN_IDFONC
+  If TYPEFONC(J)=1
+    IDFONC(J)=string$(STDMEN(J)=1,ADM_PREFIX)+string$(STDMEN(J)=0,MEN_PREFIX)+PARAM(J)
+  Elsif CODEFONC(J)>="X"
+    IDFONC(J)="SPE_"+GACTX.AFOLDER+"_"+CODEFONC(J)+string$(PARAM(J)<>"","_"+func STRG(PARAM(J)))
+  Elsif PARAM(J)<>""
+    IDFONC(J)="PAR_"+GACTX.AFOLDER+"_"+CODEFONC(J)+"_"+func STRG(PARAM(J))
+  Else
+    IDFONC(J)="STD_"+CODEFONC(J)
+  Endif
+Return
+
+# Assignment of titles and description
+$DESC_TRANS
+  Append WCLOB,'"title":{'
+  Goto TRANS_T
+$TITLE_TRANS
+  Append WCLOB,'"description":{'
+$TRANS_T
+  For IL=1 To NBL
+    Append WCLOB,string$(IL>1,",")+'"'+ISOLAN(IL)+'":"'+func TRADTXT(TABLAN(IL),TEXTOTRANS)+'"'
+  Next IL
+  Append WCLOB,"}"
+Return
+
+Funprog TRADTXT(LAN,CHAINE)
+Value Char LAN(),CHAINE()
+Local Integer I,J,K
+Local Char NUMBER
+  I=instr(1,CHAINE,"{")
+  J=instr(min(1,J),CHAINE,"}")
+  If I and J
+    NUMBER=seg$(CHAINE,I+1,J-1)
+    K=instr(1,NUMBER,",")
+    If K=0
+      Read [AZZ]NUMERO=LAN;val(NUMBER)
+      If fstat : Raz [AZZ] : Endif
+      CHAINE=left$(CHAINE,I-1)+[AZZ]TEXTE+right$(CHAINE,J+1)
+    Else
+      Read [AZS]CLE=val(left$(NUMBER,K-1)); val(right$(NUMBER,K+1));LAN
+      If fstat : Raz [AZS] : Endif
+      CHAINE=left$(CHAINE,I-1)+[AZS]LANMES+right$(CHAINE,J+1)
+    Endif
+  Endif
+End escJson(CHAINE)
+
+# Generates an entry item for a function
+$LNKFUNC
+
+# First of all, check if a representation has been found (K=1)
+  K=0
+  If left$(CODEFONC(J),3)="GES" and IFCONVERGENCE_ONLY<>2
+    Read [AFC]CODINT=CODEFONC(J)
+    CHAINE=vireblc([AFC]VALPAR(0),2)
+    If pat(CHAINE,'"*"')
+      Read [AOB]ABREV=seg$(CHAINE,2,len(CHAINE)-1)
+      K=(fstat=0)
+    Endif
+    If K
+      K=0
+      For [ACLA] Where TYPCLA=2 and TABREF=[AOB]NOMFIC
+        K=1 : Break
+      Next
+      If K
+        K=0
+        For [ASW] Where CODCLA=[ACLA]CODCLA
+          K=1 : Break
+        Next
+      Endif
+    Endif
+  Endif
+
+# Now let's generate (and add 1 to the number of entries created)
+  L+=1
+  Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"menuItem",'
+
+  # First define the type of function
+  If K or find(CODEFONC(J),"EXEALH","CONSSTA")
+    Append WCLOB,'"linkType":"$representation",'
+  Else
+    Append WCLOB,'"linkType":"$function",'
+  Endif
+
+  # The code of the function depends on the case
+  Append WCLOB,'"code":"'
+  Append WCLOB,IDFONC(J)+'",'
+
+  If NBENT : ENTITIES(NBENT)="MITEM"-IDFONC(J) : NBENT+=1 : Endif
+
+  # Add the common definitions
+  TEXTOTRANS=TITREFONC(J): Gosub TITLE_TRANS
+  Append WCLOB,','
+  Gosub DESC_TRANS
+
+  # If a class and a representation where found, call them
+  If K
+    Append WCLOB,',"application":{"application":"x3","contract":"erp"},'
+    Append WCLOB,'"representationRef":{'
+    Append WCLOB,'"entity":"'+[ACLA]CODCLA+'",'
+    Append WCLOB,'"representation":"'+[ASW]CODREP+'"},'
+    Append WCLOB,'"facet":"$query"}'
+  Else
+    Append WCLOB,',"application":{"application":"x3","contract":"erp"},'
+    Case CODEFONC(J)
+      When "EXEALH" : # Requester, a Syracuse function
+        If PARAM(J)=""
+          # See with Bruno how we can define the lookup call
+          Append WCLOB,'"representationRef":{"entity":"QUERY","representation":"QUERY"},"facet":"$query"}'
+        Else
+          Append WCLOB,'"representationRef":{"entity":"QUERY('+"'"+PARAM(J)+"'"+')",'
+          Append WCLOB,'"representation":"QUERY~'+PARAM(J)+'~1"},'
+          Append WCLOB,'"facet":"$query"}'
+        Endif
+      When "CONSSTA" : # Statistical inquiry, a Syracuse function
+        If PARAM(J)=""
+          # See with Bruno how we can define the lookup call
+          Append WCLOB,'"representationRef":{"entity":"STAT","representation":"STAT"},"facet":"$query"}'
+        Else
+          Append WCLOB,'"representationRef":{"entity":"STATS('+"'"+PARAM(J)+"'"+')",'
+          Append WCLOB,'"representation":"STATS~'+PARAM(J)+'"},'
+          Append WCLOB,'"facet":"$query"}'
+        Endif
+      When Default : # Fusion link
+        Append WCLOB,'"fusionFunction":"'+CODEFONC(J)+'",'
+        Append WCLOB,'"fusionKey":"'+PARAM(J)+'"' : # Will be replaced later
+        Append WCLOB,"}"
+    Endcase
+  Endif
+Return
+
+# Write the portlet menu list
+$GENE_PORTLIST
+
+# First step : generate the portlet in the main portal
+  For I=1 To NBPORT
+    Case PARAMPORT(I,1)
+      When "$ext"
+        L+=1
+        Append WCLOB,string$(L>1,','+CRLF)+' {"$type":"menuItem",'
+        Append WCLOB,'"linkType":"$external",'
+        Append WCLOB,'"code":"'+PORTLET(I)+'",'
+        TEXTOTRANS=TITPOR(I) : Gosub TITLE_TRANS
+        Append WCLOB,','
+        Gosub DESC_TRANS
+        Append WCLOB,','
+        Append WCLOB,'"externalUrl":"'+func STRG(PARAMPORT(I,2))+'"}'
+        If NBENT : ENTITIES(NBENT)="MITEM"-PORTLET(I) : NBENT+=1 : Endif
+      When "$rss"
+        L+=1
+        Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"menuItem",'
+        Append WCLOB,'"linkType":"$rss",'
+        TEXTOTRANS=TITPOR(I) : Gosub TITLE_TRANS
+        Append WCLOB,','
+        Gosub DESC_TRANS
+        Append WCLOB,','
+        Append WCLOB,'"NumberOfItems":'+func STRG(PARAMPORT(I,2))+','
+        Append WCLOB,'"Display":'+func STRG(PARAMPORT(I,3))+','
+        Append WCLOB,'"externalUrl":"'+func STRG(PARAMPORT(I,4))+'"}'
+        If NBENT : ENTITIES(NBENT)="MITEM"-PORTLET(I) : NBENT+=1 : Endif
+      When "$menu","$header" : # menus and header are not concerned
+      When "$table" : # Tabular representation of statistical inquiry, request, or other types
+        # Find out the type of data source
+        Read [APV]APV0=PARAMPORT(I,4)
+        If fstat=0
+          Case [APV]SRCCODTYP
+            When "REQ"
+              Gosub ADD_QUERY
+            When "STA"
+              Gosub ADD_STAT
+            When Default
+              # Inquiries, program generated feeds have to be managed here...
+          Endcase
+        Else
+          # A pseudo portlet displaying an error message should be defined here
+        Endif
+      When "$flash" : # Flash representation of statistical inquiry, request, process
+        # Find out the type of data source
+        If PARAMPORT(I,3)="SUBAPR:CLOBEXP"
+          Gosub ADD_PROC
+        Else
+          Read [APV]APV0=PARAMPORT(I,4)
+          If fstat=0
+            Case [APV]SRCCODTYP
+              When "STA"
+                Gosub ADD_STAT
+              When "REQ"
+                Gosub ADD_QUERY
+              When Default
+                # A pseudo portlet displaying an error message should be defined here
+            Endcase
+          Else
+            # A pseudo portlet displaying an error message should be defined here
+          Endif
+        Endif
+      When Default
+        L+=1
+        Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"menuItem",'
+        Append WCLOB,'"linkType":"$representation",'
+        Append WCLOB,'"code":"'+PORTLET(I)+'",'
+        Append WCLOB,'"application":{"application":"x3","contract":"erp"},'
+        Append WCLOB,'"representationRef":{"entity":"DISPLAY",'
+        Append WCLOB,'"representation":"DISPLAY"},'
+        Append WCLOB,'"facet":"$details",'
+        Append WCLOB,'"parameters":['
+        J=1
+        While J<dim(PARAMPORT,2) and PARAMPORT(I,J)<>""
+          Append WCLOB,string$(J>1,",")+'{"name":"p'+num$(I)+'","title":"P'+num$(I)+'","value":"'+PARAMPORT(I,J)+'"}'
+          J+=1
+        Wend
+        Append WCLOB,"]}"
+        If NBENT : ENTITIES(NBENT)="MITEM"-PORTLET(I) : NBENT+=1 : Endif
+    Endcase
+  Next I
+
+# Second step : generate the portlet for the functions directly attached to a level 2 menu
+  For I=1 To NB_STACK
+    For J=1 To FIRSTFAV-1
+      Break CODEFONC(J)="MENU" and PARAM(J)=MENU_STACK(I)
+    Next J
+    If J<FIRSTFAV
+
+      # an additional entry will be created
+      L+=1
+      Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"portlet",'
+      Append WCLOB,'"type":"$menu",'
+
+      # Add the common definitions
+      Append WCLOB,'"code":"'+IDFONC(J)+'_0",'
+      TEXTOTRANS=TITREFONC(J) : Gosub TITLE_TRANS
+      Append WCLOB,','
+      Gosub DESC_TRANS
+      Append WCLOB,','
+      If NBENT : ENTITIES(NBENT)="PORTMEN"-IDFONC(J) : NBENT+=1 : Endif
+
+      # Add the item list
+      Append WCLOB,'"items":['
+      N=0
+      For K=1 To FIRSTFAV-1
+        If NIVFONC(K)=3 and TYPEFONC(K)=2 and MENUFONC(K)=MENU_STACK(I)
+          Append WCLOB,string$(N>0,",")+'"'+IDFONC(K)+'"'
+          N+=1
+          If NBENT : ENTITIES(NBENT)="LNK"-IDFONC(K) : NBENT+=1 : Endif
+        Endif
+      Next K
+      Append WCLOB,"]"
+      Append WCLOB,"}"
+    Endif
+  Next I
+
+# Third step : generate the portlet linked to a level 3 menu
+  For I=1 To FIRSTFAV-1
+    If TYPEFONC(I)=1 and NIVFONC(I)=3
+      IDFONC(I)=string$(STDMEN(I)=1,ADM_PREFIX)+string$(STDMEN(I)=0,MEN_PREFIX)+PARAM(I)
+      L+=1
+      NBP+=1
+      Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"portlet",'
+      Append WCLOB,'"type":"$menu",'
+      Append WCLOB,'"code":"'+IDFONC(I)+'",'
+      TEXTOTRANS=TITREFONC(I) : Gosub TITLE_TRANS
+      Append WCLOB,','
+      Gosub DESC_TRANS
+      If NBENT : ENTITIES(NBENT)="PORTMEN"-IDFONC(I) : NBENT+=1 : Endif
+      Append WCLOB,',"items":['+CRLF+" "
+      N=0
+      For J=1 To FIRSTFAV-1
+        If NIVFONC(J)=4
+          If TYPEFONC(J)=2
+            If MENUFONC(J)=PARAM(I)
+              N+=1
+              Append WCLOB,string$(N>1,",")+'"'+IDFONC(J)+'"'
+              If mod(N,10)=0 : Append WCLOB,CRLF+"  " : Endif
+              If NBENT : ENTITIES(NBENT)="LNK"-IDFONC(J) : NBENT+=1 : Endif
+            Endif
+          Elsif MENUFONC(J)=PARAM(I)
+            For K=1 To FIRSTFAV-1
+              If NIVFONC(K)=5 and TYPEFONC(K)=2 and MENUFONC(K)=PARAM(J) : # See later if additional level exist
+                N+=1
+                Append WCLOB,string$(N>1,",")+'"'+IDFONC(K)+'"'
+                If NBENT : ENTITIES(NBENT)="LNK"-IDFONC(K) : NBENT+=1 : Endif
+                If mod(N,10)=0 : Append WCLOB,CRLF+"   " : Endif
+              Endif
+            Next K
+          Endif
+        Endif
+      Next J
+      Append WCLOB,"]}"
+    Elsif TYPEFONC(I)=2 and NIVFONC(I)=3 : # factoriser IDFONC plus tard
+      If CODEFONC(I)>="X"
+        IDFONC(I)="SPE_"+GACTX.AFOLDER+"_"+CODEFONC(I)+string$(PARAM(I)<>"","_"+func STRG(PARAM(I)))
+      Elsif PARAM(I)<>""
+        IDFONC(I)="PAR_"+GACTX.AFOLDER+"_"+CODEFONC(I)+"_"+func STRG(PARAM(I))
+      Else
+        IDFONC(I)="STD_"+CODEFONC(I)
+      Endif
+      L+=1
+      NBP+=1
+      Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"portlet",'
+      Append WCLOB,'"type":"$page",'
+      Append WCLOB,'"code":"'+IDFONC(I)+'",'
+      TEXTOTRANS=TITREFONC(I) : Gosub TITLE_TRANS
+      Append WCLOB,','
+      Gosub DESC_TRANS
+      Append WCLOB,'}'
+      If NBENT : ENTITIES(NBENT)="PORTLET"-IDFONC(I) : NBENT+=1 : Endif
+    Endif
+  Next I
+Return
+
+# Add a query portlet
+$ADD_QUERY
+  L+=1
+  Read [ALH]ALH0=[APV]SRCCOD
+  If fstat=0
+    Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"menuItem",'
+    Append WCLOB,'"linkType":"$representation",'
+    Append WCLOB,'"code":"'+PORTLET(I)+'",'
+    TEXTOTRANS=TITPOR(I) : Gosub TITLE_TRANS
+    Append WCLOB,','
+    Gosub DESC_TRANS
+    Append WCLOB,',"application":{"application":"x3", "contract":"erp"},'
+    Append WCLOB,'"representationRef":{"entity":"QUERY('+"'"+[APV]SRCCOD+"'"+')",'
+    Append WCLOB,'"representation":"QUERY~'+[APV]SRCCOD+'~1"},'
+    Append WCLOB,'"facet":"$query"}'
+    If NBENT : ENTITIES(NBENT)="MITEM"-PORTLET(I) : NBENT+=1 : Endif
+  Else
+    # Portal view referring a not existent request code, generate an error widget
+  Endif
+Return
+
+# Add a stat portlet
+$ADD_STAT
+  L+=1
+  Read [PS2]PS20=[APV]SRCCOD
+  If fstat=0
+    Append WCLOB,string$(L>1,','+CRLF)+' { "$type":"menuItem",'
+    Append WCLOB,' "linkType":"$representation",'
+    Append WCLOB,' "code":"'+PORTLET(I)+'",'
+    TEXTOTRANS=TITPOR(I) : Gosub TITLE_TRANS
+    Append WCLOB,','
+    Gosub DESC_TRANS
+    Append WCLOB,',"application":{"application":"x3", "contract":"erp"},'
+    Append WCLOB,' "representationRef":{"entity":"STATS",'
+    Append WCLOB,' "representation":"STATS~'+[APV]SRCCOD+'"},'
+    Append WCLOB,' "keyParameter":"'+[APV]SRCCOD+'",'
+    Append WCLOB,' "facet":"$cube"}'
+    If NBENT : ENTITIES(NBENT)="MITEM"-PORTLET(I) : NBENT+=1 : Endif
+  Else
+    # Portal view referring a not existent stat code, generate an error widget
+  Endif
+Return
+
+# Add a process portlet
+$ADD_PROC
+  L+=1
+  J=instr(1,PARAMPORT(I,4),";")
+  If J
+    Read [APR]APR2=left$(PARAMPORT(I,4),J-1);right$(PARAMPORT(I,4),J+1)
+    If fstat
+      Read [APR]APR2=left$(PARAMPORT(I,4),J-1);""
+    Endif
+  Else
+    Read [APR]APR2=PARAMPORT(I,4);""
+  Endif
+
+  If fstat=0
+    Append WCLOB,string$(L>1,','+CRLF)+' { "$type":"menuItem",'
+    Append WCLOB,' "linkType":"$representation",'
+    Append WCLOB,' "code":"'+PORTLET(I)+'",'
+    TEXTOTRANS=TITPOR(I) : Gosub TITLE_TRANS
+    Append WCLOB,','
+    Gosub DESC_TRANS
+    Append WCLOB,',"application":{"application":"x3", "contract":"erp"},'
+    Append WCLOB,' "representationRef":{"entity":"PROCESS",'
+    Append WCLOB,' "representation":"PROCESS~'+[APR]CODPRO+'"},'
+    Append WCLOB,' "keyParameter":"'+[APR]CODPRO+'",'
+    Append WCLOB,' "facet":"$details"}'
+    If NBENT : ENTITIES(NBENT)="MITEM"-PORTLET(I) : NBENT+=1 : Endif
+  Else
+    # Process referring a not existent process code, generate an error widget
+  Endif
+Return
+
+# Write the portlet menu list for the main portal
+$GENE_PORTLET
+  For I=1 To NBPORT
+    Case PARAMPORT(I,1)
+      When "$ext","$rss","$table","$flash"
+      # Portlet displaying an URL (RSS is done the same way for the moment), or a tabular function
+      # The generation is here the same, because the page is directly fed by the menu item (no intermediate link)
+        L+=1
+        NBP+=1
+        Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"portlet",'
+        Append WCLOB,'"type":"$page",'
+        Append WCLOB,'"code":"'+PORTLET(I)+'",'
+        TEXTOTRANS=TITPOR(I) : Gosub TITLE_TRANS
+        Append WCLOB,','
+        Gosub DESC_TRANS
+        If find(PARAMPORT(I,3),"SUBAPR:CLOBEXP","SUBAPSMON:CLOBEXP")
+          Append WCLOB,',"pageItem":"'+PORTLET(I)+'"'
+        Endif
+        Append WCLOB,"}"
+        N=1
+        If NBENT : ENTITIES(NBENT)="PORTLET"-PORTLET(I) : NBENT+=1 : Endif
+     When "$menu" : # Favorites and standard menus
+        L+=1
+        NBP+=1
+        Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"portlet",'
+        Append WCLOB,'"type":"$menu",'
+        Append WCLOB,'"code":"'+PORTLET(I)+'",'
+        TEXTOTRANS=TITPOR(I) : Gosub TITLE_TRANS
+        Append WCLOB,','
+        Gosub DESC_TRANS
+        If NBENT : ENTITIES(NBENT)="PORTMEN"-PORTLET(I) : NBENT+=1 : Endif
+        Append WCLOB,',"items":['+CRLF+"   "
+        N=1
+        If PARAMPORT(I,2)="GEN"
+          For M=2 To FIRSTFAV-1
+            If TYPEFONC(M)=1 and NIVFONC(M)=2
+              Append WCLOB,string$(N>1,",")+'"'+string$(STDMEN(M)=1,ADM_PREFIX)
+&                         +string$(STDMEN(M)=0,MEN_PREFIX)+func STRG(PARAM(M))+'"'
+              N+=1
+              If NBENT : ENTITIES(NBENT)="LNK"-
+&               (string$(STDMEN(M)=1,ADM_PREFIX)+string$(STDMEN(M)=0,MEN_PREFIX)+func STRG(PARAM(M)))
+                NBENT+=1
+              Endif
+              If mod(N,10)=0 : Append WCLOB,CRLF+"   " : Endif
+            Elsif TYPEFONC(M)=2 and NIVFONC(M)=2
+              Append WCLOB,string$(N>1,",")+'"'+IDFONC(M)+'"'
+              If NBENT : ENTITIES(NBENT)="LNK"-IDFONC(M) : NBENT+=1 : Endif
+              N+=1
+              If mod(N,10)=0 : Append WCLOB,CRLF+"   " : Endif
+            Endif
+          Next M
+          J=1 : K=FIRSTFAV-1 : CUR_LEVEL=1
+        Elsif PARAMPORT(I,2)="FAV"
+          J=FIRSTFAV : K=NBFONC : CUR_LEVEL=0
+          For M=FIRSTFAV To NBFONC
+            If TYPEFONC(M)=2
+              Append WCLOB,string$(N>1,",")+'"'+IDFONC(M)+'"'
+              If NBENT : ENTITIES(NBENT)="LNK"-IDFONC(M) : NBENT+=1 : Endif
+              N+=1
+              If mod(N,10)=0 : Append WCLOB,CRLF+"   " : Endif
+            Endif
+          Next M
+          J=1 : K=FIRSTFAV-1 : CUR_LEVEL=1
+        Endif
+        Append WCLOB,"]}"
+      When "$header" : # Ignore the header
+      When Default : # Display a message for the moment
+        L+=1
+        NBP+=1
+        Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"portlet",'
+        Append WCLOB,'"type":"$page",'
+        Append WCLOB,'"code":"'+PORTLET(I)+'",'
+        If NBENT : ENTITIES(NBENT)="PORTLET"-PORTLET(I) : NBENT+=1 : Endif
+        TEXTOTRANS=TITPOR(I) : Gosub TITLE_TRANS
+        Append WCLOB,','
+        Gosub DESC_TRANS
+        Append WCLOB,',"pageItem":"'+PORTLET(I)+'"}'
+    Endcase
+  Next I
+Return
+
+#Subprog MENU_AUTH(WCLOB,NIV,MDEP,FIRSTFONC,NBFONC,CODEFONC,TYPEFONC,NIVFONC,MENUFONC,PARAM,TITREFONC)
+#Variable Clbfile WCLOB
+#Value Integer NIV
+#Value Char MDEP()
+#Value Integer FIRSTFONC
+#Value Integer NBFONC
+#Value Libelle TYPEFONC(1..),NIVFONC(1..)
+#Value Char CODEFONC()(1..),PARAM()(1..),MENUFONC()(1..),TITREFONC()(1..)
+#Local Char CRLF : CRLF=chr$(13)+chr$(10)
+#Local Integer I,L
+#  L=0
+#  For I=FIRSTFONC To NBFONC
+#    If MENUFONC(I)=MDEP
+#      L+=1
+#      If TYPEFONC(I)=1
+#        Append WCLOB,string$(L>1,",")+'{"$title":"'+TITREFONC(I)+'",'+CRLF
+#        Append WCLOB,'"$items":['+CRLF
+#        Call MENU_AUTH(WCLOB,NIV+1,PARAM(I),FIRSTFONC,NBFONC,CODEFONC,TYPEFONC,NIVFONC,MENUFONC,PARAM,TITREFONC)
+#        Append WCLOB,']}'+CRLF
+#      Else
+#        Append WCLOB,string$(L>1,",")+'{"$bind":"'+CODEFONC(I)+string$(PARAM(I)<>"","_"+PARAM(I))+'"}'
+#      Endif
+#    Endif
+#  Next I
+#End
+
+
+$GENE_PAGES
+
+# First generate the main portal
+  L+=1
+  NBD+=1
+  Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"dashboardDef",'
+  Append WCLOB,'"dashboardName":"home",'
+  Append WCLOB,'"variants":[{'
+  Append WCLOB,'"code":"'+USR_PREFIX+'",'
+  If NBENT : ENTITIES(NBENT)="DASH"-USR_PREFIX : NBENT+=1 : Endif
+  Append WCLOB,'"title":{'
+  For IL=1 To NBL
+    Read [AZS]CLE=146;33;TABLAN(IL) : If fstat : Raz [AZS] : Endif
+    Append WCLOB,string$(IL>1,",")+'"'+ISOLAN(IL)+'":"'+escJson(func AFNC.MES1([AZS]LANMES,USER))+'"'
+  Next IL
+  Append WCLOB,'},'
+  Append WCLOB,'"allApplications":false,'
+  Append WCLOB,'"application":{'
+  Append WCLOB,'"application": "x3",'
+  Append WCLOB,'"contract":"erp"},'
+  Append WCLOB,'"vignettes":['+CRLF+"   "
+  N=0
+  # The first virtual portlet ($header) has not to be generated
+  For I=2 To NBPORT
+    Append WCLOB,string$(N>0,",")+'{"portlet":"'+PORTLET(I)+'",'
+    Append WCLOB,'"allEndpoints":true}'
+    If NBENT : ENTITIES(NBENT)="LNK"-PORTLET(I) : NBENT+=1 : Endif
+    If mod(I-1,5)=0 : Append WCLOB,CRLF+"   " : Endif
+    N+=1
+  Next I
+  Append WCLOB,"]}" : # Closes the "vignettes" section + application section
+  Append WCLOB,"]}" : # Closes the "variants" section
+
+# Generate the level 2 menus
+  For I=1 To FIRSTFAV-1
+    If TYPEFONC(I)=1 and NIVFONC(I)=2
+
+      # Dashboard header
+      L+=1
+      NBD+=1
+      Append WCLOB,string$(L>1,','+CRLF)+'{"$type":"dashboardDef",'
+      TEXTOTRANS=TITREFONC(I) : Gosub TITLE_TRANS
+      Append WCLOB,','
+      Gosub DESC_TRANS
+      Append WCLOB,',"dashboardName":"'+IDFONC(I)+'",'
+      Append WCLOB,'"variants":[{'
+      Append WCLOB,'"code":"'+PROFIL+'",'
+      If NBENT : ENTITIES(NBENT)="DASHVARIANT"-PROFIL: NBENT+=1 : Endif
+      TEXTOTRANS=TITREFONC(I) : Gosub TITLE_TRANS
+      Append WCLOB,',"allApplications":false,'
+      Append WCLOB,'"application":{'
+      Append WCLOB,'"application":"x3",'
+      Append WCLOB,'"contract":"erp"},'+CRLF
+      Append WCLOB,' "vignettes":['+CRLF+"   "
+      N=0
+
+      # First portlet if functions are directly attached at level 3
+      If find(PARAM(I),MENU_STACK(1..NB_STACK))
+        N+=1
+        Append WCLOB,'{"portlet":"'+IDFONC(I)+'_0",'
+        If NBENT : ENTITIES(NBENT)="PORTLET"-IDFONC(I): NBENT+=1 : Endif
+        TEXTOTRANS=TITREFONC(I) : Gosub TITLE_TRANS
+        Append WCLOB,',"allEndpoints":true}'
+      Endif
+
+      # Other portlets present
+      For J=2 To FIRSTFAV-1
+        If MENUFONC(J)=PARAM(I) and NIVFONC(J)=3 : # and TYPEFONC(J)=1 : # Added Jan 14
+          Append WCLOB,string$(N>0,",")+'{"portlet":"'+IDFONC(J)+'",'
+          If NBENT : ENTITIES(NBENT)="PORTLET"-IDFONC(J): NBENT+=1 : Endif
+          TEXTOTRANS=TITREFONC(J) : Gosub TITLE_TRANS
+          Append WCLOB,',"allEndpoints":true}'
+              If mod(J-1,2)=0 : Append WCLOB,CRLF+"   " : Endif
+              N+=1
+        Endif
+      Next J
+      Append WCLOB,"]}]}" : # Closes "vignette" list (']'), "variant" list ('}]') and dashboard def
+    Endif
+  Next I
+Return
+
+# Standard header generation subprogram
+# Includes the prototype and the header of the items section (  '"$items" : ['  )
+Subprog HEADER(WCLOB,LANGUE)
+Variable Clbfile WCLOB()
+Value Char LANGUE()
+
+Local Char CRLF(2)
+Local Char C(255),D(255)
+
+  CRLF=chr$(10)
+
+# The prototype is a constant, simply push the strings
+  WCLOB="{"+CRLF+'"$prototypes": {'
+&          +CRLF+'"menuItem": {'+CRLF+'"$key":"code",'
+&          +CRLF+'"parameters":{'+CRLF+'"$key":"name"},'
+&          +CRLF+'"application":{'+CRLF+'"$key":["application","contract"]'
+&          +CRLF+'}'+CRLF+'},'+CRLF
+  Append WCLOB,'"portlet":{'+CRLF+'"$key":"code",'
+&        +CRLF+'"application":{'+CRLF+'"$key":["application","contract"]'
+&        +CRLF+'},'
+&        +CRLF+'"items":{'+CRLF+'"$key":"code"},'
+&        +CRLF+'"pageItem":{"$key":"code"}'
+&        +CRLF+'},'+CRLF
+  Append WCLOB,'"dashboardDef":{'+CRLF+'"$key":"dashboardName",'
+&        +CRLF+'"variants":{'+CRLF+'"$key":"code",'
+&        +CRLF+'"vignettes":{'+CRLF+'"$key":"portlet",'
+&        +CRLF+'"portlet":{'+CRLF+'"$key":"code"'
+&        +CRLF+'}},'
+&        +CRLF+'"application":{'+CRLF+'"$key":["application","contract"]}}}},'
+   Append WCLOB,CRLF+'"$items":['+CRLF
+
+End
+
+# Gets the portal structure and layout associated to the user in variables
+Subprog GET_POR(USER,NBPORT,PORTLET,NUMONG,NUMCOL,TITPOR,PARAMPORT,MYLOG,ERR)
+Value Char USER()
+Variable Integer NBPORT
+Variable Char PORTLET()(1..)
+Variable Libelle NUMONG(1..)
+Variable Libelle NUMCOL(1..)
+Variable Char TITPOR()(1..)
+Variable Char PARAMPORT()(1..,1..)
+Variable Instance MYLOG Using C_ALOG
+Variable Integer ERR
+
+Local Integer I,J,K,ER
+Local Integer NBONG,NBCOL
+Local Char PORT_ROOT(150)
+
+  ER=0
+  If !clalev([APU]) : Local File APORTUSER : Endif
+  If !clalev([APA]) : Local File APORTTAB : Endif
+  If !clalev([AMO]) : Local File APORTMOD : Endif
+
+  If left$(USER,1)<>"_"
+    Read [APU]APU0=USER
+    If fstat
+
+      # If no portal is found, a default portal with standard menus and favorites is displayed
+      NBPORT=1
+      NBONG=1
+      PORTLET(NBPORT)="USR_"+GACTX.AFOLDER+"_"+USER : TITPOR(NBPORT)="{146,34}"-USER : # To be translated ?
+      NUMONG(NBPORT)=NBONG : NUMCOL(NBPORT)=1
+      PARAMPORT(NBPORT,1)="$menu"
+      PARAMPORT(NBPORT,2)="GEN"
+      PARAMPORT(NBPORT,3)="1"
+
+      NBPORT+=1
+      PORTLET(NBPORT)="FAV_"+GACTX.AFOLDER+"_"+USER : TITPOR(NBPORT)="{146,36}"-USER : # To be translated ?
+      NUMONG(NBPORT)=NBONG : NUMCOL(NBPORT)=1
+      PARAMPORT(NBPORT,1)="$menu"
+      PARAMPORT(NBPORT,2)="FAV"
+      PARAMPORT(NBPORT,3)="100": # Heigth
+
+      ER=0
+      End
+    Endif
+  Endif
+
+  NBPORT=0
+
+# A first virtual portlet contains the title of the dashboard
+  NBPORT+=1
+  NUMONG(NBPORT)=0 : NUMCOL(NBPORT)=0 : PARAMPORT(NBPORT,1)="$header"
+  If left$(USER,1)<>"_"
+    PORTLET(NBPORT)="USR_"+GACTX.AFOLDER+"_"+USER : TITPOR(NBPORT)="{146,34}"-USER
+  Else
+    PORTLET(NBPORT)="TRD_"+GACTX.AFOLDER+USER : TITPOR(NBPORT)="{146,35}"-right$(USER,2)
+  Endif
+  PORT_ROOT=PORTLET(NBPORT)
+  ER=fmet MYLOG.APUTLINE("Root portlet :"+PORT_ROOT,0)
+
+  For I=1 To [APU]NBTAB
+    Read [APA]APA0=USER;[APU]CODTAB(I-1)
+    If fstat=0
+      NBONG=0
+      For J=1 To [APA]NBMOD
+        Read [AMO]AMO0=USER;[APA]CODTAB;[APA]CODMOD(J-1)
+        If fstat=0 & find(PORT_ROOT+"_"+[AMO]CODMOD,PORTLET(1..NBPORT))=0 : # Sometimes, duplicate entry exist (portal's bug)
+          NBPORT+=1
+          NBONG+=1
+          PORTLET(NBPORT)=PORT_ROOT+[AMO]CODMOD : NUMONG(NBPORT)=NBONG : NUMCOL(NBPORT)=[APA]COLNUM(J-1)
+          TITPOR(NBPORT)=[AMO]TITELT+string$([AMO]TITELT="",PORTLET(NBPORT))
+          Case [AMO]MODTYP
+            When "x3navigreader" : # Menus
+              PARAMPORT(NBPORT,1)="$menu"
+              PARAMPORT(NBPORT,2)="GEN"
+              PARAMPORT(NBPORT,3)=[AMO]VALPAR(1) : # Unfolded menu (true/false)
+            When "framereader" : # Web page within a frame
+              PARAMPORT(NBPORT,1)="$ext"
+              If left$(vireblc([AMO]VALPAR(2),0),1)="="
+                PARAMPORT(NBPORT,2)=func EVALERR(right$(vireblc([AMO]VALPAR(2),0),2))
+              Else
+                PARAMPORT(NBPORT,2)=[AMO]VALPAR(2)
+              Endif
+            When "x3flashreader" : # Flash component
+              PARAMPORT(NBPORT,1)="$flash"
+              For K=1 To min(dim([AMO]VALPAR),dim(PARAMPORT,2))-1
+                PARAMPORT(NBPORT,K+1)=[AMO]VALPAR(K-1)
+                Break [AMO]VALPAR(K-1)=""
+              Next K
+            When "x3favorireader" : # Menu favorites
+              PARAMPORT(NBPORT,1)="$menu"
+              PARAMPORT(NBPORT,2)="FAV"
+              PARAMPORT(NBPORT,3)=[AMO]VALPAR(1) : # Heigth
+            When "webnote" : # Notes
+              PARAMPORT(NBPORT,1)="$notes"
+              PARAMPORT(NBPORT,2)=[AMO]VALPAR(0) : # Default text
+            When "xmlrssreader" : # RSS reader
+              PARAMPORT(NBPORT,1)="$rss"
+              PARAMPORT(NBPORT,2)=[AMO]VALPAR(2) : # Nb items
+              PARAMPORT(NBPORT,3)=[AMO]VALPAR(1) : # Display (true, false)
+              PARAMPORT(NBPORT,4)=[AMO]VALPAR(0) : # Url
+            When "x3tabreader" : # Tabular data
+              PARAMPORT(NBPORT,1)="$table"
+              PARAMPORT(NBPORT,2)=[AMO]VALPAR(0) : # Nb of items
+              PARAMPORT(NBPORT,3)=[AMO]VALPAR(1) : # Call
+              PARAMPORT(NBPORT,4)=[AMO]VALPAR(2) : # Type
+              PARAMPORT(NBPORT,5)=[AMO]VALPAR(3) : # Refresh time
+            When "x3exaleadreader" : # Exalead search page
+              PARAMPORT(NBPORT,1)="$search"
+              PARAMPORT(NBPORT,2)=[AMO]VALPAR(0) : # heigth
+              PARAMPORT(NBPORT,3)=[AMO]VALPAR(1) : # Scrolling (true, false)
+              PARAMPORT(NBPORT,4)=[AMO]VALPAR(2) : # Delay
+            When "x3tracereader" : # Log display
+              PARAMPORT(NBPORT,1)="$trace"
+              PARAMPORT(NBPORT,2)=[AMO]VALPAR(0) : # heigth
+              PARAMPORT(NBPORT,3)=[AMO]VALPAR(1) : # Data access
+              PARAMPORT(NBPORT,4)=[AMO]VALPAR(2) : # Parameters
+            When "x3flvreader" : # Video stream reader
+              PARAMPORT(NBPORT,1)="$video"
+              PARAMPORT(NBPORT,2)=[AMO]VALPAR(0) : # heigth
+              PARAMPORT(NBPORT,3)=[AMO]VALPAR(1) : # Url
+              PARAMPORT(NBPORT,4)=[AMO]VALPAR(2) : # Waiting message
+          Endcase
+          ER=fmet MYLOG.APUTLINE(" Portlet"-PORTLET(NBPORT)-"Type="-PARAMPORT(NBPORT,1),0)
+        Endif
+      Next J
+    Endif
+  Next I
+End
+
+# Organizes the hierarchy of a menu (recursive function)
+Subprog HIERARCHY(NIV,MDEP,FIRSTFONC,NBFONC,CODEFONC,IDFONC,TYPEFONC,NIVFONC,PARAM,MENUFONC,TITREFONC,MYLOG)
+Value Integer NIV
+Value Char MDEP()
+Value Integer NBFONC
+Value Integer FIRSTFONC
+Value Libelle TYPEFONC(1..),NIVFONC(1..)
+Value Char CODEFONC()(1..),IDFONC()(1..),PARAM()(1..),MENUFONC()(1..),TITREFONC()(1..)
+Variable Instance MYLOG Using C_ALOG
+Local Integer I
+  For I=FIRSTFONC To NBFONC
+    If MENUFONC(I)=MDEP
+      If TYPEFONC(I)=1
+        Call ECR_TRACE(space$(NIV*5)+"Menu"-PARAM(I)-TITREFONC(I),0) From GESECRAN
+        Call HIERARCHY(NIV+1,PARAM(I),FIRSTFONC,NBFONC,CODEFONC,IDFONC,TYPEFONC,NIVFONC,PARAM,MENUFONC,TITREFONC,MYLOG)
+      Else
+        Call ECR_TRACE(space$(NIV*5)+"Function"-CODEFONC(I)-TITREFONC(I),0) From GESECRAN
+      Endif
+    Endif
+  Next I
+End
+
+End
+
+Funprog EVALERR(FORMUL)
+Value Char FORMUL()
+Onerrgo ERRR
+End evalue(FORMUL)
+$ERRR
+Onerrgo
+End
+
+# Escapes the double quote in a string JSON constant
+Funprog STRG(CHAINE)
+Value Char CHAINE
+Local Char RESULT(250)
+Local Integer POS1,POS2
+POS2=1
+POS1=instr(POS2,CHAINE,'"')
+While POS1<>0
+    RESULT+=mid$(CHAINE,POS2,POS1-POS2)+'\"'
+    POS2=POS1+1
+    POS1=instr(POS2,CHAINE,'"')
+Wend
+End RESULT+right$(CHAINE,POS2)

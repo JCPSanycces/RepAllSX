@@ -1,0 +1,1498 @@
+#<AdxTL>@(#)12.0.0.0 $Revision$
+Local Char PARAM(10)(1..2) , VALEUR(10)
+GERR = 0 : GTEST = 0
+Call TRAITE_CHAR(VALEUR,PARAM,"","FIYEND","FIYEND",4,"") From GTRAITE
+End
+#*X3-39795   MDJ  Manage ORIGIN and ORICOD fields in GL Entry
+##########################################################################
+# Sous-programme GNRPCE                                                  #
+# Crée une pièce d'A-nouveaux par devise.                                #
+# La pièce sera multi-sites ou non d'après le référentiel                #
+# Pour chaque devise (et chaque site si l'option d'une pièce par site a  #
+# été retenue), on aura :                                                #
+#  - d'une part, une pièce d'A-nouveaux qui reporte les soldes des       #
+#    comptes de la classe 1 à 5. Les écritures générées sont soldées par #
+#    le compte d'attente pour A-nouveaux                                 #
+#  - d'autre part, une pièce qui solde le compte d'attente par le compte #
+#    de résultat ou de perte                                             #
+##########################################################################
+Subprog GNRPCE(SOC,REFER,EXER,TYP,JOU,TRACEDET,SIMUL,STAT)
+Value    Char    SOC         : # Société
+Value    Integer REFER       : # Type de référentiel
+Value    Decimal EXER        : # No d'exercice
+Value    Char    TYP()(1..2) : # Type de pièce
+Value    Char    JOU()(1..2) : # Journal
+Value    Integer TRACEDET    : # Trace détaillée
+Value    Integer SIMUL       : # Simulation
+Variable Integer STAT        : # Statut de retour
+
+##########################################################################
+## Pour les tests (pas de contrôle, pas de clôture de FISCALYEAR)
+##########################################################################
+Local Integer TEST : TEST = 0
+##########################################################################
+
+If clalev([F:TMP])=0  : Local File GACCFIYEND [TMP]  : Endif : # Fichier temporaire
+If clalev([F:TMPA])=0 : Local File GACCFIYENA [TMPA] : Endif : # Fichier temporaire
+If clalev([F:GAC])=0  : Local File GACCOUNT   [GAC]  : Endif : # Comptes
+If clalev([F:CCE])=0  : Local File CACCE      [CCE]  : Endif : # Sections
+If clalev([F:BPR])=0  : Local File BPARTNER   [BPR]  : Endif : # Tiers
+If clalev([F:BLA])=0  : Local File BALANA     [BLA]  : Endif : # Balance analytique
+If clalev([F:BLQ])=0  : Local File BLAQTY     [BLQ]  : Endif : # Balance analytique qté
+If clalev([F:CAC])=0  : Local File GACCCODE   [CAC]  : Endif : # Codes comptables
+If clalev([F:CPY])=0  : Local File COMPANY    [CPY]  : Endif : # Sociétés
+If clalev([F:GCM])=0  : Local File GACM       [GCM]  : Endif : # Modèles
+If clalev([F:LED])=0  : Local File GLED       [LED]  : Endif : # Référentiels
+If clalev([F:COA])=0  : Local File GCOA       [COA]  : Endif : # Plans comptables
+If clalev([F:CLS])=0  : Local File GACCCLS    [CLS]  : Endif : # Classes de comptes
+If clalev([F:DIE])=0  : Local File GDIE       [DIE]  : Endif : # Axes analytiques
+If clalev([F:FCY])=0  : Local File FACILITY   [FCY]  : Endif : # Sites
+If clalev([F:FIY])=0  : Local File FISCALYEAR [FIY]  : Endif : # Exercices
+If clalev([F:PER])=0  : Local File PERIOD     [PER]  : Endif : # Périodes
+If clalev([F:TCU])=0  : Local File TABCUR     [TCU]  : Endif : # Devises
+If clalev([F:ADI])=0  : Local File ATABDIV    [ADI]  : Endif : # Tables diverses
+If clalev([F:ADW])=0  : Local File ADOVAL     [ADW]  : Endif : # Valeur des paramètres
+If clalev([F:JOU])=0  : Local File GJOURNAL   [JOU]  : Endif : # Journaux comptables
+If clalev([F:GTE])=0  : Local File GTYPACCENT [GTE]  : Endif : # Type de pièce
+If clalev([F:ACV])=0  : Local File ACTIV      [ACV]  : Endif : # Code activité
+If clalev([F:BAN])=0  : Local File BANK       [BAN]  : Endif : # Banque
+
+Local Integer MAXAXE : MAXAXE = dim([F:LED]DIE)         : # Nb maxi d'axes ana / référentiel
+Local Integer MAXREF : MAXREF = dim([F:GCM]LED)         : # Nb maxi de référentiels / modèle
+Local Integer MAXSEC : MAXSEC = 1000                    : # Sections mouvementées par axe (optimisation)
+
+Local Char    COMPTE(GLONGAC)          : # Compte en cours
+Local Char    TIERS(GLONBPR)           : # Tiers pour les comptes de type collectif
+Local Char    DEVISE(GLONCUR)          : # Devise
+Local Char    DEVSOC(GLONCUR)          : # Devise de la société
+Local Char    SITE(GLONFCY)            : # Site
+Local Char    SITPRIN(GLONFCY)         : # Site principal d'une société (sert pour la génération multi-sites)
+Local Char    MESSAGE(250)             : # Message
+Local Char    CPTATT(GLONGAC)          : # Compte d'attente
+Local Char    CPTBEN(GLONGAC)          : # Compte de bénéfice
+Local Char    CPTPER(GLONGAC)          : # Compte de perte
+Local Char    IDENT(20)(1..8)          : # Identificateurs pour génération pièce comptable
+Local Integer DEV                      : # Devise (compteur pour parcours devises contenues dans TDEVISE)
+Local Integer NBDEV                    : # Nombre de devises utilisées
+Local Decimal SOLDECUR                 : # Solde en devise (de la pièce) (sert pour contrepartie sur compte d'attente)
+Local Decimal SOLDELOC                 : # Solde en devise société (de la pièce)
+Local Decimal SOLDSIT                  : # Solde du site (en devise locale)
+Local Integer FINDEV                   : # Flag de fin de validité devise
+Local Integer NBZONE                   : # Nb de zones à forcer
+Local Char    TZONE(10)(1..10)         : # Table des zones à forcer (Ex:réference simulation)
+Local Char    TVAL(30)(1..10)          : # Table des valeurs des zones à forcer
+Local Char    PIECE(GLONGAU)           : # Pièce courante
+Local Char    PCEANO(GLONGAU)          : # Pièce d'à nouveau
+Local Char    PCEITA(GLONGAU)          : # Pièce de clôture (Italie)
+Local Char    PCERES(GLONGAU)          : # Pièce de résultat
+Local Integer REPANA                   : # Indicateur de report à nouveau section
+Local Decimal DEBCUR , CRECUR          : # Montants (géné) en devise de pièce
+Local Decimal DEBLOC , CRELOC          : # Montants (géné) en devise société
+Local Decimal DEBAUTO(1..MAXREF)       : # Montants (géné) en devise 'autres référentiels'
+Local Decimal CREAUTO(1..MAXREF)
+Local Decimal SOLDAUTO(1..MAXREF)
+Local Decimal ANADEBCUR , ANACRECUR    : # Montants (ana) en devise de pièce
+Local Decimal ANADEBLOC , ANACRELOC    : # Montants (ana) en devise société
+Local Decimal ANAQTE , BALQTE , COEUOM : # Quantité analytique
+Local Decimal TOTDEBCUR , TOTCRECUR    : # Totaux analytiques
+Local Decimal TOTDEBLOC , TOTCRELOC    : # Totaux analytiques
+Local Decimal TOTANA                   : # Totaux analytiques
+Local Integer IAXE(1..MAXAXE)                      : # No des axes conservés (pas gestion de projet)
+Local Char    TBAXE(GLONDIE)(1..MAXAXE)            : # Axes conservés
+Local Char    TBSEC(GLONCCE)(1..MAXAXE,1..MAXSEC)  : # Table des sections
+Local Libelle TBANA(1..MAXAXE,1..MAXSEC)           : # Reports à nouveau
+Local Integer NBSEC(1..MAXAXE)                     : # Pointeurs
+Local Char    SECTION(GLONCCE)(1..MAXAXE)          : # Sections de report à nouveau
+Local Integer NBSITE
+Local Char    TBSITE(GLONFCY)(1..GNBSITE)          : # Tableau des sites utilisé
+Local Char    TDEVISE(GLONCUR)(1..max(1,nbrecord([TCU]))) : # Tableau des devises utilisées
+
+Local Integer GROUPE , NB , MAXI , IGRP , GRPDEB , ISOC
+Local Integer OKREPORT , OKBAN , OKSENS , OKANA
+Local Integer GENTYP , PCECLO , PCECPT , EQUILIBRE
+Local Char    PLAN(GLONCOA)
+Local Date    NEWDAT
+Local Char    CRITBAL(250) , ORDBLA(250) , CRITBLA(250)
+Local Integer AXE , NBAXE
+Local Integer LIGANA , SIGNE , TRACANA
+Local Char    UNITE(GLONUOM) , LIBEL(50)
+Local Integer I , J , K
+Local Integer NBAUTO , IAUTO , REFAUTO(1..MAXREF) , IREF, OKAUTO
+Local Char    DEVAUTO(GLONCUR)(1..MAXREF)
+
+  If TEST
+    Gosub SAVVAR From XTSTVAR
+  Endif
+
+# Pièces de fin d'exercice
+
+  Call PARAM(SOC,"GAUFIYEN",PCEANO) From ADOVAL : If PCEANO="" : PCEANO = "FIYEN"  : Endif
+  Call PARAM(SOC,"GAUFIYCL",PCEITA) From ADOVAL : If PCEITA="" : PCEITA = "FIYCL"  : Endif
+  Call PARAM(SOC,"GAUFIYRE",PCERES) From ADOVAL : If PCERES="" : PCERES = "FIYRE"  : Endif
+
+# Initialisations
+Local Mask GACCENT2 [HAE2]
+  MAXI = max(dim([M:HAE2]ACC1)-20,10)  : # Nb maxi de lignes de pièce par pièce
+
+  STAT = 0
+
+  Call LECTURE("CPY", SOC, "") From CONTOBJ
+  Call LECTURE("GCM", [F:CPY]ACM, "") From CONTOBJ
+  Call LECTURE("LED", [F:GCM]LED(REFER - 1), "") From CONTOBJ
+  Call LECTURE("COA", [F:LED]COA, "") From CONTOBJ
+  Read [FIY]FIY0 = SOC; REFER; EXER
+
+  PLAN      = [F:LED]COA               : # Plan comptable
+  DEVSOC    = [F:GCM]CUR(REFER-1)      : # Devise de société
+  GENTYP    = [F:LED]GENTYP            : # Pièce par site (1) ou par société (2) (ex FIYENDENT)
+  PCECLO    = ([F:LED]ENDVCR=2)        : # Pièce de clôture (ex code activité ACV => ITALIE)
+  PCECPT    = [F:LED]ACCVCR            : # Pièce par compte (ex param FIYITA => ITALOPT)
+  CPTATT    = [F:COA]ACCMIS(3)         : # Compte d'attente à nouveau
+  NEWDAT    = [F:FIY]FIYEND+1          : # Date début nouvel exercice
+  EQUILIBRE = ([F:LED]EQLRANANA=2)     : # Equilibre => génération du résultat
+  TRACANA   = 0                        : # Trace analytique (pour debug, peu lisible!!)
+  #
+  GSOCIETE = [L]SOC
+  #
+  Read [FIY]FIY0 = SOC;REFER;EXER+1
+
+  NBAXE  = 0
+  ORDBLA = ""
+  If [F:LED]ANA=2
+    For AXE=1 To [F:LED]DIENBR
+      Read [DIE]DIE0 = [F:LED]DIE(AXE-1)
+      If [F:DIE]PRJMGT<>2
+        NBAXE += 1
+        IAXE(NBAXE)  = AXE
+        TBAXE(NBAXE) = [F:DIE]DIE
+        If ORDBLA<>"" : ORDBLA += ";" : Endif
+        ORDBLA += "CCE"+num$(AXE)
+      Endif
+    Next AXE
+  Endif
+
+  If [F:LED]GEN=2
+    Local File BALANCE [BAL]
+    Local File BALANCE [BAL2]
+  Else
+    Local File BALANA  [BAL]
+    Local File BALANA  [BAL2]
+  Endif
+
+  Gosub CALNBDEV
+
+# Référentiels automatiques
+
+  For I=1 To len(mess(0,2644,1))
+    If [F:GCM]CFMAUT(I-1)=2 & [F:GCM]ORILEDTYP(I-1)=REFER
+      NBAUTO += 1
+      REFAUTO(NBAUTO) = I
+      DEVAUTO(NBAUTO) = [F:GCM]CUR(I-1)
+    Endif
+  Next I
+
+# On fait d'abord tous les contrôles nécessaires
+
+  Call ECR_TRACE(mess(26,113,1)-":"-SOC-[F:CPY]CPYNAM-","-mess(208,111,1)-":"-mess(REFER,2644,1)-format$("D:"+GFMDAT4,NEWDAT),0) From GESECRAN
+  # Société... référentiel
+  If !TEST
+   Gosub CONTROL
+  Endif
+  If STAT
+    End
+  Endif
+
+# Détermination du site financier
+
+  If GENTYP=2
+    If [F:CPY]MAIFCY=""
+      # Pas de site principal rattaché à la société SOC
+      STAT = 1
+      Call ECR_TRACE(mess(68,107,1)-SOC-mess(REFER,2644,1),1) From GESECRAN
+      End
+    Else
+      Call LECTURE("FCY",[F:CPY]MAIFCY,"") From CONTOBJ
+      If [F:FCY]FINFLG=2
+        SITPRIN = [F:CPY]MAIFCY
+      Else
+        SITPRIN = [F:FCY]FINRSPFCY
+      Endif
+    Endif
+  Endif
+
+# On efface le fichier temporaire
+
+  Call ANUTMP(SOC,REFER,NBAXE)
+  If GOK<1 : STAT = 1 : End : Endif
+
+# On efface les A-nouveaux provisoires
+
+  Call ANUNOUV(SOC,REFER,NBAUTO,REFAUTO,EXER+1,NBAXE)
+  If GOK<1 : End : Endif
+
+# Génération à nouveau
+
+  Call DEBTRANS From GLOCK
+  Gosub TR_PCE
+
+# Trace des référentiels automatiques
+
+  If TRACEDET
+    For IREF=1 To NBAUTO
+      Call ECR_TRACE(mess(26,113,1)-":"-SOC-[F:CPY]CPYNAM-","-mess(208,111,1)-":"-mess(REFAUTO(IREF),2644,1)-format$("D:"+GFMDAT4,NEWDAT),0) From GESECRAN
+      K = 0
+      For [TMP]FYD0(1) Where CPY=SOC & LEDTYP=REFER & RESACE<>3
+        If K>0 : Call ECR_TRACE("",0) From GESECRAN : Endif
+        K += 1
+        For [TMP]FYD0
+          If [F:TMP]RESACE=2
+            SIGNE = +1
+          Else
+            SIGNE = -1
+          Endif
+          MESSAGE  = ""
+          MESSAGE += format$("K:"+num$(GLONFCY+1)+"X",[F:TMP]FCY)
+          MESSAGE += format$("K:"+num$(GLONGAC+1)+"X",[F:TMP]ACC)
+          MESSAGE += format$("K:"+num$(GLONBPR+1)+"X",[F:TMP]BPR)
+          If SIGNE*[F:TMP]AMTAUT(REFAUTO(IREF)-1)>0
+            MESSAGE += left$(mess(1,626,1),1) : # D(débit)
+          Else
+            MESSAGE += left$(mess(2,626,1),1) : # C(crédit)
+          Endif
+          LIBEL = format$("N3:13.2",abs([F:TMP]AMTAUT(REFAUTO(IREF)-1)))
+          MESSAGE += right$(space$(18)+LIBEL,len(LIBEL)+1)
+          MESSAGE += " "+DEVAUTO(IREF)
+          MESSAGE += space$(24)
+          If [F:TMP]BPR<>""
+            Call LECTURE("BPR",[F:TMP]BPR,"") From CONTOBJ
+            MESSAGE += [F:BPR]BPRNAM
+          Else
+            Call LECTEXTRA(LIBEL,"GACCOUNT","DESTRA",PLAN,[F:TMP]ACC) From ATEXTRA
+            MESSAGE += LIBEL
+          Endif
+          Call ECR_TRACE(MESSAGE,0) From GESECRAN
+        Next
+      Next
+    Next IREF
+  Endif
+
+  If TEST : Gosub TSTVAR From XTSTVAR : Endif
+End
+
+##############################################################
+## Transaction principale
+##############################################################
+# Pour chaque devise et chaque site si on a retenu l'option d'une génération de pièce
+# multi-sites, on va générer d'une part une pièce d'AN qui reporte les soldes des
+# comptes 1->5 avec la contrepartie sur un compte d'attente et d'autre part une pièce
+# qui solde le compte d'attente par le compte de bénéfice ou de perte.
+# NB : On est obligé de faire une seule transaction (1 transaction par société). En effet,
+# on ne peut pas faire une transaction par pièce car si la génération d'une pièce plante,
+# on ne pourra pas relancer la fin d'exercice
+$TR_PCE
+
+  GROUPE = 0
+  Raz SOLDSIT
+  Trbegin [FIY]
+
+  #
+  # Réouverture de la denière période si clôture
+  #
+  If !TEST & !SIMUL & PCECLO
+    Filter [PER] Where CPY=SOC & LEDTYP=REFER & FIYNUM=EXER
+    Read [PER]PER0 Last
+    [F:PER]PERSTA = 2
+    Rewrite [PER]
+    Filter [PER]
+    If fstat
+      GOK = 0 : Call FSTA("PER") From GLOCK : Goto AB_TR_PCE
+    Endif
+    Call PERAUT(SOC,REFER,EXER,[F:PER]PERNUM,GOK) From SUBPER
+    If !GOK : Goto AB_TR_PCE : Endif
+  Endif
+
+  If GENTYP=1 : # Une pièce par site
+    For [FCY]FCY0 Where LEGCPY=SOC & FINFLG=2
+      SITE = [F:FCY]FCY : SOLDSIT = 0
+      # Si on génère une pièce par site, on prendra comme comptes de bénéfice
+      # et de perte ceux correspondant au code comptable de type 'site'
+      Gosub SETCPT_SIT
+      For DEV = 1 To NBDEV
+        DEVISE = TDEVISE(DEV)
+        Gosub VALDEV
+        # On écrit dans le fichier temporaire GACCFIYEND
+        GROUPE += 1 : GRPDEB = GROUPE
+        NB = 0
+        Gosub WR_TMP
+        If GOK<1 : Break 2 : Endif
+        # On génère l'A-nouveau
+        Gosub PIECE
+        If GOK<1 : Break 2 : Endif
+      Next
+      If EQUILIBRE
+        Gosub RESULTAT
+        If GOK<1 : Break : Endif
+      Endif
+    Next
+    If GOK<0   : Goto ROLL_TR_PCE
+    Elsif !GOK : Goto AB_TR_PCE
+    Endif
+  Else
+    For DEV = 1 To NBDEV
+      DEVISE = TDEVISE(DEV)
+      Gosub VALDEV
+      GROUPE += 1 : GRPDEB = GROUPE
+      NB = 0
+      NBSITE = 0
+      For [FCY]FCY0 Where LEGCPY=SOC & FINFLG=2
+        SITE = [F:FCY]FCY
+        NBSITE += 1
+        TBSITE(NBSITE) = SITE
+        Gosub SETCPT_SIT
+        # On écrit dans le fichier temporaire GACCFIYEND
+        Gosub WR_TMP
+        If GOK<1 : Break 2 : Endif
+      Next
+      # On génère l'A-nouveau
+      Gosub PIECE
+      If GOK<1 : Break : Endif
+    Next
+    If GOK<0   : Goto ROLL_TR_PCE
+    Elsif !GOK : Goto AB_TR_PCE
+    Endif
+    If EQUILIBRE
+      Gosub RESULTAT
+      If GOK<0   : Goto ROLL_TR_PCE
+      Elsif !GOK : Goto AB_TR_PCE
+      Endif
+    Endif
+  Endif
+
+  If !TEST & !SIMUL
+    # (re)Fermeture de la dernière période
+    If PCECLO
+      Filter [PER] Where CPY=SOC & LEDTYP=REFER & FIYNUM=EXER
+      Read [PER]PER0 Last
+      [F:PER]PERSTA = 3
+      Rewrite [PER]
+      Filter [PER]
+      If fstat
+        GOK = 0 : Call FSTA("PER") From GLOCK : Goto AB_TR_PCE
+      Endif
+      Call PERAUT(SOC,REFER,EXER,[F:PER]PERNUM,GOK) From SUBPER
+      If !GOK : Goto AB_TR_PCE : Endif
+    Endif
+
+    # Fermeture de l'exercice
+    Gosub CLOEXE
+    If GOK<0   : Goto ROLL_TR_PCE
+    Elsif !GOK : Goto AB_TR_PCE
+    Endif
+  Endif
+  Commit
+
+Return
+
+$AB_TR_PCE
+  Rollback
+Return
+
+$ROLL_TR_PCE
+  Rollback
+  Call ROLL From GLOCK
+  If GROLL
+    Return
+  Else
+    Goto TR_PCE
+  Endif
+
+################################################################
+## Pour voir si la devise n'est pas une devise "in" périmée
+################################################################
+$VALDEV
+
+  FINDEV = 0
+  If DEVISE<>GEURO
+    Call LECTURE("TCU",DEVISE,"") From CONTOBJ
+    If fstat : Return : Endif
+    # Date de validité
+    If [F:TCU]EURFLG=2 & [F:TCU]CURENDDAT<>[0/0/0] & NEWDAT>=[F:TCU]CURENDDAT
+      FINDEV = 1  : # Devise non valide à cette date
+    Endif
+  Endif
+
+Return
+
+#####################################################################
+## Comptes de bénéfices et pertes
+#####################################################################
+$SETCPT_SIT
+
+  Raz CPTBEN, CPTPER
+  Read [CAC]CAC0 = 8;[F:FCY]ACCCOD;PLAN
+  If !fstat
+    If [F:CAC]ACC(3)<>"" : CPTBEN = [F:CAC]ACC(3) : Endif
+    If [F:CAC]ACC(4)<>"" : CPTPER = [F:CAC]ACC(4) : Endif
+  Endif
+
+Return
+
+$SETCPT_SOC
+
+  Raz CPTBEN, CPTPER
+  Read [CAC]CAC0 = 7;[F:CPY]ACCCOD;PLAN
+  If !fstat
+    If [F:CAC]ACC(3)<>"" : CPTBEN = [F:CAC]ACC(3) : Endif
+    If [F:CAC]ACC(4)<>"" : CPTPER = [F:CAC]ACC(4) : Endif
+  Endif
+
+Return
+
+#####################################################################
+## Déclenchement de la pièce comptable
+#####################################################################
+$PIECE
+##############################
+## Clé de la table GACCFIYEND
+##############################
+# IDENT(1)    Devise
+# IDENT(2)    Société
+# IDENT(3)    Référentiel
+# IDENT(4)    Site
+# IDENT(5)    No groupe
+# IDENT(6)    Compte
+# IDENT(7)    Tiers
+# IDENT(8)    No ligne
+##############################
+
+  For IGRP=GRPDEB To GROUPE
+    Raz IDENT
+    If FINDEV  : # La devise In n'est plus valide, on génère les pièces en Euro
+      IDENT(1) = GEURO
+    Else
+      IDENT(1) = DEVISE
+    Endif
+    IDENT(2) = SOC
+    IDENT(3) = num$(REFER)
+    If GENTYP=1
+      IDENT(4) = SITE
+    Endif
+    IDENT(5) = num$(IGRP)
+    If GENTYP=1
+      Filter [TMP] Where CUR=IDENT(1) & CPY=SOC & LEDTYP=REFER & FCY=IDENT(4) & GRP=IGRP
+    Else
+      Filter [TMP] Where CUR=IDENT(1) & CPY=SOC & LEDTYP=REFER & GRP=IGRP
+    Endif
+    Look [TMP]FYD0 First
+    If !fstat
+      Gosub VAL_PIECE_ANO
+      If GOK<1 : Break : Endif
+      If PCECLO : # (Italie) : # (Italopt => pièce de clôture)
+        Case PCECPT
+        When 2 : # 1 pièce par compte
+          For [TMP]FYD0(7)
+            IDENT(6) = [F:TMP]ACC
+            IDENT(7) = [F:TMP]BPR
+            Gosub VAL_PIECE_ITA
+            If GOK<1 : Break : Endif
+          Next
+        When Default : # 1 seule pièce
+          Gosub VAL_PIECE_ITA
+          If GOK<1 : Break : Endif
+        Endcase
+      Endif
+    Endif
+  Next IGRP
+  Filter [TMP]
+
+Return
+
+######################################################
+## Pièce d'ouverture
+######################################################
+$VAL_PIECE_ANO
+
+  JOURNAL = JOU(1)
+  TYPPCE  = TYP(1)
+  PIECE   = PCEANO
+
+  Gosub PIECE_AUTO
+
+Return
+
+######################################################
+## Pièce de clôture pour l'Italie
+######################################################
+$VAL_PIECE_ITA
+
+  JOURNAL = JOU(2)
+  TYPPCE  = TYP(2)
+  PIECE   = PCEITA
+
+  Gosub PIECE_AUTO
+
+Return
+
+######################################################
+## Génération de la pièce de résultat
+######################################################
+$RESULTAT
+
+  # On met le "bon" compte de résultat
+  If GENTYP=1 : # Génération par site
+    Call LECTURE("FCY",SITE,"") From CONTOBJ
+    Gosub SETCPT_SIT
+    For [TMP] Where RESACE=2 & CPY=SOC & LEDTYP=REFER & FCY=SITE
+      If SOLDSIT>0
+        [F:TMP]ACCRES = CPTPER
+      Else
+        [F:TMP]ACCRES = CPTBEN
+      Endif
+      Rewrite [TMP]
+      If fstat
+        GOK = 0 : Call FSTA("TMP") From GLOCK : Break
+      Endif
+    Next
+  Elsif GENTYP=2 : # Génération par société (multi-sites)
+    Call LECTURE("CPY",SOC,"") From CONTOBJ
+    Gosub SETCPT_SOC
+    ## On stocke par site le bon compte de résultat ou perte....
+    For K=1 To NBSITE
+      SOLDSIT = 0
+      For [TMP] Where CPY=SOC & LEDTYP=REFER & FCY=TBSITE(K) & RESACE=2
+        SOLDSIT += [F:TMP]AMTLOC
+      Next
+      For [TMP] Where CPY=SOC & LEDTYP=REFER & FCY=TBSITE(K) & RESACE=2
+        If SOLDSIT>0
+          [F:TMP]ACCRES = CPTPER
+        Else
+          [F:TMP]ACCRES = CPTBEN
+        Endif
+        Rewrite [TMP]
+        If fstat
+          GOK = 0 : Call FSTA("TMP") From GLOCK : Break 2
+        Endif
+      Next
+    Next K
+  Endif
+  If GOK<1 : Return : Endif
+  Raz IDENT
+  IDENT(2) = SOC
+  IDENT(3) = num$(REFER)
+  If GENTYP=1
+    IDENT(4) = SITE
+  Endif
+  JOURNAL = JOU(1)
+  TYPPCE  = TYP(1)
+  PIECE   = PCERES
+
+  Gosub PIECE_AUTO
+
+Return
+
+#######################################################################
+## Génération d'une pièce auto (on passe par les groupes de pièces)
+#######################################################################
+$PIECE_AUTO
+If PIECE<>"" & !SIMUL
+ # Génération par société (=multi-sites) : la pièce est générée sur le site principal de la société
+ NBZONE = 0
+ If GENTYP=1
+  NBZONE += 1 : TZONE(NBZONE) = "FCY" : TVAL(NBZONE) = SITE
+ Else
+  NBZONE += 1 : TZONE(NBZONE) = "FCY" : TVAL(NBZONE) = SITPRIN
+ Endif
+ If JOURNAL<>""
+  NBZONE += 1 : TZONE(NBZONE) = "JOU" : TVAL(NBZONE)  = JOURNAL : # Journal passé en argument
+ Endif
+ If TYPPCE<>""
+  NBZONE += 1 : TZONE(NBZONE) = "TYP" : TVAL(NBZONE)  = TYPPCE  : # Type de pièce passé en argument
+ Endif
+ NBZONE += 1 : TZONE(NBZONE) = "FLGREP" : TVAL(NBZONE) = "2" : # Flag "report à nouveau"
+ #*X3-39795 --- Management of fields ORIGIN and ORICOD
+ NBZONE += 1 : TZONE(NBZONE) = "ORIGIN" : TVAL(NBZONE) = "2"      : # Automatic loading
+ NBZONE += 1 : TZONE(NBZONE) = "ORICOD" : TVAL(NBZONE) = PIECE
+ #*X3-39795 END
+ STAT = 0
+ Call VALGRPPCE3(PIECE,IDENT,STAT,MESSAGE,TZONE,TVAL) From CPTAUTO
+ If STAT
+  GOK = 0 : Call ECR_TRACE(MESSAGE-mess(18,105,1)-IDENT(1)-mess(2,45,1)-IDENT(2)-
+&                                  mess(208,111,1)-mess(val(IDENT(3)),2644,1)-mess(3,45,1)-IDENT(4),1) From GESECRAN
+ Else
+  If IDENT(1)<>"" : MESSAGE -= mess(18,105,1)-IDENT(1) : Endif : # Devise
+  If IDENT(4)<>"" : MESSAGE -= tolower(mess(3,45,1))-IDENT(4) : Endif : # Site
+  Call ECR_TRACE(mess(40,107,1)-MESSAGE,0) From GESECRAN : # Création pièce
+  If TRACEDET : Call ECR_TRACE("",0) From GESECRAN : Endif
+ Endif
+Endif
+Return
+
+#######################################################################
+## Génération de la table temporaire GACCFIYEND
+#######################################################################
+$WR_TMP
+
+  Raz SOLDECUR, SOLDELOC, SOLDAUTO
+  CRITBAL  = '[BAL]LEDTYP='+num$(REFER)
+  CRITBAL -= '& [BAL]CPY="'+SOC+'"'
+  CRITBAL -= '& [BAL]FCY="'+SITE+'"'
+  CRITBAL -= '& [BAL]FIY='+num$(EXER)
+  If DEVISE<>DEVSOC
+    CRITBAL -= '& [BAL]CUR="'+DEVISE+'" & [F:GAC]FRWCUR=2'
+  Else
+    CRITBAL -= '& ([BAL]CUR="'+DEVISE+'" or [F:GAC]FRWCUR<>2)'
+  Endif
+  Link [BAL] With [GAC]GAC0=[BAL]COA;[BAL]ACC , [CLS]CLS0=[F:COA]LEGCLS;[F:GAC]CLSCOD As [LBAL]
+&            Where evalue(CRITBAL)
+&            Order By Key CLE=[BAL]ACC;[BAL]BPR
+
+  For [LBAL]CLE(1)
+    COMPTE = [F:GAC]ACC
+    OKREPORT = ([F:CLS]ERA=2 or PCECLO) : # Pour l'italie on met tous les comptes
+    #
+    # ZZBY Il faut un indicateur dans CLS pour dire si c'est une banque!!!
+    #
+    # If [F:GAC]CUR=GEURO & [F:GAC]CLS=5 & DEVISE<>GEURO
+    If [F:GAC]CUR=GEURO & [F:GAC]CLSCOD="5" & DEVISE<>GEURO
+      Gosub OKBAN
+      If DEVISE=DEVSOC : OKREPORT *= OKBAN : Else : OKREPORT *= (!OKBAN) : Endif
+    Endif
+    If OKREPORT
+      If [F:GAC]SAC<>2  : # Compte de type normal (non collectif)
+        TIERS  = ""
+        Gosub ANOUVO
+        If GOK<1 : Break : Endif
+      Else : # Compte de type collectif
+        For [LBAL]CLE(2)
+          TIERS = [F:BAL]BPR
+          If TIERS<>""
+            Gosub ANOUVO
+            If GOK<1 : Break 2 : Endif
+          Endif
+        Next
+      Endif
+    Endif : # OKREPORT
+  Next  : # [LBAL]
+  If GOK<1 : Return : Endif
+  # On va créer l'enregistrement qui contiendra la contrepartie des écritures de
+  # report de solde des comptes de la classe 1 à 5.
+  If NB
+    Gosub WR_SOLDE
+    If GOK<1 : Return : Endif
+  Endif
+
+Return
+
+## <GB> Pour répondre au bug 14181 : lorsqu'un compte de banque a changé de devise et que la date de génération est antérieure
+## à la date de changement devise, on veut reporter le compte sur l'ancienne devise
+$OKBAN
+  OKBAN = 1
+  Filter [BAN] Where BANACC=[F:GAC]ACC & BANCSH=1 & COA=[F:GAC]COA & CPY=[L]SOC
+  Read [BAN]BAN0 First
+  Filter [BAN]
+  If !fstat
+    If [F:BAN]CHGDAT>NEWDAT & [F:BAN]OLDCUR=DEVISE
+      OKBAN = 1
+    Else
+      OKBAN = 0
+    Endif
+  Endif
+
+Return
+
+########################################################################
+## Calcul de l'à-nouveau
+########################################################################
+$ANOUVO
+
+  Raz [F:TMP]
+  Raz DEBCUR, CRECUR, DEBLOC, CRELOC, DEBAUTO, CREAUTO, TOTANA
+  For [LBAL]CLE
+    DEBCUR += sum([F:BAL]DEB)
+    CRECUR += sum([F:BAL]CDT)
+    DEBLOC += sum([F:BAL]DEBLED)
+    CRELOC += sum([F:BAL]CDTLED)
+    For IAUTO=1 To NBAUTO
+      For [BAL2] Where LEDTYP=REFAUTO(IAUTO) & CPY=[F:BAL]CPY & FCY=[F:BAL]FCY & FIY=[F:BAL]FIY
+&                & ACC=[F:BAL]ACC & BPR=[F:BAL]BPR & CUR=[F:BAL]CUR
+        DEBAUTO(IAUTO) += sum([F:BAL2]DEBLED)
+        CREAUTO(IAUTO) += sum([F:BAL2]CDTLED)
+      Next
+    Next IAUTO
+  Next
+  If DEVISE=DEVSOC
+    DEBCUR = DEBLOC
+    CRECUR = CRELOC
+  Endif
+
+  # Si la devise In n'est plus valide --> on convertit en Euro
+  If FINDEV
+    Call CONVERT(DEVISE,GEURO,DEVSOC,1,NEWDAT,DEBCUR,DEBCUR,STAT) From TRTDEV
+    Call CONVERT(DEVISE,GEURO,DEVSOC,1,NEWDAT,CRECUR,CRECUR,STAT) From TRTDEV
+    If STAT
+      GMESSAGE = mess(16,114,1)-DEVISE-"->"-GEURO-"("+format$("D:"+GFMDAT,NEWDAT)+")"
+      # Pas de cours de devises DEVISE -> GEURO
+      GOK = 0
+      Return
+    Endif
+    DEBLOC = DEBCUR
+    CRELOC = CRECUR
+  Endif
+
+# Compta géné
+
+  If (CRECUR-DEBCUR)<>0 | (CRELOC-DEBLOC)<>0 | [F:LED]ANA=2 | ( sum(CREAUTO(1..NBAUTO)) - sum(DEBAUTO(1..NBAUTO)) )<>0
+
+    OKSENS = (sgn(CRECUR-DEBCUR)=sgn(CRELOC-DEBLOC)) : # Si les sens sont différents, on génère 2 lignes
+    If FINDEV  : # La devise In n'est plus valide, on génère les pièces en Euro
+      [F:TMP]CUR = GEURO
+    Else
+      [F:TMP]CUR = DEVISE
+    Endif
+    [F:TMP]CURLED = DEVSOC
+    [F:TMP]CPY    = SOC
+    [F:TMP]LEDTYP = REFER
+    [F:TMP]FCY    = SITE
+    [F:TMP]ACCDAT = NEWDAT
+    [F:TMP]COA    = PLAN
+    [F:TMP]ACC    = COMPTE
+    [F:TMP]ACCRES = CPTATT
+    [F:TMP]BPR    = TIERS
+    [F:TMP]GRP    = GROUPE
+    Read [CLS]CLS0 = [F:COA]LEGCLS;[F:GAC]CLSCOD
+    If [F:CLS]ERA=2 : # (c'est pas toujours le cas, à cause de l'option italienne)
+      [F:TMP]RESACE = 1
+      SOLDECUR += CRECUR-DEBCUR
+      SOLDELOC += CRELOC-DEBLOC
+      For IAUTO=1 To NBAUTO
+        SOLDAUTO(IAUTO) += CREAUTO(IAUTO)-DEBAUTO(IAUTO)
+      Next IAUTO
+    Else
+      [F:TMP]RESACE = 3
+    Endif
+
+# Compta ana
+# (on écrit la compta géné après, car il faut calculer la quantité)
+
+    OKANA = 0
+    For K=1 To NBAXE
+      If find(TBAXE(K),[F:GAC]DIE(0..[F:GAC]DACDIENBR-1))
+        OKANA = 1
+        Break
+      Endif
+    Next K
+
+    If OKANA
+      LIGANA = 0
+      Raz TOTDEBCUR, TOTCRECUR, TOTDEBLOC, TOTCRELOC
+      CRITBLA  = '[BLA]LEDTYP='+num$(REFER)
+      CRITBLA -= '& [BLA]CPY="'+SOC+'"'
+      CRITBLA -= '& [BLA]FCY="'+SITE+'"'
+      CRITBLA -= '& [BLA]FIY='+num$(EXER)
+      CRITBLA -= '& [BLA]ACC="'+COMPTE+'"'
+      CRITBLA -= '& [BLA]BPR="'+TIERS+'"'
+      If DEVISE<>DEVSOC or [F:GAC]FRWCUR=2
+        CRITBLA -= '& [BLA]CUR="'+DEVISE+'"'
+      Endif
+      Filter [BLA] Where evalue(CRITBLA) Order With Key CLE=ORDBLA
+      For [BLA]CLE(NBAXE)
+        Raz ANADEBCUR, ANACRECUR, ANADEBLOC, ANACRELOC
+        Raz ANAQTE, UNITE
+        #
+        # Remise à zéro des axes dont les sections sont sans report à nouveau
+        #
+        For AXE=1 To NBAXE
+          SECTION(AXE) = evalue("[F:BLA]CCE"+num$(IAXE(AXE)))
+          If SECTION(AXE)<>""
+            K = find(SECTION(AXE),TBSEC(AXE..AXE,1..NBSEC(AXE)))
+            If K
+              REPANA = TBANA(AXE,K)
+            Else
+              Read [CCE]CCE0 = TBAXE(AXE);SECTION(AXE)
+              REPANA = ([F:CCE]FRW=2)
+              If NBSEC(AXE)<MAXSEC
+                NBSEC(AXE) += 1
+                TBSEC(AXE,NBSEC(AXE)) = SECTION(AXE)
+                TBANA(AXE,NBSEC(AXE)) = REPANA
+              Endif
+            Endif
+            If !REPANA : SECTION(AXE) = "" : Endif
+          Endif
+        Next AXE
+        #
+        # Calcul du report
+        #
+        For [BLA]CLE
+          ANADEBCUR += sum([F:BLA]DEB)
+          ANACRECUR += sum([F:BLA]CDT)
+          ANADEBLOC += sum([F:BLA]DEBLED)
+          ANACRELOC += sum([F:BLA]CDTLED)
+        Next
+
+        If [F:GAC]FLGUOM=2
+          UNITE = [F:GAC]UOM
+          For [BLQ] Where LEDTYP=REFER & CPY=SOC & FCY=SITE & FIY=EXER & ACC=COMPTE & BPR=TIERS
+&                 & CCE1=[F:BLA]CCE1 & CCE2=[F:BLA]CCE2 & CCE3=[F:BLA]CCE3
+&                 & CCE4=[F:BLA]CCE4 & CCE5=[F:BLA]CCE5 & CCE6=[F:BLA]CCE6
+&                 & CCE7=[F:BLA]CCE7 & CCE8=[F:BLA]CCE8 & CCE9=[F:BLA]CCE9
+            BALQTE = sum([F:BLQ]QTY)
+            If [F:BLQ]UOM<>UNITE : # On n'additionne pas des choux et des carottes
+              Call CALCUL_QTY(BALQTE,[F:BLQ]UOM,BALQTE,UNITE,COEUOM) From TRTX3
+            Endif
+            ANAQTE += BALQTE
+          Next
+          [F:TMP]QTY += ANAQTE
+          [F:TMP]UOM  = UNITE
+        Endif
+        If DEVISE=DEVSOC
+          ANADEBCUR = ANADEBLOC
+          ANACRECUR = ANACRELOC
+        Endif
+        # Si la devise In n'est plus valide --> on convertit en Euro
+        If FINDEV
+          Call CONVERT(DEVISE,GEURO,DEVSOC,1,NEWDAT,ANADEBCUR,ANADEBCUR,STAT) From TRTDEV
+          Call CONVERT(DEVISE,GEURO,DEVSOC,1,NEWDAT,ANACRECUR,ANACRECUR,STAT) From TRTDEV
+          If STAT
+            GMESSAGE = mess(16,114,1)-DEVISE-"->"-GEURO-"("+format$("D:"+GFMDAT,NEWDAT)+")"
+            # Pas de cours de devises DEVISE -> GEURO
+            GOK = 0 : Break
+          Endif
+          ANADEBLOC = ANADEBCUR
+          ANACRELOC = ANACRECUR
+        Endif
+        #
+        # Ecriture du report à nouveau ana
+        #
+        Raz [F:TMPA]
+        [F:TMPA] = [F:TMP]
+        [F:TMPA]UOM = UNITE
+        For AXE=1 To NBAXE
+          [F:TMPA]DIE(AXE-1) = TBAXE(AXE)
+          [F:TMPA]CCE(AXE-1) = SECTION(AXE)
+        Next AXE
+        If (ANACRECUR-ANADEBCUR)<>0 | (ANACRELOC-ANADEBLOC)<>0 |  ANAQTE<>0
+          If OKSENS
+            #
+            # Si tout va bien => 1 seule ligne
+            #
+            [F:TMPA]LIG    = NB+1
+            LIGANA += 1
+            [F:TMPA]QTY    = ANAQTE
+            [F:TMPA]ANALIG = LIGANA
+            [F:TMPA]AMTCUR = ANACRECUR-ANADEBCUR
+            [F:TMPA]AMTLOC = ANACRELOC-ANADEBLOC
+            Write [TMPA]
+            If fstat
+              GOK = 0 : Call FSTA("TMPA") From GLOCK : Break
+            Endif
+            If TRACANA : Gosub TRACANA : Endif
+          Else
+            #
+            # Si résultats de sens différent => écriture de 2 reports (1 débit + 1 crédit)
+            #
+            [F:TMPA]LIG    = NB+1
+            LIGANA += 1
+            [F:TMPA]QTY    = ANAQTE
+            [F:TMPA]ANALIG = LIGANA
+            [F:TMPA]AMTCUR = ANACRECUR
+            [F:TMPA]AMTLOC = ANACRELOC
+            Write [TMPA]
+            If fstat
+              GOK = 0 : Call FSTA("TMPA") From GLOCK : Break
+            Endif
+            If TRACANA : Gosub TRACANA : Endif
+            [F:TMPA]LIG    = NB+2
+            LIGANA += 1
+            [F:TMPA]QTY    = 0
+            [F:TMPA]ANALIG = LIGANA
+            [F:TMPA]AMTCUR = -ANADEBCUR
+             [F:TMPA]AMTLOC = -ANADEBLOC
+            Write [TMPA]
+            If fstat
+              GOK = 0 : Call FSTA("TMPA") From GLOCK : Break
+            Endif
+            If TRACANA : Gosub TRACANA : Endif
+          Endif
+          TOTDEBCUR += ANADEBCUR
+          TOTCRECUR += ANACRECUR
+          TOTDEBLOC += ANADEBLOC
+          TOTCRELOC += ANACRELOC
+          TOTANA    += 1
+         Endif
+      Next : # [BLA]
+      If GOK<1 : Return : Endif
+      #
+      # Si tout a pas été imputé => 1 ligne à vide pour le solde...
+      #
+      If OKSENS
+        If (TOTCRELOC-TOTDEBLOC)<>(CRELOC-DEBLOC)
+          Raz [F:TMPA]
+          LIGANA += 1
+          [F:TMPA] = [F:TMP]
+          [F:TMPA]LIG    = NB+1
+          [F:TMPA]ANALIG = LIGANA
+          [F:TMPA]AMTCUR = (CRECUR-DEBCUR)-(TOTCRECUR-TOTDEBCUR)
+          [F:TMPA]AMTLOC = (CRELOC-DEBLOC)-(TOTCRELOC-TOTDEBLOC)
+          [F:TMPA]QTY    = 0
+          Write [TMPA]
+          If fstat
+            GOK = 0 : Call FSTA("TMPA") From GLOCK : Return
+          Endif
+        Endif
+      Else
+        #
+        # ... ou 2 lignes si résultats de sens différents
+        #
+        If TOTCRELOC<>CRELOC
+          Raz [F:TMPA]
+          LIGANA += 1
+          [F:TMPA] = [F:TMP]
+          [F:TMPA]LIG    = NB+1
+          [F:TMPA]ANALIG = LIGANA
+          [F:TMPA]AMTCUR = CRECUR-TOTCRECUR
+          [F:TMPA]AMTLOC = CRELOC-TOTCRELOC
+          [F:TMPA]QTY    = 0
+          Write [TMPA]
+          If fstat
+            GOK = 0 : Call FSTA("TMPA") From GLOCK : Return
+          Endif
+        Endif
+        If TOTDEBLOC<>DEBLOC
+          Raz [F:TMPA]
+          LIGANA += 1
+          [F:TMPA] = [F:TMP]
+          [F:TMPA]LIG    = NB+2
+          [F:TMPA]ANALIG = LIGANA
+          [F:TMPA]AMTCUR = -(DEBCUR-TOTDEBCUR)
+          [F:TMPA]AMTLOC = -(DEBLOC-TOTDEBLOC)
+          [F:TMPA]QTY    = 0
+          Write [TMPA]
+          If fstat
+            GOK = 0 : Call FSTA("TMPA") From GLOCK : Return
+          Endif
+        Endif
+      Endif
+      Filter [BLA]
+    Endif
+
+    # Ecriture compta géné
+    OKAUTO = 1
+    For IAUTO = 1 To NBAUTO
+      If CREAUTO(IAUTO) - DEBAUTO(IAUTO) <> 0 : OKAUTO = 0 : Break : Endif
+    Next
+
+    If (CRECUR-DEBCUR)<>0 | (CRELOC-DEBLOC)<>0 | TOTANA<>0 | !OKAUTO
+      If OKSENS
+        #
+        # Si tout va bien => 1 seule ligne
+        #
+        NB += 1
+        [F:TMP]LIG    = NB
+        [F:TMP]AMTCUR = CRECUR-DEBCUR
+        [F:TMP]AMTLOC = CRELOC-DEBLOC
+        For IAUTO=1 To NBAUTO
+          [F:TMP]AMTAUT(REFAUTO(IAUTO)-1) = CREAUTO(IAUTO)-DEBAUTO(IAUTO)
+        Next IAUTO
+        If [F:TMP]QTY<>0 & [F:TMP]AMTCUR+[F:TMP]AMTLOC=0
+          [F:TMP]QTY*=-1
+        Endif
+        Write [TMP]
+        If fstat
+          GOK = 0 : Call FSTA("TMP") From GLOCK : Return
+        Endif
+        If [F:TMP]QTY<>0 & [F:TMP]AMTCUR+[F:TMP]AMTLOC=0
+          Update [TMPA] Where  [F:TMPA]CUR=[F:TMP]CUR & [F:TMPA]CPY=[F:TMP]CPY & [F:TMPA]LEDTYP=[F:TMP]LEDTYP & [F:TMPA]FCY=[F:TMP]FCY &
+&                       [F:TMPA]GRP=[F:TMP]GRP & [F:TMPA]ACC=[F:TMP]ACC & [F:TMPA]BPR=[F:TMP]BPR & [F:TMPA]LIG=[F:TMP]LIG
+&                       With QTY *= -1
+          If fstat
+            GOK = 0 : Call FSTA("TMPA") From GLOCK : Return
+          Endif
+        Endif
+        If TRACEDET : SIGNE = -1 : Gosub TRACE : Endif
+      Else
+        #
+        # Sinon => 1 débit + 1 crédit
+        #
+        NB += 1
+        [F:TMP]LIG    = NB
+        [F:TMP]AMTCUR = CRECUR
+        [F:TMP]AMTLOC = CRELOC
+        For IAUTO=1 To NBAUTO
+          [F:TMP]AMTAUT(REFAUTO(IAUTO)-1) = CREAUTO(IAUTO)
+        Next IAUTO
+        If [F:TMP]QTY<>0 & [F:TMP]AMTCUR+[F:TMP]AMTLOC=0
+          [F:TMP]QTY*=-1
+        Endif
+        Write [TMP]
+        If fstat
+          GOK = 0 : Call FSTA("TMP") From GLOCK : Return
+        Endif
+        If [F:TMP]QTY<>0 & [F:TMP]AMTCUR+[F:TMP]AMTLOC=0
+          Update [TMPA] Where  [F:TMPA]CUR=[F:TMP]CUR & [F:TMPA]CPY=[F:TMP]CPY & [F:TMPA]LEDTYP=[F:TMP]LEDTYP & [F:TMPA]FCY=[F:TMP]FCY &
+&                       [F:TMPA]GRP=[F:TMP]GRP & [F:TMPA]ACC=[F:TMP]ACC & [F:TMPA]BPR=[F:TMP]BPR & [F:TMPA]LIG=[F:TMP]LIG
+&                       With QTY *= -1
+          If fstat
+            GOK = 0 : Call FSTA("TMPA") From GLOCK : Return
+          Endif
+        Endif
+        If TRACEDET : SIGNE = -1 : Gosub TRACE : Endif
+        NB += 1
+        [F:TMP]LIG    = NB
+        [F:TMP]QTY    = 0        : # Toute la quantité a été mise sur le premier enreg
+        [F:TMP]AMTCUR = -DEBCUR
+        [F:TMP]AMTLOC = -DEBLOC
+        For IAUTO=1 To NBAUTO
+          [F:TMP]AMTAUT(REFAUTO(IAUTO)-1) = -DEBAUTO(IAUTO)
+        Next IAUTO
+        Write [TMP]
+        If fstat
+          GOK = 0 : Call FSTA("TMP") From GLOCK : Return
+        Endif
+        If TRACEDET : SIGNE = -1 : Gosub TRACE : Endif
+      Endif
+    Endif
+# Rupture de pièce
+
+    If NB>=MAXI
+      Gosub WR_SOLDE
+      GROUPE += 1
+      NB = 0
+      Raz SOLDECUR, SOLDELOC, SOLDAUTO
+    Endif
+  Endif
+Return
+
+####################################################################
+## Trace détaillée
+####################################################################
+$TRACE
+
+  If [F:TMP]RESACE=3 : Return : Endif
+  MESSAGE  = ""
+  MESSAGE += format$("K:"+num$(GLONFCY+1)+"X",[F:TMP]FCY)
+  MESSAGE += format$("K:"+num$(GLONGAC+1)+"X",[F:TMP]ACC)
+  MESSAGE += format$("K:"+num$(GLONBPR+1)+"X",[F:TMP]BPR)
+  If ([F:TMP]AMTLOC<>0 & SIGNE*[F:TMP]AMTLOC>0) or ([F:TMP]AMTLOC=0 & SIGNE*[F:TMP]AMTCUR>0)
+   MESSAGE += left$(mess(1,626,1),1) : # D(débit)
+  Else
+   MESSAGE += left$(mess(2,626,1),1) : # C(crédit)
+  Endif
+  LIBEL = format$("N3:13.2",abs([F:TMP]AMTLOC))
+  MESSAGE += right$(space$(18)+LIBEL,len(LIBEL)+1)
+  MESSAGE += " "+[F:TMP]CURLED
+  If [F:TMP]CUR<>[F:TMP]CURLED
+   LIBEL = format$("N3:13.2",abs([F:TMP]AMTCUR))
+   MESSAGE += right$(space$(18)+LIBEL,len(LIBEL)+1)
+   MESSAGE += " "+format$("K:5X",[F:TMP]CUR)
+  Else
+   MESSAGE += space$(24)
+  Endif
+  If [F:TMP]BPR<>""
+   Call LECTURE("BPR",[F:TMP]BPR,"") From CONTOBJ
+   MESSAGE += [F:BPR]BPRNAM
+  Else
+   Call LECTEXTRA(LIBEL,"GACCOUNT","DESTRA",PLAN,[F:TMP]ACC) From ATEXTRA
+   MESSAGE += LIBEL
+  Endif
+  Call ECR_TRACE(MESSAGE,0) From GESECRAN
+
+Return
+
+$TRACANA
+
+  MESSAGE = left$(space$(GLONFCY+1)+sigma(1,NBAXE,format$("K:10X",[F:TMPA]CCE(indcum-1)))+space$(80),80)
+  LIBEL = format$("N3:13.2",abs([F:TMPA]AMTLOC))
+  MESSAGE += right$(space$(18)+LIBEL,len(LIBEL)+1)-DEVISE
+  Call ECR_TRACE(MESSAGE,0) From GESECRAN
+
+Return
+
+####################################################################
+## Ligne de résultat
+####################################################################
+$WR_SOLDE
+
+# NB : La zone RESACE permettra de distinguer "l'écriture de solde", c'est-à-dire ce
+# qui va être passé sur le compte d'attente et le compte de bénéfice ou perte aux autres
+# écritures de report de solde de compte de la classe 1 à 5.
+  OKAUTO = 1
+  For IAUTO = 1 To NBAUTO
+    If SOLDAUTO(IAUTO) <> 0 : OKAUTO = 0 : Break : Endif
+  Next
+
+  If EQUILIBRE & (SOLDECUR<>0 or SOLDELOC<>0 or !OKAUTO)
+    If FINDEV
+      [F:TMP]CUR  = GEURO
+    Else
+      [F:TMP]CUR  = DEVISE
+    Endif
+    [F:TMP]CURLED = DEVSOC
+    [F:TMP]CPY    = SOC
+    [F:TMP]LEDTYP = REFER
+    [F:TMP]FCY    = SITE
+    [F:TMP]ACCDAT = NEWDAT
+    [F:TMP]COA    = PLAN
+    [F:TMP]ACC    = CPTATT
+    [F:TMP]BPR    = ""
+    If GENTYP=1
+      If SOLDELOC>0
+        [F:TMP]ACCRES = CPTPER
+      Else
+        [F:TMP]ACCRES = CPTBEN
+      Endif
+    Endif
+    SOLDSIT  += SOLDELOC
+    [F:TMP]RESACE = 2
+    [F:TMP]GRP = GROUPE
+    If sgn(SOLDECUR)=sgn(SOLDELOC)
+      NB += 1
+      [F:TMP]LIG = NB
+      [F:TMP]AMTCUR = SOLDECUR
+      [F:TMP]AMTLOC = SOLDELOC
+      For IAUTO=1 To NBAUTO
+        [F:TMP]AMTAUT(REFAUTO(IAUTO)-1) = SOLDAUTO(IAUTO)
+      Next IAUTO
+      Write [TMP]
+      If fstat
+        GOK = 0 : Call FSTA("TMP") From GLOCK : Return
+      Endif
+      If TRACEDET : SIGNE = +1 : Gosub TRACE : Endif
+      Gosub RESANA : If GOK<1 : Return : Endif
+    Else
+      #
+      # Là c'est plus compliqué
+      # parce qu'on peut pas avoir un montant forcé à 0
+      # Alors on fait une bidouille
+      #
+      Call LECTURE("TCU",DEVSOC,"") From CONTOBJ
+      NB += 1
+      [F:TMP]LIG = NB
+      [F:TMP]AMTCUR = SOLDECUR
+      [F:TMP]AMTLOC = sgn(SOLDECUR)*[F:TCU]CURRND : # La plus petite valeur possible
+      For IAUTO=1 To NBAUTO
+        Call LECTURE("TCU",DEVAUTO(IAUTO),"") From CONTOBJ
+       [F:TMP]AMTAUT(REFAUTO(IAUTO)-1) = sgn(SOLDECUR)*[F:TCU]CURRND
+      Next IAUTO
+      Write [TMP]
+      If fstat
+        GOK = 0 : Call FSTA("TMP") From GLOCK : Return
+      Endif
+      If TRACEDET : SIGNE = +1 : Gosub TRACE : Endif
+      Gosub RESANA : If GOK<1 : Return : Endif
+      Call LECTURE("TCU",DEVSOC,"") From CONTOBJ
+      NB += 1
+      [F:TMP]LIG = NB
+      [F:TMP]AMTCUR = 0
+      [F:TMP]AMTLOC = SOLDELOC-sgn(SOLDECUR)*[F:TCU]CURRND
+      For IAUTO=1 To NBAUTO
+        Call LECTURE("TCU",DEVAUTO(IAUTO),"") From CONTOBJ
+        [F:TMP]AMTAUT(REFAUTO(IAUTO)-1) = SOLDAUTO(IAUTO)-sgn(SOLDECUR)*[F:TCU]CURRND
+      Next IAUTO
+      Write [TMP]
+      If fstat
+        GOK = 0 : Call FSTA("TMP") From GLOCK : Return
+      Endif
+      If TRACEDET : SIGNE = +1 : Gosub TRACE : Endif
+      Gosub RESANA : If GOK<1 : Return : Endif
+    Endif
+  Endif
+  Call ECR_TRACE("",0) From GESECRAN
+Return
+
+$RESANA
+#
+# Analytique à vide pour le résultat (???)
+#
+  If NBAXE
+    Raz [F:TMPA]
+    [F:TMPA] = [F:TMP]
+    [F:TMPA]ANALIG = 1
+    Write [TMPA]
+    If fstat
+      GOK = 0 : Call FSTA("TMPA") From GLOCK : Return
+    Endif
+  Endif
+
+Return
+
+#####################################################################################
+## Controles avant clôture
+#####################################################################################
+$CONTROL
+  # On contrôle que tous les exercices précédents sont fermés
+  Filter [FIY] Where CPY=SOC & LEDTYP=REFER & FIYNUM<EXER & FIYSTA<3
+  Read [FIY]FIY0 First
+  Filter [FIY]
+  If !fstat
+    STAT = 1 : Call ECR_TRACE(mess(115,107,1),1) From GESECRAN
+    # Tous les exercices précédents n'ont pas été clôturés
+  Endif
+
+  # On contrôle que toutes les périodes de l'exercice à clôturer sont fermées
+  Filter [PER] Where CPY=SOC & LEDTYP=REFER & FIYNUM=EXER & PERSTA<>3
+  Read [PER]PER0 First
+  Filter [PER]
+  If !fstat
+    # Toutes les périodes n'ont pas été clôturées
+    STAT = 1 : Call ECR_TRACE(mess(69,107,1),1) From GESECRAN
+  Endif
+
+  # Vérif de l'ouverture de l'exercice suivant et de la période d'à nouveaux
+  Read [FIY]FIY0 = SOC;REFER;EXER+1
+  If fstat
+    STAT = 1 : Call ECR_TRACE(mess(3,116,1)-num$(EXER+1)-mess(7,101,1),1) From GESECRAN
+    # Exercice [EXER+1] non défini
+  Elsif [F:FIY]FIYSTA<>2
+    STAT = 1 : Call ECR_TRACE(mess(3,116,1)-num$(EXER+1)-mess(1,214,1),1) From GESECRAN
+    # Exercice [EXER+1] non ouvert
+  Endif
+  Read [PER]PER0 = SOC;REFER;EXER+1;1
+  If fstat | [F:PER]PERSTA<>2
+    # Période A-nouveau non ouverte
+    STAT = 1 : Call ECR_TRACE(mess(42,106,1),1) From GESECRAN
+  Endif
+
+  # Vérif d'existence des comptes de pertes/bénéfices
+  If EQUILIBRE
+    For [FCY] Where LEGCPY=SOC & FINFLG=2
+      Gosub SETCPT_SIT
+      If CPTBEN=""
+        Call ECR_TRACE(mess(3,45,1)-[F:FCY]FCY-"-"-mess(85,102,1)-"= ''",1) From GESECRAN
+        # Site - Compte de bénéfice
+        STAT = 1
+      Endif
+      If CPTPER=""
+        Call ECR_TRACE(mess(3,45,1)-[F:FCY]FCY-"-"-mess(86,102,1)-"= ''",1) From GESECRAN
+        # Site - Compte de perte
+        STAT = 1
+      Endif
+    Next
+
+    If GENTYP=2
+      Call LECTURE("CPY",SOC,"") From CONTOBJ
+      Gosub SETCPT_SOC
+      If CPTBEN=""
+        Call ECR_TRACE(mess(2,45,1)-SOC-"-"-mess(85,102,1)-"= ''",1) From GESECRAN
+        # Société - Compte de bénéfice
+        STAT = 1
+      Endif
+      If CPTPER=""
+        Call ECR_TRACE(mess(2,45,1)-SOC-"-"-mess(86,102,1)-"= ''",1) From GESECRAN
+        # Société - Compte de perte
+        STAT = 1
+      Endif
+    Endif
+  Endif
+
+  # Vérif de validité du type de pièce
+  mkstat = 0
+  Call CONTTYP(TYP(1),SOC,REFER,2)
+  If mkstat
+    Call ECR_TRACE(TYP(1)-":"-GMESSAGE,1) From GESECRAN
+   STAT = 1
+  Endif
+  If PCECLO
+    mkstat = 0
+    Call CONTTYP(TYP(2),SOC,REFER,3)
+    If mkstat
+      Call ECR_TRACE(TYP(2)-":"-GMESSAGE,1) From GESECRAN
+      STAT = 1
+    Endif
+  Endif
+Return
+
+#########################################################################
+# Contrôle du type de pièce
+#########################################################################
+Subprog CONTTYP(PIECE,SOCIETE,REFER,PERIODE)
+Variable Char    PIECE()
+Value    Char    SOCIETE
+Value    Integer REFER
+Value    Integer PERIODE
+
+Local Integer NOL , REF
+  NOL = nolign-1
+  Call LEC_CPY(SOCIETE) From CPTLEC
+  Call LEC_GTE_LEG([F:CPY]LEG,PIECE) From CPTLEC
+  Call CONTEXE([F:GTE]ACS) From CPTSUB
+  If mkstat : End : Endif
+  If [F:GTE]VCRREA<>2
+    GMESSAGE = mess(29,107,1) : # Type de pièce incorrect
+    mkstat = 2 : End
+  Endif
+  If PERIODE=2 & [F:GTE]AUZJOU(6)<>2
+    GMESSAGE = mess(29,107,1) : # Type de pièce incorrect
+    mkstat = 2 : End
+  Endif
+  If [F:GTE]AUZLED(REFER-1)=1
+    GMESSAGE = mess(115,104,1) : # Référentiel non autorisé sur ce type de pièce
+    mkstat = 2 : End
+  Endif
+
+  For REF=1 To len(mess(0,2644,1))
+    If REF<>REFER & [F:GTE]AUZLED(REF-1)<>1
+      GMESSAGE = mess(REF,2644,1)-":"-mess(177,107,1) : # Référentiel incorrect
+      mkstat = 2 : End
+    Endif
+  Next REF
+
+  If [F:GTE]GFY<>""
+    Call VERSOC([F:GTE]GFY,SOCIETE,"",PIECE) From CFYSUB
+    If mkstat : End : Endif
+  Endif
+  If PERIODE<>0 & [F:GTE]PER<>PERIODE
+    GMESSAGE = mess(178,107,1) : # Période incorrecte
+    mkstat = 2 : End
+  Endif
+
+End
+
+#########################################################################
+# Effacement du fichier temporaire GACCFIYEND
+#########################################################################
+Subprog ANUTMP(SOC,REFER,ANA)
+Value Char    SOC() : # Société
+Value Integer REFER : # Référentiel
+Value Integer ANA
+
+  If clalev([F:TMP])=0  : Local File GACCFIYEND [TMP]  : Endif : # Fichier temporaire
+  If clalev([F:TMPA])=0 : Local File GACCFIYENA [TMPA] : Endif : # Fichier temporaire
+  Call DEBTRANS From GLOCK
+  Gosub TR_ANNUL
+
+End
+
+$TR_ANNUL
+
+  GOK = 1
+  Trbegin [TMP] , [TMPA]
+  Delete [TMP] Where CPY=SOC & LEDTYP=REFER
+  If fstat=1 | fstat>5
+    GOK = 0 : Call RSTA("TMP",SOC) From GLOCK : Goto AB_TR_ANNUL
+  Endif
+  If ANA
+    Delete [TMPA] Where CPY=SOC & LEDTYP=REFER
+    If fstat=1 | fstat>5
+      GOK = 0 : Call RSTA("TMPA",SOC) From GLOCK : Goto AB_TR_ANNUL
+    Endif
+  Endif
+  Commit
+
+Return
+
+$AB_TR_ANNUL
+  Rollback
+Return
+
+#########################################################################
+# Effacement des A-nouveaux provisoires
+#########################################################################
+Subprog ANUNOUV(SOC,TYPREF,NBAUTO,REFAUTO,EXER,ANA)
+Value Char    SOC()
+Value Integer TYPREF
+Value Integer NBAUTO
+Value Integer REFAUTO(1..)
+Value Decimal EXER
+Value Integer ANA
+
+  If clalev([F:BAL])=0  : Local File BALANCE  [BAL]  : Endif
+  If clalev([F:BLA])=0  : Local File BALANA   [BLA]  : Endif
+  If clalev([F:BLQ])=0  : Local File BLAQTY   [BLQ]  : Endif
+  Local Integer IREF , REFER
+  REFER = TYPREF
+  Call DEBTRANS From GLOCK
+  Gosub TR_ANNUL2
+  For IREF=1 To NBAUTO
+    REFER = REFAUTO(IREF)
+    Call DEBTRANS From GLOCK
+    Gosub TR_ANNUL2
+  Next IREF
+
+End
+
+$TR_ANNUL2
+
+  GOK = 1
+  Trbegin [BAL] , [BLA] , [BLQ]
+  Update [BAL] Where LEDTYP=REFER & CPY=SOC & FIY=EXER
+&                 & (DEB(0)<>0 or CDT(0)<>0 or DEBLED(0)<>0 or CDTLED(0)<>0)
+&             With  CDT(0) = 0 , DEB(0) = 0 , DEBLED(0) = 0 , CDTLED(0) = 0
+  If fstat
+    GOK = 0 : Call FSTA("BAL") From GLOCK : Goto AB_TR_ANNUL2
+  Endif
+  If ANA
+    Update [BLA] Where LEDTYP=REFER & CPY=SOC & FIY=EXER
+&                  & (DEB(0)<>0 or CDT(0)<>0 or DEBLED(0)<>0 or CDTLED(0)<>0)
+&              With  CDT(0) = 0 , DEB(0) = 0 , DEBLED(0) = 0 , CDTLED(0) = 0
+    If fstat
+      GOK = 0 : Call FSTA("BLA") From GLOCK : Goto AB_TR_ANNUL2
+    Endif
+    Update [BLQ] Where LEDTYP=REFER & CPY=SOC & FIY=EXER & QTY(0)<>0
+&              With  QTY(0) = 0
+    If fstat
+      GOK = 0 : Call FSTA("BLQ") From GLOCK : Goto AB_TR_ANNUL2
+    Endif
+  Endif
+  Commit
+
+Return
+
+$AB_TR_ANNUL2
+  Rollback
+Return
+
+#########################################################################
+# On met dans un tableau les devises réellement utilisées
+#########################################################################
+$CALNBDEV
+
+  NBDEV = 0
+  Filter [BAL] Where LEDTYP=REFER & CPY=SOC & FIY=EXER Order By Key CLE=CUR
+  For [BAL]CLE(1)
+    NBDEV += 1
+    TDEVISE(NBDEV) = [F:BAL]CUR
+  Next
+  Filter [BAL]
+  If !find(DEVSOC,TDEVISE(1..NBDEV))
+    NBDEV += 1
+    TDEVISE(NBDEV) = DEVSOC
+  Endif
+
+Return
+
+#########################################################################
+# Clôture de l'exercice
+#########################################################################
+$CLOEXE
+
+  Call CLOTURE(SOC,REFER,EXER)
+  If GOK<1 : Return : Endif
+## Les exercices des référentiels n'existent pas, ce sont les mêmes que le réf principal
+#For IAUTO=1 To NBAUTO
+# Call CLOTURE(SOC,REFAUTO(IAUTO),EXER)
+# If GOK<1 : Break : Endif
+#Next IAUTO
+
+Return
+
+Subprog CLOTURE(SOC,REFER,EXER)
+Value Char    SOC
+Value Integer REFER
+Value Integer EXER
+
+  Read [FIY]FIY0 = SOC;REFER;EXER
+  If fstat
+    GOK = 0 : Call RSTA("FIY",SOC-num$(REFER)-num$(EXER)) From GLOCK : End
+  Else
+    [F:FIY]FIYSTA = 3
+    [F:FIY]CLODAT = date$
+    Rewrite [FIY]
+    If fstat
+      GOK = 0 : Call FSTA("FIY") From GLOCK : End
+    Endif
+    Call FIYAUT(SOC,REFER,EXER,GOK) From SUBFIY
+    If !GOK : End : Endif
+  Endif
+
+End
+

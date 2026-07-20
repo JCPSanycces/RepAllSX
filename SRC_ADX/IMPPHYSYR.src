@@ -1,0 +1,259 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ Import des éléments physiques
+#
+#*********************************************************************
+#
+#           SYRCUSE PHYSICAL ASSET IMPORT PROCESS
+#
+#*********************************************************************
+# Creation
+# GLE   22.05.2014
+#
+#*********************************************************************
+# Updates
+#
+# XXXXX DD.MM.YYYY FQ000000   : XXX
+#
+#*********************************************************************
+#TODO: Make a method on C_PHYELT class to issue a physical element with 2 parameters (ISSDAT and ISSTYP)
+
+$ACTION
+  Case ACTION
+    When "IMP_OUVRE"     : Gosub IMP_OUVRE
+    When "AP_IMPORT"     : Gosub AP_IMPORT
+    When "IMP_FERME"     : Gosub IMP_FERME
+    When "IMP_VERIF_CRE" : Gosub IMP_VERIF_CRE
+    When "IMP_VERIF_MOD" : Gosub IMP_VERIF_MOD # ==> Non appelé car Mise à jour non autorisé !
+    When Default
+  Endcase
+Return
+
+####################################################################
+# At the beginning of import process
+####################################################################
+$IMP_OUVRE
+  Local Integer CRELOC    : # Automatic creation of the location and the building
+  Local Integer CREBPR    : # Automatic creation of the supplier
+  Local Integer RET       : # To store return value to method calls
+
+  Local Date    S_ISSDAT  : # Issue date if handled by the Physical Asset
+  Local Integer S_ISSTYP  : # Issue type if handled by the Physical Asset
+
+  Local Char OTHERPHY(GLONPHY)  : # Reference of other physical element found
+  Local Tinyint B_BAC_UNIQUE
+
+  # Core data tables opening
+  If !clalev([F:BPR]) : Local File BPARTNER  [BPR] : Endif : # Supplier table
+
+  # Core data automatic creation parameters
+  Local Char LPARM(255)
+  Call PARAM("","CRELOC",LPARM) From ADOVAL : # Location
+  CRELOC = val(LPARM)
+  Call PARAM("","CREBPR",LPARM) From ADOVAL : # Supplier
+  CREBPR = val(LPARM)
+
+  Local Instance PHY Using C_PHYELT
+
+  # Set ANOWRITE to 1 to avoid creation/update by the Supervisor import process
+  ANOWRITE = 1
+Return
+
+####################################################################
+# After each line reading
+####################################################################
+$AP_IMPORT
+  # In the TEST mode ther's nothing to do
+  If ([M:IMP2]TEST=[V]CST_AYES) : Return : Endif
+
+  #Call ECR_TRACE(mess(143,141,1)-[F:PHY]PHYREF-[F:PHY]PHYDES1,0) From GESECRAN
+
+  S_ISSDAT = [0/0/0]
+  S_ISSTYP = [V]CST_PDNOTISS
+
+  #--------------------------------------------
+  # Core data automatic creation (if asked for)
+  #--------------------------------------------
+
+  # Supplier
+  If CREBPR = G_OUI and GIMP(7) <> ""
+    #Call CRE_BPR([F:PHY]BPS, GIMP(7)) From GLOFUNCIMP
+    Call CRE_BPS([F:PHY]BPS, GIMP(7)) From GLOFUNCIMP
+  Endif
+
+  # Building
+  If CRELOC = G_OUI and GIMP(1) <> ""
+    Call CRE_BUI(GIMP(1), GIMP(2)) From GLOFUNCIMP
+  Endif
+
+  # Location
+  If CRELOC = G_OUI and [F:PHY]LCTCOD <> ""
+    Call CRE_LCT([F:PHY]LCTCOD, GIMP(2), GIMP(1), [F:PHY]FCY, GIMP(3)) From GLOFUNCIMP
+  Endif
+Return
+
+####################################################################
+# Before the creation transaction
+####################################################################
+$IMP_VERIF_CRE
+
+  #--------------------------------------------
+  # Physical asset creation
+  #--------------------------------------------
+  PHY = NewInstance C_PHYELT AllocGroup null
+
+  Gosub SET_PROPERTIES_CREATE
+
+  Trbegin [F:PHY]
+  [L]RET = fmet PHY.AINSERT()
+
+  # Executing the issue if an issue date OR an issue reason if given
+  #   Remark : because a blank value or a 0 value in a local menu is transformed by 1 by
+  #   the Supervisor, the issue reason is tested greater than "not issued" ([V]CST_PDNOTISS value 1)
+  If ([L]RET = [V]CST_AOK) and ((S_ISSDAT <> [0/0/0]) or (S_ISSTYP > [V]CST_PDNOTISS))
+    If (func IMPPHYSYR._ISSUE_PHYELT(PHY, S_ISSDAT, S_ISSTYP) < [V]CST_AERROR)
+      PHY.PHYISS = [V]CST_ATRUE : # to cancel AUPDATE_CONTROL_BEFORE controls on ISSDAT and ISSTYP
+      [L]RET = fmet PHY.AUPDATE()
+      If ([L]RET = [V]CST_AOK)
+        Call ECR_TRACE(func ASYRFNC.MES1(mess(170,GML_MSGPHY,1),PHY.PHYREF),0) From GESECRAN
+      Endif
+    Endif
+  Endif
+
+  If (fmet PHY.AGETMAXERROR("") >= [V]CST_AERROR)
+    Rollback
+    Call WRITE_ERROR_STACK_CLASSIC(PHY, [V]CST_AERROR) From FXDFCT_SYRA
+    # Must set OK to zero in case of error. If not a success message is added to the log.
+    OK = 0
+  Else
+    Commit
+    Call ECR_TRACE(mess(218,GML_MSGCIG,1)-PHY.PHYREF-PHY.PHYDES1,0) From GESECRAN
+  Endif
+
+  # Free the PHYELT class
+  FreeGroup PHY
+Return
+
+####################################################################
+# Before the update transaction
+####################################################################
+$IMP_VERIF_MOD
+  #--------------------------------------------
+  # Physical asset update
+  #--------------------------------------------
+  PHY = NewInstance C_PHYELT AllocGroup null
+
+  [L]RET = fmet PHY.AREAD([F:PHY]PHYREF)
+  If ([L]RET >= [V]CST_AERROR)
+    Call WRITE_ERROR_STACK_CLASSIC(PHY, [V]CST_AERROR) From FXDFCT_SYRA
+    # Must set OK to zero in case of error. If not a success message is added to the log.
+    OK = 0
+    FreeGroup PHY
+    Return
+  Endif
+
+  Gosub SET_PROPERTIES_UPDATE
+
+  Trbegin [F:PHY]
+
+  [L]RET = fmet PHY.AUPDATE()
+
+  If ([L]RET >= [V]CST_AERROR)
+    Rollback
+    Call WRITE_ERROR_STACK_CLASSIC(PHY, [V]CST_AERROR) From FXDFCT_SYRA
+    # Must set OK to zero in case of error. If not a success message is added to the log.
+    OK = 0
+  Else
+    Commit
+    Call ECR_TRACE(mess(217,GML_MSGCIG,1)-PHY.PHYREF-PHY.PHYDES1,0) From GESECRAN
+  Endif
+
+  # Free the PHYELT class
+  FreeGroup PHY
+Return
+
+####################################################################
+# At the end of import process
+####################################################################
+$IMP_FERME
+  # Core data tables closure
+  If clalev([F:BPR]) : Close Local File [BPR]  : Endif
+Return
+
+####################################################################
+# Assign value to the class property when creating
+####################################################################
+$SET_PROPERTIES_CREATE
+  #Call ECR_TRACE("Set Instance",0) From GESECRAN
+  SetInstance PHY With [F:PHY]
+  PHY.CREORI = [V]CST_COIMPOR
+
+  #--------------------------------------------
+  # Issue management. Saving issue parameter to call the Issuing method after the creation
+  #--------------------------------------------
+  S_ISSDAT = PHY.ISSDAT
+  S_ISSTYP = PHY.ISSTYP
+  PHY.ISSDAT = [0/0/0]
+  PHY.ISSTYP = [V]CST_PDNOTISS
+Return
+
+####################################################################
+# Assign value to the class property from the F class
+# according the imported fields list when updating
+####################################################################
+$SET_PROPERTIES_UPDATE
+  Local Integer N_I, IS_NULL
+
+  For N_I = 0 To [M:AOE2]NBRLIG-1
+    If (left$([M:AOE2]FLD(N_I),1)<>"*") and (evalue("dim(PHY."+[M:AOE2]FLD(N_I)+")>-1")) and (evalue("dim([F:PHY]"+[M:AOE2]FLD(N_I)+")>-1"))
+      IS_NULL = 0
+      Case evalue("type([F:PHY]"+[M:AOE2]FLD(N_I)+")")
+        When 1, 2, 4, 5, 6, 7, 9
+          If evalue("[F:PHY]"+[M:AOE2]FLD(N_I)) = 0
+           IS_NULL = 1
+          Endif
+        When 3
+          If evalue("[F:PHY]"+[M:AOE2]FLD(N_I)) = [0/0/0]
+           IS_NULL = 1
+          Endif
+        When Default
+          If evalue("[F:PHY]"+[M:AOE2]FLD(N_I)) = ""
+           IS_NULL = 1
+          Endif
+      Endcase
+
+      # Null values are not imported
+      If !IS_NULL
+        Assign "PHY."+[M:AOE2]FLD(N_I) With evalue("[F:PHY]"+[M:AOE2]FLD(N_I))
+      Endif
+    Endif
+  Next
+Return
+
+#**
+#* Issue a Physical Asset
+#*
+#* @param P_PHY    : an instance of a Physical Asset
+#* @param P_ISSDAT : issue date
+#* @param P_ISSTYP : issue type
+#* @return AGETMAXERROR error
+#*!
+Funprog _ISSUE_PHYELT(P_PHY, P_ISSDAT, P_ISSTYP)
+Variable Instance P_PHY  Using OBJECT
+Value Date        P_ISSDAT
+Value Integer     P_ISSTYP
+
+  Local Integer RET
+
+  # PHYELTISS Data Class
+  Local Instance PARAM Using C_PHYELTISS
+  PARAM = NewInstance C_PHYELTISS AllocGroup null
+
+  PARAM.FASFLG = [V]CST_ANO
+  PARAM.ISSDAT = P_ISSDAT
+  PARAM.ISSTYP = P_ISSTYP
+
+  [L]RET = fmet P_PHY._PHYELT_ISSUE(PARAM)
+
+  # Free the PARAM class
+  FreeGroup PARAM
+End fmet P_PHY.AGETMAXERROR("")
+

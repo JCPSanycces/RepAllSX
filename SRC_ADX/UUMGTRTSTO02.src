@@ -1,0 +1,553 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+##########################################################################
+# UUMGTRTSTO02   Migration des coûts standards               Module STO   #
+##########################################################################
+#
+##########################################################################
+
+Local Char DOSSIER(30) : DOSSIER = nomap
+If !GSERVEUR
+  #--- Issue 108760 by TS
+  #Call SAIDOS(DOSSIER,"") From SAIDOS
+  Call SAIDOSHIS(DOSSIER,"") From SAIDOSHIS
+  #---
+Endif
+If DOSSIER <> ""
+  If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+  #--- Issue 108760 By TS
+  #Read [ADS] DOSSIER=[L]DOSSIER : If fstat Raz [F:ADS] : Endif
+  If func DOSSUB.FILL_ADS([L]DOSSIER)=0 : End : Endif
+  #---
+  #Call ACTIVE From TIMING
+  If !GSERVEUR
+    Call TEMPON("O") From GESECRAN
+    Call OUVRE_TRACE("UUMGTRTSTO02") From LECFIC
+  Endif
+
+  #Call RAZ_UUMGTRTSTO02(DOSSIER)
+  Call MAJ_UUMGTRTSTO02(DOSSIER)
+
+  If !GSERVEUR
+    Call TEMPOFF     From GESECRAN
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+  Endif
+  #Call ARRET From TIMING
+Endif
+End
+
+Subprog MAJ_UUMGTRTSTO02(DOSSIER)
+Value Char DOSSIER
+
+Local Integer ERR
+# Issue 86679 - 2012-12-19 by CCC : Permettre par PE de ne pas perdre les std actualisés en doublon
+Local Integer LICAFLT : LICAFLT = 1
+
+If [F:ADS]MODULE(6)<>2 : : # 6=Stock
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO02",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+#--- Issue 108760 by TS
+#adxftl=10
+#adxwrb=10
+#NEWMOTEUR=1
+#---
+
+Gosub OUVRE_STO From UUMGTRTSTO00
+Gosub INIT_TBO From UUMGTRTSTO00
+Gosub INIT_FIY From UUMGTRTSTO00
+
+#----- Présence des fichiers renommés...  -----#
+Local Char    WITCNAMORI(GLONATB),WICNNAMORI(GLONATB)
+Call MIGTABNAME([F:ADS]DOSSIER, "ITMCOST", WITCNAMORI, ERR) From TRTMIG
+Call MIGTABNAME([F:ADS]DOSSIER, "ITCNAT",  WICNNAMORI, ERR) From TRTMIG
+If ERR
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO02",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+If filinfo(filpath("FIL",WITCNAMORI,"fde",[F:ADS]DOSSIER),0) < 0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO02",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+If filinfo(filpath("FIL",WICNNAMORI,"fde",[F:ADS]DOSSIER),0) < 0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO02",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+##2 - Traitements en cours
+####################
+
+Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO02",2,ERR) From TRTMIG : #2=En cours
+
+Call ECR_TIME("UUMGTRTSTO02 Stock Process : Update ITMCOST") From DOSSUB
+Call ECR_TRACE("UUMGTRTSTO02 : Process Start on : "+DOSSIER,0) From GESECRAN
+
+#----- Modification des fichiers où on va inserer -----#
+Gosub MIG_OUVRE From TRTMIG
+Call MIGTABINIT (DOSSIER,"ITMCOST",ERR) From TRTMIG
+Call MIGTABINIT (DOSSIER,"ITCNAT",ERR) From TRTMIG
+
+#----- Ouverture des fichiers -----#
+If clalev([F:ITC])  = 0 : Local File =DOSSIER+".ITMCOST"   [ITC]  : Endif   # Fichier X3 "Vide"
+If clalev([F:ITC2]) = 0 : Local File =DOSSIER+".ITMCOST"   [ITC2] : Endif   # Fichier X3 "Vide"
+If clalev([F:ICN])  = 0 : Local File =DOSSIER+".ITCNAT"    [ICN]  : Endif   # Fichier X3 "Vide"
+
+If clalev([F:ITCM]) = 0 : Local File =DOSSIER+"."+WITCNAMORI   [ITCM] : Endif   # Fichier X3 renommé Avant Migration
+If clalev([F:ICNM]) = 0 : Local File =DOSSIER+"."+WICNNAMORI   [ICNM] : Endif   # Fichier X3 renommé Avant Migration
+
+# Autres fichiers nécessaires
+If clalev([F:FCY]) = 0 : Local File =DOSSIER+".FACILITY"   [FCY] : Endif
+If clalev([F:FIY]) = 0 : Local File =DOSSIER+".FISCALYEAR" [FIY] : Endif
+
+#-----  Déclaration des variables -----#
+# Déclaration des variables pour gérer les ruptures (évite les snapshot too old)
+Local Integer STOP, NB, ISVALID, NBCOMMIT, NBLUS
+Local Char CRITERE(250),CRITERESPE(250), HINTSPE(30)
+Local Integer NBMIGKEY : NBMIGKEY=7 # STOFCY,ITMREF,CSTTYP,YEA,CSTSEQ,STOP,LITCSEQ
+Local Char TABMIGKEY(30)(1..NBMIGKEY)
+Local Integer FILTRELIN
+
+Local Date    WEXEDATSTR, WEXEDATEND
+Local Date    LSTR, LEND
+Local Integer LITCSEQ, LITCSEQMAX, LFIY
+
+# pour les WriteB des tables détails
+Local Char WTAB_ITC (100) (adxwrb)
+Local Shortint WCPT_ITC
+Local Char WTAB_ICN (100) (adxwrb)
+Local Shortint WCPT_ICN
+
+Raz STOP, CRITERE, NBCOMMIT, NBLUS
+
+#-----  Lecture des clés -----#
+# Read de la table AMIGKEY "index migration" pour alimenter ACLE1/ACLE2/ACLE3/STOP
+Call MIGGETKEY (DOSSIER,"UUMGTRTSTO02",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT,ERR) From TRTMIG
+STOP=val(TABMIGKEY(6))
+LITCSEQ = val(TABMIGKEY(7))
+
+#-----  Lien des tables Coût standard & natures FG -----#
+Link [ITCM] With [ICNM]ICN0(5)=[F:ITCM]STOFCY;[F:ITCM]ITMREF;[F:ITCM]CSTTYP;[F:ITCM]YEA;[F:ITCM]CSTSEQ
+&    As [LNK]
+&    Order By Key CLE = [F:ITCM]STOFCY Desc;[F:ITCM]ITMREF Desc;[F:ITCM]CSTTYP Desc;[F:ITCM]YEA Desc;[F:ITCM]CSTSEQ Desc
+
+# PE pour ajout clause where
+FLUX="UUMGTRTSTO02" : FILTRELIN=0 : Raz HINTSPE : Raz CRITERESPE : Gosub PE_CRITSEL From TRTMIG
+If CRITERESPE="" : CRITERESPE="1=1" : Endif
+
+Call DEBTRANS From GLOCK
+Gosub SET_FIRST From TRTFIRST
+
+Gosub PART_INIT_SEQMAX
+
+$LOOP_STO02
+Raz NB
+If STOP = 1
+ STOP = 2
+ CRITERE = "[F:ITCM]STOFCY='"+TABMIGKEY(1)+"' & [F:ITCM]ITMREF='"+TABMIGKEY(2)+"' & [F:ITCM]CSTTYP="+TABMIGKEY(3)+" & [F:ITCM]YEA="+TABMIGKEY(4)+" & [F:ITCM]CSTSEQ<"+TABMIGKEY(5)
+Elsif STOP=2
+ STOP = 3
+ CRITERE = "[F:ITCM]STOFCY='"+TABMIGKEY(1)+"' & [F:ITCM]ITMREF='"+TABMIGKEY(2)+"' & [F:ITCM]CSTTYP="+TABMIGKEY(3)+" & [F:ITCM]YEA<"+TABMIGKEY(4)
+Elsif STOP=3
+ STOP = 4
+ CRITERE = "[F:ITCM]STOFCY='"+TABMIGKEY(1)+"' & [F:ITCM]ITMREF='"+TABMIGKEY(2)+"' & [F:ITCM]CSTTYP<"+TABMIGKEY(3)
+Elsif STOP=4
+ STOP = 5
+ CRITERE = "[F:ITCM]STOFCY='"+TABMIGKEY(1)+"' & [F:ITCM]ITMREF<'"+TABMIGKEY(2)+"'"
+Elsif STOP=5
+ STOP = 0
+ CRITERE = "[F:ITCM]STOFCY<'"+TABMIGKEY(1)+"'"
+Else
+ CRITERE = "1=1"
+Endif
+
+Trbegin [ITC],[ICN]
+GOK = 1
+
+Gosub PART_CLE3
+
+$FIN_BOUCLE
+If GOK<1
+  Rollback
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO02",7,ERR) From TRTMIG : #7=Erreur
+Else
+  #--- Issue 108760 by TS
+  #If NEWMOTEUR & adxwrb>1
+  #---
+    Flush [F:ITC]
+    If fstat
+        Call ECR_TRACE("File ITMCOST(flush itc), Error ="-num$(fstat),1) From GESECRAN
+        Gosub ITC_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+    Flush [F:ICN]
+    If fstat
+        Call ECR_TRACE("File ITCNAT(flush icn), Error ="-num$(fstat),1) From GESECRAN
+        Gosub ICN_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+  #--- Issue 108760 by TS
+  #Endif
+  #---
+  # Stocker les valeurs de ACLE1/ACLE2/ACLE3/STOP dans la table AMIGKEY.
+  If STOP
+    TABMIGKEY(6)=num$(STOP)
+  Else
+    Raz TABMIGKEY
+  Endif
+  Call MIGSTKKEY (DOSSIER,"UUMGTRTSTO02",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT+NB,ERR) From TRTMIG
+  If ERR
+   GOK=-1 : Goto FIN_BOUCLE
+  Endif
+  NBCOMMIT+=NB
+  Commit
+  Call MIGSTKPROGRESS (DOSSIER,"UUMGTRTSTO02",STOP,ERR) From TRTMIG
+  If STOP
+    Goto LOOP_STO02
+  Endif
+Endif
+
+Gosub UNSET_FIRST From TRTFIRST
+
+Close Local File [ITC], [ICN]
+Close Local File [ITCM], [ITC2], [ICNM]
+#----- Remise en état des fichiers où on a inseré -----#
+Call MIGTABEND (DOSSIER,"ITMCOST",ERR) From TRTMIG
+Call MIGTABEND (DOSSIER,"ITCNAT",ERR) From TRTMIG
+Call MIGTRTEND (DOSSIER,"UUMGTRTSTO02") From TRTMIG
+Call ECR_TIME("UUMGTRTSTO02 : "+num$(NBLUS)+" records read,"-num$(NBCOMMIT)+" records processed") From DOSSUB
+End
+
+$PART_INIT_SEQMAX
+LITCSEQMAX=1
+Local Char REQ(250)
+REQ="SELECT MAX(n) FROM (SELECT COUNT(*) n FROM "+DOSSIER+"."+WITCNAMORI+" GROUP BY STOFCY_0, ITMREF_0, CSTTYP_0) a"
+For (Integer NB) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+    LITCSEQMAX = [SQLX]NB
+Next
+Return
+
+$PART_CLE3
+For [LNK]CLE(3) Hint Key=HINTSPE Where evalue(CRITERE) & evalue(CRITERESPE)
+
+    #Call ECR_TRACE("time="+num$(time)+"; File ITMCOST(STOFCY/ITMREF/CSTTYP)"-[F:ITCM]STOFCY-'/'-[F:ITCM]ITMREF-'/'-num$([F:ITCM]CSTTYP),0) From GESECRAN
+
+# Issue 86316 - 2012-11-28 by CCC : A chaque changement de triplet on repart de LITCSEQMAX
+#    If LITCSEQ=0
+#        Raz REQ
+#        REQ = "SELECT min(ITCSEQ_0) From "+DOSSIER+".ITMCOST Where ITMREF_0 = '"+[F:ITCM]ITMREF+"' and STOFCY_0 = '"+[F:ITCM]STOFCY+"' and CSTTYP_0="+num$([F:ITCM]CSTTYP)
+#        For (Integer SEQ)From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+#            LITCSEQ = [F:SQLX]SEQ-1
+#        Next
+#    Endif
+#    If LITCSEQ<=0
+#        LITCSEQ=LITCSEQMAX   # Remise à 1 pour chaque nouveau site/article/type de coût
+#    Endif
+    If [F:ITCM]STOFCY<>TABMIGKEY(1) | [F:ITCM]ITMREF<>TABMIGKEY(2) | num$([F:ITCM]CSTTYP)<>TABMIGKEY(3)
+        LITCSEQ=LITCSEQMAX
+    Endif
+
+    Gosub PART_CLE5
+    If STOP=1
+        Break
+    Endif
+Next
+Return
+
+
+$PART_CLE5
+    For [LNK]CLE(5)
+        NBLUS+=1
+
+        #Call ECRTRACE("File ITMCOST(STOFCY/ITMREF/CSTTYP/YEA/CSTSEQ)"-[F:ITCM]STOFCY-'/'-[F:ITCM]ITMREF
+#&        -'/'-num$([F:ITCM]CSTTYP)-'/'-num$([F:ITCM]YEA)-'/'-num$([F:ITCM]CSTSEQ),0) From UUMGTRTSTO00
+
+        ISVALID=1
+        Gosub TEST_RECUP_ITC  # Peut renvoyer ISVALID=0
+
+        # PE pour exclure ligne
+        If FILTRELIN
+            FLUX="UUMGTRTSTO02" : Gosub PE_VERIFSEL From TRTMIG
+        Endif
+
+        If ISVALID=0
+             Goto SUITE_BOUCLE
+        Endif
+
+
+        Gosub PART_CLE5_TRANS
+        #Appel proc de migration sur entete
+        Gosub MAJ30_ITC
+
+
+        ############################
+        #-- Boucle sur les lignes
+        ############################
+        Gosub PART_ICN
+
+        If GOK<1 : Break : Endif
+
+        # --- alimentation des champs et écriture enreg
+        # --- alimentation des champs et écriture enreg
+        Gosub WRITE_ITC
+
+        Call ECRTRACE("File ITMCOST(STOFCY/ITMREF/CSTTYP/YEA/CSTSEQ)"
+&                    -[F:ITC]STOFCY-'/'-[F:ITC]ITMREF-'/'-num$([F:ITC]CSTTYP)-'/'-num$([F:ITC]YEA)
+&                    -'/'-num$([F:ITC]CSTSEQ)-'-->'-num$([F:ITC]ITCSEQ)-num$([F:ITC]ITCSTRDAT)
+&                    -num$([F:ITC]ITCENDDAT)-num$([F:ITC]BOMALTTYP),0) From UUMGTRTSTO00
+        If fstat
+          #--- Issue 108760 by TS
+          #If NEWMOTEUR & adxwrb>1
+          #  Call ECR_TRACE("File ITMCOST (write itc), Error ="-num$(fstat),1) From GESECRAN
+          #  Gosub ITC_ERRTRA : # pour afficher les ref
+          #Else
+          #  Call ECR_TRACE("File ITMCOST(STOFCY/ITMREF/CSTTYP/YEA/CSTSEQ)"
+#&                         -[F:ITC]STOFCY-'/'-[F:ITC]ITMREF-'/'-num$([F:ITC]CSTTYP)-'/'-num$([F:ITC]YEA)
+#&                         -'/'-num$([F:ITC]CSTSEQ)+", Error ="-num$(fstat)-"(write itc)",1) From GESECRAN
+          #Endif
+          Call ECR_TRACE("File ITMCOST (write itc), Error ="-num$(fstat),1) From GESECRAN
+          Gosub ITC_ERRTRA : # pour afficher les ref
+          #---
+          GOK=0 : Break
+        Endif
+
+        If [F:ITC]CSTTYP=2
+            [F:ITC2]STOFCY=[F:ITC]STOFCY
+            [F:ITC2]ITMREF=[F:ITC]ITMREF
+            [F:ITC2]CSTTYP=[F:ITC]CSTTYP
+            [F:ITC2]YEA   =[F:ITC]YEA
+            [F:ITC2]CSTSEQ=[F:ITC]CSTSEQ
+            [F:ITC2]ITCDAT=[F:ITC]ITCDAT
+        Endif
+
+        NB+=1
+        If NB>GMAXUPDTRS
+          TABMIGKEY(1) = [F:ITCM]STOFCY
+          TABMIGKEY(2) = [F:ITCM]ITMREF
+          TABMIGKEY(3) = num$([F:ITCM]CSTTYP)
+          TABMIGKEY(4) = num$([F:ITCM]YEA)
+          TABMIGKEY(5) = num$([F:ITCM]CSTSEQ)
+          TABMIGKEY(7) = num$(LITCSEQ)
+          STOP=1
+          Call ECR_TRACE("nb="+num$(NB)-";time="+num$(time)
+&                       +"; File ITMCOST(STOFCY/ITMREF/CSTTYP/YEA/CSTSEQ)"-[F:ITCM]STOFCY-'/'-[F:ITCM]ITMREF-'/'
+&                       -num$([F:ITCM]CSTTYP)-'/'-num$([F:ITCM]YEA)-'/'-num$([F:ITCM]CSTSEQ),0) From GESECRAN
+          Break
+        Endif
+        $SUITE_BOUCLE
+    Next
+Return
+
+
+
+
+$PART_CLE5_TRANS
+        Raz [F:ITC]     # Issue 91893 - 2013-08-20 by CCC
+        [F:ITC] = [F:ITCM]
+Return
+
+$WRITE_ITC
+        #--- Issue 108760 by TS
+        #If NEWMOTEUR
+        #    Gosub ITC_STK : # pour stocker ref
+        #    WriteB [F:ITC]
+        #Else
+        #    Write [F:ITC]
+        #Endif
+        Gosub ITC_STK : # pour stocker ref
+        WriteB [F:ITC]
+        #---
+Return
+
+$PART_ICN
+        For [LNK]CLE
+            If [F:ICNM]OVENAT=""    # S'il n'y a pas de natures de FG on n'a rien à faire dans cette boucle
+                Break
+            Endif
+#            Call ECRTRACE("File ITCNAT(STOFCY/ITMREF/CSTTYP/YEA/CSTSEQ/OVENAT)"-[F:ICNM]STOFCY-'/'
+#&                         -[F:ICNM]ITMREF-'/'-num$([F:ICNM]CSTTYP)-'/'-num$([F:ICNM]YEA)-'/'
+#&                         -num$([F:ICNM]CSTSEQ)-'/'-[F:ICNM]OVENAT,0) From UUMGTRTSTO00
+            #rupture par nature de FG
+            Raz [F:ICN]     # Issue 91893 - 2013-08-20 by CCC
+            [F:ICN] = [F:ICNM]
+
+            [F:ICN]ITCSEQ = [F:ITC]ITCSEQ
+
+Gosub WRITE_ICN
+            If fstat
+                #--- Issue 108760 by TS
+                #If NEWMOTEUR & adxwrb>1
+                #    Call ECR_TRACE("File ITCNAT(write icn), Error ="-num$(fstat),1) From GESECRAN
+                #    Gosub ICN_ERRTRA : # pour afficher les ref
+                #Else
+                #    Call ECR_TRACE("File ITCNAT(STOFCY/ITMREF/CSTTYP/YEA/CSTSEQ/OVENAT)"
+#&                                 -[F:ICN]STOFCY-'/'-[F:ICN]ITMREF-'/'-num$([F:ICN]CSTTYP)
+#&                                 -'/'-num$([F:ICN]YEA)-'/'-num$([F:ICN]CSTSEQ)-'/'-[F:ICN]OVENAT
+#&                                 +", Error ="-num$(fstat)-"(write icn)",1) From GESECRAN
+                #Endif
+                Call ECR_TRACE("File ITCNAT(write icn), Error ="-num$(fstat),1) From GESECRAN
+                Gosub ICN_ERRTRA : # pour afficher les ref
+                #---
+                GOK=0 : Break
+            Endif
+        Next
+Return
+
+$WRITE_ICN
+            #--- Issue 108760 by TS
+            #If NEWMOTEUR
+            #    Gosub ICN_STK : # pour stocker ref
+            #    WriteB [ICN]
+            #Else
+            #    Write [ICN]
+            #Endif
+            Gosub ICN_STK : # pour stocker ref
+            WriteB [ICN]
+            #---
+Return
+
+##############################################################################################
+$TEST_RECUP_ITC
+    If [F:FCY]FCY <> [F:ITCM]STOFCY
+        Read [FCY]FCY0=[F:ITCM]STOFCY
+    Endif
+
+    If WCPY<>[F:FCY]LEGCPY
+        WI = find([F:FCY]LEGCPY,WTABCPY)-1
+        WINDSTR = WINDYEA(WI,0)
+        WINDEND = WINDYEA(WI,1)
+    Endif
+    If WYEA<>[F:ITCM]YEA | WCPY<>[F:FCY]LEGCPY | WYEA=0 | WCPY=""
+        WCPY=[F:FCY]LEGCPY
+        WYEA=[F:ITCM]YEA
+        GBIDI1=find([F:ITCM]YEA,WTABYEA(WINDSTR..WINDEND)) - 1
+        If GBIDI1>=0
+            WEXEDATSTR = WDATEXE(GBIDI1+WINDSTR,0)
+            WEXEDATEND = WDATEXE(GBIDI1+WINDSTR,1)
+            LFIY = WTABFIY(GBIDI1+WINDSTR)
+        Else
+            Raz WEXEDATSTR, WEXEDATEND, WYEA    # Issue 80886 - 2012-03-21 by CCC : raz WYEA pour forcer le recalcul de WEXEDATxxx
+            # Si l'année du coût n'appartient pas à un exercice on ne le récupère pas
+            ISVALID=0
+            Return
+        Endif
+    Endif
+
+    LSTR=WEXEDATSTR
+    LEND=WEXEDATEND
+
+    # Issue 86679 - 2012-12-19 by CCC : Permettre par PE de ne pas perdre les std actualisés en doublon
+    If [F:ITCM]CSTTYP=2 & LICAFLT=1
+        Gosub PART_VERF_ITCA
+        If !ISVALID : Return : Endif
+    Endif
+
+    If find([F:ITCM]CSTTYP,2,4) & LSTR<[F:ITCM]ITCDAT & [F:ITCM]ITCDAT<LEND
+        LSTR = [F:ITCM]ITCDAT
+    Endif
+    If dim([F:ITCM]ITCENDDAT)>0 & [F:ITCM]ITCENDDAT>LSTR
+        LEND = [F:ITCM]ITCENDDAT
+    Else
+        LEND = max(LSTR,LEND)
+    Endif
+Return
+
+$PART_VERF_ITCA
+        # S'il existe un coût avec CSTSEQ plus grand et avec la même date de calcul
+        # ce n'est pas la peine de récupérer celui en cours
+        If [F:ITC2]STOFCY=[F:ITCM]STOFCY
+&        & [F:ITC2]ITMREF=[F:ITCM]ITMREF
+&        & [F:ITC2]CSTTYP=[F:ITCM]CSTTYP
+&        & ( [F:ITC2]YEA   >[F:ITCM]YEA
+&          | [F:ITC2]YEA   =[F:ITCM]YEA
+&          & [F:ITC2]CSTSEQ>[F:ITCM]CSTSEQ )
+            If [F:ITCM]ITCDAT=[F:ITC2]ITCDAT
+                ISVALID=0
+                Return
+            Elsif [F:ITCM]ITCDAT<[F:ITC2]ITCDAT
+                LEND = [F:ITC2]ITCDAT-1
+            Else
+                LEND = addmonth(LEND,12)
+            Endif
+        Endif
+Return
+
+##############################################################################################
+$MAJ30_ITC
+    [F:ITC]ITCSTRDAT = LSTR
+    [F:ITC]ITCENDDAT = LEND
+    [F:ITC]SCOCST = [F:ITC]SCOTOT
+    If [F:ITC]BOMALT>0
+        [F:ITC]BOMALTTYP = WBOMALTTYP([F:ITC]BOMALT)
+    Endif
+    [F:ITC]ITCSEQ = LITCSEQ
+    LITCSEQ-=1
+    If find([F:ITC]CSTTYP,1,3)
+# Issue 86316 - 2012-11-27 by CCC
+#        [F:ITC]FIYNUM = [F:FIY]FIYNUM
+        [F:ITC]FIYNUM = LFIY
+    Endif
+Return
+
+################################################
+$ITC_STK
+Call STK (WTAB_ITC,WCPT_ITC,[F:ITC]STOFCY-'/'-[F:ITC]ITMREF-'/'-num$([F:ITC]CSTTYP)-'/'-num$([F:ITC]YEA)-'/'-num$([F:ITC]CSTSEQ)) From TRTMIG
+Return
+$ICN_STK
+Call STK (WTAB_ICN,WCPT_ICN,[F:ICN]STOFCY-'/'-[F:ICN]ITMREF-'/'-num$([F:ICN]CSTTYP)-'/'-num$([F:ICN]YEA)-'/'-num$([F:ICN]CSTSEQ)-'/'-[F:ICN]OVENAT) From TRTMIG
+Return
+##############################################################################################
+$ITC_ERRTRA
+Call ERRTRA (WTAB_ITC,WCPT_ITC,"File ITMCOST (STOFCY/ITMREF/CSTTYP/YEA/CSTSEQ)=") From TRTMIG
+Return
+$ICN_ERRTRA
+Call ERRTRA (WTAB_ICN,WCPT_ICN,"File ITCNAT (STOFCY/ITMREF/CSTTYP/YEA/CSTSEQ/OVENAT)=") From TRTMIG
+Return
+
+##########################################################################
+Subprog RAZ_UUMGTRTSTO02(DOSSIER)
+Value Char DOSSIER
+
+Local Integer ERR
+#----- Présence des fichiers renommés...  -----#
+Local Char    WITCNAMORI,WICNNAMORI
+Call MIGTABNAME([F:ADS]DOSSIER, "ITMCOST", WITCNAMORI, ERR) From TRTMIG
+Call MIGTABNAME([F:ADS]DOSSIER, "ITCNAT",  WICNNAMORI, ERR) From TRTMIG
+
+If ERR : End : Endif
+
+If filinfo(filpath("FIL",WITCNAMORI,"fde",[F:ADS]DOSSIER),0) < 0 End Endif
+If filinfo(filpath("FIL",WICNNAMORI,"fde",[F:ADS]DOSSIER),0) < 0 End Endif
+
+Call MIGTABRAZ (DOSSIER,"ITMCOST",ERR) From TRTMIG
+Call MIGTABRAZ (DOSSIER,"ITCNAT",ERR) From TRTMIG
+
+Call MIGRAZKEY (DOSSIER,"UUMGTRTSTO02",ERR) From TRTMIG
+
+End
+
+########################################################################
+# Pour exécution automatique  en gestion de patch                      #
+########################################################################
+Subprog PATCH(APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 : End : Endif
+If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+#--- Issue 108760 by TS
+#Read [ADS] DOSSIER=APPLI : If fstat Raz [F:ADS] : Endif
+If func DOSSUB.FILL_ADS(APPLI)=0 : End : Endif
+#---
+Call MAJ_UUMGTRTSTO02(APPLI)
+End
+
+#######################################################################
+# Pour exécution depuis dosmaj (validation dossier)
+########################################################################
+Subprog UTI_MOUL (APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 End : Endif
+
+Call MAJ_UUMGTRTSTO02(APPLI)
+End
+

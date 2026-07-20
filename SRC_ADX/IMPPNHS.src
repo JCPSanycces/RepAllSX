@@ -1,0 +1,798 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$
+###########################################################################
+# IMPPNHS : Import spécifique des retours fournisseurs     MBT 30/11/2006 #
+# ----------------------------------------------------------------------- #
+# L'import des retours fournisseurs est un import spécifique, il permet   #
+# d'importer pour chaque ligne de retour le détail des sorties de stock   #
+# Cet import fonctionne :                                                 #
+#   - en création détaillée d'un retour                                   #
+#   - en suppression totale d'un retour non validé                        #
+# Les modifications d'un retour ne sont pas possibles par l'import !      #
+###########################################################################
+
+
+$ACTION
+If dim(GSTK_TRACE)>0 & GSTK_TRACE=2 & [L]ACTION<>"IMP_ZONE" & [L]ACTION<>"EXP_ZONE"
+  GSTK_ACT=[L]ACTION : GSTK_PGM="IMPPNHS" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+Case [L]ACTION
+  When "IMP_COMPILE"   : Gosub IMP_COMPILE
+  When "IMP_TRTSUP"    : Gosub IMP_TRTSUP
+  When "IMP_ZONE"      : Gosub IMP_ZONE
+  When "AP_IMPORT"     : Gosub AP_IMPORT
+  When "IMP_FERME"     : Gosub IMP_FERME
+  #-----
+  When "EXP_OUVRE"     : Gosub EXP_OUVRE   From IMPPNH
+  When "EXPORT"        : Gosub EXPORT      From IMPPNH
+  When "EXP_ZONE"      : Gosub EXP_ZONE    From IMPPNH
+Endcase
+Return
+
+
+###########################################################################
+#                                 IMPORT                                  #
+###########################################################################
+
+
+#-------------------------------------------------------------------------#
+# Début de la génération du traitement WWIxxxxxx, appelé par le SUBIMPOBJ #
+#-------------------------------------------------------------------------#
+$IMP_COMPILE
+Return
+
+
+#-----------------------------------------------------------------------#
+# Fin de la génération du traitement WWIxxxxxx, appelé par le SUBIMPOBJ #
+#-----------------------------------------------------------------------#
+$IMP_TRTSUP
+Return
+
+
+#-------------------------------------------------------------#
+# Après chargement de la classe [F] effectué par le WWIxxxxxx #
+# IMPFIC : Abréviation du fichier en cours PNH, PND, STJ      #
+#-------------------------------------------------------------#
+$AP_IMPORT
+Return
+
+
+#-----------------------------------------------------------------#
+# Début import, étiquette appelée directement depuis le SUBIMPOBJ #
+#-----------------------------------------------------------------#
+$OUVRE
+If !clalev([F:PTR])  Local File PURTRS [PTR] : Endif
+GABREV="PNH"
+#----- Sélection de la transaction d'un retour fournisseur -----#
+Call PARAM("","PNHTRS",GBIDC3) From ADOVAL : GPTRNUM=GBIDC3
+Read [PTR] PTR0=7;GPTRNUM
+If fstat
+  Filter [PTR] Where PTRTYP=7 & ENAFLG=2
+  Read [PTR] First
+  Filter [PTR]
+  If fstat
+    If GTRACE<>""
+      Call ECR_TRACE(mess(114,192,1),1) From GESECRAN
+    Endif
+    OK=0 : Return
+  Endif
+  GPTRNUM=[F:PTR]PTRNUM
+Endif
+GFLAG=GPTRNUM      : # Transaction de saisie sélectionnée
+[F:PTR]STKFLG   =2 : # On force la détermination du stock à sortir à "oui"
+[F:PTR]PRNCOD1  =1 : # On force l'impression d'étiquettes à "Non"
+[F:PTR]PRNNBFLG1=1 : # On force le nbre d'impression à "Non"
+#-----
+[L]ACTION="OUVRE"   : Gosub ACTION From GOBJSUB : Gosub DEFAUT From WOPNH
+If !clalev([M:PNH2])  Local Mask PNH2   [PNH2] : Endif
+If !clalev([M:ADB])   Local Mask ADRBPR  [ADB] : Endif
+If !clalev([M:PCEE])  Local Mask PCEE   [PCEE] : Endif
+If !clalev([M:HCCE])  Local Mask HEACCE [HCCE] : Endif
+Gosub FLD_MODELE From TRTX3IMP
+#----- Principaux contrôles sur le modèle -----#
+If !find("[F:PNH]PNHFCY(0)",[M:AOE2]ZONMSK1)
+  #----- Le site de stockage est obligatoire -----#
+  OK=0 : GERR=1 : GMESSAGE=mess(323,199,1)-"([F:PNH]PNHFCY)" : Return
+Elsif !find("[F:PNH]BPSNUM(0)",[M:AOE2]ZONMSK1)
+  #----- Le fournisseur est obligatoire -----#
+  OK=0 : GERR=1 : GMESSAGE=mess(323,199,1)-"([F:PNH]BPSNUM)" : Return
+Elsif  find("[F:PND]PTHNUM(0)",[M:AOE2]ZONMSK1) &
+&     !find("[F:PND]PTDLIN(0)",[M:AOE2]ZONMSK1) &
+&     !find("[F:PND]ITMREF(0)",[M:AOE2]ZONMSK1)
+  #----- Si no réception, la ligne ou l'article est obligatoire -----#
+  OK=0 : GERR=1 : GMESSAGE=mess(323,199,1)-"([F:PND]PTDLIN / [F:PND]ITMREF)" : Return
+Elsif !find("[F:PND]PTHNUM(0)",[M:AOE2]ZONMSK1)
+  If    !find("[F:PND]ITMREF(0)",[M:AOE2]ZONMSK1)
+    #----- Si pas de réception, référence article obligatoire -----#
+    OK=0 : GERR=1 : GMESSAGE=mess(323,199,1)-"([F:PND]ITMREF)" : Return
+  Elsif !find("[F:PND]QTYUOM(0)",[M:AOE2]ZONMSK1)
+    #----- Si pas de réception, quantité obligatoire -----#
+    OK=0 : GERR=1 : GMESSAGE=mess(323,199,1)-"([F:PND]QTYUOM)" : Return
+  Endif
+Endif
+#----- Variables locales -----#
+Local  Char     WGRPDEB(GLONVCR) : #VPO 15/02/11 71600
+Local  Integer  WNOL, J, K, L
+Local  Char     SYMBOL2(30)
+Local  Libelle  WTEST_COMPL, WTEST_ADR, WTEST_CEE, WTEST_HCCE
+# Issue 119660 - 2016-11-15 by SR : import retour validé
+Global Libelle GIMPRETVAL
+#----- Test si besoin d'importer les informations complémentaires avec l'écran PNH2 [PNH2] -----#
+Raz [L]WTEST_COMPL
+If find("[F:PNH]BPSINV(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]BPAINV(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]BPRPAY(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]BPAPAY(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]MDL(0)"      ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]BPTNUM(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]TOTGROWEI(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]WEU(0)"      ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]TOTNETWEI(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]TOTVOL(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]VOU(0)"      ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]REM(0)"      ,[M:AOE2]ZONMSK1)
+  [L]WTEST_COMPL=1
+Endif
+#----- Test si besoin d'importer les informations adresse avec l'écran ADRBPR [ADB] -----#
+Raz [L]WTEST_ADR
+If find("[F:PNH]BPRNAM(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CRY(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CRYNAM(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]SAT(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]POSCOD(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CTY(0)"   ,[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]BPAADDLIG(0)",[M:AOE2]ZONMSK1)
+  [L]WTEST_ADR=1
+Endif
+#----- Test si besoin d'importer les informations douanières avec l'écran PCEE [PCEE] -----#
+Raz [L]WTEST_CEE
+If find("[F:PNH]EECICT(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]ICTCTY(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]FFWNUM(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]FFWADD(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]EECNUM(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]EECLOC(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]EECTRN(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]EECNAT(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]EECSCH(0)",[M:AOE2]ZONMSK1)
+  [L]WTEST_CEE=1
+Endif
+#----- Test si besoin d'importer les sections analytiques d'entête avec l'écran HEACCE [HCEE] -----#
+Raz [L]WTEST_HCCE
+If find("[F:PNH]DIE(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]DIE(1)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]DIE(2)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]DIE(3)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]DIE(4)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]DIE(5)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]DIE(6)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]DIE(7)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CCE(0)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CCE(1)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CCE(2)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CCE(3)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CCE(4)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CCE(5)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CCE(6)",[M:AOE2]ZONMSK1) |
+&  find("[F:PNH]CCE(7)",[M:AOE2]ZONMSK1)
+  [L]WTEST_HCCE=1
+Endif
+# Issue 82340 - 2012-08-30 by SR :Les mvts de stock sont-ils importés
+Global Integer     GPNH_STJ : GPNH_STJ = 1
+If find("STOJOU",[M:AOE2]FIL) : GPNH_STJ = 2 : Endif
+#----- Gestion des textes -----#
+Gosub DECLARE_TEXTE From TRTX3IMP
+G_IMPORT=1 : Gosub OUVRE_TEXTE From IMPPNH
+#----- Globales à definir pour import stock -----#
+Global Char     GSTK_ACTION(20)                               : # Nom de l'action
+Global Char     GSTK_BASTAB(20) : GSTK_BASTAB="[M:PNH1]NBLIG" : # Nom variable bas tableau
+Global Libelle  GSTK_TRSTYP     : GSTK_TRSTYP=11              : # Type mouvement (M.704)
+Global Libelle  GSTK_VCRTYP     : GSTK_VCRTYP=8               : # Type pièce (M.701)
+Global Libelle  GSTK_TRACE      : GSTK_TRACE =1               : # Trace détaillée si =2
+#-----
+If GSTOTRACE>2  GSTK_TRACE=2 : Endif
+#-----
+If GSTK_TRACE=2
+  Call ECR_TRACE(mess(27,115,1)-"OUVRE"+space$(17)+"From IMPPNHS",0) From GESECRAN
+Endif
+#-----
+GSTK_ACTION="OUVRE" : Gosub ACTION From STKIMP
+[L]WSTK_ABRTTR="PTR" : # Abréviation table transaction de saisie
+#-----
+Return
+
+
+#--------------------------------------------------------------------------------------#
+# Nouveau document à importer, appelé directement depuis le traitement généré WWIxxxxx #
+#--------------------------------------------------------------------------------------#
+$RAZCRE
+If GSTK_TRACE=2
+  GSTK_ACT="RAZCRE" : GSTK_PGM="IMPPNHS" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+GREP="C"
+Raz [M:PNH1], [M:PNH2], [M:ADB], [M:PCEE], [M:HCCE]
+If GSTK_TRACE=2
+  GSTK_ACT="RAZCRE" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+[L]ACTION="RAZCRE"   : Gosub ACTION From GOBJSUB : Gosub DEFAUT From WOPNH
+GSTK_ACTION="RAZCRE" : Gosub ACTION From STKIMP
+Return
+
+
+#------------------------------------------------------------------------------------#
+# Chargement masques écrans, appelé directement depuis le traitement généré WWIxxxxx #
+#------------------------------------------------------------------------------------#
+$SAIMSK
+If GREP="A"  Return : Endif
+If GSTK_TRACE=2
+  GSTK_ACT="SAIMSK" : GSTK_PGM="IMPPNHS" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+Case IMPFIC
+  When "PNH"
+    #----- Test rupture sur ligne document -----#
+    If [M:PNH1]NBLIG>0
+      Gosub RUPT_LIGDOC
+    Endif
+    #-----
+    Gosub IMPORT_TEXTE From IMPPNH : # Import des textes entête, pied
+    Default File [PNH]  : # Voir si utile ?
+    If GSTK_TRACE=2
+      GSTK_ACT="SAIMSK" : GSTK_PGM="W0PNH1" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    Default Mask [PNH1]
+    Setmode INBAFF,IAFFCOD,IAFFMASK,IAFFCHP,IAFFIND,IAFFTXT,IAFFRANG,IAFFOPT1,IAFFOPT2
+    Call SAIMSK("PNH","IMP_ZONE","SUBIMPOBJ") From W0PNH1
+    If mkstat  NBERR+=1 : Call TRACE2(2,GMESSIMP,-10) From SUBIMPOBJ : Endif
+    If GREP="A"
+      REP="A" : Actzo [PNH1]RTNDAT, BUY, BPSNUM
+    Endif
+    Setmode
+    If GREP="A"  Return : Endif
+    If mkstat  GREP="" : REP="" : mkstat=0 : GOK=0 : Return : Endif
+    #----- Ecran complément retour -----#
+    If [L]WTEST_COMPL
+      If GSTK_TRACE=2
+        GSTK_ACT="SAIMSK" : GSTK_PGM="W0PNH2" : Gosub TRACE_DETAILLEE From STKIMP
+      Endif
+      [M:PNH2]=[M:PNHC]
+      Default Mask [PNH2]
+      Setmode INBAFF,IAFFCOD,IAFFMASK,IAFFCHP,IAFFIND,IAFFTXT,IAFFRANG,IAFFOPT1,IAFFOPT2
+      Call SAIMSK("PNH","IMP_ZONE","SUBIMPOBJ") From W0PNH2
+      If mkstat  NBERR+=1 : Call TRACE2(2,GMESSIMP,-10) From SUBIMPOBJ : Endif
+      Setmode
+      If mkstat  GREP="" : REP="" : mkstat=0 : GOK=0 : Return : Endif
+      [M:PNHC]=[M:PNH2]
+    Endif
+    #----- Ecran adresse -----#
+    If [L]WTEST_ADR
+      If GSTK_TRACE=2
+        GSTK_ACT="SAIMSK" : GSTK_PGM="W0ADRBPR" : Gosub TRACE_DETAILLEE From STKIMP
+      Endif
+      [M:ADB]=[M:AD65]
+      #----- Raz masque et lecture BPARTNER si nécessaire -----#
+      If [M:ADB]ADBBPR<>[M:PNH1]BPSNUM  Raz [M:ADB] : Endif
+      If [F:BPR]BPRNUM<>[M:PNH1]BPSNUM
+        Read [BPR] BPR0=[M:PNH1]BPSNUM
+        If fstat  Raz [F:BPR] : Endif
+      Endif
+      [M:ADB]ADBBPR=[M:PNH1]BPSNUM
+      [M:ADB]ADBTRT=0
+      If [M:ADB]BPAADD=""  [M:ADB]BPAADD=[F:BPR]BPAADD : Endif
+      #----- Lecture de l'adresse si nécessaire -----#
+      If [M:ADB]BPAADD=""  [M:ADB]BPAADD=[F:BPR]BPAADD : Endif
+      If [M:ADB]ADBFLG=0
+        Read [BPA] BPA0=1;[M:PNH1]BPSNUM;[M:ADB]BPAADD
+        If fstat  Raz [F:BPA] : Endif
+        [M:ADB]BPRNAM(0)    = [F:BPR]BPRNAM(0)
+        [M:ADB]BPRNAM(1)    = [F:BPR]BPRNAM(1)
+        [M:ADB]BPAADDLIG(0) = [F:BPA]BPAADDLIG(0)
+        [M:ADB]BPAADDLIG(1) = [F:BPA]BPAADDLIG(1)
+        [M:ADB]BPAADDLIG(2) = [F:BPA]BPAADDLIG(2)
+        [M:ADB]CRY          = [F:BPA]CRY
+        [M:ADB]CRYNAM       = [F:BPA]CRYNAM
+        [M:ADB]SAT          = [F:BPA]SAT
+        [M:ADB]POSCOD       = [F:BPA]POSCOD
+        [M:ADB]CTY          = [F:BPA]CTY
+        [M:ADB]ADBBPR       = [F:BPR]BPRNUM
+        [M:ADB]ADBFLG       = 1
+      Endif
+      #-----
+      Default Mask [ADB]
+      Setmode INBAFF,IAFFCOD,IAFFMASK,IAFFCHP,IAFFIND,IAFFTXT,IAFFRANG,IAFFOPT1,IAFFOPT2
+      Call SAIMSK("PNH","IMP_ZONE","SUBIMPOBJ") From W0ADRBPR
+      If mkstat  NBERR+=1 : Call TRACE2(2,GMESSIMP,-10) From SUBIMPOBJ : Endif
+      Setmode
+      If mkstat  GREP="" : REP="" : mkstat=0 : GOK=0 : Return : Endif
+      [M:AD65]=[M:ADB]
+      [M:AD65]ADBFLG=2
+    Endif
+    #----- Ecran informations douanières -----#
+    If [L]WTEST_CEE
+      If GSTK_TRACE=2
+        GSTK_ACT="SAIMSK" : GSTK_PGM="W0PCEE" : Gosub TRACE_DETAILLEE From STKIMP
+      Endif
+      [M:PCEE]=[M:PCEY]
+      Default Mask [PCEE]
+      Setmode INBAFF,IAFFCOD,IAFFMASK,IAFFCHP,IAFFIND,IAFFTXT,IAFFRANG,IAFFOPT1,IAFFOPT2
+      Call SAIMSK("PNH","IMP_ZONE","SUBIMPOBJ") From W0PCEE
+      If mkstat  NBERR+=1 : Call TRACE2(2,GMESSIMP,-10) From SUBIMPOBJ : Endif
+      Setmode
+      If mkstat  GREP="" : REP="" : mkstat=0 : GOK=0 : Return : Endif
+      [M:PCEY]=[M:PCEE]
+    Endif
+    #----- Ecran sections analytique d'entête -----#
+    If [L]WTEST_HCCE
+      If GSTK_TRACE=2
+        GSTK_ACT="SAIMSK" : GSTK_PGM="W0HEACCE" : Gosub TRACE_DETAILLEE From STKIMP
+      Endif
+      [M:HCCE]=[M:PNH1]
+      Default Mask [HCCE]
+      Setmode INBAFF,IAFFCOD,IAFFMASK,IAFFCHP,IAFFIND,IAFFTXT,IAFFRANG,IAFFOPT1,IAFFOPT2
+      Call SAIMSK("PNH","IMP_ZONE","SUBIMPOBJ") From W0HEACCE
+      If mkstat  NBERR+=1 : Call TRACE2(2,GMESSIMP,-10) From SUBIMPOBJ : Endif
+      Setmode
+      If mkstat  GREP="" : REP="" : mkstat=0 : GOK=0 : Return : Endif
+      [M:PNH1]=[M:HCCE]
+    Endif
+    #----- Traitement des textes entête et pied -----#
+    If GREP="C"  Gosub IMP_ZONE_TEXTE From IMPPNH : Endif
+    #----- Traitement champs invisibles -----#
+    If find("[F:PNH]TRSCOD(0)",[M:AOE2]ZONMSK1)
+      [M:PNH1]TRSCOD=[F:PNH]TRSCOD
+    Endif
+    If find("[F:PNH]ENTCOD(0)",[M:AOE2]ZONMSK1)
+      [M:PNH1]ENTCOD=[F:PNH]ENTCOD
+    Endif
+    If find("[F:PNH]CFMFLG(0)",[M:AOE2]ZONMSK1)
+      [M:PNH1]CFMFLG=[F:PNH]CFMFLG
+    Endif
+    #-----
+    GSTK_TRSCOD=[M:PNH1]TRSCOD
+    GSTK_ENTCOD=[M:PNH1]ENTCOD
+  When "PND"
+    #----- Test rupture sur ligne document -----#
+    If [M:PNH1]NBLIG>0
+      Gosub RUPT_LIGDOC
+    Endif
+    #-----
+    Gosub IMPORT_TEXTE From IMPPNH : # Import des textes ligne
+    [M:PNH1]NBLIG+=1
+    nolign=[M:PNH1]NBLIG : indice=nolign-1
+    #----- Traitement champs invisibles -----#
+    #-----
+    status=73
+    WNOL=nolign-1       : # Utile pour le traitement de "CAL"
+    Default File [PND]  : # Voir si utile ?
+    If GSTK_TRACE=2
+      GSTK_ACT="SAI_NBLIG" : GSTK_PGM="W0PNH1" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    Default Mask [PNH1]
+    Setmode INBAFF,IAFFCOD,IAFFMASK,IAFFCHP,IAFFIND,IAFFTXT,IAFFRANG,IAFFOPT1,IAFFOPT2
+    Call SAI_NBLIG("PND","IMP_ZONE","SUBIMPOBJ") From W0PNH1
+    If mkstat  NBERR+=1 : Call TRACE2(2,GMESSIMP,-10) From SUBIMPOBJ : Endif
+    Setmode
+    If mkstat  GREP="" : REP="" : mkstat=0 : GOK=0 : Return : Endif
+    #-----
+    If [F:ITM]ITMREF<>[M:PNH1]ITMREF([M:PNH1]NBLIG-1)
+      Read [ITM] ITM0=[M:PNH1]ITMREF([M:PNH1]NBLIG-1)
+      If fstat  Raz [F:ITM] : Endif
+    Endif
+    #----- Traitement des textes ligne -----#
+    If GREP="C"  Gosub IMP_ZONE_TEXTE From IMPPNH : Endif
+  When "CAL"
+    #------------------------------------------------------------------#
+    # Traitement des comptes et sections analytiques des lignes retour #
+    #            left$([M:AOE1]FLGLNK(SEPNUM-1),5)='"PND"'             #
+    #------------------------------------------------------------------#
+    [F:CAL]ABRFIC="PND"
+    [F:CAL]VCRTYP=0
+    Call IMPORT_ACCCCE(WNOL,"[M:PNH1]LINACC","","[M:PNH1]CCE") From TRTX3CPT
+    nolign=WNOL+1 : status=75 : # Modif élément
+    #-----
+    If GSTK_TRACE=2
+      GSTK_ACT="SAI_NBLIG" : GSTK_PGM="W0PNH1" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    Default Mask [PNH1]
+    indice=nolign-1 : mkstat=0
+    GNBAFF=0
+    Setmode INBAFF,IAFFCOD,IAFFMASK,IAFFCHP,IAFFIND,IAFFTXT,IAFFRANG,IAFFOPT1,IAFFOPT2
+    Call SAI_NBLIG("CAL","IMP_ZONE","SUBIMPOBJ") From W0PNH1
+    If mkstat  NBERR+=1 : Call TRACE2(2,GMESSIMP,-10) From SUBIMPOBJ : Endif
+    Setmode
+    If mkstat  GREP="" : REP="" : mkstat=0 : GOK=0 : Return : Endif
+    #-----
+  When "STJ"
+    GSTK_ACTION="SAIMSK" : Gosub ACTION From STKIMP
+Endcase
+Return
+
+
+#-----------------------------------------#
+# Equivalent à la saisie d'un champ fiche #
+# --------------------------------------- #
+# IMPFIC : Abréviation du fichier         #
+# IMPMSK : Nom de l'écran en cours        #
+# IMPZON : Nom du champ en cours          #
+# IMPMOD : Déclenche l'Après_modif        #
+# OK     : Conditionne IMP_ZONE standard  #
+#-----------------------------------------#
+$IMP_ZONE
+If GREP="A"  Return : Endif
+If dim([L]WTST_CHAMP)<1  Local Libelle  WTST_CHAMP : Endif
+Case IMPFIC
+  When "PNH"
+    If find("[F:PNH]"+IMPZON+"(0)",[M:AOE2]ZONMSK1)
+      If GSTK_TRACE=2
+        GSTK_ACT="IMP_ZONE("+IMPZON+")" : GSTK_PGM="IMPPNHS"
+        Gosub TRACE_DETAILLEE From STKIMP
+      Endif
+      Case IMPMSK
+        When "PNH1"
+          If evalue("[M:PNH1]"+IMPZON+"("+num$(indice)+")")<>evalue("[F:PNH]"+IMPZON)
+            Assign "[M:PNH1]"+IMPZON+"("+num$(indice)+")" With evalue("[F:PNH]"+IMPZON)
+             IMPMOD=1
+          Endif
+          OK=0
+        When "ADRBPR"
+          If evalue("[M:ADB]"+IMPZON+"("+num$(indice)+")")<>evalue("[F:PNH]"+IMPZON+"("+num$(indice)+")")
+            Assign "[M:ADB]"+IMPZON+"("+num$(indice)+")" With evalue("[F:PNH]"+IMPZON+"("+num$(indice)+")")
+             IMPMOD=1
+          Endif
+          OK=0
+        When "PNH2"
+          If evalue("[M:PNH2]"+IMPZON+"("+num$(indice)+")")<>evalue("[F:PNH]"+IMPZON)
+            Assign "[M:PNH2]"+IMPZON+"("+num$(indice)+")" With evalue("[F:PNH]"+IMPZON)
+             IMPMOD=1
+          Endif
+          OK=0
+        When "PCEE"
+          If evalue("[M:PCEE]"+IMPZON+"("+num$(indice)+")")<>evalue("[F:PNH]"+IMPZON)
+            Assign "[M:PCEE]"+IMPZON+"("+num$(indice)+")" With evalue("[F:PNH]"+IMPZON)
+             IMPMOD=1
+          Endif
+          OK=0
+        When "HCCE"
+          If evalue("[M:HCCE]"+IMPZON+"("+num$(indice)+")")<>evalue("[F:PNH]"+IMPZON+"("+num$(indice)+")")
+            Assign "[M:HCCE]"+IMPZON+"("+num$(indice)+")" With evalue("[F:PNH]"+IMPZON+"("+num$(indice)+")")
+             IMPMOD=1
+          Endif
+          OK=0
+      Endcase
+    Endif
+  When "PND"
+    Case IMPZON
+      When "LINACC1","LINACC2","LINACC3","LINACC4","LINACC5",
+&          "LINACC6","LINACC7","LINACC8","LINACC9","LINACC10",
+&          "CCE1", "CCE2", "CCE3", "CCE4", "CCE5", "CCE6", "CCE7", "CCE8", "CCE9", "CCE10",
+&          "CCE11","CCE12","CCE13","CCE14","CCE15","CCE16","CCE17","CCE18","CCE19","CCE20"
+        #----- Pas de contrôle si les comptes et sections sont importés avec "CAL" -----#
+        If find("CPTANALIN",[M:AOE1]FLGFIL(0..[M:AOE1]NBRFLG))
+          OK=0 : mkstat=1 : # Zones non concernées par PRETURND
+        Endif
+        #-----
+      When "VAT1"
+        If find("[F:PND]VAT(0)",[M:AOE2]ZONMSK1)
+          If GSTK_TRACE=2
+            GSTK_ACT="IMP_ZONE("+IMPZON+")" : GSTK_PGM="IMPPNHS"
+            Gosub TRACE_DETAILLEE From STKIMP
+          Endif
+          If [M:PNH1]VAT1(indice)<>[F:PND]VAT(0)
+            [M:PNH1]VAT1(indice)=[F:PND]VAT(0)   : IMPMOD=1
+          Endif
+          OK=0
+        Endif
+      When "VAT2"
+        If find("[F:PND]VAT(1)",[M:AOE2]ZONMSK1)
+          If GSTK_TRACE=2
+            GSTK_ACT="IMP_ZONE("+IMPZON+")" : GSTK_PGM="IMPPNHS"
+            Gosub TRACE_DETAILLEE From STKIMP
+          Endif
+          If [M:PNH1]VAT2(indice)<>[F:PND]VAT(1)
+            [M:PNH1]VAT2(indice)=[F:PND]VAT(1)   : IMPMOD=1
+          Endif
+          OK=0
+        Endif
+      When "VAT3"
+        If find("[F:PND]VAT(2)",[M:AOE2]ZONMSK1)
+          If GSTK_TRACE=2
+            GSTK_ACT="IMP_ZONE("+IMPZON+")" : GSTK_PGM="IMPPNHS"
+            Gosub TRACE_DETAILLEE From STKIMP
+          Endif
+          If [M:PNH1]VAT3(indice)<>[F:PND]VAT(2)
+            [M:PNH1]VAT3(indice)=[F:PND]VAT(2)   : IMPMOD=1
+          Endif
+          OK=0
+        Endif
+      When Default
+        If find("[F:PND]"+IMPZON+"(0)",[M:AOE2]ZONMSK1)
+          If GSTK_TRACE=2
+            GSTK_ACT="IMP_ZONE("+IMPZON+")" : GSTK_PGM="IMPPNHS"
+            Gosub TRACE_DETAILLEE From STKIMP
+          Endif
+          If evalue("[M:PNH1]"+IMPZON+"("+num$(indice)+")")<>evalue("[F:PND]"+IMPZON)
+            Assign "[M:PNH1]"+IMPZON+"("+num$(indice)+")" With evalue("[F:PND]"+IMPZON)
+            IMPMOD=1
+          Endif
+          OK=0
+        Endif
+    Endcase
+  When "CAL"
+    #----- La zone présente dans le modèle a déjà été chargée par IMPORT_ACCCCE du $SAIMSK
+    If find("[F:CAL]"+IMPZON+"(0)",[M:AOE2]ZONMSK1)
+      If GSTK_TRACE=2
+        GSTK_ACT="IMP_ZONE("+IMPZON+")" : GSTK_PGM="IMPPNHS"
+        Gosub TRACE_DETAILLEE From STKIMP
+      Endif
+      IMPMOD=1
+    Endif
+    OK=0
+    #-----
+  When "STJ"
+    GSTK_ACTION="IMP_ZONE" : Gosub ACTION From STKIMP
+Endcase
+Return
+
+
+#----------------------------------------------------------------------------#
+# Enregistrement du document importé, appelé directement depuis le SUBIMPOBJ #
+#----------------------------------------------------------------------------#
+$VALID
+If GSTK_TRACE=2
+  GSTK_ACT='VALID(GREP="'+GREP+'")' : GSTK_PGM="IMPPNHS" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+If GREP=""  Raz GSTK_NBLIG : Return : Endif
+[L]OK=1 : Raz GERREUR
+If GREP="C"
+  #-----
+  Gosub RUPT_LIGDOC
+  If ![L]OK  GOK=0 : Goto FIN_GENPNH : Endif
+  #-----
+  If GSTK_TRACE=2
+    GSTK_ACT="VERIF_CRE" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+  Endif
+  [L]ACTION="VERIF_CRE"  : Gosub ACTION From GOBJSUB
+  #--- Bug 71029
+  If ![L]OK  GOK=0 : Goto FIN_GENPNH : Endif
+  #If ![L]OK  GOK=0 : Gosub TRACE_CTL From SUBIMPOBJ : Goto FIN_GENPNH : Endif  # hcb 87116
+  #---
+Elsif GREP="A"
+  If GSTK_TRACE=2
+    GSTK_ACT="LIENS" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+  Endif
+  [L]ACTION="LIENS" : Gosub ACTION From GOBJSUB
+  If [M:PNH1]NBLIG=0  GOK=0 : Goto FIN_GENPNH : Endif
+  [L]SYMBOL2="PNH"+[M:PNH1]PNHNUM : Lock=[L]SYMBOL2
+  If fstat
+    Call ECR_TRACE("$PRETURN"-[M:PNH1]PNHNUM-mess(10,100,1),1) From GESECRAN
+    GOK=0 : Goto FIN_GENPNH
+  Endif
+  ################ Ce qu'il faudrait faire pour être "Clean" mais problème avec [DIA] ###
+  #Local Char    CLECUR1(GLONID1) , CLECUR2(GLONID2)(0..16)
+  #[L]CLECUR1=[M:PNH1]PNHNUM : Raz [L]CLECUR2
+  #Call ANUCOD("PNH",CLECUR1,CLECUR2,OK) From GOBJACT
+  #Default File [PNH]
+  #GREP=""
+  #If OK
+  #  Call TRACE_COR("PNH",CLECUR1,CLECUR2,"A") From GOBJET
+  #  Call ANNULE("PNH",CLECUR1,CLECUR2) From GOBJTXT
+  #  Call ANNULE("PNH",CLECUR1,CLECUR2) From SUBALI
+  #  CLECUR1 = "" : CLECUR2 = ""
+  #Endif
+  #Goto FIN_GENPNH
+  #######################################################################################
+  If GSTK_TRACE=2
+    GSTK_ACT="VERF_ANU" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+  Endif
+  [L]ACTION="VERF_ANU" : Gosub ACTION From GOBJSUB
+  If ![L]OK
+    If GMESSAGE<>""  Call ECR_TRACE(GMESSAGE,1) From GESECRAN : Raz GMESSAGE : Endif
+    Unlock=[L]SYMBOL2
+    GOK=0 : Goto FIN_GENPNH
+  Endif
+Endif
+Call DEBTRANS From GLOCK
+#-----
+$TR_GENPNH
+GOK=1
+Raz WGRPDEB : #VPO 15/02/11 71600
+If GSTK_TRACE=2
+  GSTK_ACT="Trbegin" : GSTK_PGM="" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+Trbegin [PNH], [PND]
+  If GREP="C"
+    #----- Rechargement des informations complémentaires et douanières -----#
+    If [L]WTEST_COMPL
+      If [M:PNH2]BPSINV   <>""  [M:PNHC]BPSINV   =[M:PNH2]BPSINV    : Endif
+      If [M:PNH2]BPAINV   <>""  [M:PNHC]BPAINV   =[M:PNH2]BPAINV    : Endif
+      If [M:PNH2]BPRPAY   <>""  [M:PNHC]BPRPAY   =[M:PNH2]BPRPAY    : Endif
+      If [M:PNH2]BPAPAY   <>""  [M:PNHC]BPAINV   =[M:PNH2]BPAINV    : Endif
+      If [M:PNH2]MDL      <>""  [M:PNHC]MDL      =[M:PNH2]MDL       : Endif
+      If [M:PNH2]BPTNUM   <>""  [M:PNHC]BPTNUM   =[M:PNH2]BPTNUM    : Endif
+      If [M:PNH2]TOTGROWEI<>0   [M:PNHC]TOTGROWEI=[M:PNH2]TOTGROWEI : Endif
+      If [M:PNH2]WEU      <>""  [M:PNHC]WEU      =[M:PNH2]WEU       : Endif
+      If [M:PNH2]TOTNETWEI<>0   [M:PNHC]TOTNETWEI=[M:PNH2]TOTNETWEI : Endif
+      If [M:PNH2]TOTVOL   <>0   [M:PNHC]TOTVOL   =[M:PNH2]TOTVOL    : Endif
+      If [M:PNH2]VOU      <>""  [M:PNHC]VOU      =[M:PNH2]VOU       : Endif
+      If [M:PNH2]REM      <>""  [M:PNHC]REM      =[M:PNH2]REM       : Endif
+    Endif
+    #-----
+    If [L]WTEST_CEE
+      If [M:PCEE]EECICT<>""  [M:PCEY]EECICT=[M:PCEE]EECICT : Endif
+      If [M:PCEE]ICTCTY<>""  [M:PCEY]ICTCTY=[M:PCEE]ICTCTY : Endif
+      If [M:PCEE]FFWNUM<>""  [M:PCEY]FFWNUM=[M:PCEE]FFWNUM : Endif
+      If [M:PCEE]FFWADD<>""  [M:PCEY]FFWADD=[M:PCEE]FFWADD : Endif
+      If GACTDEB=2
+        If [M:PCEE]EECNUM<>""  [M:PCEY]EECNUM=[M:PCEE]EECNUM : Endif
+        If [M:PCEE]EECLOC<>0   [M:PCEY]EECLOC=[M:PCEE]EECLOC : Endif
+        If [M:PCEE]EECTRN<>0   [M:PCEY]EECTRN=[M:PCEE]EECTRN : Endif
+        If [M:PCEE]EECNAT<>""  [M:PCEY]EECNAT=[M:PCEE]EECNAT : Endif
+        If [M:PCEE]EECSCH<>""  [M:PCEY]EECSCH=[M:PCEE]EECSCH : Endif
+      Endif
+    Endif
+    #-----
+    Raz [F:PNH], [F:PND]
+    [F:PNH]=[M:PNH1]
+    Default File [PNH]
+    If GSTK_TRACE=2
+      GSTK_ACT="INICRE" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    [L]ACTION="INICRE"   : Gosub ACTION From GOBJSUB
+    If GOK<0  Goto ROLL_GENPNH  Elsif !GOK  Goto AB_GENPNH : Endif
+    If [M:PNH1]CFMFLG=2  [F:PNH]CFMFLG=2 : Endif
+    If GSTK_TRACE=2
+      GSTK_ACT="Write [PNH]" : GSTK_PGM="" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    [F:PNH]CREUSR=GUSER
+    [F:PNH]CREDAT=date$
+    # Issue 119660 - 2016-11-15 by SR
+    Raz GIMPRETVAL
+    If [F:PNH]CFMFLG=2
+       [F:PNH]CFMFLG=1
+       GIMPRETVAL=1
+    Endif
+    # End issue 119660
+    Write [PNH]
+    If fstat  GOK=0 : Call FSTA("PNH") From GLOCK : Goto AB_GENPNH : Endif
+    If GSTK_TRACE=2
+      GSTK_ACT="CREATION" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    [L]ACTION="CREATION" : Gosub ACTION From GOBJSUB
+    If GOK<0  Goto ROLL_GENPNH  Elsif !GOK  Goto AB_GENPNH : Endif
+    #----- Mise à jour du suivi workflow -----#
+    #VPO 15/02/11 71600
+    If GOK=1
+      Call WRKGLOB(170,[F:PNH]PNHNUM,"PRETURN","") From GOBJACT
+      Call WORKPLUS(2,"PNH","C",[F:PNH]PNHNUM,"",0,1,0,WGRPDEB) From AWRK
+      If GOK<0  Goto ROLL_GENPNH  Elsif !GOK  Goto AB_GENPNH : Endif
+    Endif
+    If GSTK_TRACE=2
+      GSTK_ACT="Commit" : GSTK_PGM="" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+  Elsif GREP="A"
+    Default Mask [PNH1]
+    Default File [PNH]
+    If GSTK_TRACE=2
+      GSTK_ACT="ANNULE" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    [L]ACTION="ANNULE" : Gosub ACTION From GOBJSUB
+    If GOK<0  Goto ROLL_GENPNH  Elsif !GOK  Goto AB_GENPNH : Endif
+    If GSTK_TRACE=2
+      GSTK_ACT="Delete [PNH]" : GSTK_PGM="" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    Delete [PNH] Where PNHNUM=[M:PNH1]PNHNUM
+    If fstat  GOK=0 : Call FSTA("PNH") From GLOCK : Goto AB_GENPNH : Endif
+    If GSTK_TRACE=2
+      GSTK_ACT="Commit" : GSTK_PGM="" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+  Endif
+Commit
+Case GREP
+  When "C" : Call TRACE( 0,mess(8,701,1)-[F:PNH]PNHNUM)  From SUBIMPOBJ
+  When "M" : Call TRACE( 1,mess(8,701,1)-[M:PNH1]PNHNUM) From SUBIMPOBJ : # Pas activé !
+  When "A" : Call TRACE(-1,mess(8,701,1)-[M:PNH1]PNHNUM) From SUBIMPOBJ
+Endcase
+If GREP="C"
+  If GSTK_TRACE=2
+    GSTK_ACT="APRES_CRE" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+  Endif
+  [L]ACTION="APRES_CRE" : Gosub ACTION From GOBJSUB
+  #----- Si import avec flag validé, il faut mettre à jour les stocks -----#
+   # Issue 119660 - 2016-11-15 by SR : c'est "VALIDATION" qui positionnera ou pas CFMFLG
+  #If [F:PNH]CFMFLG=2
+   If GIMPRETVAL=1
+    If GSTK_TRACE=2
+      GSTK_ACT="Call VALIDATION" : GSTK_PGM="TRTACHRET1" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    Call VALIDATION([F:PNH]PNHNUM,2,GBIDI1) From TRTACHRET1
+  Endif
+  #----- Envoi des messages groupe workflow -----#
+  #VPO 15/02/11 71600
+  If WGRPDEB<>""  Call ENVOI_GROUPE(WGRPDEB) From AWRK : WGRPDEB="" : Endif
+  #-----
+Elsif GREP="A"
+  Unlock=[L]SYMBOL2
+  If GSTK_TRACE=2
+    GSTK_ACT="AP_ANNULE" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+  Endif
+  [L]ACTION="AP_ANNULE" : Gosub ACTION From GOBJSUB
+  #----- Mise à jour du suivi workflow -----#
+  #VPO 15/02/11 71600
+  Call WRKGLOB(172,[M:PNH0]PNHNUM,"PRETURN","") From GOBJACT
+  Call WORKFLOW(2,"PNH","A",[M:PNH0]PNHNUM)      From AWRK
+  #-----
+Endif
+Goto FIN_GENPNH
+#-----
+$ROLL_GENPNH
+If GSTK_TRACE=2
+  GSTK_ACT="Rollback" : GSTK_PGM="" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+Rollback
+Call ROLL From GLOCK
+If GROLL
+  If GREP="C"
+    If GSTK_TRACE=2
+      GSTK_ACT="AB_CREATION" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+    Endif
+    [L]ACTION="AB_CREATION" : Gosub ACTION From GOBJSUB : Goto FIN_GENPNH
+  Elsif GREP="A"
+    Unlock=[L]SYMBOL2
+  Endif
+  Goto FIN_GENPNH
+Else
+  Goto TR_GENPNH
+Endif
+#-----
+$AB_GENPNH
+If GSTK_TRACE=2
+  GSTK_ACT="Rollback" : GSTK_PGM="" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+Rollback
+If GREP="C"
+  If GSTK_TRACE=2
+    GSTK_ACT="AB_CREATION" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+  Endif
+  [L]ACTION="AB_CREATION" : Gosub ACTION From GOBJSUB
+  #----- Suppression des message groupe workflow -----#
+  #VPO 15/02/11 71600
+  If WGRPDEB<>""  Call VIRE_GROUPE(WGRPDEB)  From AWRK : WGRPDEB="" : Endif
+  #-----
+  Goto FIN_GENPNH
+Elsif GREP="A"
+  Unlock=[L]SYMBOL2
+Endif
+#-----
+$FIN_GENPNH
+Return
+
+
+#-------------------------------#
+# Rupture sur ligne de document #
+#-------------------------------#
+$RUPT_LIGDOC
+If GSTK_TRACE=2
+  GSTK_ACT="RUPT_LIGDOC(STJ="+vireblc(mess((GSTK_NBLIG>0)+1,1,1),2)+")"
+  GSTK_PGM="IMPPNHS" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+If [F:ITM]ITMREF<>[M:PNH1]ITMREF([M:PNH1]NBLIG-1)
+   Read [ITM] ITM0=[M:PNH1]ITMREF([M:PNH1]NBLIG-1) : If fstat  Raz [F:ITM] : Endif
+Endif
+If [F:ITM]STOMGTCOD>1
+   GSTK_ACTION="RUPT_LIGDOC" : Gosub ACTION From STKIMP
+Endif
+Raz GSTK_NBLIG
+Return
+
+
+#------------#
+# Fin import #
+#------------#
+$IMP_FERME
+If GSTK_TRACE=2
+  GSTK_ACT="FERME" : GSTK_PGM="GOBJSUB" : Gosub TRACE_DETAILLEE From STKIMP
+Endif
+[L]ACTION="FERME"       : Gosub ACTION From GOBJSUB : Gosub DEFAUT From WOPNH
+GSTK_ACTION="IMP_FERME" : Gosub ACTION From STKIMP
+# Issue 82340 - 2012-08-30 by SR
+Kill GSTK_ACTION, GSTK_BASTAB, GSTK_TRSTYP, GSTK_VCRTYP, GSTK_TRACE,GPNH_STJ
+Return
+

@@ -1,0 +1,277 @@
+#<AdxTL>@(#)6.0.0.0 $Revision$
+###############################################################
+# PROCEDURES DE CALCUL DES RETENUES SUR FACTURES FOURNISSEURS #
+###############################################################
+# V1.0.0 - 24/01/2000 - NG - Creation                         #
+# V1.2.4 - 24/03/2000 - NG - Modifications                    #
+###############################################################
+
+
+###################################################
+# APPEL A L'OBJET GERANT LES FACTURES FOURNISSEUR #
+###################################################
+
+GBIDC2="" : GBIDC3=""
+Call OBJET ("BIS",GBIDC2,GBIDC3) From GOBJET
+End
+
+
+#################################
+# SOUS-PROG PRINCIPAL DE CALCUL #
+#################################
+
+Subprog RETENUES_SUR_FAC (CPY,FCY,ACCDAT,BPR,FACCUR,RTZDEF,RITNBR,RITCOD,RITBAS,RITAMT,
+&                         RITBASDED,RITAMTDED,NBLIG,FCYLIN,SAC,ACC,AMTNOTLIN,PURTYP,
+&                         RITCODSRC,DES,VAT,TAX1,TAX2,TFAC,OK)
+Value    Char CPY            # societe
+Value    Char FCY            # site
+Value    Date ACCDAT         # date comptable
+Value    Char BPR            # fournisseur
+Value    Char FACCUR         # devise de facture
+Value    Char RTZDEF         # retenue a la source par defaut
+Variable Decimal RITNBR      # nbr de retenues
+Variable Char RITCOD()       # codes retenues
+Variable Decimal RITBAS()    # bases retenues
+Variable Decimal RITAMT()    # montants retenues
+Variable Decimal RITBASDED() # bases reglees
+Variable Decimal RITAMTDED() # montants regles
+Variable Shortint NBLIG      # nb de lignes
+Variable Char FCYLIN()       # sites
+Variable Char SAC()          # collectifs
+Variable Char ACC()          # comptes
+Variable Decimal AMTNOTLIN() # montants ht
+Variable Char VAT()          # codes tva
+Variable Char TAX1()         # codes tax1
+Variable Char TAX2()         # codes tax2
+Variable Integer PURTYP()    # types achats
+Variable Char RITCODSRC()    # codes retenues sources
+Variable Char DES()          # commentaires
+Value Char TFAC()()          # tableau de factures à déduire
+Variable Integer OK          # statut de retour du ss-prog.
+
+# VARIABLES LOCALES
+
+If clalev([F:BPS])=0  : Local File BPSUPPLIER [BPS]  : Endif # fournisseurs
+If clalev([F:RTZ])=0  : Local File RITENZIONE [RTZ]  : Endif # codes retenues
+If clalev([F:GAC])=0  : Local File GACCOUNT   [GAC]  : Endif # comptes generaux
+If clalev([F:TVT])=0  : Local File TABVAT     [TVT]  : Endif # codes taxes
+If clalev([F:PIH])=0  : Local File PINVOICE   [PIH]  : Endif # fact.fournisseurs
+
+Local Shortint NUMLIG,NUMRET # num. ligne, num. retenue
+Local Shortint TYPCHARGE     # type de charge (1:Prestations, 2:Frais, etc...)
+Local Char CODRET            # code retenue
+Local Char PLAN(GLONCOA)     # Plan de comptes du référentiel général principal
+Local Shortint I, J
+
+
+# LECTURE DES DEVISES RITENZIONE ET FACTURE
+
+Local Char RTZCUR(GLONCUR) # devise de ritenzione
+
+Call PARAM("","RTZCUR",[L]RTZCUR) From ADOVAL # lecture du parametre
+
+# RECHERCHE DES CODES RETENUES APPLICABLES A LA FACTURE
+
+Local Integer NBRET         # Nb de retenues sur facture
+Local Char RITCODTMP(10)(5) # Codes retenues
+Local Integer APPLIC        # Flag applicable O/N
+
+Call LECMAINPLAN(1,CPY,PLAN) From CPTDIV
+
+Read [F:BPS]BPS0=[L]BPR # lecture fiche fournisseur
+
+For NUMRET=0 To [F:BPS]RITNBR-1
+ [L]CODRET=[F:BPS]RITCOD([L]NUMRET) # code retenue
+ Read [F:RTZ]RTZ0=[L]CODRET         # lecture fiche retenue
+ Call APPLICABLE ([L]CODRET,ACCDAT,[L]APPLIC) From RTZCALCOM
+ If [F:RTZ]TYP=2 & [L]APPLIC Then  # Retenue sur facture, applicable
+  RITCODTMP([L]NBRET)=[L]CODRET # Copie code retenue
+  [L]NBRET+=1
+ Endif
+Next NUMRET
+
+
+# CALCUL DES BASES IMPOSABLES POUR CHAQUE RETENUE
+
+Local Decimal RITBASFAC(5) # bases retenues en devise de facture
+Local Decimal RITBASRTZ(5) # bases retenues en devise de ritenzione
+Local Integer OK           # statut de retour
+
+For NUMLIG=0 To NBLIG-1 # boucle sur les lignes de facture
+ Read [F:GAC]GAC0=PLAN;ACC([L]NUMLIG) # lecture fiche compte
+ [L]TYPCHARGE=[F:GAC]RITTYP      # type de charge associe au compte
+ For NUMRET=0 To [L]NBRET-1 # boucle sur les "Retenues sur Facture"
+  [L]CODRET=RITCODTMP([L]NUMRET) # code retenue
+  Read [F:RTZ]RTZ0=[L]CODRET     # lecture fiche retenue
+  If [L]TYPCHARGE<>0 & [F:RTZ]BAS([L]TYPCHARGE-1)=2 Then # type de charge inclus dans la base
+   [L]RITBASFAC([L]NUMRET)+=AMTNOTLIN([L]NUMLIG) # ajout a la base ht de la retenue
+  Endif
+ Next NUMRET # fin boucle retenues
+Next NUMLIG # fin boucle lignes
+
+
+# CALCUL DU MONTANT DES RETENUES
+
+Local Decimal RITAMTFAC(5) # montants retenues en devise de facture
+Local Decimal RITAMTRTZ(5) # montants retenues en devise de ritenzione
+Local Decimal PRVRITBAS    # base precedente (par retenue et par facture)
+Local Integer SIGNE        # sens de cumul
+
+For NUMRET=0 To [L]NBRET-1 # boucle sur les retenues auxquelles est soumis le fournisseur
+ [L]CODRET=RITCODTMP([L]NUMRET)   # code retenue
+ [L]PRVRITBAS=0 # base precedemment calculee
+ For I=0 To dim(TFAC)-1
+  If TFAC(I)="" : Break : Endif
+   Read [PIH]PIH0 = TFAC(I)
+    If [F:PIH]INVTYP=2 | [F:PIH]INVTYP=4 : SIGNE=-1 : Else SIGNE=1 : Endif
+    If fstat=0 & [F:PIH]BPR=[L]BPR & [F:PIH]CPY=[L]CPY & year([F:PIH]ACCDAT)=year([L]ACCDAT)
+    For J=0 To [F:PIH]RITNBR-1
+     If [F:PIH]RITCOD(J)=[L]CODRET
+      [L]PRVRITBAS += ([F:PIH]RITBAS(J)*SIGNE)
+     Endif
+    Next J
+  Endif
+ Next I
+ Call MONTANT_RETENUE ([L]CODRET,[L]BPR,[L]CPY,[L]ACCDAT,[L]PRVRITBAS,
+&                      [L]FACCUR,[L]RITBASFAC(NUMRET),[L]RITAMTFAC(NUMRET),
+&                      [L]RTZCUR,[L]RITBASRTZ(NUMRET),[L]RITAMTRTZ(NUMRET)) From RTZCALCOM
+Next NUMRET # fin boucle retenues
+
+
+# CREATION DES LIGNES DE RETENUES SUR FACTURE
+
+Local Integer LIGEXIST1 # flag existance lig. retenue sur compte ACC1 (caisse/état)
+Local Integer LIGEXIST2 # flag existance lig. retenue sur compte ACC2 (compte charge)
+Local Integer ERRACC1, ERRACC2
+Local Char    MESSA0(80)
+
+For NUMRET=0 To [L]NBRET-1 # boucle sur les retenues auxquelles est soumis le fournisseur
+ [L]CODRET=RITCODTMP([L]NUMRET) # code retenue
+ Read [F:RTZ]RTZ0=[L]CODRET  # lecture fiche retenue
+ # On vérifie qu'une ligne n'existe pas déjà pour cette retenue
+ If [F:RTZ]COE1 <> 0
+  [L]LIGEXIST1=find([F:RTZ]ACC1,ACC(0..[L]NBLIG-1))
+ Endif
+ If [F:RTZ]COE2 <> 0
+  [L]LIGEXIST2=find([F:RTZ]ACC2,ACC(0..[L]NBLIG-1))
+ Endif
+
+ # Création/modification d'une ligne
+ If [F:RTZ]COE2>0 & ![L]LIGEXIST2 & [L]RITAMTFAC(NUMRET)>0  # une ligne de retenue est a creer
+  [L]NUMLIG=[L]NBLIG # numero de la premiere ligne de retenue a ajouter
+  [L]NBLIG+=1        # MAJ nombre de lignes de facture
+  FCYLIN(NUMLIG)=[L]FCY                              # site
+  ACC(NUMLIG)=[F:RTZ]ACC2                            # compte de charge
+  If [F:RTZ]COE2 = 1
+   AMTNOTLIN(NUMLIG)=[L]RITAMTFAC(NUMRET)
+  Else
+   AMTNOTLIN(NUMLIG)=[L]RITAMTFAC(NUMRET)*[F:RTZ]COE2
+   Call ARRDEV(AMTNOTLIN(NUMLIG),[L]FACCUR) From TRTDIV
+  Endif
+  Call LECTURE("GAC",[F:RTZ]ACC2,PLAN) From CONTOBJ    # lecture fiche compte
+  VAT(NUMLIG)=[F:GAC]VAT(0)                          # code tva
+  TAX1(NUMLIG)=[F:GAC]VAT(1)                         # code tax1
+  TAX2(NUMLIG)=[F:GAC]VAT(2)                         # code tax2
+  PURTYP(NUMLIG)=PURTYP(0)                           # type d'achat (1=achat,2=immo)
+  DES(NUMLIG)=[F:RTZ]DES                             # designation retenue
+
+  RITCODSRC(NUMLIG) = ""  # Code retenue à blanc pour toutes les lignes ajoutées
+ Endif
+
+ ## Génération d'une ligne sur compte ACC1 (compte caisse/état) si [F:RTZ]COE1>0
+ If [F:RTZ]COE1 > 0 & ![L]LIGEXIST1 & [L]RITAMTFAC(NUMRET)>0
+  [L]NUMLIG=[L]NBLIG # numero de la première ligne de retenue a ajouter
+  [L]NBLIG+=1        # MAJ nombre de lignes de facture
+  FCYLIN(NUMLIG)=[L]FCY                              # site
+  ACC(NUMLIG)=[F:RTZ]ACC1                            # compte de charge
+  AMTNOTLIN(NUMLIG)=[L]RITAMTFAC(NUMRET)*-1          # montant retenue ht
+  Call LECTURE("GAC",[F:RTZ]ACC1,PLAN) From CONTOBJ    # lecture fiche compte
+  VAT(NUMLIG)=[F:GAC]VAT(0)                          # code tva
+  TAX1(NUMLIG)=[F:GAC]VAT(1)                         # code tax1
+  TAX2(NUMLIG)=[F:GAC]VAT(2)                         # code tax2
+  PURTYP(NUMLIG)=PURTYP(0)                           # type d'achat (1=achat,2=immo)
+  DES(NUMLIG)=[F:RTZ]DES                             # designation retenue
+  RITCODSRC(NUMLIG) = ""  # ADXITA1 Code retenue à blanc pour toute les lignes aggiunte
+ Endif
+
+ # CODE RETENUE A LA SOURCE PROPOSE POUR CETTE RETENUE
+ #If [L]RTZDEF<>"" Then
+ # Read [F:RTZ]RTZ0=[L]RTZDEF # lecture fiche retenue source
+ # [L]TYPCHARGE=[F:GAC]RITTYP # type de charge associe au compte de la retenue
+ # If [L]TYPCHARGE<>0 & [F:RTZ]BAS([L]TYPCHARGE-1)=2 Then # type de charge inclus dans la base
+ #  RITCODSRC(NUMLIG)=[L]RTZDEF # on propose le code par defaut
+ # Endif
+ #Else
+ # Raz RITCODSRC(NUMLIG) # on ne propose aucun code
+ #Endif
+
+ ERRACC1 = 0 : ERRACC2 = 0
+ If [F:RTZ]COE1>0 & [L]LIGEXIST1
+  If AMTNOTLIN([L]LIGEXIST1-1)<>[L]RITAMTFAC(NUMRET)*-1
+   ERRACC1 = 1
+  Endif
+ Endif
+ If [F:RTZ]COE2>0 & [L]LIGEXIST2
+  If ([F:RTZ]COE2=1 & AMTNOTLIN([L]LIGEXIST2-1)<>[L]RITAMTFAC(NUMRET))
+&  | ([F:RTZ]COE2<>1 & AMTNOTLIN([L]LIGEXIST2-1 )<>[L]RITAMTFAC(NUMRET)*[F:RTZ]COE2)
+   ERRACC2 = 1
+  Endif
+ Endif
+ If ERRACC1 | ERRACC2
+
+# Bug 18739 : La confirmation pour relancer le calcul de retenue est posé trop tardivement (cf SUBBIS)
+#  Local Integer USROK
+#  If    ERRACC1 & !ERRACC2 : MESSA0=mess(3,40,1)-num$([L]LIGEXIST1)
+#  Elsif !ERRACC2 & ERRACC2 : MESSA0=mess(3,40,1)-num$([L]LIGEXIST2)
+#  Elsif ERRACC1 & ERRACC2  : MESSA0=mess(7,105,1)-num$([L]LIGEXIST1)+","-num$([L]LIGEXIST2)
+#  Endif
+#  Call OUINON (MESSA0-":"-mess(3,131,1)+chr$(10)+mess(32,131,1),USROK) From GESECRAN # mt incorrect, recalculer ?
+#  If USROK=2
+   If ERRACC1
+    AMTNOTLIN([L]LIGEXIST1-1)=[L]RITAMTFAC(NUMRET)*-1 # montant retenue ht
+   Endif
+   If ERRACC2
+    If [F:RTZ]COE2 = 1
+     AMTNOTLIN([L]LIGEXIST2-1)=[L]RITAMTFAC(NUMRET)
+    Else
+     AMTNOTLIN([L]LIGEXIST2-1)=[L]RITAMTFAC(NUMRET)*[F:RTZ]COE2
+     Call ARRDEV(AMTNOTLIN([L]LIGEXIST2-1),[L]FACCUR) From TRTDIV
+    Endif
+   Endif
+#  Endif
+ Endif
+Next NUMRET
+
+
+# MAJ DU MASQUE AVEC LES BASES ET MONTANTS CALCULES
+
+For NUMRET=0 To [L]NBRET-1 # boucle sur retenues calculees
+ I=find([L]RITCODTMP(NUMRET),[L]RITCOD(0..[L]RITNBR-1))
+ If I Then
+  [L]RITBAS(I-1)=[L]RITBASRTZ(NUMRET) # MAJ de la base facturee
+  [L]RITAMT(I-1)=[L]RITAMTRTZ(NUMRET) # MAJ du montant facture
+ Elsif [L]RITBASRTZ(NUMRET)<>0 | [L]RITAMTRTZ(NUMRET)<>0
+  I=[L]RITNBR
+  If I<dim(RITCOD)
+   [L]RITCOD(I)=[L]RITCODTMP(NUMRET) # Code retenue
+   [L]RITBAS(I)=[L]RITBASRTZ(NUMRET) # Base
+   [L]RITAMT(I)=[L]RITAMTRTZ(NUMRET) # Montant
+   [L]RITBASDED(I)=0                 # Base reglee
+   [L]RITAMTDED(I)=0                 # Montant regle
+   [L]RITNBR+=1
+  Else
+   GMESSAGE="dim(RITCOD)="+num$(dim(RITCOD))
+   OK=0 : End
+  Endif
+ Endif
+Next NUMRET
+
+OK=1 # Tout s'est bien passe
+
+End
+
+
+#####################
+# FIN DU TRAITEMENT #
+#####################
+

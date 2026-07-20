@@ -1,0 +1,1066 @@
+#<AdxTL>@(#)9.0.0.0 $Revision$
+Local File ADOPAR [ADP]
+Read [ADP]ADP0 First
+Infbox [F:ADP]CHAPITRE-[F:ADP]PARAM
+Call EVENEMENT(1,"ADP","/u/mbeinat/test.pdf","")
+End
+
+#------------------------------#
+$ACTION
+Case ACTION
+ When "STORE"   : Gosub ACTION_ARC
+ When "GETURL"  : Gosub ACTION_ARC
+ When "CONTROL" : Gosub ACTION_ARC
+ When "PARAM"   : Gosub ACTION_ARC
+ When "DELETE"  : Gosub ACTION_ARC
+Endcase
+Return
+
+#------------------#
+$ACTION_ARC
+GPE = 0
+If PRGSPE<>"" : Gosub ACTION From =PRGSPE : Endif
+If PRGSTD<>"" & !GPE : Gosub ACTION From =PRGSTD : Endif
+Return
+
+#------------------------------------------------------#
+# Action ARCHIVING
+#------------------------------------------------------#
+
+Subprog ARCHIVING(CODEVT,CHEMIN)
+Value Char    CODEVT
+Value Char    CHEMIN
+Call EVENEMENT(6,PARAM(1),PARAM(2),"")
+End
+
+#------------------------------------------------------#
+Subprog EVENEMENT(TYPEVT,CODEVT,CHEMIN,TYPPCE)
+Value Integer TYPEVT
+Value Char    CODEVT
+Value Char    CHEMIN
+Value Char    TYPPCE
+
+#---------------------  CHEMIN  -------------------------------------------------------------------------------#
+# Nom du Fichier généré par le traitement appelant (état.pdf, fichier export, pièce jointe, etc.)
+# Pour les export Excel, contient le nom d'une variable clob sous la forme "[M]ZON"
+# Pour les pièces jointes, ça peut être un clob ou un blob sous la forme "[M]ZON"
+#--------------------------------------------------------------------------------------------------------------#
+# TYPPCE n'est renseigné que pour les types d'évènement Objet
+#--------------------------------------------------------------------------------------------------------------#
+
+Local Integer I , J , K , OK , ERN , OKTRT , STAT , MAXFLD , MAXFIC
+MAXFLD = 20
+MAXFIC = 20
+Local Char    ERM(250) , FORMULE(250) , SOCIETE(GLONCPY) , SITE(GLONFCY) , REPERT(GDIMFIC)
+Local Char    DIRPCE(GDIMFIC) , FICHIER(GDIMFIC) , NOMPCE(GDIMFIC) , SEP(1) , TYPDOC(GLONADI)
+Local Char    NOMPRG(GLONADC) , NOMFIC(GDIMFIC)
+Local Char    CODFLD(GLONAVA+10)(1..MAXFLD) , FORFLD(250)(1..MAXFLD) , FLD(GLONAVA+10)
+Local Char    NAMFIC(GDIMFIC)(1..MAXFIC) , VALFLD(80)(1..MAXFLD)
+Local Integer NBRFLD , NBFIC , NUFIC , OUVERT , DEBUG , TRACE
+Local Char    FICCLI(GDIMFIC) , FICSRV(GDIMFIC) , URL(GDIMFIC) , EXT(10) , MESSA(250)
+Local Char    ACTION(20) , OGTRACE(GDIMFIC) , ORELCLI(20)
+Local Blbfile BLOB(12)
+
+If !func AFNC.ACTIV("ARCH") or CHEMIN="" : End : Endif
+
+DEBUG = 0
+If TYPEVT=4
+ OGTRACE = GTRACE
+ GTRACE = ""
+Endif
+TRACE = 0
+
+If clalev([F:ARC])=0 : Local File ARCHPAR  [ARC] : Endif
+
+For [ARC] Where TYPEVT=[L]TYPEVT & ENAFLG=2
+ DEBUG = ([F:ARC]DEBUG=2)
+ Gosub SELECT : # Tests pour savoir si l'évènement correspond
+ If OK
+  Gosub OUVRE
+  Break (OK=0)
+  GPE = 0 : GPOINT = "ARCFIL" : Gosub ENTREE From EXEFNC
+  If GPE=0
+   For NUFIC=1 To NBFIC
+    NOMFIC = NAMFIC(NUFIC)
+    Gosub COPFIC   : # Copie du fichier
+    Gosub ARCHIVE  : # Evaluation des paramètres et archivage
+    If OK
+     If [F:ARC]TYPEVT=1
+      Call MAJPCE(CODFLD,VALFLD,DEBUG,TRACE) : # On se contente de mettre à jour la classe [F:AOX]
+     Elsif [F:ARC]OBJLNK<>""
+      Gosub SETCLE From =NOMPRG
+      Call CREPCE([F:ARC]OBJLNK,CLEOBJ,CODFLD,VALFLD,DEBUG,TRACE) : # Insertion d'une pièce jointe dans l'objet
+     Endif
+    Endif
+   Next NUFIC
+  Endif
+ Endif
+Next ARC
+
+Gosub FERME
+
+Close Local File
+
+If TYPEVT=4 : GTRACE = OGTRACE : Endif
+End
+
+#------------------#
+$OUVRE
+If OUVERT : Return : Endif
+If clalev([F:AOX])=0 : Local File AOBJTXT  [AOX] : Endif
+If clalev([F:AOM])=0 : Local File AOBJTXTA [AOM] : Endif
+If clalev([F:ABB])=0 : Local File ABLOB    [ABB] : Endif
+If clalev([F:ACB])=0 : Local File ACLOB    [ACB] : Endif
+If clalev([F:ARU])=0 : Local File ARCHPARU [ARU] : Endif
+If clalev([F:AUS])=0 : Local File AUTILIS  [AUS] : Endif
+If clalev([F:ADI])=0 : Local File ATABDIV  [ADI] : Endif
+Local File AOBJTXT [AOX_]
+Local Mask ARC8 [ARC8]
+
+Local Char MESSAGE(200)
+Local Char FULPATH(200)
+Local Integer ASTATUS
+
+OUVERT = 1
+Read [AUS]CODUSR=GUSER
+Read [ARU]ARU0=[F:AUS]ARCPRF
+If fstat
+ ERM = [F:AUS]ARCPRF-":"-func AFNC.MES1(mess(24,150,1),GUSER) : # Profil d'archivage inexistant pour l'utilisateur $1$
+ Gosub AFF_ERR
+ OK = 0 : Return
+Endif
+Gosub SET_PRGSTD From SUBARC
+Raz NBFIC , NAMFIC , FICSRV
+
+# Issue 44689 - 2017-06-16 by ERB :
+If pat(CHEMIN,"[*]/*")
+ ASTATUS = func ASYRSTO.CTL_VOLFIL(2,CHEMIN,FULPATH,0,MESSAGE)
+ If ASTATUS < 0
+  Gosub ERFIC
+ Endif
+ CHEMIN = FULPATH
+Endif
+# End issue 44689
+
+If left$(CHEMIN,1)="["
+ ASTATUS = func ASYRSTO.CTL_VOLFIL(2,CHEMIN,FULPATH,0,MESSAGE)
+ If ASTATUS < 0
+  Gosub ERFIC
+ Endif
+ CHEMIN = FULPATH
+
+ If [L]TYPPCE<>""
+  EXT = tolower([L]TYPPCE)
+ Else
+  EXT = "xml"
+ Endif
+ ERN = 0
+ Onerrgo ERFIC
+ K = evalue("type("+CHEMIN+")")
+ Onerrgo
+ If ERN or K<=0
+  ERM = "|"+CHEMIN-mess(101,100,1)-num$(ERN) : # Fichier inexistant
+  Gosub AFF_ERR
+  CHEMIN = ""
+ Else
+  FICCLI = "arch_"+GFONCTION+"_"+GUSER+"."+EXT
+  Call SET_FICNAM(FICCLI,FICSRV,URL) From ORDSYS
+  Onerrgo ERFIC
+  Case K
+   When 522 : # Blob
+    Openo FICSRV ,0 Using [AXL_]
+    Iomode adxifs "" Using [AXL_]
+    Iomode adxirs chr$(10) Using [AXL_]
+    Iomode adxium GUTF8 Using [AXL_]
+    [L]BLOB = evalue(CHEMIN)
+    Putseq 1,[L]BLOB Using [AXL_]
+    Openo Using [AXL_]
+   When 523 : # Clob
+    Openo FICSRV ,0 Using [AXL_]
+    Iomode adxifs "" Using [AXL_]
+    Iomode adxirs chr$(10) Using [AXL_]
+    Iomode adxium GUTF8 Using [AXL_]
+    Wrseq evalue(CHEMIN) Using [AXL_]
+    Openo Using [AXL_]
+  Endcase
+  Onerrgo
+  If ERN
+   ERM = mess(47,134,1) : # Erreur de génération d'un fichier à partir d'un clob ou d'un blob
+   Gosub AFF_ERR
+   CHEMIN = ""
+  Else
+   CHEMIN = FICSRV
+  Endif
+ Endif
+Endif
+If instr(1,CHEMIN,"~~") or instr(1,CHEMIN,"#")
+ I = func AWRK.TRTFIC(CHEMIN,NBFIC,NAMFIC)
+Elsif CHEMIN<>""
+ NBFIC += 1
+ NAMFIC(NBFIC) = CHEMIN
+Endif
+Return
+
+$ERFIC
+ERN = errn
+Resume
+
+#------------------#
+$FERME
+If OUVERT
+ If FICSRV<>"" & filinfo(FICSRV,0)>0
+  Call EFFACE(FICSRV,STAT) From ORDSYS
+ Endif
+ Close Local File [AOX] , [AOM] , [AOX_] , [ABB] , [ACB]
+ Close Local Mask [ARC8]
+Endif
+If TRACE
+ Call FERME_TRACE From LECFIC
+ Call LEC_TRACE From LECFIC
+Endif
+Return
+
+#------------------#
+$COPFIC
+Gosub SET_NOMPCE
+If GOS="unix" & !GBROWS
+ If instr(1,NOMFIC,"\") & !instr(1,NOMFIC,"@")
+  NOMFIC = "#@"+NOMFIC
+  ORELCLI = GRELCLI : GRELCLI = ""
+ Endif
+ If instr(1,NOMPCE,"\") & !instr(1,NOMPCE,"@")
+  NOMPCE = "#@"+NOMPCE
+  If ORELCLI="" : ORELCLI = GRELCLI : GRELCLI = "" : Endif
+ Endif
+Endif
+Call SETREP(NOMPCE,REPERT) From GOBJTXT
+Call EXISTE(REPERT,STAT) From ORDSYS
+If STAT<>2
+ ERM = "|"+REPERT+"|\"+mess(9,141,1) : # Répertoire inexistant
+ Gosub AFF_ERR
+Else
+ Call COPIE(NOMFIC,NOMPCE,STAT) From ORDSYS
+ If ORELCLI<>"" : GRELCLI = ORELCLI : ORELCLI = "" : Endif
+ If STAT
+  ERM = mess(33,143,1)-"|"+NOMFIC-"->"-NOMPCE : # Erreur pendant la copie du fichier
+  Gosub AFF_ERR
+ Else
+  MESSA = mess(73,141,1)-"|"+NOMFIC-"->"-NOMPCE : # Copie de fichier
+  Gosub AFF_MES
+ Endif
+Endif
+Return
+
+#------------------#
+$ARCHIVE
+# Déclaration des variables globales G_+codpar
+Gosub DECPAR From =NOMPRG
+
+# Init des paramètres
+Gosub INIPAR From =NOMPRG
+If OK=0 : Return : Endif
+
+# Init des formules de mise à jour des champs standard
+Raz NBRFLD , CODFLD , FORFLD
+For FLD="MOTCLE","IDTSTO","IDTCNT","VERSION","CAT","NAM"
+ K = evalue("dim([F:ARC]"+FLD+")")
+ If K
+  For I=1 To K
+   NBRFLD += 1
+   If I>1
+    CODFLD(NBRFLD) = FLD+"("+num$(I-1)+")"
+   Else
+    CODFLD(NBRFLD) = FLD
+   Endif
+   FORFLD(NBRFLD) = evalue("[F:ARC]"+CODFLD(NBRFLD))
+  Next I
+ Endif
+Next FLD
+For FLD="NOMPCE","TYPDOC"
+ NBRFLD += 1
+ CODFLD(NBRFLD) = FLD
+ Case FLD
+  When "NOMPCE" : FORFLD(NBRFLD) = '"'+NOMPCE+'"'
+  When "TYPDOC" : FORFLD(NBRFLD) = '"'+[L]TYPDOC+'"'
+ Endcase
+Next FLD
+
+# Affichage des paramètres
+If [F:ARC]INTERV=2
+ [M:ARC8]CODARC = [F:ARC]CODARC
+ For I=1 To NBPAR
+  [M:ARC8]CODPAR(I-1) = CODPAR(I)
+  [M:ARC8]VALPAR(I-1) = VALPAR(I)
+  If dim([M:ARC8]ADRPAR)>0
+   [M:ARC8]ADRPAR(I-1) = ADRPAR(I)
+  Endif
+ Next I
+ [M:ARC8]NBPAR = NBPAR
+ GBIDC1 = mess(61,143,1) : # Avant archivage
+ Local Char VALARC(10) , PARARC(10)(1..2) , SPEARC(GLONADC)
+ Call TRTSPE(nomap,"ARCAFFPAR",SPEARC) From SUBACT
+ Call SAISIE_CHAR(VALARC,PARARC,"ARCAFFPAR","ARCAFFPAR",SPEARC) From GSAISIE
+ If find(GSTATUT,GSTAOK,GSTARET)
+  For I=1 To NBPAR
+   CODPAR(I) = [M:ARC8]CODPAR(I-1)
+   VALPAR(I) = [M:ARC8]VALPAR(I-1)
+  Next I
+ Endif
+Endif
+
+# Appel du spé pour gérer le web-service
+OK = 1
+ACTION = "STORE" : Gosub ACTION
+If GMESSAGE<>""
+ If !OK : ERM   = GMESSAGE : Gosub AFF_ERR
+ Else   : MESSA = "|"+GMESSAGE : Gosub AFF_MES
+ Endif
+ GMESSAGE = ""
+Endif
+If !OK : Return : Endif
+
+# Affichage des paramètres
+If [F:ARC]INTERV=2
+ [M:ARC8]CODARC = [F:ARC]CODARC
+ For I=1 To NBPAR
+  [M:ARC8]CODPAR(I-1) = CODPAR(I)
+  [M:ARC8]VALPAR(I-1) = VALPAR(I)
+  If dim([M:ARC8]ADRPAR)>0
+   [M:ARC8]ADRPAR(I-1) = ADRPAR(I)
+  Endif
+ Next I
+ [M:ARC8]NBPAR = NBPAR
+ GBIDC1 = mess(62,143,1) : # Après archivage
+ Local Char VALARC(10) , PARARC(10)(1..2) , SPEARC(GLONADC)
+ Call TRTSPE(nomap,"ARCAFFPAR",SPEARC) From SUBACT
+ Call SAISIE_CHAR(VALARC,PARARC,"ARCAFFPAR","ARCAFFPAR",SPEARC) From GSAISIE
+ If find(GSTATUT,GSTAOK,GSTARET)
+  For I=1 To NBPAR
+   CODPAR(I) = [M:ARC8]CODPAR(I-1)
+   VALPAR(I) = [M:ARC8]VALPAR(I-1)
+  Next I
+ Endif
+Endif
+
+# Mise à jour des paramètres passés en variable
+Gosub MAJPAR From =NOMPRG
+If !OK : Return : Endif
+
+# Evaluation des formules d'init des champs standard
+For I=1 To NBRFLD
+ If CODFLD(I)<>"" & FORFLD(I)<>""
+  CHAINE = FORFLD(I)
+  ERN = 0
+  FORMULE = format$("KTv2:255X",CHAINE)
+  Onerrgo  ER
+  Case evalue("type("+CODFLD(I)+")")
+   When 1
+    If CHAINE="" : CHAINE = '"1"' : Endif
+    VALFLD(I) = num$(evalue(CHAINE))
+   When 2,4,5,6,7
+    If CHAINE="" : CHAINE = '"0"' : Endif
+    VALFLD(I) = num$(evalue(CHAINE))
+   When 3
+    If CHAINE="" : CHAINE = "[00/00/0000]" : Endif
+    VALFLD(I) = num$(evalue(CHAINE))
+   When Default
+    If CHAINE="" : CHAINE = '""' : Endif
+    VALFLD(I) = num$(evalue(CHAINE))
+  Endcase
+  Onerrgo
+  If ERN : OK = 0 : Break : Endif
+ Endif
+Next I
+If !OK : Return : Endif
+
+# Kill des variables globales G_+codpar
+Gosub KILPAR From =NOMPRG
+
+Return
+
+#----------------------------#
+$SELECT
+OK = 0
+Case [F:ARC]TYPEVT
+ When 1 : # Objet
+  If [F:ARC]OBJEVT="" or CODEVT=[F:ARC]OBJEVT
+   OK = 1
+  Endif
+ When 2 : # Etat
+  If [F:ARC]OBJEVT="" or GABREV=[F:ARC]OBJEVT
+   If [F:ARC]RPTEVT="" or CODEVT=[F:ARC]RPTEVT
+    OK = 1
+   Endif
+  Endif
+ When 3 : # Export
+  If [F:ARC]EXPEVT="" or CODEVT=[F:ARC]EXPEVT
+   OK = 1
+  Endif
+ When 4,5,6 : # Trace/Excel/Manuel
+  If [F:ARC]FCTEVT="" or CODEVT=[F:ARC]FCTEVT
+   OK = 1
+  Endif
+Endcase
+If !OK : Return : Endif
+If [F:ARC]TYPDOC="" & [L]TYPPCE=""
+ OK = 0 : MESSA = mess(43,143,1) : # Type de document indéterminé
+ Gosub AFF_MES : Return
+Elsif [F:ARC]TYPDOC<>"" & [L]TYPPCE<>"" & [L]TYPPCE<>[F:ARC]TYPDOC
+ OK = 0 : MESSA = mess(44,143,1)-[L]TYPPCE-"<>"-[F:ARC]TYPDOC : # Type de document
+ Gosub AFF_MES : Return
+Endif
+If [L]TYPPCE<>""
+ [L]TYPDOC = [L]TYPPCE
+Else
+ [L]TYPDOC = [F:ARC]TYPDOC
+Endif
+If [F:ARC]FILTRE<>""
+ ERN = 0
+ FORMULE = format$("KTv2:255X",[F:ARC]FILTRE)
+ Onerrgo  ER
+ OK = evalue(FORMULE)
+ Onerrgo
+ If ERN
+  OK = 0 : Return
+ Elsif !OK
+  OK = 0 : MESSA = FORMULE : Gosub AFF_MES : Return
+ Endif
+Endif
+If [F:ARC]CPY<>""
+ If [F:ARC]FLDCPY<>""
+  ERN = 0
+  FORMULE = format$("KTv2:255X",[F:ARC]FLDCPY)
+  Onerrgo  ER
+  SOCIETE = evalue(FORMULE)
+  Onerrgo
+  If ERN
+   OK = 0 : Return
+  Elsif [F:ARC]CPY<>SOCIETE
+   OK = 0 : MESSA = mess(26,113,1)-[L]SOCIETE-"<>"-[F:ARC]CPY : # Société
+   Gosub AFF_MES : Return
+  Endif
+ Endif
+ If [F:ARC]FLDFCY<>""
+  ERN = 0
+  FORMULE = format$("KTv2:255X",[F:ARC]FLDFCY)
+  Onerrgo  ER
+  SITE = evalue(FORMULE)
+  Onerrgo
+  If ERN
+   OK = 0 : Return
+  Else
+   K = find(SITE,GSITE(1..GNBSITE))
+   If !K
+    OK = 0 : Return
+   Else
+    SOCIETE = GSOCSITE(K)
+    If SOCIETE<>[F:ARC]CPY
+     OK = 0 : MESSA = mess(26,113,1)-[L]SOCIETE-"<>"-[F:ARC]CPY : # Société
+     Gosub AFF_MES : Return
+    Endif
+   Endif
+  Endif
+ Endif
+Endif
+NOMFIC = CHEMIN
+Gosub FICHIER
+If !OK
+ If MESSA<>"" : Gosub AFF_MES : Endif
+ Return
+Endif
+Gosub SET_PREF From SUBARC
+NOMPRG = PREF+[F:ARC]CODARC
+Call EXISTE_ADX("","",NOMPRG,OKTRT) From ORDSYS
+If !OKTRT
+ OK = 0 : MESSA = NOMPRG-mess(90,123,1) : # Traitement inexistant
+ Gosub AFF_MES : Return
+Endif
+Return
+
+#------------------#
+$FICHIER
+FICHIER = ""
+If [F:ARC]FORFIC<>""
+ ERN = 0
+ FORMULE = format$("KTv2:255X",[F:ARC]FORFIC)
+ Onerrgo  ER
+ FICHIER = evalue(FORMULE)
+ Onerrgo
+ If ERN
+  OK = 0
+ Else
+  OK = (FICHIER<>"")                                  : # Nom de fichier <> vide
+  OK *= (FICHIER=vireblc(FICHIER,4))                  : # Pas d'espace
+  OK *= (left$(func GOBJTXT.SETFIC(FICHIER),1)<>".")  : # Ne doit pas comencer par .
+  If !OK
+   MESSA = "\|"+FICHIER-"|: "-mess(35,126,1) : # Nom de fichier incorrect
+  Endif
+ Endif
+Endif
+Return
+
+#------------------#
+$ER
+ERN = errn
+ERM = "|"+errp-"("+num$(errl)+")"-mess(6,123,1)-num$(ERN)-":"-errmes$(ERN)-errm+"|"
+If FORMULE<>""
+ ERM += mess(65,106,1)-FORMULE : # Erreur en évaluation de la formule
+Endif
+Gosub AFF_ERR
+Resume
+
+#------------------#
+$AFF_ERR
+Gosub DEBUG
+If DEBUG
+ Call ECR_TRACE(mess(48,143,1)-[F:ARC]CODARC-":"-func DECODE(ERM),1) From GESECRAN : # Code archivage
+Endif
+Return
+
+#-------------------#
+$AFF_MES
+Gosub DEBUG
+If DEBUG
+ Call ECR_TRACE(mess(48,143,1)-[F:ARC]CODARC-":"-func DECODE(MESSA),0) From GESECRAN : # Code archivage
+Endif
+Return
+
+#------------------#
+$DEBUG
+If !DEBUG : Return : Endif
+If GTRACE=""
+ Call OUVRE_TRACE(mess(45,143,1)) From LECFIC : # Evénements d'archivage
+ TRACE = 1
+Endif
+Return
+
+#----------------------------------------------------------#
+Funprog DECODE(CODE)
+Value Char CODE
+Local Char LIGNE(255)
+Gosub SET_CODE
+LIGNE = CODE
+For I=1 To 4
+ K = instr(1,LIGNE,CX(I))
+ While K
+  LIGNE = left$(LIGNE,K-1)+CA(I)+right$(LIGNE,K+len(CX(I)))
+  K = instr(K,LIGNE,CX(I))
+ Wend
+Next I
+End LIGNE
+
+$SET_CODE
+Local Char CA(1)(1..4) , CX(6)(1..4)
+CA(1) = "<" : CX(1) = "&lt;"
+CA(2) = ">" : CX(2) = "&gt;"
+CA(3) = '"' : CX(3) = "&quot;"
+CA(4) = '&' : CX(4) = "&amp;"
+Return
+
+#------------------#
+$SET_NOMPCE
+Gosub FICHIER
+If left$(FICHIER,1)="\" or pat(left$(FICHIER,3),"!:\")
+ SEP = "\"
+ NOMPCE = FICHIER
+Elsif left$(FICHIER,1)="/"
+ SEP = "/"
+ NOMPCE = FICHIER
+Elsif instr(1,FICHIER,"@")
+ If instr(1,FICHIER,"\")
+  SEP = "\"
+ Elsif instr(1,FICHIER,"/")
+  SEP = "/"
+ Endif
+ NOMPCE = FICHIER
+Else
+ If DIRPCE=""
+  DIRPCE = func AFNC.PARAMUTIL("ARCDIR","","") : # Répertoire EDM
+  If DIRPCE=""
+   DIRPCE = func AFNC.PARAM("DIRPCE","") : # Répertoire pièces jointes
+  Endif
+  If DIRPCE=""
+   DIRPCE = filpath("tmp","","")
+  Else
+   ERN = 0
+   FORMULE = DIRPCE
+   Onerrgo ERFIC
+   DIRPCE = evalue(FORMULE)
+   Onerrgo
+   If ERN
+    DIRPCE = FORMULE
+   Endif
+  Endif
+  If instr(1,DIRPCE,"/")
+   SEP = "/"
+  Elsif instr(1,DIRPCE,"\")
+   SEP = "\"
+  Endif
+  If right$(DIRPCE,len(DIRPCE))="\" or right$(DIRPCE,len(DIRPCE))="/"
+   DIRPCE = left$(DIRPCE,len(DIRPCE)-1)
+  Endif
+ Endif
+ If SEP=""
+  If instr(1,FICHIER,"/")
+   SEP = "/"
+  Elsif instr(1,FICHIER,"\")
+   SEP = "\"
+  Elsif GOS="unix"
+   SEP = "/"
+  Else
+   SEP = "\"
+  Endif
+ Endif
+ If FICHIER=""
+  K = 0
+  For I=len(NOMFIC) To 1 Step -1
+   If find(mid$(NOMFIC,I,1),"\","/") : K = I : Break : Endif
+  Next I
+  If K
+   FICHIER = right$(NOMFIC,K+1)
+  Else
+   FICHIER = NOMFIC
+  Endif
+  FICHIER = GUSER+"_"+format$("D:YYMMDD",date$)+ctrans(time$,":","")+"_"+FICHIER
+ Endif
+ NOMPCE = filpath(DIRPCE+SEP+FICHIER,"","")
+Endif
+If NUFIC>1
+ K = 0
+ For I=len(NOMPCE) To 1 Step -1
+  If mid$(NOMPCE,I,1)=SEP : Break : Endif
+  If mid$(NOMPCE,I,1)="." : K = I : Break : Endif
+ Next I
+ If K
+  NOMPCE = left$(NOMPCE,K-1)+"_"+num$(NUFIC)+right$(NOMPCE,K)
+ Else
+  NOMPCE += "_"+num$(NUFIC)
+ Endif
+Endif
+Return
+
+#----------------------------------#
+Subprog PARAM(SITE,PARAM,DIRPCE)
+Value    Char SITE , PARAM
+Variable Char DIRPCE
+Local File ADOVAL [ADW]
+Call PARAM(SITE,PARAM,DIRPCE) From ADOVAL
+Close Local File [ADW]
+End
+
+#------------------------------------------------------------------------------#
+Subprog CREPCE(OBJET,CLEOBJ,CODFLD,VALFLD,DEBUG,TRACE)
+Value    Char    OBJET
+Value    Char    CLEOBJ
+Value    Char    CODFLD()(1..)
+Value    Char    VALFLD()(1..)
+Value    Integer DEBUG , TRACE
+
+Local Char    PROGOBJ(GLONADC) , CLE(30)(1..16) , CHAINE(250) , DELNAM(GDIMFIC)
+Local Char    SYMBOLE(80) , POSTE(30) , USER(30) , ERM(250) , MESSA(250)
+Local Char    IDNOL(3) , CLE1(GLONID1) , CLE2(GLONID2)
+Local Integer I , J , K , ERN , NBCLE , VERROU , NOL , STAT
+
+If OBJET=""
+ ERM = mess(17,123,1) : # Table non définie
+Elsif CLEOBJ=""
+ ERM = mess(15,124,1)-OBJET
+ ERM += "\"+mess(1,127,1) : # Clé incorrecte
+Endif
+If ERM<>"" : Gosub AFF_ERR : End : Endif
+
+Gosub SET_TYPX3 From GOBJTXT
+
+PROGOBJ = "WO"+OBJET
+Gosub NOMFIC From =PROGOBJ
+Gosub SETCLE From =PROGOBJ
+CHAINE = CLEOBJ
+NBCLE = 0
+While CHAINE<>""
+ NBCLE += 1
+ I = instr(1,CHAINE,"~")
+ If I
+  CLE(NBCLE) = left$(CHAINE,I-1)
+  CHAINE = right$(CHAINE,I+1)
+ Else
+  CLE(NBCLE) = CHAINE
+  CHAINE = ""
+ Endif
+Wend
+If TYPGES=2
+ SYMBOLE = NOMFIC
+Else
+ Case NBCLE
+  When 1
+   SYMBOLE = func GOBJACT.SYMBOLE_VERROU(ABFIC,CLE(1))
+  When Default
+   If TYPGES=3
+    SYMBOLE = func GOBJACT.SYMBOLE_VERROU(ABFIC,CLE(1)+"\"+CLE(2))
+   Else
+    SYMBOLE = func GOBJACT.SYMBOLE_VERROU(ABFIC,CLE(2)+"\"+CLE(1))
+   Endif
+   For I=3 To NBCLE
+    SYMBOLE += "\"+CLE(I)
+   Next I
+ Endcase
+Endif
+Call DEBTRANS From GLOCK
+Gosub VERROU
+If !VERROU
+ Call QUILOCKE(SYMBOLE,POSTE,USER) From OBJDIV
+ ERM = mess(33,115,1)-OBJET-func AFNC.INTABR(OBJET) : # Objet
+ If USER<>""
+  ERM = "\"+USER+"\"+POSTE
+ Endif
+ ERM += "\("+mess(20,100,1)-mess(56,100,1)+" |"+SYMBOLE+"|)" : # Erreur de verrouillage sur Symbole
+ Gosub AFF_ERR : End
+Endif
+ABR = ABFIC
+Gosub OUVFIC From =PROGOBJ
+Gosub DEFAUT From =PROGOBJ
+Raz [F]
+Case NBCLE
+ When 1
+  Case evalue("type([F]"+CLEPRIM+")")
+   When 1,2,4,5,6,7 : Assign "[F]"+CLEPRIM With val(CLE(1))
+   When 3           : Assign "[F]"+CLEPRIM With evalue("["+CLE(1)+"]")
+   When Default     : Assign "[F]"+CLEPRIM With CLE(1)
+  Endcase
+  CLE1 = CLE(1)
+ When Default
+  If TYPGES=3
+   Case evalue("type([F]"+CLEPRIM+")")
+    When 1,2,4,5,6,7 : Assign "[F]"+CLEPRIM With val(CLE(1))
+    When 3           : Assign "[F]"+CLEPRIM With evalue("["+CLE(1)+"]")
+    When Default     : Assign "[F]"+CLEPRIM With CLE(1)
+   Endcase
+   Case evalue("type([F]"+CLESEC(0)+")")
+    When 1,2,4,5,6,7 : Assign "[F]"+CLESEC(0) With val(CLE(2))
+    When 3           : Assign "[F]"+CLESEC(0) With evalue("["+CLE(2)+"]")
+    When Default     : Assign "[F]"+CLESEC(0) With CLE(2)
+   Endcase
+   CLE1 = CLE(1)
+   CLE2 = CLE(2)
+  Else
+   Case evalue("type([F]"+CLESEC(0)+")")
+    When 1,2,4,5,6,7 : Assign "[F]"+CLESEC(0) With val(CLE(1))
+    When 3           : Assign "[F]"+CLESEC(0) With evalue("["+CLE(1)+"]")
+    When Default     : Assign "[F]"+CLESEC(0) With CLE(1)
+   Endcase
+   Case evalue("type([F]"+CLEPRIM+")")
+    When 1,2,4,5,6,7 : Assign "[F]"+CLEPRIM With val(CLE(2))
+    When 3           : Assign "[F]"+CLEPRIM With evalue("["+CLE(2)+"]")
+    When Default     : Assign "[F]"+CLEPRIM With CLE(2)
+   Endcase
+   CLE1 = CLE(2)
+   CLE2 = CLE(1)
+  Endif
+  For I=3 To NBCLE
+   Case evalue("type([F]"+CLESEC(I-2)+")")
+    When 1,2,4,5,6,7 : Assign "[F]"+CLESEC(I-2) With val(CLE(I))
+    When 3           : Assign "[F]"+CLESEC(I-2) With evalue("["+CLE(I)+"]")
+    When Default     : Assign "[F]"+CLESEC(I-2) With CLE(I)
+   Endcase
+   CLE2 += "~"+CLE(I)
+  Next I
+Endcase
+Read [F] =
+If fstat
+ ERM = mess(56,123,1)-NOMFIC : # Table
+ ERM += "\"+CLEOBJ-":"-mess(23,100,1) : # Fiche inexistante
+ Gosub DEVERROU
+ Gosub AFF_ERR : End
+Endif
+If !adxlog
+ Call DEBTRANS From GLOCK
+ Gosub TR1
+Else
+ Gosub MAJFLD
+Endif
+If GOK=1
+ If DELNAM<>""
+  Call EFFACE(DELNAM,STAT) From ORDSYS
+ Endif
+ MESSA = mess(42,143,1)-OBJET+"/"+CLE1-CLE2-[F:AOX]TYPDOC-"|"+[F:AOX]NAM : # Création de la pièce jointe
+ Gosub AFF_MES
+Endif
+Gosub DEVERROU
+End
+
+#-------------#
+$VERROU
+Lock =SYMBOLE With lockwait=0
+If !fstat
+ VERROU = 1
+Else
+ GLOCK = "%"+SYMBOLE
+ Call ROLL From GLOCK
+ If GROLL
+  VERROU = 0
+ Else
+  Goto VERROU
+ Endif
+Endif
+Return
+
+#-------------#
+$DEVERROU
+If SYMBOLE<>""
+ Unlock = SYMBOLE
+Endif
+Return
+
+#-------------#
+$TR1
+Trbegin ADOVAL
+ Gosub MAJFLD
+ If GOK<0 : Goto ROLL_TR1
+ Elsif GOK<1 : Goto AB_TR1
+ Endif
+Commit
+Return
+
+$AB_TR1
+Rollback
+Return
+
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+
+#-------------#
+$MAJFLD
+Default File "["+ABR+"]"
+Readlock [F] Curr
+If fstat=1
+ GOK=-1 : Call FSTA(ABR) From GLOCK : Return
+Elsif fstat
+ GOK=0 : Call FSTA(ABR) From GLOCK : Return
+Endif
+Onerrgo RIEN
+
+# Création de la pièce jointe
+NOL = 0
+For [AOX_] Where ABREV=[L]OBJET & IDENT1=CLE1 & IDENT2=CLE2
+ NOL += 1
+Next AOX_
+IDNOL = format$("N0:3#",NOL+1)
+[F:AOX]ABREV  = OBJET
+[F:AOX]IDENT1 = CLE1
+[F:AOX]IDENT2 = CLE2
+[F:AOX]IDENT3 = IDNOL
+For I=1 To dim(CODFLD)
+ If CODFLD(I)<>"" & VALFLD(I)<>""
+  If CODFLD(I)="NOMPCE"
+   DELNAM = VALFLD(I)
+  Elsif evalue("dim([F:AOX]"+CODFLD(I)+")")>0
+   Case evalue("type([F:AOX]"+CODFLD(I)+")")
+    When 1         : Assign "[F:AOX]"+CODFLD(I) With max(1,val(VALFLD(I)))
+    When 2,4,5,6,7 : Assign "[F:AOX]"+CODFLD(I) With val(VALFLD(I))
+    When 3         : Assign "[F:AOX]"+CODFLD(I) With VALFLD(I)
+    When Default   : Assign "[F:AOX]"+CODFLD(I) With VALFLD(I)
+   Endcase
+  Endif
+ Endif
+Next I
+For I=2 To 5
+ Case I
+  When 2 : If find([F:AOX]MOTCLE(2),[F:AOX]MOTCLE(1))                                                    : [F:AOX]MOTCLE(2) = "" : Endif
+  When 3 : If find([F:AOX]MOTCLE(3),[F:AOX]MOTCLE(1),[F:AOX]MOTCLE(2))                                   : [F:AOX]MOTCLE(3) = "" : Endif
+  When 4 : If find([F:AOX]MOTCLE(4),[F:AOX]MOTCLE(1),[F:AOX]MOTCLE(2),[F:AOX]MOTCLE(3))                  : [F:AOX]MOTCLE(4) = "" : Endif
+  When 5 : If find([F:AOX]MOTCLE(5),[F:AOX]MOTCLE(1),[F:AOX]MOTCLE(2),[F:AOX]MOTCLE(3),[F:AOX]MOTCLE(4)) : [F:AOX]MOTCLE(5) = "" : Endif
+ Endcase
+Next I
+If [F:AOX]NAM=""
+ If ((dim([F:AOX]IDTSTO)>0 & [F:AOX]IDTSTO<>"") or find([F:AOX]TYPDOC,CLOBX3,CLOBXT,BLOBX3))
+  [F:AOX]NAM = func GOBJTXT.SETFIC(DELNAM)
+ Else
+  If left$(DELNAM,2)="#@"
+   [F:AOX]NAM = right$(DELNAM,3)
+  Else
+   [F:AOX]NAM = DELNAM
+  Endif
+  DELNAM = "" : # Il faut conserver le fichier qui n'a pas été archivé dans la base d'archivage
+ Endif
+Endif
+Write [AOX]
+If fstat
+ GOK = 0 : Call FSTA("AOX") From GLOCK : Return
+Endif
+
+# Création du blob ou dun clob
+If find([F:AOX]TYPDOC,CLOBX3,CLOBXT) : # Clob
+ Gosub SET_PCE From GOBJTXT
+ Raz [F:ACB]
+ ERN = 0
+ Onerrgo ERFIC
+ Openi DELNAM Using [A___]
+ Iomode adxifs "" Using [A___]
+ Iomode adxirs "" Using [A___]
+ Iomode adxium GUTF8 Using [A___] : # Par défaut on essaye de lire en utf8
+ Rdseq [F:ACB]CLOB Using [A___]
+ Openi Using [A___]
+ If ERN
+  ERN = 0
+  Openi DELNAM Using [A___]
+  Iomode adxifs "" Using [A___]
+  Iomode adxirs "" Using [A___]
+  Iomode adxium GASCII Using [A___] : # On essaye de lire en ascii
+  Rdseq [F:ACB]CLOB Using [A___]
+  Openi Using [A___]
+  If ERN
+   ERM = mess(12,100,1)-"|"+DELNAM : # Erreur d'accès sur le fichier
+   Gosub AFF_ERR
+  Endif
+ Endif
+ Onerrgo RIEN
+ [F:ACB]NAMBLB = [F:AOX]NAM
+ [F:ACB]TYPDOC = [F:AOX]TYPDOC
+ [F:ACB]CODBLB = CBLOB+OBJET
+ [F:ACB]IDENT1 = CLE1
+ [F:ACB]IDENT2 = CLE2
+ [F:ACB]IDENT3 = IDNOL
+ If dim([F:ACB]CNTTYP)>0 : [F:ACB]CNTTYP=func ASYRLOB.F_ADI902_TO_CNTTYP(CST_ATYPCLOB,nomap,[F:ACB]TYPDOC) : Endif
+ If dim([F:ACB]CREUSR)>0 : [F:ACB]CREUSR = GUSER : Endif
+ If dim([F:ACB]CREDAT)>0 : [F:ACB]CREDAT = date$ : Endif
+ If dim([F:ACB]CRETIM)>0 : [F:ACB]CRETIM = time  : Endif
+ Write [ACB]
+ If fstat
+  GOK = 0 : GLOCK = "$ACLOB"-CBLOB+OBJET-CLE1-CLE2 : Return
+ Endif
+Elsif find([F:AOX]TYPDOC,BLOBX3) : # Blob
+ Gosub SET_PCE From GOBJTXT
+ Raz [F:ABB]
+ ERN = 0
+ Onerrgo ERFIC
+ Openi DELNAM Using [A___]
+ Getseq 1,[F:ABB]BLOB Using [A___]
+ Openi Using [A___]
+ If ERN
+  ERM = mess(12,100,1)-"|"+DELNAM : # Erreur d'accès sur le fichier
+  Gosub AFF_ERR
+ Endif
+ Onerrgo RIEN
+ [F:ABB]NAMBLB = [F:AOX]NAM
+ [F:ABB]CODBLB = CBLOB+OBJET
+ [F:ABB]TYPBLB = 3 : # Image
+ [F:ABB]IDENT1 = CLE1
+ [F:ABB]IDENT2 = CLE2
+ [F:ABB]IDENT3 = IDNOL
+ If dim([F:ABB]CNTTYP)>0 : [F:ABB]CNTTYP=func ASYRLOB.F_AML7806_TO_ATYP([F:ABB]TYPBLB) : Endif
+ If dim([F:ABB]CREUSR)>0 : [F:ABB]CREUSR = GUSER : Endif
+ If dim([F:ABB]CREDAT)>0 : [F:ABB]CREDAT = date$ : Endif
+ If dim([F:ABB]CRETIM)>0 : [F:ABB]CRETIM = time  : Endif
+ Write [ABB]
+ If fstat
+  GOK = 0 : GLOCK = "$ABLOB"-CBLOB+OBJET-CLE1-CLE2 : Return
+ Endif
+Elsif dim([F:AOX]IDTSTO)<1 or [F:AOX]IDTSTO=""
+ DELNAM = ""
+Endif
+
+# Mise à jour des mot-clés
+For K=1 To 5
+ I = find("MOTCLE("+num$(K)+")",CODFLD)
+ If I
+  CHAINE = VALFLD(I)
+  If CHAINE<>""
+   Look [AOM]AOM0=OBJET;CLE1;CLE2;IDNOL;CHAINE
+   If fstat
+    [F:AOM]MOTCLE = CHAINE
+    [F:AOM]ABREV  = OBJET
+    [F:AOM]IDENT1 = CLE1
+    [F:AOM]IDENT2 = CLE2
+    [F:AOM]IDENT3 = IDNOL
+    Write [AOM]
+    If fstat
+     GOK = 0 : Call FSTA("AOM") From GLOCK : Break
+    Endif
+   Endif
+  Endif
+ Endif
+Next K
+Onerrgo
+If GOK<1 : Return : Endif
+Return
+
+$RIEN
+Resume
+
+#----------------------------------------------------------#
+Subprog MAJPCE(CODFLD,VALFLD,DEBUG,TRACE)
+Value    Char    CODFLD()(1..)
+Value    Char    VALFLD()(1..)
+Value    Integer DEBUG , TRACE
+Local Integer I , ER
+Local Char    ERM(250) , MESSA(250)
+If !adxlog
+ Call DEBTRANS From GLOCK
+ Gosub TR2
+Else
+ Gosub MAJFLD2
+Endif
+If ER
+ ERM = mess(154,115,1) : # Pas d'enregistrement courant
+ Gosub AFF_ERR
+Elsif GOK=1
+ MESSA = mess(46,143,1)-[F:AOX]ABREV+"/|"+[F:AOX]IDENT1-[F:AOX]IDENT2-[F:AOX]TYPDOC-[F:AOX]NAM : # Mise à jour de la pièce jointe
+ Gosub AFF_MES
+Endif
+End
+
+#-------------#
+$TR2
+Trbegin ADOVAL
+ Gosub MAJFLD2
+ If GOK<0 : Goto ROLL_TR2
+ Elsif GOK<1 : Goto AB_TR2
+ Endif
+Commit
+Return
+
+$AB_TR2
+Rollback
+Return
+
+$ROLL_TR2
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR2 : Endif
+
+#-------------#
+$MAJFLD2
+Onerrgo ERD
+Readlock [AOX]AOX0 Curr
+If fstat=1
+ GOK=-1 : Call FSTA("AOX") From GLOCK : Return
+Elsif fstat
+ GOK=0 : Call FSTA("AOX") From GLOCK : Return
+Endif
+If ER : Return : Endif
+Onerrgo RIEN
+For I=1 To dim(CODFLD)
+ # Type d'évènement objet -> pas de modification du nom du fichier, du type de document, de la catégorie et des mot-clés
+ If left$(CODFLD(I),6)<>"MOTCLE" & !find(CODFLD(I),"","NAM","NOMPCE","TYPDOC","CAT") & VALFLD(I)<>""
+  If evalue("dim([F:AOX]"+CODFLD(I)+")")>0
+   Case evalue("type([F:AOX]"+CODFLD(I)+")")
+    When 1         : Assign "[F:AOX]"+CODFLD(I) With max(1,val(VALFLD(I)))
+    When 2,4,5,6,7 : Assign "[F:AOX]"+CODFLD(I) With val(VALFLD(I))
+    When 3         : Assign "[F:AOX]"+CODFLD(I) With VALFLD(I)
+    When Default   : Assign "[F:AOX]"+CODFLD(I) With VALFLD(I)
+   Endcase
+  Endif
+ Endif
+Next I
+Onerrgo
+Rewrite [AOX]
+If fstat
+ GOK = 0 : Call FSTA("AOX") From GLOCK : Return
+Endif
+Return
+
+$ERD
+ER = errn
+Resume
+

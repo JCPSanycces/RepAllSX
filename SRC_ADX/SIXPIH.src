@@ -1,0 +1,1667 @@
+#<AdxTL>@(#)7.0.0.0 $Revision$
+#########################################################################
+#  SIXPIH : Migration factures d'achat intégrale --> X3                 #
+# --------------------------------------------------------------------- #
+#                                                                       #
+# Gosub PIH_VERIF                                                       #
+#   Vérifications avant traitement                                      #
+#                                                                       #
+# Gosub PIH_REPRISE                                                     #
+#   Récupération des factures d'achat                                   #
+#                                                                       #
+# func CALNBENR                                                         #
+#   Calcul le nombre d'enregistrements total et restant à traiter       #
+#   Appelé depuis le traitement SUBSIM avec la classe [M:SIM4] chargée  #
+#                                                                       #
+#########################################################################
+
+
+#----- Exécution manuelle de la migration -----#
+Global Integer X_NB, X_TIME
+Local  Integer WNBFAC
+#-----
+Gosub SI_CONTEXT From SIXFONCTION
+#-----
+If !clalev([F:SPX])  Local File =SI_DOSSIER+".SIPARX3"   [SPX] : Endif
+If !clalev([F:SPV])  Local File =SI_DOSSIER+".SIPARVAC"  [SPV] : Endif
+If !clalev([F:SVB])  Local File =SI_DOSSIER+".SIPARVACB" [SVB] : Endif
+Read [SPX] SPX0 First : If fstat  Raz [F:SPX] : Endif
+#-----
+Local File XIEPA [XEPA] Where find(TYPPIE,"FF","AF","AA")<>0
+&                             & FLGMAJ="C"
+&                             & FLGREP<2
+&                             & DATPIE>=[F:SPX]STRPER
+WNBFAC=rowcount([XEPA])
+Close Local File [XEPA]
+#-----
+SI_SIMU=2 : # Simulation de la migration !
+#----- Ouverture de la trace et de la boîte de progression -----#
+Call OUVRE_TRACE("SIXPIH : Process translation file from INTEGRALE to X3") From LECFIC
+Call OUVRE_BOITE(SI_MES(120),WNBFAC) From GESECRAN
+#-----
+Call EXEC From SIXPIH
+#----- Fermeture boîte de progression et lecture trace -----#
+Call FERME_BOITE From GESECRAN
+Call FERME_TRACE From LECFIC
+Call LEC_TRACE   From LECFIC
+#-----
+Kill X_NB, X_TIME
+End
+
+
+############################################################
+# Exécution des actions engendrée par l'import des données #
+############################################################
+$ACTION
+If GPIH_WERR  mkstat=1 : Return : Endif : # Si déjà une erreur, c'est fini !
+Case ACTION
+  When "IMP_DEBUT" : Gosub DEB_GENPIH
+  When "IMP_ZONE"  : Gosub MSK_ENTETE
+  When "IMP_TAB"   : Gosub MSK_DETAIL
+Endcase
+Return
+
+
+#########################################################################
+# Exécution de la migration des factures d'achat appelé :               #
+#   - depuis la fonction de "Lancement migration Intégrale"             #
+#   - manuellement par exécution de ce traitement                       #
+#########################################################################
+Subprog EXEC
+#-----
+Local Char    WMSG(80)
+Local Integer WOK
+Local Integer WNBPIH, WNBERR
+#----- Migration des commandes d'achat -----#
+Call ECR_TRACE(string$(64,"-"),0)     From GESECRAN
+Call ECR_TIME("SIXPIH :"-SI_MES(120)) From DOSSUB
+Call ECR_TRACE(" ",0)                 From GESECRAN
+#-----
+Onerrgo TRT_ERR
+#----- Vérifications avant traitement -----#
+Gosub PIH_VERIF
+#-----
+If WOK  Gosub PIH_REPRISE : Endif
+#-----
+If SI_SIMU=2
+  WMSG="**"-mess(25,133,1)-"**" : # ** Simulation **
+Else
+  WMSG=""
+Endif
+#-----
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TIME("SIXPIH :"-SI_MES(119)-num$(WNBPIH)+"/"+num$(WNBPIH+WNBERR)-WMSG) From DOSSUB
+Call ECR_TRACE(string$(64,"-"),0) From GESECRAN
+#-----
+Onerrgo
+End
+
+
+############################
+# Si une erreur se produit #
+############################
+$TRT_ERR
+Call ECR_TRACE(errp-"("-num$(errl)-") :"-errmes$(errn)-errm, 1) From GESECRAN
+Raz GOK, WOK
+Resume
+
+
+############################################################
+#              Vérifications avant traitement              #
+# -------------------------------------------------------- #
+# Prérequis :                                              #
+#   - Affectation compteur facture ("PIH")                 #
+#   - Affectation compteur avoir   ("PAV")                 #
+#   - Fichier paramètre SIPARX3 [SPX]                      #
+#       Société par défaut [F:SPX]CPY                      #
+#       Site    par défaut [F:SPX]FCY                      #
+#       Devise  par défaut [F:SPX]CUR                      #
+#       Correspondance éléments fact [F:SPX]PFINUM(0-7)    #
+#       Imputation des écarts                              #
+#   - Devise dossier par défaut GSYSCUR                    #
+#   - Structure tarif achat par défaut (code structure="") #
+#       Remise 1 % (article)                               #
+#       Remise 2 % (fournisseur)                           #
+#       Majoration 1 % (article)                           #
+#       Majoration 2 % (fournisseur)                       #
+#   - Motifs tarif                                         #
+#       1 = Saisie manuelle                                #
+#       2 = Remise fournisseur                             #
+#       3 = Tarif article                                  #
+#       4 = Tarif famille article                          #
+#       5 = Tarif sous-famille article                     #
+#   - Vérification cohérence code activité ANA             #
+############################################################
+$PIH_VERIF
+#-----
+Local Integer WERR, WI, WCOL
+WOK=1
+Raz GMESSAGE
+#----- Vérification compteur facture d'achat -----#
+If !clalev([F:TCA])   Local File =SI_DOSSIER+".TABCOUAFF"  [TCA]  : Endif
+Read [TCA] TCA0=6
+If fstat  Raz [F:TCA] : Endif
+If [F:TCA]CODNUM(7)=""
+  WERR=1  : WMSG=mess(8,535,1)  : Gosub PIH_VERIF_ERR : Return
+Elsif [F:TCA]CODNUM(9)=""
+  WERR=1  : WMSG=mess(10,535,1) : Gosub PIH_VERIF_ERR : Return
+Endif
+#----- Vérification société, site et devise issus du paramétrage -----#
+If !clalev([F:CPY])   Local File =SI_DOSSIER+".COMPANY"   [CPY]  : Endif
+If !clalev([F:FCY])   Local File =SI_DOSSIER+".FACILITY"  [FCY]  : Endif
+If !clalev([F:TCU])   Local File =SI_DOSSIER+".TABCUR"    [TCU]  : Endif
+#-----
+If [F:SPX]CPY=""
+  WERR=2  : Gosub PIH_VERIF_ERR : Return
+Endif
+Look [CPY] CPY0=[F:SPX]CPY
+If fstat
+  WERR=2  : Gosub PIH_VERIF_ERR : Return
+Endif
+#-----
+If [F:SPX]FCY=""
+  WERR=3  : Gosub PIH_VERIF_ERR : Return
+Endif
+Read [FCY] FCY0=[F:SPX]FCY
+If fstat
+  WERR=3  : Gosub PIH_VERIF_ERR : Return
+Elsif [F:FCY]FINFLG<>2
+  WERR=4  : Gosub PIH_VERIF_ERR : Return
+Endif
+#-----
+If [F:SPX]CUR=""
+  WERR=5  : Gosub PIH_VERIF_ERR : Return
+Endif
+Look [TCU] TCU0=[F:SPX]CUR
+If fstat
+  WERR=5  : Gosub PIH_VERIF_ERR : Return
+Endif
+#----- Vérification devise dossier -----#
+If dim(GSYSCUR)<1 | GSYSCUR=""
+  WERR=6  : Gosub PIH_VERIF_ERR : Return
+Endif
+#----- Vérification correspondance éléments de facturation -----#
+If !clalev([F:PFI])   Local File =SI_DOSSIER+".PFOOTINV"   [PFI]  : Endif
+For WI=1 To 8
+  WMSG=SI_MES(97+WI)-num$([F:SPX]PFINUM(WI-1))
+  Case WI
+    When 1,2,3,4,7,8 : #----- Frais en montant -----#
+      If [F:SPX]PFINUM(WI-1)<>0
+        Filter [PFI] Where ENAFLG=2 & AMTCOD=2 & INCDCR=1 & DACLIN=1
+        Look [PFI] PFI0=[F:SPX]PFINUM(WI-1)
+        Filter [PFI]
+        If fstat  WERR=7 : Gosub PIH_VERIF_ERR : Break : Endif
+      Endif
+    When 5           : #----- Remise en montant -----#
+      If [F:SPX]PFINUM(WI-1)<>0
+        Filter [PFI] Where ENAFLG=2 & AMTCOD=2 & INCDCR=2 & DACLIN=1
+        Look [PFI] PFI0=[F:SPX]PFINUM(WI-1)
+        Filter [PFI]
+        If fstat  WERR=7 : Gosub PIH_VERIF_ERR : Break : Endif
+      Endif
+    When 6           : #----- Escompte en pourcentage -----#
+      If [F:SPX]PFINUM(WI-1)=0
+        WERR=8 : Gosub PIH_VERIF_ERR : Break
+      Else
+        Filter [PFI] Where ENAFLG=2 & AMTCOD=1 & INCDCR=2 & DACORD=2
+        Look [PFI] PFI0=[F:SPX]PFINUM(WI-1)
+        Filter [PFI]
+        If fstat  WERR=7 : Gosub PIH_VERIF_ERR : Break : Endif
+      Endif
+  Endcase
+Next WI
+If !WOK  Return : Endif
+#----- Vérification imputation des écarts -----#
+If [F:SPX]PFINUM1<>0
+  Filter [PFI] Where ENAFLG=2 & AMTCOD=2 & INCDCR=1 & DACLIN=1 & DACORD=1
+  Look [PFI] PFI0=[F:SPX]PFINUM1
+  Filter [PFI]
+  If fstat  WMSG=num$([F:SPX]PFINUM1) : WERR=7 : Gosub PIH_VERIF_ERR : Return : Endif
+Else
+  WERR=9 : Gosub PIH_VERIF_ERR : Return
+Endif
+#-----
+If [F:SPX]PFINUM2<>0
+  Filter [PFI] Where ENAFLG=2 & AMTCOD=2 & INCDCR=2 & DACLIN=1 & DACORD=1
+  Look [PFI] PFI0=[F:SPX]PFINUM2
+  Filter [PFI]
+  If fstat  WMSG=num$([F:SPX]PFINUM2) : WERR=7 : Gosub PIH_VERIF_ERR : Return : Endif
+Else
+  WERR=9 : Gosub PIH_VERIF_ERR : Return
+Endif
+#----- Vérification structure tarif (code tarif = "") -----#
+If !clalev([F:PRS])   Local File =SI_DOSSIER+".PRICSTRUCT" [PRS]  : Endif
+Read [PRS] PRS0=2;""
+If fstat
+  WERR=10 : Gosub PIH_VERIF_ERR : Return
+Endif
+#----- Vérification correspondance colonnes structure tarif achat -----#
+For WI=0 To 3
+  WCOL=[F:SPX]DISCRGACH(WI)
+  If WCOL<0 | WCOL>dim([F:PRS]INCDCR)
+    WERR=13 : Gosub PIH_VERIF_ERR : Break
+  Endif
+  If WCOL<>0
+    If !find([F:PRS]VALTYP(WCOL-1),2,3) | [F:PRS]CLCRUL(WCOL-1)<>1 | [F:PRS]NPRNOTFLG(WCOL-1)<>2
+      WERR=13 : Gosub PIH_VERIF_ERR : Break
+    Endif
+    Case WI+1
+      When 1,2 : If [F:PRS]INCDCR(WCOL-1)<>2  WERR=13 : Gosub PIH_VERIF_ERR : Break : Endif
+      When 3,4 : If [F:PRS]INCDCR(WCOL-1)<>1  WERR=13 : Gosub PIH_VERIF_ERR : Break : Endif
+    Endcase
+  Endif
+Next WI
+If !WOK  Return : Endif
+#----- Vérification motifs tarifs fournisseurs -----#
+If !clalev([F:PPR])   Local File =SI_DOSSIER+".PPREASON"   [PPR]  : Endif
+For WI=1 To 5
+  Read [PPR] PPR0=WI
+  If fstat
+    WMSG="("+num$(WI)+"="+SI_MES(80+WI)+")"
+    WERR=11 : Gosub PIH_VERIF_ERR
+  Endif
+Next WI
+If !WOK  Return : Endif
+#----- Vérification cohérence nbre d'axes définis dans "Intégrale" et code activité ANA -----#
+Call VARGLOBANA(WMSG,WERR) From SIXGAS
+If WERR
+  WERR=12 : Gosub PIH_VERIF_ERR
+Endif
+If !WOK  Return : Endif
+#-----
+Return
+
+
+#---------------------------------------#
+# Erreurs détectées par la vérification #
+#---------------------------------------#
+$PIH_VERIF_ERR
+Case WERR
+  When  1 : GMESSAGE=WMSG+","-mess(12,114,1)            : # Facture, Compteur inexistant
+  When  2 : GMESSAGE='"'+[F:SPX]CPY+'"'-mess(16,104,1)  : # "xxx" Société inexistante
+  When  3 : GMESSAGE='"'+[F:SPX]FCY+'"'-mess(15,104,1)  : # "xxx" Site inexistant
+  When  4 : GMESSAGE='"'+[F:SPX]FCY+'"'-SI_MES(126)     : # "xxx" Le site n'EST pas un site financier !
+  When  5 : GMESSAGE='"'+[F:SPX]CUR+'"'-mess(151,105,1) : # "xxx" Devise inexistante
+  When  6 : GMESSAGE="GSYSCUR"-mess(12,116,1)           : # GSYSCUR Devise inexistante
+  When  7 : GMESSAGE=WMSG-":"-SI_MES(107)               : # xxxxxxxxxx 99 : Elément de facturation non conforme
+  When  8 : GMESSAGE=SI_MES(103)-":"-SI_MES(110)        : # Escompte : Correspondance non renseignée
+  When  9 : GMESSAGE=mess(524,197,1)                    : # Elément(s) pour gestion des écarts non renseigné(s) !
+  When 10 : GMESSAGE=SI_MES(79)                         : # Structure tarifs fournisseurs inexistante ou erronée
+  When 11 : GMESSAGE=SI_MES(80)-WMSG                    : # Motif tarif inexistant
+  When 12 : GMESSAGE=WMSG                               : # Erreur dimensionnement code activité ANA
+  When 13 : GMESSAGE=SI_MES(208)                        : # Correspondance structure tarifs achats erronée
+Endcase
+Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+WOK=0
+Return
+
+
+#########################################################################
+#                    Reprise des commandes d'achat                      #
+# --------------------------------------------------------------------- #
+# WTRA : Indicateur trace détaillée                                     #
+#         1 = Trace normale                                             #
+#         2 = Trace détaillée (+ Warning et no des pièces traitées)     #
+#         3 = Super détaillée (+ détail des actions pour mise au point) #
+#         4 = Hyper détaillée (+ détail des champs pour mise au point)  #
+#########################################################################
+$PIH_REPRISE
+Raz WERR, WNBPIH, WNBERR
+#----- Variables locales -----#
+Local  Integer  SAV_GIMPORT   : SAV_GIMPORT=GIMPORT
+Local  Integer  SAV_NBLIG
+Local  Integer  WTRA          : WTRA=2 : # Trace (2=Détaillée, 3=Super détaillée, 4=Hyper détaillée)
+Local  Integer  OK            : OK=1
+Local  Integer  I
+Local  Char     WTRT(GLONADC) : WTRT="SIXPIH"
+Local  Char     ACTION(30)
+Local  Char     WPGM(GLONADC)
+Local  Char     WMSG2(40)
+Local  Char     WMESSAGE(100)
+Local  Char     WPAYS(GLONCRY)
+Local  Integer  WNUMORD
+Local  Char     WLETRLQ(1)
+Local  Char     ABREV(5)
+#-----
+Global Integer  GPIH_WTRA : GPIH_WTRA=WTRA
+Global Integer  GPIH_WERR : GPIH_WERR=WERR
+Global Integer  GPIH_WCOD : # La présence de cette globale est testée en AM_BPR du SUBPIH
+#----- Ouverture masques écrans si nécessaire -----#
+If !clalev([M:PIH0])  Local Mask =SI_DOSSIER+".PIH0"       [PIH0] : Endif
+If !clalev([M:PIH1])  Local Mask =SI_DOSSIER+".PIH1"       [PIH1] : Endif
+If !clalev([M:PIH3])  Local Mask =SI_DOSSIER+".PIH3"       [PIH3] : Endif
+If !clalev([M:PIH4])  Local Mask =SI_DOSSIER+".PIH4"       [PIH4] : Endif
+If !clalev([M:AD66])  Local Mask =SI_DOSSIER+".ADRBPR"     [AD66] : Endif
+If !clalev([M:AD67])  Local Mask =SI_DOSSIER+".ADRBPR"     [AD67] : Endif
+If !clalev([M:PCEZ])  Local Mask =SI_DOSSIER+".PCEE"       [PCEZ] : Endif
+If !clalev([M:PCIW])  Local Mask =SI_DOSSIER+".PCRITINV"   [PCIW] : Endif
+If !clalev([M:ACL])   Local Mask =SI_DOSSIER+".ACLOB"      [ACL]  : Endif
+#-----
+Raz [M:PIH0], [M:PIH1], [M:PIH3], [M:PIH4], [M:AD66], [M:AD67], [M:PCEZ], [M:PCIW]
+#----- Globales pour correspondance taxes "Intégrale" vers X3 -----#
+Global Integer  GPIH_CODTVA  (dim([M:PIH4]TAX)) : # Codes taxe "Intégrale"
+Global Decimal  GPIH_BASHTTVA(dim([M:PIH4]TAX)) : # Bases calcul taxe
+Global Decimal  GPIH_MNTTVA  (dim([M:PIH4]TAX)) : # Montants taxe
+Global Char     GPIH_CODEXO(GLONVAT)
+Global Char     GPIH_CODPAY(3)                  : # Code pays (fournisseur ou ligne adresse)
+Global Char     GPIH_TAX(GLONVAT)
+#----- Codes taxes X3 issus ligne article, l'indice est le code TVA intégrale -----#
+Global Char     GPIH_VAT1(GLONVAT)(10)
+#----- Définition des variables de l'objet -----#
+Raz GPTRNUM, GCLE
+GIMPORT=1
+ABREV ="PIH"
+GABREV="PIH"
+ACTION="DEFVAR" : WPGM="GOBJET"  : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub DEFVAR  From GOBJET
+WINPROG="WGOPIH"
+# sr 02.12 Demande 80297
+# Issue 81372 - 2012-05-04 by SR
+Call ISWINDOWOK (nomap,"OPIH") From INTRUTILB
+#----- Ouverture des tables de l'objet PIH et appel des actions OUVRE -----#
+ACTION="OUVRE"  : WPGM="SIXPIH"  : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub OUVRE
+#-----
+OK=1
+ACTION="OUVRE"  : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB
+If !OK  WERR=1 : Goto FINPIH_REPRISE : Endif
+#----- Ouverture des tables "Intégrale" -----#
+If !clalev([F:XEPA])  Local File =SI_DOSSIER+".XIEPA"      [XEPA] : Endif
+If !clalev([F:XLPA])  Local File =SI_DOSSIER+".XILPA"      [XLPA] : Endif
+If !clalev([F:XLAD])  Local File =SI_DOSSIER+".XILPAADR"   [XLAD] : Endif
+If !clalev([F:XLAN])  Local File =SI_DOSSIER+".XILPAANA"   [XLAN] : Endif
+If !clalev([F:XLTX])  Local File =SI_DOSSIER+".XILPATXT"   [XLTX] : Endif
+If !clalev([F:XLEM])  Local File =SI_DOSSIER+".XILPAEMB"   [XLEM] : Endif
+If !clalev([F:XLPO])  Local File =SI_DOSSIER+".XILPAPOR"   [XLPO] : Endif
+If !clalev([F:XLFD])  Local File =SI_DOSSIER+".XILPAFADIV" [XLFD] : Endif
+If !clalev([F:XLFF])  Local File =SI_DOSSIER+".XILPAFAFIX" [XLFF] : Endif
+If !clalev([F:XLRE])  Local File =SI_DOSSIER+".XILPAREM"   [XLRE] : Endif
+If !clalev([F:XLF1])  Local File =SI_DOSSIER+".XILPAFSPF1" [XLF1] : Endif
+If !clalev([F:XLF2])  Local File =SI_DOSSIER+".XILPAFSPF2" [XLF2] : Endif
+If !clalev([F:XFOU])  Local File =SI_DOSSIER+".XIFOU"      [XFOU] : Endif
+If !clalev([F:XETV])  Local File =SI_DOSSIER+".XIEPATVA"   [XETV] : Endif
+If !clalev([F:XLTV])  Local File =SI_DOSSIER+".XILPATVA"   [XLTV] : Endif
+If !clalev([F:XLTP])  Local File =SI_DOSSIER+".XILPATPF"   [XLTP] : Endif
+If !clalev([F:XART])  Local File =SI_DOSSIER+".XIART"      [XART] : Endif
+If !clalev([F:XACT])  Local File =SI_DOSSIER+".XIARTCDT"   [XACT] : Endif
+#-----
+SI_SUBPRG="SIXPIH"
+SI_TABLE="XIEPA"
+Gosub SI_CRITSUP From SIXFONCTION
+#----- Boucle de création des factures d'achat X3 -----#
+For [XEPA] IND0 Where find(TYPPIE,"FF","AF","AA")<>0
+&                   & FLGMAJ="C"
+&                   & FLGREP<2
+&                   & DATPIE>=[F:SPX]STRPER
+&                   & evalue(SI_CRITERE)
+  Gosub GENPIH
+  GIMPORT=0
+  Call AFFBOITE(WMSG2) From SUBSIM
+  GIMPORT=1
+  If WERR
+    WNBERR+=1 : # Compteurs des factures non reprises
+  Else
+    WNBPIH+=1 : # Compteur des factures créées
+  Endif
+  If WTRA>1
+    WMESSAGE="**********"-WMSG2-":"
+    If WERR         : #----- *** CF 99 999999 : Pièce non générée
+      Call ECR_TRACE(WMESSAGE-mess(35,117,1),0) From GESECRAN
+    Else
+      If PIHTYP<3   : #----- *** CF 99 999999 : Facture xxxxxxxxxxxxxxx créée !
+        WMESSAGE-=vireblc(mess(8,535,1),2)-[F:PIH]NUM-mess(224,197,1)
+      Else          : #----- *** CF 99 999999 : Avoir xxxxxxxxxxxxxxx créé !
+        WMESSAGE-=vireblc(mess(10,535,1),2)-[F:PIH]NUM-mess(233,197,1)
+      Endif
+      If SI_SIMU=2  WMESSAGE-="**"-mess(25,133,1)-"**" : Endif
+      Call ECR_TRACE(WMESSAGE,0) From GESECRAN
+    Endif
+  Elsif WERR        : #----- *** CF 99 999999 : Pièce non générée
+    WMESSAGE="**********"-WMSG2-":"
+    Call ECR_TRACE(WMESSAGE-mess(35,117,1),0) From GESECRAN
+  Endif
+Next
+#-----
+$FINPIH_REPRISE
+ACTION="FERME"  : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB
+Kill GPIH_WTRA, GPIH_WERR, GPIH_CODTVA, GPIH_BASHTTVA, GPIH_MNTTVA, GPIH_WCOD, GPIH_CODEXO
+Kill GPIH_CODPAY, GPIH_TAX, GPIH_VAT1
+GIMPORT=SAV_GIMPORT
+Return
+
+
+#######################################
+# Génération d'une facture d'achat X3 #
+#######################################
+$GENPIH
+OK=1
+Raz WERR, GPIH_WERR
+#WMSG2=num$([F:XEPA]NUMORD)-[F:XEPA]LETRLQNUMORD                        : # C'est la vrai clé
+WMSG2=[F:XEPA]TYPPIE+[F:XEPA]NUMSER+[F:XEPA]NUMPIE+[F:XEPA]LETRLQNUMPIE : # C'est le numéro de pièce
+WNUMORD=[F:XEPA]NUMORD
+WLETRLQ=[F:XEPA]LETRLQNUMORD
+#-----
+Raz [M:PIH0], [M:PIH1], [M:PIH3], [M:PIH4], [M:AD66], [M:AD67], [M:PCEZ], [M:PCIW]
+Raz GPIH_CODTVA, GPIH_BASHTTVA, GPIH_MNTTVA, GPIH_VAT1
+GREP="C"
+ACTION="RAZCRE" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB : If !OK  WERR=1 : Return : Endif
+#-----
+OK=1
+ACTION="IMP_DEBUT" : WPGM=WTRT   : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From =WTRT   : If !OK  WERR=1 : Return : Endif
+SAV_NBLIG=[M:PIH3]NBLIG
+[M:PIH3]NBLIG=0
+#----- Chargement masques écrans -----#
+ACTION="IMP_ZONE(SAIMSK)" : WPGM="W0PIH0" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Default Mask [PIH0] : Call SAIMSK("PIH","IMP_ZONE",WTRT) From W0PIH0
+If mkstat | GPIH_WERR  WERR=1 : Return : Endif
+ACTION="IMP_ZONE(SAIMSK)" : WPGM="W0PIH1" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Default Mask [PIH1] : Call SAIMSK("PIH","IMP_ZONE",WTRT) From W0PIH1
+If mkstat | GPIH_WERR  WERR=1 : Return : Endif
+#----- Ecran lignes -----#
+[M:PIH3]NBLIG=SAV_NBLIG
+#----- Avertissement : L'article n'est pas référencé chez le fournisseurs -----#
+If GITMBPS=2  & WTRA<3
+  GITMBPS=3 : # Pour ne pas imprimer le message d'information dans la trace !
+Endif
+#-----
+ACTION="IMP_TAB(SAIMSK)"  : WPGM="W0PIH3" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Default Mask [PIH3] : Call SAIMSK("PIH","IMP_TAB" ,WTRT) From W0PIH3
+If mkstat | GPIH_WERR  WERR=1 : Return : Endif
+#----- Ecran contrôle -----#
+ACTION="IMP_ZONE(SAIMSK)" : WPGM="W0PIH4" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Default Mask [PIH4] : Call SAIMSK("PIH","IMP_ZONE",WTRT) From W0PIH4
+If mkstat | GPIH_WERR  WERR=1 : Return : Endif
+#----- Point d'entrée pour gestion champs ou écrans supplémentaires spécifiques -----#
+GPOINT="ALIMSKPIH" : Gosub ENTREE From EXEFNC
+If mkstat | GPIH_WERR  WERR=1 : Return : Endif
+#----- Récupération des informations CEE -----#
+If GACTDEB=2 & ([F:XEPA]ASJTVA="C" | [F:XEPA]DLRTVA="O")
+  If WTRA>2
+    ACTION="RECUP_INFOCEE" : WPGM="SIXPIH" : Gosub TRACE_DETAILLEE
+  Endif
+  Gosub RECUP_INFOCEE
+  If mkstat | GPIH_WERR  WERR=1 : Return : Endif
+Endif
+#----- Récupération des champs adresse si nécessaire -----#
+If WTRA>2
+  ACTION="RECUP_ADRESSE" : WPGM="SIXPIH" : Gosub TRACE_DETAILLEE
+Endif
+Gosub RECUP_ADRESSE
+If mkstat | GPIH_WERR  WERR=1 : Return : Endif
+#----- Récupération des textes entête et lignes -----#
+If WTRA>2
+  ACTION="RECUP_TEXTE"   : WPGM="SIXPIH" : Gosub TRACE_DETAILLEE
+Endif
+Gosub RECUP_TEXTE
+If mkstat | GPIH_WERR  WERR=1 : Return : Endif
+#----- Génération de la facture X3 proprement dite -----#
+OK=1
+ACTION="VERIF_CRE" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB : If !OK  WERR=1 : Return : Endif
+Call DEBTRANS From GLOCK
+#-----
+$TR_GENPIH
+GOK=1
+If WTRA>2
+  ACTION="Trbegin [PIH], [PIV], [PID]" : WPGM="" : Gosub TRACE_DETAILLEE
+Endif
+Trbegin [PIH], [PIV], [PID]
+  Raz [F:PIH], [F:PIV], [F:PID]
+  [F:PIH]=[M:PIH0]
+  [F:PIH]=[M:PIH1]
+  [F:PIH]=[M:PIH3]
+  [F:PIH]=[M:PIH4]
+  If dim([F:PIH]CREDAT)>0  [F:PIH]CREDAT=date$     : Endif
+  If dim([F:PIH]CRETIM)>0  [F:PIH]CRETIM=time      : Endif
+  If dim([F:PIH]CREUSR)>0  [F:PIH]CREUSR=GUSER     : Endif
+  If dim([F:PIH]EXPNUM)>0  [F:PIH]EXPNUM=[C]EXPORT : Endif
+  Default File [PIH]
+  ACTION="INICRE"   : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+  Gosub ACTION From GOBJSUB
+  If GOK<0  Goto ROLL_GENPIH  Elsif !GOK  Goto AB_GENPIH : Endif
+  #----- Chargement numéro correspondant à la facture "Intégrale" -----#
+  If dim([F:PIH]SINUM)>0  [F:PIH]SINUM=WMSG2 : Endif
+  #-----
+  If [F:XEPA]FLGMAJ="C"  [F:PIH]STA=3    : Endif : # Statut "Validée"
+  #----- Il faut récupérer la date d'échéance car elle peut être écrasée -----#
+  If [F:XEPA]DATECH1<>[0/0/0]
+    [M:PIH1]STRDUDDAT=[F:XEPA]DATECH1
+    [F:PIH]STRDUDDAT =[F:XEPA]DATECH1
+  Endif
+  #-----
+  If WTRA>2
+    ACTION="Write [PIH]" : WPGM="" : Gosub TRACE_DETAILLEE
+  Endif
+  SI_TABLE="PINVOICE" : Gosub SI_BEFWRI From SIXFONCTION
+  Write [PIH]
+  If fstat  GOK=0 : Call FSTA("PIH")  From GLOCK : Goto AB_GENPIH : Endif
+  ACTION="CREATION" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+  Gosub ACTION From GOBJSUB
+  If GOK<0  Goto ROLL_GENPIH  Elsif !GOK  Goto AB_GENPIH : Endif
+  #----- Mise à jour indicateur "traité" sur entête facture "Intégrale" -----#
+  If WTRA>2
+    ACTION="Update [XEPA]" : WPGM="" : Gosub TRACE_DETAILLEE
+  Endif
+  Update [XEPA] Where NUMORD=WNUMORD & LETRLQNUMORD=WLETRLQ With FLGREP=2
+  If fstat  GOK=0 : Call FSTA("XEPA") From GLOCK : Goto AB_GENPIH : Endif
+  #-----
+  If WTRA>2
+    ACTION="Commit" : WPGM="" : Gosub TRACE_DETAILLEE
+  Endif
+  #-----
+  If SI_SIMU=2
+    Rollback
+  Else
+    Commit
+  Endif
+#-----
+ACTION="APRES_CRE" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB
+Return
+#-----
+$ROLL_GENPIH
+If WTRA>2
+  ACTION="Rollback" : WPGM="" : Gosub TRACE_DETAILLEE
+Endif
+Rollback
+Call ROLL From GLOCK
+If GROLL
+  ACTION="AB_CREATION" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+  Gosub ACTION From GOBJSUB : WERR=1 : Return
+Else
+  Goto TR_GENPIH
+Endif
+#-----
+$AB_GENPIH
+If WTRA>2
+  ACTION="Rollback" : WPGM="" : Gosub TRACE_DETAILLEE
+Endif
+Rollback
+ACTION="AB_CREATION" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB : WERR=1 : Return
+#-----
+
+
+################################################################
+# Traitement à effectuer avant le chargement des champs écrans #
+# ------------------------------------------------------------ #
+# - Boucle sur les lignes de la commande "Intégrale"           #
+#     [M:PIH3]LINORI(indice) = numéro d'ordre  "Intégrale"     #
+#     [M:PIH3]NUMORI(indice) = lettre reliquat "Intégrale"     #
+#     [M:PIH3]SEQORI(indice) = numéro de ligne "Intégrale"     #
+################################################################
+DEB_GENPIH
+#----- Boucle sur les lignes de la commande "Intégrale" -----#
+For [XLPA] IND0 Where NUMORD=[F:XEPA]NUMORD & LETRLQ=[F:XEPA]LETRLQNUMORD & TYPLIG="L"
+  [M:PIH3]LINORI([M:PIH3]NBLIG)=[F:XLPA]NUMORD
+  [M:PIH3]NUMORI([M:PIH3]NBLIG)=[F:XLPA]LETRLQ
+  [M:PIH3]SEQORI([M:PIH3]NBLIG)=[F:XLPA]NUMLIG
+  [M:PIH3]NBLIG+=1
+Next
+#----- Vérif nbre de ligne uniquement si trace détaillée -----#
+If GPIH_WTRA>1
+  #----- Comptage des textes de la commande "Intégrale" -----#
+  Raz WI
+  For [XLTX] IND0 Where NUMORD=[F:XEPA]NUMORD
+&                     & LETRLQ=[F:XEPA]LETRLQNUMORD
+&                     & TYPLIG="T"
+    WI+=1
+  Next
+  #----- Contrôle nombre de lignes -----#
+  If [M:PIH3]NBLIG<>[F:XEPA]NBRLIG-WI
+    GPIH_WERR=1 : Gosub PIH_REPRISE_WARNING
+  Endif
+Endif
+Return
+
+
+#############################################
+#     Récupération des informations CEE     #
+# ----------------------------------------- #
+# [M:PCEZ]EECNAT : Nature de la transaction #
+# [M:PCEZ]EECSCH : Régime CEE               #
+# [M:PCEZ]EECTRN : Mode de transport CEE    #
+# [M:PCEZ]EECICT : Incoterm                 #
+# [M:PCEZ]EECLOC : Lieu de transport CEE    #
+# ----------------------------------------- #
+# Ces infos n'étant pas primordiales,       #
+# le contrôle d'existence dans les tables   #
+#   TABEECSCH [TEE] TEE0=[M:PCEZ]EECSCH     #
+#   ATABDIV   [ADI] CODE=6;[M:PCEZ]EECNAT   #
+# n'est pas effectué !                      #
+#                                           #
+# Attention : si un "puriste" veut ajouter  #
+#   les contrôles, il faudra mettre         #
+#   l'ouverture de la table TABEECSCH dans  #
+#   la section $OUVRE de ce traitement.     #
+#############################################
+$RECUP_INFOCEE
+#----- Contrôle si type de régime de taxe est bien CEE ? -----#
+If [M:PIH1]VACTYP<>4
+  GPIH_WERR=7 : Gosub PIH_REPRISE_WARNING
+Endif
+#----- Récupération Nature de transaction -----#
+If [F:XEPA]CODTST<>0
+  [M:PCEZ]EECNAT=mid$("000",1,3-len(num$([F:XEPA]CODTST)))+num$([F:XEPA]CODTST)
+Endif
+#----- Récupération Code régime CEE -----#
+If [F:XEPA]CODREG<>0
+  [M:PCEZ]EECSCH=mid$("00" ,1,2-len(num$([F:XEPA]CODREG)))+num$([F:XEPA]CODREG)
+Endif
+#-----
+Return
+
+
+#################################################
+# Récupération des champs adresse si nécessaire #
+#################################################
+$RECUP_ADRESSE
+If [F:XLAD]TYPLIG="A"
+  If [F:XFOU]CODFOU<>[F:XEPA]CODFOU
+    Read [XFOU] IND0=[F:XEPA]CODFOU : If fstat  Raz [F:XFOU] : Endif
+  Endif
+  If [F:XFOU]TIERGL<>"" | [F:XEPA]CODFOU<>[F:XEPA]FOURGL
+    Raz [F:XLAD]
+  Endif
+Else
+  If [F:XEPA]CODFOU<>[F:XEPA]FOURGL
+    If [F:XFOU]CODFOU<>[F:XEPA]FOURGL
+      Read [XFOU] IND0=[F:XEPA]FOURGL : If fstat  Raz [F:XFOU] : Endif
+    Endif
+    If [F:XFOU]CODFOU<>""
+      [F:XLAD]TYPLIG ="A"
+      [F:XLAD]NOMFOU =[F:XFOU]NOM
+      [F:XLAD]ADRFOU1=[F:XFOU]ADR1
+      [F:XLAD]ADRFOU2=[F:XFOU]ADR2
+      [F:XLAD]ADRFOU3=[F:XFOU]ADR3
+      [F:XLAD]CODPST =[F:XFOU]CODPST
+      [F:XLAD]VIL    =[F:XFOU]VIL
+      [F:XLAD]CODPAY =[F:XFOU]CODPAY
+    Endif
+  Else
+    If [F:XFOU]CODFOU<>[F:XEPA]CODFOU
+      Read [XFOU] IND0=[F:XEPA]CODFOU : If fstat  Raz [F:XFOU] : Endif
+    Endif
+    If [F:XFOU]TIERGL<>""
+      GBIDC2=[F:XFOU]TIERGL
+      If [F:XFOU]CODFOU<>GBIDC2
+        Read [XFOU] IND0=GBIDC2 : If fstat  Raz [F:XFOU] : Endif
+      Endif
+      If [F:XFOU]CODFOU<>""
+        [F:XLAD]TYPLIG ="A"
+        [F:XLAD]NOMFOU =[F:XFOU]NOM
+        [F:XLAD]ADRFOU1=[F:XFOU]ADR1
+        [F:XLAD]ADRFOU2=[F:XFOU]ADR2
+        [F:XLAD]ADRFOU3=[F:XFOU]ADR3
+        [F:XLAD]CODPST =[F:XFOU]CODPST
+        [F:XLAD]VIL    =[F:XFOU]VIL
+        [F:XLAD]CODPAY =[F:XFOU]CODPAY
+      Endif
+    Endif
+  Endif
+Endif
+If [F:XLAD]TYPLIG="A"
+  #----- Lecture du business partner si nécessaire -----#
+  If [F:BPR]BPRNUM<>[M:PIH0]BPR
+    Read [BPR] BPR0=[M:PIH0]BPR
+    If fstat  Raz [F:BPR] : Endif
+  Endif
+  #----- Lecture du fournisseur si nécessaire -----#
+  If [F:BPS]BPSNUM<>[M:PIH0]BPR
+    Read [BPS] BPS0=[M:PIH0]BPR
+    If fstat  Raz [F:BPS] : Endif
+  Endif
+  #-----
+  [M:AD66]ADBBPR      =[M:PIH0]BPR
+  [M:AD66]BPAADD      =[F:BPS]BPAADD
+  #----- Lecture de l'adresse du business partner si nécessaire -----#
+  If [F:BPA]BPATYP<>1 | [F:BPA]BPANUM<>[M:PIH0]BPR | [F:BPA]BPAADD<>[F:BPS]BPAADD
+    Read [BPA] BPA0=1;[M:PIH0]BPR;[F:BPS]BPAADD
+    If fstat  Raz [F:BPA] : Endif
+  Endif
+  #----- Chargement des champs adresse avec les valeurs par défaut -----#
+  [M:AD66]BPRNAM(0)   =[F:BPR]BPRNAM(0)
+  [M:AD66]BPRNAM(1)   =[F:BPR]BPRNAM(1)
+  [M:AD66]BPAADDLIG(0)=[F:BPA]BPAADDLIG(0)
+  [M:AD66]BPAADDLIG(1)=[F:BPA]BPAADDLIG(1)
+  [M:AD66]BPAADDLIG(2)=[F:BPA]BPAADDLIG(2)
+  [M:AD66]CRY         =[F:BPA]CRY
+  [M:AD66]CRYNAM      =[F:BPA]CRYNAM
+  [M:AD66]SAT         =[F:BPA]SAT
+  [M:AD66]POSCOD      =[F:BPA]POSCOD
+  [M:AD66]CTY         =[F:BPA]CTY
+  #----- Chargement des champs adresse avec les valeurs trouvées dans "Intégrale" -----#
+  [M:AD66]BPRNAM(0)   =[F:XLAD]NOMFOU
+  [M:AD66]BPAADDLIG(0)=[F:XLAD]ADRFOU1
+  [M:AD66]BPAADDLIG(1)=[F:XLAD]ADRFOU2
+  [M:AD66]BPAADDLIG(2)=[F:XLAD]ADRFOU3
+  [M:AD66]POSCOD      =[F:XLAD]CODPST
+  [M:AD66]CTY         =[F:XLAD]VIL
+  [M:AD66]ADBFLG      =2
+  #----- Récupération du code pays X3 et de son libellé traduisible -----#
+  WPAYS=func SIXFONCTION.SI_COR("XIPAY",[F:XLAD]CODPAY,"TABCOUNTRY","")
+  If WPAYS<>""
+    If [M:AD66]CRY<>WPAYS
+      If [F:TCY]CRY<>WPAYS
+        Read [TCY] TCY0=WPAYS : If fstat  Raz [F:TCY] : Endif
+      Endif
+      [M:AD66]CRY=WPAYS
+      Call GET_ATEXTRA("TABCOUNTRY","CRYDES",[F:BPR]LAN,[M:AD66]CRYNAM) From TRTX3TEX
+      If [M:AD66]CRYNAM=""  [M:AD66]CRYNAM=[F:BPA]CRYNAM : Endif
+    Endif
+  Endif
+  #----- Adresse fournisseur payé = adresse fournisseur facturant -----#
+  If [M:PIH1]BPRPAY=[M:PIH0]BPR
+    [M:AD67]=[M:AD66]
+  Endif
+Endif
+Return
+
+
+###############################################################
+#          Récupération des textes entête et lignes           #
+# ----------------------------------------------------------- #
+# Les textes entêtes sont :                                   #
+#   - le commentaire d'entête de la commande "Intégrale"      #
+#   - les lignes de texte placées avant le 1ère ligne article #
+# Les textes lignes article sont :                            #
+#   - les lignes de texte placées après la ligne article      #
+#           mais avant la ligne article suivante              #
+# ----------------------------------------------------------- #
+# [M:PIH3]SEQORI(indice) contient le numéro ligne "Intégrale" #
+###############################################################
+$RECUP_TEXTE
+[M:PIH3]SEQORI([M:PIH3]NBLIG)=9999
+#----- Textes entête -----#
+Raz SI_CLOB, I
+If [F:XEPA]CMT<>""
+  SI_CLOB(I)=[F:XEPA]CMT : I+=1
+Endif
+For [XLTX] IND0 Where NUMORD=[F:XEPA]NUMORD
+&                   & LETRLQ=[F:XEPA]LETRLQNUMORD
+&                   & NUMLIG<[M:PIH3]SEQORI(0)
+&                   & TYPLIG="T"
+  SI_CLOB(I)=[F:XLTX]TXT : I+=1
+  If I>=dim(SI_CLOB)  Break : Endif
+Next
+If I>0
+  Trbegin [TXC]
+  [M:PIH0]TEX1=func SIXFONCTION.SI_CLOB("PIH")
+  If SI_SIMU=2  Rollback  Else  Commit : Endif
+Endif
+#---- Textes lignes -----#
+For WI=0 To [M:PIH3]NBLIG-1
+  Raz SI_CLOB, I
+  For [XLTX] IND0 Where NUMORD=[F:XEPA]NUMORD
+&                     & LETRLQ=[F:XEPA]LETRLQNUMORD
+&                     & NUMLIG>[M:PIH3]SEQORI(WI)
+&                     & NUMLIG<[M:PIH3]SEQORI(WI+1)
+&                     & TYPLIG="T"
+    SI_CLOB(I)=[F:XLTX]TXT : I+=1
+    If I>=dim(SI_CLOB)  Break : Endif
+  Next
+  If I>0
+    Trbegin [TXC]
+    [M:PIH3]LINTEX(WI)=func SIXFONCTION.SI_CLOB("PID")
+    If SI_SIMU=2  Rollback  Else  Commit : Endif
+  Endif
+Next WI
+#----- Nettoyage des champs utilisés pour la lecture ligne "Intégrale" et texte -----#
+For WI=0 To [M:PIH3]NBLIG-1
+  Raz [M:PIH3]LINORI(WI), [M:PIH3]NUMORI(WI), [M:PIH3]SEQORI(WI)
+Next WI
+Raz [M:PIH3]SEQORI([M:PIH3]NBLIG)
+Return
+
+
+###############################################################################
+#                         TRAITEMENT des erreurs                              #
+# --------------------------------------------------------------------------- #
+#  1 = 999999 X 9999 L Ligne facture introuvable                              #
+#  2 = CODFOU : xxxxxxxxxxxxx sans correspondance dans X3 !                   #
+#  3 = FOURGL : xxxxxxxxxxxxx sans correspondance dans X3 !                   #
+#  4 = CODDVS : xx sans correspondance dans X3 !                              #
+#  5 = MODRGL1 : xxx sans correspondance dans X3 !                            #
+#  6 = CODTVA : 9 sans correspondance dans X3 !                               #
+#  7 = Taxe parafiscale non trouvée dans X3 !                                 #
+#  8 = CODART : xxxxxxxxxxxxxxxx sans correspondance dans X3 !                #
+#  9 = UNIVEN : xxx sans correspondance dans X3 !                             #
+# 10 = xxx Unité non présente dans article ou article-fournisseur xxxx - xxxx #
+###############################################################################
+$PIH_REPRISE_ERR
+Case GPIH_WERR
+  When  1 : GMESSAGE ="[XLPA]"-num$([M:PIH3]LINORI(NOL))-[M:PIH3]NUMORI(NOL)
+            GMESSAGE-=num$([M:PIH3]SEQORI(NOL))-"L"-mess(520,197,1)
+  When  2 : GMESSAGE ="CODFOU :"-[F:XEPA]CODFOU-SI_MES(112)
+  When  3 : GMESSAGE ="FOURGL :"-[F:XEPA]FOURGL-SI_MES(112)
+  When  4 : GMESSAGE ="CODDVS :"-[F:XEPA]CODDVS-SI_MES(112)
+  When  5 : GMESSAGE ="MODRGL1 :"-[F:XEPA]MODRGL1-SI_MES(112)
+  When  6 : GMESSAGE ="CODTVA :"-GBIDC3-SI_MES(112)
+  When  7 : GMESSAGE =SI_MES(125)
+  When  8 : GMESSAGE ="CODART :"-[F:XLPA]CODART-SI_MES(112)
+  When  9 : GMESSAGE ="UNIVEN :"-[F:XLPA]UNIVEN-SI_MES(112)
+  When 10 : GMESSAGE =[M:PIH3]UOM(NOL)-SI_MES(252)-[M:PIH3]ITMREF(NOL)-"-"-[M:PIH3]BPSNUM(NOL)
+Endcase
+If GPIH_WTRA>2 | GPIH_WERR=1 | GPIH_WERR=7 | GPIH_WERR=10
+  Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+Endif
+Raz GMESSAGE
+mkstat=1
+Return
+
+
+##########################################################################
+#                     Traitement des "warning"                           #
+# ---------------------------------------------------------------------- #
+#  1 = Nombre de lignes différent (999<>999)                             #
+#  2 = Code taxe facture "Intégrale" inexistant sur facture X3 !         #
+#  3 = Bases taxes différentes entre facture "Intégrale" et facture X3 ! #
+#  4 = Code taxe facture X3 inexistant sur facture "Intégrale" !         #
+#  5 = Totaux TTC différents entre "Intégrale" et X3 !                   #
+#  6 = Eléments de facturation Tableau plein                             #
+#  7 = Le type de régime de taxe devrait être CEE ?                      #
+#  8 = xxx Cette unité a été remplacée par l'unité d'achat xxx           #
+##########################################################################
+$PIH_REPRISE_WARNING
+Case GPIH_WERR
+  When  1 : GMESSAGE=SI_MES(111)-"("+num$([F:XEPA]NBRLIG)+"<>"+num$([M:PIH3]NBLIG)+")"
+  When  2 : GMESSAGE=GBIDC3-"-->"-GPIH_TAX-SI_MES(121)
+  When  3 : GMESSAGE =[M:PIH4]TAX(I)-[M:PIH4]LIBTAX(I)-":"-SI_MES(122)
+            GMESSAGE-="("+num$(GPIH_BASHTTVA(I))-"<>"-num$([M:PIH4]BASTAX(I))+")"
+  When  4 : GMESSAGE=[M:PIH4]TAX(I)-[M:PIH4]LIBTAX(I)-":"-SI_MES(123)
+  When  5 : GMESSAGE=SI_MES(129)-"("+num$([F:XEPA]MNTTOTTTC)+"<>"+num$([M:PIH4]AMTATI)+")"
+  When  6 : GMESSAGE=mess(523,197,1)-mess(26,100,1)
+  When  7 : GMESSAGE=[M:PIH1]VAC-SI_MES(157)
+  When  8 : GMESSAGE=[M:PIH3]UOM(NOL)-SI_MES(253)-[M:PIH3]PUU(NOL)
+Endcase
+If GPIH_WTRA>2 | find(GPIH_WERR,2,3,5,6,8)
+  If find(GPIH_WERR,1,6,8)
+    Call ECR_TRACE(GMESSAGE,0)  From GESECRAN
+  Else
+    Call ECR_TRACE(GMESSAGE,-1) From GESECRAN
+  Endif
+Endif
+Raz GMESSAGE, GPIH_WERR
+Return
+
+
+##############################################################################
+# Création d'un élément de pied de facture supplémentaire pour gérer l'écart #
+##############################################################################
+$CRE_ELESUP
+Local Decimal WECART
+Local Char    WTAXE(GLONVAT)
+Local Decimal WPFI
+Local Libelle W_IDEB
+#-----
+Case J
+  When 1
+    WECART=[F:XETV]BASHTTVA
+    WTAXE =GPIH_TAX
+  When 2
+    WECART=[F:XLTV]BASHTTVA
+    WTAXE =GPIH_TAX
+  When 3
+    WECART=GPIH_BASHTTVA(I)-[M:PIH4]BASTAX(I)
+    WTAXE =[M:PIH4]TAX(I)
+  When 4
+    WECART=-[M:PIH4]BASTAX(I)
+    WTAXE =[M:PIH4]TAX(I)
+  When 5
+    WECART=[F:XEPA]MNTTOTTTC-[M:PIH4]AMTATI
+    Read [PFI] PFI0=[F:SPX]PFINUM1            : If fstat  Raz [F:PFI] : Endif
+    #----- Lecture table détermination des codes taxe si nécessaire -----#
+    For [TVC] TVC2 Where VATTYP=1
+&                      & ENAFLG=2
+&                      & LEG<=GCURLEG
+&                      & VACBPR=[M:PIH1]VAC
+&                      & VACITM=[F:PFI]VACITM
+      Raz fstat : Gosub CONTROLE_TVC From TRTX3 : If !fstat  WTAXE=[F:TVC]VAT : Break : Endif
+    Next
+    #-----
+Endcase
+#-----
+If WECART<0  WPFI=[F:SPX]PFINUM2  Else WPFI=[F:SPX]PFINUM1 : Endif
+#-----
+Raz W_IDEB
+While W_IDEB<[M:PIH4]NBFAC
+  K=find(WPFI,[M:PIH4]INVDTA(W_IDEB..[M:PIH4]NBFAC-1))
+  If !K
+    W_IDEB=[M:PIH4]NBFAC
+  Elsif [M:PIH4]INVDTAVAT(K-1)<>WTAXE
+    W_IDEB+=K : K=0
+  Else
+    W_IDEB=[M:PIH4]NBFAC
+  Endif
+Wend
+#-----
+If !K & [M:PIH4]NBFAC>dim([M:PIH4]TAX)-1
+  GPIH_WERR=6 : Gosub PIH_REPRISE_WARNING : Return
+Endif
+#-----
+If [F:PFI]PFINUM<>WPFI
+  Read [PFI] PFI0=WPFI : If fstat  Raz [F:PFI] : Endif
+Endif
+#-----
+If K
+  nolign=K
+  Call AVANT_NBFAC From SUBPIH
+  WECART+=[M:PIH4]INVDTAAMT(nolign-1)
+  Call AM_INVDTAAMT(WECART) From SUBPIH
+  [M:PIH4]INVDTAAMT(nolign-1)=WECART
+  Call AV_INVDIFAMT([M:PIH4]INVDIFAMT(nolign-1)) From SUBPIH
+  Call APRES_NBFAC From SUBPIH
+Else
+  nolign=[M:PIH4]NBFAC+1
+  Call AM_INVDTA(WPFI) From SUBPIH
+  [M:PIH4]INVDTA(nolign-1)=WPFI
+  Call AM_INVDTAAMT(WECART) From SUBPIH
+  [M:PIH4]INVLINFLG(nolign-1)=1
+  [M:PIH4]INVORDFLG(nolign-1)=1
+  [M:PIH4]INVDTAVAT(nolign-1)=WTAXE
+  [M:PIH4]INVDTAAMT(nolign-1)=WECART
+  Call AV_INVDIFAMT([M:PIH4]INVDIFAMT(nolign-1)) From SUBPIH
+  Call D_ACC1([M:PIH4]ACC1(nolign-1)) From SUBPIH
+  [M:PIH4]NBFAC+=1
+  Call APRES_NBFAC From SUBPIH
+Endif
+Return
+
+
+##################################################################
+# Chargement des champs écran PIH0, PIH1, PIH4 entête facture X3 #
+##################################################################
+$MSK_ENTETE
+If GPIH_WTRA>3
+  If IMPZON="CCE" | IMPZON="INVDTAAMT"
+    Call ECR_TRACE("     ."-mess(36,124,1)-IMPZON+"("+num$(nolign-1)+")",0) From GESECRAN
+  Else
+    Call ECR_TRACE("     ."-mess(36,124,1)-IMPZON,0) From GESECRAN
+  Endif
+Endif
+Case IMPZON
+  When "FCY"      : #----- Ecran PIH0 -----#
+    [M:PIH0]FCY=[F:SPX]FCY
+    IMPMOD=1
+  When "PIVTYP"
+    If [F:XEPA]TYPPIE="FF"
+      Filter [TPV] Where PIHTYP=1 & INVTYP<3 & LEG=GCURLEG
+    Else
+      Filter [TPV] Where PIHTYP=3 & INVTYP<3 & LEG=GCURLEG
+    Endif
+    Read [TPV] First : If fstat Raz [F:TPV] : Endif
+    If [F:TPV]PIVTYP=""
+      If [F:XEPA]TYPPIE="FF"
+        Filter [TPV] Where PIHTYP=1 & INVTYP<3 & LEG=""
+      Else
+        Filter [TPV] Where PIHTYP=3 & INVTYP<3 & LEG=""
+      Endif
+      Read [TPV] First : If fstat Raz [F:TPV] : Endif
+    Endif
+    Filter [TPV]
+    [M:PIH0]PIVTYP=[F:TPV]PIVTYP
+    IMPMOD=1
+  When "NUM"
+  When "ACCDAT"
+    [M:PIH0]ACCDAT=[F:XEPA]DATPIE : IMPMOD=1
+  When "BPR"
+    [M:PIH0]BPR=func SIXFONCTION.SI_COR("XIFOU",[F:XEPA]CODFOU,"BPSUPPLIER","")
+    If [M:PIH0]BPR=""
+      GPIH_WERR=2 : Gosub PIH_REPRISE_ERR : Return
+    Endif
+    IMPMOD=1
+  When "BPRSAC"
+  When "PAZ"
+  When "BPRDAT"   : #----- Ecran PIH1 -----#
+    [M:PIH1]BPRDAT=[F:XEPA]DATPIE
+    IMPMOD=1
+  When "BPRVCR"
+    [M:PIH1]BPRVCR=[F:XEPA]TYPPIE-[F:XEPA]NUMSER-[F:XEPA]NUMPIE-[F:XEPA]LETRLQNUMORD
+    IMPMOD=1
+  When "BPRPAY"
+    If [F:XEPA]FOURGL<>""
+      [M:PIH1]BPRPAY=func SIXFONCTION.SI_COR("XIFOU",[F:XEPA]FOURGL,"BPSUPPLIER","")
+      If [M:PIH1]BPRPAY=""
+        GPIH_WERR=3 : Gosub PIH_REPRISE_ERR : Return
+      Endif
+    Endif
+  When "CUR"
+    If [F:XEPA]CODDVS<>""
+      [M:PIH1]CUR=func SIXFONCTION.SI_COR("XIDVS",[F:XEPA]CODDVS,"TABCUR","")
+      If [M:PIH1]CUR=""
+        GPIH_WERR=4 : Gosub PIH_REPRISE_ERR : Return
+      Endif
+      IMPMOD=1
+    Else
+      [M:PIH1]CUR=[F:SPX]CUR : IMPMOD=1
+    Endif
+  When "CURTYP"
+    If [M:PIH1]CURTYP=0  [M:PIH1]CURTYP=1 : IMPMOD=1 : Endif
+  When "RATCUR"
+    If [F:XEPA]CODDVS<>"" & [F:XEPA]TAUDVS<>0 & [F:XEPA]NAP9<>0
+      [M:PIH1]RATCUR=arr([F:XEPA]NAPFRS/[F:XEPA]NAP9,10^-6) : IMPMOD=1
+    Endif
+  When "RATRPT"
+  When "INVNUM"
+  When "INVREF"
+    [M:PIH1]INVREF=num$([F:XEPA]NUMORD)-[F:XEPA]LETRLQNUMORD : IMPMOD=1
+  When "STRDUDDAT"
+    If [F:XEPA]DATECH1<>[0/0/0]
+      [M:PIH1]STRDUDDAT=[F:XEPA]DATECH1 : IMPMOD=1
+    Elsif [M:PIH1]STRDUDDAT=[0/0/0]
+      [M:PIH1]STRDUDDAT=[F:XEPA]DATPIE  : IMPMOD=1
+    Endif
+  When "PTE"
+    If [F:XEPA]MODRGL1<>""
+      [M:PIH1]PTE=func SIXFONCTION.SI_COR2("XIMODRGL",
+&                 left$([F:XEPA]MODRGL1,2),right$([F:XEPA]MODRGL1,3),"TABPAYTERM","")
+      If [M:PIH1]PTE=""
+        GPIH_WERR=5 : Gosub PIH_REPRISE_ERR : Return
+      Endif
+      IMPMOD=1
+    Endif
+  When "DEP"
+  When "VAC"
+    #----- Chargement de la globale code pays -----#
+    If [F:XFOU]CODFOU<>[F:XEPA]CODFOU
+      Read [XFOU] IND0=[F:XEPA]CODFOU : If fstat  Raz [F:XFOU] : Endif
+    Endif
+    Read [XLAD] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"A"
+    If fstat  Raz [F:XLAD] : Endif
+    If [F:XLAD]CODPAY<>""
+      GPIH_CODPAY=[F:XLAD]CODPAY
+    Else
+      GPIH_CODPAY=[F:XFOU]CODPAY
+    Endif
+    #-----
+    If find([F:XEPA]ASJTVA,"O","N","C","I")
+      [M:PIH1]VAC=func SIXFONCTION.SI_VACBPR("S",[F:XEPA]ASJTVA,"","",GPIH_CODPAY)
+      IMPMOD=1
+    Endif
+    #----- Récupération du code TVA exo présent sur l'élément écart -----#
+    Read [PFI] PFI0=[F:SPX]PFINUM1 : If fstat  Raz [F:PFI] : Endif
+    Call RECHVATFOOT(2,[M:PIH0]BPR,[F:PFI]PFINUM,"PIH4",GPIH_CODEXO) From TRTX3
+    #-----
+  When "DAS2"
+  When "STRDATSVC"
+  When "ENDDATSVC"
+  When "NBFAC1"
+  When "INVDTA1"
+  When "DES"
+    If indice=0
+      [M:PIH1]DES(0)=[F:XEPA]REFCMD : IMPMOD=1
+    Endif
+  When "INVDTAAMT1"
+  When "TOTLINAMT1"
+  When "TOTTAXAMT1"
+  When "NBFAC"    : #----- Ecran PIH4 -----#
+    Gosub TEST_VALID From SUBPIH
+  When "INVDTA"
+  When "INVDTAAMT"
+    If dim(WI)<1  Local Integer WI : Endif
+    WI=find([M:PIH1]INVDTA1(nolign-1),[F:SPX]PFINUM)
+    Case WI
+      When 1 : #----- Emballage
+        Read [XLEM] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLEM]CODTVAFRAEMB<>0
+            If GPIH_VAT1([F:XLEM]CODTVAFRAEMB)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLEM]CODTVAFRAEMB),GPIH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPIH_VAT1([F:XLEM]CODTVAFRAEMB)
+            Endif
+            If GBIDC3<>""  [M:PIH4]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:PIH4]INVDTAVAT(nolign-1)=GPIH_CODEXO
+          Endif
+          [M:PIH4]INVDTAAMT(nolign-1)=[F:XLEM]MNTFRAEMB  : IMPMOD=1
+        Endif
+      When 2 : #----- Port
+        Read [XLPO] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLPO]CODTVAFRAPOR<>0
+            If GPIH_VAT1([F:XLPO]CODTVAFRAPOR)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLPO]CODTVAFRAPOR),GPIH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPIH_VAT1([F:XLPO]CODTVAFRAPOR)
+            Endif
+            If GBIDC3<>""  [M:PIH4]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:PIH4]INVDTAVAT(nolign-1)=GPIH_CODEXO
+          Endif
+          [M:PIH4]INVDTAAMT(nolign-1)=[F:XLPO]MNTFRAPOR  : IMPMOD=1
+        Endif
+      When 3 : #----- Frais divers
+        Read [XLFD] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLFD]CODTVAFRADIV<>0
+            If GPIH_VAT1([F:XLFD]CODTVAFRADIV)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLFD]CODTVAFRADIV),GPIH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPIH_VAT1([F:XLFD]CODTVAFRADIV)
+            Endif
+            If GBIDC3<>""  [M:PIH4]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:PIH4]INVDTAVAT(nolign-1)=GPIH_CODEXO
+          Endif
+          [M:PIH4]INVDTAAMT(nolign-1)=[F:XLFD]MNTFRADIV  : IMPMOD=1
+        Endif
+      When 4 : #----- Frais fixe
+        Read [XLFF] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLFF]CODTVAFRAFIX<>0
+            If GPIH_VAT1([F:XLFF]CODTVAFRAFIX)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLFF]CODTVAFRAFIX),GPIH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPIH_VAT1([F:XLFF]CODTVAFRAFIX)
+            Endif
+            If GBIDC3<>""  [M:PIH4]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:PIH4]INVDTAVAT(nolign-1)=GPIH_CODEXO
+          Endif
+          [M:PIH4]INVDTAAMT(nolign-1)=[F:XLFF]MNTFRAFIX  : IMPMOD=1
+        Endif
+      When 5 : #----- Remise
+        Read [XLRE] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          [M:PIH4]INVDTAAMT(nolign-1)=[F:XLRE]MNTFRAREM  : IMPMOD=1
+        Endif
+      When 6 : #----- Escompte en %
+        [M:PIH4]INVDTAAMT(nolign-1)=[F:XEPA]MNTEPT : IMPMOD=1
+      When 7 : #----- Frais spécifique 1
+        Read [XLF1] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLF1]CODTVAFRA1<>0
+            If GPIH_VAT1([F:XLF1]CODTVAFRA1)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLF1]CODTVAFRA1),GPIH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPIH_VAT1([F:XLF1]CODTVAFRA1)
+            Endif
+            If GBIDC3<>""  [M:PIH4]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:PIH4]INVDTAVAT(nolign-1)=GPIH_CODEXO
+          Endif
+          [M:PIH4]INVDTAAMT(nolign-1)=[F:XLF1]MNTFRASPF1 : IMPMOD=1
+        Endif
+      When 8 : #----- frais spécifique 2
+        Read [XLF2] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLF2]CODTVAFRA2<>0
+            If GPIH_VAT1([F:XLF2]CODTVAFRA2)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLF2]CODTVAFRA2),GPIH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPIH_VAT1([F:XLF2]CODTVAFRA2)
+            Endif
+            If GBIDC3<>""  [M:PIH4]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:PIH4]INVDTAVAT(nolign-1)=GPIH_CODEXO
+          Endif
+          [M:PIH4]INVDTAAMT(nolign-1)=[F:XLF2]MNTFRASPF2 : IMPMOD=1
+        Endif
+    Endcase
+    #-----
+    If [M:PIH4]INVORDFLG(indice)=2
+      [M:PIH4]INVORDAMT(indice)=[M:PIH4]INVDTAAMT(indice) : IMPMOD=1
+      If ([M:PIH0]PIHTYP<3 & [M:PIH1]DEBCDT1(indice)=2) |
+&        ([M:PIH0]PIHTYP>2 & [M:PIH1]DEBCDT1(indice)=1)
+        If [M:PIH4]INVORDAMT(indice)>0 [M:PIH4]INVORDAMT(indice)=-[M:PIH4]INVORDAMT(indice) : Endif
+      Elsif [M:PIH4]INVORDAMT(indice)<0
+        [M:PIH4]INVORDAMT(indice)=-[M:PIH4]INVORDAMT(indice)
+      Endif
+    Endif
+  When "INVDTAVAT"
+    If [M:PIH4]INVDTAVAT(nolign-1)=""
+      Read [PFI] PFI0=[M:PIH4]INVDTA(nolign-1) : If fstat  Raz [F:PFI] : Endif
+      If [F:PFI]VATRUL=2
+        Call RECHVATFOOT(2,[M:PIH0]BPR,[F:PFI]PFINUM,"PIH4",GBIDC3) From TRTX3
+        [M:PIH4]INVDTAVAT(nolign-1)=GBIDC3
+      Endif
+      If [M:PIH4]INVDTAVAT(nolign-1)<>""
+        IMPMOD=1
+      Else
+        Call ECR_TRACE(mess(306,199,1)-":"-[M:PIH1]VAC-"-"-[F:PFI]VACITM,1) From GESECRAN
+        GCLE=num$([M:PIH4]INVDTA(nolign-1))-[M:PIH4]INVDTALIB(nolign-1)
+      Endif
+    Endif
+  When "ACC1"
+    Raz GCLE
+  When "ACC2"
+  When "ACC3"
+  When "ACC4"
+  When "ACC5"
+  When "ACC6"
+  When "ACC7"
+  When "ACC8"
+  When "ACC9"
+  When "ACC10"
+  When "DSP"
+  When "PFICCE1"
+    Case find([M:PIH1]INVDTA1(nolign-1),[F:SPX]PFINUM)
+      When 1 : Call SI_INICCE("XILPAEMB"  ,0,"",0,"[M:PIH4]PFICCE",nolign-1) From SIXFONCTION
+      When 2 : Call SI_INICCE("XILPAPOR"  ,0,"",0,"[M:PIH4]PFICCE",nolign-1) From SIXFONCTION
+      When 3 : Call SI_INICCE("XILPAFADIV",0,"",0,"[M:PIH4]PFICCE",nolign-1) From SIXFONCTION
+      When 4 : Call SI_INICCE("XILPAFAFIX",0,"",0,"[M:PIH4]PFICCE",nolign-1) From SIXFONCTION
+      When 5 : Call SI_INICCE("XILPAREM"  ,0,"",0,"[M:PIH4]PFICCE",nolign-1) From SIXFONCTION
+      When 7 : Call SI_INICCE("XILPAFSPF1",0,"",0,"[M:PIH4]PFICCE",nolign-1) From SIXFONCTION
+      When 8 : Call SI_INICCE("XILPAFSPF2",0,"",0,"[M:PIH4]PFICCE",nolign-1) From SIXFONCTION
+    Endcase
+  When "PFICCE2"
+  When "PFICCE3"
+  When "PFICCE4"
+  When "PFICCE5"
+  When "PFICCE6"
+  When "PFICCE7"
+  When "PFICCE8"
+  When "PFICCE9"
+  When "PFICCE10"
+  When "PFICCE11"
+  When "PFICCE12"
+  When "PFICCE13"
+  When "PFICCE14"
+  When "PFICCE15"
+  When "PFICCE16"
+  When "PFICCE17"
+  When "PFICCE18"
+  When "PFICCE19"
+  When "PFICCE20"
+  When "NBTAX"
+    #----- Lecture fournisseur "Intégrale" si nécessaire pour détermination code TVA -----#
+    If [F:XFOU]CODFOU<>[F:XEPA]CODFOU
+      Read [XFOU] IND0=[F:XEPA]CODFOU : If fstat  Raz [F:XFOU] : Endif
+    Endif
+    #----- Boucle de lecture sur les taxes TVA "Intégrale" -----#
+    For [XETV] IND0 Where NUMORD=[F:XEPA]NUMORD & LETRLQNUMORD=[F:XEPA]LETRLQNUMORD
+      If GPIH_VAT1([F:XETV]CODTVA)=""
+        GPIH_TAX=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XETV]CODTVA),GPIH_CODPAY,"TABVAT","")
+      Else
+        GPIH_TAX=GPIH_VAT1([F:XETV]CODTVA)
+      Endif
+      If GPIH_TAX=""
+        GBIDC3=num$([F:XETV]CODTVA) : GPIH_WERR=6 : Gosub PIH_REPRISE_ERR : Return
+      Endif
+      #----- Code taxe facture "Intégrale" inexistant sur facture achat X3 ! -----#
+      If !find(GPIH_TAX,[M:PIH4]TAX)
+        GBIDC3=num$([F:XETV]CODTVA)-GPIH_CODPAY
+        GPIH_WERR=2  : Gosub PIH_REPRISE_WARNING
+        J=1 : Gosub CRE_ELESUP
+        If mkstat | GPIH_WERR  Return : Endif
+      Endif
+      #----- Chargement des valeurs "Intégrale" dans les globales dimensionnées -----#
+      J=find(GPIH_TAX,[M:PIH4]TAX)
+      GPIH_CODTVA  (J-1)=[F:XETV]CODTVA
+      GPIH_BASHTTVA(J-1)=[F:XETV]BASHTTVA
+      GPIH_MNTTVA  (J-1)=[F:XETV]MNTTVA
+    Next
+    #----- Boucle de lecture sur les compléments de taxe TVA "Intégrale" -----#
+    For [XLTV] IND0 Where NUMORD=[F:XEPA]NUMORD & LETRLQ=[F:XEPA]LETRLQNUMORD & TYPLIG="O"
+      If GPIH_VAT1([F:XLTV]CODTVA)=""
+        GPIH_TAX=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLTV]CODTVA),GPIH_CODPAY,"TABVAT","")
+      Else
+        GPIH_TAX=GPIH_VAT1([F:XLTV]CODTVA)
+      Endif
+      If GPIH_TAX=""
+        GBIDC3=num$([F:XLTV]CODTVA) : GPIH_WERR=6 : Gosub PIH_REPRISE_ERR : Return
+      Endif
+      #----- Code taxe facture "Intégrale" inexistant sur facture achat X3 ! -----#
+      If !find(GPIH_TAX,[M:PIH4]TAX)
+        GBIDC3=num$([F:XLTV]CODTVA)-GPIH_CODPAY
+        GPIH_WERR=2  : Gosub PIH_REPRISE_WARNING
+        J=2 : Gosub CRE_ELESUP
+        If mkstat | GPIH_WERR  Return : Endif
+      Endif
+      #----- Chargement des valeurs "Intégrale" dans les globales dimensionnées -----#
+      J=find(GPIH_TAX,[M:PIH4]TAX)
+      GPIH_CODTVA  (J-1)=[F:XLTV]CODTVA
+      GPIH_BASHTTVA(J-1)=[F:XLTV]MNTBASTVA
+      GPIH_MNTTVA  (J-1)=[F:XLTV]MNT
+    Next
+    #----- Lecture taxe parafiscale "Intégrale" -----#
+    Read [XLTP] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";6
+    If !fstat
+      Raz J
+      For I=1 To [M:PIH4]NBTAX
+        # Issue 71937 - 2012-03-27 by SR report CPO : comment
+        Call LEC_TVT_LEG(GCURLEG,[M:PIH4]TAX(I-1),WOK) From TRTLECLEG
+        If WOK : Raz [F:TVT] : Endif
+        #Read [TVT] TVT0=[M:PIH4]TAX(I-1)
+        #If !fstat & [F:TVT]VATTYP>1  J=I : Break : Endif : # Taxe parafiscale trouvée !
+        If WRET=0 & [F:TVT]VATTYP>1  J=I : Break : Endif : # Taxe parafiscale trouvée ! :#--CPO 71937
+      Next I
+      If J<>0
+        GPIH_CODTVA  (J-1)=999
+        GPIH_BASHTTVA(J-1)=[M:PIH4]BASTAX(J-1)
+        GPIH_MNTTVA  (J-1)=[F:XLTP]MNTFRATPF
+      Else
+        #----- Taxe parafiscale non trouvée dans X3 ! -----#
+        GPIH_WERR=7 : Gosub PIH_REPRISE_ERR : Return
+      Endif
+    Endif
+    #-----
+    For I=0 To [M:PIH4]NBTAX-1
+      If GPIH_CODTVA(I)<>0
+        #----- Bases taxes différentes entre facture "Intégrale" et facture X3 ! -----#
+        If [M:PIH4]BASTAX(I)<>GPIH_BASHTTVA(I) &
+&          [M:PIH4]AMTTAX(I)<>GPIH_MNTTVA  (I)
+          GPIH_WERR=3  : Gosub PIH_REPRISE_WARNING
+          J=3 : Gosub CRE_ELESUP
+          If mkstat | GPIH_WERR  Return : Endif
+        Endif
+      Elsif GPIH_BASHTTVA(I)=0 & [M:PIH4]AMTTAX(I)<>0
+        #----- Code taxe facture X3 inexistant sur facture "Intégrale" ! -----#
+        GPIH_WERR=4  : Gosub PIH_REPRISE_WARNING
+        J=4 : Gosub CRE_ELESUP
+        If mkstat | GPIH_WERR  Return : Endif
+      Endif
+    Next I
+    #-----
+  When "AMTTAX"
+    If [M:PIH4]AMTTAX(nolign-1)<>GPIH_MNTTVA(nolign-1)
+      [M:PIH4]AMTTAX(nolign-1)=GPIH_MNTTVA(nolign-1) : IMPMOD=1
+    Endif
+  When "TOTTAXAMT"
+    If [M:PIH1]VACTYP<>4
+      [M:PIH4]TOTTAXAMT=[F:XEPA]MNTTOTTVA+[F:XEPA]MNTTOTTPF : IMPMOD=1
+    Endif
+  When "TOTLINAMT"
+    #----- Contrôle du TTC -----#
+    [M:PIH4]AMTATI=[M:PIH3]CUMLINAMT1+sum([M:PIH4]INVDTAAMT)+sum([M:PIH4]AMTTAX)
+    If [F:XEPA]MNTTOTTTC<>[M:PIH4]AMTATI
+      GPIH_WERR=5 : Gosub PIH_REPRISE_WARNING
+      J=5 : Gosub CRE_ELESUP
+      If mkstat | GPIH_WERR  Return : Endif
+    Endif
+    #-----
+    [M:PIH4]TOTLINAMT=[M:PIH3]CUMLINAMT1 : IMPMOD=1
+Endcase
+Return
+
+
+######################################################
+# Chargement des champs écran PIH3 lignes facture X3 #
+######################################################
+$MSK_DETAIL
+NOL=nolign-1 : # La variable NOL est définie par W0PIH3
+If GPIH_WTRA>3
+  If IMPZON="NBLIG"
+    Call ECR_TRACE("     ."-mess(36,124,1)-IMPZON,0) From GESECRAN
+  Else
+    Call ECR_TRACE("     ."-mess(36,124,1)-IMPZON+"("+num$(NOL)+")",0) From GESECRAN
+  Endif
+Endif
+Case IMPZON
+  When "NBLIG"
+  When "TYPORI"
+    Read [XLPA] IND0=[M:PIH3]LINORI(NOL);[M:PIH3]NUMORI(NOL);[M:PIH3]SEQORI(NOL);"L"
+    If fstat
+      Raz [F:XLPA] : GPIH_WERR=1 : Gosub PIH_REPRISE_ERR : Return
+    Endif
+    [M:PIH3]TYPORI(NOL)=5  : # Ligne diverse
+  When "NUMORI"
+  When "LINORI"
+  When "ITMREF"
+    [M:PIH3]ITMREF(NOL)=func SIXFONCTION.SI_COR("XIART",[F:XLPA]CODART,"ITMMASTER","")
+    If [M:PIH3]ITMREF(NOL)=""
+      GPIH_WERR=8 : Gosub PIH_REPRISE_ERR : Return
+    Endif
+    IMPMOD=1
+  When "ITMDES"
+    If [F:XLPA]NOMART<>""  [M:PIH3]ITMDES(NOL)=[F:XLPA]NOMART : IMPMOD=1 : Endif
+  When "ITMDES1"
+  When "UOM"
+    If [F:XLPA]UNIVEN<>""
+      [M:PIH3]UOM(NOL)=func SIXFONCTION.SI_COR("XIUNIFAC",[F:XLPA]UNIVEN,"TABUNIT","")
+      If [M:PIH3]UOM(NOL)=""
+        GPIH_WERR=9 : Gosub PIH_REPRISE_ERR : Return
+      Endif
+      IMPMOD=1
+    Endif
+    #----- Lecture de l'article et article-fournisseur si nécessaire -----#
+    If [F:ITM]ITMREF<>[M:PIH3]ITMREF(NOL)
+      Read [ITM] ITM0=[M:PIH3]ITMREF(NOL)
+      If fstat Raz [F:ITM] : Endif
+    Endif
+    If [F:ITP]ITMREF<>[M:PIH3]ITMREF(NOL) | [F:ITP]BPSNUM<>[M:PIH3]BPSNUM(NOL)
+      Read [ITP] ITP0=[M:PIH3]ITMREF(NOL);[M:PIH3]BPSNUM
+      If fstat Raz [F:ITP] : Endif
+    Endif
+    #----- Contrôle que l'unité est présente dans l'article ou article-fournisseur -----#
+    If !find([M:PIH3]UOM(NOL),[F:ITM]PUU,[F:ITM]PCU,[F:ITM]STU,[F:ITP]PUU,[F:ITP]PCU)
+     #GPIH_WERR=10 : Gosub PIH_REPRISE_ERR : Return
+      #----- Si ce n'est pas le cas, on remplace par l'unité d'achat -----#
+      GPIH_WERR=8  : Gosub PIH_REPRISE_WARNING
+      [M:PIH3]UOM(NOL)=[M:PIH3]PUU(NOL)
+    Endif
+    #-----
+  When "QTYUOM"
+    [M:PIH3]QTYUOM(NOL)=[F:XLPA]QTELIV    : IMPMOD=1
+  When "NETPRI"
+    [M:PIH3]NETPRI(NOL)=[F:XLPA]PRXUNINET : IMPMOD=1
+  When "AMTNOTLIN"
+    [M:PIH3]AMTNOTLIN(NOL)=[F:XLPA]MNTHT  : IMPMOD=1
+  When "PJT"
+  When "LINACC1"
+  When "LINACC2"
+  When "LINACC3"
+  When "LINACC4"
+  When "LINACC5"
+  When "LINACC6"
+  When "LINACC7"
+  When "LINACC8"
+  When "LINACC9"
+  When "LINACC10"
+  When "LINPURTYP"
+  When "LINDSP"
+  When "CCE1"
+    Call SI_INICCE("XILPAANA",[F:XLPA]NUMORD,[F:XLPA]LETRLQ,[F:XLPA]NUMLIG,
+&                  "[M:PIH3]CCE",NOL)  From SIXFONCTION
+  When "CCE2"
+  When "CCE3"
+  When "CCE4"
+  When "CCE5"
+  When "CCE6"
+  When "CCE7"
+  When "CCE8"
+  When "CCE9"
+  When "CCE10"
+  When "CCE11"
+  When "CCE12"
+  When "CCE13"
+  When "CCE14"
+  When "CCE15"
+  When "CCE16"
+  When "CCE17"
+  When "CCE18"
+  When "CCE19"
+  When "CCE20"
+  When "VAT1"
+    If [F:XLPA]CODTVA<>0
+      If GPIH_CODPAY<>""
+        GBIDC3=func SIXFONCTION.SI_VAT1([F:XEPA]TVADBTENC,[F:XLPA]TVADBTENC,GPIH_CODPAY,
+&                                       [F:XLPA]CODTVA,[M:PIH1]VAC,[F:XLPA]CODART)
+        If GBIDC3<>""
+          GPIH_VAT1([F:XLPA]CODTVA)=GBIDC3 : # Correspondance codes TVA Intégrale et X3
+          [M:PIH3]VAT1(NOL)=GBIDC3 : IMPMOD=1
+        Else
+          mkstat=1 : GPIH_WERR=99 : Return
+        Endif
+      Endif
+    Endif
+  When "VAT2"
+    If [F:XLPA]CODTPF<>0
+      If [F:XFOU]CODPAY<>""
+        GBIDC3=func SIXFONCTION.SI_COR2("XITAXPFC",num$([F:XLPA]CODTPF),GPIH_CODPAY,"TABVAT","")
+        If GBIDC3<>""
+          [M:PIH3]VAT2(NOL)=GBIDC3 : IMPMOD=1
+        Else
+          mkstat=1 : GPIH_WERR=99 : Return
+        Endif
+      Endif
+    Else
+      [M:PIH3]VAT2(NOL)=""
+    Endif
+  When "VAT3"
+    [M:PIH3]VAT3(NOL)="" : # Pas de taxe additionnelle sur les factures fournisseurs !
+  When "TAXRCP"
+  When "TAXISS"
+  When "TAXOTH1"
+  When "TAXOTH2"
+  When "STRDAT"
+  When "ENDDAT"
+  When "PERNBR"
+  When "PERTYP"
+Endcase
+Return
+
+
+###################
+# Trace détaillée #
+###################
+$TRACE_DETAILLEE
+If WPGM=""
+  If ACTION="Write [PIH]" | ACTION="Update [XEPA]"
+    WMESSAGE=ACTION
+  Else
+    WMESSAGE="---"-mess(5,126,1)-ACTION
+  Endif
+Else
+  WMESSAGE=mess(27,115,1)-ACTION+space$(20-len(ACTION))+"From "-WPGM
+Endif
+Call ECR_TRACE(WMESSAGE,0) From GESECRAN
+Return
+
+
+##################################################################################
+# Ouverture des tables X3 (celles de l'objet PIH + celles du traitement SUBPIHA) #
+##################################################################################
+$OUVRE
+If !clalev([F:PIH])  Local File =SI_DOSSIER+".PINVOICE"   [PIH] : Endif
+If !clalev([F:PTR])  Local File =SI_DOSSIER+".PURTRS"     [PTR] : Endif
+#-------------------------------------------------------#
+# Ouvertures normalement effectuées par $OUVRE de WOPIH #
+#-------------------------------------------------------#
+If !clalev([F:PIV])  Local File =SI_DOSSIER+".PINVOICEV"  [PIV] : Endif
+If !clalev([F:PID])  Local File =SI_DOSSIER+".PINVOICED"  [PID] : Endif
+If !clalev([F:PVF])  Local File =SI_DOSSIER+".PVCRFOOT"   [PVF] : Endif
+If !clalev([F:PVV])  Local File =SI_DOSSIER+".PVCRVAT"    [PVV] : Endif
+If !clalev([F:CAL])  Local File =SI_DOSSIER+".CPTANALIN"  [CAL] : Endif
+If !clalev([F:POH])  Local File =SI_DOSSIER+".PORDER"     [POH] : Endif
+If !clalev([F:POP])  Local File =SI_DOSSIER+".PORDERP"    [POP] : Endif
+If !clalev([F:POQ])  Local File =SI_DOSSIER+".PORDERQ"    [POQ] : Endif
+If !clalev([F:POC])  Local File =SI_DOSSIER+".PORDERC"    [POC] : Endif
+If !clalev([F:PTH])  Local File =SI_DOSSIER+".PRECEIPT"   [PTH] : Endif
+If !clalev([F:PTD])  Local File =SI_DOSSIER+".PRECEIPTD"  [PTD] : Endif
+If !clalev([F:PNH])  Local File =SI_DOSSIER+".PRETURN"    [PNH] : Endif
+If !clalev([F:PND])  Local File =SI_DOSSIER+".PRETURND"   [PND] : Endif
+If !clalev([F:BPR])  Local File =SI_DOSSIER+".BPARTNER"   [BPR] : Endif
+If !clalev([F:BPA])  Local File =SI_DOSSIER+".BPADDRESS"  [BPA] : Endif
+If !clalev([F:BPS])  Local File =SI_DOSSIER+".BPSUPPLIER" [BPS] : Endif
+If !clalev([F:MVS])  Local File =SI_DOSSIER+".BPSUPPMVT"  [MVS] : Endif
+If !clalev([F:ITM])  Local File =SI_DOSSIER+".ITMMASTER"  [ITM] : Endif
+If !clalev([F:ITP])  Local File =SI_DOSSIER+".ITMBPS"     [ITP] : Endif
+If !clalev([F:ITF])  Local File =SI_DOSSIER+".ITMFACILIT" [ITF] : Endif
+If !clalev([F:ITV])  Local File =SI_DOSSIER+".ITMMVT"     [ITV] : Endif
+If !clalev([F:FCY])  Local File =SI_DOSSIER+".FACILITY"   [FCY] : Endif
+If !clalev([F:TUN])  Local File =SI_DOSSIER+".TABUNIT"    [TUN] : Endif
+If !clalev([F:TCU])  Local File =SI_DOSSIER+".TABCUR"     [TCU] : Endif
+If !clalev([F:TCY])  Local File =SI_DOSSIER+".TABCOUNTRY" [TCY] : Endif
+If !clalev([F:TCO])  Local File =SI_DOSSIER+".TABCOEFF"   [TCO] : Endif
+If !clalev([F:TVT])  Local File =SI_DOSSIER+".TABVAT"     [TVT] : Endif
+If !clalev([F:GAC])  Local File =SI_DOSSIER+".GACCOUNT"   [GAC] : Endif
+If !clalev([F:CAC])  Local File =SI_DOSSIER+".GACCCODE"   [CAC] : Endif
+If !clalev([F:ADI])  Local File =SI_DOSSIER+".ATABDIV"    [ADI] : Endif
+If !clalev([F:PER])  Local File =SI_DOSSIER+".PERIOD"     [PER] : Endif
+If !clalev([F:FIY])  Local File =SI_DOSSIER+".FISCALYEAR" [FIY] : Endif
+If !clalev([F:GTE])  Local File =SI_DOSSIER+".GTYPACCENT" [GTE] : Endif
+If !clalev([F:PFI])  Local File =SI_DOSSIER+".PFOOTINV"   [PFI] : Endif
+If !clalev([F:TPV])  Local File =SI_DOSSIER+".TABPIVTYP"  [TPV] : Endif
+If !clalev([F:CPY])  Local File =SI_DOSSIER+".COMPANY"    [CPY] : Endif
+If !clalev([F:AFF])  Local File =SI_DOSSIER+".AFCTFCY"    [AFF] : Endif
+#---------------------------------------------------------#
+# Ouvertures normalement effectuées par $OUVRE de SUBPIHA #
+#---------------------------------------------------------#
+If !clalev([F:TRA])  Local File =SI_DOSSIER+".TABRATVAT"  [TRA] : Endif
+If !clalev([F:PTDB]) Local File =SI_DOSSIER+".PRECEIPTD" [PTDB] : Endif
+If !clalev([F:PIHB]) Local File =SI_DOSSIER+".PINVOICE"  [PIHB] : Endif
+If !clalev([F:PIDB]) Local File =SI_DOSSIER+".PINVOICED" [PIDB] : Endif
+If !clalev([F:TCA])  Local File =SI_DOSSIER+".TABCOUAFF"  [TCA] : Endif
+If !clalev([F:TCY])  Local File =SI_DOSSIER+".TABCOUNTRY" [TCY] : Endif
+If !clalev([F:POS])  Local File =SI_DOSSIER+".POSCOD"     [POS] : Endif
+If !clalev([F:STJ])  Local File =SI_DOSSIER+".STOJOU"     [STJ] : Endif
+If !clalev([F:STO])  Local File =SI_DOSSIER+".STOCK"      [STO] : Endif
+If !clalev([F:GCM])  Local File =SI_DOSSIER+".GACM"       [GCM] : Endif
+If !clalev([F:ACV])  Local File =SI_DOSSIER+".ACTIV"      [ACV] : Endif
+#-----
+If !clalev([F:PIX])
+  Link [PIDB] With [PIHB] PIH0=[F:PIDB]NUM As [PIX]
+Endif
+#----- Test présence avant ouverture car normalement conditionné par GMODU(x) -----#
+If filinfo(filpath("FIL","SINVOICE",   "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SIH]) Local File =SI_DOSSIER+".SINVOICE"   [SIH] : Endif
+Endif
+If filinfo(filpath("FIL","SINVOICEV",  "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SIV]) Local File =SI_DOSSIER+".SINVOICEV"  [SIV] : Endif
+Endif
+If filinfo(filpath("FIL","SINVOICED",  "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SID]) Local File =SI_DOSSIER+".SINVOICED"  [SID] : Endif
+Endif
+#--------------------------------------------#
+# Ouvertures complémentaires des tables "X3" #
+#--------------------------------------------#
+If !clalev([F:BPT])  Local File =SI_DOSSIER+".BPCARRIER"  [BPT] : Endif
+If !clalev([F:PPL])  Local File =SI_DOSSIER+".PPRICLIST"  [PPL] : Endif
+If !clalev([F:GTE])  Local File =SI_DOSSIER+".GTYPACCENT" [GTE] : Endif
+If !clalev([F:CCE])  Local File =SI_DOSSIER+".CACCE"      [CCE] : Endif
+If !clalev([F:AVN])  Local File =SI_DOSSIER+".AVALNUM"    [AVN] : Endif
+If !clalev([F:ANM])  Local File =SI_DOSSIER+".ACODNUM"    [ANM] : Endif
+If !clalev([F:AXX])  Local File =SI_DOSSIER+".ATEXTRA"    [AXX] : Endif
+If !clalev([F:TCC])  Local File =SI_DOSSIER+".TEXCPT"     [TCC] : Endif
+If !clalev([F:TXC])  Local File =SI_DOSSIER+".TEXCLOB"    [TXC] : Endif
+If !clalev([F:TVC])  Local File =SI_DOSSIER+".TABVAC"     [TVC] : Endif
+If !clalev([F:AGC])  Local File =SI_DOSSIER+".AGRPCPY"    [AGC]  : Endif
+Return
+
+
+############################################################
+# CALNBENR : Compte le nombre d'enregistrement déjà traité #
+#            et le nombre d'enregistrement total à traiter #
+# -------------------------------------------------------- #
+# Appelé depuis le traitement SUBSIM                       #
+# La clase [M:SIM2] doit être ouverte et chargée           #
+# WNOL est l'indice de la ligne en cours de traitement     #
+# -------------------------------------------------------- #
+# En sortie :                                              #
+#    [M:SIM2]NB2TRT chargé avec nbre total à traiter       #
+#    LMES chargé avec "nbre traité / nbre total"           #
+############################################################
+Funprog CALNBENR(WNOL)
+Value Integer WNOL
+#-----
+Local Char    LMES(30)
+Local Integer WNBFAC
+#-----
+If !clalev([F:SPX])  Local File =SI_DOSSIER+".SIPARX3"  [SPX] : Endif
+Read [SPX] SPX0 First : If fstat  Raz [F:SPX] : Endif
+#----- Nombre total d'enregistrements reste à traiter -----#
+Local File XIEPA [XEPA] Where find(TYPPIE,"FF","AF","AA")<>0
+&                           & FLGMAJ="C"
+&                           & FLGREP<2
+&                           & DATPIE>=[F:SPX]STRPER
+WNBFAC=rowcount([XEPA])
+Close Local File [XEPA]
+#-----
+LMES=num$(WNBFAC)-"/"
+#----- Nombre total d'enregistrements à traiter -----#
+Local File XIEPA [XEPA] Where find(TYPPIE,"FF","AF","AA")<>0
+&                           & FLGMAJ="C"
+&                           & DATPIE>=[F:SPX]STRPER
+WNBFAC=rowcount([XEPA])
+Close Local File [XEPA]
+#-----
+LMES-=num$(WNBFAC)
+[M:SIM4]NB2TRT(WNOL)=WNBFAC
+#-----
+End LMES

@@ -1,0 +1,1579 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+#-------------------------------------------------------------------------------------------#
+#      MTKMTOLIB mise à jour des affectations/allocations suite à déclaration de production
+#-------------------------------------------------------------------------------------------#
+
+###########################################
+# Mise à jour des affectations et allocation
+# du stock produit à la demande
+Subprog MAJ_MTO (TRTLIG,LQTY)
+Value Char    TRTLIG
+Value Decimal LQTY
+
+If GMODU(5) = 2
+    If clalev ([F:SOQ]) = 0  : Local File SORDERQ [SOQ]  : Endif
+    If clalev ([F:SOP]) = 0  : Local File SORDERP [SOP]  : Endif
+    If clalev ([F:SOH]) = 0  : Local File SORDER  [SOH]  : Endif
+Endif
+If GMODU(6) = 2
+    Gosub OPEN_FILES_SCO From SCOLIB
+Endif
+If GMODU(8) = 2
+    Gosub OPEN_FILES_MFG From MFGLIB
+Endif
+
+If clalev ([F:STA]) = 0  : Local File STOALL  [STA]  : Endif
+If clalev ([F:STJ]) = 0  : Local File STOJOU  [STJ]  : Endif
+
+Gosub OPEN_MTO From MTOLINKLIB
+
+Case TRTLIG
+    When "C":   # allocation aux demandes affectées
+                If func MTOLINKLIB.LINK_EXISTS([F:MFI]MFGFCY, 10, [F:MFI]MFGNUM, [F:MFI]MFGLIN, 0, 5)
+                    Raz [M:MLIK]
+                    [M:MLIK]MAJCOD  = "E"
+                    [M:MLIK]STOFCY  = [F:MFI]MFGFCY
+                    [M:MLIK]RESSTYP = 10
+                    [M:MLIK]RESSNUM = [F:MFI]MFGNUM
+                    [M:MLIK]RESSLIN = [F:MFI]MFGLIN
+                    [M:MLIK]RESSSEQ = 0
+                    [M:MLIK]ITMREF  = [F:MFI]ITMREF
+                    [M:MLIK]LIKQTY  = LQTY
+                    [M:MLIK]TRTNAM  = "MTKMTOLIB"
+
+                    Local File MFGITM     [MFI] : # GH 15/12/11 bug 78667
+                    Local File MFGHEAD    [MFG] : # GH 06/11/12 bug 84466
+                    Local File MFGMAT     [MFM] : # GH 06/11/12 bug 84466
+                    Call UPDMTOLINK From MTOLINKLIB
+                Endif
+
+    When "A":   # suppression allocations si contremarque
+                # GH !!
+                # homogénisation avec PURMTOLIB ?
+                If [F:MFI]FMI = 5 & [F:MFI]VCRTYPORI = 2
+                    Raz [M:MLIK]
+                    [M:MLIK]MAJCOD  = "S"
+                    [M:MLIK]DEMNUM  = [F:MFI]VCRNUMORI
+                    [M:MLIK]DEMLIN  = [F:MFI]VCRLINORI
+                    [M:MLIK]DEMSEQ  = [F:MFI]VCRSEQORI
+                    [M:MLIK]DWIPTYP = 1                   # 68911
+                    [M:MLIK]ITMREF  = [F:MFI]ITMREF
+                    Gosub MAJ_MTO_ALLOCATION
+                Endif
+
+                # MAJ_MTO_MFI et MAJ_MTO_MFM sont appelés indépendamment pour l'annulation dans SUBMTKC
+Endcase
+End
+
+###########################################
+# Allocation basée sur affectation
+$MAJ_MTO_ALLOCATION
+Local Decimal WQTY, WQTY1, WQTY2, WSHTQTY
+Local Decimal WQTYACT, WALLQTY
+Local Integer WRETOUR, WRET
+Local Decimal SAV_WALLQTY, WQTE, WQTE1, WQTE2, WSTOCOU
+Local Char    WDEFLOC(GLONLOC), WDEFLOCTYP(GLONTLO)
+Local Char    WDEFLOC2(GLONLOC), WDEFLOCTYP2(GLONTLO)
+Local Char    SYMBOLE(250)
+Local Integer WSPEALL
+Local Decimal WSTJQTY, WENTCUMALLQTY   # 76887
+
+WRETOUR = 0
+
+# suivant le type de demande, on sépare les traitements pour plus de lisibilité
+Case [M:MLIK]DWIPTYP
+    When 1, 8 : Gosub MAJ_SOF                # commande client ou demande inter-site
+  # GH 19/06/12 bug 80881
+  # When 1    : Gosub MAJ_SOF                # commande client
+    When 3: Gosub MAJ_MSF                    # matière à envoyer a un sous-traitant
+    When 6: Gosub MAJ_MWF                    # matière pour production interne
+
+    When 14:    Gosub MAJ_PJM                # Process PJM demands (X3-70711)
+
+Endcase
+
+Return
+
+###################################################
+# Allocation a une matière pour production interne
+$MAJ_MWF
+Local Integer MEMSTA
+
+Read [MFM]MFM0 = [M:MLIK]DEMNUM ;[M:MLIK]DEMLIN;[M:MLIK]DEMSEQ;[M:MLIK]ITMREF
+If fstat : Return : Endif
+
+# si la matière est soldée/exclue
+If [F:MFM]MATSTA > 2 : Return : Endif
+
+Read [MFG]MFG0 = [F:MFM]MFGNUM
+If fstat : Raz [F:MFG] : Return : Endif
+
+If [M:MLIK]MAJCOD = "S"
+   GPE = 0
+   GPOINT = "CUSTRTALL" : Gosub ENTREE From EXEFNC
+   If GOK < 1 : Return : Endif
+   If !GPE
+
+     If clalev([F:STO1]) = 0  : Local File STOCK  [STO1] : Endif
+
+     # suppression des allocations
+     For [STJ]STJ1   Where STOFCY = [F:MKI]MFGFCY
+&                        & VCRTYP = 15
+&                        & VCRNUM = [F:MKI]MFGTRKNUM
+&                        & VCRLIN = [F:MKI]ITMTRKLIN
+&                        & REGFLG <> 2
+          Raz WSTOCOU
+          #--- Issue X3-53322 : ajout LPN
+          Call CLESTO([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]BPSLOT,
+&                     [F:STJ]PALNUM,[F:STJ]CTRNUM,[F:STJ]STA,[F:STJ]LOC,[F:STJ]PCU,
+&                     [F:STJ]PCUSTUCOE,[F:STJ]SERNUM,[F:STJ]QLYCTLDEM,[F:STJ]OWNER,
+&                     [F:STJ]STOFLD1,[F:STJ]STOFLD2,[F:STJ]LPNNUM,[L]WSTOCOU) From STKLIB
+          For [STA]STA1 Where STOFCY = [F:STJ]STOFCY &
+&                             VCRTYP = 2 & STOCOU = WSTOCOU &
+&                             VCRNUM = [F:MFM]MFGNUM & VCRLIN = [F:MFM]MFGLIN &
+&                             VCRSEQ = [F:MFM]BOMSEQ
+               Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,WRETOUR) From STKALL
+               If WRETOUR <> 0 : GOK = 0 : Break : Endif
+               WQTE2-= [F:STA]QTYSTU
+               SAV_WALLQTY-= [F:STA]QTYSTU
+          Next
+          If GOK < 1 : Break : Endif
+      Next
+      If GOK < 1 : Return : Endif
+   Endif
+Else
+     # GH 23/07/2013 bug 87805 remplacé par le DIMALL dans la boucle
+     # si manquants, suppression allocation sur les manquants
+     #If [F:MFM]SHTQTY > 0
+     #   WQTY1 = 0 : WQTY2 = 0
+     #   Call DELALL(10, [F:MFM]MFGNUM, [F:MFM]MFGLIN, [F:MFM]BOMSEQ, [F:MFM]ITMREF, 2, WQTY1, WQTY2, WRET) From STKALL
+     #   If WRET <> 0 : Return : Endif
+     #   [F:MFM]SHTQTY = 0
+     #Endif
+
+     # qté restant a allouer
+     WALLQTY = [F:MFM]RETQTY - [F:MFM]ALLQTY - [F:MFM]USEQTY
+     If WALLQTY <= 0  : Return : Endif
+
+     # point d'entrée permettant de modifier la quantité à allouer
+     # il suffit de mettre WALLQTY = [M:MLIK]LIKQTY
+     # derrière, on enlève la quantité déclarée en "R"
+     GPOINT = "CALWALLQTY"
+     Gosub  ENTREE From EXEFNC
+
+     If WALLQTY > [M:MLIK]LIKQTY : WALLQTY = [M:MLIK]LIKQTY : Endif
+     If WALLQTY <= 0             : Return                   : Endif
+     # SAV_WALLQTY = WALLQTY      # GH 23/07/2013 bug 87805
+
+     # ---------------------------------------------
+     GPE = 0
+     GPOINT = "CUSTRTALL" : Gosub ENTREE From EXEFNC
+     If GOK < 1 : Return : Endif
+     If !GPE
+         ## Recherche de l'emp (type) de consommation si exclusif
+         Raz WDEFLOC, WDEFLOCTYP
+         Call RECH_PICLOC(10,[F:MFM]MFGFCY,[F:MFM]ITMREF,[F:MFM]LOC,"",1,1,"O",WDEFLOC,WDEFLOCTYP) From STKALL
+
+         ## Issue 118801 GH 02/12/16 - search location (type) for allocation if there is one exclusive
+         Raz WDEFLOC2, WDEFLOCTYP2
+         Call RECH_PICLOC(-10,[F:MFM]MFGFCY,[F:MFM]ITMREF,[F:MFM]LOC,"",1,1,"O",WDEFLOC2,WDEFLOCTYP2) From STKALL
+
+         # GH 15/01/15 Bug 104861 : Changement du type d'allocation globale en détaillée ?
+         # 0=Non 1=Allocation globale à supprimer 2=Affectation allouée en détail => ancien (Allocation + Manquant) global à recréer en détaillé
+         Local Integer WCHGALL
+         WCHGALL = (find([F:MFM]ALLSTA,2,3)<>0)
+         If WCHGALL & [F:MFM]ALLQTY=0 : WCHGALL=2 : Endif
+
+         WENTCUMALLQTY = ENT_CUMALLQTY  # 76887
+         # boucle du fichier STOJOU
+         For [STJ]STJ1 Where STOFCY = [F:MKI]MFGFCY
+&                        & VCRTYP = 15
+&                        & VCRNUM = [F:MKI]MFGTRKNUM
+&                        & VCRLIN = [F:MKI]ITMTRKLIN
+&                        & REGFLG <> 2
+
+             If WALLQTY <= 0 : Break : Endif
+
+             ## Issue 118801 GH 02/12/16 - compatibility with resource stock location depends on the (exclusive) allocation location
+             ##                            instead of the (exclusive) material consumption
+             ## GH 23/07/2013 bug 87805 test de WDEFLOC
+             #If !find([L]WDEFLOC,"",[F:STJ]LOC) : Goto NXT_STJ_MWF : Endif
+             ## GH 23/07/2013 bug 91012 test de WDEFLOCTYP
+             #If !find([L]WDEFLOCTYP,"","*")
+             #   If !clalev([F:STC]) : Local File STOLOC [STC] : Endif
+             #   Read [STC]STC0 = [F:STJ]STOFCY;[F:STJ]LOC
+             #   If fstat | pat([F:STC]LOCTYP,[L]WDEFLOCTYP)=0  : Goto NXT_STJ_MWF : Endif
+             #Endif
+             If !find([L]WDEFLOC2,"",[F:STJ]LOC) : Goto NXT_STJ_MWF : Endif
+             If !find([L]WDEFLOCTYP2,"","*")
+                If !clalev([F:STC]) : Local File STOLOC [STC] : Endif
+                Read [STC]STC0 = [F:STJ]STOFCY;[F:STJ]LOC
+                If fstat | pat([F:STC]LOCTYP,[L]WDEFLOCTYP2)=0 : Goto NXT_STJ_MWF : Endif
+             Endif
+             [L]WSTOCOU=0
+             #--- Issue X3-53322 : ajout LPN
+             Call CLESTO([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]BPSLOT,
+&                        [F:STJ]PALNUM,[F:STJ]CTRNUM,[F:STJ]STA,[F:STJ]LOC,[F:STJ]PCU,
+&                        [F:STJ]PCUSTUCOE,[F:STJ]SERNUM,[F:STJ]QLYCTLDEM,[F:STJ]OWNER,
+&                        [F:STJ]STOFLD1,[F:STJ]STOFLD2,[F:STJ]LPNNUM,[L]WSTOCOU) From STKLIB
+             If [L]WSTOCOU=0 : Goto NXT_STJ_MWF : Endif
+
+             # 76887
+             If [F:STJ]QTYSTU <= WENTCUMALLQTY
+                WSTJQTY = 0
+                WENTCUMALLQTY-= [F:STJ]QTYSTU
+             Else
+                WSTJQTY = [F:STJ]QTYSTU - WENTCUMALLQTY
+                WENTCUMALLQTY = 0
+             Endif
+             If WSTJQTY<=0 : Goto NXT_STJ_MWF : Endif
+
+             # GH 15/01/15 Bug 104861 : # suppression de l'allocation globale
+             If WCHGALL=1
+                WQTY    = [F:MFM]ALLQTY
+                WQTY1 = 0 : WQTY2 = 0
+                Call DIMALL(10, [F:MFM]MFGNUM, [F:MFM]MFGLIN, [F:MFM]BOMSEQ, [F:MFM]ITMREF, 1 , WQTY, WQTY1, WQTY2, WRET) From STKALL
+                If WRET <> 0 : GOK=0 : Break : Endif
+
+                WCHGALL = 2
+                WQTE2-= WQTY1
+             Endif
+
+             # GH 27/06/2017 Issue 38509 - consider WSTJQTY and not anymore [F:STJ]QTYSTU
+#            WALLQTY-= [F:STJ]QTYSTU
+#            If WALLQTY >= 0
+#               WQTY = [F:STJ]QTYSTU
+#            Else
+#               WQTY = WALLQTY + [F:STJ]QTYSTU
+#            Endif
+             WQTY = min(WALLQTY,WSTJQTY)
+             WALLQTY-= WQTY
+
+             If [F:STJ]POT <> 0
+                 WQTYACT = WQTY * ([F:STJ]POT/100)
+             Else
+                 WQTYACT = WQTY
+             Endif
+
+             WQTE = [F:MFM]ALLQTY  # quantité déjà allouée
+             # calcul de la quantité allouée en unité active
+             If [F:STJ]POT <> 0
+                   GBIDD2 = WQTE * ([F:STJ]POT/100)
+             Else
+                   GBIDD2 = WQTE
+             Endif
+             Raz GBIDC1
+
+             # creation detailed allocation
+             #--- TS 106217 ajout paramètre LECC (avant dernier)
+             Call CREALL(2,[F:STJ]STOFCY,[F:STJ]ITMREF,WSTOCOU,[F:MTK]MFGTRKDAT,WQTY,
+&                        WQTYACT,10,[F:MFM]MFGNUM,[F:MFM]MFGLIN,[F:MFM]BOMSEQ,GBIDC1,[F:MFM]RETDAT,
+&                        "","","","","","",WQTE,GBIDD2,WDEFLOC,WDEFLOCTYP,"","",1,"",WRETOUR) From STKALL
+             If WRETOUR <> 0 : GOK = 0 : Break : Endif
+             WQTE2+= WQTY
+             SAV_WALLQTY+= WQTY       # GH 23/07/2013 bug 87805
+
+$NXT_STJ_MWF
+         Next
+         If GOK < 1 : Return : Endif
+
+         # GH 23/07/2013 bug 87805
+         If SAV_WALLQTY <> 0 : # WCHGALL=2
+            If WCHGALL : WQTY = [F:MFM]SHTQTY : # suppression du manquant global  # GH 31/07/13 Bug 90797
+            Else       : WQTY = SAV_WALLQTY   : # diminution du manquant détail
+            Endif
+            If WQTY<>0
+               WQTY1 = 0 : WQTY2 = 0
+               Call DIMALL(10, [F:MFM]MFGNUM, [F:MFM]MFGLIN, [F:MFM]BOMSEQ, [F:MFM]ITMREF, 2, WQTY, WQTY1, WQTY2, WRET) From STKALL
+               If WRET <> 0 : Return : Endif
+            Endif
+
+            If WCHGALL
+              # GH 15/01/15 Bug 104861 : # allocation en détaillé
+
+              WSHTQTY = max(0,[F:MFM]SHTQTY-SAV_WALLQTY)
+              [F:MFM]ALLSTA = 3-(WSHTQTY>0)
+              If WSHTQTY<>0 : # GH 23/06/14 Bug 100441
+                 # Création du manquant détail
+                 #--- TS 106217 ajout paramètre LECC (avant dernier)
+                 Call CREALL(4,[F:MFM]MFGFCY,[F:MFM]ITMREF,0,[31/12/2999],0,
+&                            WSHTQTY,10,[F:MFM]MFGNUM,[F:MFM]MFGLIN,[F:MFM]BOMSEQ,"",max(date$,[F:MFM]RETDAT),
+&                            [F:MFM]LOT,"",[F:MFM]STA,WDEFLOC2,"","",0,0,"","","","",1,[F:MFM]ECCVALMAJ,WRET) From STKALL
+                 If WRET <> 0 : Return : Endif
+              Endif
+
+              If [F:MFM]ALLQTY<>0
+                 WQTY = [F:MFM]ALLQTY : WQTY2 = 0
+                 Call ALLOCATION("C", 2, WQTY, WQTY2, WRET) From MFGALL
+                 If WRET <> 0 : Return : Endif
+                 WQTE2+= WQTY
+              Endif
+
+              # WCHGALL = 3
+            Endif
+         Endif
+
+     Endif
+Endif
+If WRETOUR <> 0     : Return : Endif
+If SAV_WALLQTY = 0  : Return : Endif
+
+SYMBOLE = "MFG"+[F:MFG]MFGNUM
+Lock =SYMBOLE With lockwait=0
+If fstat
+   # Ordre de fabrication ... Modification en cours sur un autre poste
+   GMESSAGE=mess(5,306,1)-[F:MFG]MFGNUM+"\"+mess(10,100,1) : GERR=1
+   GOK=0 : Return
+Endif
+
+# mise à jour detail matière
+Readlock [MFG]MFG0 = [F:MFM]MFGNUM
+If fstat= 1
+    GOK = -1 : GLOCK = "$MFGHEAD"-[F:MFM]MFGNUM : Goto MAJ_FIN
+Elsif fstat
+    GOK = 0  : Call RSTA("MFG",[F:MFM]MFGNUM) From GLOCK : Goto MAJ_FIN
+Endif
+
+Readlock [MFM]MFM0=[M:MLIK]DEMNUM;[M:MLIK]DEMLIN;[M:MLIK]DEMSEQ;[M:MLIK]ITMREF
+If fstat = 1
+    GOK = -1 : GLOCK = "$MFGMAT"-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)-[M:MLIK]ITMREF : Goto MAJ_FIN
+Elsif fstat
+    GOK = 0  : Call RSTA("MFM",[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)-[M:MLIK]ITMREF) From GLOCK : Goto MAJ_FIN
+Endif
+
+MEMSTA = [F:MFM]ALLSTA
+
+#-- WQTE2 contient la quantité allouée ou désallouée réellement
+[F:MFM]ALLQTY+= WQTE2
+If [F:MFM]ALLQTY < 0 : [F:MFM]ALLQTY = 0 : Endif
+
+# statut alloc détaillé et complet ou rupture
+[F:MFM]ALLSTA = 5
+WSHTQTY = 0
+If [F:MFM]ALLQTY < ([F:MFM]RETQTY - [F:MFM]USEQTY)
+    [F:MFM]ALLSTA-= 1
+    WSHTQTY = [F:MFM]RETQTY - [F:MFM]USEQTY - [F:MFM]ALLQTY
+Endif
+
+If [M:MLIK]MAJCOD="S"
+    If WSHTQTY>0
+      #--- TS 106217 ajout paramètre LECC (avant dernier)
+      Call CREALL(4,[F:MFM]MFGFCY,[F:MFM]ITMREF,0,[F:PTD]RCPDAT,0,
+&                 WSHTQTY,10,[F:MFM]MFGNUM,[F:MFM]MFGLIN,[F:MFM]BOMSEQ,"",[F:MFM]RETDAT,
+&                 [F:MFM]LOT,"",[F:MFM]STA,[F:MFM]LOC,"","",0,0,"","","","",1,[F:MFM]ECCVALMAJ,WRET) From STKALL
+    Endif
+    [F:MFM]SHTQTY = WSHTQTY
+Else
+    [F:MFM]SHTQTY-= SAV_WALLQTY
+Endif
+If [F:MFM]SHTQTY<0 : [F:MFM]SHTQTY=0 : Endif : # GH 09/12/2014 bug 103464
+
+# mise à jour matière
+Rewrite [MFM]
+If fstat
+    GOK = 0 : Call FSTA ("MFG") From GLOCK : Goto MAJ_FIN
+Endif
+
+# lecture encours pour récupérer le n° affaire
+Read [ORD]ORD0=6;[F:MFM]WIPNUM;[F:MFM]ITMREF
+
+# mise à jour de l'encours
+Call UPDATE_MFX("M", [F:ORD]PJT, [F:ORD]BOMALT, 0) From MFGLIBM
+
+Gosub MAJMFGHEAD From MFGLIB : # GH 18/06/2013 Bug 90567
+
+Rewrite [MFG]
+If fstat
+    GOK = 0 : Call FSTA ("MFG") From GLOCK : Goto MAJ_FIN
+Endif
+
+# 76887 sauvegarde du cumul alloué
+If [M:MLIK]MAJCOD = "E" : ENT_CUMALLQTY+= SAV_WALLQTY : Endif
+
+Goto MAJ_FIN
+
+###########################################
+# Allocation a une commande de vente
+$MAJ_SOF
+Local Decimal WALL, WSHT
+Local Char    ABR(7) : ABR="[F:SOQ]"
+
+Read [SOQ]SOQ0 = [M:MLIK]DEMNUM ;[M:MLIK]DEMLIN;[M:MLIK]DEMSEQ
+If fstat : Raz [F:SOQ] : Return : Endif
+
+# si la ligne de vente est soldée
+If [F:SOQ]SOQSTA = 3 : Return : Endif
+
+Read [SOH]SOH0 = [F:SOQ]SOHNUM
+If fstat : Raz [F:SOH] : Return : Endif
+
+Read [SOP]SOP0 = [F:SOQ]SOHNUM ;[F:SOQ]SOPLIN;[F:SOQ]SOQSEQ
+If fstat : Raz [F:SOP] : Endif
+
+If [M:MLIK]MAJCOD = "S"
+   GPE = 0
+   GPOINT = "CUSTRTALL" : Gosub ENTREE From EXEFNC
+   If GOK < 1 : Return : Endif
+   WSPEALL = GPE
+   If !GPE
+
+     If clalev([F:STO1]) = 0  : Local File STOCK  [STO1] : Endif
+
+     # suppression des allocations
+     For [STJ]STJ1   Where STOFCY = [F:MKI]MFGFCY
+&                        & VCRTYP = 15
+&                        & VCRNUM = [F:MKI]MFGTRKNUM
+&                        & VCRLIN = [F:MKI]ITMTRKLIN
+&                        & REGFLG <> 2
+          Raz WSTOCOU
+          #--- Issue X3-53322 : ajout LPN
+          Call CLESTO([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]BPSLOT,
+&                     [F:STJ]PALNUM,[F:STJ]CTRNUM,[F:STJ]STA,[F:STJ]LOC,[F:STJ]PCU,
+&                     [F:STJ]PCUSTUCOE,[F:STJ]SERNUM,[F:STJ]QLYCTLDEM,[F:STJ]OWNER,
+&                     [F:STJ]STOFLD1,[F:STJ]STOFLD2,[F:STJ]LPNNUM,[L]WSTOCOU) From STKLIB
+          For [STA]STA1 Where STOFCY = [F:STJ]STOFCY &
+&                             VCRTYP = 2 & STOCOU = WSTOCOU &
+&                             VCRNUM = [F:SOQ]SOHNUM & VCRLIN = [F:SOQ]SOPLIN &
+&                             VCRSEQ = [F:SOQ]SOQSEQ
+               Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,WRETOUR) From STKALL
+               If WRETOUR <> 0 : GOK = 0 : Break : Endif
+               WQTE2-= [F:STA]QTYSTU
+               SAV_WALLQTY-= [F:STA]QTYSTU
+          Next
+          If GOK < 1 : Break : Endif
+      Next
+      If GOK < 1 : Return : Endif
+   Endif
+Else
+     # GH 23/07/2013 bug 87805 remplacé par le DIMALL dans la boucle
+     # si manquants, diminution/suppression allocation sur les manquants
+     #If [F:SOQ]SHTQTYSTU <> 0
+     #   WQTY = [M:MLIK]LIKQTY
+     #   WQTY1 = 0 : WQTY2 = 0
+     #   Call DIMALL(2, [F:SOQ]SOHNUM, [F:SOQ]SOPLIN, [F:SOQ]SOQSEQ, [F:SOQ]ITMREF, 2, WQTY, WQTY1, WQTY2,WRET) From STKALL
+     #   If WRET <> 0 : Return : Endif
+     #   WSHTQTY = [F:SOQ]SHTQTYSTU - WQTY2
+     #Endif
+
+     WSHTQTY = [F:SOQ]SHTQTYSTU
+
+     # qté restant a allouer
+     # cde facturation directe : qté cde  - qté alloué - qté livré - qté facturé
+     # autre cde                 qté cde  - qté alloué - qté livré - qté encours de livraison
+     If [F:SOH]SOHCAT = 3
+         WALLQTY = [F:SOQ]QTYSTU  - [F:SOQ]ALLQTYSTU - [F:SOQ]INVQTYSTU
+     Else
+         WALLQTY = [F:SOQ]QTYSTU  - [F:SOQ]ALLQTYSTU - [F:SOQ]DLVQTYSTU - [F:SOQ]ODLQTYSTU
+     Endif
+     If WALLQTY <= 0  : Return : Endif
+
+     # point d'entrée permettant de modifier la quantité à allouer
+     # il suffit de mettre WALLQTY = [M:MLIK]LIKQTY
+     # derrière, on enlève la quantité déclarée en "R"
+     GPOINT = "CALWALLQTY"
+     Gosub  ENTREE From EXEFNC
+
+     If WALLQTY > [M:MLIK]LIKQTY : WALLQTY = [M:MLIK]LIKQTY : Endif
+     If WALLQTY <= 0             : Return                   : Endif
+
+     #--- Issue 122340
+     Local Decimal WQTYSTU, WQTYARR
+     #---------------------------------------------
+     # TS : réajustement qté en unité vente entière
+     #---------------------------------------------
+     WQTYSTU = WALLQTY
+     If [F:SOP]SAU<>[F:SOP]STU
+       Call CTRQTYPCU([F:SOP]SAU,[F:SOP]SAUSTUCOE,WQTYSTU,WQTYARR) From STKLIB
+       If WQTYARR<>WQTYSTU
+         Call QTEARR(WQTYARR,[F:SOP]STU) From TRTDIV
+         WQTYSTU = WQTYARR
+         WQTY    = WQTYSTU/[F:SOP]SAUSTUCOE
+         Call QTEARR(WQTY,[F:SOP]SAU) From TRTDIV
+       Endif
+     Endif
+     WALLQTY = WQTYSTU
+     If WALLQTY<=0  Return Endif
+     #--- End 122340
+
+     # SAV_WALLQTY = WALLQTY    # GH 23/07/2013 bug 87805
+
+     # ---------------------------------------------
+     GPE = 0
+     GPOINT = "CUSTRTALL" : Gosub ENTREE From EXEFNC
+     If GOK < 1 : Return : Endif
+     WSPEALL = GPE
+     If !GPE
+         # Recherche de l'emp (type) de livraison si exclusif
+         Raz WDEFLOC, WDEFLOCTYP
+         Call RECH_PICLOC(2,[F:SOQ]STOFCY,[F:SOQ]ITMREF,"","",1,1,"O",WDEFLOC,WDEFLOCTYP) From STKALL
+
+         ## Issue 118801 GH 02/12/16 - search location (type) for allocation if there is one exclusive
+         Raz WDEFLOC2, WDEFLOCTYP2
+         Call RECH_PICLOC(-2,[F:SOQ]STOFCY,[F:SOQ]ITMREF,"","",1,1,"O",WDEFLOC2,WDEFLOCTYP2) From STKALL
+
+         # GH 31/07/13 Bug 90797 : Changement du type d'allocation globale en détaillée ?
+         # 0=Non 1=Allocation globale à supprimer 2=Affectation allouée en détail => ancien (Allocation + Manquant) global à recréer en détaillé
+         Local Integer WCHGALL
+         WCHGALL = ([F:SOQ]ALLTYP=1)
+         If WCHGALL & [F:SOQ]ALLQTYSTU=0 : WCHGALL=2 : Endif
+
+         WENTCUMALLQTY = ENT_CUMALLQTY  # 76887
+         # boucle du fichier STOJOU
+         For [STJ]STJ1 Where STOFCY = [F:MKI]MFGFCY
+&                        & VCRTYP = 15
+&                        & VCRNUM = [F:MKI]MFGTRKNUM
+&                        & VCRLIN = [F:MKI]ITMTRKLIN
+&                        & REGFLG <> 2
+
+             If WALLQTY <= 0 : Break : Endif
+
+             ## Issue 118801 GH 02/12/16 - compatibility with resource stock location depends on the (exclusive) allocation location
+             ##                            instead of the (exclusive) delivery location
+             ## GH 23/07/2013 bug 87805 test de WDEFLOC
+             #If !find([L]WDEFLOC,"",[F:STJ]LOC) : Goto NXT_STJ_SOF : Endif
+             ## GH 23/07/2013 bug 91012 test de WDEFLOCTYP
+             #If !find([L]WDEFLOCTYP,"","*")
+             #  If !clalev([F:STC]) : Local File STOLOC [STC] : Endif
+             #  Read [STC]STC0 = [F:STJ]STOFCY;[F:STJ]LOC
+             #  If fstat | pat([F:STC]LOCTYP,[L]WDEFLOCTYP)=0  : Goto NXT_STJ_SOF : Endif
+             #Endif
+
+             If !find([L]WDEFLOC2,"",[F:STJ]LOC) : Goto NXT_STJ_SOF : Endif
+             If !find([L]WDEFLOCTYP2,"","*")
+                If !clalev([F:STC]) : Local File STOLOC [STC] : Endif
+                Read [STC]STC0 = [F:STJ]STOFCY;[F:STJ]LOC
+                If fstat | pat([F:STC]LOCTYP,[L]WDEFLOCTYP2)=0 : Goto NXT_STJ_SOF : Endif
+             Endif
+             [L]WSTOCOU=0
+             # Issue 112211 - 2015-11-02 by MAE : Oubli de STOFLD1 et STOFLD2
+             #--- Issue X3-53322 : ajout LPN
+             Call CLESTO([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]BPSLOT,
+&                        [F:STJ]PALNUM,[F:STJ]CTRNUM,[F:STJ]STA,[F:STJ]LOC,[F:STJ]PCU,
+&                        [F:STJ]PCUSTUCOE,[F:STJ]SERNUM,[F:STJ]QLYCTLDEM,[F:STJ]OWNER,
+&                        [F:STJ]STOFLD1,[F:STJ]STOFLD2,[F:STJ]LPNNUM,[L]WSTOCOU) From STKLIB
+             If [L]WSTOCOU=0 : Goto NXT_STJ_SOF : Endif
+
+             # 76887
+             If [F:STJ]QTYSTU <= WENTCUMALLQTY
+                WSTJQTY = 0
+                WENTCUMALLQTY-= [F:STJ]QTYSTU
+             Else
+                WSTJQTY = [F:STJ]QTYSTU - WENTCUMALLQTY
+                WENTCUMALLQTY = 0
+             Endif
+             If WSTJQTY<=0 : Goto NXT_STJ_SOF : Endif
+
+             # GH 31/07/13 Bug 90797 : # suppression de l'allocation globale
+             If WCHGALL=1
+               WQTY    = [F:SOQ]ALLQTYSTU
+               WQTY1 = 0 : WQTY2 = 0
+               Call DIMALL(2, [F:SOQ]SOHNUM, [F:SOQ]SOPLIN, [F:SOQ]SOQSEQ, [F:SOQ]ITMREF, 1 , WQTY, WQTY1, WQTY2,WRET) From STKALL
+               If WRET <> 0 : GOK=0 : Break : Endif
+
+               WCHGALL = 2
+               WQTE2-= WQTY1
+               WSHTQTY-= WQTY2
+             Endif
+
+             # GH 27/06/2017 Issue 38509 - consider WSTJQTY and not anymore [F:STJ]QTYSTU
+#            [F:STJ]QTYSTU = WSTJQTY
+#            WALLQTY-= [F:STJ]QTYSTU
+#            If WALLQTY >= 0
+#                WQTY = [F:STJ]QTYSTU
+#            Else
+#                WQTY = WALLQTY + [F:STJ]QTYSTU
+#            Endif
+             WQTY = min(WALLQTY,WSTJQTY)
+             WALLQTY-= WQTY
+
+             If [F:STJ]POT <> 0
+                 WQTYACT = WQTY * ([F:STJ]POT/100)
+             Else
+                 WQTYACT = WQTY
+             Endif
+
+             WQTE = [F:SOQ]ALLQTYSTU  # quantité déjà allouée
+             # calcul de la quantité allouée en unité active
+             If [F:STJ]POT <> 0
+                   GBIDD2 = WQTE * ([F:STJ]POT/100)
+             Else
+                   GBIDD2 = WQTE
+             Endif
+             Raz GBIDC1
+
+             # creation detailed allocation
+             #--- TS 106217 ajout paramètre LECC (avant dernier)
+             Call CREALL(2,[F:STJ]STOFCY,[F:STJ]ITMREF,WSTOCOU,[F:MTK]MFGTRKDAT,WQTY,
+&                        WQTYACT,2,[F:SOQ]SOHNUM,[F:SOQ]SOPLIN,[F:SOQ]SOQSEQ,GBIDC1,[F:SOQ]SHIDAT,
+&                        "","","","","","",WQTE,GBIDD2,WDEFLOC,WDEFLOCTYP,"","",1,"",WRETOUR) From STKALL
+             If WRETOUR <> 0 : GOK = 0 : Break : Endif
+             WQTE2+= WQTY
+             SAV_WALLQTY+= WQTY      # GH 23/07/2013 bug 87805
+
+$NXT_STJ_SOF
+         Next
+         If GOK < 1 : Return : Endif
+
+         # GH 23/07/2013 bug 87805
+         If SAV_WALLQTY <> 0 : # WCHGALL=2
+           If WCHGALL : WQTY=[F:SOQ]SHTQTYSTU : # suppression du manquant global  # GH 31/07/13 Bug 90797
+           Else       : WQTY = SAV_WALLQTY    : # diminution du manquant détail
+           Endif
+           If WQTY<>0
+               WQTY1 = 0 : WQTY2 = 0
+               Call DIMALL(2, [F:SOQ]SOHNUM, [F:SOQ]SOPLIN, [F:SOQ]SOQSEQ, [F:SOQ]ITMREF, 2, WQTY, WQTY1, WQTY2,WRET) From STKALL
+               If WRET <> 0 : Return : Endif
+               WSHTQTY-= WQTY2
+           Endif
+
+           If WCHGALL
+              # GH 31/07/13 Bug 90797 : # allocation en détaillé
+              Local Libelle WIMPCLI, WGENSHT
+              Local Char    WPARAM(1)
+              Call PARAM([F:SOQ]SALFCY,"USERERBPC",WPARAM) From ADOVAL : WIMPCLI=min(2,val(WPARAM))
+              If find([F:SOP]LINTYP,2,3,4,5,10,11,12,13)
+                 WGENSHT=2
+              Else
+                 Call PARAM([F:SOQ]STOFCY,"GENSHT",WPARAM) From ADOVAL : WGENSHT=val(WPARAM)
+              Endif
+
+              [F:SOQ]ALLTYP = 2
+
+              WSHTQTY+= [F:SOQ]SHTQTYSTU-SAV_WALLQTY
+              ## GH 23/06/14 Bug 100441
+              If WSHTQTY<0 : WSHTQTY=0 : Endif
+              If WSHTQTY<>0 & WGENSHT=2 : # GH 23/06/14 Bug 100441
+                 # Création du manquant détail
+                 #--- TS 106217 ajout paramètre LECC (avant dernier)
+                 Call CREALL(4,[F:SOQ]STOFCY,[F:SOQ]ITMREF,0,[31/12/2999],0,
+&                            WSHTQTY,2,[F:SOQ]SOHNUM,[F:SOQ]SOPLIN,[F:SOQ]SOQSEQ,"",max(date$,[F:SOQ]SHIDAT),
+&                            [F:SOQ]LOT,"",[F:SOQ]STA,WDEFLOC2,"","",0,0,"","","","",1,[F:SOQ]ECCVALMAJ,WRET) From STKALL
+                 If WRET <> 0 : Return : Endif
+              Endif
+              ##
+
+              If [F:SOQ]ALLQTYSTU<>0
+                  WQTY = [F:SOQ]ALLQTYSTU : WQTY2 = 0
+                  Call GENALLORD("","","C", WIMPCLI, WGENSHT, 0, WQTY, WQTY2, WRET) From TRTVENALL
+                  If WRET <> 0 : Return : Endif
+                  WQTE2+= WQTY
+                  WSHTQTY+= WQTY2
+              Endif
+
+              # WCHGALL = 3
+           Endif
+         Endif
+
+     Endif
+Endif
+If WRETOUR <> 0     : Return : Endif
+If SAV_WALLQTY = 0  : Return : Endif
+
+SYMBOLE = "SOH"+[F:SOQ]SOHNUM
+Lock =SYMBOLE With lockwait=0
+If fstat
+   # Commande client ... Modification en cours sur un autre poste
+   GMESSAGE=mess(1,306,1)-[F:SOQ]SOHNUM+"\"+mess(10,100,1) : GERR=1
+   GOK=0 : Return
+Endif
+
+# mise à jour detail commande de vente
+Readlock [SOH]SOH0 = [F:SOQ]SOHNUM
+If fstat= 1
+    GOK = -1 : GLOCK = "$SORDER"-[F:SOQ]SOHNUM : Goto MAJ_FIN
+Elsif fstat
+    GOK = 0  : Call RSTA("SOH",[F:SOQ]SOHNUM) From GLOCK : Goto MAJ_FIN
+Endif
+
+Readlock [SOQ]SOQ0=[M:MLIK]DEMNUM;[M:MLIK]DEMLIN;[M:MLIK]DEMSEQ
+If fstat = 1
+    GOK = -1 : GLOCK = "$SORDERQ"-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ) : Goto MAJ_FIN
+Elsif fstat
+    GOK = 0  : Call RSTA("SOQ",[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)) From GLOCK : Goto MAJ_FIN
+Endif
+
+#[F:SOQ]SHTQTY    = WSHTQTY : # GH 14/09/2012 bug 81610
+[F:SOQ]SHTQTYSTU = WSHTQTY
+
+If [F:SOH]SOHCAT = 3
+    WQTE1= [F:SOQ]INVQTYSTU
+Else
+    WQTE1= [F:SOQ]DLVQTYSTU
+Endif
+
+If [F:SOQ]ALLQTYSTU + [F:SOQ]ODLQTYSTU + WQTE1 >= [F:SOQ]QTYSTU
+&       &  [F:SOQ]SHTQTYSTU = 0 & ([F:SOQ]STOMGTCOD <> 1  | find([F:SOP]LINTYP,2,10))
+    # la ligne etait allouée
+    GBIDI1 = 2
+Else
+    # la ligne n'etait pas allouée
+    GBIDI1 = 1
+Endif
+
+#-----------------------------------------#
+# mise à jour détail de commande de vente #
+#-----------------------------------------#
+#-- WQTE2 contient la quantité allouée ou désallouée réellement
+[F:SOQ]ALLQTYSTU+= WQTE2
+If [F:SOQ]ALLQTYSTU < 0 : [F:SOQ]ALLQTYSTU = 0 : Endif
+
+# lecture SORDERP pour recuperer UV
+Read [SOP]SOP0 = [F:SOQ]SOHNUM ;[F:SOQ]SOPLIN;[F:SOQ]SOQSEQ
+If fstat : Raz [F:SOP] : Endif
+
+If [F:SOP]SAU = [F:SOP]STU
+    [F:SOQ]ALLQTY+= WQTE2
+Else
+    GBIDD1 = WQTE2*(1/[F:SOP]SAUSTUCOE)
+    Call QTEARR(GBIDD1, [F:SOP]SAU) From TRTDIV
+    [F:SOQ]ALLQTY+= GBIDD1
+Endif
+If [F:SOQ]ALLQTY < 0 : [F:SOQ]ALLQTY = 0 : Endif
+
+# GH 14/09/2012 bug 81610
+If [F:SOP]SAU = [F:SOP]STU
+    [F:SOQ]SHTQTY =  WSHTQTY
+Else
+    GBIDD1 =  WSHTQTY*(1/[F:SOP]SAUSTUCOE)
+    Call QTEARR(GBIDD1, [F:SOP]SAU) From TRTDIV
+    [F:SOQ]SHTQTY = GBIDD1
+Endif
+
+# Issue 68996 - 2010-11-09 by CCC : La variable GPE a pu être modifiée entre temps par d'autres sous-pro (LECSRU par ex.)
+If !WSPEALL : [F:SOQ]ALLTYP = 2 : Endif
+
+Rewrite [SOQ]
+If fstat
+    GOK = 0 : Call FSTA ("SOQ") From GLOCK : Goto MAJ_FIN
+Endif
+
+# la ligne est passée du statut non alloué au statut alloué
+# If [F:SOQ]ALLQTYSTU + [F:SOQ]ODLQTYSTU >= [F:SOQ]QTYSTU # Issue 117459 GH 07/12/16 - WQTE1 has to be considered
+If [F:SOQ]ALLQTYSTU + [F:SOQ]ODLQTYSTU + WQTE1 >= [F:SOQ]QTYSTU
+&       &  [F:SOQ]SHTQTYSTU = 0 & ([F:SOQ]STOMGTCOD <> 1 | find([F:SOP]LINTYP,2,10))
+&       &  GBIDI1 = 1
+    GBIDI2 = -1
+# la ligne a passé du statut alloué au statut non alloué
+# If [F:SOQ]ALLQTYSTU + [F:SOQ]ODLQTYSTU < [F:SOQ]QTYSTU # Issue 117459 GH 07/12/16 - WQTE1 has to be considered
+Elsif ([F:SOQ]ALLQTYSTU + [F:SOQ]ODLQTYSTU + WQTE1 < [F:SOQ]QTYSTU
+&       | [F:SOQ]SHTQTYSTU <> 0) & ([F:SOQ]STOMGTCOD <> 1  | find([F:SOP]LINTYP,2,10))
+&       &  GBIDI1 = 2
+    GBIDI2 = 1
+Else
+# la ligne n'a pas changé d'état
+    GBIDI2=0
+Endif
+
+#-----------------------------------------#
+# mise à jour entete de commande de vente #
+#-----------------------------------------#
+If GBIDI2 <> 0  # la ligne a changé d'état
+    [F:SOH]ALLLINNBR+= GBIDI2
+Endif
+
+If [F:SOH]ALLLINNBR <= 0
+   [F:SOH]ALLLINNBR = 0
+   [F:SOH]ALLSTA = 3
+Elsif [F:SOH]ALLLINNBR < [F:SOH]LINNBR | [F:SOQ]ALLQTY <> 0
+   [F:SOH]ALLSTA = 2
+Else
+   [F:SOH]ALLSTA = 1
+Endif
+
+Rewrite [SOH]
+If fstat
+    GOK = 0 : Call FSTA ("SOH") From GLOCK : Goto MAJ_FIN
+Endif
+
+# si composé de kit/sous-traité, il faut allouer les composants
+If find([F:SOP]LINTYP,2,10) & WQTE2 <> 0
+    Local Char WSOQ_TRTLIG
+    Local Decimal WSOQ_ALLSTU
+    If WQTE2<0
+        # c'est une diminution/annulation de l'allocation
+        WSOQ_TRTLIG = "D"
+        WSOQ_ALLSTU = -WQTE2
+    Else
+        # c'est une augmentation de l'allocation
+        If [F:SOQ]ALLQTYSTU=WQTE2 : WSOQ_TRTLIG = "C" : Else : WSOQ_TRTLIG = "M" : Endif
+        WSOQ_ALLSTU = [F:SOQ]ALLQTYSTU
+    Endif
+    # récupération du paramètre vente : USERERBPC : Consommation réservations clients
+    Local Char WSOQ_PARAM(10) : Call PARAM([F:SOH]SALFCY,"USERERBPC",WSOQ_PARAM) From ADOVAL
+    Call GENALLKIT ([F:SOH]SOHNUM, [F:SOQ]SOPLIN, [F:SOQ]SOQSEQ, WSOQ_TRTLIG, val(WSOQ_PARAM), 2, 0, 1, 0,
+&                   WSOQ_ALLSTU, WRETOUR) From TRTVENALL
+    If WRETOUR <> 0 : GOK = 0 : Goto MAJ_FIN : Endif
+Endif
+
+#--------------------------------------#
+# Màj de l'encours SOF ou TPF (ventes) #
+#--------------------------------------#
+[M:ORDK]MAJCOD    = "M"
+# [M:ORDK]WIPTYP    = 1 : # GH 19/06/12 bug 80881
+If [F:SOH]BETFCY = 2 & [F:SOH]BETCPY <> 2
+    [M:ORDK]WIPTYP = 8
+Else
+    [M:ORDK]WIPTYP = 1
+Endif
+[M:ORDK]WIPSTA    = [F:SOQ]DEMSTA
+[M:ORDK]WIPNUM    = [F:SOQ]DEMNUM
+[M:ORDK]ITMREF    = [F:SOQ]ITMREF
+[M:ORDK]ORIFCY    = [F:SOH]SALFCY
+[M:ORDK]STOFCY    = [F:SOQ]STOFCY
+[M:ORDK]PJT       = [F:SOH]PJT
+[M:ORDK]BPRNUM    = [F:SOH]BPCORD
+[M:ORDK]STRDAT    = [F:SOQ]ORDDAT
+[M:ORDK]ENDDAT    = [F:SOQ]SHIDAT
+[M:ORDK]VCRTYP    = 2
+[M:ORDK]VCRNUM    = [F:SOQ]SOHNUM
+[M:ORDK]VCRLIN    = [F:SOQ]SOPLIN
+[M:ORDK]VCRSEQ    = [F:SOQ]SOQSEQ
+[M:ORDK]EXTQTY    = [F:SOQ]QTYSTU
+If [F:SOH]SOHCAT = 3
+  [M:ORDK]CPLQTY = [F:SOQ]INVQTYSTU
+Else
+  [M:ORDK]CPLQTY = [F:SOQ]DLVQTYSTU
+Endif
+
+## GH 02/07/2014 bug 93888
+# [M:ORDK]ALLQTY  = [F:SOQ]ALLQTYSTU + [F:SOQ]ODLQTYSTU
+# [M:ORDK]SHTQTY  = [F:SOQ]SHTQTYSTU
+Raz WALL, WSHT
+If [F:SOQ]OPRQTYSTU+[F:SOQ]PREQTYSTU>0
+   Gosub WIP_ALLSHT From TRTVENMAJ
+Endif
+[M:ORDK]ALLQTY  = [F:SOQ]ALLQTYSTU + WALL + [F:SOQ]ODLQTYSTU
+[M:ORDK]SHTQTY  = [F:SOQ]SHTQTYSTU + WSHT
+##
+
+[M:ORDK]MRPMES    = 1
+[M:ORDK]VCRTYPORI = 0
+[M:ORDK]VCRNUMORI = ""
+[M:ORDK]VCRLINORI = 0
+[M:ORDK]VCRSEQORI = 0
+[M:ORDK]BOMALT    = 0
+[M:ORDK]ORI       = 2
+[M:ORDK]PIO       = [F:SOQ]DLVPIO
+If [F:SOH]SOHCAT = 4
+   [M:ORDK]ABBFIL  = "SOC"
+   [M:ORDK]FMI     = 1
+Else
+   [M:ORDK]ABBFIL  = "SOQ"
+   [M:ORDK]FMI     = [F:SOQ]FMI
+Endif
+Call WIP From TRTWIP
+If GOK < 1 : GMESSAGE = mess(013,100,1)-"ORDERS:"-[F:SOQ]DEMNUM : Goto MAJ_FIN : Endif
+
+# 76887 sauvegarde du cumul alloué
+If [M:MLIK]MAJCOD = "E" : ENT_CUMALLQTY+= SAV_WALLQTY : Endif
+
+Goto MAJ_FIN
+
+###################################################
+# Allocation a une matière mise à dispo du sous-traitant
+$MAJ_MSF
+Local Integer MEMSTA
+
+Read [SCM]SCM0 = [M:MLIK]DEMNUM ;[M:MLIK]DEMLIN;[M:MLIK]DEMSEQ
+If fstat : Return : Endif
+
+# si la matière est soldée/exclue
+If [F:SCM]MATSTA > 2 : Return : Endif
+
+Read [SCO]SCO0 = [F:SCM]SCONUM
+If fstat : Raz [F:SCO] : Return : Endif
+
+If [M:MLIK]MAJCOD = "S"
+   GPE = 0
+   GPOINT = "CUSTRTALL" : Gosub ENTREE From EXEFNC
+   If GOK < 1 : Return : Endif
+   If !GPE
+
+     If clalev([F:STO1]) = 0  : Local File STOCK  [STO1] : Endif
+
+     # suppression des allocations
+     For [STJ]STJ1   Where STOFCY = [F:MKI]MFGFCY
+&                        & VCRTYP = 15
+&                        & VCRNUM = [F:MKI]MFGTRKNUM
+&                        & VCRLIN = [F:MKI]ITMTRKLIN
+&                        & REGFLG <> 2
+          Raz WSTOCOU
+          # Issue 112211  - 2015-11-02 by MAE : oubli de STOFLD1 et STOFLD2
+          #--- Issue X3-53322 : ajout LPN
+          Call CLESTO([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]BPSLOT,
+&                     [F:STJ]PALNUM,[F:STJ]CTRNUM,[F:STJ]STA,[F:STJ]LOC,[F:STJ]PCU,
+&                     [F:STJ]PCUSTUCOE,[F:STJ]SERNUM,[F:STJ]QLYCTLDEM,[F:STJ]OWNER,
+&                     [F:STJ]STOFLD1,[F:STJ]STOFLD2,[F:STJ]LPNNUM,[L]WSTOCOU) From STKLIB
+          For [STA]STA1 Where STOFCY = [F:STJ]STOFCY &
+&                             VCRTYP = 2 & STOCOU = WSTOCOU &
+&                             VCRNUM = [F:SCM]SCONUM & VCRLIN = [F:SCM]SCILIN &
+&                             VCRSEQ = [F:SCM]SCMLIN
+               Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,WRETOUR) From STKALL
+               If WRETOUR <> 0 : GOK = 0 : Break : Endif
+               WQTE2-= [F:STA]QTYSTU
+               SAV_WALLQTY-= [F:STA]QTYSTU
+          Next
+          If GOK < 1 : Break : Endif
+      Next
+      If GOK < 1 : Return : Endif
+   Endif
+Else
+     # GH 23/07/2013 bug 87805 remplacé par le DIMALL dans la boucle
+     # si manquants, suppression allocation sur les manquants
+     #If [F:SCM]SHTQTY > 0
+     #   WQTY1 = 0 : WQTY2 = 0
+     #   Call DELALL(36, [F:SCM]SCONUM, [F:SCM]SCILIN, [F:SCM]SCMLIN, [F:SCM]CPNITMREF, 2, WQTY1, WQTY2, WRET) From STKALL
+     #   If WRET <> 0 : Return : Endif
+     #   [F:SCM]SHTQTY = 0
+     #Endif
+
+     # qté restant a allouer
+     WALLQTY = [F:SCM]RETQTY - [F:SCM]ALLQTY - [F:SCM]USEQTY
+     If WALLQTY <= 0  : Return : Endif
+
+     # point d'entrée permettant de modifier la quantité à allouer
+     # il suffit de mettre WALLQTY = [M:MLIK]LIKQTY
+     # derrière, on enlève la quantité déclarée en "R"
+     GPOINT = "CALWALLQTY"
+     Gosub  ENTREE From EXEFNC
+
+     If WALLQTY > [M:MLIK]LIKQTY : WALLQTY = [M:MLIK]LIKQTY : Endif
+     If WALLQTY <= 0             : Return                   : Endif
+     # SAV_WALLQTY = WALLQTY      # GH 23/07/2013 bug 87805
+
+     # ---------------------------------------------
+     GPE = 0
+     GPOINT = "CUSTRTALL" : Gosub ENTREE From EXEFNC
+     If GOK < 1 : Return : Endif
+     If !GPE
+         # Recherche de l'emp (type) de consommation si exclusif
+         Raz WDEFLOC, WDEFLOCTYP
+         Call RECH_PICLOC(36,[F:SCM]STOFCY,[F:SCM]CPNITMREF,[F:SCM]LOC,"",1,1,"O",WDEFLOC,WDEFLOCTYP) From STKALL
+
+         # GH 15/01/15 Bug 104861 : Changement du type d'allocation globale en détaillée ?
+         # 0=Non 1=Allocation globale à supprimer 2=Affectation allouée en détail => ancien (Allocation + Manquant) global à recréer en détaillé
+         Local Integer WCHGALL
+         WCHGALL = (find([F:SCM]ALLSTA,2,3)<>0)
+         If WCHGALL & [F:SCM]ALLQTY=0 : WCHGALL=2 : Endif
+
+         WENTCUMALLQTY = ENT_CUMALLQTY  # 76887
+         # boucle du fichier STOJOU
+         For [STJ]STJ1 Where STOFCY = [F:MKI]MFGFCY
+&                        & VCRTYP = 15
+&                        & VCRNUM = [F:MKI]MFGTRKNUM
+&                        & VCRLIN = [F:MKI]ITMTRKLIN
+&                        & REGFLG <> 2
+
+             If WALLQTY <= 0 : Break : Endif
+
+             # GH 23/07/2013 bug 87805 test de WDEFLOC
+             If !find([L]WDEFLOC,"",[F:STJ]LOC) : Goto NXT_STJ_MSF : Endif
+             # GH 23/07/2013 bug 91012 test de WDEFLOCTYP
+             If !find([L]WDEFLOCTYP,"","*")
+                If !clalev([F:STC]) : Local File STOLOC [STC] : Endif
+                Read [STC]STC0 = [F:STJ]STOFCY;[F:STJ]LOC
+                If fstat | pat([F:STC]LOCTYP,[L]WDEFLOCTYP)=0  : Goto NXT_STJ_MSF : Endif
+             Endif
+             [L]WSTOCOU=0
+             # Issue 112211 - 2015-11-02 by MAE : Oubli de STOFLD1 et STOFLD2
+             #--- Issue X3-53322 : ajout LPN
+             Call CLESTO([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]BPSLOT,
+&                        [F:STJ]PALNUM,[F:STJ]CTRNUM,[F:STJ]STA,[F:STJ]LOC,[F:STJ]PCU,
+&                        [F:STJ]PCUSTUCOE,[F:STJ]SERNUM,[F:STJ]QLYCTLDEM,[F:STJ]OWNER,
+&                        [F:STJ]STOFLD1,[F:STJ]STOFLD2,[F:STJ]LPNNUM,[L]WSTOCOU) From STKLIB
+             If [L]WSTOCOU=0 : Goto NXT_STJ_MSF : Endif
+
+             # 76887
+             If [F:STJ]QTYSTU <= WENTCUMALLQTY
+                WSTJQTY = 0
+                WENTCUMALLQTY-= [F:STJ]QTYSTU
+             Else
+                WSTJQTY = [F:STJ]QTYSTU - WENTCUMALLQTY
+                WENTCUMALLQTY = 0
+             Endif
+             If WSTJQTY<=0 : Goto NXT_STJ_MSF : Endif
+
+             # GH 15/01/15 Bug 104861 : # suppression de l'allocation globale
+             If WCHGALL=1
+                WQTY    = [F:SCM]ALLQTY
+                WQTY1 = 0 : WQTY2 = 0
+                Call DIMALL(36, [F:SCM]SCONUM, [F:SCM]SCILIN, [F:SCM]SCMLIN, [F:SCM]CPNITMREF, 1, WQTY, WQTY1, WQTY2, WRET) From STKALL
+                If WRET <> 0 : GOK=0 : Break : Endif
+
+                WCHGALL = 2
+                WQTE2-= WQTY1
+             Endif
+
+             # GH 27/06/2017 Issue 38509 - consider WSTJQTY and not anymore [F:STJ]QTYSTU
+#            WALLQTY-= [F:STJ]QTYSTU
+#            If WALLQTY >= 0
+#               WQTY = [F:STJ]QTYSTU
+#            Else
+#               WQTY = WALLQTY + [F:STJ]QTYSTU
+#            Endif
+             WQTY = min(WALLQTY,WSTJQTY)
+             WALLQTY-= WQTY
+
+             If [F:STJ]POT <> 0
+                 WQTYACT = WQTY * ([F:STJ]POT/100)
+             Else
+                 WQTYACT = WQTY
+             Endif
+
+             WQTE = [F:SCM]ALLQTY  # quantité déjà allouée
+             # calcul de la quantité allouée en unité active
+             If [F:STJ]POT <> 0
+                   GBIDD2 = WQTE * ([F:STJ]POT/100)
+             Else
+                   GBIDD2 = WQTE
+             Endif
+             Raz GBIDC1
+
+             # creation detailed allocation
+             #--- TS 106217 ajout paramètre LECC (avant dernier)
+             Call CREALL(2,[F:STJ]STOFCY,[F:STJ]ITMREF,WSTOCOU,[F:MTK]MFGTRKDAT,WQTY,
+&                        WQTYACT,36,[F:SCM]SCONUM,[F:SCM]SCILIN,[F:SCM]SCMLIN,GBIDC1,[F:SCM]DLVDAT,
+&                        "","","","","","",WQTE,GBIDD2,WDEFLOC,WDEFLOCTYP,"","",1,"",WRETOUR) From STKALL
+             If WRETOUR <> 0 : GOK = 0 : Break : Endif
+             WQTE2+= WQTY
+             SAV_WALLQTY+= WQTY       # GH 23/07/2013 bug 87805
+
+$NXT_STJ_MSF
+         Next
+         If GOK < 1 : Return : Endif
+
+        # GH 23/07/2013 bug 87805
+         If SAV_WALLQTY <> 0 : # WCHGALL=2
+            If WCHGALL : WQTY = [F:SCM]SHTQTY : # suppression du manquant global  # GH 31/07/13 Bug 90797
+            Else       : WQTY = SAV_WALLQTY   : # diminution du manquant détail
+            Endif
+            If WQTY<>0
+               WQTY1 = 0 : WQTY2 = 0
+               Call DIMALL(36, [F:SCM]SCONUM, [F:SCM]SCILIN, [F:SCM]SCMLIN, [F:SCM]CPNITMREF, 2, WQTY, WQTY1, WQTY2, WRET) From STKALL
+               If WRET <> 0 : Return : Endif
+            Endif
+
+            If WCHGALL
+              # GH 15/01/15 Bug 104861 : # allocation en détaillé
+
+              WSHTQTY = max(0,[F:SCM]SHTQTY-SAV_WALLQTY)
+              [F:SCM]ALLSTA = 3-(WSHTQTY>0)
+              If WSHTQTY<>0 : # GH 23/06/14 Bug 100441
+                 # Création du manquant détail
+                 #--- TS 106217 ajout paramètre LECC (avant dernier)
+                 Call CREALL(4,[F:SCM]STOFCY,[F:SCM]CPNITMREF,0,[31/12/2999],0,
+&                            WSHTQTY,36,[F:SCM]SCONUM,[F:SCM]SCILIN,[F:SCM]SCMLIN,"",max(date$,[F:SCM]DLVDAT),
+&                            [F:SCM]LOT,"",[F:SCM]STA,WDEFLOC,"","",0,0,"","","","",1,[F:SCM]ECCVALMAJ,WRET) From STKALL
+                 If WRET <> 0 : Return : Endif
+              Endif
+
+              If [F:SCM]ALLQTY<>0
+                  WQTY = [F:SCM]ALLQTY : WQTY2 = 0
+                  Call ALLOCATION("C", 2, WQTY, WQTY2, WRET) From SCOALL
+                  If WRET <> 0 : Return : Endif
+                  WQTE2+= WQTY
+              Endif
+
+              # WCHGALL = 3
+            Endif
+         Endif
+
+     Endif
+Endif
+If WRETOUR <> 0     : Return : Endif
+If SAV_WALLQTY = 0  : Return : Endif
+
+SYMBOLE = "SCO"+[F:SCO]SCONUM
+Lock =SYMBOLE With lockwait=0
+If fstat
+   # Ordre de sous-traitance ... Modification en cours sur un autre poste
+   GMESSAGE=mess(13,306,1)-[F:SCO]SCONUM+"\"+mess(10,100,1) : GERR=1
+   GOK=0 : Return
+Endif
+
+# mise à jour detail matière
+Readlock [SCO]SCO0 = [F:SCM]SCONUM
+If fstat= 1
+    GOK = -1 : GLOCK = "$SCOHEAD"-[F:SCM]SCONUM : Goto MAJ_FIN
+Elsif fstat
+    GOK = 0  : Call RSTA("SCO",[F:SCM]SCONUM) From GLOCK : Goto MAJ_FIN
+Endif
+
+Readlock [SCM]SCM0=[M:MLIK]DEMNUM;[M:MLIK]DEMLIN;[M:MLIK]DEMSEQ
+If fstat = 1
+    GOK = -1 : GLOCK = "$SCOMAT"-[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ) : Goto MAJ_FIN
+Elsif fstat
+    GOK = 0  : Call RSTA("SCM",[M:MLIK]DEMNUM-num$([M:MLIK]DEMLIN)-num$([M:MLIK]DEMSEQ)) From GLOCK : Goto MAJ_FIN
+Endif
+
+MEMSTA = [F:SCM]ALLSTA
+
+#-- WQTE2 contient la quantité allouée ou désallouée réellement
+[F:SCM]ALLQTY+= WQTE2
+If [F:SCM]ALLQTY < 0 : [F:SCM]ALLQTY = 0 : Endif
+
+# statut alloc détaillé et complet ou rupture
+[F:SCM]ALLSTA = 5
+WSHTQTY = 0
+If [F:SCM]ALLQTY < ([F:SCM]RETQTY - [F:SCM]USEQTY)
+    [F:SCM]ALLSTA-= 1
+    WSHTQTY = [F:SCM]RETQTY - [F:SCM]USEQTY - [F:SCM]ALLQTY
+Endif
+
+If [M:MLIK]MAJCOD="S"
+    If WSHTQTY>0
+      #--- TS 106217 ajout paramètre LECC (avant dernier)
+      Call CREALL(4,[F:SCM]STOFCY,[F:SCM]CPNITMREF,0,[F:SCM]DLVDAT,0,
+&                 WSHTQTY,36,[F:SCM]SCONUM,[F:SCM]SCILIN,[F:SCM]SCMLIN,"",[F:SCM]DLVDAT,
+&                 [F:SCM]LOT,"",[F:SCM]STA,[F:SCM]LOC,"","",0,0,"","","","",1,[F:SCM]ECCVALMAJ,WRET) From STKALL
+    Endif
+    [F:SCM]SHTQTY = WSHTQTY
+Else
+    [F:SCM]SHTQTY-= SAV_WALLQTY
+Endif
+If [F:SCM]SHTQTY<0 : [F:SCM]SHTQTY=0 : Endif : # GH 09/12/2014 bug 103464
+
+# mise à jour matière
+Rewrite [SCM]
+If fstat
+    GOK = 0 : Call FSTA ("SCM") From GLOCK : Goto MAJ_FIN
+Endif
+
+# lecture encours pour récupérer le n° affaire
+Read [ORD]ORD0=3;[F:SCM]WIPNUM;[F:SCM]CPNITMREF
+
+# mise à jour de l'encours
+Call UPDATE_MSX("M", 0) From SCOLIB
+
+Gosub MAJSCOHEAD From SCOLIB
+
+Rewrite [SCO]
+If fstat
+    GOK = 0 : Call FSTA ("SCO") From GLOCK : Goto MAJ_FIN
+Endif
+
+# 76887 sauvegarde du cumul alloué
+If [M:MLIK]MAJCOD = "E" : ENT_CUMALLQTY+= SAV_WALLQTY : Endif
+
+Goto MAJ_FIN
+
+#----- Déblocage logique de la commande de vente / Ordre de fabrication / Ordre de sous-traitance -----#
+
+$MAJ_FIN
+Unlock = SYMBOLE
+Return
+
+# Process PJM demands (X3-70711)
+$MAJ_PJM
+
+  Local Integer IRET
+  Local Integer ILINTAS           # Project task row
+  Local Integer ILINRITT          # Project task product row
+  Local Char SKEYCONCAT(GLONPIM)
+  Local Char PROJECT(GLONPIM)
+  Local Char BUDGET(GLONPBU)
+  Local Char TASK(GLONTAC)
+  Local Char SMESSAGE(250)
+  Local Integer WCHGALL
+  Local Tinyint WIMPCLI
+  Local Tinyint WGENSHT
+  Local Char WPARAM(1)
+  Local Char LOT(30)
+  Local Char STA(30)
+  Local Char SECCVALMAJ(GLONECS)
+  Local Instance ZINSPJM Using C_OPPOR           # Project
+  Local Instance ZTECALLITM Using C_TECALLITM
+
+  ZINSPJM = NewInstance C_OPPOR AllocGroup null
+
+  IRET = func PJMTSK_CSTD_PROGS.GET_KEYCONCAT_FROM_TASNUM(ZINSPJM.ACTX, [M:MLIK]DEMNUM, SKEYCONCAT, SMESSAGE)# Determine project+task from task number
+  IRET = func PIMPL_CSTD_PROGS.PJM_KEY_SPLIT(ZINSPJM.ACTX, SKEYCONCAT, PROJECT, BUDGET, TASK)                # Split project+task into project, (budget) and task
+  ZINSPJM.TCHTOREAD = "PJM"
+  IRET = fmet ZINSPJM.AREAD(PROJECT)
+  ILINTAS = fmet ZINSPJM.PJM(1).TAS_GET_INDEX(TASK)
+  ILINRITT = fmet ZINSPJM.PJM(1).TAS(ILINTAS).RITT_GET_INDEX_ITMREF([M:MLIK]ITMREF)
+  If ILINRITT = 0 Then
+    Goto MAJ_FIN_PJM
+  Endif
+
+  If ([M:MLIK]MAJCOD = "S")
+    GPE = 0
+    GPOINT = "CUSTRTALL"
+    Gosub ENTREE From EXEFNC
+    If (GOK < 1)
+      Goto MAJ_FIN_PJM
+    Endif
+    WSPEALL = GPE
+    If (!GPE)
+      If (clalev([F:STO1]) = 0)
+        Local File STOCK [STO1]
+      Endif
+      For [STJ]STJ1 Where STOFCY = [F:MKI]MFGFCY
+&                       & VCRTYP = 15
+&                       & VCRNUM = [F:MKI]MFGTRKNUM
+&                       & VCRLIN = [F:MKI]ITMTRKLIN
+&                       & REGFLG <> 2
+        Raz WSTOCOU
+
+        # Issue 105859 - 2018-08-28 by STLIG : missing parameter [F:STJ]LPNNUM
+        Call CLESTO([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]BPSLOT,
+&                   [F:STJ]PALNUM,[F:STJ]CTRNUM,[F:STJ]STA,[F:STJ]LOC,[F:STJ]PCU,
+&                   [F:STJ]PCUSTUCOE,[F:STJ]SERNUM,[F:STJ]QLYCTLDEM,[F:STJ]OWNER,[F:STJ]STOFLD1,
+&                   [F:STJ]STOFLD2,[F:STJ]LPNNUM,WSTOCOU) From STKLIB
+
+        If GOK < 1
+          Break
+        Endif
+        For [STA]STA1 Where STOFCY = [F:STJ]STOFCY
+&                         & VCRTYP = 2
+&                         & STOCOU = WSTOCOU
+&                         & VCRNUM = [M:MLIK]DEMNUM
+&                         & VCRLIN = [M:MLIK]DEMLIN
+&                         & VCRSEQ = [M:MLIK]DEMSEQ
+          Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,WRETOUR) From STKALL
+          If (WRETOUR <> 0)
+            GOK = 0
+            Break
+          Endif
+          WQTE2 -= [F:STA]QTYSTU
+          SAV_WALLQTY -= [F:STA]QTYSTU
+        Next
+        If (GOK < 1)
+          Break
+        Endif
+      Next
+      If (GOK < 1)
+        Goto MAJ_FIN_PJM
+      Endif
+    Endif
+  Else
+
+    # Calculate shortage qty. and qty. to allocate
+    #
+    WSHTQTY = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).SHTQTY
+    WALLQTY = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).WALLQTY
+    If (WALLQTY <= 0)
+      Goto MAJ_FIN_PJM
+    Endif
+    GPOINT = "CALWALLQTY"
+    Gosub ENTREE From EXEFNC
+    If (WALLQTY > [M:MLIK]LIKQTY)
+      WALLQTY = [M:MLIK]LIKQTY
+    Endif
+    If (WALLQTY <= 0)
+      Goto MAJ_FIN_PJM
+    Endif
+
+    # Note:- project task product quantities = stock unit, no conversion necessary
+    GPE = 0
+    GPOINT = "CUSTRTALL"
+    Gosub ENTREE From EXEFNC
+    If (GOK < 1)
+      Goto MAJ_FIN_PJM
+    Endif
+    WSPEALL = GPE
+    If (!GPE)
+
+      # Determine the exclusive consumption location/location type
+      #
+      Raz WDEFLOC, WDEFLOCTYP
+      Call RECH_PICLOC(2,
+&                      ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).STOFCY,
+&                      ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ITMREF,
+&                      AVOID.ACHAR, AVOID.ACHAR, 1, 1, "O", WDEFLOC, WDEFLOCTYP)
+&     From STKALL
+      Raz WDEFLOC2, WDEFLOCTYP2
+      Call RECH_PICLOC(-2,
+&                      ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).STOFCY,
+&                      ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ITMREF,
+&                      AVOID.ACHAR, AVOID.ACHAR, 1, 1, "O", WDEFLOC2, WDEFLOCTYP2)
+&     From STKALL
+
+      # Change project task product allocation type from global to detailed (if no existing allocations)
+      #
+      WCHGALL = (ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ALLTYP = 1)
+      If (WCHGALL = [V]CST_ATRUE & ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ALLQTY = 0)
+        WCHGALL = 2
+      Endif
+      WENTCUMALLQTY = ENT_CUMALLQTY
+
+      # Filter 'production tracking' (STOJOU stock journal) records for processing
+      #
+      For [STJ]STJ1 Where STOFCY = [F:MKI]MFGFCY
+&                       & VCRTYP = 15
+&                       & VCRNUM = [F:MKI]MFGTRKNUM
+&                       & VCRLIN = [F:MKI]ITMTRKLIN
+&                       & REGFLG <> 2
+        If (WALLQTY <= 0)
+          Break
+        Endif
+
+        # Check 'production tracking' location/location type matches exclusive consumption location/location type, or
+        # blank
+        #
+        If (!find(WDEFLOC2, AVOID.ACHAR, [F:STJ]LOC))
+          Goto NEXT_STJ_PJM
+        Endif
+        If (!find(WDEFLOCTYP2, AVOID.ACHAR, "*"))
+          If (!clalev([F:STC]))
+            Local File STOLOC [STC]
+          Endif
+          Read [STC]STC0 = [F:STJ]STOFCY;[F:STJ]LOC
+          If (fstat | pat([F:STC]LOCTYP,WDEFLOCTYP2) = 0)
+            Goto NEXT_STJ_PJM
+          Endif
+        Endif
+
+        # Determine the chronological stock value WSTOCOU (STOCK stock)
+        #
+        WSTOCOU = 0
+
+        # Issue 105859 - 2018-08-28 by STLIG : missing parameter [F:STJ]LPNNUM
+        Call CLESTO([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]BPSLOT,
+&                   [F:STJ]PALNUM,[F:STJ]CTRNUM,[F:STJ]STA,[F:STJ]LOC,[F:STJ]PCU,
+&                   [F:STJ]PCUSTUCOE,[F:STJ]SERNUM,[F:STJ]QLYCTLDEM,[F:STJ]OWNER,
+&                   [F:STJ]STOFLD1,[F:STJ]STOFLD2,[F:STJ]LPNNUM,WSTOCOU) From STKLIB
+
+        If (WSTOCOU = 0)
+          Goto NEXT_STJ_PJM
+        Endif
+
+        # Maintain WENTCUMALLQTY (ENT_CUMALLQTY)
+        #
+        If ([F:STJ]QTYSTU <= WENTCUMALLQTY)
+          WSTJQTY = 0
+          WENTCUMALLQTY -= [F:STJ]QTYSTU
+        Else
+          WSTJQTY = [F:STJ]QTYSTU - WENTCUMALLQTY
+          WENTCUMALLQTY = 0
+        Endif
+        If (WSTJQTY <= 0)
+          Goto NEXT_STJ_PJM
+        Endif
+
+        # 'Suppress' shortages (project task product allocation type = global)
+        #
+        If (WCHGALL = 1)
+          WQTY = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ALLQTY
+          WQTY1 = 0
+          WQTY2 = 0
+          Call DIMALL(2, [M:MLIK]DEMNUM, [M:MLIK]DEMLIN, [M:MLIK]DEMSEQ,
+&                     ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ITMREF,
+&                     1, WQTY, WQTY1, WQTY2, WRET)
+&         From STKALL
+          If (WRET <> 0)
+            GOK = 0
+            Break
+          Endif
+
+          # Change project task product allocation type from global to detailed
+          #
+          WCHGALL = 2
+          WQTE2 -= WQTY1
+          WSHTQTY -= WQTY2
+        Endif
+        WQTY = min(WALLQTY,WSTJQTY)
+        WALLQTY -= WQTY
+
+        # Apply potency of production tracking
+        #
+        If ([F:STJ]POT <> 0)
+          WQTYACT = WQTY * ([F:STJ]POT / 100)
+        Else
+          WQTYACT = WQTY
+        Endif
+        WQTE = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ALLQTY
+        If ([F:STJ]POT <> 0)
+          GBIDD2 = WQTE * ([F:STJ]POT / 100)
+        Else
+          GBIDD2 = WQTE
+        Endif
+        Raz GBIDC1
+
+        # Create allocation - detailed
+        #
+        # NB.- ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).REQDAT = requirement date
+        Call CREALL(2, [F:STJ]STOFCY, [F:STJ]ITMREF, WSTOCOU, [F:MTK]MFGTRKDAT,
+&                 WQTY, WQTYACT, 40, [M:MLIK]DEMNUM, [M:MLIK]DEMLIN,
+&                 [M:MLIK]DEMSEQ, GBIDC1,
+&                 ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).REQDAT,
+&                 AVOID.ACHAR, AVOID.ACHAR,
+&                 AVOID.ACHAR, AVOID.ACHAR, AVOID.ACHAR, AVOID.ACHAR, WQTE,
+&                 GBIDD2, WDEFLOC, WDEFLOCTYP, AVOID.ACHAR, AVOID.ACHAR,
+&                 1, AVOID.ACHAR, WRETOUR)
+&       From STKALL
+        If (WRETOUR <> 0)
+          GOK = 0
+          Break
+        Endif
+        WQTE2 += WQTY
+        SAV_WALLQTY += WQTY
+$NEXT_STJ_PJM
+      Next
+      If (GOK < 1)
+        Goto MAJ_FIN_PJM
+      Endif
+
+      # 'Suppress' shortages
+      #
+      If (SAV_WALLQTY <> 0)
+        If (WCHGALL)
+          WQTY = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).SHTQTY
+        Else
+          WQTY = SAV_WALLQTY
+        Endif
+        If (WQTY <> 0)
+          WQTY1 = 0
+          WQTY2 = 0
+          Call DIMALL(2, [M:MLIK]DEMNUM, [M:MLIK]DEMLIN, [M:MLIK]DEMSEQ,
+&                     ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ITMREF,
+&                     2, WQTY, WQTY1, WQTY2, WRET)
+&         From STKALL
+          If (WRET <> 0)
+            Goto MAJ_FIN_PJM
+          Endif
+          WSHTQTY -= WQTY2
+        Endif
+
+        # Create allocation - detailed shortage (shortage remains)
+        #
+        If (WCHGALL)
+          WIMPCLI = min(2, fmet ZINSPJM.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).STOFCY, "USERERBPC"))
+          WGENSHT = fmet ZINSPJM.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).STOFCY, "GENSHT")
+          WSHTQTY += ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).SHTQTY - SAV_WALLQTY
+          If (WSHTQTY < 0)
+            WSHTQTY = 0
+          Endif
+          If (WSHTQTY <> 0 & WGENSHT = 2)
+
+            # Create (shortage) allocation - detailed
+            #
+            # NB.- ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).REQDAT = requirement date
+            # NB.- LOT = filter lot; STA = filter status
+            Raz LOT
+            Raz STA
+            If dim(ZINSPJM.PJM(1).TAS(ILINTAS).ECCVALMAJ) >= 0 Then
+              SECCVALMAJ = ZINSPJM.PJM(1).TAS(ILINTAS).ECCVALMAJ
+            Else
+              Raz SECCVALMAJ
+            Endif
+            Call CREALL(4,
+&                       ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).STOFCY,
+&                       ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ITMREF,
+&                       0, [31/12/2999],
+&                       0, WSHTQTY, 40, [M:MLIK]DEMNUM, [M:MLIK]DEMLIN,
+&                       [M:MLIK]DEMSEQ, AVOID.ACHAR,
+&                       max(date$,ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).REQDAT),
+&                       LOT, AVOID.ACHAR,
+&                       STA, WDEFLOC2, AVOID.ACHAR, AVOID.ACHAR, 0,
+&                       0, AVOID.ACHAR, AVOID.ACHAR, AVOID.ACHAR, AVOID.ACHAR,
+&                       1,
+&                       SECCVALMAJ,
+&                       WRET)
+&           From STKALL
+            If (WRET <> 0)
+              Goto MAJ_FIN_PJM
+            Endif
+          Endif
+          If (ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ALLQTY <> 0)
+            WQTY = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ALLQTY
+            WQTY2 = 0
+            Call GENALLORD(AVOID.ACHAR, AVOID.ACHAR, "C", WIMPCLI, WGENSHT,
+&                          0, WQTY, WQTY2, WRET) From TRTVENALL
+            If (WRET <> 0)
+              Goto MAJ_FIN_PJM
+            Endif
+            WQTE2 += WQTY
+            WSHTQTY += WQTY2
+          Endif
+        Endif
+      Endif
+    Endif
+  Endif
+  If (WRETOUR <> 0)
+    Goto MAJ_FIN_PJM
+  Endif
+  If (SAV_WALLQTY = 0)
+    Goto MAJ_FIN_PJM
+  Endif
+
+  ##############
+  # Update PJM #
+  ##############
+  ZTECALLITM = NewInstance C_TECALLITM AllocGroup null
+  # MANUF_ADD_LINE: Add project, product, unit(project task product), allocated quantity to
+  #                 TECALLITM parameters class collection..
+  IRET = fmet ZTECALLITM.MANUF_ADD_LINE(SKEYCONCAT,
+&                                       ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ITMREF,
+&                                       ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).UOM,
+&                                       WQTE2)
+  # PJM_TASK_RITT_ALLOCATION: Update project from TECALLITM parameters class collection..
+  IRET = fmet ZINSPJM.PJM_TASK_RITT_ALLOCATION(ZINSPJM.OPPNUM, ZTECALLITM)
+  If (IRET >= CST_AWARNING)
+    If (func SYRSTACKTOOLS.MSGSTACK_GET_FIRST_UPPER_MESSAGE(ZINSPJM, GMESSAGE) = CST_AWARNING)
+      GERR = 2
+    Else
+      GOK = 0
+      GERR = 1
+    Endif
+  Endif
+  If (GOK < 1)
+    Goto MAJ_FIN_PJM
+  Endif
+
+  #################
+  # Update ORDERS #
+  #################
+  [M:ORDK]MAJCOD    = "M"
+  [M:ORDK]WIPTYP    = 14  # Project demand
+  [M:ORDK]WIPSTA    = 1   # 1=Firm, 2=Planned, 3=Suggested, 4=Closed
+  [M:ORDK]WIPNUM    = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).WIPNUM
+  [M:ORDK]ITMREF    = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ITMREF
+  [M:ORDK]ORIFCY    = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).STOFCY
+  [M:ORDK]STOFCY    = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).STOFCY
+  [M:ORDK]PJT       = SKEYCONCAT
+  # Customer
+  If ZINSPJM.OPPCMP <> AVOID.ACHAR Then
+    [M:ORDK]BPRNUM  = ZINSPJM.OPPCMP
+  Else
+    Raz [M:ORDK]BPRNUM
+  Endif
+  [M:ORDK]STRDAT    = ZINSPJM.PJM(1).TAS(ILINTAS).TASSTARTDT
+  [M:ORDK]ENDDAT    = ZINSPJM.PJM(1).TAS(ILINTAS).TASENDDT
+  [M:ORDK]VCRTYP    = 40  # Project
+  [M:ORDK]VCRNUM    = [M:MLIK]DEMNUM
+  [M:ORDK]VCRLIN    = [M:MLIK]DEMLIN
+  [M:ORDK]VCRSEQ    = [M:MLIK]DEMSEQ
+  [M:ORDK]EXTQTY    = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ITTQTY
+  [M:ORDK]CPLQTY    = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).DLVQTY
+  [M:ORDK]ALLQTY    = ZINSPJM.PJM(1).TAS(ILINTAS).RITT(ILINRITT).ALLQTY + WQTE2
+  [M:ORDK]SHTQTY    = WSHTQTY
+  [M:ORDK]MRPMES    = 1
+  [M:ORDK]VCRTYPORI = 0
+  [M:ORDK]VCRNUMORI = AVOID.ACHAR
+  [M:ORDK]VCRLINORI = 0
+  [M:ORDK]VCRSEQORI = 0
+  [M:ORDK]BOMALT    = 0
+  [M:ORDK]ORI       = 7
+  [M:ORDK]PIO       = 1
+  [M:ORDK]ABBFIL    = AVOID.ACHAR
+  [M:ORDK]FMI       = 1
+
+  Call WIP From TRTWIP
+  If (GOK < 1)
+    GMESSAGE = mess(013,100,1)-"ORDERS:"-[M:MLIK]DEMNUM
+  Elsif ([M:MLIK]MAJCOD = "E")
+    ENT_CUMALLQTY+= SAV_WALLQTY
+  Endif
+
+$MAJ_FIN_PJM
+  If ZTECALLITM <> null Then
+    FreeGroup ZTECALLITM
+    Raz ZTECALLITM
+  Endif
+  If ZINSPJM <> null Then
+    FreeGroup ZINSPJM
+    Raz ZINSPJM
+  Endif
+Return
+

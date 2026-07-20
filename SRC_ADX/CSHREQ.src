@@ -1,0 +1,608 @@
+#<AdxTL>@(#)6.0.0.0 $Revision$
+####################################################################################
+# Program Name: CSHREQ
+# Description : NA Cash Requirements Report Preprocessor
+####################################################################################
+
+####################################################################################
+$ACTION
+
+Case ACTION
+  When "FIN"    : Gosub FIN
+  When Default  :
+Endcase
+PID
+
+Return
+####################################################################################
+$FIN
+
+Kill DUEDATMAX,DUEDATMIN,DISDATDEB,DISDATFIN,PAYDTE
+Kill GDISFLG
+
+Return
+####################################################################################
+Subprog IMPRIME(NBPAR,PARAMETRE)
+Value    Integer NBPAR
+Variable Char    PARAMETRE()()
+
+Call EXEC(NBPAR,PARAMETRE)
+
+End
+####################################################################################
+Subprog EXEC(NBPAR,PARAMETRE)
+Value    Integer NBPAR
+Variable Char    PARAMETRE()()
+
+Local Char DEPDUDDAT(1)
+
+Gosub OUVRE
+If GERREUR : GERREUR=0 : End : Endif
+Gosub DECLARE
+
+# Based on the parameters passed (report selection criteria), create the information
+# to filter on.
+[L]CRITERE = "1=1"
+
+For I=1 To NBPAR
+  J=instr(1,[L]PARAMETRE(I),"=")
+  If J
+    [L]PARAM  = left$([L]PARAMETRE(I),J-1)
+    [L]VALEUR = right$([L]PARAMETRE(I),J+1)
+    Case [L]PARAM
+      When "X3ETA"     : [L]ETAT = [L]VALEUR
+      When "__REQUETE" : [L]NUMREQ = val([L]VALEUR)
+      When "societe"   : [L]CRITERE -= "& CPY='"+[L]VALEUR+"'"
+      When "sitedeb"   : [L]CRITERE -= "& FCY>='"+[L]VALEUR+"'"
+      When "sitefin"   : [L]CRITERE -= "& FCY<='"+[L]VALEUR+"'"
+      When "tiersdeb"  : [L]CRITERE -= "& BPRPAY>='"+[L]VALEUR+"'"
+      When "tiersfin"  : [L]CRITERE -= "& BPRPAY<='"+[L]VALEUR+"'"
+      When "datdeb"    : DUEDATMIN=gdat$(val(right$([L]VALEUR,7)),val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+      When "datfin"    : DUEDATMAX=gdat$(val(right$([L]VALEUR,7)),val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+      When "disdatdeb"
+        If [L]VALEUR<>"18000101"  # blank
+          DISDATDEB=gdat$(val(right$([L]VALEUR,7)),val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+        Endif
+      When "disdatfin"
+        If [L]VALEUR<>"29991231"  # blank
+          DISDATFIN=gdat$(val(right$([L]VALEUR,7)),val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+        Endif
+      When "andor"     : XANDOR =val([L]VALEUR)
+      When "paydte"    : PAYDTE=gdat$(val(right$([L]VALEUR,7)),val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+      When "disflg"    : GDISFLG=val([L]VALEUR)+1  # plus 1 for yes=2
+    Endcase
+  Endif
+Next
+
+CRIT1 = "AMTLOC > (PAYLOC+TMPLOC) & BPRTYP=2 & BPRFCT='' & DUDSTA=2 & SOINUM='' & SOI<>2 & FLGPAZ=4"
+CRIT1 -= "& FLGPAZ="+num$(len(mess(0,510,1))) # 93907.n
+CRITPP = "AMTLOC > (PAYLOC+TMPLOC) & BPRTYP=2 & BPRFCT='' & DUDSTA<>2 & SOINUM='' & SOI=2 & FLGPAZ=4 & IBDAMT<>0"  # 90695.n
+WAPP = len(mess(0,510,1)) # Approval menu 93907.n
+
+If XANDOR=1 # And
+  CRIT2 = '([F:DUD]DUDDAT<=DUEDATMAX & [F:DUD]DUDDAT>=DUEDATMIN)'
+  CRIT2-= "& FLGPAZ="+num$(len(mess(0,510,1))) # 93907.n
+  CRIT2-= '| (year(DUEDATMIN)=0 & [F:DUD]DUDDAT<=DUEDATMAX) | (year(DUEDATMAX)=0 & [F:DUD]DUDDAT>=DUEDATMIN)'
+Else # 2 Or
+ # CRIT2='1=1' # 93907.o
+  CRIT2= "[F:DUD]FLGPAZ="+num$(len(mess(0,510,1))) # 93907.n
+Endif
+
+# BODEL .s For each open item record it must be correlated to a journal entry record where the category must equal "Actual"
+#         This is a new requirment - X3-44745
+Link [DUD] With
+& [HAE]HAE0 = [DUD]TYP;[DUD]NUM
+& As [DUDLNK]
+& Where evalue([L]CRITERE) & evalue([L]CRIT1) & [HAE]CAT = 1
+
+For [DUDLNK] # BODEL .e X3-44745
+#For [DUD] Where evalue([L]CRITERE) & evalue([L]CRIT1)
+#If [DUD]NUM = XNUM : Goto SKIP : Endif # 90659.o
+If func CHK_APPROVAL([DUD]TYP,[DUD]NUM,[DUD]ACCNUM) : Goto SKIP : Endif   # 93907.n
+If [DUD]NUM = XNUM and [DUD]DUDDAT = XDAT: Goto SKIP : Endif  # 90659.n
+  If evalue([L]CRIT2) and func CHK_DISCTBL(XANDOR,DISDATDEB,DISDATFIN,PAYDTE)
+    Gosub ADD_CSHREQ  # If open item within Due date range, run through this rountine
+  Endif
+$SKIP
+XNUM = [DUD]NUM
+XDAT = [DUD]DUDDAT # 90659.n
+Next
+
+# Prepayment Selection
+# TYP="*PO" indicates supplier prepayment
+#For [DUD] Where evalue([L]CRITERE) & evalue([L]CRIT1) & TYP="*PO" & evalue([L]CRIT2)       # 90695.o
+# For [DUD] Where evalue([L]CRITERE) & evalue([L]CRITPP) & TYP="*PO" & evalue([L]CRIT2) & 1=2 # 90659.o
+For [DUD] Where evalue([L]CRITERE) & evalue([L]CRITPP) & TYP="*PO" & evalue([L]CRIT2)       # 90659.n
+  Gosub ADD_CSHREQ_PP
+Next
+
+# Gosub DEL_NEG_SUP # 89708.o
+
+End
+####################################################################################
+$ADD_CSHREQ
+Local Integer XPID
+Local Char OPT      : # 1:Open Item Due Date   2:Invoice date
+
+Local Integer ISPIH
+ISPIH = -1
+
+Read [PIH]PIH0=[F:DUD]NUM
+#BODEL .n A cash requirements record need not only come from a PINVOICE record
+#         or a SINVOICE record (SINVOICE not considered in this report anyways).
+#         A cash requirements record can come directly from a journal entry.
+#         In this case, add it to the report, but do not calculate discount amounts.
+#If fstat | [F:PIH]STA<>3 | [F:DUD]FLGPAZ<>4 : Return : Endif #
+If fstat
+  ISPIH = 1 #Not a PIH record
+  #This is a GL journal entry record only. Avoid discount calculations, etc.
+  Gosub ADD_CSHREQ_JE
+  Return
+Endif
+
+# However, the PINVOICE status must be validated and this must also be authorized to pay
+#If !fstat | [F:PIH]STA<>3 | [F:DUD]FLGPAZ<>4 : Return : Endif
+If ISPIH > 1
+  If ( [F:PIH]STA<>3 | [F:DUD]FLGPAZ<>4 )
+    Return
+  Endif
+Endif
+
+# BODEL X3-44745
+# GACCDUDATE entry must be linked to a document type that is for purchasing
+Call GETSOC([F:DUD]FCY) From DEVSUB
+Read [GTE]GTE0=[DUD]TYP;GCURLEG
+If fstat | [F:GTE]AUZJOU(1) <> 2
+  #This GACCDUDATE entry type is not for purchasing, do not add it as a cash requirement
+  Return
+Endif
+# BODEL
+
+# 90659.sn
+Filter [TCR] Where [DUD]NUM=[TCR]NUM and [DUD]DUDLIG = [TCR]DUDLIG and GUSER = [TCR]CREUSR
+Read [TCR] First
+If !fstat
+ Return
+Endif
+Filter [TCR]
+# 90659.en
+
+Raz XPID
+Read [PID]PID0=[PIH]NUM;([DUD]DUDLIG*1000)
+# If fstat : Return : Endif # PID is not available on AP Invoices
+If fstat : XPID=1 : Endif  # 84834
+Trbegin [TCR]
+Raz [TCR]
+[F:TCR] = [F:DUD]
+[F:TCR]PROCESS= [L]ETAT
+
+[F:TCR]BPR = [F:DUD]BPRPAY  # Save the Pay-to customer in the BPR field of the temp table
+
+Read [BPS]BPS0=[F:DUD]BPRPAY
+If !fstat
+  [F:TCR]BPRNAM = [F:BPS]BPSNAM
+Endif
+
+[F:TCR]ACCDAT = [F:PIH]ACCDAT
+[F:TCR]BPRDAT = [F:PIH]BPRDAT
+If day([F:TCR]BPRDAT)=0 # New DATDEP parameter definition
+  WDATE=[F:TCR]ACCDAT
+  Else
+  WDATE=[F:TCR]BPRDAT
+Endif
+
+Raz [F:TCR]DEPDES
+
+#Call GETSOC([F:DUD]FCY) From DEVSUB # BODEL moved up higher X3-44746
+Call LEC_TDA(GCURLEG,[F:DUD]DEP) From CPTLEC
+If !fstat
+  If [F:TDA]DEPDES<>""
+    [F:TCR]DEPDES = [F:TDA]DEPDES
+  Else
+  Local Char SHOAXX
+  Call LECTEXTRA([L]SHOAXX,"TABDEPAGIO","SHOAXX",num$([F:TDA]DEP),"") From ATEXTRA
+  [F:TCR]DEPDES = [L]SHOAXX
+  Endif
+Endif
+
+If [F:DUD]PAYLOC=0     # No partial payments
+  If [F:PIH]BASDEP=0
+    AMT = [F:DUD]AMTLOC - [F:DUD]PAYLOC
+  Else                # Using DUD-DEP field when running through standard Due Date pickup
+    AMT = [F:PIH]BASDEP * [F:PIH]RATMLT() # Discountable Amount
+  Endif
+
+# BODEL X3-52857 sub section #5. Discount amount is showing incorrect amount. .s
+#
+#   Problem #1: ESC_AGIO from TRTDIV calls PAYDEPLIB.DSCAMTCAL which declares OPT locally and determines
+#     how to age based on DATDEP. There's no need to determine that ahead of time.
+#
+#   Problem #2: WDATE and [F:TCR]BPRDAT are both incorrect to pass. It's clearly noted that PAYDEPLIB.DSCAMTCAL expects the
+#     "Payment date in case of Payment Processes or a reference date that corresponds to the potentiel payment date"
+#   for the third parameter. BPRDAT and WDATE are neither in this case (except a special case where WDATE is set as ACCDAT).
+#   Changing to always pass the ACCDAT sent from the report parameters will allow us to match payment proposals output
+#   when running payment proposals by the same dates, and the same DATDEP parameter value.
+
+#  Call PARAML([F:DUD]CPY,"DATDEP",OPT) From ADOVAL
+#    If OPT = "1"  # Discount based on Accounting or Source Date
+#      Call ESC_AGIO([F:DUD]DEP,AMT,WDATE,[F:DUD]DUDDAT,DELAI,[L]TAUX_ESC,[L]MONT_ESC,[F:DUD]ACCNUM,[F:DUD]DUDLIG) From TRTDIV
+#    Elsif OPT = "2"  # Discount based on Invoice Date
+#      Call ESC_AGIO([F:DUD]DEP,AMT,[F:TCR]BPRDAT,[F:DUD]DUDDAT,DELAI,[L]TAUX_ESC,[L]MONT_ESC,[F:DUD]ACCNUM,[F:DUD]DUDLIG) From TRTDIV
+#    Endif
+
+  Raz TAUX_ESC,DELAI, [L]MONT_ESC
+  Call ESC_AGIO([F:DUD]DEP,AMT,PAYDTE,[F:DUD]DUDDAT,DELAI,[L]TAUX_ESC,[L]MONT_ESC,[F:DUD]ACCNUM,[F:DUD]DUDLIG) From TRTDIV
+  # BODEL X3-52857 sub section #5. Discount amount is showing incorrect amount. .e
+
+# BODEL X3-52857 sub section #1. Late charges were always thrown away. Now they are included. .s
+#If func ACCCHECK(WDATE,[F:DUD]DEP) = 0 : [L]MONT_ESC = 0 : Endif # PAYDTE accounting versus virtual disc date check
+# BODEL X3-52857 sub section #1. Late charges were always thrown away. Now they are included. .e
+
+Else
+   AMT = [F:DUD]AMTLOC - [F:DUD]PAYLOC
+  # BODEL X3-53216 .s
+  # Partial payments need to have the proper aging amount sent
+  # so that your discount can be calculated only on what is left.
+  Raz TAUX_ESC,DELAI, [L]MONT_ESC
+  Call ESC_AGIO([F:DUD]DEP,AMT,PAYDTE,[F:DUD]DUDDAT,DELAI,[L]TAUX_ESC,[L]MONT_ESC,[F:DUD]ACCNUM,[F:DUD]DUDLIG) From TRTDIV
+  # BODEL X3-53216 .e
+Endif
+
+If MONT_ESC=0 : Raz AMT : Endif # No discount then RAZ the discountable value
+[F:TCR]AMT    = abs(([F:DUD]AMTLOC - [F:DUD]PAYLOC))
+If AMT < [F:TCR]AMT & MONT_ESC <> 0 # DSCBAS in CALBASE_GLB of PAYDEPLIB3 applies BASDEP / AMTATI factor
+  [L]MONT_ESC*= 1/(evalue("[F:PIH]BASDEP")/evalue("[F:PIH]AMTATI")) #2
+Endif
+
+If [F:DUD]SNS=1    # credit memo
+  [F:TCR]AMT = [F:TCR]AMT * -1
+Endif
+
+
+# BODEL .s : Get Discountable Amount X3-44746
+Local Char LTMP(1)
+Local Decimal DDISCAMT
+
+Call PARAML([F:DUD]CPY, "DEPMGTMOD", [L]LTMP) From ADOVAL
+Local Integer LDEPMGTMOD : [L]LDEPMGTMOD = val([L]LTMP)
+
+DDISCAMT = func SUBPAYDISMSK.GET_DISCOUNTABLE_AMOUNT([L]LDEPMGTMOD, [F:DUD]TYP, [F:DUD]NUM, [F:DUD]ACCNUM,
+&     [F:DUD]CPY, [F:DUD]CUR, [F:DUD]BPRTYP, [F:DUD]DEP, [F:TCR]AMT, [F:DUD]AMTCUR, [F:PIH]AMTATI)
+
+[F:TCR]DISDAT = func PAYDEPLIB3.SETDISDAT(WDATE)
+
+# Required to use common library to retrieve the discountable amount
+#[F:TCR]AMTDIS = AMT * -[F:DUD]SNS
+#[F:TCR]AMTDIS = DDISCAMT
+[F:TCR]AMTDIS = DDISCAMT * -[F:DUD]SNS # PBA decision to invert the sign. Intentionally different from payment proposal.
+# BODEL .e X3-44746
+
+[F:TCR]DISAMT = [L]MONT_ESC * -[F:DUD]SNS
+[F:TCR]NETAMT = [F:TCR]AMT + [F:TCR]DISAMT
+[F:TCR]CREUSR = GUSER
+[F:TCR]CREDAT = date$
+[F:TCR]UID    = adxuid(1)
+
+Write [TCR]
+If fstat
+   # Infbox num$(fstat)-"Write of TCR failed:"-[F:TCR]CREUSR-[F:TCR]BPR-[F:TCR]FCY-[F:TCR]TYP-[F:TCR]NUM-[F:TCR]DUDDAT   89708.o
+     GMESSAGE=mess(317,107,1)
+     Infbox num$(fstat)-GMESSAGE-"TCR"-[F:TCR]CREUSR-[F:TCR]BPR-[F:TCR]FCY-[F:TCR]TYP-[F:TCR]NUM-[F:TCR]DUDDAT # 89708.n
+   Rollback
+Else
+   Commit
+Endif
+
+Return
+
+# Prepayments
+####################################################################################
+$ADD_CSHREQ_PP
+
+Trbegin [TCR]
+
+Raz [TCR]
+[F:TCR] = [F:DUD]
+
+[F:TCR]BPR = [F:DUD]BPRPAY  # Save the Pay-to customer in the BPR field of the temp table
+
+Read [BPS]BPS0=[F:DUD]BPRPAY
+If !fstat
+  [F:TCR]BPRNAM = [F:BPS]BPSNAM
+Endif
+
+[F:TCR]ACCDAT = [F:DUD]DUDDAT
+[F:TCR]BPRDAT = [F:DUD]SENDAT
+
+If day([F:TCR]BPRDAT)=0 # New DATDEP parameter definition
+  WDATE=[F:TCR]ACCDAT
+  Else
+  WDATE=[F:TCR]BPRDAT
+Endif
+
+[F:TCR]AMT    = ([F:DUD]AMTLOC - [F:DUD]PAYLOC) * -[F:DUD]SNS
+[F:TCR]AMTDIS = 0  # Prepayments not discounted
+[F:TCR]DISAMT = 0  # Prepayments not discounted
+[F:TCR]NETAMT = [F:TCR]AMT
+[F:TCR]CREUSR = GUSER
+[F:TCR]CREDAT = date$
+[F:TCR]UID    = adxuid(1)
+
+Write [TCR]
+If fstat
+   # Infbox num$(fstat)-"Write of TCR failed:"-[F:TCR]CREUSR-[F:TCR]BPR-[F:TCR]FCY-[F:TCR]TYP-[F:TCR]NUM-[F:TCR]DUDDAT 89708.o
+     GMESSAGE=mess(317,107,1) # 89708.n
+     Infbox num$(fstat)-GMESSAGE-"TCR"-[F:TCR]CREUSR-[F:TCR]BPR-[F:TCR]FCY-[F:TCR]TYP-[F:TCR]NUM-[F:TCR]DUDDAT # 89708.n
+   Rollback
+Else
+   Commit
+Endif
+
+Return
+
+# X3-44745:
+# Add cash requirements for journal entry records without a source document
+# As with manual check entry, discounts are not applied to journal entries
+####################################################################################
+$ADD_CSHREQ_JE
+
+  # Clear the record and copy from the buffer
+  Raz [TCR]
+  [F:TCR]       = [F:DUD]
+
+  # Obtain the supplier name
+  Read [BPS]BPS0=[F:DUD]BPRPAY
+  If !fstat
+    [F:TCR]BPRNAM = [F:BPS]BPSNAM
+  Endif
+
+  [F:TCR]AMT    = abs(([F:DUD]AMTLOC - [F:DUD]PAYLOC))
+  If [F:DUD]SNS=1                 # credit memo
+    [F:TCR]AMT = [F:TCR]AMT * -1
+  Endif
+
+  [F:TCR]BPR    = [F:DUD]BPRPAY   # Save the Pay-to customer in the BPR field of the temp table
+  [F:TCR]PROCESS= [L]ETAT
+  [F:TCR]BPRDAT = [F:HAE]ENTDAT   # Entry date from GACCENTRY
+  [F:TCR]ACCDAT = [F:HAE]ACCDAT
+  [F:TCR]DUDDAT = [F:DUD]DUDDAT
+  [F:TCR]NETAMT = [F:TCR]AMT
+  [F:TCR]AMTDIS = 0               # Amount discountable doesn't apply for journal entries without a source document
+  [F:TCR]DISAMT = 0               # Discount amount doesn't apply for journal entries without a source document
+  [F:TCR]CREUSR = GUSER
+  [F:TCR]CREDAT = date$
+  [F:TCR]UID    = adxuid(1)
+
+  Trbegin [TCR]
+  Write [TCR]
+  If fstat
+     # Infbox num$(fstat)-"Write of TCR failed:"-[F:TCR]CREUSR-[F:TCR]BPR-[F:TCR]FCY-[F:TCR]TYP-[F:TCR]NUM-[F:TCR]DUDDAT   89708.o
+       GMESSAGE=mess(317,107,1)
+       Infbox num$(fstat)-GMESSAGE-"TCR"-[F:TCR]CREUSR-[F:TCR]BPR-[F:TCR]FCY-[F:TCR]TYP-[F:TCR]NUM-[F:TCR]DUDDAT # 89708.n
+     Rollback
+  Else
+     Commit
+  Endif
+Return
+
+# Remove suppliers with negative balance
+####################################################################################
+$DEL_NEG_SUP
+
+Trbegin [TCR]
+
+Local Decimal NETAMT
+Local Char    BPR
+
+Raz STAT
+For [TCR] Where CREUSR=GUSER & CREDAT=date$ & UID=adxuid(1)
+
+  If [F:TCR]BPR=[L]BPR : Goto DEL_NEG_SUP_NXT : Endif
+
+  BPR = [F:TCR]BPR
+  Raz NETAMT
+  For [TCR2] Where CREUSR=GUSER & CREDAT=date$ & UID=adxuid(1) & BPR=[L]BPR
+    NETAMT += [F:TCR2]NETAMT
+  Next
+  If NETAMT>0 : Goto DEL_NEG_SUP_NXT : Endif
+
+  Delete [TCR] Where BPR=[L]BPR
+  If fstat
+     GMESSAGE=mess(391,182,1) # 89708.n
+     #Infbox num$(fstat)-"Delete of TCR failed:"-[F:TCR]CREUSR-[F:TCR]BPR-[F:TCR]FCY-[F:TCR]TYP-[F:TCR]NUM-[F:TCR]DUDDAT 89708.o
+     Infbox num$(fstat)-GMESSAGE-[F:TCR]CREUSR-[F:TCR]BPR-[F:TCR]FCY-[F:TCR]TYP-[F:TCR]NUM-[F:TCR]DUDDAT # 89708.n
+     STAT=1 : Break
+  Endif
+
+$DEL_NEG_SUP_NXT
+Next
+
+If STAT
+   Rollback
+Else
+   Commit
+Endif
+
+Return
+####################################################################################
+Funprog CHK_DISCTBL (XANDOR,XDISDATDEB,XDISDATFIN,XPAYDTE)
+Value Integer XANDOR # 90695.n
+Value Date XDISDATDEB, XDISDATFIN, XPAYDTE
+Local Integer DISC, BPRTYPE
+Local Date ACCDAT
+Local Date REFERENCEDATE, DUEDATE, WDISDAT
+Local Char TYP, NUM, DISCBASE
+
+If DISDATDEB > gdat$(01,01,1900)
+ [M:DIA]DATDISMIN=DISDATDEB # Discount parameters
+Else
+ [M:DIA]DATDISMIN= gdat$(01,01,1900) # To work with paydeplib.nochecknecessary
+Endif
+If DISDATFIN > gdat$(01,01,1900)
+ [M:DIA]DATDISMAX=DISDATFIN
+Else
+ #[M:DIA]DATDISMAX= gdat$(01,01,1900) # To work with paydeplib.nochecknecessary  89708.o
+ [M:DIA]DATDISMAX= gdat$(31,12,2999) # To work with paydeplib.nochecknecessary # 89708.n
+Endif
+
+[M:DIA]DATMIN=DUEDATMIN
+[M:DIA]DATMAX=DUEDATMAX
+
+Read [PIH]PIH0=[F:DUD]NUM
+
+Call PARAM([F:PIH]CPY,"DATDEP",DISCBASE) From ADOVAL
+
+If XANDOR = 1 # And
+  Read [TDA]TDA0=[F:DUD]DEP
+  If fstat : End 0 : Endif
+  If func PAYDEPLIB.MATCHDISCOUNTTERMS(2,[F:DUD]DEP,[F:DUD]DUDDAT,[F:DUD]NUM,[F:DUD]TYP,[F:DUD]BPRTYP,[L]DISCBASE) = 1  Then End 1
+    Else End 0
+  Endif
+Endif
+
+If XANDOR = 2 # OR
+  Raz WDISDAT
+  WDISDAT= func PAYDEPLIB3.SETDISDAT(XPAYDTE)  # Discount date check against parameters - New for OR logic
+  If  (WDISDAT<=XDISDATFIN & WDISDAT>=XDISDATDEB) | ((year(DISDATDEB)=0 & WDISDAT<=DISDATFIN) | (year(DISDATFIN)=0 & WDISDAT>=DISDATDEB))
+    End 1
+  Elsif ([F:DUD]DUDDAT<=DUEDATMAX & [F:DUD]DUDDAT>=DUEDATMIN) | (year(DUEDATMIN)=0 & [F:DUD]DUDDAT<=DUEDATMAX) | (year(DUEDATMAX)=0 & [F:DUD]DUDDAT>=DUEDATMIN)
+    End 1
+  Else
+  End 0
+  Endif
+Endif
+
+End 0
+####################################################################################
+Funprog ACCCHECK (WDATE,WDEP)
+Value Date WDATE
+Value Char WDEP
+
+Local Integer WDISC, DISC
+
+If GDISFLG=2 : End 1 : Endif # Always discount flag
+  WDISC = 0
+
+Read [TDA]TDA0=[F:DUD]DEP
+If fstat : End 0 : Endif
+If !fstat
+  For I=0 To dim([F:TDA]DEPDAY)-1
+    If [F:TDA]DEPDAY(I) = 999 : Break : Endif
+    If [F:TDA]DEPDAY(I) = 0 : Goto $SKIP2 : Endif
+
+    # Calculate discount date
+
+    # BODEL X3-52857 .s
+    # Payment proposals, more specifically, SUBPAYDISMSK.INIT_DIA
+    # substracts a day from TABDEPAGIO.DEPDAY. Keeping consistent here.
+    DISC = nday(WDATE) + abs([F:TDA]DEPDAY(I)-1)
+    # BODEL X3-52857 .e
+
+     If DISC < nday(PAYDTE)
+       Goto $SKIP2 # Discount date passed
+       Else
+       WDISC = 1 # Keep calculated discount
+     Endif
+$SKIP2
+Next
+Endif
+
+End WDISC
+
+###################################################################################
+Funprog DISCDAY(DEP,DELAI)
+Value Char DEP
+Value Integer DELAI
+
+Local Integer OK, DAYS, TAUX, WSTEP
+Local Char DATSELDEP
+
+TAUX = 0
+OK = 0
+
+Call PARAML([F:DUD]CPY,"DATSELDEP",DATSELDEP) From ADOVAL
+If clalev([F:TDA]) = 0 : Local File TABDEPAGIO : Endif
+
+Read [TDA] TDA0=DEP
+If fstat : End : Endif
+# pour l'Escompte on prend le poste juste supérieur
+# pour l'agio     on prend le poste juste inférieur
+For I = 0 To dim([F:TDA]DEPRAT)-1
+ If [F:TDA]DEPDAY(I) = 999 : End DAYS : Endif
+ If [F:TDA]DEPDAY(I) > DELAI
+  If DELAI < 0
+   TAUX = [F:TDA]DEPRAT(I)
+  Elsif I > 0
+   TAUX = [F:TDA]DEPRAT(I - 1)
+  Endif
+   #End [F:TDA]DEPDAY(I) # use param below
+ Endif
+ #DAYS=abs([F:TDA]DEPDAY(I)) use param below
+
+ If DAYS=0 :  DAYS=abs([F:TDA]DEPDAY(I)) : Endif
+ If DATSELDEP = "1" & abs([F:TDA]DEPDAY(I)) < DAYS : DAYS = [F:TDA]DEPDAY(I) : Endif
+ If DATSELDEP = "2" & abs([F:TDA]DEPDAY(I)) > DAYS : DAYS = [F:TDA]DEPDAY(I) : Endif
+
+Next
+
+
+End DAYS
+
+# 93907.sn
+####################################################################################
+Funprog CHK_APPROVAL(WTYP,WNUM,WACCNUM)
+Value Char WTYP
+Value Char WNUM
+Value Integer WACCNUM
+
+Local Integer APPROVAL
+
+Filter [DUD2] Where NUM=WNUM and TYP = WTYP and ACCNUM<> WACCNUM and [DUD2]FLGPAZ < WAPP # Searching for unauthorized, posted invoices
+Look [DUD2] First
+
+If !fstat
+  APPROVAL=1
+Endif
+
+End APPROVAL
+####################################################################################
+# 93907.en
+
+####################################################################################
+$OUVRE
+
+Local File TMPCSRQ [TCR]
+Local File TMPCSRQ [TCR2]
+If !clalev([F:DUD])  : Local File GACCDUDATE     [DUD]  : Endif
+If !clalev([F:PIH])  : Local File PINVOICE       [PIH]  : Endif
+If !clalev([F:PID])  : Local File PINVOICED      [PID]  : Endif
+If !clalev([F:TDA])  : Local File TABDEPAGIO     [TDA]  : Endif
+If !clalev([F:BPS])  : Local File BPSUPPLIER     [BPS]  : Endif
+If !clalev([F:GAC])  : Local File GACCOUNT       [GAC]  : Endif
+If !clalev([F:DUD2]) : Local File GACCDUDATE     [DUD2] : Endif # 93907.n
+If !clalev([M:DIA])  : Local Mask PAYPROP0       [DIA]  : Endif  ####
+If !clalev([F:GTE])  : Local File GTYPACCENT     [GTE]  : Endif # X3-44745 BODEL Required to check entry category
+If !clalev([F:HAE])  : Local File GACCENTRY      [HAE]  : Endif # X3-44745 BODEL Required to check entry category
+
+# Initialize the TMPCSRQ table to prepare to load it with new information.
+Lock [TCR]
+Delete [TCR] Where CREUSR=GUSER | UID=adxuid(1) | CREDAT < date$-5
+Unlock [TCR]
+
+Return
+####################################################################################
+$DECLARE
+
+Local Char    CRITERE(255),CRIT1(255),CRIT2(255),XNUM(25)
+Local Char    PARAM(30),VALEUR(30),ETAT(GLONARP)
+Local Date    XDAT(25) # 90659.n
+Local Integer I,J,NUMREQ,DELAI,STAT,XANDOR
+Local Decimal TAUX_ESC,MONT_ESC,AMT
+
+Global Date    DUEDATMAX,DUEDATMIN,WDATE,WDSCDATE
+Global Date    DISDATDEB,DISDATFIN,PAYDTE
+Global Integer GDISFLG  # used in TRTDIV
+Global Integer WAPP # 93907.n
+
+Return
+

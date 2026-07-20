@@ -1,0 +1,602 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+##########################################################################################################
+# Reminder campaign validation:
+# - update FUP table (used for printing FUP report file) + HDU (Open item archive)
+# - incrémentation du niveau de relances
+# - CRM tasks creation
+# - creation and sending of reminder letters
+#
+# Tables used:
+# TMPFUP2 [TFP2]
+# TMPFUP1 [TFP3]
+# TMPFUP2 [TFP4]
+##########################################################################################################
+# 2018-05-15 DNE X3-78302 Error on CURSHRFLD not set
+# 2018-06-29 DNE X3-71195 Prevend index overflow in []
+##########################################################################################################
+
+Local Char PARAM(10)(1..2) , VALEUR(10)
+GERR = 0
+GPROG    = "TRTCFUP"
+GTYPPROG = 4
+GWINDOW  = "DFUP"
+GWINCRIT = "CRITFUP"
+Call TRAITE_CHAR(VALEUR,PARAM,GWINDOW,GPROG,GWINCRIT,GTYPPROG,"") From GTRAITE
+End
+
+#########################################################################################################
+
+$DECLARE
+If GSERVEUR
+ Local Char NUM(250)
+ NUM = [M:CFP0]QURNUM
+ Gosub CHARGE_CFP0 From TRTCFUP
+Endif
+
+Local Char TBPAR(10)(1..50), TBVAL(30)(1..50), TRI(50), TMPGRPCRI(30), VALPAR(1), LIT(GLONADI)(1..5), TSKREP(GLONREP), BPRFUP(GLONBPR), RPTDST(250)
+Local Integer NBPAR, NBWRITE, NBTSK, CREDIT, EXIST, NBRCOP, FUPCUR, FUPFCY, FUPMOD, FUPMOD2(0..1), NMOD, FUPCRM, LNGMAX, REMPLI, MAXI
+Local Clbfile FULOBJ(3), FULOBJ2(3), LIGNE(3)
+Local Decimal MTDES, AMTDEP, T, DEPRAT
+#93920
+Local Char OLDBPC(GLONBPC)
+
+Call PARAML("","FUPCRM",VALPAR) From ADOVAL
+FUPCRM = val(VALPAR)
+
+# TABLES
+
+If clalev([F:AIM])=0  : Local File APRINTER [AIM]   : Endif
+If clalev([F:FGP])=0  : Local File FUPGRP [FGP]     : Endif
+If clalev([F:FUP2])=0 : Local File FUP [FUP2]       : Endif
+If clalev([F:LCM])=0  : Local File LASTCUSMVT [LCM] : Endif
+If clalev([F:AMZ])=0  : Local File AMSKZON [AMZ]    : Endif
+If clalev([F:ATY])=0  : Local File ATYPE   [ATY]    : Endif
+If clalev([F:TDA])=0  : Local File TABDEPAGIO [TDA] : Endif
+
+# generate CRM tasks if CRM Activity module is enabled
+If FUPCRM=2 and GMODU(13)=2
+ If clalev([M:TK0])=0 : Local Mask TSK0   [TK0] : Endif
+ If clalev([M:TK1])=0 : Local Mask TSK1   [TK1] : Endif
+ If clalev([M:TK2])=0 : Local Mask TSK2   [TK2] : Endif
+Endif
+
+If GSERVEUR
+ If clalev([F:ABR])=0 : Local File ABATRQT [ABR] : Endif
+ If clalev([F:ABA])=0 : Local File ABATABT [ABA] : Endif
+Endif
+Return
+
+# Campaign validation
+$VALIDATION
+
+Gosub DECLARE
+
+Call PARAML("","FUPLEV1",[L]LIT(1)) From ADOVAL # Reminder level 1
+Call PARAML("","FUPLEV2",[L]LIT(2)) From ADOVAL # Reminder level 2
+Call PARAML("","FUPLEV3",[L]LIT(3)) From ADOVAL # Reminder level 3
+Call PARAML("","FUPLEV4",[L]LIT(4)) From ADOVAL # Reminder level 4
+Call PARAML("","FUPLEV5",[L]LIT(5)) From ADOVAL # Reminder level 5
+
+GOK = 1
+NBWRITE = 0
+NBTSK = 0
+# CRM tasks creation
+If !GSERVEUR and GTRACE=""
+ # in batch mode, use the trace already opened by supervisor
+ Call OUVRE_TRACE(mess(215,117,1)) From LECFIC
+Endif
+NBPAR = 0
+NBPAR += 1 : TBPAR(NBPAR)="numedt" : TBVAL(NBPAR) = [M:CFP0]QURNUM
+
+If GSERVEUR
+ Read [ABR]NUMREQ = val(getenv$("RQT_ENTREP"))
+ Read [ABA]CODABT=[ABR]CODABT
+ If [F:ABA]CODABT<>""
+  # Recurring task XYZ
+  Call ECR_TRACE(mess(14,104,1)-[F:ABA]CODABT-":"-[F:ABA]NOMABT,0) From GESECRAN
+ Endif
+Endif
+
+# Campaign number
+Call ECR_TRACE(mess(231,117,1)-[M:CFP0]QURNUM,0) From GESECRAN
+
+TT=0
+Call PARAMUTIL("AUSCRMF",[L]TSKREP,GUSER,"") From SUBAUS # rep code initialization
+Read [REP]REP0=[L]TSKREP
+If fstat
+ # The rep code given by AUSCRMF parameter does not match an existing rep code
+ [L]TSKREP=""
+Endif
+
+
+If GSERVEUR : Gosub OUVRE_TABLES From TRTFUP : Endif
+
+Call DEBTRANS From GLOCK
+Gosub TR0
+
+If GOK=1
+ # This label is called once
+ # It handles printing for all reminders, and sending mails if necessary
+ Gosub IMPRESSION
+
+ Call DEBTRANS From GLOCK
+ Gosub TR1
+Endif
+
+If FUPCRM=2 and GMODU(13)=2 # create CRM tasks
+ Call FERME_BOITE From GESECRAN
+ Call ECR_TRACE(mess(212,117,1)+num$(NBTSK),0) From GESECRAN
+Endif
+
+If GSERVEUR
+ TRA = 0
+Else
+ Call FERME_TRACE From LECFIC
+ Call LEC_TRACE From LECFIC
+Endif
+
+Return
+
+$TR0
+Filter [TFP1]
+Trbegin [FUP]
+ # loop through all distinct (BPC, FUPMOD) pairs of the campaign
+ For [TFP2]TFP3(1) Where NUMREQ=[M:CFP0]QURNUM and SEL=2
+  Raz FULOBJ
+
+  # loop to group "Phone" and "Fax" modes (see $TASK)
+  # 2629 : 1) Lettre, 2) Email, 3) Téléphone, 4) Fax
+  # 3 appels de $FUP :
+  # 1) Letter (printing in "file" mode)
+  # 2) Email
+  # 3) Phone & Fax : currently ignored by GESFUP function
+  For [L]FUPMOD=1 To 3
+   FUPMOD2(0) = [L]FUPMOD
+   If [L]FUPMOD=3
+    FUPMOD2(1) = 4
+    NMOD = 2
+   Else
+    NMOD = 1
+   Endif
+
+   # no reminder if total amount to be reminded is negative for this client
+   T = 0
+   For [TFP1]TFP1 Where NUMREQ=[M:CFP0]QURNUM and BPC=[TFP2]BPC
+    T += [TFP1]FUPTOTAMT
+   Next
+   If T>0
+    Gosub FUP
+    If GOK=0 : Break 2 : Endif
+    If FUPCRM=2 and GMODU(13)=2 : Gosub TASK : Endif
+   Endif
+  Next
+ Next # end of loop
+
+# Check that records of FUP table set with "Global reminder" all use the most severe reminder text
+# If not, the reminder level of these records is updated
+ For [FUP]FUP0(4) Where NUMEDT=[M:CFP0]QURNUM and TYPTXT=2 and left$(GRPCRI,1)="2"
+  MAXI = 0
+  Filter [FUP2] Where [F:FUP2]NUMEDT=[F:FUP]NUMEDT and [F:FUP2]TYPTXT=[F:FUP]TYPTXT and [F:FUP2]GRPCRI=[F:FUP]GRPCRI Order By LEVFUP Desc
+  Read [FUP2] First
+  MAXI = [FUP2]LEVFUP
+  Filter [FUP2]
+  Update [FUP2] Where [F:FUP2]NUMEDT=[F:FUP]NUMEDT and [F:FUP2]TYPTXT=[F:FUP]TYPTXT and [F:FUP2]GRPCRI=[F:FUP]GRPCRI and [F:FUP2]LEVFUP<>MAXI With [F:FUP2]LEVFUP=MAXI
+ Next
+
+ If GOK=0 : Goto AB_TR1 : Endif
+Commit
+Return
+
+$TR1
+GOK = 1
+Trbegin [LCM]
+
+ Link [TFP2] With [DUD]DUD8=[TFP2]NUMDUD As [LNKV] Where NUMREQ=[M:CFP0]QURNUM and SEL=2
+ #93920
+ Raz OLDBPC
+ For [LNKV]TFP3
+  #Fin 93920
+  If [F:TFP2]LEVFUP>0 and [L]LIT(min([F:TFP2]LEVFUP, 5))<>""
+   Update [DUD] Where NUMDUD=[TFP2]NUMDUD With LEVFUP=[TFP2]LEVFUP, DEP=[TFP2]DEP, DPTCOD=[L]LIT(min([F:TFP2]LEVFUP, 5)), DATFUP=datesyst
+  Else
+   Update [DUD] Where NUMDUD=[TFP2]NUMDUD With LEVFUP=[TFP2]LEVFUP, DEP=[TFP2]DEP, DATFUP=datesyst
+  Endif
+  Gosub TR1_2
+ Next
+ If GOK=-1
+  GLOCK = "$LASTCUSMVT"-[F:DUD]BPR-num$(N)-[F:DUD]CPY : Goto ROLL_TR1
+ Elsif GOK=0
+  Call FSTA("LCM") From GLOCK : Goto AB_TR1
+ Endif
+ # set the campaign as validated
+ Update [TFP0] Where QURNUM=[M:CFP0]QURNUM With VALIDE=2, UPDUSR=GUSER, UPDDAT=date$
+ [M:CFP0]VALIDE=2
+ If fstat=1
+  GOK = -1 : GLOCK = "$TMPFUP0"-[M:CFP0]QURNUM : Goto ROLL_TR1
+ Elsif fstat
+  GOK = 0  : Call FSTA("TFP0") From GLOCK : Goto AB_TR1
+ Endif
+
+Commit
+
+Return
+
+$TR1_2
+For N=18 To 20
+ Raz [LCM]
+ # 18) Last reminder
+ # 19) Last reminder level
+ # 20) Maximum reminder level
+ Read [LCM]LCM0=[DUD]BPR;N;[DUD]CPY
+ If fstat<>0
+  # create new record
+  [F:LCM]BPCNUM = [F:DUD]BPR
+  [F:LCM]IFFTYP = N
+  [F:LCM]CPY    = [DUD]CPY
+  [F:LCM]MVTTYP = 12 # Reminder
+  [F:LCM]IFFFCY = [DUD]FCY
+  [F:LCM]CREUSR = GUSER
+  [F:LCM]CREDAT = date$
+  [F:LCM]UPDUSR = GUSER
+  [F:LCM]UPDDAT = date$
+
+  If N=18
+   # Last reminder
+   [F:LCM]MVTDAT = date$
+   #[F:LCM]VCRNUM = [DUD]NUM
+  Elsif N=19
+   # Last reminder level
+   [F:LCM]AMT   = [DUD]LEVFUP
+  Elsif N=20
+   # Maximum reminder level
+   [F:LCM]AMT   = [DUD]LEVFUP
+  Endif
+
+  Write [LCM]
+  If fstat
+   GOK = 0 : Break 2
+  Endif
+ Else
+  If N=18
+   Update [LCM] Where BPCNUM=[DUD]BPR and IFFTYP=N and CPY=[DUD]CPY With MVTDAT=date$, UPDUSR=GUSER, UPDDAT=date$
+   If fstat=1
+    GOK = -1 : Break 2
+   Elsif fstat
+    GOK = 0 : Break 2
+   Endif
+  Elsif N=19
+  #93920
+   If OLDBPC=[F:TFP2]BPC
+    Update [LCM] Where BPCNUM=[DUD]BPR and IFFTYP=N and CPY=[DUD]CPY With AMT=max(AMT, [TFP2]LEVFUP), UPDUSR=GUSER, UPDDAT=date$
+   Else
+    OLDBPC=[F:TFP2]BPC
+    Update [LCM] Where BPCNUM=[DUD]BPR and IFFTYP=N and CPY=[DUD]CPY With AMT=[TFP2]LEVFUP, UPDUSR=GUSER, UPDDAT=date$
+   Endif
+   If fstat=1
+    GOK = -1 : Break 2
+   Elsif fstat
+    GOK = 0 : Break 2
+   Endif
+  Elsif N=20
+   Update [LCM] Where BPCNUM=[DUD]BPR and IFFTYP=N and CPY=[DUD]CPY With AMT=max(AMT, [DUD]LEVFUP), UPDUSR=GUSER, UPDDAT=date$
+   If fstat=1
+    GOK = -1 : Break 2
+   Elsif fstat
+    GOK = 0 : Break 2
+   Endif
+  Endif
+ Endif
+Next
+Return
+
+$AB_TR1
+Rollback
+Return
+
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+
+#########################################################################################################
+
+$CMT
+# create the comment of the CRM task
+# retrieve the selected open items for this BP and this/these reminder mode(s)
+Raz [M:TK2]FULRPO
+
+# compute the maximum number of characters that may be stored in field FULRPO
+If [F:AMZ]CODMSK<>"TSK2" or [F:AMZ]CODZON<>"FULRPO" : Read [AMZ]CODE="TSK2";"FULRPO" : Endif
+If [F:ATY]CODTYP<>[F:AMZ]CODTYP : Read [ATY]CODTYP=[AMZ]CODTYP : Endif
+If [F:ATY]TYPTYP=9 or [F:ATY]TYPTYP=10 # Clob ou Blob
+ LNGMAX = 512*(2^[F:ATY]LNGTYP)-2
+Elsif [F:ATY]TYPTYP=7
+ LNGMAX = [F:ATY]LNGTYP
+Endif
+
+N=0 : REMPLI=0
+Link [TFP4] With [DUD]DUD8~=[TFP4]NUMDUD, [TCF]TCF0=[TFP4]NUMDUD As [LNKT]
+&    Where NUMREQ=[M:CFP0]QURNUM and SEL=2 and [TFP4]BPC=[TFP2]BPC and find([TFP4]FUPMOD, [L]FUPMOD2(0..[L]NMOD-1))<>0
+For [LNKT]
+ If [M:TK2]FULRPO<>"" : [M:TK2]FULRPO += chr$(13) : Endif
+ LIGNE = [F:DUD]TYP+chr$(9)+[F:DUD]NUM+chr$(9)+[F:DUD]CUR+chr$(9)+num$([F:DUD]AMTCUR)+chr$(9)+[F:TCF]CMT
+ # if there is not enough space to add a new line
+ If len([M:TK2]FULRPO+LIGNE)<LNGMAX-len(mess(258,193,1))
+  [M:TK2]FULRPO += LIGNE
+ Elsif REMPLI=0
+  [M:TK2]FULRPO += mess(258,193,1)
+  REMPLI=1
+ Endif
+ N+=1
+Next
+[M:TK2]FULRPO = mess(229,117,1)+chr$(13)+[M:TK2]FULRPO
+[M:TK1]TSKORIVCRL = N
+Return
+
+#########################################################################################################
+# Store the data in FUP table to print the Crystal report
+#########################################################################################################
+$FUP
+If FUPCRM=2 and GMODU(13)=2 : Gosub CMT : Endif
+
+Gosub FUP1
+
+If GOK=0 : Return : Endif
+
+Gosub FUP2
+Return
+
+$FUP1
+# select all open items matching the current BP and reminder mode
+# [TFP4] : table TMPFUP2
+
+Link [TFP4] With [DUD]DUD8=[TFP4]NUMDUD As [LNKW]
+&    Where [TFP4]NUMREQ=[M:CFP0]QURNUM and [TFP4]BPC=[TFP2]BPC and find([TFP4]FUPMOD, [L]FUPMOD2(0..[L]NMOD-1))<>0 and [TFP4]SEL=2
+For [LNKW]
+ If [F:BPC]BPCNUM<>[F:TFP2]BPC : Read [BPC]BPC0=[F:TFP2]BPC : Endif
+ If [F:FGP]GRP<>[F:BPC]GRP : Read [F:FGP]FGP0=[F:BPC]GRP : Endif
+
+ Raz [F:FUP]
+
+ If [F:HAE]TYP<>[F:DUD]TYP or [F:HAE]NUM<>[F:DUD]NUM : Read [HAE]HAE0=[F:DUD]TYP;[F:DUD]NUM : Endif
+
+ # reminder by transaction currency
+ If [F:FGP]FUPCUR=2 : [L]FUPCUR=1 : Else : [L]FUPCUR=0 : Endif
+ # reminder by site
+ If [F:FGP]FUPFCY=2 : [L]FUPFCY=1 : Else : [L]FUPFCY=0 : Endif
+
+ If [M:CFP1]BPRFUP=1
+  [L]BPRFUP = [F:DUD]BPRPAY
+ Else
+  [L]BPRFUP = [F:DUD]BPR
+ Endif
+
+ # GRPCRI is computed to take into account a possible change of the reminder level in the campaign detail screen
+ Case [F:BPC]FUPTYP
+  When 2  :# By invoice
+   [F:TFP2]GRPCRI = "1;"+[L]BPRFUP+";"+num$([F:DUD]ACCNUM)+";"+num$([F:DUD]DUDLIG)
+   [F:TFP2]TYPTXT = 1
+  When 3  :# Global
+   If [L]FUPFCY  :# 1 letter by facility
+    [F:TFP2]GRPCRI = "2;"+[L]BPRFUP+";"+[F:DUD]FCY+";"
+   Else
+    [F:TFP2]GRPCRI = "2;"+[L]BPRFUP+";"+[F:DUD]CPY+";"
+   Endif
+   [F:TFP2]GRPCRI += [F:TFP4]ADD+";"
+   If [L]FUPCUR  :# 1 letter by currency
+    [F:TFP2]GRPCRI += [F:DUD]CUR
+   Endif
+   [F:TFP2]TYPTXT = 2
+  When 4  :# Global by level
+   # 64475
+   If [L]FUPFCY  :# 1 letter by facility
+    [F:TFP2]GRPCRI = "3;"+[L]BPRFUP+";"+[F:DUD]FCY+";"+num$([F:TFP4]LEVFUP+1)+";"
+   Else
+    [F:TFP2]GRPCRI = "3;"+[L]BPRFUP+";"+[F:DUD]CPY+";"+num$([F:TFP4]LEVFUP+1)+";"
+   Endif
+   [F:TFP2]GRPCRI += [F:TFP4]ADD+";"
+   If [L]FUPCUR  :# 1 letter by currency
+    [F:TFP2]GRPCRI += [F:DUD]CUR
+   Endif
+   [F:TFP2]TYPTXT = 2
+  When 5   :# Global by delay
+   If [L]FUPFCY  :# 1 letter by facility
+    [F:TFP2]GRPCRI = "4;"+[L]BPRFUP+";"+[F:DUD]FCY+";"
+   Else
+    [F:TFP2]GRPCRI = "4;"+[L]BPRFUP+";"+[F:DUD]CPY+";"
+   Endif
+
+   J = func TRTCFUP.GET_THRESHOLD([F:DUD]DUDDAT, [M:CFP1]REFDAT, [F:FGP]SEUILS(0..min(dim([F:FGP]SEUILS), max([F:FGP]FUPMAX, 1))-1))
+   [F:TFP2]GRPCRI += num$(J)+";"
+   [F:TFP2]GRPCRI += [F:TFP4]ADD+";"
+   If [L]FUPCUR  :# 1 letter by currency
+    [F:TFP2]GRPCRI += [F:DUD]CUR+";"
+   Endif
+   [F:TFP2]TYPTXT = 2
+ Endcase
+
+ # store data in FUP table
+ [L]TMPGRPCRI = [F:TFP2]GRPCRI
+ If [F:BPC]BPCNUM<>[L]BPRFUP : Read [BPC]BPC0=[L]BPRFUP : Endif
+ If [F:BPR]BPRNUM<>[F:BPC]BPCNUM : Read [BPR]BPR0=[F:BPC]BPCNUM : Endif
+
+ [F:FUP]       = [F:DUD]
+ [F:FUP]       = [F:TFP2]
+ [F:FUP]FCY    = [F:DUD]FCY
+ [F:FUP]LEVFUP = [F:TFP4]LEVFUP
+
+ # 58705 : the address code to use is the one stored in TMPFUP2 table, not the default address of the pay-by BP
+ [F:FUP]ADD    = [F:TFP4]ADD
+
+ [F:FUP]NUMEDT = [F:TFP2]NUMREQ
+ [F:FUP]BPRFUP = [L]BPRFUP
+ [F:FUP]TRI    = [L]TRI
+ [F:FUP]LAN    = [F:BPR]LAN
+ [F:FUP]GRP    = [F:BPC]GRP
+ [F:FUP]ACCDAT = [F:HAE]ACCDAT
+ [F:FUP]DATREF = [M:CFP1]REFDAT
+ [F:FUP]GRPCRI = [L]TMPGRPCRI
+
+ Call LITTABDEP([F:TFP4]DEP, nday([M:CFP1]REFDAT)-nday([F:DUD]DUDDAT), [L]DEPRAT) From TRTDIV
+ [F:FUP]DEPRAT = [L]DEPRAT
+
+ [F:FUP]SIM = 1
+ [F:FUP]DATEDT = datesyst
+
+ If [F:BPC]FUPTYP=5 # global reminder by delay
+  # the reminder level must be equal to the open item threshold
+  [F:FUP]LEVFUP = func TRTCFUP.GET_THRESHOLD([F:DUD]DUDDAT, [M:CFP1]REFDAT, [F:FGP]SEUILS(0..min(dim([F:FGP]SEUILS), max([F:FGP]FUPMAX, 1))-1))
+ Endif
+
+ # retrieval of the biggest LEVFUP value
+ Raz fstat
+ If [F:FPT]LAN<>[F:FUP]LAN or [F:FPT]GRP<>[F:FUP]GRP or [F:FPT]TYPTXT<>[F:FUP]TYPTXT or [F:FPT]LEVFUP<>[F:FUP]LEVFUP
+  Read [FPT]FPT0=[F:FUP]LAN;[F:FUP]GRP;[F:FUP]TYPTXT;[F:FUP]LEVFUP
+ Endif
+
+ # if the reminder text doesn't exist for the group to be used, the reminder text in group "All groups" (GRP="")
+ # with the highest level is used instead (and with level smaller than or equal to the level defined in [F:FUP]
+ If fstat
+  Filter [FPT] Where LAN=[F:FUP]LAN and GRP="" and TYPTXT=[F:FUP]TYPTXT and LEVFUP<=[F:FUP]LEVFUP Order By LEVFUP Desc
+  Read [FPT] First
+  Filter [FPT]
+  [F:FUP]GRP = ""
+  [F:FUP]LEVFUP = [F:FPT]LEVFUP
+ Endif
+ RPTDST=""
+ If [F:TFP4]FUPMOD=1 # letter
+  Call PARAML([F:FUP]FCY, "RPTDST1", RPTDST) From ADOVAL
+ Elsif [F:TFP4]FUPMOD=2 # e-mail
+  Call PARAML([F:FUP]FCY, "RPTDST2", RPTDST) From ADOVAL
+ Endif
+ If RPTDST<>""
+  If [F:AIM]COD<>RPTDST : Read [AIM]AIM0=RPTDST : Endif
+  If [F:AIM]PRT=1
+   [F:FUP]PREVIEW = 2
+  Else
+   [F:FUP]PREVIEW = 1
+  Endif
+  [F:FUP]DST = [F:AIM]COD
+ Endif
+
+  # US X3-2648 begin
+  Local Char LCURSHRFLD(30)
+  Call PARAML([F:FUP]FCY, "CURSHRFLD", [L]LCURSHRFLD) From ADOVAL
+# 2018-05-15 DNE X3-78302 BEGIN
+  If [L]LCURSHRFLD = ""
+      # 'Company'
+      # 'Parameter '$1$' not set.'
+      Call ECR_TRACE( func AFNC.MES1( mess(332,123,1), "CURSHRFLD" ), 1 ) From GESECRAN
+      GOK = 0
+      Break
+  Else
+# 2018-05-15 DNE X3-78302 END
+
+    # Common field rate type
+    Local Char VALPAR(200)
+    Local Integer LTYPCURSHR
+    Call PARAML("", "TYPCURSHR", [L]VALPAR) From ADOVAL
+    [L]LTYPCURSHR = val(VALPAR)
+    Local Integer STA
+# 2018-06-29 DNE X3-71195
+#    Call CONVERT([L]LCURSHRFLD, [F:CPY]ACCCUR, [F:CPY]ACCCUR, [L]LTYPCURSHR, [F:FUP]DATREF, [F:FGP]FUPCRG([F:FUP]LEVFUP - 1), [F:FUP]FUPCRG, [L]STA) From TRTDEV
+    Call CONVERT( [L]LCURSHRFLD, [F:CPY]ACCCUR, [F:CPY]ACCCUR, [L]LTYPCURSHR, [F:FUP]DATREF,
+&                 [F:FGP]FUPCRG( min( [F:FUP]LEVFUP - 1, dim( [F:FGP]FUPCRG ) - 1 ) ),
+&                 [F:FUP]FUPCRG, [L]STA) From TRTDEV
+    If [L]STA <> 0 Then
+# 2018-05-15 DNE X3-78302 BEGIN
+#      Call ERREUR(mess(1017,196,1)) From GESECRAN
+      # 'Currency conversion problem'
+      Call ECR_TRACE( mess(1017,196,1), 1 ) From GESECRAN
+      GOK = 0
+      Break
+# 2018-05-15 DNE X3-78302 END
+    Endif
+# 2018-06-29 DNE X3-71195
+#    Call CONVERT([L]LCURSHRFLD, [F:DUD]CUR, [F:CPY]ACCCUR, [L]LTYPCURSHR, [F:FUP]DATREF, [F:FGP]FUPCRG([F:FUP]LEVFUP - 1), [F:FUP]FUPCRGCUR, [L]STA) From TRTDEV
+    Call CONVERT( [L]LCURSHRFLD, [F:DUD]CUR, [F:CPY]ACCCUR, [L]LTYPCURSHR, [F:FUP]DATREF,
+&                 [F:FGP]FUPCRG( min( [F:FUP]LEVFUP - 1, dim( [F:FGP]FUPCRG ) - 1 ) ),
+&                 [F:FUP]FUPCRGCUR, [L]STA) From TRTDEV
+    If [L]STA <> 0 Then
+#      Call ERREUR(mess(1017,196,1)) From GESECRAN
+      # 'Currency conversion problem'
+      Call ECR_TRACE( mess(1017,196,1), 1 ) From GESECRAN
+      GOK = 0
+      Break
+    Endif
+# 2018-05-15 DNE X3-78302 END
+    # US X3-2648 end
+
+     # create one record for each copy
+     For [L]NBRCOP=1 To [F:FGP]NBRCOP
+      [F:FUP]NBRCOP = [F:FGP]NBRCOP
+      [F:FUP]GRPCRI += num$([L]NBRCOP)+";"
+      [F:FUP]NUMCOP = [L]NBRCOP
+
+      GPOINT="FUPVAL" : Gosub ENTREE From EXEFNC
+
+      Write [F:FUP]
+      If fstat
+       GOK = 0
+       Call FSTA("FUP") From GLOCK
+       Break
+      Endif
+      NBWRITE+=1
+     Next
+
+     If GOK=0 : Break : Endif
+
+     If FUPCRM=2 and GMODU(13)=2 # create CRM tasks
+      [L]FULOBJ = mess(232,117,1)-[M:CFP0]QURNUM+chr$(13)
+      [L]FULOBJ += mess(233,117,1)+chr$(13)
+      For N=0 To NMOD-1
+       [L]FULOBJ += mess([L]FUPMOD2(N),2629,1)+chr$(13)
+      Next
+
+      [M:TK1]FULOBJ = [L]FULOBJ
+      If [TFP2]FUPMOD=1 or [TFP2]FUPMOD=2
+       # letter or email = task completed
+       [M:TK0]TSKDON = 2
+      Else
+       # Phone or fax = task to be performed
+       [M:TK0]TSKDON = 1
+      Endif
+     Endif
+# 2018-05-15 DNE X3-78302 BEGIN
+  Endif
+# 2018-05-15 DNE X3-78302
+Next # end of loop [LNKW]
+Return
+
+$FUP2
+# 64152 - check that the amount to be reminded on each reminder letter is strictly greater than zero
+# loop on each value of GRPCRI
+For [FUP]FUP6(2) Where NUMEDT=[M:CFP0]QURNUM
+ Raz T
+ Link [FUP2] With [DUD]DUD1=[FUP2]ACCNUM;[FUP2]DUDLIG As [LNK2]
+& Where [FUP2]NUMEDT=[M:CFP0]QURNUM and [FUP2]GRPCRI=[F:FUP]GRPCRI and find([FUP2]FUPMOD, [L]FUPMOD2(0..[L]NMOD-1))<>0
+ For [LNK2]
+  T += ([F:DUD]AMTLOC-[F:DUD]PAYLOC-[F:DUD]TMPLOC)*[F:DUD]SNS
+ Next
+ If T<=0
+  Delete [FUP2] Where NUMEDT=[M:CFP0]QURNUM and GRPCRI=[F:FUP]GRPCRI and find([FUP2]FUPMOD, [L]FUPMOD2(0..[L]NMOD-1))<>0
+ Endif
+Next
+Return
+
+$TASK
+# if no open item is selected, do not create CRM tasks
+If rowcount([LNKW])>0
+ Call CRM From TRTFUPCRM
+# 58689
+ NBTSK=NBTSK+1
+Endif
+Return
+
+#########################################################################################################
+
+# Print the report without running the campaign validation code
+$IMPRESSION
+Call EDITION([M:CFP0]QURNUM) From RPTFUP
+Return
+

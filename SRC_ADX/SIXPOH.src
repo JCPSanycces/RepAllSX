@@ -1,0 +1,1676 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+#########################################################################
+#  SIXPOH : Migration commandes d'achat intégrale --> X3                #
+# --------------------------------------------------------------------- #
+#                                                                       #
+# Gosub POH_VERIF                                                       #
+#   Vérifications avant traitement                                      #
+#                                                                       #
+# Gosub POH_REPRISE                                                     #
+#   Récupération des commandes d'achat                                  #
+#                                                                       #
+# func CALNBENR                                                         #
+#   Calcul le nombre d'enregistrements total et restant à traiter       #
+#   Appelé depuis le traitement SUBSIM avec la classe [M:SIM4] chargée  #
+#                                                                       #
+#########################################################################
+
+#----- Exécution manuelle de la migration -----#
+Global Integer X_NB, X_TIME
+Local  Integer WNBCDE
+#----- Variables utilisées pour la migration des acomptes 
+Local  Integer FLGERRACP
+#-----
+Gosub SI_CONTEXT From SIXFONCTION
+#-----
+If !clalev([F:SPX])  Local File =SI_DOSSIER+".SIPARX3"   [SPX] : Endif
+If !clalev([F:SPV])  Local File =SI_DOSSIER+".SIPARVAC"  [SPV] : Endif
+If !clalev([F:SVB])  Local File =SI_DOSSIER+".SIPARVACB" [SVB] : Endif
+Read [SPX] SPX0 First : If fstat  Raz [F:SPX] : Endif
+#-----
+Local File XIEPA [XEPA] Where TYPPIE="CF"
+&                             & FLGMAJ=""
+&                             & FLGREP<2
+&                             & DATPIE>=[F:SPX]STRPER
+WNBCDE=rowcount([XEPA])
+Close Local File [XEPA]
+#-----
+SI_SIMU=2 : # Simulation de la migration !
+#----- Ouverture de la trace et de la boîte de progression -----#
+Call OUVRE_TRACE("SIXPOH : Process translation file from INTEGRALE to X3") From LECFIC
+Call OUVRE_BOITE(SI_MES(97),WNBCDE) From GESECRAN
+#-----
+Call EXEC From SIXPOH 
+#----- Fermeture boîte de progression et lecture trace -----#
+Call FERME_BOITE From GESECRAN
+Call FERME_TRACE From LECFIC
+Call LEC_TRACE   From LECFIC
+#-----
+Kill X_NB, X_TIME
+End
+
+
+############################################################
+# Exécution des actions engendrée par l'import des données #
+############################################################
+$ACTION
+If GPOH_WERR  mkstat=1 : Return : Endif : # Si déjà une erreur, c'est fini !
+Case ACTION
+  When "IMP_DEBUT" : Gosub DEB_GENPOH
+  When "IMP_ZONE"  : Gosub MSK_ENTETE
+  When "IMP_TAB"   : Gosub MSK_DETAIL
+Endcase
+Return
+
+
+#########################################################################
+# Exécution de la migration des commandes d'achat appelé :              #
+#   - depuis la fonction de "Lancement migration Intégrale"             #
+#   - manuellement par exécution de ce traitement                       #
+#########################################################################
+Subprog EXEC
+#-----
+Local Char    WMSG(80)
+Local Integer WOK
+Local Integer WNBPOH, WNBERR
+#----- Migration des commandes d'achat -----#
+Call ECR_TRACE(string$(64,"-"),0)    From GESECRAN
+Call ECR_TIME("SIXPOH :"-SI_MES(97)) From DOSSUB
+Call ECR_TRACE(" ",0)                From GESECRAN
+#-----
+Onerrgo TRT_ERR
+#----- Vérifications avant traitement -----#
+Gosub POH_VERIF
+#-----
+If WOK  Gosub POH_REPRISE : Endif
+#-----
+If SI_SIMU=2
+  WMSG="**"-mess(25,133,1)-"**" : # ** Simulation **
+Else
+  WMSG=""
+Endif
+#-----
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TIME("SIXPOH :"-SI_MES(118)-num$(WNBPOH)+"/"+num$(WNBPOH+WNBERR)-WMSG) From DOSSUB
+Call ECR_TRACE(string$(64,"-"),0) From GESECRAN
+#-----
+Onerrgo
+End
+
+
+############################
+# Si une erreur se produit #
+############################
+$TRT_ERR
+Call ECR_TRACE(errp-"("-num$(errl)-") :"-errmes$(errn)-errm, 1) From GESECRAN
+Raz GOK, WOK
+Resume
+
+
+#############################################################
+#              Vérifications avant traitement               #
+# --------------------------------------------------------- #
+# Prérequis :                                               #
+#   - Affectation compteur commande ("POH")                 #
+#   - Fichier paramètre SIPARX3 [SPX]                       #
+#       Société par défaut [F:SPX]CPY                       #
+#       Site    par défaut [F:SPX]FCY                       #
+#       Devise  par défaut [F:SPX]CUR                       #
+#       Correspondance éléments fact  [F:SPX]PFINUM(0-7)    #
+#       Correspondance col.struct.tar.[F:SPX]DISCRGACH(0-3) #
+#   - Devise dossier par défaut GSYSCUR                     #
+#   - Structure tarif achat par défaut (code structure="")  #
+#       Remise 1 % (article)                                #
+#       Remise 2 % (fournisseur)                            #
+#       Majoration 1 % (article)                            #
+#       Majoration 2 % (fournisseur)                        #
+#   - Motifs tarif                                          #
+#       1 = Saisie manuelle                                 #
+#       2 = Remise fournisseur                              #
+#       3 = Tarif article                                   #
+#       4 = Tarif famille article                           #
+#       5 = Tarif sous-famille article                      #
+#   - Vérification cohérence code activité ANA              #
+#############################################################
+$POH_VERIF
+#-----
+Local Integer WERR, WI, WCOL
+WOK=1
+Raz GMESSAGE
+#----- Vérification compteur commande classique d'achat -----#
+If !clalev([F:TCA])   Local File =SI_DOSSIER+".TABCOUAFF"  [TCA]  : Endif
+Read [TCA] TCA0=6
+If fstat  Raz [F:TCA] : Endif
+If [F:TCA]CODNUM(2)=""
+  WERR=1  : Gosub POH_VERIF_ERR : Return
+Endif
+#----- Vérification société, site et devise issus du paramétrage -----#
+If !clalev([F:CPY])   Local File =SI_DOSSIER+".COMPANY"   [CPY]  : Endif
+If !clalev([F:FCY])   Local File =SI_DOSSIER+".FACILITY"  [FCY]  : Endif
+If !clalev([F:TCU])   Local File =SI_DOSSIER+".TABCUR"    [TCU]  : Endif
+#-----
+If [F:SPX]CPY=""
+  WERR=2  : Gosub POH_VERIF_ERR : Return
+Endif
+Look [CPY] CPY0=[F:SPX]CPY
+If fstat
+  WERR=2  : Gosub POH_VERIF_ERR : Return
+Endif
+#-----
+If [F:SPX]FCY=""
+  WERR=3  : Gosub POH_VERIF_ERR : Return
+Endif
+Read [FCY] FCY0=[F:SPX]FCY
+If fstat
+  WERR=3  : Gosub POH_VERIF_ERR : Return
+Elsif [F:FCY]PURFLG<>2
+  WERR=4  : Gosub POH_VERIF_ERR : Return
+Endif
+#-----
+If [F:SPX]CUR=""
+  WERR=5  : Gosub POH_VERIF_ERR : Return
+Endif
+Look [TCU] TCU0=[F:SPX]CUR
+If fstat
+  WERR=5  : Gosub POH_VERIF_ERR : Return
+Endif
+#----- Vérification devise dossier -----#
+If dim(GSYSCUR)<1 | GSYSCUR=""
+  WERR=6  : Gosub POH_VERIF_ERR : Return
+Endif
+#----- Vérification correspondance éléments de facturation -----#
+If !clalev([F:PFI])   Local File =SI_DOSSIER+".PFOOTINV"   [PFI]  : Endif
+For WI=1 To 8
+  WMSG=SI_MES(97+WI)-num$([F:SPX]PFINUM(WI-1))
+  Case WI
+    When 1,2,3,4,7,8 : #----- Frais en montant -----#
+      If [F:SPX]PFINUM(WI-1)<>0
+        Filter [PFI] Where ENAFLG=2 & AMTCOD=2 & INCDCR=1 & DACLIN=1
+        Look [PFI] PFI0=[F:SPX]PFINUM(WI-1)
+        Filter [PFI]
+        If fstat  WERR=7 : Gosub POH_VERIF_ERR : Break : Endif
+      Endif
+    When 5           : #----- Remise en montant -----#
+      If [F:SPX]PFINUM(WI-1)<>0
+        Filter [PFI] Where ENAFLG=2 & AMTCOD=2 & INCDCR=2 & DACLIN=1
+        Look [PFI] PFI0=[F:SPX]PFINUM(WI-1)
+        Filter [PFI]
+        If fstat  WERR=7 : Gosub POH_VERIF_ERR : Break : Endif
+      Endif
+    When 6           : #----- Escompte en pourcentage -----#
+      If [F:SPX]PFINUM(WI-1)=0
+        WERR=8 : Gosub POH_VERIF_ERR : Break
+      Else
+        Filter [PFI] Where ENAFLG=2 & AMTCOD=1 & INCDCR=2 & DACORD=2
+        Look [PFI] PFI0=[F:SPX]PFINUM(WI-1)
+        Filter [PFI]
+        If fstat  WERR=7 : Gosub POH_VERIF_ERR : Break : Endif
+      Endif
+  Endcase
+Next WI
+If !WOK  Return : Endif
+#----- Vérification structure tarif (code tarif = "") -----#
+If !clalev([F:PRS])   Local File =SI_DOSSIER+".PRICSTRUCT" [PRS]  : Endif
+Read [PRS] PRS0=2;""
+If fstat
+  WERR=9 : Gosub POH_VERIF_ERR : Return
+Endif
+#----- Vérification correspondance colonnes structure tarif achat -----#
+For WI=0 To 3
+  WCOL=[F:SPX]DISCRGACH(WI)
+  If WCOL<0 | WCOL>dim([F:PRS]INCDCR)
+    WERR=12 : Gosub POH_VERIF_ERR : Break
+  Endif
+  If WCOL<>0
+    If !find([F:PRS]VALTYP(WCOL-1),2,3) | [F:PRS]CLCRUL(WCOL-1)<>1 | [F:PRS]NPRNOTFLG(WCOL-1)<>2
+      WERR=12 : Gosub POH_VERIF_ERR : Break
+    Endif
+    Case WI+1
+      When 1,2 : If [F:PRS]INCDCR(WCOL-1)<>2  WERR=12 : Gosub POH_VERIF_ERR : Break : Endif
+      When 3,4 : If [F:PRS]INCDCR(WCOL-1)<>1  WERR=12 : Gosub POH_VERIF_ERR : Break : Endif
+    Endcase
+  Endif
+Next WI
+If !WOK  Return : Endif
+#----- Vérification motifs tarifs fournisseurs -----#
+If !clalev([F:PPR])   Local File =SI_DOSSIER+".PPREASON"   [PPR]  : Endif
+For WI=1 To 5
+  Read [PPR] PPR0=WI
+  If fstat
+    WMSG="("+num$(WI)+"="+SI_MES(80+WI)+")"
+    WERR=10 : Gosub POH_VERIF_ERR
+  Endif
+Next WI
+If !WOK  Return : Endif
+#----- Vérification cohérence nbre d'axes définis dans "Intégrale" et code activité ANA -----#
+Call VARGLOBANA(WMSG,WERR) From SIXGAS
+If WERR
+  WERR=11 : Gosub POH_VERIF_ERR
+Endif
+If !WOK  Return : Endif
+#-----
+Return
+
+
+#---------------------------------------#
+# Erreurs détectées par la vérification #
+#---------------------------------------#
+$POH_VERIF_ERR
+Case WERR
+  When  1 : GMESSAGE=mess(3,535,1)+","-mess(12,114,1)   : # Commande standard, Compteur inexistant
+  When  2 : GMESSAGE='"'+[F:SPX]CPY+'"'-mess(16,104,1)  : # "xxx" Société inexistante
+  When  3 : GMESSAGE='"'+[F:SPX]FCY+'"'-mess(15,104,1)  : # "xxx" Site inexistant
+  When  4 : GMESSAGE='"'+[F:SPX]FCY+'"'-mess(145,194,1) : # "xxx" Le site n'est pas un site d'achat
+  When  5 : GMESSAGE='"'+[F:SPX]CUR+'"'-mess(151,105,1) : # "xxx" Devise inexistante
+  When  6 : GMESSAGE="GSYSCUR"-mess(12,116,1)           : # GSYSCUR Devise inexistante
+  When  7 : GMESSAGE=WMSG-":"-SI_MES(107)               : # xxxxxxxxxx 99 : Elément de facturation non conforme
+  When  8 : GMESSAGE=SI_MES(103)-":"-SI_MES(110)        : # Escompte : Correspondance non renseignée
+  When  9 : GMESSAGE=SI_MES(79)                         : # Structure tarifs fournisseurs inexistante ou erronée
+  When 10 : GMESSAGE=SI_MES(80)-WMSG                    : # Motif tarif inexistant
+  When 11 : GMESSAGE=WMSG                               : # Erreur dimensionnement code activité ANA
+  When 12 : GMESSAGE=SI_MES(208)                        : # Correspondance structure tarifs achats erronée
+Endcase
+Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+WOK=0
+Return
+
+
+#########################################################################
+#                     Reprise des commandes d'achat                     #
+# --------------------------------------------------------------------- #
+# WTRA : Indicateur trace détaillée                                     #
+#         1 = Trace normale                                             #
+#         2 = Trace détaillée (+ Warning et no des pièces traitées)     #
+#         3 = Super détaillée (+ détail des actions pour mise au point) #
+#         4 = Hyper détaillée (+ détail des champs pour mise au point)  #
+#########################################################################
+$POH_REPRISE
+Raz WERR, WNBPOH, WNBERR
+#----- Variables locales -----#
+Local  Integer  SAV_GIMPORT   : SAV_GIMPORT=GIMPORT
+Local  Integer  SAV_NBLIG
+Local  Integer  WTRA          : WTRA=2 : # Trace (2=Détaillée, 3=Super détaillée, 4=Hyper détaillée)
+Local  Integer  OK            : OK=1
+Local  Integer  I
+Local  Char     WTRT(GLONADC) : WTRT="SIXPOH"
+Local  Char     ACTION(30)
+Local  Char     WPGM(GLONADC)
+Local  Char     WMSG2(40)
+Local  Char     WMESSAGE(100)
+Local  Char     WPAYS(GLONCRY)
+Local  Integer  WNUMORD
+Local  Char     WLETRLQ(1)
+Local  Char     ABREV(5)
+#-----
+Global Integer  GPOH_WTRA     : GPOH_WTRA=WTRA
+Global Integer  GPOH_WERR     : GPOH_WERR=WERR
+#----- Variables globales utilisées pour la migration des acomptes -----#
+Global Integer  GNBEAA
+Global Char     GMODRGL(3)      (30)
+Global Decimal  GMNTECH         (30)
+Global Date     GDATECH         (30)
+Global Char     GCODTVA(GLONVAT)(30)
+#----- Ouverture masques écrans si nécessaire -----#
+If !clalev([M:POH0])  Local Mask =SI_DOSSIER+".POH0"       [POH0] : Endif
+If !clalev([M:POH1])  Local Mask =SI_DOSSIER+".POH1"       [POH1] : Endif
+If !clalev([M:POH2])  Local Mask =SI_DOSSIER+".POH2"       [POH2] : Endif
+If !clalev([M:POH3])  Local Mask =SI_DOSSIER+".POH3"       [POH3] : Endif
+If !clalev([M:AD61])  Local Mask =SI_DOSSIER+".ADRBPR"     [AD61] : Endif
+If !clalev([M:AD62])  Local Mask =SI_DOSSIER+".ADRBPR"     [AD62] : Endif
+If !clalev([M:PCEV])  Local Mask =SI_DOSSIER+".PCEE"       [PCEV] : Endif
+If !clalev([M:ACL])   Local Mask =SI_DOSSIER+".ACLOB"      [ACL]  : Endif
+#-----
+Global Char     GPOH_CODEXO(GLONVAT)
+Global Char     GPOH_CODPAY(3)         : # Code pays (fournisseur ou ligne adresse)
+Global Integer  GPOH_ESCOMPTE          : # Code élément escompte en montant
+Global Libelle  GPOH_ESC_CREFLG        : # Indicateur escompte en montant à créer
+#----- Codes taxes X3 issus ligne article, l'indice est le code TVA intégrale -----#
+Global Char     GPOH_VAT1(GLONVAT)(10)
+#-----
+Raz [M:POH0], [M:POH1], [M:POH2], [M:POH3], [M:AD61], [M:AD62], [M:PCEV]
+#----- Définition des variables de l'objet -----#
+Raz GPTRNUM, GCLE
+GIMPORT=1
+ABREV ="POH"
+GABREV="POH"
+ACTION="DEFVAR" : WPGM="GOBJET"  : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub DEFVAR  From GOBJET
+WINPROG="WGOPOH"
+# sr 02.12 Demande 80297
+# Issue 81372 - 2012-05-04 by SR
+Call ISWINDOWOK (nomap,"OPOH") From INTRUTILB
+#----- Ouverture des tables de l'objet POH et appel des actions OUVRE -----#
+ACTION="OUVRE"  : WPGM="SIXPOH"  : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub OUVRE
+#-----
+OK=1
+ACTION="OUVRE"  : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB
+If !OK  WERR=1 : Goto FINPOH_REPRISE : Endif
+#----- Ouverture des tables "Intégrale" -----#
+If !clalev([F:XEPA])  Local File =SI_DOSSIER+".XIEPA"      [XEPA] : Endif
+If !clalev([F:XLPA])  Local File =SI_DOSSIER+".XILPA"      [XLPA] : Endif
+If !clalev([F:XLAD])  Local File =SI_DOSSIER+".XILPAADR"   [XLAD] : Endif
+If !clalev([F:XLAN])  Local File =SI_DOSSIER+".XILPAANA"   [XLAN] : Endif
+If !clalev([F:XLTX])  Local File =SI_DOSSIER+".XILPATXT"   [XLTX] : Endif
+If !clalev([F:XLEM])  Local File =SI_DOSSIER+".XILPAEMB"   [XLEM] : Endif
+If !clalev([F:XLPO])  Local File =SI_DOSSIER+".XILPAPOR"   [XLPO] : Endif
+If !clalev([F:XLFD])  Local File =SI_DOSSIER+".XILPAFADIV" [XLFD] : Endif
+If !clalev([F:XLFF])  Local File =SI_DOSSIER+".XILPAFAFIX" [XLFF] : Endif
+If !clalev([F:XLRE])  Local File =SI_DOSSIER+".XILPAREM"   [XLRE] : Endif
+If !clalev([F:XLF1])  Local File =SI_DOSSIER+".XILPAFSPF1" [XLF1] : Endif
+If !clalev([F:XLF2])  Local File =SI_DOSSIER+".XILPAFSPF2" [XLF2] : Endif
+If !clalev([F:XFOU])  Local File =SI_DOSSIER+".XIFOU"      [XFOU] : Endif
+If !clalev([F:XETV])  Local File =SI_DOSSIER+".XIEPATVA"   [XETV] : Endif
+If !clalev([F:XART])  Local File =SI_DOSSIER+".XIART"      [XART] : Endif
+If !clalev([F:XACT])  Local File =SI_DOSSIER+".XIARTCDT"   [XACT] : Endif
+#-----
+SI_SUBPRG="SIXPOH"
+SI_TABLE="XIEPA"
+Gosub SI_CRITSUP From SIXFONCTION
+#----- Boucle de création des commandes d'achat X3 -----#
+For [XEPA] IND0 Where TYPPIE="CF"
+&                   & FLGMAJ=""
+&                   & FLGREP<2
+&                   & DATPIE>=[F:SPX]STRPER
+&                   & evalue(SI_CRITERE)
+  Gosub GENPOH
+  GIMPORT=0
+  Call AFFBOITE(WMSG2) From SUBSIM
+  GIMPORT=1
+  If WERR
+    WNBERR+=1 : # Compteurs des commandes non reprises
+  Else
+    WNBPOH+=1 : # Compteur des commandes créées
+  Endif
+  If WTRA>1
+    WMSG2="**********"-WMSG2-":"-mess(98,197,1)
+    If WERR         : #----- *** CF 99 999999 : Commande non générée !
+      Call ECR_TRACE(WMSG2-mess(202,197,1),0) From GESECRAN
+    Elsif SI_SIMU=2 : #----- *** CF 99 999999 : Commande xxxxxxxxxxxxxxx créée ! ** Simulation **
+      Call ECR_TRACE(WMSG2-[F:POH]POHNUM-mess(224,197,1)-"**"-mess(25,133,1)-"**",0) From GESECRAN
+    Else            : #----- *** CF 99 999999 : Commande xxxxxxxxxxxxxxx créée !
+      Call ECR_TRACE(WMSG2-[F:POH]POHNUM-mess(224,197,1),0) From GESECRAN
+    Endif
+  Elsif WERR        : #----- *** CF 99 999999 : Commande non générée !
+    WMSG2="**********"-WMSG2-":"-mess(98,197,1)
+    Call ECR_TRACE(WMSG2-mess(202,197,1),0) From GESECRAN
+  Endif
+Next
+Kill GNBEAA, GMODRGL, GMNTECH, GDATECH, GCODTVA
+#-----
+$FINPOH_REPRISE
+ACTION="FERME"  : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB
+Kill GPOH_WTRA, GPOH_WERR, GPOH_CODEXO
+Kill GPOH_CODPAY, GPOH_ESCOMPTE, GPOH_ESC_CREFLG, GPOH_VAT1
+GIMPORT=SAV_GIMPORT
+Return
+
+
+########################################
+# Génération d'une commande d'achat X3 #
+########################################
+$GENPOH
+OK=1
+Raz WERR, GPOH_WERR
+#WMSG2=num$([F:XEPA]NUMORD)-[F:XEPA]LETRLQNUMORD                        : # C'est la vrai clé
+WMSG2=[F:XEPA]TYPPIE+[F:XEPA]NUMSER+[F:XEPA]NUMPIE+[F:XEPA]LETRLQNUMPIE : # C'est le numéro de pièce
+WNUMORD=[F:XEPA]NUMORD
+WLETRLQ=[F:XEPA]LETRLQNUMORD
+#-----
+Raz [M:POH0], [M:POH1], [M:POH2], [M:POH3], [M:AD61], [M:AD62], [M:PCEV]
+Raz GPOH_ESCOMPTE, GPOH_ESC_CREFLG, GPOH_VAT1
+GREP="C"
+ACTION="RAZCRE" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB : If !OK  WERR=1 : Return : Endif
+#-----
+OK=1
+ACTION="IMP_DEBUT" : WPGM=WTRT   : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From =WTRT   : If !OK  WERR=1 : Return : Endif
+SAV_NBLIG=[M:POH2]NBLIG
+[M:POH2]NBLIG=0
+#----- Chargement masques écrans -----#
+ACTION="IMP_ZONE(SAIMSK)" : WPGM="W0POH0" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Default Mask [POH0] : Call SAIMSK("POH","IMP_ZONE",WTRT) From W0POH0
+If mkstat | GPOH_WERR  WERR=1 : Return : Endif
+ACTION="IMP_ZONE(SAIMSK)" : WPGM="W0POH1" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Default Mask [POH1] : Call SAIMSK("POH","IMP_ZONE",WTRT) From W0POH1
+If mkstat | GPOH_WERR  WERR=1 : Return : Endif
+#----- Avertissement : L'article n'est pas référencé chez le fournisseurs -----#
+If GITMBPS=2  & WTRA<3
+  GITMBPS=3 : # Pour ne pas imprimer le message d'information dans la trace !
+Endif
+#----- Ne pas arrondir le prix unitaire net -----#
+GPURRND=1
+#-----
+[M:POH2]NBLIG=SAV_NBLIG
+ACTION="IMP_TAB(SAIMSK)"  : WPGM="W0POH2" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Default Mask [POH2] : Call SAIMSK("POH","IMP_TAB" ,WTRT) From W0POH2
+If mkstat | GPOH_WERR  WERR=1 : Return : Endif
+ACTION="IMP_ZONE(SAIMSK)" : WPGM="W0POH3" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Default Mask [POH3] : Call SAIMSK("POH","IMP_ZONE",WTRT) From W0POH3
+If mkstat | GPOH_WERR  WERR=1 : Return : Endif
+#----- Point d'entrée pour gestion champs ou écrans supplémentaires spécifiques -----#
+GPOINT="ALIMSKPOH" : Gosub ENTREE From EXEFNC
+If mkstat | GPOH_WERR  WERR=1 : Return : Endif
+#----- Contrôle du total HT, taxes et TTC de la commande -----#
+If [F:XEPA]MNTTOTHT<>[M:POH3]TOTORD
+  GPOH_WERR=6 : Gosub POH_REPRISE_WARNING
+Endif
+If [F:XEPA]MNTTOTTVA<>[M:POH3]TOTTAXAMT
+  GPOH_WERR=7 : Gosub POH_REPRISE_WARNING
+Endif
+If [F:XEPA]MNTTOTTTC<>[M:POH3]TTVORD
+  GPOH_WERR=8 : Gosub POH_REPRISE_WARNING
+Endif
+#----- Récupération des champs adresse si nécessaire -----#
+If WTRA>2
+  ACTION="RECUP_ADRESSE"  : WPGM="SIXPOH" : Gosub TRACE_DETAILLEE
+Endif
+Gosub RECUP_ADRESSE
+If mkstat | GPOH_WERR  WERR=1 : Return : Endif
+#----- Récupération des textes entête et lignes -----#
+If WTRA>2
+  ACTION="RECUP_TEXTE"    : WPGM="SIXPOH" : Gosub TRACE_DETAILLEE
+Endif
+Gosub RECUP_TEXTE
+If mkstat | GPOH_WERR  WERR=1 : Return : Endif
+#----- Génération de la commande X3 proprement dite -----#
+GAPPPOH=1 : # Pas de gestion de signatures !
+OK=1
+ACTION="VERIF_CRE" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB : If !OK  WERR=1 : Return : Endif
+Call DEBTRANS From GLOCK
+#-----
+$TR_GENPOH
+GOK=1
+If WTRA>2
+  ACTION="Trbegin [POH], [POQ], [POP]" : WPGM="" : Gosub TRACE_DETAILLEE
+Endif
+Trbegin [POH], [POQ], [POP]
+  Raz [F:POH], [F:POQ], [F:POP]
+  [F:POH]=[M:POH0]
+  [F:POH]=[M:POH1]
+  [F:POH]=[M:POH2]
+  [F:POH]=[M:POH3]
+  If dim([F:POH]CREDAT)>0  [F:POH]CREDAT=date$     : Endif
+  If dim([F:POH]CRETIM)>0  [F:POH]CRETIM=time      : Endif
+  If dim([F:POH]CREUSR)>0  [F:POH]CREUSR=GUSER     : Endif
+  If dim([F:POH]EXPNUM)>0  [F:POH]EXPNUM=[C]EXPORT : Endif
+  Default File [POH]
+  ACTION="INICRE"   : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+  Gosub ACTION From GOBJSUB
+  If GOK<0  Goto ROLL_GENPOH  Elsif !GOK  Goto AB_GENPOH : Endif
+  #----- Chargement numéro correspondant à la commande "Intégrale" -----#
+  If dim([F:POH]SINUM)>0  [F:POH]SINUM=WMSG2 : Endif
+  #----- Si indicateur "Supprimé" positionner les lignes et l'entête comme "Soldé" -----#
+  If [F:XEPA]FLGMAJ="S"
+    For I=0 To [M:POH2]NBLIG-1
+      [M:POH2]LINCLEFLG(I)=2
+    Next I
+    [M:POH1]CLEFLG=2
+  Endif
+  #-----
+  [F:POH]APPFLG=5                               : # Indicateur signature à "Automatique"
+  If [F:XEPA]FLGEDI="E" [F:POH]PRNFLG=2 : Endif : # Indicateur d'impression à "Oui"
+  #-----
+  If WTRA>2
+    ACTION="Write [POH]" : WPGM="" : Gosub TRACE_DETAILLEE
+  Endif
+  SI_TABLE="PORDER" : Gosub SI_BEFWRI From SIXFONCTION
+  Write [POH]
+  If fstat  GOK=0 : Call FSTA("POH")  From GLOCK : Goto AB_GENPOH : Endif
+  ACTION="CREATION" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+  Gosub ACTION From GOBJSUB
+  If GOK<0  Goto ROLL_GENPOH  Elsif !GOK  Goto AB_GENPOH : Endif
+  #----- 
+  Gosub CREATION_ACOMPTES
+  If GOK<0  Goto ROLL_GENPOH  Elsif !GOK  Goto AB_GENPOH : Endif
+  If FLGERRACP=1
+    Call ECR_TRACE(SI_MES(254),0) From GESECRAN
+  Endif
+  #----- Mise à jour indicateur "traité" sur entête commande "Intégrale" -----#
+  If WTRA>2
+    ACTION="Update [XEPA]" : WPGM="" : Gosub TRACE_DETAILLEE
+  Endif
+  Update [XEPA] Where NUMORD=WNUMORD & LETRLQNUMORD=WLETRLQ With FLGREP=2
+  If fstat  GOK=0 : Call FSTA("XEPA") From GLOCK : Goto AB_GENPOH : Endif
+  #----- Création élément escompte en montant si nécessaire -----#
+  If GPOH_ESC_CREFLG
+    Read [PFI2] PFI0=[F:SPX]PFINUM(5)
+    If !fstat
+      [F:PFI]=[F:PFI2]
+      Call GET_ATEXTRA("PFOOTINV","DESAXX","",GBIDC3) From TRTX3TEX
+      Call GET_ATEXTRA("PFOOTINV","SHOAXX","",GBIDC2) From TRTX3TEX
+      Raz [F:PFI]EXPNUM, [F:PFI]UPDUSR, [F:PFI]UPDDAT
+      [F:PFI]PFINUM   =GPOH_ESCOMPTE
+      [F:PFI]PFINUMCAR=num$(GPOH_ESCOMPTE)
+      [F:PFI]AMTCOD   =2
+      [F:PFI]CREUSR   =GUSER
+      [F:PFI]CREDAT   =date$
+      If WTRA>2
+        ACTION="Write [PFI]"-[F:PFI]PFINUMCAR-GBIDC3-mess(50,104,1) : WPGM="" : Gosub TRACE_DETAILLEE
+      Endif
+      Write [PFI]
+      If fstat  GOK=0 : Call FSTA("PFI")  From GLOCK : Goto AB_GENPOH : Endif
+      Call MAJTEXTRA (GBIDC3,"PFOOTINV","DESAXX",[F:PFI]PFINUMCAR,"") From ATEXTRA
+      Call MAJTEXTRA (GBIDC2,"PFOOTINV","SHOAXX",[F:PFI]PFINUMCAR,"") From ATEXTRA
+      Endif
+  Endif
+  #-----
+  If WTRA>2
+    ACTION="Commit" : WPGM="" : Gosub TRACE_DETAILLEE
+  Endif
+  #-----
+  If SI_SIMU=2
+    Rollback
+  Else
+    Commit
+  Endif
+#-----
+ACTION="APRES_CRE" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB
+Return
+#-----
+$ROLL_GENPOH
+If WTRA>2
+  ACTION="Rollback" : WPGM="" : Gosub TRACE_DETAILLEE
+Endif
+Rollback
+Call ROLL From GLOCK
+If GROLL
+  ACTION="AB_CREATION" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+  Gosub ACTION From GOBJSUB : WERR=1 : Return
+Else
+  Goto TR_GENPOH
+Endif
+#-----
+$AB_GENPOH
+If WTRA>2
+  ACTION="Rollback" : WPGM="" : Gosub TRACE_DETAILLEE
+Endif
+Rollback
+ACTION="AB_CREATION" : WPGM="GOBJSUB" : If WTRA>2  Gosub TRACE_DETAILLEE : Endif
+Gosub ACTION From GOBJSUB : WERR=1 : Return
+#-----
+
+
+################################################################
+# Traitement à effectuer avant le chargement des champs écrans #
+# ------------------------------------------------------------ #
+# - Boucle sur les lignes de la commande "Intégrale"           #
+#     [M:POH2]OCNLIN   (indice) = numéro d'ordre  "Intégrale"  #
+#     [M:POH2]LINOCNNUM(indice) = lettre reliquat "Intégrale"  #
+#     [M:POH2]POHLIN   (indice) = numéro de ligne "Intégrale"  #
+################################################################
+DEB_GENPOH
+#----- Boucle sur les lignes de la commande "Intégrale" -----#
+For [XLPA] IND0 Where NUMORD=[F:XEPA]NUMORD & LETRLQ=[F:XEPA]LETRLQNUMORD & TYPLIG="L"
+  [M:POH2]OCNLIN   ([M:POH2]NBLIG)=[F:XLPA]NUMORD
+  [M:POH2]LINOCNNUM([M:POH2]NBLIG)=[F:XLPA]LETRLQ
+  [M:POH2]POHLIN   ([M:POH2]NBLIG)=[F:XLPA]NUMLIG
+  [M:POH2]NBLIG+=1
+Next
+#----- Vérif nbre de ligne uniquement si trace détaillée -----#
+If GPOH_WTRA>1
+  #----- Comptage des textes de la commande "Intégrale" -----#
+  Raz WI
+  For [XLTX] IND0 Where NUMORD=[F:XEPA]NUMORD
+&                     & LETRLQ=[F:XEPA]LETRLQNUMORD
+&                     & TYPLIG="T"
+    WI+=1
+  Next
+  #----- Contrôle nombre de lignes -----#
+  If [M:POH2]NBLIG<>[F:XEPA]NBRLIG-WI
+    GPOH_WERR=1 : Gosub POH_REPRISE_WARNING
+  Endif
+Endif
+Return
+
+
+#################################################
+# Récupération des champs adresse si nécessaire #
+#################################################
+$RECUP_ADRESSE
+If [F:XLAD]TYPLIG="A"
+  #----- Lecture du business partner si nécessaire -----#
+  If [F:BPR]BPRNUM<>[M:POH0]BPSNUM 
+    Read [BPR] BPR0=[M:POH0]BPSNUM
+    If fstat  Raz [F:BPR] : Endif
+  Endif
+  #----- Lecture du fournisseur si nécessaire -----#
+  If [F:BPS]BPSNUM<>[M:POH0]BPSNUM 
+    Read [BPS] BPS0=[M:POH0]BPSNUM
+    If fstat  Raz [F:BPS] : Endif
+  Endif
+  #-----
+  [M:AD61]ADBBPR      =[M:POH0]BPSNUM
+  [M:AD61]BPAADD      =[F:BPS]BPAADD
+  #----- Lecture de l'adresse du business partner si nécessaire -----#
+  If [F:BPA]BPATYP<>1 | [F:BPA]BPANUM<>[M:POH0]BPSNUM | [F:BPA]BPAADD<>[F:BPS]BPAADD
+    Read [BPA] BPA0=1;[M:POH0]BPSNUM;[F:BPS]BPAADD
+    If fstat  Raz [F:BPA] : Endif
+  Endif
+  #----- Chargement des champs adresse avec les valeurs par défaut -----#
+  [M:AD61]BPRNAM(0)   =[F:BPR]BPRNAM(0)
+  [M:AD61]BPRNAM(1)   =[F:BPR]BPRNAM(1)
+  [M:AD61]BPAADDLIG(0)=[F:BPA]BPAADDLIG(0)
+  [M:AD61]BPAADDLIG(1)=[F:BPA]BPAADDLIG(1)
+  [M:AD61]BPAADDLIG(2)=[F:BPA]BPAADDLIG(2)
+  [M:AD61]CRY         =[F:BPA]CRY
+  [M:AD61]CRYNAM      =[F:BPA]CRYNAM
+  [M:AD61]SAT         =[F:BPA]SAT
+  [M:AD61]POSCOD      =[F:BPA]POSCOD
+  [M:AD61]CTY         =[F:BPA]CTY
+  #----- Chargement des champs adresse avec les valeurs trouvées dans "Intégrale" -----#
+  [M:AD61]BPRNAM(0)   =[F:XLAD]NOMFOU
+  [M:AD61]BPAADDLIG(0)=[F:XLAD]ADRFOU1
+  [M:AD61]BPAADDLIG(1)=[F:XLAD]ADRFOU2
+  [M:AD61]BPAADDLIG(2)=[F:XLAD]ADRFOU3
+  [M:AD61]POSCOD      =[F:XLAD]CODPST
+  [M:AD61]CTY         =[F:XLAD]VIL
+  [M:AD61]ADBFLG      =2  
+  #----- Récupération du code pays X3 et de son libellé traduisible -----#
+  WPAYS=func SIXFONCTION.SI_COR("XIPAY",[F:XLAD]CODPAY,"TABCOUNTRY","")
+  If WPAYS<>""
+    If [M:AD61]CRY<>WPAYS
+      If [F:TCY]CRY<>WPAYS
+        Read [TCY] TCY0=WPAYS : If fstat  Raz [F:TCY] : Endif
+      Endif
+      [M:AD61]CRY=WPAYS
+      Call GET_ATEXTRA("TABCOUNTRY","CRYDES",[F:BPR]LAN,[M:AD61]CRYNAM) From TRTX3TEX
+      If [M:AD61]CRYNAM=""  [M:AD61]CRYNAM=[F:BPA]CRYNAM : Endif
+    Endif
+  Endif
+  #----- Adresse fournisseur expéditeur = adresse fournisseur commande -----#
+  [M:AD62]=[M:AD61]
+Endif
+Return
+
+
+###############################################################
+#          Récupération des textes entête et lignes           #
+# ----------------------------------------------------------- #
+# Les textes entêtes sont :                                   #
+#   - le commentaire d'entête de la commande "Intégrale"      #
+#   - les lignes de texte placées avant le 1ère ligne article #
+# Les textes lignes article sont :                            #
+#   - les lignes de texte placées après la ligne article      #
+#           mais avant la ligne article suivante              #
+# ----------------------------------------------------------- #
+# [M:POH2]POHLIN(indice) contient le numéro ligne "Intégrale" #
+###############################################################
+$RECUP_TEXTE
+[M:POH2]POHLIN([M:POH2]NBLIG)=9999
+#----- Textes entête -----#
+Raz SI_CLOB, I
+If [F:XEPA]CMT<>""
+  SI_CLOB(I)=[F:XEPA]CMT : I+=1
+Endif
+For [XLTX] IND0 Where NUMORD=[F:XEPA]NUMORD
+&                   & LETRLQ=[F:XEPA]LETRLQNUMORD
+&                   & NUMLIG<[M:POH2]POHLIN(0)
+&                   & TYPLIG="T"
+  SI_CLOB(I)=[F:XLTX]TXT : I+=1
+  If I>=dim(SI_CLOB)  Break : Endif
+Next
+If I>0
+  Trbegin [TXC]
+  [M:POH1]TEX1=func SIXFONCTION.SI_CLOB("POH")
+  If SI_SIMU=2  Rollback  Else  Commit : Endif
+Endif
+#---- Textes lignes -----#
+For WI=0 To [M:POH2]NBLIG-1
+  Raz SI_CLOB, I
+  For [XLTX] IND0 Where NUMORD=[F:XEPA]NUMORD
+&                     & LETRLQ=[F:XEPA]LETRLQNUMORD
+&                     & NUMLIG>[M:POH2]POHLIN(WI)
+&                     & NUMLIG<[M:POH2]POHLIN(WI+1)
+&                     & TYPLIG="T"
+& 
+    SI_CLOB(I)=[F:XLTX]TXT : I+=1
+    If I>=dim(SI_CLOB)  Break : Endif
+  Next
+  If I>0
+    Trbegin [TXC]
+    [M:POH2]LINTEX(WI)=func SIXFONCTION.SI_CLOB("POQ")
+    If SI_SIMU=2  Rollback  Else  Commit : Endif
+  Endif
+Next WI
+#----- Nettoyage des champs utilisés pour la lecture ligne "Intégrale" et texte -----#
+For WI=0 To [M:POH2]NBLIG-1
+  Raz [M:POH2]OCNLIN(WI), [M:POH2]LINOCNNUM(WI), [M:POH2]POHLIN(WI)
+  #----- Exceptionnellement ne pas récupérer les textes achats de l'article -----#
+  If find(left$([M:POH2]LINTEX(WI),3),"ITM","ITP")
+    Raz [M:POH2]LINTEX(WI)
+  Endif
+  #-----
+Next WI
+Raz [M:POH2]POHLIN([M:POH2]NBLIG)
+Return
+
+
+###############################################################################
+#                         TRAITEMENT des erreurs                              #
+# --------------------------------------------------------------------------- #
+#  1 = 999999 X 9999 L Ligne commande introuvable                             #
+#  2 = CODFOU : xxxxxxxxxxxxx sans correspondance dans X3 !                   #
+#  3 = MODRGL1 : xxx sans correspondance dans X3 !                            #
+#  4 = CODDVS : xx sans correspondance dans X3 !                              #
+#  5 = CODART : xxxxxxxxxxxxxxxx sans correspondance dans X3 !                #
+#  6 = CODDPO : xx sans correspondance dans X3 !                              #
+#  7 = UNIVEN : xxx sans correspondance dans X3 !                             #
+#  8 = xxx Unité non présente dans article ou article-fournisseur xxxx - xxxx #
+###############################################################################
+$POH_REPRISE_ERR
+Case GPOH_WERR
+  When  1 : GMESSAGE ="[XLPA]"-num$([M:POH2]OCNLIN(NOL))-[M:POH2]LINOCNNUM(NOL)
+            GMESSAGE-=num$([M:POH2]POHLIN(NOL))-"L"-mess(360,197,1)
+  When  2 : GMESSAGE ="CODFOU :"-[F:XEPA]CODFOU-SI_MES(112)
+  When  3 : GMESSAGE ="MODRGL1 :"-[F:XEPA]MODRGL1-SI_MES(112)
+  When  4 : GMESSAGE ="CODDVS :"-[F:XEPA]CODDVS-SI_MES(112)
+  When  5 : GMESSAGE ="CODART :"-[F:XLPA]CODART-SI_MES(112)
+  When  6 : GMESSAGE ="CODDPO :"-[F:XLPA]CODDPO-SI_MES(112)
+  When  7 : GMESSAGE ="UNIVEN :"-[F:XLPA]UNIVEN-SI_MES(112)
+  When  8 : GMESSAGE =[M:POH2]UOM(NOL)-SI_MES(252)-[M:POH2]ITMREF(NOL)-"-"-[M:POH0]BPSNUM
+Endcase
+If GPOH_WTRA>2 | GPOH_WERR=1 | GPOH_WERR=8
+  Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+Endif
+Raz GMESSAGE
+mkstat=1
+Return
+
+
+#######################################################################
+#                     Traitement des "warning"                        #
+# ------------------------------------------------------------------- #
+#  1 = Nombre de lignes différent (999<>999)                          #
+#  2 = MODEXD : xx sans correspondance dans X3 !                      #
+#  3 = xxxxxx Transporteur non repris car inexistant !                #
+#  4 = xxx Cette unité a été remplacée par l'unité d'achat xxx        #
+#  5 = 99 Elément à ajouter au fournisseur xxxxxxxxxxxxx              #
+#  6 = Totaux HT différents entre "Intégrale" et X3 !                 #
+#  7 = Taxes différentes entre "Intégrale" et X3 !                    #
+#  8 = Totaux TTC différents entre "Intégrale" et X3 !                #
+#######################################################################
+$POH_REPRISE_WARNING
+Case GPOH_WERR
+  When  1 : GMESSAGE =SI_MES(111)-"("+num$([F:XEPA]NBRLIG)+"<>"+num$([M:POH2]NBLIG)+")"
+  When  2 : GMESSAGE ="MODEXD :"-[F:XEPA]MODEXD-SI_MES(112)
+  When  3 : GMESSAGE =[F:XEPA]TYPPIE+[F:XEPA]NUMSER+[F:XEPA]NUMPIE+[F:XEPA]LETRLQNUMPIE-":"
+            GMESSAGE =[F:XEPA]TSP-SI_MES(255)
+  When  4 : GMESSAGE =[F:XEPA]TYPPIE+[F:XEPA]NUMSER+[F:XEPA]NUMPIE+[F:XEPA]LETRLQNUMPIE-":"
+            GMESSAGE-=[M:POH2]UOM(NOL)-SI_MES(253)-[M:POH2]PUU(NOL)
+  When  5 : GMESSAGE =num$([M:POH3]INVDTA(nolign-1))-SI_MES(260)-[M:POH0]BPSNUM
+  When  6 : GMESSAGE=SI_MES(288)-"("+num$([F:XEPA]MNTTOTHT)+"<>"+num$([M:POH3]TOTORD)+")"
+  When  7 : GMESSAGE=SI_MES(285)-"("+num$([F:XEPA]MNTTOTTVA)+"<>"+num$([M:POH3]TOTTAXAMT)+")"
+  When  8 : GMESSAGE=SI_MES(129)-"("+num$([F:XEPA]MNTTOTTTC)+"<>"+num$([M:POH3]TTVORD)+")"
+Endcase
+If GPOH_WTRA>2 | find(GPOH_WERR,3,4,5,6,7,8)
+  If find(GPOH_WERR,1,2,4,5)
+    Call ECR_TRACE(GMESSAGE,0)  From GESECRAN
+  Else
+    Call ECR_TRACE(GMESSAGE,-1) From GESECRAN
+  Endif
+Endif
+Raz GMESSAGE, GPOH_WERR
+Return
+
+
+###################################################################
+# Chargement des champs écran POH0, POH1, POH3 entête commande X3 #
+###################################################################
+$MSK_ENTETE
+If GPOH_WTRA>3
+  If IMPZON="CCE" | IMPZON="INVDTAAMT"
+    Call ECR_TRACE("     ."-mess(36,124,1)-IMPZON+"("+num$(nolign-1)+")",0) From GESECRAN
+  Else
+    Call ECR_TRACE("     ."-mess(36,124,1)-IMPZON,0) From GESECRAN
+  Endif
+Endif
+Case IMPZON
+  When "POHFCY"    : #----- Ecran POH0 -----#
+    [M:POH0]POHFCY=[F:SPX]FCY
+    IMPMOD=1
+  When "POHNUM"
+  When "ORDDAT"
+    [M:POH0]ORDDAT=[F:XEPA]DATPIE
+    IMPMOD=1
+  When "BPSNUM"
+    [M:POH0]BPSNUM=func SIXFONCTION.SI_COR("XIFOU",[F:XEPA]CODFOU,"BPSUPPLIER","")
+    If [M:POH0]BPSNUM=""
+      GPOH_WERR=2 : Gosub POH_REPRISE_ERR : Return
+    Endif
+    IMPMOD=1
+  When "ORDREF"    : #----- Ecran POH1 -----#
+    If [F:XEPA]REFCMD<>""
+      [M:POH1]ORDREF=[F:XEPA]REFCMD
+    Else
+      [M:POH1]ORDREF=[F:XEPA]TYPPIE-[F:XEPA]NUMSER-[F:XEPA]NUMPIE-[F:XEPA]LETRLQNUMPIE
+    Endif
+    IMPMOD=1
+  When "PTE"
+    If [F:XEPA]MODRGL1<>""
+      [M:POH1]PTE=func SIXFONCTION.SI_COR2("XIMODRGL",
+&                 left$([F:XEPA]MODRGL1,2),right$([F:XEPA]MODRGL1,3),"TABPAYTERM","")
+      If [M:POH1]PTE=""
+        GPOH_WERR=3 : Gosub POH_REPRISE_ERR : Return
+      Endif
+      IMPMOD=1
+    Endif
+  When "BUY"
+  When "CUR"
+    If [F:XEPA]CODDVS<>""
+      [M:POH1]CUR=func SIXFONCTION.SI_COR("XIDVS",[F:XEPA]CODDVS,"TABCUR","")
+      If [M:POH1]CUR=""
+        GPOH_WERR=4 : Gosub POH_REPRISE_ERR : Return
+      Endif
+      IMPMOD=1
+    Else
+      [M:POH1]CUR=[F:SPX]CUR : IMPMOD=1
+    Endif
+  When "CHGTYP"
+    If [M:POH1]CHGTYP=0  [M:POH1]CHGTYP=1 : IMPMOD=1 : Endif
+  When "MDL"
+    If [F:XEPA]MODEXD<>""
+      [M:POH1]MDL=func SIXFONCTION.SI_COR("XIMODEXD",[F:XEPA]MODEXD,"TABMODELIV","")
+      If [M:POH1]MDL=""
+        GPOH_WERR=2 : Gosub POH_REPRISE_WARNING : Return
+      Endif
+      IMPMOD=1
+    Endif
+  When "BPTNUM"
+    If [F:XEPA]TSP<>""
+      [M:POH1]BPTNUM=func SIXFONCTION.SI_COR("XIFOU",[F:XEPA]TSP,"#BPCARRIER","")
+      If [M:POH1]BPTNUM=""
+        GPOH_WERR=3 : Gosub POH_REPRISE_WARNING : Return
+      Endif
+      IMPMOD=1
+    Endif
+  When "VACBPR"
+    #----- Chargement de la globale code pays -----#
+    If [F:XFOU]CODFOU<>[F:XEPA]CODFOU
+      Read [XFOU] IND0=[F:XEPA]CODFOU : If fstat  Raz [F:XFOU] : Endif
+    Endif
+    Read [XLAD] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"A"
+    If fstat  Raz [F:XLAD] : Endif
+    If [F:XLAD]CODPAY<>""
+      GPOH_CODPAY=[F:XLAD]CODPAY
+    Else
+      GPOH_CODPAY=[F:XFOU]CODPAY
+    Endif
+    #-----
+    If find([F:XEPA]ASJTVA,"O","N","C","I")
+      [M:POH1]VACBPR=func SIXFONCTION.SI_VACBPR("S",[F:XEPA]ASJTVA,"","",GPOH_CODPAY)
+      IMPMOD=1
+    Endif
+    #----- Récupération du code TVA exo présent sur l'élément écart -----#
+    Read [PFI] PFI0=[F:SPX]PFINUM1 : If fstat  Raz [F:PFI] : Endif
+    Call RECHVATFOOT(2,[M:POH0]BPSNUM,[F:PFI]PFINUM,"POH3",GPOH_CODEXO) From TRTX3
+    #-----
+  When "INVFCY"
+  When "NBAXE"
+  When "CCE"
+  When "NBFAC"     : #----- Ecran POH3 -----#
+    If [F:XEPA]TAUEPT=0 & [F:XEPA]MNTEPT<>0
+      #----- Présence d'un escompte en montant -----#
+      If dim(WPFINUM)<1  Local Shortint WPFINUM : Endif
+      WPFINUM=mod([F:SPX]PFINUM(5),10)
+      While WPFINUM<100
+        WPFINUM+=10
+        Read [PFI2] PFI0=WPFINUM
+        If !fstat & [F:PFI2]AMTCOD=2 & [F:PFI2]INCDCR=2 & [F:PFI2]DACORD=2
+          GPOH_ESCOMPTE=WPFINUM
+          GPOH_ESC_CREFLG=0
+          WPFINUM=100
+        Elsif fstat
+          GPOH_ESCOMPTE=WPFINUM
+          GPOH_ESC_CREFLG=1
+          WPFINUM=100
+        Endif
+      Wend
+      #----- Ajout de l'escompte en montant dans les éléments de la commande -----#
+      If !find(GPOH_ESCOMPTE,[M:POH3]INVDTA(0..[M:POH3]NBFAC-1))
+        If dim(WSHO)<1  Local Char WSHO(GLONAX1) : Endif
+        nolign=[M:POH3]NBFAC+1
+        [M:POH3]INVDTA(nolign-1)=GPOH_ESCOMPTE
+        If GPOH_ESC_CREFLG
+          Call LECTEXTRA(WSHO,"PFOOTINV","SHOAXX",num$([F:SPX]PFINUM(5)),"") From ATEXTRA
+        Else
+          Call LECTEXTRA(WSHO,"PFOOTINV","SHOAXX",num$(GPOH_ESCOMPTE),"") From ATEXTRA
+        Endif
+        [M:POH3]INVDTALIB(nolign-1)=WSHO
+        [M:POH3]AMTCODLIB(nolign-1)=GCUR
+        [M:POH3]INVDTAFLG(nolign-1)=2
+        [M:POH3]INVLINFLG(nolign-1)=3
+        [M:POH3]INVORDFLG(nolign-1)=2
+        If dim([M:POH3]DISVATFLG)>0  [M:POH3]DISVATFLG(nolign-1)=1 : Endif
+        [M:POH3]DEBCDT   (nolign-1)=2
+        [M:POH3]INVDTAVAT(nolign-1)=""
+        [M:POH3]CLCORD   (nolign-1)=0
+        [M:POH3]CLCBAS   (nolign-1)=1
+        [M:POH3]AMTCOD   (nolign-1)=2
+        [M:POH3]FORMAT   (nolign-1)="NZ:"+GDEVFMT1(max(find(GCUR,GDEVISE(1..GNBDEV)),1))+"[ ]"
+        [M:POH3]NBFAC+=1
+      Endif
+    Endif
+  When "INVDTAAMT"
+    If dim(WI)<1  Local Integer WI : Endif
+    WI=find([M:POH3]INVDTA(nolign-1),[F:SPX]PFINUM,GPOH_ESCOMPTE)
+    Case WI
+      When 1 : #----- Emballage
+        Read [XLEM] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLEM]CODTVAFRAEMB<>0
+            If GPOH_VAT1([F:XLEM]CODTVAFRAEMB)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLEM]CODTVAFRAEMB),GPOH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPOH_VAT1([F:XLEM]CODTVAFRAEMB)
+            Endif
+            If GBIDC3<>""  [M:POH3]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:POH3]INVDTAVAT(nolign-1)=GPOH_CODEXO
+          Endif
+          [M:POH3]INVDTAAMT(nolign-1)=[F:XLEM]MNTFRAEMB  : IMPMOD=1
+        Endif
+      When 2 : #----- Port
+        Read [XLPO] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLPO]CODTVAFRAPOR<>0
+            If GPOH_VAT1([F:XLPO]CODTVAFRAPOR)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLPO]CODTVAFRAPOR),GPOH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPOH_VAT1([F:XLPO]CODTVAFRAPOR)
+            Endif
+            If GBIDC3<>""  [M:POH3]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:POH3]INVDTAVAT(nolign-1)=GPOH_CODEXO
+          Endif
+          [M:POH3]INVDTAAMT(nolign-1)=[F:XLPO]MNTFRAPOR  : IMPMOD=1
+        Endif
+      When 3 : #----- Frais divers
+        Read [XLFD] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLFD]CODTVAFRADIV<>0
+            If GPOH_VAT1([F:XLFD]CODTVAFRADIV)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLFD]CODTVAFRADIV),GPOH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPOH_VAT1([F:XLFD]CODTVAFRADIV)
+            Endif
+            If GBIDC3<>""  [M:POH3]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:POH3]INVDTAVAT(nolign-1)=GPOH_CODEXO
+          Endif
+          [M:POH3]INVDTAAMT(nolign-1)=[F:XLFD]MNTFRADIV  : IMPMOD=1 : 
+        Endif
+      When 4 : #----- Frais fixe
+        Read [XLFF] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLFF]CODTVAFRAFIX<>0
+            If GPOH_VAT1([F:XLFF]CODTVAFRAFIX)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLFF]CODTVAFRAFIX),GPOH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPOH_VAT1([F:XLFF]CODTVAFRAFIX)
+            Endif
+            If GBIDC3<>""  [M:POH3]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:POH3]INVDTAVAT(nolign-1)=GPOH_CODEXO
+          Endif
+          [M:POH3]INVDTAAMT(nolign-1)=[F:XLFF]MNTFRAFIX  : IMPMOD=1
+        Endif
+      When 5 : #----- Remise
+        Read [XLRE] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat  [M:POH3]INVDTAAMT(nolign-1)=[F:XLRE]MNTFRAREM  : IMPMOD=1 : Endif
+      When 6 : #----- Escompte en %
+        If [F:XEPA]TAUEPT<>0
+          [M:POH3]INVDTAAMT(nolign-1)=[F:XEPA]TAUEPT : IMPMOD=1
+        Endif
+      When 7 : #----- Frais spécifique 1
+        Read [XLF1] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLF1]CODTVAFRA1<>0
+            If GPOH_VAT1([F:XLF1]CODTVAFRA1)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLF1]CODTVAFRA1),GPOH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPOH_VAT1([F:XLF1]CODTVAFRA1)
+            Endif
+            If GBIDC3<>""  [M:POH3]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:POH3]INVDTAVAT(nolign-1)=GPOH_CODEXO
+          Endif
+          [M:POH3]INVDTAAMT(nolign-1)=[F:XLF1]MNTFRASPF1 : IMPMOD=1
+        Endif
+      When 8 : #----- frais spécifique 2
+        Read [XLF2] IND0=[F:XEPA]NUMORD;[F:XEPA]LETRLQNUMORD;0;"F";1
+        If !fstat
+          If [F:XLF2]CODTVAFRA2<>0
+            If GPOH_VAT1([F:XLF2]CODTVAFRA2)=""
+              GBIDC3=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XLF2]CODTVAFRA2),GPOH_CODPAY,"TABVAT","")
+            Else
+              GBIDC3=GPOH_VAT1([F:XLF2]CODTVAFRA2)
+            Endif
+            If GBIDC3<>""  [M:POH3]INVDTAVAT(nolign-1)=GBIDC3 : Endif
+          Else
+            [M:POH3]INVDTAVAT(nolign-1)=GPOH_CODEXO
+          Endif
+          [M:POH3]INVDTAAMT(nolign-1)=[F:XLF2]MNTFRASPF2 : IMPMOD=1
+        Endif
+      When 9 : #----- Escompte en montant
+        If [F:XEPA]MNTEPT<>0
+          [M:POH3]INVDTAAMT(nolign-1)=[F:XEPA]MNTEPT : IMPMOD=1
+        Endif
+    Endcase
+  When "INVDTAVAT"
+    If [M:POH3]INVDTAVAT(nolign-1)=""
+      Read [PFI] PFI0=[M:POH3]INVDTA(nolign-1) : If fstat  Raz [F:PFI] : Endif
+      If [F:PFI]VATRUL=2
+        Call RECHVATFOOT(2,[M:POH0]BPSNUM,[F:PFI]PFINUM,"POH3",GBIDC3) From TRTX3
+        [M:POH3]INVDTAVAT(nolign-1)=GBIDC3
+      Endif
+      If [M:POH3]INVDTAVAT(nolign-1)<>""
+        IMPMOD=1
+      Else
+        Call ECR_TRACE(mess(306,199,1)-":"-[M:POH1]VACBPR-"-"-[F:PFI]VACITM,1) From GESECRAN
+        GCLE=num$([M:POH3]INVDTA(nolign-1))-[M:POH3]INVDTALIB(nolign-1)
+      Endif
+    Endif
+  When "ACC1"
+    Raz GCLE
+  When "ACC2"
+  When "ACC3"
+  When "ACC4"
+  When "ACC5"
+  When "ACC6"
+  When "ACC7"
+  When "ACC8"
+  When "ACC9"
+  When "ACC10"
+  When "DSP"
+  When "PFICCE1"
+    Case find([M:POH3]INVDTA(nolign-1),[F:SPX]PFINUM)
+      When 1 : Call SI_INICCE("XILPAEMB"  ,0,"",0,"[M:POH3]PFICCE",nolign-1) From SIXFONCTION
+      When 2 : Call SI_INICCE("XILPAPOR"  ,0,"",0,"[M:POH3]PFICCE",nolign-1) From SIXFONCTION
+      When 3 : Call SI_INICCE("XILPAFADIV",0,"",0,"[M:POH3]PFICCE",nolign-1) From SIXFONCTION
+      When 4 : Call SI_INICCE("XILPAFAFIX",0,"",0,"[M:POH3]PFICCE",nolign-1) From SIXFONCTION
+      When 5 : Call SI_INICCE("XILPAREM"  ,0,"",0,"[M:POH3]PFICCE",nolign-1) From SIXFONCTION
+      When 7 : Call SI_INICCE("XILPAFSPF1",0,"",0,"[M:POH3]PFICCE",nolign-1) From SIXFONCTION
+      When 8 : Call SI_INICCE("XILPAFSPF2",0,"",0,"[M:POH3]PFICCE",nolign-1) From SIXFONCTION
+    Endcase
+  When "PFICCE2"
+  When "PFICCE3"
+  When "PFICCE4"
+  When "PFICCE5"
+  When "PFICCE6"
+  When "PFICCE7"
+  When "PFICCE8"
+  When "PFICCE9"
+  When "PFICCE10"
+  When "PFICCE11"
+  When "PFICCE12"
+  When "PFICCE13"
+  When "PFICCE14"
+  When "PFICCE15"
+  When "PFICCE16"
+  When "PFICCE17"
+  When "PFICCE18"
+  When "PFICCE19"
+  When "PFICCE20"
+  When "OCNDAT"
+  When "OCNNUM"
+  When "OCNREM"
+Endcase
+Return
+
+
+#######################################################
+# Chargement des champs écran POH2 lignes commande X3 #
+#######################################################
+$MSK_DETAIL
+NOL=nolign-1 : # La variable NOL est définie par W0POH2
+If GPOH_WTRA>3
+  If IMPZON="NBLIG"
+    Call ECR_TRACE("     ."-mess(36,124,1)-IMPZON,0) From GESECRAN
+  Else
+    Call ECR_TRACE("     ."-mess(36,124,1)-IMPZON+"("+num$(NOL)+")",0) From GESECRAN
+  Endif
+Endif
+Case IMPZON
+  When "NBLIG"
+  When "ITMREF"
+    Read [XLPA] IND0=[M:POH2]OCNLIN(NOL);[M:POH2]LINOCNNUM(NOL);[M:POH2]POHLIN(NOL);"L"
+    If fstat
+      Raz [F:XLPA] : GPOH_WERR=1 : Gosub POH_REPRISE_ERR : Return
+    Endif
+    [M:POH2]ITMREF(NOL)=func SIXFONCTION.SI_COR("XIART",[F:XLPA]CODART,"ITMMASTER","")
+    If [M:POH2]ITMREF(NOL)=""
+      GPOH_WERR=5 : Gosub POH_REPRISE_ERR : Return
+    Endif
+    IMPMOD=1
+  When "ITMDES"
+    If [F:XLPA]NOMART<>""  [M:POH2]ITMDES(NOL)=[F:XLPA]NOMART : IMPMOD=1 : Endif
+  When "ITMDES1"
+  When "PRHFCY"
+    If [F:XLPA]CODDPO<>""
+      [M:POH2]PRHFCY(NOL)=func SIXFONCTION.SI_COR("XIDPO",[F:XLPA]CODDPO,"FACILITY","")
+      If [M:POH2]PRHFCY(NOL)=""
+        GPOH_WERR=6 : Gosub POH_REPRISE_ERR : Return
+      Endif
+      IMPMOD=1
+    Endif
+  When "FCYADD"
+  When "USEPLC"
+  When "LINSTOFCY"
+  When "SCOADD"
+  When "UOM"
+    If [F:XLPA]UNIVEN<>""
+      [M:POH2]UOM(NOL)=func SIXFONCTION.SI_COR("XIUNIFAC",[F:XLPA]UNIVEN,"TABUNIT","")
+      If [M:POH2]UOM(NOL)=""
+        GPOH_WERR=7 : Gosub POH_REPRISE_ERR : Return
+      Endif
+      IMPMOD=1
+    Endif
+    #----- Lecture de l'article et article-fournisseur si nécessaire -----#
+    If [F:ITM]ITMREF<>[M:POH2]ITMREF(NOL)
+      Read [ITM] ITM0=[M:POH2]ITMREF(NOL)
+      If fstat Raz [F:ITM] : Endif
+    Endif
+    If [F:ITP]ITMREF<>[M:POH2]ITMREF(NOL) | [F:ITP]BPSNUM<>[M:POH0]BPSNUM
+      Read [ITP] ITP0=[M:POH2]ITMREF(NOL);[M:POH0]BPSNUM
+      If fstat Raz [F:ITP] : Endif
+    Endif
+    #----- Contrôle que l'unité est présente dans l'article ou article-fournisseur -----#
+    If !find([M:POH2]UOM(NOL),[F:ITM]PUU,[F:ITM]PCU,[F:ITM]STU,[F:ITP]PUU,[F:ITP]PCU)
+     #GPOH_WERR=8 : Gosub POH_REPRISE_ERR : Return
+      #----- Si ce n'est pas le cas, on remplace par l'unité d'achat -----#
+      GPOH_WERR=4 : Gosub POH_REPRISE_WARNING
+      [M:POH2]UOM(NOL)=[M:POH2]PUU(NOL)
+    Endif
+    #-----
+  When "QTYUOM"
+    If [F:XLPA]QTELIV<>0
+      [M:POH2]QTYUOM(NOL)=[F:XLPA]QTELIV
+    Else
+      [M:POH2]QTYUOM(NOL)=1 : [M:POH2]LINOCNFLG(NOL)=9
+    Endif
+    IMPMOD=1
+  When "UOMPUUCOE"
+  When "QTYSTU"
+  When "PJT"
+  When "EXTRCPDAT"
+    If [F:XLPA]DATLIV<>[0/0/0]
+      [M:POH2]EXTRCPDAT(NOL)=[F:XLPA]DATLIV : IMPMOD=1
+    Endif
+  When "GROPRI"
+    [M:POH2]GROPRI(NOL)   =[F:XLPA]PRXUNI : IMPMOD=1
+  When "DISCRGVAL1", "DISCRGVAL2", "DISCRGVAL3", "DISCRGVAL4", "DISCRGVAL5",
+&      "DISCRGVAL6", "DISCRGVAL7", "DISCRGVAL8", "DISCRGVAL9"
+    Case find(val(right$(IMPZON,10)),[F:SPX]DISCRGACH)
+      When 1
+        If [F:XLPA]TAUREM1>=0
+          Assign "[M:POH2]"+IMPZON+"(NOL)" With [F:XLPA]TAUREM1      : IMPMOD=1
+        Endif
+      When 2
+        If [F:XLPA]TAUREM2>=0
+          Assign "[M:POH2]"+IMPZON+"(NOL)" With [F:XLPA]TAUREM2      : IMPMOD=1
+        Endif
+      When 3
+        If [F:XLPA]TAUREM1<0
+          Assign "[M:POH2]"+IMPZON+"(NOL)" With abs([F:XLPA]TAUREM1) : IMPMOD=1
+        Endif
+      When 4
+        If [F:XLPA]TAUREM2<0
+          Assign "[M:POH2]"+IMPZON+"(NOL)" With abs([F:XLPA]TAUREM2) : IMPMOD=1
+        Endif
+    Endcase
+  When "LINACC1"
+  When "LINACC2"
+  When "LINACC3"
+  When "LINACC4"
+  When "LINACC5"
+  When "LINACC6"
+  When "LINACC7"
+  When "LINACC8"
+  When "LINACC9"
+  When "LINACC10"
+  When "LINPURTYP"
+  When "CCE1"
+    Call SI_INICCE("XILPAANA",[F:XLPA]NUMORD,[F:XLPA]LETRLQ,[F:XLPA]NUMLIG,
+&                  "[M:POH2]CCE",NOL)  From SIXFONCTION
+  When "CCE2"
+  When "CCE3"
+  When "CCE4"
+  When "CCE5"
+  When "CCE6"
+  When "CCE7"
+  When "CCE8"
+  When "CCE9"
+  When "CCE10"
+  When "CCE11"
+  When "CCE12"
+  When "CCE13"
+  When "CCE14"
+  When "CCE15"
+  When "CCE16"
+  When "CCE17"
+  When "CCE18"
+  When "CCE19"
+  When "CCE20"
+  When "QUAFLG"
+  When "EECINCRAT"
+  When "ORICRY"
+  When "VAT1"
+    If [F:XLPA]CODTVA<>0
+      If GPOH_CODPAY<>""
+        GBIDC3=func SIXFONCTION.SI_VAT1([F:XEPA]TVADBTENC,[F:XLPA]TVADBTENC,GPOH_CODPAY,
+&                                       [F:XLPA]CODTVA,[M:POH1]VACBPR,[F:XLPA]CODART)
+        If GBIDC3<>""
+          GPOH_VAT1([F:XLPA]CODTVA)=GBIDC3 : # Correspondance codes TVA Intégrale et X3
+          [M:POH2]VAT1(NOL)=GBIDC3 : IMPMOD=1
+        Else
+          mkstat=1 : GPOH_WERR=99 : Return
+        Endif
+      Endif
+    Endif
+  When "VAT2"
+    If [F:XLPA]CODTPF<>0 & [F:XEPA]ASJTPF="O"
+      If GPOH_CODPAY<>""
+        GBIDC3=func SIXFONCTION.SI_COR2("XITAXPFC",num$([F:XLPA]CODTPF),GPOH_CODPAY,"TABVAT","")
+        If GBIDC3<>""
+          [M:POH2]VAT2(NOL)=GBIDC3 : IMPMOD=1
+        Else
+          mkstat=1 : GPOH_WERR=99 : Return
+        Endif
+      Endif
+    Else
+      [M:POH2]VAT2(NOL)=""
+    Endif
+  When "VAT3"
+    [M:POH2]VAT3(NOL)="" : # Pas de taxe additionnelle sur les commandes fournisseurs !
+    #----- Dernier champ saisissable, traitement qté à zéro -----#
+    If [M:POH2]LINOCNFLG(NOL)=9
+      Raz [M:POH2]QTYUOM(NOL), [M:POH2]QTYPUU(NOL), [M:POH2]QTYSTU(NOL), [M:POH2]LINOCNFLG(NOL)
+      [M:POH2]LINCLEFLG(NOL)=2
+    Endif
+    #-----
+Endcase
+Return
+
+
+###################
+# Trace détaillée #
+###################
+$TRACE_DETAILLEE
+If WPGM=""
+  If ACTION="Write [POH]" | ACTION="Update [XEPA]"| left$(ACTION,11)="Write [PFI]"
+    WMESSAGE=ACTION
+  Else
+    WMESSAGE="---"-mess(5,126,1)-ACTION
+  Endif
+Else
+  WMESSAGE=mess(27,115,1)-ACTION+space$(20-len(ACTION))+"From "-WPGM
+Endif
+Call ECR_TRACE(WMESSAGE,0) From GESECRAN
+Return
+
+
+##################################################################################
+# Ouverture des tables X3 (celles de l'objet POH + celles du traitement SUBPOHA) #
+##################################################################################
+$OUVRE
+If !clalev([F:POH])  Local File =SI_DOSSIER+".PORDER"     [POH] : Endif
+If !clalev([F:PTR])  Local File =SI_DOSSIER+".PURTRS"     [PTR] : Endif
+#-------------------------------------------------------#
+# Ouvertures normalement effectuées par $OUVRE de WOPOH #
+#-------------------------------------------------------#
+If !clalev([F:POP])  Local File =SI_DOSSIER+".PORDERP"    [POP] : Endif
+If !clalev([F:POQ])  Local File =SI_DOSSIER+".PORDERQ"    [POQ] : Endif
+If !clalev([F:POC])  Local File =SI_DOSSIER+".PORDERC"    [POC] : Endif
+If !clalev([F:PVF])  Local File =SI_DOSSIER+".PVCRFOOT"   [PVF] : Endif
+If !clalev([F:PVV])  Local File =SI_DOSSIER+".PVCRVAT"    [PVV] : Endif
+If !clalev([F:CAL])  Local File =SI_DOSSIER+".CPTANALIN"  [CAL] : Endif
+If !clalev([F:PSH])  Local File =SI_DOSSIER+".PREQUIS"    [PSH] : Endif
+If !clalev([F:PSD])  Local File =SI_DOSSIER+".PREQUISD"   [PSD] : Endif
+If !clalev([F:PQD])  Local File =SI_DOSSIER+".PQUOTATD"   [PQD] : Endif
+If !clalev([F:PPH])  Local File =SI_DOSSIER+".PRESP"      [PPH] : Endif
+If !clalev([F:PPD])  Local File =SI_DOSSIER+".PRESPD"     [PPD] : Endif
+If !clalev([F:PWO])  Local File =SI_DOSSIER+".PWRKORDERS" [PWO] : Endif
+If !clalev([F:PPK])  Local File =SI_DOSSIER+".PPRICLINK"  [PPK] : Endif
+If !clalev([F:PFI])  Local File =SI_DOSSIER+".PFOOTINV"   [PFI] : Endif
+If !clalev([F:BPR])  Local File =SI_DOSSIER+".BPARTNER"   [BPR] : Endif
+If !clalev([F:BPS])  Local File =SI_DOSSIER+".BPSUPPLIER" [BPS] : Endif
+If !clalev([F:BPA])  Local File =SI_DOSSIER+".BPADDRESS"  [BPA] : Endif
+If !clalev([F:MVS])  Local File =SI_DOSSIER+".BPSUPPMVT"  [MVS] : Endif
+If !clalev([F:ITM])  Local File =SI_DOSSIER+".ITMMASTER"  [ITM] : Endif
+If !clalev([F:ITP])  Local File =SI_DOSSIER+".ITMBPS"     [ITP] : Endif
+If !clalev([F:ITS])  Local File =SI_DOSSIER+".ITMSALES"   [ITS] : Endif
+If !clalev([F:ITF])  Local File =SI_DOSSIER+".ITMFACILIT" [ITF] : Endif
+If !clalev([F:ORD])  Local File =SI_DOSSIER+".ORDERS"     [ORD] : Endif
+If !clalev([F:FCY])  Local File =SI_DOSSIER+".FACILITY"   [FCY] : Endif
+If !clalev([F:TCU])  Local File =SI_DOSSIER+".TABCUR"     [TCU] : Endif
+If !clalev([F:TCY])  Local File =SI_DOSSIER+".TABCOUNTRY" [TCY] : Endif
+If !clalev([F:TUN])  Local File =SI_DOSSIER+".TABUNIT"    [TUN] : Endif
+If !clalev([F:TCO])  Local File =SI_DOSSIER+".TABCOEFF"   [TCO] : Endif
+If !clalev([F:GAC])  Local File =SI_DOSSIER+".GACCOUNT"   [GAC] : Endif
+If !clalev([F:GAG])  Local File =SI_DOSSIER+".GAUTACEF"   [GAG] : Endif
+If !clalev([F:GAD])  Local File =SI_DOSSIER+".GAUTACED"   [GAD] : Endif
+If !clalev([F:PER])  Local File =SI_DOSSIER+".PERIOD"     [PER] : Endif
+If !clalev([F:ADI])  Local File =SI_DOSSIER+".ATABDIV"    [ADI] : Endif
+If !clalev([F:TVT])  Local File =SI_DOSSIER+".TABVAT"     [TVT] : Endif
+If !clalev([F:AFF])  Local File =SI_DOSSIER+".AFCTFCY"    [AFF] : Endif
+#---------------------------------------------------------#
+# Ouvertures normalement effectuées par $OUVRE de SUBPOHA #
+#---------------------------------------------------------#
+If !clalev([F:GCM])  Local File =SI_DOSSIER+".GACM"       [GCM] : Endif
+If !clalev([F:PSO])  Local File =SI_DOSSIER+".PREQUISO"   [PSO] : Endif
+If !clalev([F:BPR2]) Local File =SI_DOSSIER+".BPARTNER"  [BPR2] : Endif
+If !clalev([F:BPS2]) Local File =SI_DOSSIER+".BPSUPPLIER"[BPS2] : Endif
+If !clalev([F:BPC])  Local File =SI_DOSSIER+".BPCUSTOMER" [BPC] : Endif
+If !clalev([F:BPD])  Local File =SI_DOSSIER+".BPDLVCUST"  [BPD] : Endif
+If !clalev([F:TCY])  Local File =SI_DOSSIER+".TABCOUNTRY" [TCY] : Endif
+If !clalev([F:POS])  Local File =SI_DOSSIER+".POSCOD"     [POS] : Endif
+If !clalev([F:TCA])  Local File =SI_DOSSIER+".TABCOUAFF"  [TCA] : Endif
+If !clalev([F:BPC])  Local File =SI_DOSSIER+".BPCUSTOMER" [BPC] : Endif
+If !clalev([F:BPD])  Local File =SI_DOSSIER+".BPDLVCUST"  [BPD] : Endif
+If !clalev([F:POS])  Local File =SI_DOSSIER+".POSCOD"     [POS] : Endif
+If !clalev([F:PSA])  Local File =SI_DOSSIER+".PREQUISA"   [PSA] : Endif
+#----- Test présence avant ouverture car normalement conditionné par GMODU(x) -----#
+If filinfo(filpath("FIL","BUDPAR",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:BUP]) Local File =SI_DOSSIER+".BUDPAR"     [BUP] : Endif
+Endif
+If filinfo(filpath("FIL","BPCUSTMVT", "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MVC]) Local File =SI_DOSSIER+".BPCUSTMVT"  [MVC] : Endif
+Endif
+If filinfo(filpath("FIL","SORDER",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SOH]) Local File =SI_DOSSIER+".SORDER"     [SOH] : Endif
+Endif
+If filinfo(filpath("FIL","SORDERP",   "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SOP]) Local File =SI_DOSSIER+".SORDERP"    [SOP] : Endif
+Endif
+If filinfo(filpath("FIL","SORDERQ",   "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SOQ]) Local File =SI_DOSSIER+".SORDERQ"    [SOQ] : Endif
+Endif
+If filinfo(filpath("FIL","SVCRFOOT",  "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SVF]) Local File =SI_DOSSIER+".SVCRFOOT"   [SVF] : Endif
+Endif
+If filinfo(filpath("FIL","SVCRVAT",   "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SVV]) Local File =SI_DOSSIER+".SVCRVAT"    [SVV] : Endif
+Endif
+If filinfo(filpath("FIL","MFGOPE",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MFO]) Local File =SI_DOSSIER+".MFGOPE"     [MFO] : Endif   
+Endif
+If filinfo(filpath("FIL","MFGHEAD",   "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MFG]) Local File =SI_DOSSIER+".MFGHEAD"    [MFG] : Endif
+Endif
+If filinfo(filpath("FIL","MFGITM",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MFI]) Local File =SI_DOSSIER+".MFGITM"     [MFI] : Endif
+Endif
+If filinfo(filpath("FIL","MFGMAT",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MFM]) Local File =SI_DOSSIER+".MFGMAT"     [MFM] : Endif    
+Endif
+If filinfo(filpath("FIL","MFGPRN",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MFP]) Local File =SI_DOSSIER+".MFGPRN"     [MFP] : Endif
+Endif
+If filinfo(filpath("FIL","MFGHEADTRK","fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MTK]) Local File =SI_DOSSIER+".MFGHEADTRK" [MTK] : Endif
+Endif
+If filinfo(filpath("FIL","MFGOPETRK", "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MKO]) Local File =SI_DOSSIER+".MFGOPETRK"  [MKO] : Endif
+Endif
+If filinfo(filpath("FIL","MFGTRS",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MTS]) Local File =SI_DOSSIER+".MFGTRS"     [MTS] : Endif
+Endif
+If filinfo(filpath("FIL","OPERATIONS","fde",SI_DOSSIER),0)>=0
+ If !clalev([F:OPS]) Local File =SI_DOSSIER+".OPERATIONS" [OPS] : Endif
+Endif
+If filinfo(filpath("FIL","SCHEDULING","fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SCH]) Local File =SI_DOSSIER+".SCHEDULING" [SCH] : Endif
+Endif
+If filinfo(filpath("FIL","PARJAL",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:PJA]) Local File =SI_DOSSIER+".PARJAL"     [PJA] : Endif
+Endif
+If filinfo(filpath("FIL","WORKSTATIO","fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MWS]) Local File =SI_DOSSIER+".WORKSTATIO" [MWS] : Endif
+Endif
+If filinfo(filpath("FIL","SCOHEAD",   "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SCO]) Local File =SI_DOSSIER+".SCOHEAD"    [SCO] : Endif
+Endif
+If filinfo(filpath("FIL","SCOITM",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SCI]) Local File =SI_DOSSIER+".SCOITM"     [SCI] : Endif
+Endif
+If filinfo(filpath("FIL","SCOSRV",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SCS]) Local File =SI_DOSSIER+".SCOSRV"     [SCS] : Endif
+Endif
+If filinfo(filpath("FIL","SCOMAT",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:SCM]) Local File =SI_DOSSIER+".SCOMAT"     [SCM] : Endif
+Endif
+If filinfo(filpath("FIL","MTOLINK",   "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:MLK]) Local File =SI_DOSSIER+".MTOLINK"    [MLK] : Endif
+Endif
+If filinfo(filpath("FIL","PARMTO",    "fde",SI_DOSSIER),0)>=0
+ If !clalev([F:PTO]) Local File =SI_DOSSIER+".PARMTO"     [PTO] : Endif
+Endif
+#--------------------------------------------#
+# Ouvertures complémentaires des tables "X3" #
+#--------------------------------------------#
+If !clalev([F:PFI2]) Local File =SI_DOSSIER+".PFOOTINV"   [PFI2] : Endif
+If !clalev([F:TVC])  Local File =SI_DOSSIER+".TABVAC"     [TVC]  : Endif
+If !clalev([F:AGC])  Local File =SI_DOSSIER+".AGRPCPY"    [AGC]  : Endif
+If !clalev([F:BPT])  Local File =SI_DOSSIER+".BPCARRIER"  [BPT]  : Endif
+If !clalev([F:PPL])  Local File =SI_DOSSIER+".PPRICLIST"  [PPL]  : Endif
+If !clalev([F:GTE])  Local File =SI_DOSSIER+".GTYPACCENT" [GTE]  : Endif
+If !clalev([F:CCE])  Local File =SI_DOSSIER+".CACCE"      [CCE]  : Endif
+If !clalev([F:AVN])  Local File =SI_DOSSIER+".AVALNUM"    [AVN]  : Endif
+If !clalev([F:ANM])  Local File =SI_DOSSIER+".ACODNUM"    [ANM]  : Endif
+If !clalev([F:AXX])  Local File =SI_DOSSIER+".ATEXTRA"    [AXX]  : Endif
+If !clalev([F:TCC])  Local File =SI_DOSSIER+".TEXCPT"     [TCC]  : Endif
+If !clalev([F:TXC])  Local File =SI_DOSSIER+".TEXCLOB"    [TXC]  : Endif
+Return
+
+
+############################################################
+# CALNBENR : Compte le nombre d'enregistrement déjà traité #
+#            et le nombre d'enregistrement total à traiter #
+# -------------------------------------------------------- #
+# Appelé depuis le traitement SUBSIM                       #
+# La clase [M:SIM2] doit être ouverte et chargée           #
+# WNOL est l'indice de la ligne en cours de traitement     #
+# -------------------------------------------------------- #
+# En sortie :                                              #
+#    [M:SIM2]NB2TRT chargé avec nbre total à traiter       #
+#    LMES chargé avec "nbre traité / nbre total"           #
+############################################################
+Funprog CALNBENR(WNOL)
+Value Integer WNOL
+#-----
+Local Char    LMES(30)
+Local Integer WNBCDE
+#----- Nombre total d'enregistrements reste à traiter -----#
+Local File XIEPA [XEPA] Where TYPPIE="CF"
+&                           & FLGMAJ=""
+&                           & FLGREP<2
+&                           & DATPIE>=[F:SPX]STRPER
+WNBCDE=rowcount([XEPA])
+Close Local File [XEPA]
+#-----
+LMES=num$(WNBCDE)-"/"
+#----- Nombre total d'enregistrements à traiter -----#
+Local File XIEPA [XEPA] Where TYPPIE="CF"
+&                           & FLGMAJ=""
+&                           & DATPIE>=[F:SPX]STRPER
+WNBCDE=rowcount([XEPA])
+Close Local File [XEPA]
+#-----
+LMES-=num$(WNBCDE)
+[M:SIM4]NB2TRT(WNOL)=WNBCDE
+#-----
+End LMES
+
+
+#-----------------------#
+# Création des acomptes #
+#-----------------------#
+$CREATION_ACOMPTES
+#----- Suppression des acomptes générés en standard -----#
+Call ACOMPTES(6,2,[F:POH]POHNUM,[F:POH]LINNBR,[F:POH]PTE,[F:POH]ORDDAT,[F:POH]TOTORD,
+&             [F:POH]TTVORD,[F:POH]CUR,[F:POH]CHGTYP,[F:POH]BPSINV,[F:POH]BPRPAY,
+&             [F:POH]BPAPAY,1,OK) From TRTTPT
+If GOK<1  Return : Endif
+#----- Création des acomptes à partir de ceux de l'intégrale -----#
+Gosub SIXRECUPTABI
+If GNBEAA=0  Return : Endif
+Call SIXACOMPTES(6,1,[F:POH]POHNUM,[F:POH]LINNBR,[F:POH]PTE,[F:POH]ORDDAT,[F:POH]TOTORD,
+&                [F:POH]TTVORD,[F:POH]CUR,[F:POH]CHGTYP,[F:POH]BPSINV,[F:POH]BPRPAY,
+&                [F:POH]BPAPAY,1,OK)
+Return
+
+
+#---------------------------------------------#
+# Récupération des acomptes dans des tableaux #
+#---------------------------------------------#
+$SIXRECUPTABI
+#-----
+Local Char WCODTVA(GLONVAT)
+#-----
+If !clalev([F:XEAA])  Local File =SI_DOSSIER+".XIEAA"    [XEAA] : Endif
+If !clalev([F:XLAA])  Local File =SI_DOSSIER+".XILAA"    [XLAA] : Endif
+If !clalev([F:XOPT])  Local File =SI_DOSSIER+".XILAAOPT" [XOPT] : Endif
+#-----
+Raz GNBEAA, GMODRGL, GMNTECH, GDATECH, GCODTVA
+FLGERRACP=0
+If [F:XEPA]GENAPT="O"
+  #----- Il y a eu génération d'acompte, on les récupère s'il n'y a pas eu liaison comptable
+  For [XEAA] Where NUMORD=[F:XEPA]NUMORD
+&                & LETRLQNUMORD=[F:XEPA]LETRLQNUMORD
+&                & FLGMAJ<>"C"
+    If GNBEAA>=dim(GMODRGL)
+      FLGERRACP=1 : Break
+    Endif
+    #----- Lecture de l'entête de l'acompte
+    WCODTVA=func SIXFONCTION.SI_COR2("XITVAACH",num$([F:XEAA]CODTVA),[F:XFOU]CODPAY,"#","")
+    GMODRGL(GNBEAA)=[F:XEAA]MODRGL1    : # Mode de règlement
+    GMNTECH(GNBEAA)=[F:XEAA]MNTECH1    : # Montant de l'échéance
+    GDATECH(GNBEAA)=[F:XEAA]DATECH1    : # Date de l'échéance
+    GCODTVA(GNBEAA)=WCODTVA            : # Code tva
+    GNBEAA +=1
+    #----- Pour chaque acompte, lecture lignes règlement si règlement a plusieurs échéances
+    For [XOPT] Where NUMORD=[F:XEAA]NUMORD
+&                  & LETRLQ=[F:XEAA]LETRLQNUMORD
+&                  & NUMAPT=[F:XEAA]NUMAPT
+&                  & TYPLIG="O"
+      If GNBEAA>=dim(GMODRGL)
+        FLGERRACP=1 : Break 2
+      Endif
+      GMODRGL(GNBEAA)=[F:XOPT]MODRGL   : # Mode de règlement
+      GMNTECH(GNBEAA)=[F:XOPT]MNTECH   : # Montant de l'échéance
+      GDATECH(GNBEAA)=[F:XOPT]DATECH   : # Date de l'échéance
+      GCODTVA(GNBEAA)=WCODTVA          : # Code tva
+      GNBEAA +=1
+    Next
+    #-----
+  Next
+Elsif [F:XEPA]MNTAPT<>0
+  #----- Il n'y a pas eu génération d'acompte, on génère une ligne si le mt acompte<>0
+  GMNTECH(GNBEAA)=[F:XEPA]MNTAPT  : # Montant de l'échéance
+  GDATECH(GNBEAA)=[F:XEPA]DAT1ECH : # Date de l'échéance   # Non renseignée !!
+  If GDATECH(GNBEAA)="000000"
+    GDATECH(GNBEAA)=[F:XEPA]DATPIE
+  Endif
+  GNBEAA +=1
+Endif
+Return
+
+
+#------------------------# 
+# Création des acomptes  #
+#------------------------#
+Subprog SIXACOMPTES (MODULE,TRAIT,NUMCDE,NBLIN,CODECHE,DEPECHE,MONTANT,MONTTTC,
+&                    CURECH,TYPCOURS,TFACT,TPAYE,ADRPAY,NOLIN,OK)
+Value    Integer MODULE
+Value    Integer TRAIT
+Value    Char    NUMCDE
+Value    Integer NBLIN
+Value    Char    CODECHE
+Value    Date    DEPECHE
+Value    Decimal MONTANT
+Value    Decimal MONTTTC
+Value    Char    CURECH
+Value    Integer TYPCOURS
+Value    Char    TFACT
+Value    Char    TPAYE
+Value    Char    ADRPAY
+Value    Integer NOLIN
+Variable Integer OK
+#----- Historisation des échéances supprimées -----#
+Local Char    CRITSUPPR(250)
+Local Char    TABTAXE(3)(0..NBLIN)
+Local Decimal TABMNT    (0..NBLIN)
+Local Integer WRET, WDUDLIG, WLIG, STAT, WACCNUM
+#----- Ouverture des fichiers si nécessaire -----#
+If !clalev([F:TPT])  Local File =SI_DOSSIER+".TABPAYTERM" [TPT] : Endif
+If !clalev([F:TCU])  Local File =SI_DOSSIER+".TABCUR"     [TCU] : Endif
+If !clalev([F:DUD])  Local File =SI_DOSSIER+".GACCDUDATE" [DUD] : Endif
+If !clalev([F:CAC])  Local File =SI_DOSSIER+".GACCCODE"   [CAC] : Endif
+If !clalev([F:GAC])  Local File =SI_DOSSIER+".GACCOUNT"   [GAC] : Endif
+If !clalev([F:ADI])  Local File =SI_DOSSIER+".ATABDIV"    [ADI] : Endif
+#----- Uniquement création d'acomptes -----#
+If TRAIT<>1  Return : Endif
+#-----
+Local Integer WI, WJ, J
+Local Char    WPTE, WMODECHE
+#-----
+Call LECDEV(CURECH) From TRTDIV
+NBECH=GNBEAA-1
+#-----
+Local Char     MODECHE(15)(0..NBECH)
+Local Integer  TYPECHE    (0..NBECH)
+Local Decimal  MNTECHE    (0..NBECH)
+Local Date     DATECHE    (0..NBECH)
+Local Integer  RELEVE     (0..NBECH)
+Local Char     TABTAXE(GLONVAT)(0..max(NBECH,1))
+Local Shortint NECHE : NECHE=0
+#-----
+For WI=0 To GNBEAA-1
+  If GMODRGL(WI)<>""
+    If len(GMODRGL(WI))>2
+      CLERGL=left$(GMODRGL (WI),2)
+      NUMORD=right$(GMODRGL(WI),3)
+    Else 
+      CLERGL=GMODRGL(WI)
+      # NUMORD="" ==> à voir pour ajout initialisation NUMORD dans ce cas
+    Endif 
+    WPTE=func SIXFONCTION.SI_COR2("XIMODRGL",CLERGL,NUMORD,"","")
+  Else
+    # Aucun mode règlement sur ligne d'acompte, on prend la condition paiement entête commande
+    WPTE=CODECHE
+  Endif
+  #----- Init mode de règlement avec celui de la 1ère ligne de type acompte
+  Filter [TPT] Where PTE=WPTE & PAMTYP=2
+  Read [TPT] TPT0 First
+  If !fstat
+    WMODECHE=[F:TPT]PAM
+  Else
+    #----- Aucune ligne de type acompte, init mode règlement celui de la 1ère ligne 
+    Filter [TPT] Where PTE=CODECHE
+    Read [TPT] TPT0 First
+    If !fstat  WMODECHE=[F:TPT]PAM : Endif
+  Endif 
+  Filter [TPT]
+  #-----
+  MODECHE(NECHE) = WMODECHE
+  TYPECHE(NECHE) = 2
+  MNTECHE(NECHE) = GMNTECH(WI)
+  DATECHE(NECHE) = GDATECH(WI)
+  RELEVE (NECHE) = 1    : # Inutilisé à la création de l'acompte
+  #-----
+  If GCODTVA(WI)<>"" & !find(GCODTVA(WI), TABTAXE(0..NBECH-1))
+    TABTAXE(WJ) = GCODTVA(WI)
+    WJ+=1
+  Endif
+  NECHE+=1
+Next
+#-----
+J=WJ
+Gosub CREA_ACOMPTE From TRTTPT
+End

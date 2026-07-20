@@ -1,0 +1,614 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# SUBPCST : Affichage des couts de la ligne d'un document muarn 16/05/13 #
+# ---------------------------------------------------------------------- #
+# Ce traitement n'est pas un objet mais est utilisé par l'action         #
+# VISUCSTLIN et sert à gérer les masques écran "CST0" "CST1" "CST2"      #
+##########################################################################
+# GSYSCUR   = Devise dossier (reporting)                                 #
+# GLOCALDEV = Devise société                                             #
+# GCUR      = Devise document                                            #
+# GFINRSP   = Site financier                                             #
+##########################################################################
+
+##############################################################################
+#  Visualisation de la valorisation d'une ligne de commande ou de réception  #
+# -------------------------------------------------------------------------- #
+# Action VISUCSTLIN avec paramètres :                         muarn 12/07/12 #
+#   PARAM(1) = VCRNUM : Numéro de la commande/réception/facture              #
+#   PARAM(2) = VCRLIN : Numéro de la ligne de commande/réception/facture     #
+#   PARAM(3) = VCRSEQ : Séquence de la ligne de commande                     #
+#   PARAM(4) = VCRTYP : Type de document (14:commande/6:réception/17: facture#
+#   PARAM(5) = WABMSK : Abréviation du masque écran contenant les lignes     #
+#   PARAM(6) = NOLIG  : Indice de la ligne en cours                          #
+#   PARAM(7) = EECICT : Code incoterm du document                            #
+##############################################################################
+
+$ACTION
+Case ACTION
+  When "OUVRE" : Gosub OUVRE
+  When "TITRE" : Gosub TIT_CSTLIN
+  When "DEBUT" : Gosub DEBUT
+  When "FINSAI" : Gosub FINSAI
+  When Default
+Endcase
+Return
+
+$OUVRE
+Local Char     LVCRNUM      : LVCRNUM  = PARAM(1)
+Local Integer  LVCRLIN      : LVCRLIN  = val(PARAM(2))
+Local Integer  LVCRSEQ      : LVCRSEQ  = val(PARAM(3))
+Local Integer  LVCRTYP      : LVCRTYP  = val(PARAM(4))
+Local Char     WABMSK(4)    : WABMSK   = PARAM(5)
+Local Shortint NOL          : NOL      = val(PARAM(6))
+Local Char     LEECICT      : LEECICT  = PARAM(7)
+
+Local Integer  LTYP
+Local Char     LFCY
+
+Local Shortint SAVNOLIGN    : SAVNOLIGN= nolign
+Local Integer  I, J
+Local Decimal  COURDEVISE : COURDEVISE =1
+Local Char     WTAX(GLONVAT)
+Local Char     WLIBTAX(GLONSHO)
+Local Decimal  WAMTTAX, WDEDTAX
+Local Integer  WRET
+Local Char     DESIGN(20)
+
+Local Integer LRET
+Local Integer LNBL            # Nombre lignes écran
+
+Local Decimal ARODOC, AROCPY  #arrondi devise document et devise société
+
+# Issue 105027 - 2015-01-02 by MUARN : pour intersite et intersoc
+Local Integer WBETFCY, WBETCPY
+
+If evalue("[M:"+WABMSK+"]ITMREF(NOL)=''")  FIN=1 : Return : Endif
+#----- Mise à jour des répartitions si nécessaire -----#
+If evalue("[M:"+WABMSK+"]CLCFLG=2")
+  Case WABMSK
+    When "POH2" : #----- Commandes -----#
+      Gosub CALCUL_MT_ELEMENT From SUBPOHC
+      If !GIMPORT  Affzo [POH3]1-99 : Endif
+      If [M:POH1]CUR <>GLOCALDEV
+        # Issue 117586 - 2016-09-20 by MUARN : cours en table devises
+        #COURDEVISE = [M:POH1]CHGCOE
+        Call COURSITE(GCUR,GFCY,[M:POH1]CHGTYP,[M:POH0]ORDDAT,COURDEVISE,I) From TRTDEV
+      Endif
+    When "PTH1" : #----- Réceptions -----#
+      Gosub TEST_VALID From SUBPTH
+      If [M:PTH0]CUR <>GLOCALDEV
+        # Issue 117586 - 2016-09-20 by MUARN : cours en table devises
+        #COURDEVISE = [M:PTH0]CHGCOE
+        Call COURSITE(GCUR,GFCY,[M:PTH0]CHGTYP,[M:PTH0]RCPDAT,COURDEVISE,I) From TRTDEV
+      Endif
+    When "PIH3" : #----- Factures -------#
+      #----- Chargement prix unitaire brut si nécessaire -----#
+      If [M:PIH3]GROPRI(NOL)=0 [M:PIH3]GROPRI(NOL)=[M:PIH3]NETPRI(NOL) : Endif
+      #----- Réajustement des montants de taxe sur éléments et lignes facture -----#
+      Call MAJ_TAXE (NOL) From SUBPIHB : If !GIMPORT Affzo [PIH4]10 : Endif
+      If [M:PIH1]NBFAC1>0 & [M:PIH4]NBFAC=0
+        [M:PIH4]NBFAC=[M:PIH1]NBFAC1
+        For I=0 To [M:PIH1]NBFAC1-1
+          Call MAJ_ELEMENT (I,1,+1) From SUBPIHB
+        Next I
+      Endif
+      If [M:PIH1]CUR<>GLOCALDEV
+        COURDEVISE = arr([M:PIH1]RAT2/[M:PIH1]RAT1,10^-GDECRCU)
+      Endif
+  Endcase
+Endif
+#-----
+If !clalev([F:PFI])  Local File PFOOTINV    [PFI]  : Endif
+If !clalev([F:TVT])  Local File TABVAT      [TVT]  : Endif
+If !clalev([F:PPR])  Local File PPREASON    [PPR]  : Endif
+If !clalev([F:STCD]) Local File COSTSTCD    [STCD] : Endif
+If !clalev([F:FCS])  Local File FRECST      [FCS]  : Endif
+If !clalev([F:ICTD]) Local File INCOTERMD   [ICTD] : Endif
+If !clalev([F:TCU])  Local File TABCUR      [TCU]  : Endif
+
+If !clalev([F:ITF])  Local File ITMFACILIT  [ITF]  : Endif
+If !clalev([F:TCM])  Local File TABCOSTMET  [TCM]  : Endif
+If !clalev([F:PTD])  Local File PRECEIPTD   [PTD]  : Endif
+If !clalev([F:PIH])  Local File PINVOICE    [PIH]  : Endif
+If !clalev([F:PIHB]) Local File PINVOICE   [PIHB]  : Endif
+If !clalev([F:PID])  Local File PINVOICED   [PID]  : Endif
+If !clalev([F:PIDB]) Local File PINVOICED   [PIDB] : Endif
+If !clalev([F:PIDC]) Local File PINVOICED   [PIDC] : Endif
+If !clalev([F:PIDD]) Local File PINVOICED   [PIDD] : Endif
+If !clalev([F:PID])  Local File PINVOICED   [PID]  : Endif
+#-----
+
+Return
+
+$TIT_CSTLIN
+TIT=mess(497,198,1)
+Case WABMSK
+  When "POH2" : TIT-=mess(191,198,1)
+  When "PTH1" : TIT-=mess(117,198,1)
+  When "PIH3" : TIT-=mess(193,198,1)
+Endcase
+#TIT-=NUM-mess(18,197,1)-num$(LIN)
+TIT-=LVCRNUM-mess(18,197,1)-num$(LVCRLIN)
+Raz [M:CST0]
+Raz [M:CST1]
+Raz [M:CST2]
+[M:CST0]WABMSK=WABMSK
+
+#----- Chargement des libellés des éléments de facturation -----#
+For I=0 To 8
+  If evalue("[M:"+WABMSK+"]INVDTALIN2(I)")<>0
+    Read [PFI] PFI0=evalue("[M:"+WABMSK+"]INVDTALIN2(I)")
+    If fstat Raz [F:PFI] : Endif
+    If [F:PFI]PFINUM<>0
+      Call LECTEXTRA(DESIGN,"PFOOTINV","SHOAXX",num$([F:PFI]PFINUM),"") From ATEXTRA
+      Assign "[M:CST1]LIB"+num$(I+1) With DESIGN+"  ("+format$("N0:3",[F:PFI]PFINUM)+")"
+    Else
+      Assign "[M:CST1]LIB"+num$(I+1) With ""
+    Endif
+    Assign "[M:CST1]NPRVLT"+num$(I+1) With [F:PFI]NPRVLT
+  Endif
+Next I
+#-----
+Return
+
+$DEBUT
+#############################
+#---- Mise à jour entête
+#############################
+Raz [M:CST0]TYPORIMSK
+
+If WABMSK ="POH2"
+  If [M:POH1]CUR <>GLOCALDEV
+    # Issue 117586 - 2016-09-20 by MUARN : cours en table devises
+    #COURDEVISE = [M:POH1]CHGCOE
+    Call COURSITE(GCUR,GFCY,[M:POH1]CHGTYP,[M:POH0]ORDDAT,COURDEVISE,I) From TRTDEV
+  Endif
+  # Issue 105027 - 2015-01-02 by MUARN : inter site
+  WBETFCY = [M:POH0]BETFCY
+  WBETCPY = [M:POH0]BETCPY
+Elsif WABMSK = "PIH3"
+  If [M:PIH1]CUR<>GLOCALDEV
+    COURDEVISE = arr([M:PIH1]RAT2/[M:PIH1]RAT1,10^-GDECRCU)
+  Endif
+  [M:CST0]TYPORI    = evalue("[M:"+WABMSK+"]TYPORI(NOL)")
+  [M:CST0]TYPORIMSK = mess([M:CST0]TYPORI,511,1)
+  [M:CST0]NUMORI    = evalue("[M:"+WABMSK+"]NUMORI(NOL)")
+  [M:CST0]LINORI    = evalue("[M:"+WABMSK+"]LINORI(NOL)")
+  # Issue 102926 - 2014-09-29 by MUARN : ne pas afficher le prix brut en facture
+  Chgfmt [M:CST0]GROPRI With "-NPz3:"
+  # Issue 105027 - 2015-01-02 by MUARN : inter site
+  WBETCPY = [M:PIH0]BETCPY
+  If WBETCPY= 2
+    WBETFCY = 2
+  Else
+    WBETFCY = 1
+  Endif
+Elsif WABMSK ="PTH1"
+  If [M:PTH0]CUR <>GLOCALDEV
+    # Issue 117586 - 2016-09-20 by MUARN : cours en table devises
+    #COURDEVISE = [M:PTH0]CHGCOE
+    Call COURSITE(GCUR,GFCY,[M:PTH0]CHGTYP,[M:PTH0]RCPDAT,COURDEVISE,I) From TRTDEV
+  Endif
+  [M:CST0]NUMORI = evalue("[M:"+WABMSK+"]POHNUM(NOL)")
+  [M:CST0]LINORI = evalue("[M:"+WABMSK+"]POPLIN(NOL)")
+  If [M:CST0]NUMORI <> ""  [M:CST0]TYPORIMSK = mess(1,511,1) Endif
+  # Issue 105027 - 2015-01-02 by MUARN : inter site
+  WBETFCY = [M:PTH0]BETFCY
+  WBETCPY = [M:PTH0]BETCPY
+Endif
+[M:CST2]CHGCOE = COURDEVISE
+[M:CST0]CUR    = GCUR
+
+[M:CST0]ITMREF    = evalue("[M:"+WABMSK+"]ITMREF(NOL)")
+[M:CST0]ITMDES    = evalue("[M:"+WABMSK+"]ITMDES(NOL)")
+[M:CST0]QTYUOM    = evalue("[M:"+WABMSK+"]QTYUOM(NOL)")
+[M:CST0]UOM       = evalue("[M:"+WABMSK+"]UOM(NOL)")
+[M:CST0]NETPRI    = evalue("[M:"+WABMSK+"]NETPRI(NOL)")
+[M:CST0]GROPRI    = evalue("[M:"+WABMSK+"]GROPRI(NOL)")
+If WABMSK <> "PIH3"
+  [M:CST0]LINAMT    = evalue("[M:"+WABMSK+"]LINAMT(NOL)")
+  [M:CST0]LINATIAMT = evalue("[M:"+WABMSK+"]LINATIAMT(NOL)")
+Else
+  [M:CST0]LINAMT    = evalue("[M:"+WABMSK+"]AMTNOTLIN(NOL)")
+  [M:CST0]LINATIAMT = evalue("[M:"+WABMSK+"]AMTATILIN(NOL)")
+Endif
+
+Call FMTREM("CST1",[M:CST0]CUR)  From TRTPRICE
+
+#############################################
+#----- Mise à jour Détail valorisation -----#
+#############################################
+
+#----- Chargement des frais, remises et motifs tarif -----#
+For I=0 To dim(GCOLREM)-1
+  If GCOLREM(I)<>""
+    If GDISCRGTYP(I)=1
+      [M:CST1]DISCRGTYP([M:CST1]NBREM)=GCUR
+    Else
+      [M:CST1]DISCRGTYP([M:CST1]NBREM)="%"
+    Endif
+    If evalue("dim([M:"+WABMSK+"]DISCRGREN"+num$(I+1)+"(NOL))")>0
+      [M:CST1]DISCRGVAL([M:CST1]NBREM) = evalue("[M:"+WABMSK+"]DISCRGVAL"+num$(I+1)+"(NOL)")
+      [M:CST1]DISCRGREN([M:CST1]NBREM) = evalue("[M:"+WABMSK+"]DISCRGREN"+num$(I+1)+"(NOL)")
+    Endif
+    #----- Mettre les formats colonnes tarif en affiché -----#
+    J=instr(1,[M:CST1]FMTREM([M:CST1]NBREM),":")
+    If J
+      [M:CST1]FMTREM([M:CST1]NBREM) = left$([M:CST1]FMTREM([M:CST1]NBREM),J-1)
+&                             +"P"+right$([M:CST1]FMTREM([M:CST1]NBREM),J)
+    Endif
+     #-----
+    [M:CST1]NBREM+=1
+  Endif
+Next I
+
+# Issue 105027 - 2015-02-10 by MUARN : prise en compte inter site
+If WBETFCY = 1 | WBETCPY = 2
+  #----- Mise à jour des éléments de facturation -----#
+  [M:CST1]DISCRGAMT1=evalue("[M:"+WABMSK+"]DISCRGAMT1(NOL)")
+  [M:CST1]DISCRGAMT2=evalue("[M:"+WABMSK+"]DISCRGAMT2(NOL)")
+  [M:CST1]DISCRGAMT3=evalue("[M:"+WABMSK+"]DISCRGAMT3(NOL)")
+  [M:CST1]DISCRGAMT4=evalue("[M:"+WABMSK+"]DISCRGAMT4(NOL)")
+  [M:CST1]DISCRGAMT5=evalue("[M:"+WABMSK+"]DISCRGAMT5(NOL)")
+  [M:CST1]DISCRGAMT6=evalue("[M:"+WABMSK+"]DISCRGAMT6(NOL)")
+  [M:CST1]DISCRGAMT7=evalue("[M:"+WABMSK+"]DISCRGAMT7(NOL)")
+  [M:CST1]DISCRGAMT8=evalue("[M:"+WABMSK+"]DISCRGAMT8(NOL)")
+  [M:CST1]DISCRGAMT9=evalue("[M:"+WABMSK+"]DISCRGAMT9(NOL)")
+Endif
+#----- Mise à jour des bases et taxes -----#
+[M:CST1]CLCAMT1   = evalue("[M:"+WABMSK+"]CLCAMT1(NOL)")
+[M:CST1]CLCAMT2   = evalue("[M:"+WABMSK+"]CLCAMT2(NOL)")
+[M:CST1]CLCAMT3   = evalue("[M:"+WABMSK+"]CLCAMT3(NOL)")
+If func TRTX3.ACTIV_PTX & dim([M:CST1]CLCAMT4)>0
+  [M:CST1]CLCAMT4 = evalue("[M:"+WABMSK+"]CLCAMT4(NOL)")
+  [M:CST1]CLCAMT5 = evalue("[M:"+WABMSK+"]CLCAMT5(NOL)")
+  [M:CST1]CLCAMT6 = evalue("[M:"+WABMSK+"]CLCAMT6(NOL)")
+  [M:CST1]CLCAMT7 = evalue("[M:"+WABMSK+"]CLCAMT7(NOL)")
+Endif
+[M:CST1]BASTAXLIN1   = evalue("[M:"+WABMSK+"]BASTAXLIN1(NOL)")
+If dim([M:CST1]DISBASLIN1)>0
+  [M:CST1]DISBASLIN1 = evalue("[M:"+WABMSK+"]DISBASLIN1(NOL)")
+Endif
+#-----
+For I=1 To 3+4*(func TRTX3.ACTIV_PTX & evalue("dim([M:"+WABMSK+"]TAXRCP)")>0)
+  Case I
+    When 1
+      WTAX   =evalue("[M:"+WABMSK+"]VAT1(NOL)")
+      WAMTTAX=evalue("[M:"+WABMSK+"]AMTTAXLIN1(NOL)")
+      WDEDTAX=evalue("[M:"+WABMSK+"]DEDTAXLIN1(NOL)")
+    When 2
+      WTAX   =evalue("[M:"+WABMSK+"]VAT2(NOL)")
+      WAMTTAX=evalue("[M:"+WABMSK+"]AMTTAXLIN2(NOL)")
+      WDEDTAX=evalue("[M:"+WABMSK+"]DEDTAXLIN2(NOL)")
+    When 3
+      WTAX   =evalue("[M:"+WABMSK+"]VAT3(NOL)")
+      WAMTTAX=evalue("[M:"+WABMSK+"]AMTTAXLIN3(NOL)")
+      WDEDTAX=evalue("[M:"+WABMSK+"]DEDTAXLIN3(NOL)")
+    When 4
+      WTAX   =evalue("[M:"+WABMSK+"]TAXRCP(NOL)")
+      WAMTTAX=evalue("[M:"+WABMSK+"]AMTTAXRCP(NOL)")
+      WDEDTAX=evalue("[M:"+WABMSK+"]DEDTAXRCP(NOL)")
+    When 5
+      WTAX   =evalue("[M:"+WABMSK+"]TAXISS(NOL)")
+      WAMTTAX=evalue("[M:"+WABMSK+"]AMTTAXISS(NOL)")
+      WDEDTAX=evalue("[M:"+WABMSK+"]DEDTAXISS(NOL)")
+    When 6
+      WTAX   =evalue("[M:"+WABMSK+"]TAXOTH1(NOL)")
+      WAMTTAX=evalue("[M:"+WABMSK+"]AMTTAXOTH1(NOL)")
+      WDEDTAX=evalue("[M:"+WABMSK+"]DEDTAXOTH1(NOL)")
+    When 7
+      WTAX=evalue("[M:"+WABMSK+"]TAXOTH2(NOL)")
+      WAMTTAX=evalue("[M:"+WABMSK+"]AMTTAXOTH2(NOL)")
+      WDEDTAX=evalue("[M:"+WABMSK+"]DEDTAXOTH2(NOL)")
+  Endcase
+  If WTAX<>""
+    # Issue 71937 - 2012-03-27 by SR : comment
+    Call LEC_TVT_LEG(GCURLEG,WTAX,WRET) From TRTLECLEG
+    If WRET : Raz [F:TVT] : Endif
+#    Read [TVT] TVT0=WTAX : If fstat  Raz [F:TVT] : Endif
+    #-----
+    If [F:TVT]VATTYP>1
+      If [F:TVT]VATBAS>1
+        [M:CST1]BASTAX([M:CST1]NBTAX)=evalue("[M:"+WABMSK+"]CLCAMT"+num$(I)+"(NOL)")
+      Else
+        # Issue 98528 - 2014-03-28 by MUARN : PIH3 nom champ différent
+        If WABMSK <> "PIH3"
+          [M:CST1]BASTAX([M:CST1]NBTAX)=evalue("[M:"+WABMSK+"]LINAMT(NOL)")
+        Else
+          [M:CST1]BASTAX([M:CST1]NBTAX)=evalue("[M:"+WABMSK+"]AMTNOTLIN(NOL)")
+        Endif
+      Endif
+    Else
+      [M:CST1]BASTAX([M:CST1]NBTAX)=evalue("[M:"+WABMSK+"]BASTAXLIN1(NOL)")
+    Endif
+    #-----
+    Call GET_ATEXTRA("TABVAT","SHOAXX",GLANGUE,WLIBTAX) From TRTX3TEX
+    [M:CST1]TAX      ([M:CST1]NBTAX)=WTAX
+    [M:CST1]LIBTAX   ([M:CST1]NBTAX)=WLIBTAX
+    [M:CST1]AMTTAX   ([M:CST1]NBTAX)=WAMTTAX
+    [M:CST1]DEDTAX   ([M:CST1]NBTAX)=WDEDTAX
+    [M:CST1]NONDEDTAX([M:CST1]NBTAX)=WAMTTAX-WDEDTAX
+    [M:CST1]LINPURTYP([M:CST1]NBTAX)=evalue("[M:"+WABMSK+"]LINPURTYP(NOL)")
+    [M:CST1]NBTAX+=1
+  Endif
+Next I
+
+####################################
+#---- Mise à jour détail cout -----#
+####################################
+# afin de gérer le changement d'affichage devise document / devise société
+# nous utilisons des zones invisibles contenant les données en devise document et devise société
+# on affecte les données affichées avec l'une des 2 zones invisibles en fonction de la devise choisie
+
+#---- Mise à jour coût stock et coût achat -----#
+[M:CST2]SDEVISE   =2
+[M:CST2]CUR1         = GLOCALDEV
+[M:CST2]CURCPY1      = GLOCALDEV
+[M:CST2]CURDOC1      = GCUR
+If [F:TCU]CUR<>[M:CST2]CURCPY1
+  Read [TCU]TCU0=[M:CST2]CURCPY1 : If fstat  Raz [F:TCU] : Endif
+Endif
+AROCPY = [F:TCU]CURRND
+If [F:TCU]CUR<>[M:CST2]CURDOC1
+  Read [TCU]TCU0=[M:CST2]CURDOC1 : If fstat  Raz [F:TCU] : Endif
+Endif
+ARODOC = [F:TCU]CURRND
+
+[M:CST2]CPRCOE    =evalue("[M:"+WABMSK+"]CPRCOE(NOL)")
+[M:CST2]CPRAMT    =arr(evalue("[M:"+WABMSK+"]CPRAMT(NOL)"),AROCPY)
+[M:CST2]CPRAMTCPY =arr(evalue("[M:"+WABMSK+"]CPRAMT(NOL)"),AROCPY)
+[M:CST2]CPRAMTDOC =arr(evalue("[M:"+WABMSK+"]CPRAMT(NOL)")/COURDEVISE,ARODOC)
+If WABMSK <> "PIH3"
+  [M:CST2]AMTNOTLIN    =arr(evalue("[M:"+WABMSK+"]LINAMT(NOL)*COURDEVISE"),AROCPY)
+  [M:CST2]AMTNOTLINDOC =arr(evalue("[M:"+WABMSK+"]LINAMT(NOL)"),ARODOC)
+  [M:CST2]AMTNOTLINCPY =arr(evalue("[M:"+WABMSK+"]LINAMT(NOL)*COURDEVISE"),AROCPY)
+Else
+  [M:CST2]AMTNOTLIN    =arr(evalue("[M:"+WABMSK+"]AMTNOTLIN(NOL)*COURDEVISE"),AROCPY)
+  [M:CST2]AMTNOTLINDOC =arr(evalue("[M:"+WABMSK+"]AMTNOTLIN(NOL)"),ARODOC)
+  [M:CST2]AMTNOTLINCPY =arr(evalue("[M:"+WABMSK+"]AMTNOTLIN(NOL)*COURDEVISE"),AROCPY)
+Endif
+
+[M:CST2]STCNUM       = evalue("[M:"+WABMSK+"]STCNUM(NOL)")
+[M:CST2]CPR          = arr(evalue("[M:"+WABMSK+"]CPR(NOL)"),10^-GDECPRI)
+[M:CST2]CPRCPY       = arr(evalue("[M:"+WABMSK+"]CPR(NOL)"),10^-GDECPRI)
+[M:CST2]CPRDOC       = arr(evalue("[M:"+WABMSK+"]CPR(NOL)")/COURDEVISE,10^-GDECPRI)
+[M:CST2]LINAMTCPR    = arr(evalue("[M:"+WABMSK+"]LINAMTCPR(NOL)"),10^-GDECPRI)
+[M:CST2]LINAMTCPRCPY = arr(evalue("[M:"+WABMSK+"]LINAMTCPR(NOL)"),10^-GDECPRI)
+[M:CST2]LINAMTCPRDOC = arr(evalue("[M:"+WABMSK+"]LINAMTCPR(NOL)")/COURDEVISE,10^-GDECPRI)
+[M:CST2]CSTPUR       = arr(evalue("[M:"+WABMSK+"]CSTPUR(NOL)"),10^-GDECPRI)
+[M:CST2]CSTPURCPY    = arr(evalue("[M:"+WABMSK+"]CSTPUR(NOL)"),10^-GDECPRI)
+[M:CST2]CSTPURDOC    = arr(evalue("[M:"+WABMSK+"]CSTPUR(NOL)")/COURDEVISE,10^-GDECPRI)
+[M:CST2]LINCSTPUR    = arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)"),10^-GDECPRI)
+[M:CST2]LINCSTPURCPY = arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)"),10^-GDECPRI)
+[M:CST2]LINCSTPURDOC = arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)")/COURDEVISE,10^-GDECPRI)
+[M:CST2]NONDEDTAX    = arr(sigma(I=0, [M:CST1]NBTAX-1,[M:CST1]NONDEDTAX(I))*COURDEVISE,AROCPY)
+[M:CST2]NONDEDTAXCPY = arr(sigma(I=0, [M:CST1]NBTAX-1,[M:CST1]NONDEDTAX(I))*COURDEVISE,AROCPY)
+[M:CST2]NONDEDTAXDOC = arr(sigma(I=0, [M:CST1]NBTAX-1,[M:CST1]NONDEDTAX(I)),ARODOC)
+For I=1 To 9
+  If evalue("dim([M:CST1]DISCRGAMT"+num$(I)+")")>0
+    [M:CST2]DISCGRAMT+=evalue("[M:CST1]DISCRGAMT"+num$(I)+"*COURDEVISE")
+    [M:CST2]DISCGRAMTDOC+=evalue("[M:CST1]DISCRGAMT"+num$(I))
+    [M:CST2]DISCGRAMTCPY+=evalue("[M:CST1]DISCRGAMT"+num$(I)+"*COURDEVISE")
+  Endif
+Next I
+[M:CST2]DISCGRAMT=arr([M:CST2]DISCGRAMT,AROCPY)
+[M:CST2]DISCGRAMTDOC=arr([M:CST2]DISCGRAMTDOC,ARODOC)
+[M:CST2]DISCGRAMTCPY=arr([M:CST2]DISCGRAMTCPY,AROCPY)
+#---- Mise à jour charge directe
+If [M:CST2]STCNUM<>"" & WABMSK <> "PIH3"
+  If evalue("[M:"+WABMSK+"]WSTCSEQ(NOL)") = 0
+   # chargement de l'écran de travail
+   # alimentation de WSTSEQ de la ligne du document
+   Call WSTCSEQ (WABMSK,NOL,evalue("[M:"+WABMSK+"]NBLIG"),LRET) From STCLIB
+   # alimentation à partir de la structure de coût de la ligne du document
+   Call COSTSTCD_STCDW(WABMSK,NOL,LVCRTYP,LVCRNUM,LVCRLIN,LVCRSEQ,LEECICT,LRET) From STCLIB
+   # on alimente toujours à partir de COSTSTCD car le document doit être créé ou enregistré
+  Endif
+  For I=0 To [M:STCDW]NBLIG-1
+    #--- Issue 98489
+    If [M:CST2]NBDIR>dim([M:CST2]DIRLOD)-1
+      # Issue 121755 - 2017-03-16 by MUARN : ERREUR 1 seul paramètre
+      Call ERREUR(mess(26,100,1)) From GESECRAN : Break
+    Endif
+    #---
+    If [M:STCDW]WSTCSEQ(I)=evalue("[M:"+WABMSK+"]WSTCSEQ(NOL)")
+      [M:CST2]DIRLOD([M:CST2]NBDIR)    = [M:STCDW]WFCSCOD(I)
+      [M:CST2]STKVLTDIR([M:CST2]NBDIR) = [M:STCDW]WSTKVLT(I)
+      #devise société
+      [M:CST2]AMTDIRCPY([M:CST2]NBDIR) = [M:STCDW]WFCSAMTSOC(I)
+      [M:CST2]CURCPY([M:CST2]NBDIR)    = GLOCALDEV
+      #devise document
+      [M:CST2]CURDOC([M:CST2]NBDIR)    = GCUR
+      [M:CST2]AMTDIRDOC([M:CST2]NBDIR) = [M:STCDW]WFCSAMTSOC(I)/COURDEVISE
+      [M:CST2]NBDIR+=1
+    Endif
+  Next
+
+Endif
+
+#---- Mise à jour charge indirecte
+
+#---- Mise à jour charge non-détaillée
+
+# Factures complémentaires et avoir sur facture complémentaire
+If WABMSK="POH2"
+  LTYP =1
+  LFCY = [M:POH0]POHFCY
+  If [F:POQ]POHNUM <> LVCRNUM | [F:POQ]POPLIN <> LVCRLIN | [F:POQ]POQSEQ <> LVCRSEQ
+    Read [POQ] POQ0=LVCRNUM;LVCRLIN;LVCRSEQ
+  Endif
+Elsif WABMSK="PTH1"
+  LTYP = 2
+  LFCY = [M:PTH0]PRHFCY
+  If [F:PTD]PTHNUM <> LVCRNUM | [F:PTD]PTDLIN <> LVCRLIN
+    Read [PTD] PTD0=LVCRNUM;LVCRLIN
+  Endif
+Else
+  LTYP=4
+  If [M:PIH3]TYPORI(NOL)=1
+    If !clalev([F:POQC])   Local File PORDERQ   [POQC] : Endif
+    If [F:POQC]POHNUM<>[M:PIH3]NUMORI(NOL) | [F:POQC]POPLIN<>[M:PIH3]LINORI(NOL) | [F:POQC]POQSEQ<>[M:PIH3]SEQORI(NOL)
+      Read [POQC] POQ0=[M:PIH3]NUMORI(NOL);[M:PIH3]LINORI(NOL);[M:PIH3]SEQORI(NOL)
+    Endif
+    LFCY = [F:POQC]PRHFCY
+  Else
+    LFCY = [M:PIH3]FCYLIN(NOL)
+  Endif
+  If [F:PID]NUM <> LVCRNUM | [F:PID]PIDLIN <> LVCRLIN
+    Read [PID] PID0=LVCRNUM;LVCRLIN
+  Endif
+Endif
+
+Call COST_ADDINV(LTYP,LVCRNUM,LVCRLIN,LVCRSEQ,LFCY,evalue("[M:"+WABMSK+"]ITMREF(NOL)"),LRET) From STCLIB
+
+If (WABMSK="POH2" | WABMSK="PTH1" | (WABMSK="PIH3" & [M:PIH0]PIHTYP = 1))
+  If [M:CST2]STCNUM = ""
+    #--- Issue 98489
+    If [M:CST2]NBNONDET>dim([M:CST2]NDTLOD)-1
+      # Issue 121755 - 2017-03-16 by MUARN : ERREUR 1 seul paramètre
+      Call ERREUR(mess(26,100,1)) From GESECRAN
+    Else
+    #---
+      [M:CST2]NBNONDET+=1
+      [M:CST2]NDTLOD([M:CST2]NBNONDET-1) = mess(434,194,1)
+      [M:CST2]NDTLODTYP([M:CST2]NBNONDET-1) = mess(441,194,1)
+      [M:CST2]CURCPY3([M:CST2]NBNONDET-1)   = GLOCALDEV
+      If [M:CST2]CPRCOE=1 & [M:CST2]CPRAMT=0
+        [M:CST2]AMTNDTCPY([M:CST2]NBNONDET-1) = 0
+        [M:CST2]AMTNDTDOC([M:CST2]NBNONDET-1) = 0
+      Else
+        # Issue 105027 - 2015-01-02 by MUARN : cas particulier inter site
+        If WBETFCY = 2 & WBETCPY=1
+          [M:CST2]AMTNDTCPY([M:CST2]NBNONDET-1) = arr([M:CST2]LINCSTPUR,10^-GDECPRI)
+          [M:CST2]AMTNDTDOC([M:CST2]NBNONDET-1) = arr([M:CST2]AMTNDTCPY([M:CST2]NBNONDET-1)/COURDEVISE,10^-GDECPRI)
+        Else
+          [M:CST2]AMTNDTCPY([M:CST2]NBNONDET-1) = arr([M:CST2]LINCSTPUR-[M:CST2]AMTNOTLIN-[M:CST2]DISCGRAMT-[M:CST2]NONDEDTAX,10^-GDECPRI)
+          [M:CST2]AMTNDTDOC([M:CST2]NBNONDET-1) = arr([M:CST2]AMTNDTCPY([M:CST2]NBNONDET-1)/COURDEVISE,10^-GDECPRI)
+        Endif
+      Endif
+      [M:CST2]CURDOC3([M:CST2]NBNONDET-1)   = GCUR
+      If WABMSK = "POH2" | WABMSK ="PTH1" | (WABMSK = "PIH3" & GPIHCPR = 2)
+        [M:CST2]STKVLTNDT([M:CST2]NBNONDET-1)=2
+      Else
+        [M:CST2]STKVLTNDT([M:CST2]NBNONDET-1)=1
+      Endif
+    #--- Issue 98489
+    Endif
+  Endif
+
+  # Issue 105027 - 2015-02-10 by MUARN : prise en compte inter site
+  If WBETFCY = 1 | WBETCPY = 2
+    For I=1 To 9
+      If evalue("dim([M:CST1]DISCRGAMT"+num$(I)+")")>0 & evalue("[M:CST1]DISCRGAMT"+num$(I))<>0
+        #--- Issue 98489
+        If [M:CST2]NBNONDET>dim([M:CST2]NDTLOD)-1
+          # Issue 121755 - 2017-03-16 by MUARN : ERREUR 1 seul paramètre
+          Call ERREUR(mess(26,100,1)) From GESECRAN : Break
+        Endif
+        #---
+        [M:CST2]NBNONDET+=1
+        [M:CST2]NDTLOD([M:CST2]NBNONDET-1) = evalue("[M:CST1]LIB"+num$(I))
+        [M:CST2]NDTLODTYP([M:CST2]NBNONDET-1) = mess(523,197,1)
+        [M:CST2]AMTNDTDOC([M:CST2]NBNONDET-1) = evalue("[M:CST1]DISCRGAMT"+num$(I))
+        [M:CST2]CURCPY3([M:CST2]NBNONDET-1)   = GLOCALDEV
+        [M:CST2]AMTNDTCPY([M:CST2]NBNONDET-1) = evalue("[M:CST1]DISCRGAMT"+num$(I)+"*COURDEVISE")
+        [M:CST2]CURDOC3([M:CST2]NBNONDET-1)   = GCUR
+        [M:CST2]STKVLTNDT([M:CST2]NBNONDET-1) = evalue("[M:CST1]NPRVLT"+num$(I))
+      Endif
+    Next I
+  Endif
+Endif
+
+Local    Integer I, NBFAC, WMAX
+
+If WABMSK <>"PIH3"
+  [M:CST2]AMTDIRLOD    = arr(sigma(I=0, [M:CST2]NBDIR-1,[M:CST2]AMTDIRCPY(I)),AROCPY)
+Else
+  [M:CST2]AMTDIRLOD    = [M:PIH3]FCSCSTPUR(NOL)
+Endif
+[M:CST2]AMTNDRLOD    =arr(sigma(I=0, [M:CST2]NBINDIR-1,[M:CST2]AMTNDRCPY(I)),AROCPY)
+[M:CST2]AMTNDTLOD    =arr(sigma(I=0, [M:CST2]NBNONDET-1,[M:CST2]AMTNDTCPY(I)),AROCPY)
+[M:CST2]AMTLOD = arr([M:CST2]AMTDIRLOD + [M:CST2]AMTNDRLOD + [M:CST2]AMTNDTLOD,AROCPY)
+If WABMSK <> "PIH3"
+  [M:CST2]AMTDIRLODCPY =arr(sigma(I=0, [M:CST2]NBDIR-1,[M:CST2]AMTDIRCPY(I)),AROCPY)
+Else
+  [M:CST2]AMTDIRLODCPY =[M:PIH3]FCSCSTPUR(NOL)
+Endif
+[M:CST2]AMTNDRLODCPY =arr(sigma(I=0, [M:CST2]NBINDIR-1,[M:CST2]AMTNDRCPY(I)),AROCPY)
+[M:CST2]AMTNDTLODCPY =arr(sigma(I=0, [M:CST2]NBNONDET-1,[M:CST2]AMTNDTCPY(I)),AROCPY)
+If WABMSK <> "PIH3"
+  [M:CST2]AMTDIRLODDOC =arr(sigma(I=0, [M:CST2]NBDIR-1,[M:CST2]AMTDIRCPY(I))/COURDEVISE,ARODOC)
+Else
+  [M:CST2]AMTDIRLODDOC =arr([M:PIH3]FCSCSTPUR(NOL)/COURDEVISE, ARODOC)
+Endif
+[M:CST2]AMTNDRLODDOC =arr(sigma(I=0, [M:CST2]NBINDIR-1,[M:CST2]AMTNDRCPY(I))/COURDEVISE,ARODOC)
+[M:CST2]AMTNDTLODDOC =arr(sigma(I=0, [M:CST2]NBNONDET-1,[M:CST2]AMTNDTCPY(I))/COURDEVISE,ARODOC)
+
+Affzo [CST0]1-99
+Affzo [CST1]1-99
+Affzo [CST2]1-99
+
+Affzo [M:CST1]LIB1
+
+Return
+
+$FINSAI
+nolign=SAVNOLIGN
+Return
+
+
+##############################################
+# Chargement du format des montants :        #
+#   - répartis si I est différent de 0       #
+#   - autres si I égal 0                     #
+##############################################
+Funprog FMT(I)
+Value Integer I
+Local Char FORMAT(15)
+FORMAT="NZP:"+GDEVFMT1(max(find([M:CST0]CUR,GDEVISE(1..GNBDEV)),1))
+If I>0
+  #----- Faire disparaitre les montants répartis non utilisés -----#
+  If evalue("[M:"+[M:CST0]WABMSK+"]INVDTALIN2(I-1)")=0 & evalue("[M:CST1]DISCRGAMT"+num$(I))=0
+    FORMAT="-"+FORMAT
+  Endif
+  #-----
+Endif
+End FORMAT
+
+Subprog AM_SDEVISE(VALEUR)
+Variable Integer VALEUR
+If VALEUR =1
+  [M:CST2]AMTNOTLIN = [M:CST2]AMTNOTLINDOC
+  [M:CST2]NONDEDTAX = [M:CST2]NONDEDTAXDOC
+  [M:CST2]CUR1      = GCUR
+  [M:CST2]DISCGRAMT = [M:CST2]DISCGRAMTDOC
+  [M:CST2]AMTDIRLOD = [M:CST2]AMTDIRLODDOC
+  [M:CST2]CPRAMT    = [M:CST2]CPRAMTDOC
+  [M:CST2]AMTNDRLOD = [M:CST2]AMTNDRLODDOC
+  [M:CST2]LINAMTCPR = [M:CST2]LINAMTCPRDOC
+  [M:CST2]LINCSTPUR = [M:CST2]LINCSTPURDOC
+  [M:CST2]AMTNDTLOD = [M:CST2]AMTNDTLODDOC
+  [M:CST2]CPR       = [M:CST2]CPRDOC
+  [M:CST2]CSTPUR    = [M:CST2]CSTPURDOC
+  [M:CST2]AMTLOD    = [M:CST2]AMTLODDOC
+Else
+  [M:CST2]AMTNOTLIN = [M:CST2]AMTNOTLINCPY
+  [M:CST2]NONDEDTAX = [M:CST2]NONDEDTAXCPY
+  [M:CST2]CUR1      = GLOCALDEV
+  [M:CST2]DISCGRAMT = [M:CST2]DISCGRAMTCPY
+  [M:CST2]AMTDIRLOD = [M:CST2]AMTDIRLODCPY
+  [M:CST2]CPRAMT    = [M:CST2]CPRAMTCPY
+  [M:CST2]AMTNDRLOD = [M:CST2]AMTNDRLODCPY
+  [M:CST2]LINAMTCPR = [M:CST2]LINAMTCPRCPY
+  [M:CST2]LINCSTPUR = [M:CST2]LINCSTPURCPY
+  [M:CST2]AMTNDTLOD = [M:CST2]AMTNDTLODCPY
+  [M:CST2]CPR       = [M:CST2]CPRCPY
+  [M:CST2]CSTPUR    = [M:CST2]CSTPURCPY
+  [M:CST2]AMTLOD    = [M:CST2]AMTLODCPY
+Endif
+[M:CST2]AMTLOD = [M:CST2]AMTDIRLOD + [M:CST2]AMTNDRLOD+ [M:CST2]AMTNDTLOD
+Affzo [CST2]1-99
+End
+
+######################################################################################
+

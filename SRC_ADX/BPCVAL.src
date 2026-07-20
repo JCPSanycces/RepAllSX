@@ -1,0 +1,577 @@
+#<AdxTL>@(#)10.0.0.0 $Revision$
+Local Char PARAM(10)(1..2) , VALEUR(10)
+PARAM(1) = "V"
+Call TRAITE_CHAR(VALEUR,PARAM,"","BPCVAL","FBPCVAL",3,"") From GTRAITE
+End
+
+# Issue X3-102547 - 2018-07-27 by MWA :  Side effect X3-99385 Import large number of Supplier BP invoices failed on 2018 R4 cloud site
+
+#######################################################
+## Global validation of customer/supplier BP invoices
+## and invoices pending
+############################################
+$ACTION
+Case ACTION
+ When "INIT"        : Gosub INIT
+ When "INIT_DIA"    : Gosub INIT_DIA
+ When "CONTROLE"    : Gosub CONTROLE
+ When "EXEC"        : Gosub EXEC
+ When "TERMINE"     : Gosub FIN
+ When "SEL_TABLE"   : Gosub SEL_TABLE
+ When "OUVRE_BATCH" : Gosub OUVRE_BATCH
+Endcase
+Return
+
+############################################
+$INIT
+Gosub OUVRE
+Return
+
+############################################
+$INIT_DIA
+[M:DIA]ACTION = OPTVAL
+Case [M:DIA]ACTION
+ When 'C' :
+  # Customer BP invoices
+  TIT = mess(44,119,1)
+ When 'F' :
+  # Supplier BP invoices
+  TIT = mess(45,119,1)
+ When 'V' :
+  # Supplier BP invoices : Pending -> To validate
+  TIT = mess(7,41,1)-":"-mess(1,509,1)-"->"-mess(2,509,1)
+Endcase
+If dim(TITCRIT)>0 : TITCRIT = TIT : Endif
+Return
+
+############################################
+$CONTROLE
+TMP = 1  :# To display tempon/tempoff
+If FIN : Return : Endif
+
+Call AVERTDGI([M:DIA]ALLCPY,[M:DIA]CPY,1,SAI) From CPTDIV2
+If SAI : Return : Endif
+
+Return
+
+############################################
+$FIN
+If !GSERVEUR & [M:DIA]TRC=2
+ TRA = 1
+Else
+ TRA = 0
+Endif
+
+# 103027 Sage Exchange
+If func AFNC.ACTIV("SEPP")
+  If dim(GSEPAYLOT)> 0 : Kill GSEPAYLOT : Endif
+  If dim(GSENBRPAY)> 0 : Kill GSENBRPAY : Endif # 119006.n
+Endif
+
+Return
+
+############################################
+$EXEC
+If GSERVEUR
+ [M:DIA]TRC = 2
+Endif
+
+If !GSERVEUR & [M:DIA]TRC=2
+ Call OUVRE_TRACE(TIT) From LECFIC
+Endif
+If [M:DIA]TRC=2
+ Call ECR_TRACE(TIT,0) From GESECRAN
+ Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+
+# Reinit de GCURLEG car en lancement par batch on perd le GCURLEG
+If GNBLEG=1
+ GCURLEG = GDOSLEG(1)
+Else
+ GCURLEG=[M:DIA]LEG
+Endif
+
+CRITERE = "ORIMOD=3"
+Case [M:DIA]ACTION
+ When 'C' : CRITERE -= "& STA<3" : CRITERE2 = "STARPT=2 | func AFNC.PARAM('SIVCFM',FCY)<>'2'"
+ When 'F' : CRITERE -= "& STA=2"
+ When 'V' : CRITERE -= "& STA=1"
+Endcase
+If [M:DIA]ALLFCY<>2
+ CRITERE -= '& FCY = "'+[M:DIA]FCY+'"'
+Endif
+If [M:DIA]ALLUSR<>2
+ CRITERE -= '& (UPDUSR = "'+[M:DIA]USR+'"'
+ CRITERE -= '| (UPDUSR = "" & CREUSR = "'+[M:DIA]USR+'"))'
+Endif
+If [M:DIA]STRDAT<>[0/0/0]
+ CRITERE -= "& ACCDAT>=["+format$(GFMD,[M:DIA]STRDAT)+"]"
+Endif
+If [M:DIA]ENDDAT<>[0/0/0]
+ CRITERE -= "& ACCDAT<=["+format$(GFMD,[M:DIA]ENDDAT)+"]"
+Endif
+If [M:DIA]VCRDEB<>""
+ CRITERE -= '& NUM>="'+[M:DIA]VCRDEB+'"'
+Endif
+If [M:DIA]VCRFIN<>""
+ CRITERE -= '& NUM<="'+[M:DIA]VCRFIN+'"'
+Endif
+Case [M:DIA]ACTION
+ When 'C' :
+   If [M:DIA]ALLTYP<>2
+    CRITERE -= '& SIVTYP="'+[M:DIA]SIVTYP+'"'
+   Endif
+ When "F" , "V" :
+   If [M:DIA]ALLTYP<>2
+    CRITERE -= '& PIVTYP="'+[M:DIA]SIVTYP+'"'
+   Else
+    CRITERE -= '& INVTYP<>5' : # Not the proforma
+   Endif
+Endcase
+
+#### Entry point FILTRE : additional selection
+GPOINT = "FILTRE" : Gosub ENTREE From EXEFNC
+If vireblc(FILTRE,2)="" : FILTRE="1=1" : Endif
+
+NBPCE = 0
+For [CPY2] Where ([M:DIA]ALLCPY=2 | CPY=[M:DIA]CPY) & CPYLEGFLG=2 & LEG=GCURLEG
+ COMPANY= [F:CPY2]CPY
+ Case [M:DIA]ACTION
+  When 'C' : Gosub TRTVALC
+  When 'F' : Gosub TRTVALF
+  When 'V' : Gosub TRTVALV
+ Endcase
+Next
+
+If !NBPCE
+ # No document to process
+ Call ECR_TRACE(mess(8,107,1),0) From GESECRAN
+Endif
+If !GSERVEUR & [M:DIA]TRC=2
+ Call FERME_TRACE From LECFIC
+ Call LEC_TRACE From LECFIC
+Endif
+
+Return
+
+##############################################
+Subprog PARAM(DOSSIER,USER,P1,P2,OK)
+Value    Char    DOSSIER
+Value    Char    USER
+Variable Char    P1()(1..)
+Variable Char    P2()(1..)
+Variable Integer OK
+Gosub OUVRE
+Gosub INIT_DIA
+
+Local Char    WIN (GLONFEN)
+WIN="FBPCVAL"
+Call PARAM(DOSSIER,USER,P1,P2,OK,TIT,WIN) From CPTTRT
+
+End
+
+$OUVRE_BATCH
+$OUVRE
+Local Integer OK , NBPCE
+Local Char    CRITERE(250) , FILTRE(250), OPTVAL(1), CRITERE2(250)
+Local Integer FLGINTCPY
+
+# Issue X3-102547
+Gosub OUVRE_ACT_CODE From SUBBIS2
+
+# 103027 Sage Exchange
+If func AFNC.ACTIV("SEPP")
+  Global Char     GSEPAYLOT
+  Global Integer  GSENBRPAY # 119006.n
+Endif
+
+OPTVAL = PARAM(1)
+Case OPTVAL
+ When "C" :
+  If clalev([F:SIH])=0  : Local File SINVOICE [SIH] : Endif
+  Gosub OUVRE From WOBIC
+ When "F" , "V" :
+  If clalev([F:PIH])=0  : Local File PINVOICE [PIH] : Endif
+  Gosub OUVRE From WOBIS
+ When Default
+  GERR = 1 : GMESSAGE = mess(92,116,1) : # Argument incorrect
+Endcase
+# BRBAN 105200#US2 Need to update invoice REVCANSTA
+If func AFNC.ACTIV("INVCA")>0
+  If !clalev([F:ISIH]) : Local File SINVOICE [ISIH] : Endif
+Endif
+#-
+Gosub OUVRE2
+Return
+
+$OUVRE2
+Local Mask GACCENT0 [HAE0], GACCENT1 [HAE1], GACCENT2 [HAE2], VENTILE  [VTL], VENTILE2 [VT2]
+If clalev([F:GAU])=0 : Local File GAUTACE     [GAU] : Endif
+If clalev([F:GAD])=0 : Local File GAUTACED    [GAD] : Endif
+If clalev([F:GAG])=0 : Local File GAUTACEF    [GAG] : Endif
+If clalev([F:CAC])=0 : Local File GACCCODE    [CAC] : Endif
+If clalev([F:COA])=0 : Local File GCOA        [COA] : Endif
+If clalev([F:GAC])=0 : Local File GACCOUNT    [GAC] : Endif
+If clalev([F:CPY])=0 : Local File COMPANY     [CPY] : Endif
+If clalev([F:CPY2])=0 : Local File COMPANY     [CPY2] : Endif
+If clalev([F:FCY])=0 : Local File FACILITY    [FCY] : Endif
+If clalev([F:TCU])=0 : Local File TABCUR      [TCU] : Endif
+If clalev([F:TCH])=0 : Local File TABCHANGE   [TCH] : Endif
+If clalev([F:TCK])=0 : Local File TABACCLIK   [TCK] : Endif
+If clalev([F:GTE])=0 : Local File GTYPACCENT  [GTE] : Endif
+If clalev([F:DUD])=0 : Local File GACCDUDATE  [DUD] : Endif
+If clalev([F:DIE])=0 : Local File GDIE        [DIE] : Endif
+If clalev([F:CCE])=0 : Local File CACCE       [CCE] : Endif
+If clalev([F:FIY])=0 : Local File FISCALYEAR  [FIY] : Endif
+If clalev([F:PER])=0 : Local File PERIOD      [PER] : Endif
+If clalev([F:BPR])=0 : Local File BPARTNER    [BPR] : Endif
+If clalev([F:TUN])=0 : Local File TABUNIT     [TUN] : Endif
+If clalev([F:DSP])=0 : Local File CADSP       [DSP] : Endif
+If clalev([F:AUZ])=0 : Local File CAAUZ       [AUZ] : Endif
+If clalev([F:ANM])=0 : Local File ACODNUM     [ANM] : Endif
+If clalev([F:AVN])=0 : Local File AVALNUM     [AVN] : Endif
+If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+If clalev([F:ATZ])=0 : Local File ATABZON     [ATZ] : Endif
+If clalev([F:ATI])=0 : Local File ATABIND     [ATI] : Endif
+If clalev([F:CCE2])=0 : Local File CACCE      [CCE2] : Endif
+If clalev([F:ATB])=0  : Local File ATABLE     [ATB]  : Endif
+If clalev([F:HAE2])=0 : Local File GACCTMP    [HAE2] : Endif
+If clalev([F:GCM])=0  : Local File GACM       [GCM] : Endif
+If GMODU(2)=2  :# Accounting
+ If clalev([F:GDE])=0 : Local File GDIAENTRY   [GDE] : Endif
+ If clalev([F:GDD])=0 : Local File GDIAENTRYD  [GDD] : Endif
+ If clalev([F:PBS])=0 : Local File GAPARBSE    [PBS] : Endif
+ If clalev([F:JOU])=0 : Local File GJOURNAL    [JOU] : Endif
+ If clalev([F:JST])=0 : Local File GAJOUSTA    [JST] : Endif
+ If clalev([F:HAE1])=0 : Local File GACCENTRY  [HAE1] : Endif
+Endif
+If func AFNC.ACTIV("INTCO")
+ If clalev([F:ICF])=0 : Local File INTCOFLO  [ICF] : Endif
+Endif
+
+# Folder single leg GCURLEG must be GDOSLEG
+If GNBLEG = 1  : GCURLEG = GDOSLEG : Endif
+Return
+
+# Customer BP invoices
+$TRTVALC
+For [SIH] Where evalue(CRITERE) & evalue(FILTRE) & evalue(CRITERE2) & CPY=COMPANY
+ Gosub TRTVALBIC
+ If GOK<0 & GTRACE<>""
+  Call ECR_TRACE([F:SIH]NUM-mess(17,107,1),1) From GESECRAN  :# Rollback
+  Call ECR_TRACE("",0) From GESECRAN
+ Endif
+Next
+Return
+
+## Supplier BP invoices
+$TRTVALF
+For [PIH] Where evalue(CRITERE) & evalue(FILTRE) & CPY=COMPANY
+ Gosub TRTVALBIS
+ If GOK<0 & GTRACE<>""
+  Call ECR_TRACE([F:PIH]NUM-mess(17,107,1),1) From GESECRAN  :# Rollback
+  Call ECR_TRACE("",0) From GESECRAN
+ Endif
+Next
+Return
+
+## Supplier invoices : 'Pending' --> 'To validate'
+$TRTVALV
+Call DEBTRANS From GLOCK
+Trbegin [PIH]
+GOK = 1
+For [PIH] Where evalue(CRITERE)  & evalue(FILTRE) & CPY=COMPANY
+ OK = 1 : mkstat = 0
+ Call CONTFCY([F:PIH]FCY) From CPTSUB
+ If mkstat : OK = 0 : Endif
+ If OK & [F:PIH]INVTYP<>5
+  NBPCE += 1
+  SYMBOLE = "PIH"+[F:PIH]NUM
+  Lock =SYMBOLE With lockwait=0
+  If fstat=1
+   Call ECR_TRACE([F:PIH]NUM-mess(10,100,1),1) From GESECRAN
+  Else
+   [F:PIH]STA = 2
+   Rewrite [PIH]
+   If fstat : GOK = 0 : Call FSTA("PIH") From GLOCK : Break : Endif
+   If GOK=1 & GTRACE<>""
+    # Invoice/Credit memo
+    Call ECR_TRACE(mess(16,122,1)-[F:PIH]NUM,0) From GESECRAN
+   Endif
+   Unlock =SYMBOLE
+  Endif
+ Endif
+Next
+If GOK<0    : Goto ROLL
+Elsif GOK=0 : Goto ABORT
+Endif
+Commit
+Return
+
+$ROLL
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TRTVALV : Endif
+Return
+
+$ABORT
+Rollback
+Return
+
+$TRTVALBIC
+OK = 1 : mkstat=0
+Call CONTFCY([F:SIH]FCY) From CPTSUB
+If mkstat : OK = 0 : Endif
+If OK
+ NBPCE += 1
+ SYMBOLE = "SIH"+[F:SIH]NUM
+ Lock =SYMBOLE With lockwait=0
+ If fstat=1
+  Call ECR_TRACE([F:SIH]NUM-mess(10,100,1),1) From GESECRAN
+ Else
+  Call VALID([F:SIH]NUM) From SUBBIC
+  If GOK=1 & GTRACE<>""
+   If [F:SIH]NBRCPY<=1
+    [L]FLGINTCPY = 0
+    Call ECR_TRACE(mess(11,107,1)-[F:SIH]NUM,0) From GESECRAN
+   Else : # Inter-company invoices
+    If ![L]FLGINTCPY : Call ECR_TRACE("",0) From GESECRAN : Endif
+    Call ECR_TRACE(mess(327,107,1)-[F:SIH]NUM-":",0) From GESECRAN
+    For [ICF]ICF0 Where ABRFIC="SIH" & NUM=[F:SIH]NUM & FCYTGR=""
+     Call ECR_TRACE(mess(11,107,1)-[F:ICF]TYPVCR-[F:ICF]NUMVCR-"("+[F:ICF]CPYTGR+")",0) From GESECRAN
+    Next
+    Call ECR_TRACE("",0) From GESECRAN : [L]FLGINTCPY = 1
+   Endif
+  Else
+   If [F:SIH]NBRCPY<=1
+    [L]FLGINTCPY = 0
+    Call ECR_TRACE(mess(12,107,1)-[F:SIH]NUM-GMESSAGE,1) From GESECRAN
+   Else
+    If ![L]FLGINTCPY : Call ECR_TRACE("",0) From GESECRAN : Endif
+    Call ECR_TRACE(mess(327,107,1)-[F:SIH]NUM-":",0) From GESECRAN
+    Call ECR_TRACE(mess(12,107,1)-[F:SIH]NUM-GMESSAGE,1) From GESECRAN
+    Call ECR_TRACE("",0) From GESECRAN : [L]FLGINTCPY = 1
+   Endif
+  Endif
+  Unlock =SYMBOLE
+ Endif
+Endif
+Return
+
+$TRTVALBIS
+OK = 1 : mkstat=0
+Call CONTFCY([F:PIH]FCY) From CPTSUB
+If mkstat : OK = 0 : Endif
+If OK
+ NBPCE += 1
+ SYMBOLE = "PIH"+[F:PIH]NUM
+ Lock =SYMBOLE With lockwait=0
+ If fstat=1
+  Call ECR_TRACE([F:PIH]NUM-mess(10,100,1),1) From GESECRAN
+ Else
+  If [F:PIH]INVTYP<>5
+   Call VALID([F:PIH]NUM) From SUBBIS
+  Elsif [F:PIH]RITNBR<>0
+   Call VALIDPRO([F:PIH]NUM) From SUBBIS
+  Else GOK=2
+   # No retention on this Invoice
+   GMESSAGE=mess(18,131,1)
+   Call ECR_TRACE([F:PIH]NUM-GMESSAGE,1) From GESECRAN
+  Endif
+  If GOK=1 & GTRACE<>""
+   If [F:PIH]NBRCPY<=1
+    [L]FLGINTCPY = 0
+    Call ECR_TRACE(mess(11,107,1)-[F:PIH]NUM,0) From GESECRAN
+   Else : # Inter-company invoices
+    If ![L]FLGINTCPY : Call ECR_TRACE("",0) From GESECRAN : Endif
+    Call ECR_TRACE(mess(327,107,1)-[F:PIH]NUM-":",0) From GESECRAN
+    For [ICF]ICF0 Where ABRFIC="PIH" & NUM=[F:PIH]NUM & FCYTGR=""
+     Call ECR_TRACE(mess(11,107,1)-[F:ICF]TYPVCR-[F:ICF]NUMVCR-"("+[F:ICF]CPYTGR+")",0) From GESECRAN
+    Next
+    Call ECR_TRACE("",0) From GESECRAN : [L]FLGINTCPY = 1
+   Endif
+  Else
+   If [F:PIH]NBRCPY<=1
+    [L]FLGINTCPY = 0
+    Call ECR_TRACE(mess(12,107,1)-[F:PIH]NUM-GMESSAGE,1) From GESECRAN
+   Else
+    If ![L]FLGINTCPY : Call ECR_TRACE("",0) From GESECRAN : Endif
+    Call ECR_TRACE(mess(327,107,1)-[F:PIH]NUM-":",0) From GESECRAN
+    Call ECR_TRACE(mess(12,107,1)-[F:PIH]NUM-GMESSAGE,1) From GESECRAN
+    Call ECR_TRACE("",0) From GESECRAN : [L]FLGINTCPY = 1
+   Endif
+  Endif
+  Unlock =SYMBOLE
+ Endif
+Endif
+Return
+
+################################################################
+# Mask  BPCVAL
+################################################################
+Subprog AS_ALLCPY(VALEUR)
+Variable Integer  VALEUR
+End
+
+Subprog C_ALLCPY(VALEUR)
+Variable Integer VALEUR
+Call C_ALLCPY(VALEUR) From CPTTRT
+End
+
+Subprog AS_CPY(VALEUR)
+Variable Char  VALEUR
+If [M]ALLCPY=2 : mkstat = 1 : End : Endif
+End
+
+Subprog C_CPY(VALEUR)
+Variable Char    VALEUR()
+# The mask displays all previous entered data. When we go back to GESBIC the legisltaion gets clear out
+# if Allcompanies checkbox is unselected (in C_ALLCPY). In that case, to keep the legislation :
+If dim([M]LEG)>0 : [M]LEG = [F:CPY]LEG : Endif
+# Initialize the global varibales in order to allow the controls (group , leg ..) of the different object available as on the GTE / JOU etc..
+GCURLEG=[F:CPY]LEG
+GSOCIETE=VALEUR
+If GCURFCY=""
+ I = find(GSOCIETE,GSOCSITE(1..GNBSITE))
+ GCURFCY = GSITE(I)
+Endif
+End
+
+Subprog AM_CPY(VALEUR)
+Variable Char  VALEUR
+Call AM_CPY(VALEUR) From CPTTRT
+End
+
+Subprog C_LEG(VALEUR)
+Variable Char    VALEUR()
+Call C_LEG(VALEUR) From CPTTRT
+End
+
+Subprog AS_ALLFCY(VALEUR)
+Variable Integer  VALEUR
+Call AS_ALLFCY(VALEUR) From CPTTRT
+End
+
+Subprog C_ALLFCY(VALEUR)
+Variable Integer VALEUR
+Call C_ALLFCY(VALEUR) From CPTTRT
+End
+
+Subprog AS_FCY(VALEUR)
+Variable Char VALEUR
+If [M]ALLFCY=2 : mkstat = 1 : End : Endif
+End
+
+Subprog C_FCY(VALEUR)
+Variable Char     VALEUR
+Call C_FCY(VALEUR) From CPTTRT
+End
+
+Subprog AS_USR(VALEUR)
+Variable Char     VALEUR
+If [M]ALLUSR = 2 : VALEUR="" : mkstat = 2 : End : Endif
+If VALEUR=""
+ VALEUR = GUSER
+Endif
+End
+
+Subprog AS_VCRFIN(VALEUR)
+Variable Char    VALEUR()
+If VALEUR="" | VALEUR<[M]VCRDEB : VALEUR=[M]VCRDEB : Endif
+End
+
+Subprog C_VCRFIN(VALEUR)
+Variable Char    VALEUR()
+If VALEUR<>"" & VALEUR<[M]VCRDEB
+ GMESSAGE = mess(44,199,1) :# La borne fin est inferieure a la borne debut
+ mkstat = 2
+Endif
+End
+
+Subprog AS_SIVTYP(VALEUR)
+Variable Char    VALEUR()
+If [M]ALLTYP=2 : mkstat=2 : End : Endif
+End
+
+Subprog IB_SIVTYP
+Raz GBOUTS, GBOUT1, GBOUT2, GBOUT3, GBOUT4, GBOUT5
+
+Case [M:DIA]ACTION
+ When 'C' :
+  GBOUT2 = mess(18,100,1)   # Selection
+  GBOUT4 = mess(191,124,1)
+ When 'F' , 'V' :
+  GBOUT3 = mess(18,100,1)   # Selection
+  GBOUT5 = mess(191,124,1)
+Endcase
+End
+
+Subprog C_SIVTYP(VALEUR)
+Variable Char    VALEUR()
+If !clalev([F:TSV]) : Local File TABSIVTYP [TSV] : Endif
+If !clalev([F:TPV]) : Local File TABPIVTYP [TPV] : Endif
+If VALEUR<>""
+ Case [M]ACTION
+  When "C"      : Call CONTTSV(VALEUR,GCURLEG,"BPCVAL","SIVTYP",[M]FCY,"",[M]CPY) From SUBTSV
+  When "F", "V" : Call CONTTPV(VALEUR,GCURLEG,"BPCVAL","SIVTYP",[M]FCY,"",[M]CPY) From SUBTPV
+ Endcase
+Endif
+End
+
+Subprog AM_ALLTYP(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+ [M]SIVTYP=""
+Endif
+End
+
+Subprog D_INI(VALEUR)
+Variable Char    VALEUR()
+Call D_INI (VALEUR) From CPTTRT
+End
+
+$SEL_TABLE
+Case COUZON
+ When "VCRDEB", "VCRFIN" :
+  Case [M]ACTION
+   When "C"      : OBJET = "BIC" : Gosub SELFAC
+   When "F", "V" : OBJET = "BIS" : Gosub SELFAC
+  Endcase
+Endcase
+Return
+
+$SELFAC
+Case [M]ACTION
+ When "C" : CRITERE = 'STA<3'   : # To valid
+ When "F" : CRITERE = 'STA=2'   : # To valid
+ When "V" : CRITERE = 'STA=1'   : # Waiting
+Endcase
+If [M:DIA]ALLCPY<>2
+ CRITERE -= '& CPY = "'+[M:DIA]CPY+'"'
+Else
+ CRITERE -= '& [F:CPY]LEG = "'+GCURLEG+'"'
+ CRITERE += ' | [F:CPY]LEG=""'
+Endif
+If [M:DIA]ALLFCY<>2
+ CRITERE -= '& FCY = "'+[M:DIA]FCY+'"'
+Endif
+Return
+
+
+########################################################
+# Evaluation de zones lors de la validation de factures
+########################################################
+Subprog VALBPC(AMT1,AMT2,AMT3,AMT4,STAT)
+Value    Decimal AMT1      # [F]AMTNOTLIN : Montant total ligne
+Value    Decimal AMT2      #  MNT ou QTE  : Montant ou quantité (analytique)
+Value    Decimal AMT3      #  xxxVAT ou xxxTAXx  : Montant
+Variable Decimal AMT4      #  Resultat
+Variable Integer STAT
+
+If AMT1<>0
+    AMT4 = AMT2*AMT3/AMT1
+Endif
+End
+
+######################################################################################
+

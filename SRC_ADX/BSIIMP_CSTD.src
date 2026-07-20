@@ -1,0 +1,203 @@
+#<AdxTL>@(#)6.0.0.0 $Revision$ Bank statement import
+######################################################################################################
+# Project       : Bank statement import (MT940)
+# File          : BSIIMP_CSTD
+# Version       : 1.0
+# Author        : Todor Ganchovsky
+# Creation Date : 17.05.2016
+######################################################################################################
+# Module        : Finance
+# Description   : Import screen (Class BSIIMP)
+######################################################################################################
+# Updates       :
+# Date          | Author | Version | Description
+# 2017-05-12    | Bader  | 2017.R3 | X3-35653: Support FLGCRE = 3/4 (partially validated, manually closed > new local menu 3690)
+# 2017-09-21    | DNE    | 2017.R3 | X3-55850: Support statement header status 'Reconcile'
+# Issue X3-109897 - 2018-10-09 by SEMOL : BAI originator ID hidded when it's not BAI2 format type
+######################################################################################################
+
+
+#**
+#* Label for coding event of CRUD
+#* @param CURPTH Local Char(250), contains the class path
+#* @param AEVENT Local Char(20), contains the event code
+#* @return ASTATUS Local Integer
+#*!
+$EVENTS
+    Case [L]CURPTH
+        When ""
+            Case [L]AEVENT
+                When "ADELETE_CONTROL_BEFORE" : Gosub ADELETE_CONTROL_BEFORE
+                When "AREAD_AFTER"            : Gosub SET_HEADER_ATTRIBUTES
+            Endcase
+    Endcase
+Return
+
+
+#**
+#* Label for coding action on INIT, GET, CONTROL and PROPAGATE
+#* @param CURPRO Local Char(50), contains the property code
+#* @param ARULE Local Char(20), contains the action code requested
+#* @return ASTATUS Local Integer
+#*!
+$PROPERTIES
+    Case [L]ARULE
+        When "CONTROL"
+            Case [L]CURPRO
+                When "CPY" : Gosub CHECK_FCY_VS_CPY From BSILIB
+                When "FCY" : Gosub CHECK_FCY_VS_CPY From BSILIB
+                When "BAN" : Gosub CHECK_BAN_VS_CPY_FCY From BSILIB
+            Endcase
+    Endcase
+Return
+
+
+#**
+#* Label for coding your methods
+#* @param AMETHOD Local Char(20), contains the method code
+#* @return ARET_VALUE (the type of the return value is declared in the method)
+#*!
+$METHODS
+#    Case [L]AMETHOD
+#    Endcase
+Return
+
+
+#**
+#* Label for coding your operations
+#* @param AOPERATION Local Char(20), contains the operation code
+#* @return ARET_VALUE (the type of the return value is declared in the method)
+#*!
+$OPERATIONS
+    Case [L]AOPERATION
+        When "RESET_MATCHING" : Gosub RESET_MATCHING
+    Endcase
+Return
+
+########################################################################################################################
+
+$ADELETE_CONTROL_BEFORE
+    If !clalev ([F:BSIDUD]) :  Local File BSIDUD      [BSIDUD] :  Endif # Open items for one transaction
+    If !clalev ([F:BSIMAN]) :  Local File BSIMANENT   [BSIMAN] :  Endif # Manually created matchings.
+
+    # We can only delete if no open item information exists, and ...
+    Look [F:BSIDUD]BSIDUD0(1) = this.STMCOD
+    If !fstat
+        ASTATUS = fmet this.ASETERROR( "",  this.STMCOD - mess(3,7703,1) - "(" + mess(9,7703,1) + ")", [V]CST_AERROR )
+        # 'Statement cannot be deleted' /  'Statement already matched or payment created'
+        Return
+    Endif
+
+    # ... no manual entries are made.
+    Look [F:BSIMAN]BSIMAN0(1) = this.STMCOD
+    If !fstat
+        ASTATUS = fmet this.ASETERROR( "",  this.STMCOD - mess(3,7703,1) - "(" + mess(9,7703,1) + ")", [V]CST_AERROR )
+        # 'Statement cannot be deleted' /  'Statement already matched or payment created'
+        Return
+    Endif
+
+    # 2017-09-21 DNE X3-55850
+    #
+    # Note: For the moment we do not support deleting if the bank statement import settings are set to
+    #       "Reconciliation only".
+    #
+    If !clalev([F:BSIIP])  : Local File BSIIMPPAR [BSIIP] : Endif
+
+    # Read corresponding import settings
+    Read [F:BSIIP]BSIIP0 = this.CODIMPPAR
+    If fstat
+        # Note: We only warn in the case import settings are missing for otherwise deleteing would be
+        #       impossible at all.
+        #
+        ASTATUS = fmet this.ASETERROR( "", this.CODIMPPAR - "~" - mess(6,7703,1), [V]CST_AWARNING ) # 'Import settings not found'
+        Return
+    Endif
+
+    # Check if flow type is 'Reconciliation only'. Alert and cancel in case it is.
+    If [F:BSIIP]FLOTYP = 2
+        # Message: "Action not possible for bank statements with flow type '$1$'"
+        ASTATUS = fmet this.ASETERROR( "",func AFNC.MES1( mess(241,7703,1), mess(max( 1, [F:BSIIP]FLOTYP ),3694,1) ), [V]CST_AERROR )
+        Return
+    Endif
+Return
+
+
+########################################################################################################################
+
+$RESET_MATCHING
+    If !clalev ([F:BSIIMP])    Local File BSIIMP      [BSIIMP]  Endif # Header import
+    If !clalev ([F:BSIIMPD])   Local File BSIIMPD     [BSIIMPD] Endif # Details import
+
+    Local Char MSG(250)        # Message from BSI_UNMATCH() function.
+    Local Integer STA          # Status from BSI_UNMATCH() function.
+    Local Char SYMBOL(255)     # Contains the symbol to lock while updates are in progress.
+
+    # Initialize variables
+    ASTATUS = [V]CST_ASUCCESS
+
+    # Start database transaction
+    Local Integer SAVADXLOG : SAVADXLOG = adxlog
+
+    If !SAVADXLOG
+        Trbegin [F:BSIIMP], [F:BSIIMPD]
+    Endif
+
+    # Do some pre-checkings on the header (statement) before looping over all
+    # its transactions.
+    Read [F:BSIIMP]BSIIMP0 = [L]STMCOD  # Read statement (import header)
+    If fstat # Not found?
+        ASTATUS = fmet this.ASETERROR( "", [L]STMCOD - mess(1,7703,1), [V]CST_AERROR ) # 'Statement does not exist'
+    Elsif [F:BSIIMP]FLGMTC >= 3 # Already validated?
+        ASTATUS = fmet this.ASETERROR( "", [L]STMCOD - mess(2,7703,1), [V]CST_AERROR ) # 'Statement already validated'
+    Else
+        # Loop over set of transactions.
+        For [F:BSIIMPD]BSIIMPD0 Where [F:BSIIMPD]STMCOD = [L]STMCOD
+            If [F:BSIIMPD]FLGCRE >= 2                     # check if validated, partially validated or manually closed > no unmatch
+                ASTATUS = fmet this.ASETERROR( "", [L]STMCOD - mess(2,7703,1), [V]CST_AERROR ) # 'Statement already validated'
+            Else
+                # Try to lock the current MDT object.
+                SYMBOL = "BSIIMPD~" + num$([F:BSIIMPD]LIN) +"\" + [F:BSIIMPD]STMCOD
+                Lock =SYMBOL With lockwait = 0
+                If fstat
+                    # Locking was not possible.
+                    ASTATUS = fmet this.ASETERROR( "", SYMBOL - mess(124,187,1), [V]CST_AERROR ) # "Locked document: update is impossible "
+                    Break
+                Else
+                    Call BSI_UNMATCH( [F:BSIIMPD]STMCOD, [F:BSIIMPD]LIN, STA, MSG ) From BSILIBMTC
+                    Unlock =SYMBOL
+                    If STA >= 3
+                        ASTATUS = fmet this.ASETERROR( "", MSG, [V]CST_AERROR )
+                        Break
+                    Elsif STA >= 1
+                        ASTATUS = fmet this.ASETERROR( "", MSG, [V]CST_AWARNING )
+                    Endif
+                Endif
+            Endif
+        Next
+    Endif
+
+    # Check on errors.
+    If ASTATUS = [V]CST_AERROR
+        If !SAVADXLOG
+            Rollback
+        Endif
+    Else
+        If !SAVADXLOG
+            Commit
+        Endif
+        ASTATUS = fmet this.ASETERROR( "", func AFNC.MES1( mess(27,7703,1), [L]STMCOD ), [V]CST_ASUCCESS ) # 'Statement $1$ unmatched'
+    Endif
+    Call BSI_UPDATE_STATEMENT_STATE( [L]STMCOD ) From BSILIBMTC
+Return
+
+#SMO X3-109897
+$SET_HEADER_ATTRIBUTES
+  If this.FILFMT <> "BAI2" Then
+    ASTATUS = fmet this.ASETATTRIBUTE ("ORIGNTR","$isHidden","true")
+  Else
+    ASTATUS = fmet this.ASETATTRIBUTE ("ORIGNTR","$isHidden","false")
+  Endif
+Return
+#END SMO X3-109897
+########################################################################################################################
+

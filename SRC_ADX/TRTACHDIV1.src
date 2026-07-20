@@ -1,0 +1,3821 @@
+#<AdxTL>@(#)12.0.0.0 $Revision$
+
+##############################################################################
+# TRTACHDIV1        Traitements divers liés aux achats          Module Achat #
+# -------------------------------------------------------------------------- #
+#                                                                            #
+# ACTIONS modélisation WEB (Traitement divers)                               #
+#   - DIVALLCMM  : Mise à jour de tous les engag/pré-engag d'un document     #
+#   - DIVMAJCMM  : Mise à jour engagements/pré-engagements d'une ligne       #
+#   - DIVPSHAPP  : Mise à jour indicateur signature entête d'une DA          #
+#   - DIVPSDAPP  : Mise à jour indicateur signature lignes d'une DA          #
+#   - DIVLINAPP1 : Mise à jour indicateur signature d'une ligne de DA à 1    #
+#   - DIVPSHAPP1 : Mise à jour indicateur signature entête d'une DA à 1      #
+#   - DIVPOHAPP1 : Mise à jour indicateur signature d'une commande à 1       #
+#   - DIVPSHCLE  : Solde complet d'une DA avec désengagement si besoin       #
+#   - DIVPOHCLE  : Solde complet d'une commande avec désengagement si besoin #
+#   - DIVPSDCLE  : Solde d'une ligne de DA avec désengagement si besoin      #
+# -------------------------------------------------------------------------- #
+#                                                                            #
+# Sous-programmes :                                                          #
+#   - MAJ_CALTAX_LIG : S/P de calcul des bases et des taxes de la ligne      #
+#                      d'un document achat                                   #
+#   - DIVPOQCLE  : Solde d'une ligne de cde avec désengagement si besoin     #Issue 110325/125-2016-05-23 by SR
+##############################################################################
+
+#--- Issue 99254
+$VERIFCMM
+# Si pas de no engagement ou gestion des pré-engagements, pas de vérification
+If [L]WCMMNUM="" | [L]WTYP=1 Return Endif
+Local Decimal WCMDAMTCUR
+If !clalev([F:CMD])  Local File  GCOMMITD [CMD] : Endif
+For [CMD]CMD0 Where NUM=[L]WCMMNUM
+  [L]WCMDAMTCUR+=[F:CMD]AMTCUR
+Next
+# Correction du montant à engager/désengager dans le cas ou
+# son application entrainerait un montant d'engagement négatif
+# Remarque : on ne fait rien pour la quantité
+If [L]WCMDAMTCUR + [L]WAMTCUR*[L]WSIGN < 0
+  #WMSG = "Engagement prévue ="-num$([L]WAMTCUR*[L]WSIGN)
+  If [L]WSIGN=-1
+    [L]WAMTCUR = [L]WCMDAMTCUR
+  Else
+    [L]WAMTCUR = [L]WCMDAMTCUR*-1
+  Endif
+  #WMSG -= ": Engagement réalisé ="-num$([L]WAMTCUR*[L]WSIGN)
+  #Infbox WMSG
+  Return
+Endif
+# Correction si l'annulation du solde commande réengage à tord
+If [L]WABREV="POQ2" & [L]WSIGN=1
+  # Bien que la ligne cde soit soldée, il reste un montant engagé,
+  # il n'y a donc aucune raison de réengager sur l'annulation du solde
+  If [L]WCMDAMTCUR > 0
+    #WMSG = "Engagement prévu ="-num$([L]WAMTCUR*[L]WSIGN)
+    #WMSG-= ": Engagement réalisé = 0"
+    #Infbox WMSG
+    [L]WAMTCUR = 0
+    Return
+  Endif
+Endif
+Return
+#---
+
+################################################################################
+# DIVALLCMM : S/P Màj de tous les engag/pré-engag d'un document   MBT 24/10/05 #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVALLCMM (WNUMDOC,WSIGN,WTYP,WMSGFLG)                               #
+#   Sous-programme appelé par l'action DIVALLCMM.                              #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours et la ligne de DA ou        #
+#     de commande devra être mise à jour dans ce sous-programme.               #
+# ---------------------------------------------------------------------------- #
+#   WNUMDOC : Numéro du document concerné (DA, commande)                       #
+#   WSIGN   : Sens de ma mise à jour (+1 = Mise à jour,                        #
+#                                     -1 = Annulation)                         #
+#   WTYP    : Type d'engagement (1 = pré-engagement,                           #
+#                                2 = engagement)                               #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVALLCMM(WNUMDOC,WSIGN,WTYP,WMSGFLG)
+Value    Char     WNUMDOC
+Value    Integer  WSIGN
+Value    Integer  WTYP
+Value    Integer  WMSGFLG
+#----- Variables locales -----#
+Local    Integer  WLINDOC
+Local    Integer  WSEQDOC
+Local    Char     WABREV(5)
+Local    Integer  WRET
+Local    Integer  WFBUFLG
+Local    Libelle  WADXLOG
+Local    Libelle  WLOCK
+Local    Shortint WFBULINNBR
+Local    Char     WMSG(200)
+#-----
+Local Integer SAV_GOK                : [L]SAV_GOK      =GOK
+If [L]WTYP=1  [L]WABREV="PSD"  Else  [L]WABREV="POQ" : Endif
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_ALLCMM
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#----- Traitement de toutes les lignes non soldées du document -----#
+If [L]WTYP=1 : # Pré-engagement
+  If !clalev([F:PSH])  Local File PREQUIS  [PSH] : Endif
+  Local File PREQUISD  [PSD] : # Il faut réouvrir à cause du "Link" workflow
+  If [F:PSH]PSHNUM<>[L]WNUMDOC
+    Read [PSH] PSH0=[L]WNUMDOC
+    If fstat  [L]WRET=2 : Gosub TRT_ERR : Goto AB_ALLCMM : Endif
+  Endif
+  #----- Contrôle lock logique -----#
+  Call JELOCKE("PSH"+[L]WNUMDOC,[L]WRET) From OBJDIV
+  If [L]WRET=0
+    Lock="PSH"+[L]WNUMDOC
+    If fstat  [L]WRET=9 : Gosub TRT_ERR : Goto AB_ALLCMM : Endif
+    [L]WLOCK=1
+  Else
+    Raz [L]WRET, [L]WLOCK
+  Endif
+  #-----
+  Local File PREQUISD  [TB0]
+  Local File CPTANALIN [TB2]
+  # Issue X3-44845 - 2017-06-26 by SR : Uniquement pour lignes créées ou modifiées (tester CMMPRPFLG)
+  For [PSD] PSD0 Where PSHNUM=[L]WNUMDOC & LINCLEFLG<>2 & [F:PSD]CMMPRPFLG = 0
+     [L]WLINDOC=[F:PSD]PSDLIN
+      Gosub MAJCMM
+    If GOK=-1  Break : Endif
+    If GOK=0   Break : Endif
+    #----- Remettre indicateur engagement à 0 si annulation appelée par le workflow -----#
+    If [L]WSIGN=-1  [L]WCMMFLG=0 : Endif
+    #----- Mise à jour numéro pré-engagement sur ligne DA -----#
+    [L]WFBUFLG=[F:PSD]FBUFLG
+    Update [PSD] Where PSHNUM=[L]WNUMDOC & PSDLIN=[L]WLINDOC
+&                With  CMMPRPNUM=[L]WCMMNUM, CMMPRPFLG=[L]WCMMFLG, FBUFLG=[L]WFBUFLG
+    If fstat
+      GOK=0  : Call FSTA("PSD") From GLOCK
+      [L]WRET=7 : Gosub TRT_ERR : Break
+    Endif
+  Next
+Else         : # Engagement
+  If !clalev([F:POH])  Local File PORDER   [POH] : Endif
+  Local File PORDERQ  [POQ] : # Il faut réouvrir à cause du "Link" workflow
+  If [F:POH]POHNUM<>[L]WNUMDOC
+    Read [POH] POH0=[L]WNUMDOC
+    If fstat  [L]WRET=2 : Gosub TRT_ERR : Goto AB_ALLCMM : Endif
+  Endif
+  #----- Contrôle lock logique -----#
+  Call JELOCKE("POH"+[L]WNUMDOC,[L]WRET) From OBJDIV
+  If [L]WRET=0
+    Lock="POH"+[L]WNUMDOC
+    If fstat  [L]WRET=9 : Gosub TRT_ERR : Goto AB_ALLCMM : Endif
+    [L]WLOCK=1
+  Else
+    Raz [L]WRET, [L]WLOCK
+  Endif
+  #-----
+  For [POQ] POQ0 Where POHNUM=[L]WNUMDOC & LINCLEFLG<>2
+    [L]WLINDOC=[F:POQ]POPLIN
+    [L]WSEQDOC=[F:POQ]POQSEQ
+    Gosub MAJCMM
+    If GOK=-1  Break : Endif
+    If GOK=0   Break : Endif
+    #----- Remettre indicateur engagement à 0 si annulation appelée par le workflow -----#
+    If [L]WSIGN=-1  [L]WCMMFLG=0 : Endif
+    #----- Mise à jour numéro engagement sur ligne commande -----#
+    [L]WFBUFLG=[F:POQ]FBUFLG
+    Update [POQ] Where POHNUM=[L]WNUMDOC & POPLIN=[L]WLINDOC & POQSEQ=[L]WSEQDOC
+&                With  CMMNUM=[L]WCMMNUM, CMMFLG=[L]WCMMFLG, FBUFLG=[L]WFBUFLG
+    If fstat
+      GOK=0  : Call FSTA("POQ") From GLOCK
+      [L]WRET=8 : Gosub TRT_ERR : Break
+    Endif
+  Next
+Endif
+If GOK=-1  Goto ROLL_ALLCMM : Endif
+If GOK=0   Goto AB_ALLCMM   : Endif
+If [L]WTYP=1
+  #----- Màj indicateur nbre de lignes en dépassement de budget -----#
+  Gosub MAJPSHFBU : If GOK=0  [L]WRET=10 : Gosub TRT_ERR : Goto AB_ALLCMM : Endif
+Else
+  #----- Màj indicateur nbre de lignes en dépassement de budget -----#
+  Gosub MAJPOHFBU : If GOK=0  [L]WRET=11 : Gosub TRT_ERR : Goto AB_ALLCMM : Endif
+Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+#----- Déblocage logique si nécessaire -----#
+$FIN_ALLCMM
+If [L]WLOCK
+  If [L]WTYP=1
+    Unlock="PSH"+[L]WNUMDOC
+  Else
+    Unlock="POH"+[L]WNUMDOC
+  Endif
+Endif
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+End
+#-----
+$ROLL_ALLCMM
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  Goto FIN_ALLCMM  Else  Goto TR_ALLCMM : Endif
+Else
+  Goto FIN_ALLCMM
+Endif
+#-----
+$AB_ALLCMM
+If [L]WADXLOG=0
+  Rollback
+Endif
+Goto FIN_ALLCMM
+
+
+################################################################################
+# TRTMAJCMM : S/P Mise à jour des engagements/pré-engagements     MBT 24/10/05 #
+# ---------------------------------------------------------------------------- #
+# Subprog TRTMAJCMM (WNUMDOC,WLINDOC,WSEQDOC,WSIGN,WTYP,WABREV,WMSGFLG,WRET)   #
+#   Sous-programme appelé dans les traitements du module achats.               #
+#   Il y a toujours une transaction en cours et la ligne de DA ou de commande  #
+#     sera réécrite dans le traitement appelant.                               #
+# ---------------------------------------------------------------------------- #
+#   WNUMDOC : Numéro du document concerné (DA, commande)                       #
+#   WLINDOC : Numéro de ligne du document                                      #
+#   WSEQDOC : Numéro de séquence de la ligne (pour cde uniquement)             #
+#   WSIGN   : Sens de ma mise à jour (+1 = Mise à jour,                        #
+#                                     -1 = Annulation)                         #
+#   WTYP    : Type d'engagement (1 = pré-engagement,                           #
+#                                2 = engagement)                               #
+#   WABREV  : Contexte, abréviation écran ou table (------ Gestion DA -------- #
+#                                                   "PSD"  = Créat/Suppr DA    #
+#                                                   "PSD1" = Modif DA          #
+#                                                   "PSD2" = Solde/Désolde DA  #
+#                                                   ------ Consommation DA --- #
+#                                                   "PSD3" = Créat/Suppr cde   #
+#               Non utilisé (extension future) -->  "PSD4" = Modif commande    #
+#                                                   ------ Gestion commande -- #
+#                                                   "POQ"  = Créat/Suppr cde   #
+#                                                   "POQ1" = Modif commande    #
+#                                                   "POQ2" = Solde/Désolde cde #
+#                                                   ------ Validation fact --- #
+#                                                   "PID"  = Validation fac,   #
+#                                                   "PID1" = Dévalidation fac) #
+#                                                   -------------------------) #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+#   WRET    : Code retour ( 0 = Ok avec GOK=1,                                 #
+#                         1-5 = Erreur avec GOK=0 si bloquant)                 #
+# ---------------------------------------------------------------------------- #
+# Nota : GSYSCUR   = Devise du dossier (ou reporting)                          #
+#        GSOCIETE  = Société courante                                          #
+#        GLOCALDEV = Devise de la société courante                             #
+#        GFINRSP   = Site financier courant                                    #
+################################################################################
+Subprog TRTMAJCMM(WNUMDOC,WLINDOC,WSEQDOC,WSIGN,WTYP,WABREV,WMSGFLG,WRET)
+Value    Char    WNUMDOC
+Value    Integer WLINDOC
+Value    Integer WSEQDOC
+Value    Integer WSIGN
+Value    Integer WTYP
+Value    Char    WABREV
+Value    Integer WMSGFLG
+Variable Integer WRET
+#-----
+If [L]WTYP=1  Local File PREQUISD [TB0], CPTANALIN [TB2] : Endif
+Gosub MAJCMM
+If GOK<1  End : Endif
+#----- Mise à jour numéro d'engagement sur ligne de facture -----#
+#If [L]WABREV="PID" & dim([L]WCMMNUM2)>0 & [L]WCMMNUM2<>""
+#  Local Char    WNUM(GLONPIH) : [L]WNUM   =[F:PID]NUM
+#  Local Integer WPIDLIN       : [L]WPIDLIN=[F:PID]PIDLIN
+#  Update [PID] Where NUM=[L]WNUM & PIDLIN=[L]WPIDLIN
+#&              With  CMMNUM=[L]WCMMNUM2
+#  If fstat
+#    GOK=0  : Call FSTA("PID") From GLOCK : End
+#  Else
+#    [F:PID]CMMNUM=[L]WCMMNUM2
+#  Endif
+#Endif
+#-----
+End
+
+################################################################################
+# DIVMAJCMM : S/P Mise à jour des engagements/pré-engagements     MBT 24/10/05 #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVMAJCMM (WNUMDOC,WLINDOC,WSEQDOC,WSIGN,WTYP,WMSGFLG)               #
+#   Sous-programme appelé par l'action DIVMAJCMM.                              #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours et la ligne de DA ou        #
+#     de commande devra être mise à jour dans ce sous-programme.               #
+# ---------------------------------------------------------------------------- #
+#   WNUMDOC : Numéro du document concerné (DA, commande)                       #
+#   WLINDOC : Numéro de ligne du document                                      #
+#   WSEQDOC : Numéro de séquence de la ligne (pour cde uniquement)             #
+#   WSIGN   : Sens de ma mise à jour (+1 = Mise à jour,                        #
+#                                     -1 = Annulation)                         #
+#   WTYP    : Type d'engagement (1 = pré-engagement,                           #
+#                                2 = engagement)                               #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVMAJCMM(WNUMDOC,WLINDOC,WSEQDOC,WSIGN,WTYP,WMSGFLG)
+Value    Char     WNUMDOC
+Value    Integer  WLINDOC
+Value    Integer  WSEQDOC
+Value    Integer  WSIGN
+Value    Integer  WTYP
+Value    Integer  WMSGFLG
+#----- Variables locales -----#
+Local    Char     WABREV(5)
+Local    Integer  WRET
+Local    Integer  WFBUFLG
+Local    Libelle  WADXLOG
+Local    Shortint WFBULINNBR
+Local    Char     WMSG(200)
+#-----
+Local Integer SAV_GOK                : [L]SAV_GOK      =GOK
+If [L]WTYP=1  [L]WABREV="PSD"  Else  [L]WABREV="POQ" : Endif
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_MAJCMM
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+If [L]WTYP=1
+  Local File PREQUISD  [TB0]
+  Local File CPTANALIN [TB2]
+  Local File PREQUISD  [PSD] : # Il faut réouvrir à cause du "Link" workflow
+Else
+  Local File PORDERQ   [POQ] : # Il faut réouvrir à cause du "Link" workflow
+Endif
+Gosub MAJCMM
+If GOK=-1  Goto ROLL_MAJCMM : Endif
+If GOK=0   Goto AB_MAJCMM   : Endif
+#----- Remettre indicateur engagement à 0 si annulation appelée par le workflow -----#
+If [L]WSIGN=-1  [L]WCMMFLG=0 : Endif
+#-----
+If [L]WTYP=1 : # Mise à jour numéro pré-engagement sur ligne DA
+  [L]WFBUFLG=[F:PSD]FBUFLG
+  Update [PSD] Where PSHNUM=[L]WNUMDOC & PSDLIN=[L]WLINDOC
+&              With  CMMPRPNUM=[L]WCMMNUM, CMMPRPFLG=[L]WCMMFLG, FBUFLG=[L]WFBUFLG
+  If fstat
+    GOK=0  : Call FSTA("PSD") From GLOCK
+    [L]WRET=7 : Gosub TRT_ERR : Goto AB_MAJCMM
+  Endif
+  #----- Màj indicateur nbre de lignes en dépassement de budget -----#
+  Gosub MAJPSHFBU : If GOK=0  [L]WRET=10 : Gosub TRT_ERR : Goto AB_MAJCMM : Endif
+Else      : # Mise à jour numéro engagement sur ligne commande
+  [L]WFBUFLG=[F:POQ]FBUFLG
+  Update [POQ] Where POHNUM=[L]WNUMDOC & POPLIN=[L]WLINDOC & POQSEQ=[L]WSEQDOC
+&              With  CMMNUM=[L]WCMMNUM, CMMFLG=[L]WCMMFLG, FBUFLG=[L]WFBUFLG
+  If fstat
+    GOK=0  : Call FSTA("POQ") From GLOCK
+    [L]WRET=8 : Gosub TRT_ERR : Goto AB_MAJCMM
+  Endif
+  #----- Màj indicateur nbre de lignes en dépassement de budget -----#
+  Gosub MAJPOHFBU : If GOK=0  [L]WRET=11 : Gosub TRT_ERR : Goto AB_MAJCMM : Endif
+Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+$FIN_DIVMAJCMM
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+End
+#-----
+$ROLL_MAJCMM
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_MAJCMM : Endif
+Else
+  Goto FIN_DIVMAJCMM
+Endif
+#-----
+$AB_MAJCMM
+If [L]WADXLOG=0
+  Rollback
+Endif
+Goto FIN_DIVMAJCMM
+
+#-------------------------------------------------------------------#
+# Mise à jour nbre de lignes en dépassement de budget sur entête DA #
+#-------------------------------------------------------------------#
+$MAJPSHFBU
+Raz [L]WFBULINNBR
+For [PSD] PSD0 Where PSHNUM=[L]WNUMDOC
+  If [F:PSD]FBUFLG=2  [L]WFBULINNBR+=1 : Endif
+Next
+Update [PSH] Where PSHNUM=[L]WNUMDOC With FBULINNBR=[L]WFBULINNBR
+If fstat
+  GOK=0  : Call FSTA("PSH") From GLOCK
+Endif
+Return
+
+#-------------------------------------------------------------------------#
+# Mise à jour nbre de lignes en dépassement de budget sur entête commande #
+#-------------------------------------------------------------------------#
+$MAJPOHFBU
+Raz [L]WFBULINNBR
+For [POQ] POQ0 Where POHNUM=[L]WNUMDOC
+  If [F:POQ]FBUFLG=2  [L]WFBULINNBR+=1 : Endif
+Next
+Update [POH] Where POHNUM=[L]WNUMDOC With FBULINNBR=[L]WFBULINNBR
+If fstat
+  GOK=0  : Call FSTA("POH") From GLOCK
+Endif
+Return
+
+#------------------------------------------------------------#
+# Traitement des mise à jour des engagements/pré-engagements #
+#------------------------------------------------------------#
+$MAJCMM
+Local    Char    WCMMNUM(GLONVCR) : # , WCMMNUM2(GLONVCR)
+Local    Char    WMSG(200)
+Local    Integer SAV_GOK : [L]SAV_GOK=GOK : GOK=1 : Raz [L]WRET
+# Issue 82536 - 2012-06-29 by SR
+Local    Integer  WWSEQDOC
+#----- Test présence module comptabilité -----#
+If GMODU(2)<>2 | GOPTCANA<1  Return : Endif
+#----- Test si numéro de document renseigné -----#
+If [L]WNUMDOC="" | [L]WLINDOC=0
+  [L]WRET=1 : Gosub TRT_ERR : Return
+Endif
+#----- Lecture du document concerné -----#
+If [L]WTYP=1 : # Pré-engagement
+  If !clalev([F:PSH])  Local File PREQUIS   [PSH] : Endif
+  If !clalev([F:PSD])  Local File PREQUISD  [PSD] : Endif
+  If !clalev([F:CAL])  Local File CPTANALIN [CAL] : Endif
+  If [F:PSH]PSHNUM<>[L]WNUMDOC
+    Read [PSH] PSH0=[L]WNUMDOC
+    If fstat  [L]WRET=2 : Gosub TRT_ERR : Return : Endif
+  Endif
+  If [F:PSD]PSHNUM<>[L]WNUMDOC | [F:PSD]PSDLIN<>[L]WLINDOC
+    Read [PSD] PSD0=[L]WNUMDOC;[L]WLINDOC
+    If fstat  [L]WRET=2 : Gosub TRT_ERR : Return : Endif
+  Endif
+  Read [CAL] CAL0="PSD";0;[F:PSD]PSHNUM;[F:PSD]PSDLIN;0;"";1
+  If fstat  Raz [F:CAL] : Endif
+Else      : # Engagement
+  If !clalev([F:POH])  Local File PORDER    [POH] : Endif
+  If !clalev([F:POQ])  Local File PORDERQ   [POQ] : Endif
+  If !clalev([F:POP])  Local File PORDERP   [POP] : Endif
+  If !clalev([F:CAL])  Local File CPTANALIN [CAL] : Endif
+  If [F:POH]POHNUM<>[L]WNUMDOC
+    Read [POH] POH0=[L]WNUMDOC
+    If fstat  [L]WRET=2 : Gosub TRT_ERR : Return : Endif
+  Endif
+  If [F:POQ]POHNUM<>[L]WNUMDOC | [F:POQ]POPLIN<>[L]WLINDOC | [F:POQ]POQSEQ<>[L]WSEQDOC
+    Read [POQ] POQ0=[L]WNUMDOC;[L]WLINDOC;[L]WSEQDOC
+    If fstat  [L]WRET=2 : Gosub TRT_ERR : Return : Endif
+  Endif
+  #----- Pas d'engagement si ligne article composé (sous-traité, produit fini)
+  If [F:POQ]LINTYP=2  Return : Endif
+  If [F:POH]POHTYP<>2
+    If [F:POP]POHNUM<>[L]WNUMDOC | [F:POP]POPLIN<>[L]WLINDOC | [F:POP]POPSEQ<>1
+      Read [POP] POP0=[L]WNUMDOC;[L]WLINDOC;1
+      If fstat  [L]WRET=2 : Gosub TRT_ERR : Return : Endif
+    Endif
+  Else
+    If [F:POP]POHNUM<>[L]WNUMDOC | [F:POP]POPLIN<>[L]WLINDOC | [F:POP]POPDAT<[F:POQ]DEMRCPDAT
+      Filter [POP] Where POHNUM=[L]WNUMDOC & POPLIN=[L]WLINDOC & POPDAT>=[F:POQ]DEMRCPDAT
+      Read [POP] POP1 First
+      Filter [POP]
+      If fstat  [L]WRET=2 : Gosub TRT_ERR : Return : Endif
+    Endif
+  Endif
+  Read [CAL] CAL0="POP";0;[F:POP]POHNUM;[F:POP]POPLIN;[F:POP]POPSEQ;"";1
+  If fstat  Raz [F:CAL] : Endif
+  # Issue 82536 - 2012-06-29 by SR
+  WWSEQDOC = [F:POP]POPSEQ
+Endif
+#----- Variables locales -----#
+Local Char    WFCY(GLONFCY), WPARNAM(10), WPARAME(10)
+Local Libelle WCMMFLG, WCMMTAX
+#-----
+If [L]WTYP=1 : # Pré-engagement
+  [L]WFCY   =[F:PSD]PSHFCY
+  [L]WCMMNUM=[F:PSD]CMMPRPNUM
+  [L]WCMMFLG=[F:PSD]CMMPRPFLG
+  [L]WCMMTAX=[F:PSD]CMMPRPTAX
+  [L]WPARNAM="PURCMMPRP"
+Else      : # Engagement
+  [L]WFCY   =[F:POQ]POHFCY
+  [L]WCMMNUM=[F:POQ]CMMNUM
+  [L]WCMMFLG=[F:POQ]CMMFLG
+  [L]WCMMTAX=[F:POQ]CMMTAX
+  [L]WPARNAM="PURCMM"
+Endif
+#[L]WCMMNUM2=[L]WCMMNUM
+#----- Test si annulation et si numéro engagement/pré-engagement est connu -----#
+If [L]WSIGN=-1 & [L]WCMMNUM=""  Return : Endif
+If [L]WSIGN=-1 & [L]WCMMFLG=0   Return : Endif
+#----- Test si paramètre de mis à jour est égal à "Oui" -----#
+Call PARAML([L]WFCY,[L]WPARNAM,[L]WPARAME) From ADOVAL
+If val([L]WPARAME)<>2  Return : Endif
+#----- Particularité pour les commandes -----#
+If find([L]WABREV,"POQ","POQ1","POQ2")
+  #----- Si appel depuis les commandes et ligne soldée, on ne fait rien ! -----#
+  If [F:POQ]RCPCLEFLG=4 & [F:POQ]LINCLEFLG=2  Return : Endif
+  #----- Si autres appels, ligne soldée et sens +, on ne fait rien ! -----#
+  If [F:POQ]RCPCLEFLG=2 & [F:POQ]LINCLEFLG=2 & [L]WSIGN=1  Return : Endif
+  #-----
+  If [F:POQ]RCPCLEFLG=0  [F:POQ]RCPCLEFLG=1 : Endif
+  If [F:POQ]RCPCLEFLG=3  [F:POQ]RCPCLEFLG=4 : Endif
+Endif
+#----- Particularité pour les factures -----#
+If find([L]WABREV,"PID","PID1") & [F:POQ]RCPCLEFLG<>2
+  #----- Si appel depuis les factures et ligne soldée, on ne fait rien ! -----#
+  # Issue 94968/95376 - 2013-12-17 by MUARN : ne pas faire ce contrôle dans le cas des avoir, tout est
+  # traité dans TRTACHFAC1
+  #If [F:PID]PRIREN>=0 & [F:POQ]LINCLEFLG=2  Return : Endif
+  If [F:PID]PRIREN>=0 & [F:POQ]LINCLEFLG=2 & [F:PID]TYPORI<>4 Return : Endif
+Endif
+#----- Variables locales -----#
+Local Char    SAV_GSOCIETE(GLONCPY)  : [L]SAV_GSOCIETE  =GSOCIETE
+Local Char    SAV_GLOCALDEV(GLONCUR) : [L]SAV_GLOCALDEV =GLOCALDEV
+Local Char    SAV_GFINRSP(GLONFCY)   : [L]SAV_GFINRSP   =GFINRSP
+Local Integer SAV_GTYPGEN            : [L]SAV_GTYPGEN   =GTYPGEN
+Local Integer SAV_GTYPANA            : [L]SAV_GTYPANA   =GTYPANA
+Local Char    WPUU(GLONUOM), WSTU(GLONUOM)
+Local Char    WCUR(GLONCUR)
+Local Date    WDAT, WDAT2
+Local Decimal WQTYPUU, WQTYSTU, WQTYUOM
+Local Decimal WAMTCUR, WAMTLED, WCUMCUR, WCUMLED, WD
+Local Char    WITMREF(GLONITM), WBPSNUM(GLONBPS)
+Local Char    WCODGAU(GLONGAU), WTRTNAM(GLONADC)
+Local Char    WTYPPCE(GLONGTE), WNUMPCE(GLONPIH)
+Local Char    ID1(20)(1..2), ID2(20)(1..3)
+Local Decimal WRATDIV(1..10), WRATMLT(1..10)
+Local Integer TBTYPLED(1..10)
+Local Char    TPLAN  (GLONCOA)(1..10), TPLAN2  (GLONCOA)(1..10)
+Local Char    TCOMPTE(GLONGAC)(1..10), TCOMPTE2(GLONGAC)(1..10)
+Local Char    TBLED  (GLONLED)(1..10)
+Local Char    TBDIE  (GLONDIE)(1..GOPTCANA)
+Local Char    TBCCE  (GLONCCE)(1..GOPTCANA)
+#Local Char    TBDIE2 (GLONDIE)(1..GOPTCANA)
+#Local Char    TBCCE2 (GLONCCE)(1..GOPTCANA)
+Local Char    WCOMPTE(GLONGAC)
+Local Char    WCPTANA(GLONGAC)
+Local Char    WLED   (GLONLED)
+Local Char    WDEVLED(GLONCUR)
+Local Char    WCOA   (GLONCOA)
+Local Integer WI, WJ, WCHGTYP, WTYPORG, WBUDCTL, WCNTBUD
+#Local Char    WDOCUMENT(max(GLONPSH,GLONPOH))(1..3)
+Local Char    WDOCUMENT(max(GLONPSH,GLONPOH))(1..4)  # Issue 84939 - 2013-02-01 by MUARN : ajout n° seq commande
+Local Libelle WMOTIF(1..2)
+#----- Ouverture fichiers si nécessaire -----#
+If !clalev([F:GAD])  Local File GAUTACED [GAD] : Endif
+If !clalev([F:GAC])  Local File GACCOUNT [GAC] : Endif
+If !clalev([F:TCO])  Local File TABCOEFF [TCO] : Endif
+#-----
+Call GETDEV([L]WFCY)  From DEVSUB : If GFINRSP=""  GFINRSP=[L]WFCY : Endif
+Call GLOBVAR(GFINRSP) From WWGLOBBUD
+#----- Liste des types de référentiel de la société -----#
+Call LSTLEDTYP(GSOCIETE,0,[L]TBTYPLED,[L]WI) From CPTDIV
+#----- Référentiels, codes plans et comptes -----#
+For [L]WI=1 To 10
+  [L]TPLAN  ([L]WI)=[F:CAL]COA([L]WI-1)
+  [L]TCOMPTE([L]WI)=[F:CAL]ACC([L]WI-1)
+  [L]TBLED  ([L]WI)=[F:CAL]LED([L]WI-1)
+Next [L]WI
+#----- Compte général -----#
+Call LECLED(GSOCIETE,GTYPGEN,[L]WLED,[L]WDEVLED) From CPTDIV
+[L]WI=find([L]WLED,[F:CAL]LED(0..9))
+If [L]WI
+  [L]WCOMPTE=[F:CAL]ACC([L]WI-1)
+Endif
+#----- Compte analytique -----#
+Call LECLED(GSOCIETE,GTYPANA,[L]WLED,[L]WDEVLED) From CPTDIV
+[L]WI=find([L]WLED,[F:CAL]LED(0..9))
+If [L]WI
+  [L]WCPTANA=[F:CAL]ACC([L]WI-1)
+  [L]WCOA   =[F:CAL]COA([L]WI-1)
+Endif
+#----- Codes axes et sections analytiques -----#
+For [L]WI=1 To GOPTCANA
+  [L]TBDIE([L]WI)=[F:CAL]DIE([L]WI-1)
+  [L]TBCCE([L]WI)=[F:CAL]CCE([L]WI-1)
+Next [L]WI
+#----- Filtrage des codes et sections analytiques sur référentiel analytique -----#
+#             On ne filtre plus à partir de la version Béryl 6.1 !                #
+#---------------------------------------------------------------------------------#
+#Call SETCCEAXE(GSOCIETE,GTYPANA,TBDIE,TBCCE,TBDIE2,TBCCE2) From CPTDIV
+#-----
+If [L]WTYP=1 : # Pré-engagement
+  [L]WDAT   =[F:PSD]EXTRCPDAT
+  [L]WPUU   =[F:PSD]PUU
+  [L]WSTU   =[F:PSD]STU
+  Case [L]WABREV
+    When "PSD",  "PSD1", "PSD2"
+      [L]WQTYPUU=[F:PSD]QTYPUU-[F:PSD]ORDQTYPUU
+      [L]WQTYSTU=[F:PSD]QTYSTU-[F:PSD]ORDQTYSTU
+    When "PSD3", "PSD4"
+      [L]WQTYPUU=[F:PSO]QTYPUU
+      [L]WQTYSTU=[F:PSO]QTYSTU
+  Endcase
+  [L]WTYPPCE=""
+  [L]WNUMPCE=""
+  [L]WCUR   =[F:PSD]CUR
+  [L]WCHGTYP=[F:PSD]CHGTYP
+  Case [L]WCMMTAX
+    When 2       : #----- Pré-engagement HT + taxes non déductibles
+      [L]WAMTCUR=[F:PSD]LINAMT
+      # Issue 82857 - 2012-06-21 by MUARN : tva intra-comm si CEE HT=TTC toujours ajouté taxe non déductible
+      If [F:PSD]VACTYP <>4
+        If [F:PSD]LINATIAMT>[F:PSD]LINAMT
+          [L]WAMTCUR+=([F:PSD]AMTTAXLIN1-[F:PSD]DEDTAXLIN1)
+          [L]WAMTCUR+=([F:PSD]AMTTAXLIN2-[F:PSD]DEDTAXLIN2)
+          [L]WAMTCUR+=([F:PSD]AMTTAXLIN3-[F:PSD]DEDTAXLIN3)
+          [L]WAMTCUR+=([F:PSD]AMTTAXRCP -[F:PSD]DEDTAXRCP )
+          [L]WAMTCUR+=([F:PSD]AMTTAXISS -[F:PSD]DEDTAXISS )
+          [L]WAMTCUR+=([F:PSD]AMTTAXOTH1-[F:PSD]DEDTAXOTH1)
+          [L]WAMTCUR+=([F:PSD]AMTTAXOTH2-[F:PSD]DEDTAXOTH2)
+        Endif
+      Else
+        [L]WAMTCUR+=([F:PSD]AMTTAXLIN1-[F:PSD]DEDTAXLIN1)
+        [L]WAMTCUR+=([F:PSD]AMTTAXLIN2-[F:PSD]DEDTAXLIN2)
+        [L]WAMTCUR+=([F:PSD]AMTTAXLIN3-[F:PSD]DEDTAXLIN3)
+        [L]WAMTCUR+=([F:PSD]AMTTAXRCP -[F:PSD]DEDTAXRCP )
+        [L]WAMTCUR+=([F:PSD]AMTTAXISS -[F:PSD]DEDTAXISS )
+        [L]WAMTCUR+=([F:PSD]AMTTAXOTH1-[F:PSD]DEDTAXOTH1)
+        [L]WAMTCUR+=([F:PSD]AMTTAXOTH2-[F:PSD]DEDTAXOTH2)
+      Endif
+      If [F:PSD]QTYPUU=0 [F:PSD]QTYPUU=1 : Endif
+      [L]WAMTCUR=[L]WAMTCUR*[L]WQTYPUU/[F:PSD]QTYPUU
+    When 3       : #----- Pré-engagement TTC
+      If [F:PSD]QTYPUU=0 [F:PSD]QTYPUU=1 : Endif
+      [L]WAMTCUR=[F:PSD]LINATIAMT*[L]WQTYPUU/[F:PSD]QTYPUU
+    When Default : #----- Pré-engagement HT
+      [L]WAMTCUR=[F:PSD]NETPRI*[L]WQTYPUU
+  Endcase
+  [L]WBPSNUM=[F:PSD]BPSNUM
+  [L]WITMREF=[F:PSD]ITMREF
+  [L]WTYPORG=3
+  [L]WCODGAU="PQUIS"
+  [L]WTRTNAM="CPTCOD"
+  [L]ID1(1) =[F:PSD]PSHNUM
+  [L]ID1(2) =num$([F:PSD]PSDLIN)
+  [F:TB0]=[F:PSD]
+  [F:TB2]=[F:CAL]
+Else      : # Engagement
+  Call PARAML([L]WFCY,"PURCMMDAT",[L]WPARAME) From ADOVAL
+  If val([L]WPARAME)=1
+    [L]WDAT =[F:POH]ORDDAT
+  Else
+    [L]WDAT =[F:POQ]EXTRCPDAT
+  Endif
+  [L]WPUU   =[F:POQ]PUU
+  [L]WSTU   =[F:POQ]STU
+  Case [L]WABREV
+    When "POQ", "POQ1", "POQ2"
+      [L]WQTYPUU=[F:POQ]QTYPUU
+      [L]WQTYSTU=[F:POQ]QTYSTU
+      #-----
+      If [F:POQ]INVQTYPUU<>0 | [F:POQ]INVQTYSTU<>0 | [F:POQ]LININVNBR<>0 | [F:POQ]LININVFLG>1
+        If !clalev([F:PIH1])  Local File PINVOICE  [PIH1] : Endif
+        If !clalev([F:PID1])  Local File PINVOICED [PID1] : Endif
+        If !clalev([F:PIH2])  Local File PINVOICE  [PIH2] : Endif
+        If !clalev([F:PID2])  Local File PINVOICED [PID2] : Endif
+        If !clalev([F:PIX1])
+          Link [PID1] With [PIH1] PIH0=[F:PID1]NUM As [PIX1]
+        Endif
+        If !clalev([F:PIX2])
+          Link [PID2] With [PIH2] PIH0=[F:PID2]NUM As [PIX2]
+        Endif
+        #-----
+        For [PIX1] Where [PID1]POHNUM=[F:POQ]POHNUM
+&                      & [PID1]POPLIN=[F:POQ]POPLIN
+&                      & [PID1]POQSEQ=[F:POQ]POQSEQ
+&                      & find([PID1]TYPORI,1,2)<>0
+&                      & [PID1]PIHTYP=1
+&                      & [PIH1]STA=3
+          [L]WQTYPUU-=[F:PID1]QTYPUU
+          [L]WQTYSTU-=[F:PID1]QTYSTU
+          For [PIX2] Where [PID2]TYPORI=4
+&                        & [PID2]NUMORI=[F:PID1]NUM
+&                        & [PID2]LINORI=[F:PID1]PIDLIN
+&                        & [PID2]PIHTYP=3
+&                        & [PIH2]STA=3
+            [L]WQTYPUU+=[F:PID2]QTYPUU
+            [L]WQTYSTU+=[F:PID2]QTYSTU
+          Next
+        Next
+        # Issue 91048 - 2013-07-09 by MUARN : Si commande entièrement facturée, rien à faire
+        If WQTYPUU<=0
+          Return
+        Endif
+      Endif
+      #-----
+      [L]WTYPPCE=""
+      [L]WNUMPCE=""
+      # Issue 84041 - 2012-08-28 by MUARN : engagement et changement de devise commande
+      If WSIGN = 1
+        [L]WCUR = [F:POH]CUR
+      Elsif clalev ([M:POH1])
+        [L]WCUR=[M:POH1]OLDCURCMM
+      Else
+        [L]WCUR = [F:POH]CUR
+      Endif
+    When "PID", "PID1"
+      [L]WDAT2=[L]WDAT
+      Call PARAML([L]WFCY,"PURCMMPIH",[L]WPARAME) From ADOVAL
+      If val([L]WPARAME)=2
+        [L]WDAT =[F:PIH]ACCDAT
+      Else
+        Local Decimal WEXERCICE1, WEXERCICE2
+        Call GETEXE(GSOCIETE,GTYPGEN,[L]WDAT,[L]WEXERCICE1)       From CPTSUB
+        Call GETEXE(GSOCIETE,GTYPGEN,[F:PIH]ACCDAT,[L]WEXERCICE2) From CPTSUB
+        If [L]WEXERCICE1<>[L]WEXERCICE2
+          #----- Si changement d'exercice, on prend la date de facture -----#
+          [L]WDAT=[F:PIH]ACCDAT
+        Else
+          #----- Y a t-il eu un report entre date d'engagement et date facture ? -----#
+          If !clalev([F:CMD])  Local File  GCOMMITD [CMD] : Endif
+          Filter [CMD] Where NUM=[L]WCMMNUM & GRDPCE=6
+          Read [CMD] CMD0 Last
+          If !fstat  [L]WDAT=[F:CMD]ACCDAT : Endif
+          Filter [CMD]
+          #-----
+        Endif
+      Endif
+      #WDAT2 = date d'engagement
+      #WDAT  = date de désengagement calculée
+      # Issue 79851 - 2012-03-15 by SR : Si engagement sur N+1 et facture sur N
+      If year([L]WDAT2) > year([L]WDAT)
+         WDAT = WDAT2
+      Endif
+      #If [L]WABREV="PID"
+      #  If [L]WDAT<>[L]WDAT2  Raz [L]WCMMNUM2 : Endif
+      #Elsif [F:PID]CMMNUM<>""
+      #  [L]WCMMNUM2=[F:PID]CMMNUM
+      #Endif
+      [L]WQTYPUU=[F:PID]QTYBUDLIN
+      Call PCAL_QTY([L]WQTYPUU,[L]WPUU,[L]WQTYSTU,[L]WSTU,
+&                   [F:POQ]ITMREF,[F:POQ]BPSNUM,1,[L]WD) From TRTACHQTE1
+      [L]WTYPPCE=[F:PIH]GTE
+      [L]WNUMPCE=[F:PIH]NUM
+      # Issue 84041 - 2012-08-28 by MUARN : engagement et changement de devise commande
+      [L]WCUR = [F:POH]CUR
+  Endcase
+  # Issue 83801 - 2012-07-27 by SR : Possibilité de surcharger les variables de travail
+  [V]GPOINT="CUSSPELOA" : Gosub ENTREE From EXEFNC
+  If GOK<1  Return : Endif
+  # Issue 84041 - 2012-08-28 by MUARN : engagement et changement de devise commande
+  # devise remonté dans CASE
+  #[L]WCUR   =[F:POH]CUR
+  [L]WCHGTYP=[F:POH]CHGTYP
+  Case [L]WCMMTAX
+    When 2       : #----- Engagement HT + taxes non déductibles
+      [L]WAMTCUR=[F:POQ]LINAMT
+      # Issue 82857 - 2012-06-21 by MUARN : tva intra-comm si CEE HT=TTC toujours ajouté taxe non déductible
+      If [F:POH]VACTYP <> 4
+        If [F:POQ]LINATIAMT>[F:POQ]LINAMT
+          [L]WAMTCUR+=([F:POQ]AMTTAXLIN1-[F:POQ]DEDTAXLIN1)
+          [L]WAMTCUR+=([F:POQ]AMTTAXLIN2-[F:POQ]DEDTAXLIN2)
+          [L]WAMTCUR+=([F:POQ]AMTTAXLIN3-[F:POQ]DEDTAXLIN3)
+          [L]WAMTCUR+=([F:POQ]AMTTAXRCP -[F:POQ]DEDTAXRCP )
+          [L]WAMTCUR+=([F:POQ]AMTTAXISS -[F:POQ]DEDTAXISS )
+          [L]WAMTCUR+=([F:POQ]AMTTAXOTH1-[F:POQ]DEDTAXOTH1)
+          [L]WAMTCUR+=([F:POQ]AMTTAXOTH2-[F:POQ]DEDTAXOTH2)
+        Endif
+      Else
+        [L]WAMTCUR+=([F:POQ]AMTTAXLIN1-[F:POQ]DEDTAXLIN1)
+        [L]WAMTCUR+=([F:POQ]AMTTAXLIN2-[F:POQ]DEDTAXLIN2)
+        [L]WAMTCUR+=([F:POQ]AMTTAXLIN3-[F:POQ]DEDTAXLIN3)
+        [L]WAMTCUR+=([F:POQ]AMTTAXRCP -[F:POQ]DEDTAXRCP )
+        [L]WAMTCUR+=([F:POQ]AMTTAXISS -[F:POQ]DEDTAXISS )
+        [L]WAMTCUR+=([F:POQ]AMTTAXOTH1-[F:POQ]DEDTAXOTH1)
+        [L]WAMTCUR+=([F:POQ]AMTTAXOTH2-[F:POQ]DEDTAXOTH2)
+      Endif
+      If [F:POQ]QTYPUU=0 [F:POQ]QTYPUU=1 : Endif
+      [L]WAMTCUR=[L]WAMTCUR*[L]WQTYPUU/[F:POQ]QTYPUU
+    When 3       : #----- Engagement TTC
+      If [F:POQ]QTYPUU=0 [F:POQ]QTYPUU=1 : Endif
+      [L]WAMTCUR=[F:POQ]LINATIAMT*[L]WQTYPUU/[F:POQ]QTYPUU
+    When Default : #----- Engagement HT
+      [L]WAMTCUR=[F:POQ]LINAMT
+      If [F:POQ]QTYPUU=0 [F:POQ]QTYPUU=1 : Endif
+      [L]WAMTCUR=[L]WAMTCUR*[L]WQTYPUU/[F:POQ]QTYPUU
+  Endcase
+  [L]WBPSNUM=[F:POQ]BPSNUM
+  [L]WITMREF=[F:POQ]ITMREF
+  If [F:POH]POHTYP=2  [L]WTYPORG=2  Else  [L]WTYPORG=1 : Endif
+  [L]WCODGAU="PORD"
+  [L]WTRTNAM="TRTACHCDE1"
+  [L]ID1(1) =[F:POH]POHNUM
+  [L]ID2(1) =[F:POQ]POHNUM
+  [L]ID2(2) =num$([F:POQ]POPLIN)
+  [L]ID2(3) =num$([F:POQ]POQSEQ)
+  If !clalev([F:TB0]) Local File PORDER    [TB0] : Endif
+  [F:TB0]=[F:POH]
+  If !clalev([F:TB1]) Local File PORDERQ   [TB1] : Endif
+  [F:TB1]=[F:POQ]
+  If !clalev([F:TB2]) Local File CPTANALIN [TB2] : Endif
+  [F:TB2]=[F:CAL]
+Endif
+#----- Arrondi du montant selon devise -----#
+Call ARRDEV([L]WAMTCUR,[L]WCUR) From TRTDIV
+#----- Chargement type de contrôle engagement/pré-engagement -----#
+If [L]WTYP=1 : # Pré-engagement
+  Call PARAML(GFINRSP,"BUDCTLPSH",[L]WPARAME) From ADOVAL
+  [L]WBUDCTL=val([L]WPARAME)
+  [L]WPARNAM="BUDCNTPRP"
+Else      : # Engagement
+  Call PARAML(GFINRSP,"BUDCTLPOH",[L]WPARAME) From ADOVAL
+  [L]WBUDCTL=val([L]WPARAME)
+  [L]WPARNAM="BUDCNTCMM"
+Endif
+If [L]WBUDCTL=1
+  [L]WCNTBUD=0
+Else
+  Call PARAML(GFINRSP,[L]WPARNAM,[L]WPARAME) From ADOVAL
+  If val([L]WPARAME)=4 : # Contrôle budgétaire selon opérateur
+    Call PARAMUTIL("CNTBUD",[L]WPARAME,"",GFINRSP) From SUBAUS
+  Endif
+  [L]WCNTBUD=val([L]WPARAME)
+  If [L]WCNTBUD=1
+    [L]WCNTBUD=0
+  Elsif [L]WCNTBUD=3
+    [L]WCNTBUD=1
+  Endif
+Endif
+#----- Pas de contrôle si dévalidation de facture -----#
+If [L]WABREV="PID1"  [L]WCNTBUD=0  : Endif
+#----- Recherche des comptes si nécessaire -----#
+If [L]WCOMPTE="" & [L]WCPTANA=""
+  Call SETREF(GSOCIETE,[L]WI,[L]TBLED) From CPTDIV
+  Call COMPTE([L]WCODGAU,1,[L]ID1,[L]ID2,[L]TPLAN2,[L]TCOMPTE2,[L]WRET,[L]WMSG) From =[L]WTRTNAM
+  If [L]WRET  [L]WRET=3 : Gosub TRT_ERR : Goto FIN_MAJCMM : Endif
+  For [L]WI=1 To 10
+    If [L]TPLAN2([L]WI)<>""
+      [L]WJ=find([F:GAD]LEDTYP([L]WI-1),[L]TBTYPLED(1..10))
+      If [L]WJ
+        [L]TPLAN  ([L]WJ)=[L]TPLAN2  ([L]WI)
+        [L]TCOMPTE([L]WJ)=[L]TCOMPTE2([L]WI)
+      Endif
+    Endif
+  Next [L]WI
+  #----- Récupération compte général -----#
+  Call LECPLAN(GSOCIETE,GTYPGEN,[L]WCOA) From CPTDIV
+  [L]WI=find([L]WCOA,[L]TPLAN(1..10))
+  If [L]WI  [L]WCOMPTE=[L]TCOMPTE([L]WI) : Endif
+  If [F:GAC]COA<>[L]WCOA | [F:GAC]ACC<>[L]WCOMPTE
+    Read [GAC] GAC0=[L]WCOA;[L]WCOMPTE : If fstat  Raz [F:GAC] : Endif
+  Endif
+  #----- Initialisation type d'achat -----#
+  If [L]WTYP=1
+    If [F:GAC]VATIPT=5
+      [F:PSD]LINPURTYP=3
+    Elsif [F:GAC]VATIPT=4
+      [F:PSD]LINPURTYP=2
+    Else
+      [F:PSD]LINPURTYP=1
+    Endif
+  Else
+    If [F:GAC]VATIPT=5
+      [F:POQ]LINPURTYP=3
+    Elsif [F:GAC]VATIPT=4
+      [F:POQ]LINPURTYP=2
+    Else
+      [F:POQ]LINPURTYP=1
+    Endif
+  Endif
+  #----- Récupération compte analytique -----#
+  Call LECPLAN(GSOCIETE,GTYPANA,[L]WCOA) From CPTDIV
+  [L]WI=find([L]WCOA,[L]TPLAN(1..10))
+  If [L]WI  [L]WCPTANA=[L]TCOMPTE([L]WI) : Endif
+Endif
+#----- Si pas de compte analytique pas de màj engagement/pré-engagement -----#
+If [L]WCOMPTE="" | [L]WCPTANA=""  Return : Endif
+#----- Conversion quantité en unité d'oeuvre -----#
+If [F:GAC]COA<>[L]WCOA | [F:GAC]ACC<>[L]WCPTANA
+  Read [GAC] GAC0=[L]WCOA;[L]WCPTANA : If fstat  Raz [F:GAC] : Endif
+Endif
+If [F:GAC]FLGUOM=2
+  Call PCAL_QTY([L]WQTYPUU,[L]WPUU,[L]WQTYUOM,[F:GAC]UOM,[L]WITMREF,[L]WBPSNUM,1,[L]WD) From TRTACHQTE1
+  If [F:TCO]UOM1=""
+    Call PCAL_QTY([L]WQTYSTU,[L]WSTU,[L]WQTYUOM,[F:GAC]UOM,[L]WITMREF,[L]WBPSNUM,1,[L]WD) From TRTACHQTE1
+  Endif
+  If [F:TCO]UOM1="" & [L]WSIGN=+1
+    [L]WRET=4 : Gosub TRT_ERR : Goto FIN_MAJCMM
+  Endif
+Else
+  Raz [L]WQTYUOM
+Endif
+
+#--- Issue 99254
+Gosub VERIFCMM
+If [L]WAMTCUR=0 Goto FIN_MAJCMM Endif
+#---
+
+#----- Calcul montant en devise référentiel -----#
+Raz [L]WCUMCUR, [L]WCUMLED
+If [L]WSIGN=-1 & [L]WCMMNUM<>""
+  #----- Désengagement : Recherche engagements pour en déduire le taux de conversion -----#
+  If !clalev([F:CMD])  Local File  GCOMMITD [CMD] : Endif
+  For [CMD]  CMD0 Where NUM=[L]WCMMNUM
+    [L]WCUMCUR+=[F:CMD]AMTCUR
+    [L]WCUMLED+=[F:CMD]AMTLED
+  Next
+  If [L]WCUMCUR<>[L]WAMTCUR & [L]WCUMCUR<>0
+    [L]WAMTLED=[L]WAMTCUR*([L]WCUMLED/[L]WCUMCUR) : Call ARRDEV([L]WAMTLED,[L]WDEVLED) From TRTDIV
+  Else
+    [L]WAMTLED=[L]WCUMLED
+  Endif
+Endif
+#----- Engagement : Conversion avec taux de devise -----#
+If [L]WCUMCUR=0
+  If [L]WDEVLED<>[L]WCUR
+    Call CONVERT([L]WCUR,[L]WDEVLED,GLOCALDEV,[L]WCHGTYP,[L]WDAT,[L]WAMTCUR,[L]WAMTLED,[L]WRET) From TRTDEV
+  Else
+    [L]WAMTLED=[L]WAMTCUR
+  Endif
+Endif
+#----- Appel du point d'entrée MAJENG -----#
+Local Decimal MTORD     : [L]MTORD    =[L]WAMTCUR
+Local Decimal MTLED     : [L]MTLED    =[L]WAMTLED
+Local Decimal QTYUO     : [L]QTYUO    =[L]WQTYUOM
+Local Decimal WQUANTITE : [L]WQUANTITE=[L]WQTYUOM
+Local Decimal SIGN      : [L]SIGN     =[L]WSIGN
+Local Integer WTYPMAJ
+If find([L]WABREV,"PSD3","PSD4")
+  [L]WTYPMAJ=9
+Elsif find([L]WABREV,"PSD","PSD1","PSD2")
+  [L]WTYPMAJ=8
+Elsif find([L]WABREV,"PID","PID1")
+  [L]WTYPMAJ=7
+Else
+  [L]WTYPMAJ=5+([F:POH]POHTYP<>2)
+Endif
+#----- Chargement du motif actions (menu local 2683) -----#
+If find([L]WABREV,"PSD2","POQ2")
+  If SIGN=-1
+    [L]WMOTIF(1)=4 : # Solde
+  Else
+    [L]WMOTIF(1)=6 : # Annulation solde
+  Endif
+Elsif find([L]WABREV,"PSD","POQ")
+  If SIGN=+1
+    [L]WMOTIF(1)=1 : # Création
+  Else
+    [L]WMOTIF(1)=3 : # Suppression
+  Endif
+Elsif find([L]WABREV,"PSD3")
+  If SIGN=-1
+    [L]WMOTIF(1)=1 : # Création
+  Else
+    [L]WMOTIF(1)=3 : # Suppression
+  Endif
+Elsif find([L]WABREV,"PID","PID1")
+  If (SIGN=-1 & [F:PIH]INVTYP=1) | (SIGN=+1 & [F:PIH]INVTYP=2)
+    [L]WMOTIF(1)=1 : # Création
+  Else
+    [L]WMOTIF(1)=3 : # Suppression
+  Endif
+Elsif find([L]WABREV,"PSD1","POQ1","PSD4")
+  [L]WMOTIF(1)=2   : # Modification
+Else
+  [L]WMOTIF(1)=0 : Infbox "Motif actions iconnu ?"
+Endif
+#----- Chargement du motif pièces (menu local 2684) -----#
+If find([L]WABREV,"PSD","PSD1","PSD2")
+  [L]WMOTIF(2)=1   : # Demande d'achat
+Elsif find([L]WABREV,"PSD3","PSD4","POQ","POQ1","POQ2")
+  [L]WMOTIF(2)=2   : # Commande
+Elsif find([L]WABREV,"PID","PID1")
+  If [F:PIH]INVTYP=1
+    [L]WMOTIF(2)=3 : # Facture
+  Else
+    [L]WMOTIF(2)=7 : # Avoir
+  Endif
+Else
+  [L]WMOTIF(2)=0 : Infbox "Motif pièces iconnu ?"
+Endif
+#-----
+Gosub POINT_MAJENG From TRTACHCDE1
+#------- Mise à jour de l'engagement/pré-engagement -------#
+# WRET =-1 Une erreur a empêché le contrôle de s'effectuer #
+# WRET = 0 Le budget est dépassé (GOK=0 si ctrl bloquant)  #
+# WRET = 1 Tout va bien                                    #
+#----------------------------------------------------------#
+#Call MAJENGOLD([L]WDAT,GFINRSP,[L]WCUR,[L]WAMTCUR,[L]WDEVLED,[L]WAMTLED,[L]WQTYUOM,
+#&           [L]WCPTANA,[L]WBPSNUM,[L]TBDIE2,[L]TBCCE2,1,[L]WSIGN,[L]WTYP,[L]WCNTBUD,
+#&           [L]WCMMNUM,[L]WNUMDOC,[L]WRET,[L]WMSG,[L]WCODGAU,[L]ID1,[L]WTYPPCE,[L]WNUMPCE,
+#&           [L]WTYPORG,[L]WCHGTYP) From CPTENG
+#----- Nouvel appel Béryl 6.1 -----#
+[L]WDOCUMENT(1)=[L]WNUMDOC
+[L]WDOCUMENT(2)=num$([L]WLINDOC)
+# Issue 82536 - 2012-06-29 by SR
+#[L]WDOCUMENT(3)=num$([L]WSEQDOC)
+[L]WDOCUMENT(3)=num$([L]WWSEQDOC)
+# Issue 84939 - 2013-02-01 by MUARN : ajout n° seq commande
+[L]WDOCUMENT(4)=num$([L]WSEQDOC)
+
+Call MAJENG([L]WDAT,GFINRSP,[L]WCUR,[L]WAMTCUR,[L]WRATDIV,[L]WRATMLT,[L]WQTYUOM,
+&           [L]TCOMPTE,[L]TBLED,[L]WBPSNUM,[L]TBDIE,[L]TBCCE,1,[L]WSIGN,[L]WTYP,[L]WCNTBUD,
+&           [L]WCMMNUM,[L]WDOCUMENT,[L]WMOTIF,[L]WRET,[L]WMSG,[L]WCODGAU,[L]ID1,[L]WTYPPCE,[L]WNUMPCE,
+&           [L]WTYPORG,[L]WCHGTYP) From CPTENG
+#-----
+#If !find([L]WABREV,"PID","PID1") | [L]WCMMNUM=""  [L]WCMMNUM=[L]WCMMNUM2 : Endif
+# Issue 83427 - 2012-07-09 by MUARN : si engagement locké info non remontée
+If GOK = -1 : GOK = 0 : Endif
+
+If [L]WRET<>1
+  If [L]WRET=0 & [L]WSIGN=+1
+    If [L]WTYP=1
+      If GOK=1
+        [F:PSD]CMMPRPNUM=[L]WCMMNUM
+        [F:PSD]FBUFLG   =2
+      Endif
+    Else
+      If GOK=1
+        [F:POQ]CMMNUM   =[L]WCMMNUM
+        [F:POQ]FBUFLG   =2
+      Endif
+    Endif
+  Endif
+  If [L]WCNTBUD=0 & GOK=1
+    Raz [L]WMSG : [L]WRET=0
+  Else
+    If [L]WMSG=""
+      If [L]WRET=-1  [L]WMSG=mess(93,197,1)  Else  [L]WMSG=mess(173,197,1) : Endif
+    Endif
+    If [L]WRET=-1
+      [L]WRET=6 : Gosub TRT_ERR
+    Else
+      [L]WRET=5 : Gosub TRT_ERR
+    Endif
+  Endif
+  # Issue 108483 - 2015-06-01 by MUARN : n'est plus utile, correction effecutée dans MAJENG par la compta
+  # Issue 90921 - 2013-07-05 by MUARN : solde réception et buo
+  #Goto FIN_MAJCMM
+Else
+  If [L]WSIGN=+1
+    If [L]WTYP=1
+      [F:PSD]CMMPRPNUM=[L]WCMMNUM
+      [F:PSD]FBUFLG   =1
+    Else
+      [F:POQ]CMMNUM   =[L]WCMMNUM
+      [F:POQ]FBUFLG   =1
+    Endif
+  Endif
+  Raz [L]WMSG : [L]WRET=0
+Endif
+#----- Mise à jour indicateur engagement/pré-engagement -----#
+If [L]WTYP=1
+  If [L]WSIGN=-1 & [F:PSD]LINCLEFLG=2
+    [L]WCMMFLG=0 : [F:PSD]CMMPRPFLG=0
+  Else
+    [L]WCMMFLG=1 : [F:PSD]CMMPRPFLG=1
+  Endif
+Else
+  If [L]WSIGN=-1 & [F:POQ]LINCLEFLG=2
+    [L]WCMMFLG=0 : [F:POQ]CMMFLG=0
+  Else
+    [L]WCMMFLG=1 : [F:POQ]CMMFLG=1
+  Endif
+Endif
+#----- Rétablissement des globales -----#
+$FIN_MAJCMM
+GSOCIETE =[L]SAV_GSOCIETE
+GLOCALDEV=[L]SAV_GLOCALDEV
+GTYPGEN  =[L]SAV_GTYPGEN
+GTYPANA  =[L]SAV_GTYPANA
+#----- Rétablissement des paramètres budget avant l'appel à ce S/P -----#
+If [L]SAV_GFINRSP<>GFINRSP
+  GFINRSP=[L]SAV_GFINRSP
+  Call GLOBVAR(GFINRSP) From WWGLOBBUD
+Endif
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+
+#-----------------------------------------------------------------#
+#                     Traitement des erreurs                      #
+# --------------------------------------------------------------- #
+#  1 = WNUMDOC-WLINDOC Paramètre non renseigné                    #
+#  2 = xxxxxxxxxx 999999 9999 Pièce inexistante                   #
+#  3 = xxxxxxxxxx 999999 xxxxxxxx Compte et nature non trouvés    #
+#  4 = xxx -> xxx Coefficient de conversion en UO introuvable !   #
+#  5 = Problème de mise à jour des budgets \ ligne 9999           #
+#  6 = Problème de mise à jour des budgets \ ligne 9999 (WRET=-1) #
+#  7 = Erreur d'écriture sur le fichier PREQUISD xxxxxxxx         #
+#  8 = Erreur d'écriture sur le fichier PORDERQ xxxxxxxx 999 999  #
+#  9 = $XXXXXXX xxxxxxxx Modification en cours sur un autre poste #
+# 10 = Erreur d'écriture sur le fichier PREQUIS xxxxxxxx          #
+# 11 = Erreur d'écriture sur le fichier PORDER xxxxxxxx           #
+#-----------------------------------------------------------------#
+$TRT_ERR
+Case [L]WRET
+  When 1   : [L]WMSG="WNUMDOC-WLINDOC"-mess(136,199,1)                            : GOK=0
+  When 2   : [L]WMSG=[L]WNUMDOC-num$([L]WLINDOC)-num$([L]WSEQDOC)-mess(261,197,1) : GOK=0
+  When 3   : If [L]WMSG<>""
+               [L]WMSG+="\"+[L]ID1(1)-[L]ID1(2)-[L]WITMREF-mess(36,194,1)         : GOK=0
+             Else
+               [L]WMSG=[L]ID1(1)-[L]ID1(2)-[L]WITMREF-mess(36,194,1)              : GOK=0
+             Endif
+  When 4   : [L]WMSG=[L]WSTU-"->"-[F:GAC]UOM-mess(473,199,1)                      : GOK=0
+  When 5,6 : If [L]WTYP=1
+               [L]WMSG+="\"+mess(222,197,1)
+             Else
+               [L]WMSG+="\"+mess(98,197,1)
+             Endif
+             [L]WMSG-=[L]WNUMDOC+","-mess(18,197,1)-num$([L]WLINDOC)
+  When 7   : [L]WMSG=mess(13,100,1)-"PREQUISD"-[L]WNUMDOC
+  When 8   : [L]WMSG=mess(13,100,1)-"PORDERQ"-[L]WNUMDOC-num$([L]WLINDOC)-num$([L]WSEQSOC)
+  When 9   : If [L]WTYP=1  [L]WMSG="$PREQUIS" Else [L]WMSG="$PORDER" : Endif
+             [L]WMSG-=[L]WNUMDOC-mess(10,100,1)                                   : GOK=0
+  When 10  : [L]WMSG=mess(13,100,1)-"PREQUIS"-[L]WNUMDOC
+  When 11  : [L]WMSG=mess(13,100,1)-"PORDER"-[L]WNUMDOC
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+             If dim(GPURTRACE)>0  & GPURTRACE=1  GPURTRACE=2 : Endif
+           Else
+             If dim([L]WADXLOG)>0 & ![L]WADXLOG
+               Call ECR_TRACE([L]WMSG,1) From GESECRAN
+               If dim(GPURTRACE)>0  & GPURTRACE=1  GPURTRACE=2 : Endif
+             Else
+               GMESSAGE=[L]WMSG : GERR=1
+               #VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+               GPURMESSAGE=[L]WMSG
+             Endif
+           Endif
+Endcase
+Return
+
+
+################################################################################
+# TRTPSHAPP : Mise à jour indicateur signature entête d'une DA    MBT 07/11/05 #
+#             à partir des indicateurs lignes de cette DA                      #
+# ---------------------------------------------------------------------------- #
+# Subprog TRTPSHAPP (WPSHNUM)                                                  #
+#   Sous-programme appelé dans les traitements du module achats.               #
+#   il y a toujours une transactions en cours                                  #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+#   WRET    : Code retour ( 0 = Ok avec GOK=1,                                 #
+#                       11-15 = Erreur avec GOK=0 si bloquant)                 #
+################################################################################
+Subprog TRTPSHAPP(WPSHNUM,WMSGFLG,WRET)
+Value    Char    WPSHNUM
+Value    Integer WMSGFLG
+Variable Integer WRET
+#-----
+If !clalev([F:PSD])  Local File PREQUISD  [PSD] : Endif
+#-----
+Gosub PSHAPP
+End
+
+################################################################################
+# DIVPSHAPP : Mise à jour indicateur signature entête d'une DA    MBT 07/11/05 #
+#             à partir des indicateurs lignes de cette DA                      #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVPSHAPP (WPSHNUM)                                                  #
+#   Sous-programme appelé par l'action DIVPSHAPP.                              #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours.                            #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVPSHAPP(WPSHNUM,WMSGFLG)
+Value    Char    WPSHNUM
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WRET
+Local    Libelle WADXLOG
+#-----
+Local File PREQUISD  [PSD] : # Il faut réouvrir à cause du "Link" workflow
+#-----
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_PSHAPP
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub PSHAPP
+If GOK=-1  Goto ROLL_PSHAPP : Endif
+If GOK=0   Goto AB_PSHAPP   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+End
+#-----
+$ROLL_PSHAPP
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_PSHAPP : Endif
+Else
+  End
+Endif
+#-----
+$AB_PSHAPP
+If [L]WADXLOG=0
+  Rollback
+Endif
+End
+
+#-----------------------------------------------------#
+# Traitement de la màj indicateur signature entête DA #
+#-----------------------------------------------------#
+$PSHAPP
+#----- Variables locales -----#
+Local    Char    WFCY(GLONFCY), WPARAME(10), WMSG(100)
+Local    Integer WAPPLINNBR,    WAPPCLENBR,  WAPPFLG,     WFLG_2,   WNBRFLG_5
+Local    Integer SAV_GAPPPSH  : [L]SAV_GAPPPSH=GAPPPSH
+Local    Integer SAV_GOK      : [L]SAV_GOK=GOK : GOK=1 : Raz [L]WRET
+Local    Libelle WLOCK
+#-----
+If !clalev([F:PSH])  Local File PREQUIS   [PSH] : Endif
+#-----
+If [L]WPSHNUM=""  [L]WRET=11 : Gosub TRT_ERR_PSHAPP : Return : Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("PSH"+[L]WPSHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="PSH"+[L]WPSHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_PSHAPP : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+#----- Lecture entête demande d'achat -----#
+Readlock [PSH] PSH0=[L]WPSHNUM
+If fstat=1
+  GOK=-1  : GLOCK="$PREQUIS"-[L]WPSHNUM
+  [L]WRET=13 : Gosub TRT_ERR_PSHAPP : Goto FIN_PSHAPP
+Elsif fstat
+  GOK=0   : Call RSTA("PSH",[L]WPSHNUM) From GLOCK
+  [L]WRET=14 : Gosub TRT_ERR_PSHAPP : Goto FIN_PSHAPP
+Endif
+#-----
+[L]WFCY=[F:PSH]PSHFCY
+Call PARAML([L]WFCY,"APPPSH",[L]WPARAME) From ADOVAL
+GAPPPSH=val([L]WPARAME)
+#-----
+Raz [L]WAPPLINNBR, [L]WAPPCLENBR, [L]WNBRFLG_5, [L]WFLG_2
+For [PSD] PSD0 Where PSHNUM=[F:PSH]PSHNUM
+  If [F:PSD]LINAPPFLG>2
+    [L]WAPPLINNBR+=1
+  Elsif [F:PSD]LINAPPFLG>1
+    [L]WFLG_2=1
+  Endif
+  If [F:PSD]LINCLEFLG=2 & [F:PSD]LINAPPFLG>2
+    [L]WAPPCLENBR+=1
+  Endif
+  If [F:PSD]LINAPPFLG=5  [L]WNBRFLG_5+=1 : Endif
+Next
+#----- Positionnement indicateur signature -----#
+If [L]WAPPLINNBR=0 & [L]WFLG_2=0
+  [L]WAPPFLG=1
+Elsif [L]WAPPLINNBR<[F:PSH]LINNBR
+  [L]WAPPFLG=2
+Elsif GAPPPSH<2
+  [L]WAPPFLG=4
+Elsif [L]WNBRFLG_5=[F:PSH]LINNBR
+  [L]WAPPFLG=5
+Else
+  [L]WAPPFLG=3
+Endif
+#-----
+If [L]WAPPFLG=2 & [L]WAPPLINNBR+[F:PSH]CLELINNBR-[L]WAPPCLENBR=[F:PSH]LINNBR
+  [L]WAPPFLG=3
+Endif
+#----- Réécriture entête demande d'achat -----#
+If [F:PSH]APPLINNBR<>[L]WAPPLINNBR | [F:PSH]APPFLG<>[L]WAPPFLG
+  [F:PSH]APPLINNBR=[L]WAPPLINNBR
+  [F:PSH]APPFLG   =[L]WAPPFLG
+  [F:PSH]UPDDAT   =date$
+  [F:PSH]UPDUSR   =GUSER
+  [F:PSH]EXPNUM   =[C]EXPORT
+Endif
+Rewrite [PSH]
+If fstat
+  GOK=0   : Call FSTA("PSH") From GLOCK
+  [L]WRET=15 : Gosub TRT_ERR_PSHAPP : Goto FIN_PSHAPP
+Endif
+#-----
+$FIN_PSHAPP
+If [L]WLOCK  Unlock="PSH"+[L]WPSHNUM : Endif
+GAPPPSH=[L]SAV_GAPPPSH
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+#-----------------------------------------------------------------#
+#                     Traitement des erreurs                      #
+# --------------------------------------------------------------- #
+# 11 = WPSHNUM Paramètre non renseigné                            #
+# 12 = $PREQUIS xxxxxxxx Modification en cours sur un autre poste #
+# 13 = Erreur d'accès sur le fichier PREQUIS xxxxxxxx             #
+# 14 = xxxxxxxxxx Demande d'achat introuvable !                   #
+# 15 = Erreur d'écriture sur le fichier PREQUIS xxxxxxxx          #
+#-----------------------------------------------------------------#
+$TRT_ERR_PSHAPP
+Case [L]WRET
+  When 11  : [L]WMSG="WPSHNUM"-mess(136,199,1)             : GOK=0
+  When 12  : [L]WMSG="$PREQUIS"-[L]WPSHNUM-mess(10,100,1)  : GOK=0
+  When 13  : [L]WMSG=mess(12,100,1)-"PREQUIS"-[L]WPSHNUM
+  When 14  : [L]WMSG=[L]WPSHNUM-mess(220,197,1)
+  When 15  : [L]WMSG=mess(13,100,1)-"PREQUIS"-[L]WPSHNUM
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+           Else
+             Call ECR_TRACE([L]WMSG,1) From GESECRAN
+           Endif
+           If dim(GPURTRACE)>0  GPURTRACE=2 : Endif
+Endcase
+Return
+
+
+################################################################################
+# TRTPSDAPP : Mise à jour indicateur signature de toutes les      MBT 07/11/05 #
+#             lignes d'une DA à partir de l'indicateur d'entête                #
+#             et mise à jour pré-engagement si nécessaire                      #
+# ---------------------------------------------------------------------------- #
+# Subprog TRTPSDAPP (WPSHNUM)                                                  #
+#   Sous-programme appelé dans les traitements du module achats.               #
+#   Il y a toujours une transaction en cours.                                  #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+#   WRET    : Code retour ( 0 = Ok avec GOK=1,                                 #
+#                       11-18 = Erreur avec GOK=0 si bloquant)                 #
+################################################################################
+Subprog TRTPSDAPP(WPSHNUM,WMSGFLG,WRET)
+Value    Char    WPSHNUM
+Value    Integer WMSGFLG
+Variable Integer WRET
+#-----
+If !clalev([F:PSD])  Local File PREQUISD  [PSD] : Endif
+#-----
+Gosub PSDAPP
+End
+
+################################################################################
+# DIVPSDAPP : Mise à jour indicateur signature de toutes les      MBT 07/11/05 #
+#             lignes d'une DA à partir de l'indicateur d'entête                #
+#             et mise à jour pré-engagement si nécessaire                      #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVPSDAPP (WPSHNUM)                                                  #
+#   Sous-programme appelé par l'action DIVPSDAPP.                              #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours.                            #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVPSDAPP(WPSHNUM,WMSGFLG)
+Value    Char    WPSHNUM
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WRET
+Local    Libelle WADXLOG
+#-----
+Local File PREQUISD  [PSD] : # Il faut réouvrir à cause du "Link" workflow
+#-----
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_PSDAPP
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub PSDAPP
+If GOK=-1  Goto ROLL_PSDAPP : Endif
+If GOK=0   Goto AB_PSDAPP   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+End
+#-----
+$ROLL_PSDAPP
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_PSDAPP : Endif
+Else
+  End
+Endif
+#-----
+$AB_PSDAPP
+If [L]WADXLOG=0
+  Rollback
+Endif
+End
+
+#------------------------------------------------------#
+# Traitement de la màj indicateurs signature lignes DA #
+#------------------------------------------------------#
+$PSDAPP
+#----- Variables locales -----#
+Local    Char    WMSG(100), WPARAME(10)
+Local    Integer WPSDLIN, WAPPLINNBR, WLINAPPFLG, WSIGN, WFLAG
+Local    Integer SAV_GOK      : [L]SAV_GOK=GOK : GOK=1 : Raz [L]WRET
+Local    Libelle WLOCK
+Local    Libelle WPSHCMMLEV
+#-----
+If [L]WPSHNUM=""  [L]WRET=11 : Gosub TRT_ERR_PSDAPP : Return : Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("PSH"+[L]WPSHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="PSH"+[L]WPSHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_PSDAPP : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+#-----
+If !clalev([F:PSH])  Local File PREQUIS   [PSH] : Endif
+If !clalev([F:GAC])  Local File GACCOUNT  [GAC] : Endif
+If !clalev([F:TCO])  Local File TABCOEFF  [TCO] : Endif
+#----- Lecture entête demande d'achat -----#
+Read [PSH] PSH0=[L]WPSHNUM
+If fstat
+  GOK=0 : [L]WRET=14 : Gosub TRT_ERR_PSDAPP : Goto FIN_PSDAPP
+Endif
+[L]WAPPLINNBR=[F:PSH]APPLINNBR
+#----- Récupération paramètre déclenchement pré-engagements -----#
+Call PARAML([F:PSH]PSHFCY,"PSHCMMLEV",[L]WPARAME) From ADOVAL
+[L]WPSHCMMLEV=val([L]WPARAME)
+#----- Mise à jour indicateur signature sur toutes les lignes de la DA -----#
+For [PSD] PSD0 Where PSHNUM=[L]WPSHNUM
+  [L]WPSDLIN   =[F:PSD]PSDLIN
+  [L]WLINAPPFLG=[F:PSD]LINAPPFLG
+  Readlock [PSD] Curr
+  If fstat=1
+    GOK=-1  : GLOCK="$PREQUISD"-[L]WPSHNUM-num$([L]WPSDLIN)
+    [L]WRET=16 : Gosub TRT_ERR_PSDAPP : Break
+  Elsif fstat
+    GOK=0   : Call RSTA("PSD",[L]WPSHNUM-num$([L]WPSDLIN)) From GLOCK
+    [L]WRET=17 : Gosub TRT_ERR_PSDAPP : Break
+  Endif
+  [F:PSD]LINAPPFLG=[F:PSH]APPFLG
+  [F:PSD]UPDDAT   =date$
+  [F:PSD]UPDUSR   =GUSER
+  Raz [L]WSIGN
+  If [L]WPSHCMMLEV<2    : # Màj à la 1ère signature
+    If [L]WLINAPPFLG<2 & [F:PSD]LINAPPFLG>1 & [F:PSD]CMMPRPFLG=0
+      [L]WSIGN=+1
+    Elsif [L]WLINAPPFLG>1 & [F:PSD]LINAPPFLG<2 & [F:PSD]CMMPRPFLG=1
+      [L]WSIGN=-1
+    Endif
+  Elsif [L]WPSHCMMLEV=2 : # Màj à la dernière signature
+    If [L]WLINAPPFLG<3 & [F:PSD]LINAPPFLG>2 & [F:PSD]CMMPRPFLG=0
+      [L]WSIGN=+1
+    Elsif [L]WLINAPPFLG>2 & [F:PSD]LINAPPFLG<3 & [F:PSD]CMMPRPFLG=1
+      [L]WSIGN=-1
+    Endif
+  Endif
+  #----- Mise à jour pré-engagement -----#
+  If [L]WSIGN<>0 & [F:PSD]LINCLEFLG<>2
+    Call TRTMAJCMM([F:PSD]PSHNUM,[F:PSD]PSDLIN,0,[L]WSIGN,1,"PSD",3,[L]WRET) From TRTACHDIV1
+    If GOK<1  Break  Else  Raz [L]WRET : Endif
+    # Issue 80399/80484 - 2012-03-05 by VPO : remettre indiq à zero si annulation
+    #----- Remettre indicateur engagement à 0 si annulation appelée par le workflow -----#
+    If [L]WSIGN=-1  [F:PSD]CMMPRPFLG=0 : Endif
+  Endif
+  #-----
+  Rewrite [PSD]
+  If fstat
+    GOK=0   : Call FSTA("PSD") From GLOCK
+    [L]WRET=18 : Gosub TRT_ERR_PSDAPP : Break
+  Endif
+Next
+If GOK<1  Goto FIN_PSDAPP : Endif
+#----- Mise à jour nbre lignes signées sur l'entête si nécessaire -----#
+Raz [L]WFLAG
+If [F:PSH]APPFLG<3 & [F:PSH]APPLINNBR>0
+  [L]WAPPLINNBR=0             : [L]WFLAG=1
+Elsif [F:PSH]APPFLG>2 & [F:PSH]APPLINNBR<>[F:PSH]LINNBR
+  [L]WAPPLINNBR=[F:PSH]LINNBR : [L]WFLAG=1
+Endif
+If [L]WFLAG=1
+  Update [PSH] Where PSHNUM=[L]WPSHNUM
+&              With  APPLINNBR=[L]WAPPLINNBR, EXPNUM=[C]EXPORT
+  If fstat
+    GOK=0   : Call FSTA("PSH") From GLOCK
+    [L]WRET=15 : Gosub TRT_ERR_PSDAPP : Goto FIN_PSDAPP
+  Endif
+Endif
+#-----
+$FIN_PSDAPP
+If [L]WLOCK  Unlock="PSH"+[L]WPSHNUM : Endif
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+#-----------------------------------------------------------------#
+#                     Traitement des erreurs                      #
+# --------------------------------------------------------------- #
+# 11 = WPSHNUM Paramètre non renseigné                            #
+# 12 = $PREQUIS xxxxxxxx Modification en cours sur un autre poste #
+# 13 = Erreur d'accès sur le fichier PREQUIS xxxxxxxx             #
+# 14 = xxxxxxxxxx Demande d'achat introuvable !                   #
+# 15 = Erreur d'écriture sur le fichier PREQUIS xxxxxxxx          #
+# 16 = Erreur d'accès sur le fichier PREQUISD xxxxxxxx            #
+# 17 = xxxxxxxxxx 9999 Demande d'achat introuvable !              #
+# 18 = Erreur d'écriture sur le fichier PREQUISD xxxxxxxx         #
+#-----------------------------------------------------------------#
+$TRT_ERR_PSDAPP
+Case [L]WRET
+  When 11 : [L]WMSG="WPSHNUM"-mess(136,199,1)                : GOK=0
+  When 12 : [L]WMSG="$PREQUIS"-[L]WPSHNUM-mess(10,100,1)     : GOK=0
+  When 13 : [L]WMSG=mess(12,100,1)-"PREQUIS"-[L]WPSHNUM
+  When 14 : [L]WMSG=[L]WPSHNUM-mess(220,197,1)
+  When 15 : [L]WMSG=mess(13,100,1)-"PREQUIS"-[L]WPSHNUM
+  When 16 : [L]WMSG=mess(12,100,1)-"PREQUISD"-[L]WPSHNUM
+  When 17 : [L]WMSG=[L]WPSHNUM-num$([L]WPSDLIN)-mess(220,197,1)
+  When 18 : [L]WMSG=mess(13,100,1)-"PREQUISD"-[L]WPSHNUM
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+           Else
+             Call ECR_TRACE([L]WMSG,1) From GESECRAN
+           Endif
+           If dim(GPURTRACE)>0  GPURTRACE=2 : Endif
+Endcase
+Return
+
+
+################################################################################
+# TRTLINAPP1 : Mise à jour indicateur signature d'une ligne       MBT 09/12/05 #
+#             de DA à la valeur 1 (non signée)                                 #
+# ---------------------------------------------------------------------------- #
+# Subprog TRTLINAPP1 (WPSHNUM,WPSDLIN,WMSGFLG,WRET)                            #
+#   Sous-programme appelé dans les traitements du module achats.               #
+#   Il y a toujours une transaction en cours.                                  #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WPSDLIN : Numéro de la ligne                                               #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+#   WRET    : Code retour ( 0 = Ok avec GOK=1,                                 #
+#                       11-18 = Erreur avec GOK=0 si bloquant)                 #
+################################################################################
+Subprog TRTLINAPP1(WPSHNUM,WPSDLIN,WMSGFLG,WRET)
+Value    Char    WPSHNUM
+Value    Integer WPSDLIN
+Value    Integer WMSGFLG
+Variable Integer WRET
+#-----
+Gosub LINAPP1
+End
+
+################################################################################
+# DIVLINAPP1 : Mise à jour indicateur signature d'une ligne       MBT 09/12/05 #
+#             de DA à la valeur 1 (non signée)                                 #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVLINAPP1 (WPSHNUM,WPSDLIN,WMSGFLG)                                 #
+#   Sous-programme appelé par l'action DIVLINAPP1.                             #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours.                            #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WPSDLIN : Numéro de la ligne                                               #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVLINAPP1(WPSHNUM,WPSDLIN,WMSGFLG)
+Value    Char    WPSHNUM
+Value    Integer WPSDLIN
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WRET
+Local    Libelle WADXLOG
+#-----
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_LINAPP1
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub LINAPP1
+If GOK=-1  Goto ROLL_LINAPP1 : Endif
+If GOK=0   Goto AB_LINAPP1   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+End
+#-----
+$ROLL_LINAPP1
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_LINAPP1 : Endif
+Else
+  End
+Endif
+#-----
+$AB_LINAPP1
+If [L]WADXLOG=0
+  Rollback
+Endif
+End
+
+#--------------------------------------------------------------#
+# Traitement de la màj indicateur signature de la ligne DA à 1 #
+#--------------------------------------------------------------#
+$LINAPP1
+#----- Variables locales -----#
+Local    Char    WMSG(100)
+Local    Integer SAV_GOK      : [L]SAV_GOK=GOK : GOK=1 : Raz [L]WRET
+Local    Libelle WLOCK
+#-----
+If [L]WPSHNUM=""  [L]WRET=11 : Gosub TRT_ERR_LINAPP1 : Return : Endif
+If [L]WPSDLIN=0   [L]WRET=11 : Gosub TRT_ERR_LINAPP1 : Return : Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("PSH"+[L]WPSHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="PSH"+[L]WPSHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_LINAPP1 : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+#-----
+If !clalev([F:PSH])  Local File PREQUIS   [PSH] : Endif
+If !clalev([F:PSD])  Local File PREQUISD  [PSD] : Endif
+#----- Mise à 1 de l'indicateur de la ligne DA -----#
+Update [PSD] Where PSHNUM=[L]WPSHNUM & PSDLIN=[L]WPSDLIN With LINAPPFLG=1
+If fstat
+  GOK=0   : Call FSTA("PSD") From GLOCK
+  [L]WRET=18 : Gosub TRT_ERR_LINAPP1 : Goto FIN_LINAPP1
+Endif
+#-----
+$FIN_LINAPP1
+If [L]WLOCK  Unlock="PSH"+[L]WPSHNUM : Endif
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+#-----------------------------------------------------------------#
+#                     Traitement des erreurs                      #
+# --------------------------------------------------------------- #
+# 11 = WPSHNUM Paramètre non renseigné                            #
+# 12 = $PREQUIS xxxxxxxx Modification en cours sur un autre poste #
+# 18 = Erreur d'écriture sur le fichier PREQUISD xxxxxxxx         #
+#-----------------------------------------------------------------#
+$TRT_ERR_LINAPP1
+Case [L]WRET
+  When 11 : [L]WMSG="WPSHNUM-WPSDLIN"-mess(136,199,1)        : GOK=0
+  When 12 : [L]WMSG="$PREQUIS"-[L]WPSHNUM-mess(10,100,1)     : GOK=0
+  When 18 : [L]WMSG=mess(13,100,1)-"PREQUISD"-[L]WPSHNUM
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+           Else
+             Call ECR_TRACE([L]WMSG,1) From GESECRAN
+           Endif
+           If dim(GPURTRACE)>0  GPURTRACE=2 : Endif
+Endcase
+Return
+
+
+################################################################################
+# DIVPSHAPP1 : Mise à jour indicateur signature entête d'une      MBT 27/12/05 #
+#              demande d'achat à la valeur 1 (non signée)                      #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVPSHAPP1 (WPSHNUM,WMSGFLG)                                         #
+#   Sous-programme appelé par l'action DIVPSHAPP1.                             #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours.                            #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVPSHAPP1(WPSHNUM,WMSGFLG)
+Value    Char    WPSHNUM
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WRET
+Local    Libelle WADXLOG
+#-----
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_PSHAPP1
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub PSHAPP1
+If GOK=-1  Goto ROLL_PSHAPP1 : Endif
+If GOK=0   Goto AB_PSHAPP1   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+End
+#-----
+$ROLL_PSHAPP1
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_PSHAPP1 : Endif
+Else
+  End
+Endif
+#-----
+$AB_PSHAPP1
+If [L]WADXLOG=0
+  Rollback
+Endif
+End
+
+#---------------------------------------------------------#
+# Traitement de la màj indicateur signature entête DA à 1 #
+#---------------------------------------------------------#
+$PSHAPP1
+#----- Variables locales -----#
+Local    Char    WMSG(100)
+Local    Integer SAV_GOK      : [L]SAV_GOK=GOK : GOK=1 : Raz [L]WRET
+Local    Libelle WLOCK
+#-----
+If [L]WPSHNUM=""  [L]WRET=11 : Gosub TRT_ERR_PSHAPP1 : Return : Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("PSH"+[L]WPSHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="PSH"+[L]WPSHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_PSHAPP1 : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+#-----
+If !clalev([F:PSH])  Local File PREQUIS   [PSH] : Endif
+#----- Mise à 1 de l'indicateur de la ligne DA -----#
+Update [PSH] Where PSHNUM=[L]WPSHNUM With APPFLG=1
+If fstat
+  GOK=0   : Call FSTA("PSH") From GLOCK
+  [L]WRET=18 : Gosub TRT_ERR_PSHAPP1 : Goto FIN_PSHAPP1
+Endif
+#-----
+$FIN_PSHAPP1
+If [L]WLOCK  Unlock="PSH"+[L]WPSHNUM : Endif
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+#-----------------------------------------------------------------#
+#                     Traitement des erreurs                      #
+# --------------------------------------------------------------- #
+# 11 = WPSHNUM Paramètre non renseigné                            #
+# 12 = $PREQUIS xxxxxxxx Modification en cours sur un autre poste #
+# 18 = Erreur d'écriture sur le fichier PREQUIS xxxxxxxx          #
+#-----------------------------------------------------------------#
+$TRT_ERR_PSHAPP1
+Case [L]WRET
+  When 11 : [L]WMSG="WPSHNUM"-mess(136,199,1)              : GOK=0
+  When 12 : [L]WMSG="$PREQUIS"-[L]WPSHNUM-mess(10,100,1)   : GOK=0
+  When 18 : [L]WMSG=mess(13,100,1)-"PREQUIS"-[L]WPSHNUM
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+           Else
+             Call ECR_TRACE([L]WMSG,1) From GESECRAN
+           Endif
+           If dim(GPURTRACE)>0  GPURTRACE=2 : Endif
+Endcase
+Return
+
+
+################################################################################
+# DIVPOHAPP1 : Mise à jour indicateur signature d'une             MBT 27/12/05 #
+#              commande à la valeur 1 (non signée)                             #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVPOHAPP1 (WPOHNUM,WMSGFLG)                                         #
+#   Sous-programme appelé par l'action DIVPOHAPP1.                             #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours.                            #
+# ---------------------------------------------------------------------------- #
+#   WPOHNUM : Numéro de la commande d'achat                                    #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVPOHAPP1(WPOHNUM,WMSGFLG)
+Value    Char    WPOHNUM
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WRET
+Local    Libelle WADXLOG
+#-----
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_POHAPP1
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub POHAPP1
+If GOK=-1  Goto ROLL_POHAPP1 : Endif
+If GOK=0   Goto AB_POHAPP1   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+End
+#-----
+$ROLL_POHAPP1
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_POHAPP1 : Endif
+Else
+  End
+Endif
+#-----
+$AB_POHAPP1
+If [L]WADXLOG=0
+  Rollback
+Endif
+End
+
+#--------------------------------------------------------------#
+# Traitement de la màj indicateur signature de la commande à 1 #
+#--------------------------------------------------------------#
+$POHAPP1
+#----- Variables locales -----#
+Local    Char    WMSG(100)
+Local    Integer SAV_GOK      : [L]SAV_GOK=GOK : GOK=1 : Raz [L]WRET
+Local    Libelle WLOCK
+#-----
+If [L]WPOHNUM=""  [L]WRET=11 : Gosub TRT_ERR_POHAPP1 : Return : Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("POH"+[L]WPOHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="POH"+[L]WPOHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_POHAPP1 : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+#-----
+If !clalev([F:POH])  Local File PORDER    [POH] : Endif
+#----- Mise à 1 de l'indicateur de la commande -----#
+Update [POH] Where POHNUM=[L]WPOHNUM With APPFLG=1
+If fstat
+  GOK=0   : Call FSTA("POH") From GLOCK
+  [L]WRET=18 : Gosub TRT_ERR_POHAPP1 : Goto FIN_POHAPP1
+Endif
+#-----
+$FIN_POHAPP1
+If [L]WLOCK  Unlock="POH"+[L]WPOHNUM : Endif
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+#-----------------------------------------------------------------#
+#                     Traitement des erreurs                      #
+# --------------------------------------------------------------- #
+# 11 = WPOHNUM Paramètre non renseigné                            #
+# 12 = $PORDER xxxxxxxx Modification en cours sur un autre poste  #
+# 18 = Erreur d'écriture sur le fichier PORDER xxxxxxxx           #
+#-----------------------------------------------------------------#
+$TRT_ERR_POHAPP1
+Case [L]WRET
+  When 11 : [L]WMSG="WPOHNUM"-mess(136,199,1)              : GOK=0
+  When 12 : [L]WMSG="$PORDER"-[L]WPOHNUM-mess(10,100,1)    : GOK=0
+  When 18 : [L]WMSG=mess(13,100,1)-"PORDER"-[L]WPOHNUM
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+           Else
+             Call ECR_TRACE([L]WMSG,1) From GESECRAN
+           Endif
+           If dim(GPURTRACE)>0  GPURTRACE=2 : Endif
+Endcase
+Return
+
+
+################################################################################
+# TRTPSHCLE : Solde complet d'une DA avec pour chaque ligne       MBT 07/11/05 #
+#             mise à jour du pré-engagement si nécessaire,                     #
+#             annulation suivi et suppression de l'encours                     #
+# ---------------------------------------------------------------------------- #
+# Subprog TRTPSHCLE (WPSHNUM,WMSGFLG,WRET)                                     #
+#   Sous-programme appelé dans les traitements du module achats.               #
+#   Il y a toujours une transaction en cours.                                  #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+#   WRET    : Code retour ( 0 = Ok avec GOK=1,                                 #
+#                       11-19 = Erreur avec GOK=0 si bloquant)                 #
+################################################################################
+Subprog TRTPSHCLE(WPSHNUM,WMSGFLG,WRET)
+Value    Char    WPSHNUM
+Value    Integer WMSGFLG
+Variable Integer WRET
+#-----
+Local    Libelle WORIFLG : WORIFLG=1 : # Appel hors Workflow (annulation suivi)
+#-----
+If !clalev([F:PSD])  Local File PREQUISD  [PSD] : Endif
+#-----
+Gosub PSHCLE
+End
+
+################################################################################
+# DIVPSHCLE : Solde complet d'une DA avec pour chaque ligne       MBT 07/11/05 #
+#             mise à jour du pré-engagement si nécessaire                      #
+#             et suppression de l'encours                                      #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVPSHCLE (WPSHNUM,WMSGFLG)                                          #
+#   Sous-programme appelé par l'action DIVPSHCLE.                              #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours.                            #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVPSHCLE(WPSHNUM,WMSGFLG)
+Value    Char    WPSHNUM
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WRET
+Local    Libelle WADXLOG
+Local    Libelle WORIFLG : WORIFLG=0 : # Appel depuis le Workflow
+#-----
+Local File PREQUISD  [PSD] : # Il faut réouvrir à cause du "Link" workflow
+#-----
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_PSHCLE
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub PSHCLE
+If GOK=-1  Goto ROLL_PSHCLE : Endif
+If GOK=0   Goto AB_PSHCLE   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+End
+#-----
+$ROLL_PSHCLE
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_PSHCLE : Endif
+Else
+  End
+Endif
+#-----
+$AB_PSHCLE
+If [L]WADXLOG=0
+  Rollback
+Endif
+End
+
+#---------------------------------------------------#
+# Traitement du solde complet d'une demande d'achat #
+#---------------------------------------------------#
+$PSHCLE
+#----- Variables locales -----#
+Local    Char    WFCY(GLONFCY), WPARAME(10), WMSG(100)
+Local    Integer WPSDLIN, WLINCLEFLG, WCLELINNBR, WCLEFLG, WFLAG
+Local    Integer SAV_GAPPPSH  : [L]SAV_GAPPPSH=GAPPPSH
+Local    Integer SAV_GOK      : [L]SAV_GOK=GOK : GOK=1 : Raz [L]WRET
+Local    Libelle WLOCK
+#-----
+If [L]WPSHNUM=""  [L]WRET=11 : Gosub TRT_ERR_PSHCLE : Return : Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("PSH"+[L]WPSHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="PSH"+[L]WPSHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_PSHCLE : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+#-----
+If !clalev([F:PSH])  Local File PREQUIS   [PSH] : Endif
+If !clalev([F:GAC])  Local File GACCOUNT  [GAC] : Endif
+If !clalev([F:TCO])  Local File TABCOEFF  [TCO] : Endif
+If !clalev([F:ORD])  Local File ORDERS    [ORD] : Endif
+If !clalev([M:ORDK]) Local Mask ORDK     [ORDK] : Endif
+#----- Lecture entête demande d'achat -----#
+Read [PSH] PSH0=[L]WPSHNUM
+If fstat
+  GOK=0 : [L]WRET=14 : Gosub TRT_ERR_PSHCLE : Goto FIN_PSHCLE
+Endif
+[L]WCLELINNBR=[F:PSH]CLELINNBR
+[L]WCLEFLG   =[F:PSH]CLEFLG
+#-----
+[L]WFCY=[F:PSH]PSHFCY
+Call PARAML([L]WFCY,"APPPSH",[L]WPARAME) From ADOVAL
+GAPPPSH=val([L]WPARAME)
+Call PARAML([L]WFCY,"PSHAPPHEA",[L]WPARAME) From ADOVAL
+GPSHAPPHEA=val([L]WPARAME)
+#----- Mise à jour indicateur solde sur toutes les lignes de la DA -----#
+For [PSD] PSD0 Where PSHNUM=[L]WPSHNUM & LINCLEFLG<>2
+  [L]WPSDLIN   =[F:PSD]PSDLIN
+  [L]WLINCLEFLG=[F:PSD]LINCLEFLG
+  Readlock [PSD] Curr
+  If fstat=1
+    GOK=-1  : GLOCK="$PREQUISD"-[L]WPSHNUM-num$([L]WPSDLIN)
+    [L]WRET=16 : Gosub TRT_ERR_PSHCLE : Break
+  Elsif fstat
+    GOK=0   : Call RSTA("PSD",[L]WPSHNUM-num$([L]WPSDLIN)) From GLOCK
+    [L]WRET=17 : Gosub TRT_ERR_PSHCLE : Break
+  Endif
+  #-----
+  Gosub MAJ_PSDCLE : If GOK<1  Break : Endif
+  #-----
+  Rewrite [PSD]
+  If fstat
+    GOK=0   : Call FSTA("PSD") From GLOCK
+    [L]WRET=18 : Gosub TRT_ERR_PSHCLE : Break
+  Endif
+Next
+If GOK<1  Goto FIN_PSHCLE : Endif
+#----- Postionnement indicateur "Annulé" sur les lignes de suivi de workflow -----#
+If GAPPPSH>1 & [L]WORIFLG=1 & [F:PSH]APPFLG<3 & GPSHAPPHEA=2
+  #----- Uniquement si appel hors évènement de Workflow ! -----#
+  Call ANNULE_SUIVI("PSH",mess(654,197,1),1,[L]WRET) From TRTACHDIV1
+  If GOK<1  Goto FIN_PSHCLE  Else  Raz [L]WRET : Endif
+Endif
+#----- Mise à jour indicateur solde sur l'entête de la DA -----#
+Raz [L]WFLAG
+If [F:PSH]CLELINNBR<>[F:PSH]LINNBR | [F:PSH]CLEFLG<>2
+  [L]WCLELINNBR=[F:PSH]LINNBR : [L]WCLEFLG=2 : [L]WFLAG=1
+Endif
+If [L]WFLAG=1
+  Update [PSH] Where PSHNUM=[L]WPSHNUM With CLELINNBR=[L]WCLELINNBR, CLEFLG=[L]WCLEFLG
+  If fstat
+    GOK=0   : Call FSTA("PSH") From GLOCK
+    [L]WRET=15 : Gosub TRT_ERR_PSHCLE : Goto FIN_PSHCLE
+  Endif
+Endif
+#-----
+$FIN_PSHCLE
+If [L]WLOCK  Unlock="PSH"+[L]WPSHNUM : Endif
+GAPPPSH=[L]SAV_GAPPPSH
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+#-----------------------------------------------------------------#
+#                     Traitement des erreurs                      #
+# --------------------------------------------------------------- #
+# 11 = WPSHNUM Paramètre non renseigné                            #
+# 12 = $PREQUIS xxxxxxxx Modification en cours sur un autre poste #
+# 13 = Erreur d'accès sur le fichier PREQUIS xxxxxxxx             #
+# 14 = xxxxxxxxxx Demande d'achat introuvable !                   #
+# 15 = Erreur d'écriture sur le fichier PREQUIS xxxxxxxx          #
+# 16 = Erreur d'accès sur le fichier PREQUISD xxxxxxxx            #
+# 17 = xxxxxxxxxx 9999 Demande d'achat introuvable !              #
+# 18 = Erreur d'écriture sur le fichier PREQUISD xxxxxxxx         #
+# 19 = xxxxxxxxxx Problème de mise à jour des encours             #
+#-----------------------------------------------------------------#
+$TRT_ERR_PSHCLE
+Case [L]WRET
+  When 11 : [L]WMSG="WPSHNUM"-mess(136,199,1)               : GOK=0
+  When 12 : [L]WMSG="$PREQUIS"-[L]WPSHNUM-mess(10,100,1)    : GOK=0
+  When 13 : [L]WMSG=mess(12,100,1)-"PREQUIS"-[L]WPSHNUM
+  When 14 : [L]WMSG=[L]WPSHNUM-mess(220,197,1)
+  When 15 : [L]WMSG=mess(13,100,1)-"PREQUIS"-[L]WPSHNUM
+  When 16 : [L]WMSG=mess(12,100,1)-"PREQUISD"-[L]WPSHNUM
+  When 17 : [L]WMSG=[L]WPSHNUM-num$([L]WPSDLIN)-mess(220,197,1)
+  When 18 : [L]WMSG=mess(13,100,1)-"PREQUISD"-[L]WPSHNUM
+  When 19 : [L]WMSG=[F:PSD]ITMREF-mess(92,197,1)
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+           Else
+             Call ECR_TRACE([L]WMSG,1) From GESECRAN
+           Endif
+           If dim(GPURTRACE)>0  GPURTRACE=2 : Endif
+Endcase
+Return
+
+
+################################################################################
+# TRTPOHCLE : Solde complet d'une commande avec pour chaque ligne MBT 27/12/05 #
+#             mise à jour de l'engagement si nécessaire,                       #
+#             annulation suivi et suppression de l'encours                     #
+# ---------------------------------------------------------------------------- #
+# Subprog TRTPOHCLE (WPOHNUM,WMSGFLG,WRET)                                     #
+#   Sous-programme appelé dans les traitements du module achats.               #
+#   Il y a toujours une transaction en cours.                                  #
+# ---------------------------------------------------------------------------- #
+#   WPOHNUM : Numéro de la commande d'achat                                    #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+#   WRET    : Code retour ( 0 = Ok avec GOK=1,                                 #
+#                       11-19 = Erreur avec GOK=0 si bloquant)                 #
+################################################################################
+Subprog TRTPOHCLE(WPOHNUM,WMSGFLG,WRET)
+Value    Char    WPOHNUM
+Value    Integer WMSGFLG
+Variable Integer WRET
+#-----
+Local    Libelle WORIFLG : WORIFLG=1 : # Appel hors Workflow (annulation suivi)
+#-----
+If !clalev([F:POQ])  Local File PORDERQ  [POQ] : Endif
+# Issue 106506 - 2015-05-05 by SR : Landed Cost
+If !clalev([F:SHD])  Local File SHIPMENTD  [SHD] : Endif
+#-----
+# Issue 82703 - 2013-03-28 by SR : Régul valo stock : Flag solde modifié #
+If !GSERVEUR
+# Ouverture de la trace "solde du document"
+    Call OUVRE_TRACE(mess(654,197,1)) From LECFIC
+Endif
+Call DEBTRANS From GLOCK
+#-----
+$TR_TRTPOHCLE
+GOK=1
+Trbegin ADOVAL
+Gosub POHCLE
+If GOK=-1  Goto ROLL_TRTPOHCLE : Endif
+If GOK=0   Goto AB_TRTPOHCLE   : Endif
+Commit
+# Issue 82703 - 2013-03-28 by SR : Régul valo stock : Flag solde modifié #
+If !GSERVEUR
+    Call FERME_TRACE From LECFIC
+Endif
+End
+#-----
+$ROLL_TRTPOHCLE
+Rollback : Call ROLL From GLOCK
+If GROLL  End  Else  Goto TR_TRTPOHCLE : Endif
+#-----
+$AB_TRTPOHCLE
+Rollback
+End
+
+
+################################################################################
+# DIVPOHCLE : Solde complet d'une commande avec pour chaque ligne MBT 27/12/05 #
+#             mise à jour del'engagement si nécessaire                         #
+#             et suppression de l'encours                                      #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVPOHCLE (WPOHNUM,WMSGFLG)                                          #
+#   Sous-programme appelé par l'action DIVPOHCLE.                              #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours.                            #
+# ---------------------------------------------------------------------------- #
+#   WPOHNUM : Numéro de la commande d'achat                                    #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVPOHCLE(WPOHNUM,WMSGFLG)
+Value    Char    WPOHNUM
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WRET
+Local    Libelle WADXLOG
+Local    Libelle WORIFLG : WORIFLG=0 : # Appel depuis le Workflow
+#-----
+Local File PORDERQ  [POQ] : # Il faut réouvrir à cause du "Link" workflow
+#-----
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_POHCLE
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub POHCLE
+If GOK=-1  Goto ROLL_POHCLE : Endif
+If GOK=0   Goto AB_POHCLE   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+End
+#-----
+$ROLL_POHCLE
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_POHCLE : Endif
+Else
+  End
+Endif
+#-----
+$AB_POHCLE
+If [L]WADXLOG=0
+  Rollback
+Endif
+End
+
+#----------------------------------------------------#
+# Traitement du solde complet d'une commande d'achat #
+#----------------------------------------------------#
+$POHCLE
+#----- Variables locales -----#
+Local Char    WFCY(GLONFCY), WPARAME(10), WMSG(100)
+Local Integer WPOPLIN, WLINCLEFLG, WCLELINNBR, WCLEFLG, WFLAG
+Local Decimal WORDNOT, WORDATI
+Local Libelle WTRAIT
+Local Integer SAV_GOK                : [L]SAV_GOK      =GOK
+Local Char    SAV_GSOCIETE(GLONCPY)  : [L]SAV_GSOCIETE =GSOCIETE
+Local Char    SAV_GLOCALDEV(GLONCUR) : [L]SAV_GLOCALDEV=GLOCALDEV
+Local Char    SAV_GFINRSP(GLONFCY)   : [L]SAV_GFINRSP  =GFINRSP
+Local Integer SAV_GAPPPOH            : [L]SAV_GAPPPOH  =GAPPPOH
+Local Libelle WLOCK
+Local Integer SIGN
+#-----
+GOK=1 : Raz [L]WRET
+If [L]WPOHNUM=""  [L]WRET=11 : Gosub TRT_ERR_POHCLE : Return : Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("POH"+[L]WPOHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="POH"+[L]WPOHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_POHCLE : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+#-----
+If !clalev([F:POH])  Local File PORDER    [POH]  : Endif
+If !clalev([F:POP])  Local File PORDERP   [POP]  : Endif
+If !clalev([F:ITM])  Local File ITMMASTER [ITM]  : Endif
+If !clalev([F:MVS])  Local File BPSUPPMVT [MVS]  : Endif
+If !clalev([F:GAC])  Local File GACCOUNT  [GAC]  : Endif
+If !clalev([F:TCO])  Local File TABCOEFF  [TCO]  : Endif
+If !clalev([F:ORD])  Local File ORDERS    [ORD]  : Endif
+# Issue 113200 - 2015-12-17 by SR
+If !clalev([F:ITV])   Local File ITMMVT   [ITV]  :  Endif
+If !clalev([F:SHD])   Local File SHIPMENTD [SHD] :  Endif
+# End issue 113200
+
+If !clalev([M:ORDK]) Local Mask ORDK     [ORDK] : Endif
+If !clalev([M:SBCK]) Local Mask SBCK     [SBCK] : Endif
+#----- Lecture entête commande d'achat -----#
+Read [POH] POH0=[L]WPOHNUM
+If fstat
+  GOK=0 : [L]WRET=14 : Gosub TRT_ERR_POHCLE : Goto FIN_POHCLE
+Endif
+[L]WCLELINNBR=[F:POH]CLELINNBR
+[L]WCLEFLG   =[F:POH]CLEFLG
+#-----
+[L]WFCY=[F:POH]POHFCY
+Call GETDEV([L]WFCY)  From DEVSUB : If GFINRSP=""  GFINRSP=[L]WFCY : Endif
+Call PARAML([L]WFCY,"APPPOH",[L]WPARAME) From ADOVAL
+GAPPPOH=val([L]WPARAME)
+#----- Mise à jour indicateur solde sur toutes les lignes de la commande -----#
+Raz [L]WORDNOT, [L]WORDATI
+For [POQ] POQ0 Where POHNUM=[L]WPOHNUM & LINCLEFLG<>2
+  [L]WPOPLIN   =[F:POQ]POPLIN
+  [L]WLINCLEFLG=[F:POQ]LINCLEFLG
+  Readlock [POQ] Curr
+  If fstat=1
+    GOK=-1  : GLOCK="$PORDERQ"-[L]WPOHNUM-num$([L]WPOPLIN)
+    [L]WRET=16 : Gosub TRT_ERR_POHCLE : Break
+  Elsif fstat
+    GOK=0   : Call RSTA("POQ",[L]WPOHNUM-num$([L]WPOPLIN)) From GLOCK
+    [L]WRET=17 : Gosub TRT_ERR_POHCLE : Break
+  Endif
+  #-----
+  # Issue 83217 - 2012-07-02 by SR : Ne sert plus à rien
+  # Issue 80684 - 2012-03-14 by MUARN : ne pas solder commande si commande vente en cours de livraison
+#  If !clalev([F:SOH])  Local File SORDER  [SOH] : Endif
+#  Read [SOH] SOH0=[F:POH]OCNNUM
+#  If [F:SOH]LASDLVNUM <> ""
+#    GOK=0
+#    [L]WRET=23 : Gosub TRT_ERR_POHCLE : Goto FIN_POHCLE
+#  Endif
+
+  Gosub MAJ_POQCLE : If GOK<1  Break : Endif
+  #-----
+  Rewrite [POQ]
+  If fstat
+    GOK=0   : Call FSTA("POQ") From GLOCK
+    [L]WRET=18 : Gosub TRT_ERR_POHCLE : Break
+  Endif
+  # Issue 82703 - 2013-03-28 by SR : Régul valo stock
+  If [F:POQ]RCPQTYSTU <> 0
+      Call REGPRIX_FCC(2,"",0) From TRTACHFAC1
+      If GOK<1 : Break : Endif
+  Endif
+Next
+If GOK<1  Goto FIN_POHCLE : Endif
+#----- Màj nbre lignes soldées et indicateur solde sur l'entête de la commande -----#
+[L]WCLEFLG=[F:POH]CLEFLG
+Raz [L]WFLAG
+If [F:POH]CLELINNBR<>[F:POH]LINNBR | [F:POH]CLEFLG<>2
+  [L]WCLELINNBR=[F:POH]LINNBR : [L]WCLEFLG=2 : [L]WFLAG=1
+Endif
+If [L]WFLAG=1
+  # Issue 101281 - 2014-08-26 by MUARN : mise à jour champs UPDDAT
+#  Update [POH] Where POHNUM=[L]WPOHNUM
+#&              With  CLELINNBR=[L]WCLELINNBR, CLEFLG=[L]WCLEFLG, EXPNUM=[C]EXPORT
+  Update [POH] Where POHNUM=[L]WPOHNUM
+&              With  CLELINNBR=[L]WCLELINNBR, CLEFLG=[L]WCLEFLG, EXPNUM=[C]EXPORT,UPDDAT=date$
+  If fstat
+    GOK=0   : Call FSTA("POH") From GLOCK
+    [L]WRET=15 : Gosub TRT_ERR_POHCLE : Goto FIN_POHCLE
+  Endif
+  [F:POH]CLEFLG=[L]WCLEFLG
+Endif
+#----- Positionnement indicateur "Annulé" sur les lignes de suivi de workflow -----#
+If GAPPPOH>1 & [L]WORIFLG=1 & [F:POH]CLEFLG=2 & [F:POH]APPFLG<3
+  #----- Uniquement si appel hors évènement de Workflow ! -----#
+  If [F:POH]POHTYP=1
+    Call ANNULE_SUIVI("POH",mess(654,197,1),1,[L]WRET) From TRTACHDIV1
+  Else
+    Call ANNULE_SUIVI("POC",mess(654,197,1),1,[L]WRET) From TRTACHDIV1
+  Endif
+  If GOK<1  Goto FIN_POHCLE : Endif
+Endif
+#----- Mise à jour en commande dans mvts fournisseurs -----#
+Call MAJENC_BPS([F:POH]BPSNUM,3,[F:POH]POHFCY,[F:POH]CUR,[F:POH]CHGTYP,[F:POH]ORDDAT,
+&               [F:POH]POHNUM,[L]WORDNOT,[L]WORDATI,[F:POH]TTVORD) From TRTBPMVT
+If GOK<1  Goto FIN_POHCLE : Endif
+#----- Solde de la commande de vente inter-sites si nécessaire -----#
+If [F:POH]SALFCY<>"" & [F:POH]OCNNUM<>""
+  If !clalev([F:SOH])  Local File SORDER  [SOH] : Endif
+  Read [SOH] SOH0=[F:POH]OCNNUM
+  #----- Ne pas solder la commande de vente si déjà soldée -----#
+  If !fstat & [F:SOH]ORDSTA<>2
+    Call GENSOH("S",1,[L]WRET) From TRTVENISOC
+    If GOK<1
+      [L]WRET=22 : Gosub TRT_ERR_POHCLE : Goto FIN_POHCLE
+    Endif
+  Endif
+Endif
+#-----
+$FIN_POHCLE
+If [L]WLOCK  Unlock="POH"+[L]WPOHNUM : Endif
+#----- Rétablissement des globales -----#
+GSOCIETE =[L]SAV_GSOCIETE
+GLOCALDEV=[L]SAV_GLOCALDEV
+GFINRSP  =[L]SAV_GFINRSP
+GAPPPOH  =[L]SAV_GAPPPOH
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+#------------------------------------------------------------------------------#
+#                           Traitement des erreurs                             #
+# -----------------------------------------------------------------------------#
+# 11 = WPOHNUM Paramètre non renseigné                                         #
+# 12 = $PORDER xxxxxxxx Modification en cours sur un autre poste               #
+# 13 = Erreur d'accès sur le fichier PORDER xxxxxxxx                           #
+# 14 = xxxxxxxxxx Commande introuvable !                                       #
+# 15 = Erreur d'écriture sur le fichier PORDER xxxxxxxx                        #
+# 16 = Erreur d'accès sur le fichier PORDERQ xxxxxxxx                          #
+# 17 = xxxxxxxxxx 9999 Commande introuvable !                                  #
+# 18 = Erreur d'écriture sur le fichier PORDERQ xxxxxxxx                       #
+# 19 = xxxxxxxxxx Problème de mise à jour des encours                          #
+# 22 = xxxxxxxxxx Inter-sites : La commande de vente n'existe pas              #
+# 23 = xxxxxxxxxx Inter-sites : La commande de vente est en cours de livraison #
+#------------------------------------------------------------------------------#
+$TRT_ERR_POHCLE
+Case [L]WRET
+  When 11 : [L]WMSG="WPOHNUM"-mess(136,199,1)              : GOK=0
+  When 12 : [L]WMSG="$PORDER"-[L]WPOHNUM-mess(10,100,1)    : GOK=0
+  When 13 : [L]WMSG=mess(12,100,1)-"PORDER"-[L]WPOHNUM
+  When 14 : [L]WMSG=[L]WPOHNUM-mess(359,197,1)
+  When 15 : [L]WMSG=mess(13,100,1)-"PORDER"-[L]WPOHNUM
+  When 16 : [L]WMSG=mess(12,100,1)-"PORDERQ"-[L]WPOHNUM
+  When 17 : [L]WMSG=[L]WPOHNUM-num$([L]WPOPLIN)-mess(359,197,1)
+  When 18 : [L]WMSG=mess(13,100,1)-"PORDERQ"-[L]WPOHNUM
+  When 19 : [L]WMSG=[F:POQ]ITMREF-mess(92,197,1) # Issue 110325/125 - 2016-05-23 by SR : erreur de classe [F]
+  When 22 : [L]WMSG=[F:POH]OCNNUM-mess(274,194,1)
+  When 23 : [L]WMSG=[F:POH]OCNNUM-mess(427,194,1) # Issue 80684 - 2012-03-14 by MUARN : inter-site commande vente livrée
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+           Else
+             Call ECR_TRACE([L]WMSG,1) From GESECRAN
+           Endif
+           If dim(GPURTRACE)>0  GPURTRACE=2 : Endif
+Endcase
+Return
+
+
+################################################################################
+# TRTPSDCLE : Solde d'une ligne de DA avec désengagement si       MBT 08/11/05 #
+#             besoin, annulation suivi et suppression de l'encours             #
+# ---------------------------------------------------------------------------- #
+# Subprog TRTPSDCLE (WPSHNUM,WPSDLIN,WMSGFLG,WRET)                             #
+#   Sous-programme appelé dans les traitements du module achats.               #
+#   Il y a toujourd une transaction en cours.                                  #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WPSDLIN : Numéro de la ligne                                               #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+#   WRET    : Code retour ( 0 = Ok avec GOK=1,                                 #
+#                       11-19 = Erreur avec GOK=0 si bloquant)                 #
+################################################################################
+Subprog TRTPSDCLE(WPSHNUM,WPSDLIN,WMSGFLG,WRET)
+Value    Char    WPSHNUM
+Value    Integer WPSDLIN
+Value    Integer WMSGFLG
+Variable Integer WRET
+#-----
+Local    Libelle WORIFLG : WORIFLG=1 : # Appel hors Workflow (annulation suivi)
+#-----
+Gosub PSDCLE
+End
+
+################################################################################
+# DIVPSDCLE : Solde d'une ligne de DA avec désengagement si       MBT 08/11/05 #
+#             besoin et suppression de l'encours                               #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVPSDCLE (WPSHNUM,WPSDLIN,WMSGFLG)                                  #
+#   Sous-programme appelé par l'action DIVPSDCLE.                              #
+#   Cette action est utilisée par le workflow des signatures.                  #
+#   Il n'y a pas forcément de transaction en cours.                            #
+# ---------------------------------------------------------------------------- #
+#   WPSHNUM : Numéro de la demande d'achat                                     #
+#   WPSDLIN : Numéro de la ligne                                               #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVPSDCLE(WPSHNUM,WPSDLIN,WMSGFLG)
+Value    Char    WPSHNUM
+Value    Integer WPSDLIN
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WRET
+Local    Libelle WADXLOG
+Local    Libelle WORIFLG : WORIFLG=0 : # Appel depuis le Workflow
+#-----
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_PSDCLE
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub PSDCLE
+If GOK=-1  Goto ROLL_PSDCLE : Endif
+If GOK=0   Goto AB_PSDCLE   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+Endif
+End
+#-----
+$ROLL_PSDCLE
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_PSDCLE : Endif
+Else
+  End
+Endif
+#-----
+$AB_PSDCLE
+If [L]WADXLOG=0
+  Rollback
+Endif
+End
+
+#---------------------------------------#
+# Traitement du solde d'une ligne de DA #
+#---------------------------------------#
+$PSDCLE
+#----- Variables locales -----#
+Local    Char    WFCY(GLONFCY), WPARAME(10), WMSG(100)
+Local    Integer WLINCLEFLG, WCLELINNBR, WCLEFLG
+Local    Integer SAV_GAPPPSH  : [L]SAV_GAPPPSH=GAPPPSH
+Local    Integer SAV_GOK      : [L]SAV_GOK=GOK : GOK=1 : Raz [L]WRET
+Local    Libelle WLOCK
+#-----
+If [L]WPSHNUM=""  [L]WRET=11 : Gosub TRT_ERR_PSDCLE : Return : Endif
+If [L]WPSDLIN=0   [L]WRET=11 : Gosub TRT_ERR_PSDCLE : Return : Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("PSH"+[L]WPSHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="PSH"+[L]WPSHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_PSDCLE : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+#-----
+If !clalev([F:PSH])  Local File PREQUIS   [PSH] : Endif
+If !clalev([F:PSD])  Local File PREQUISD  [PSD] : Endif
+If !clalev([F:GAC])  Local File GACCOUNT  [GAC] : Endif
+If !clalev([F:TCO])  Local File TABCOEFF  [TCO] : Endif
+If !clalev([F:ORD])  Local File ORDERS    [ORD] : Endif
+If !clalev([M:ORDK]) Local Mask ORDK     [ORDK] : Endif
+#----- Lecture entête demande d'achat -----#
+Read [PSH] PSH0=[L]WPSHNUM
+If fstat
+  GOK=0 : [L]WRET=14 : Gosub TRT_ERR_PSDCLE : Goto FIN_PSDCLE
+Endif
+[L]WCLELINNBR=[F:PSH]CLELINNBR
+[L]WCLEFLG   =[F:PSH]CLEFLG
+#-----
+[L]WFCY=[F:PSH]PSHFCY
+Call PARAML([L]WFCY,"APPPSH",[L]WPARAME) From ADOVAL
+GAPPPSH=val([L]WPARAME)
+Call PARAML([L]WFCY,"PSHAPPHEA",[L]WPARAME) From ADOVAL
+GPSHAPPHEA=val([L]WPARAME)
+#----- Mise à jour indicateur solde sur la ligne de la DA -----#
+Readlock [PSD] PSD0=[L]WPSHNUM;[L]WPSDLIN
+If fstat=1
+  GOK=-1  : GLOCK="$PREQUISD"-[L]WPSHNUM-num$([L]WPSDLIN)
+  [L]WRET=16 : Gosub TRT_ERR_PSDCLE : Goto FIN_PSDCLE
+Elsif fstat
+  GOK=0   : Call RSTA("PSD",[L]WPSHNUM-num$([L]WPSDLIN)) From GLOCK
+  [L]WRET=17 : Gosub TRT_ERR_PSDCLE : Goto FIN_PSDCLE
+Endif
+If [F:PSD]LINCLEFLG=2
+  [L]WRET=20 : Unlock [PSD] : Gosub TRT_ERR_PSDCLE : Goto FIN_PSDCLE
+Endif
+#-----
+Gosub MAJ_PSDCLE : If GOK<1  Goto FIN_PSDCLE : Endif
+#-----
+Rewrite [PSD]
+If fstat
+  GOK=0   : Call FSTA("PSD") From GLOCK
+  [L]WRET=18 : Gosub TRT_ERR_PSDCLE : Goto FIN_PSDCLE
+Endif
+#----- Mise à jour indicateur solde sur l'entête de la DA -----#
+[L]WCLELINNBR=min([F:PSH]CLELINNBR+1,[F:PSH]LINNBR)
+If [L]WCLELINNBR<[F:PSH]LINNBR  [L]WCLEFLG=1  Else  [L]WCLEFLG=2 : Endif
+Update [PSH] Where PSHNUM=[L]WPSHNUM With CLELINNBR=[L]WCLELINNBR, CLEFLG=[L]WCLEFLG
+If fstat
+  GOK=0   : Call FSTA("PSH") From GLOCK
+  [L]WRET=15 : Gosub TRT_ERR_PSDCLE : Goto FIN_PSDCLE
+Endif
+#-----
+$FIN_PSDCLE
+If [L]WLOCK  Unlock="PSH"+[L]WPSHNUM : Endif
+GAPPPSH=[L]SAV_GAPPPSH
+#VPO 19/11/10 FQ69241 pb sur retour erreur workflow signature
+If GOK & dim([L]SAV_GOK)>0
+    GOK=[L]SAV_GOK
+Endif
+Return
+#-----------------------------------------------------------------#
+#                     Traitement des erreurs                      #
+# --------------------------------------------------------------- #
+# 11 = WPSHNUM Paramètre non renseigné                            #
+# 12 = $PREQUIS xxxxxxxx Modification en cours sur un autre poste #
+# 13 = Erreur d'accès sur le fichier PREQUIS xxxxxxxx             #
+# 14 = xxxxxxxxxx Demande d'achat introuvable !                   #
+# 15 = Erreur d'écriture sur le fichier PREQUIS xxxxxxxx          #
+# 16 = Erreur d'accès sur le fichier PREQUISD xxxxxxxx            #
+# 17 = xxxxxxxxxx 9999 Demande d'achat introuvable !              #
+# 18 = Erreur d'écriture sur le fichier PREQUISD xxxxxxxx         #
+# 19 = xxxxxxxxxx Problème de mise à jour des encours             #
+# 20 = xxxxxxxxxx 9999 Ligne déjà soldée, solde impossible !      #
+#-----------------------------------------------------------------#
+$TRT_ERR_PSDCLE
+Case [L]WRET
+  When 11 : [L]WMSG="WPSHNUM-WPSDLIN"-mess(136,199,1)           : GOK=0
+  When 12 : [L]WMSG="$PREQUIS"-[L]WPSHNUM-mess(10,100,1)        : GOK=0
+  When 13 : [L]WMSG=mess(12,100,1)-"PREQUIS"-[L]WPSHNUM
+  When 14 : [L]WMSG=[L]WPSHNUM-mess(220,197,1)
+  When 15 : [L]WMSG=mess(13,100,1)-"PREQUIS"-[L]WPSHNUM
+  When 16 : [L]WMSG=mess(12,100,1)-"PREQUISD"-[L]WPSHNUM
+  When 17 : [L]WMSG=[L]WPSHNUM-num$([L]WPSDLIN)-mess(220,197,1)
+  When 18 : [L]WMSG=mess(13,100,1)-"PREQUISD"-[L]WPSHNUM
+  When 19 : [L]WMSG=[F:PSD]ITMREF-mess(92,197,1)
+  When 20 : [L]WMSG=[L]WPSHNUM-num$([L]WPSDLIN)-mess(168,194,1) : GOK=0
+Endcase
+Case [L]WMSGFLG
+  When 1 : If GOK=1
+             Call MESSAGE ([L]WMSG)    From GESECRAN
+           Else
+             Call ERREUR ([L]WMSG)     From GESECRAN
+           Endif
+  When 2 : If GOK=1
+             GMESSAGE=[L]WMSG : GERR=2
+           Else
+             GMESSAGE=[L]WMSG : GERR=1
+           Endif
+  When 3 : If GOK=1
+             Call ECR_TRACE([L]WMSG,0) From GESECRAN
+           Else
+             Call ECR_TRACE([L]WMSG,1) From GESECRAN
+           Endif
+           If dim(GPURTRACE)>0  GPURTRACE=2 : Endif
+Endcase
+Return
+
+
+#--------------------------------------------------------#
+#  Mises à jour dans le cas du solde d'une ligne de DA   #
+# ------------------------------------------------------ #
+# - Màj pré-engagement                                   #
+# - Annulation du workflow                               #
+# - Suppression de l'encours                             #
+# - Positionnement du flag solde et date/opérateur modif #
+#--------------------------------------------------------#
+$MAJ_PSDCLE
+#----- Mise à jour pré-engagement -----#
+If GAPPPSH<2 | [F:PSD]CMMPRPFLG=1
+  Call TRTMAJCMM([F:PSD]PSHNUM,[F:PSD]PSDLIN,0,-1,1,"PSD2",3,[L]WRET) From TRTACHDIV1
+  If GOK<1  Return  Else  Raz [L]WRET : Endif
+  [F:PSD]CMMPRPFLG=0
+Endif
+#----- Postionnement indicateur "Annulé" sur les lignes de suivi de workflow -----#
+If GAPPPSH>1 & [L]WORIFLG=1 & [F:PSD]LINAPPFLG<3 & GPSHAPPHEA<2
+  #----- Uniquement si appel hors évènement de Workflow ! -----#
+  Call ANNULE_SUIVI("PSD",mess(654,197,1),1,[L]WRET) From TRTACHDIV1
+  If GOK<1  Return  Else  Raz [L]WRET : Endif
+Endif
+#----- Suppression de l'encours -----#
+If [F:PSD]WIPNUM<>""
+  [M:ORDK]MAJCOD="A"
+  [M:ORDK]WIPTYP=2
+  [M:ORDK]WIPNUM=[F:PSD]WIPNUM
+  [M:ORDK]ITMREF=[F:PSD]ITMREF
+  Call WIP From TRTWIP
+  If GOK<1  [L]WRET=19 : Gosub TRT_ERR_PSHCLE : Return : Endif
+Endif
+#-----
+[F:PSD]LINCLEFLG=2
+[F:PSD]UPDDAT   =date$
+[F:PSD]UPDUSR   =GUSER
+Return
+
+
+#-----------------------------------------------------------#
+# Mises à jour dans le cas du solde d'une ligne de commande #
+# --------------------------------------------------------- #
+# - Màj qté commandée de l'article-site                     #
+# - Màj engagement                                          #
+# - Annulation du workflow                                  #
+# - Suppression de l'encours                                #
+# - Màj opération de sous-traitance                         #
+# - Positionnement du flag solde et date/opérateur modif    #
+#-----------------------------------------------------------#
+$MAJ_POQCLE
+If [F:POQ]RCPQTYPUU<[F:POQ]QTYPUU
+  #----- Cumuls des montants restant en commande -----#
+  Read [POP] POP0=[F:POQ]POHNUM;[F:POQ]POPLIN;1
+  If fstat  Raz [F:POP] : Endif
+  [L]SIGN=-1 : Gosub CAL_MVS From SUBPOHA
+  #----- Mise à jour de la quantité commandée dans l'article-site -----#
+  If [F:POQ]WIPNUM<>""
+    Call LECITV([F:POQ]PRHFCY,[F:POQ]ITMREF,"",[L]WRET) From STKLIB
+    If GOK<1  [L]WRET=0 : Return : Endif
+    If [L]WRET=0
+      Update [ITV] Where ITMREF=[F:POQ]ITMREF & STOFCY=[F:POQ]PRHFCY
+&                  With ORDSTO-=([F:POQ]QTYSTU-[F:POQ]RCPQTYSTU)
+      If fstat  GOK=0 : Call FSTA("ITV") From GLOCK : Return : Endif
+    Endif
+  Endif
+Endif
+#----- Mise à jour engagement -----#
+[F:POQ]LINCLEFLG=2
+Call TRTMAJCMM([F:POQ]POHNUM,[F:POQ]POPLIN,[F:POQ]POQSEQ,-1,2,"POQ2",[L]WMSGFLG,[L]WRET) From TRTACHDIV1
+If GOK<1  Return  Else  Raz [L]WRET : Endif
+#----- Mise à jour opération de sous-traitance -----#
+If find([F:POQ]VCRTYPORI,10,36) : # Si achat sous-traitance
+  If [F:POH]POHNUM<>[F:POQ]POHNUM
+    Read [POH] POH0=[F:POQ]POHNUM : If fstat Raz [F:POH] : Endif
+  Endif
+  If [F:POQ]RCPQTYSTU=0
+    [M:SBCK]MAJCOD="A"
+  Else
+    [M:SBCK]MAJCOD="M"
+  Endif
+  [M:SBCK]VCRNUM=[F:POQ]POHNUM
+  [M:SBCK]VCRLIN=[F:POQ]POPLIN
+  [M:SBCK]VCRSEQ=[F:POQ]POQSEQ
+  If dim([M:SBCK]LINTYP)>0 [M:SBCK]LINTYP = [F:POQ]LINTYP Endif  # FQ 76147 GA 09/2011
+  [M:SBCK]BPAADD=[F:POQ]SCOADD
+  [M:SBCK]ORDQTY=[F:POQ]RCPQTYSTU : # ligne cde soldée donc qté commandée = qté réceptionnée
+  [M:SBCK]ORDDAT=[F:POQ]EXTRCPDAT-[F:POQ]OFS
+  [M:SBCK]RCPDAT=[F:POQ]EXTRCPDAT
+  Call CONVERT2([F:POH]CUR,GLOCALDEV,GLOCALDEV,[F:POH]CHGTYP,[F:POH]ORDDAT,
+&               [F:POQ]LINAMT,[M:SBCK]EXTPRI,[L]WRET) From TRTDEV
+  [M:SBCK]EXTPRI=arr([M:SBCK]EXTPRI/[F:POQ]QTYSTU,10^-GDECPRI)
+  [M:SBCK]OFS   =[F:POQ]OFS
+  [M:SBCK]MSGFLG=1
+  [M:SBCK]CLEFLG=[F:POQ]LINCLEFLG
+  [M:SBCK]ITMREFORI=[F:POQ]ITMREFORI # Issue 109433 by GA 09/2015 idem SUBPOHA
+  [M:SBCK]VCRTYPORI=[F:POQ]VCRTYPORI # Issue 109433 by GA 09/2015 idem SUBPOHA
+  [M:SBCK]VCRNUMORI=[F:POQ]VCRNUMORI # Issue 92866 GA 09/2013
+  [M:SBCK]VCRLINORI=[F:POQ]VCRLINORI # Issue 92866 GA 09/2013
+  [M:SBCK]VCRSEQORI=[F:POQ]VCRSEQORI # Issue 92866 GA 09/2013
+  Call MAJ_SBC From SBCLIB
+  If [M:SBCK]CODRET<>0
+    # Issue 109433 by GA 09/2015 idem SUBPOHA
+    #GMESSAGE=mess(96,193,1) : GERR=1 : GOK=0 : Return
+      If [M:SBCK]VCRTYPORI=10
+        GMESSAGE=mess(96,193,1)-":"-GMESSAGE
+      Elsif [M:SBCK]VCRTYPORI=36
+        GMESSAGE=mess(913,196,1)-":"-GMESSAGE
+      Endif
+      GERR=1 : GOK=0 : Return
+  Endif
+Endif
+
+# solde = suppression affectations
+If [F:POQ]LINCLEFLG = 2 : Gosub SUP_MTO_POQ From PURMTOLIB : Endif
+
+#----- Suppression de l'encours -----#
+If [F:POQ]WIPNUM<>""
+  [M:ORDK]MAJCOD="A"
+  [M:ORDK]WIPTYP=[F:POQ]WIPTYP
+  [M:ORDK]WIPNUM=[F:POQ]WIPNUM
+  [M:ORDK]ITMREF=[F:POQ]ITMREF
+  Call WIP From TRTWIP
+  If GOK<1  [L]WRET=19 : Gosub TRT_ERR_POHCLE : Return : Endif
+Endif
+
+# Issue 106506 - 2015-05-05 by SR : Landed Cost
+Gosub MAJ_SHD
+# End issue 106506
+#-----
+[F:POQ]RCPCLEFLG=1
+[F:POQ]UPDDAT   =date$
+[F:POQ]UPDUSR   =GUSER
+[F:POQ]EXPNUM   =[C]EXPORT
+#----- Appel du point d'entrée POHCLE solde/désolde ligne de commande -----#
+[L]WTRAIT=1 : [L]WCLEFLG=1
+Gosub POINT_POHCLE From TRTACHCDE1
+#-----
+Return
+
+# Issue 106506 - 2015-05-05 by SR : Landed Cost
+$MAJ_SHD
+If [F:POQ]LINCLEFLG = 2
+   # Solde
+   # Issue 110948 - 2015-09-10 by SR : Seulement les non encore soldées
+   Update [SHD] Where POHNUM = [F:POQ]POHNUM & POPLIN = [F:POQ]POPLIN & POQSEQ = [F:POQ]POQSEQ
+&                   & CLEFLG <> 2  With CLEFLG=2
+Else
+   Update [SHD] Where POHNUM = [F:POQ]POHNUM & POPLIN = [F:POQ]POPLIN & POQSEQ = [F:POQ]POQSEQ
+&                   & (SHIQTYPUU - RCPQTYPUU > 0)  With CLEFLG=1
+Endif
+# End issue 110948
+Return
+# End issue 106506
+
+################################################################################
+# ANNULE_SUIVI : S/P Positionnement indicateur "Annulé"           MBT 20/12/05 #
+#                sur les lignes de suivi de workflow                           #
+# ---------------------------------------------------------------------------- #
+# Subprog ANNULE_SUIVI(WOBJET,WMOTIF,WMSGFLG,WRET)                             #
+# ---------------------------------------------------------------------------- #
+#   WOBJET  : Code l'objet ("PSH","PSD","POH","POC")                           #
+#   WMOTIF  : Motif de l'annulation                                            #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = message dans une trace)         #
+#   WRET    : Code retour ( 0 = Ok avec GOK=1,                                 #
+#                           1 = Erreur avec GOK=0 si bloquant)                 #
+################################################################################
+Subprog ANNULE_SUIVI(WOBJET,WMOTIF,WMSGFLG,WRET)
+Value    Char    WOBJET
+Value    Char    WMOTIF
+Value    Integer WMSGFLG
+Variable Integer WRET
+#----- Variables locales -----#
+Local    Integer WTYPEVT,     WTYPEVT2
+Local    Char    WCODEVT(10), WCODEVT2(10)
+#-----
+Raz [L]WRET
+Case [L]WOBJET
+  When "PSH" : [L]WTYPEVT=2 : [L]WCODEVT="PSH" : [L]WTYPEVT2=9 : [L]WCODEVT2="PSHSIG"
+  When "PSD" : [L]WTYPEVT=2 : [L]WCODEVT="PSH" : [L]WTYPEVT2=9 : [L]WCODEVT2="PSDSIG"
+  When "POH" : [L]WTYPEVT=2 : [L]WCODEVT="POH" : [L]WTYPEVT2=9 : [L]WCODEVT2="POHSIG"
+  When "POC" : [L]WTYPEVT=2 : [L]WCODEVT="POC" : [L]WTYPEVT2=9 : [L]WCODEVT2="POCSIG"
+Endcase
+#-----
+Call ANNULE_SUIVI([L]WTYPEVT,[L]WCODEVT,0,[L]WRET,[L]WMOTIF,0) From AWRKDEL
+If GOK<1  Gosub ERR_ANNULE_SUIVI : End : Endif
+End
+$ERR_ANNULE_SUIVI
+If [L]WMSGFLG=1
+  Case [L]WOBJET
+    When "PSH", "PSD" : If GPURTRACE=1  GPURTRACE=2  Else  GPURTRACE=1 : Endif
+    When "POH"        : If GPURTRACE=1  GPURTRACE=2 : Endif
+    When "POC"
+  Endcase
+Endif
+Return
+
+
+#########################################################################
+# MAJ_CALTAX_LIG : S/P de calcul des bases et des taxes    MBT 22/09/09 #
+#                     de la ligne d'un document achat                   #
+# --------------------------------------------------------------------- #
+# Subprog MAJ_CALTAX_LIG(ABREV,NOL)                                     #
+#   ABREV  : Abréviation de l'écran ou de la table ("PSD","PSH1"...etc) #
+#   NOL    : indice de la ligne (nolign-1) si ABREV = Abréviation écran #
+#########################################################################
+Subprog MAJ_CALTAX_LIG(ABREV,NOL)
+Value  Char     ABREV
+Value  Shortint NOL
+
+#----- Si c'est le composé (produit fini), pas de chiffrage -----#
+# Issue 102669 - 2014-10-03 by MUARN : point d'entrée non documenté pour un spé
+GPE = 1
+#CHECK IGNORE BEGIN
+[V]GPOINT="CUSTAXE" : Gosub ENTREE From EXEFNC
+#CHECK IGNORE END
+If GPE =1
+  If ABREV="POH2" & [M:POH2]LINTYP(NOL)=2  End : Endif
+  If ABREV="PTH1" & [M:PTH1]LINTYP(NOL)=2  End : Endif
+Endif
+
+#----- Variables locales -----#
+# Issue 74556 - 2011-07-05 by VPO : lecture code activité PTX
+#Local  Libelle  X : X=3+4*func AFNC.ACTIV("PTX")
+Local  Libelle  X : X=3+4*func TRTX3.ACTIV_PTX
+Local  Shortint I
+Local  Integer  TYPREG, STAT
+Local  Decimal  BASE, MONTANT(1..X), MONTDED(1..X)
+Local  Char     TAXE(GLONVAT)(1..X)
+Local  Decimal  WRND
+#-----
+Local  Char     WCLASSE(8)
+Local  Char     WNOMIND(5)
+Local  Char     WCUR(GLONCUR)
+Local  Char     WITMREF(GLONITM)
+Local  Char     WBPSNUM(GLONBPS)
+Local  Char     WVAT1(GLONVAT)
+Local  Shortint WNOL
+Local  Date     WDOCDAT
+Local  Char     WVACBPR(GLONTVB)
+Local  Libelle  WVACTYP
+Local  Decimal  WQTYPUU
+Local  Decimal  WLINAMT, WLINATIAMT
+Local  Decimal  WCLCAMT(1..X)
+Local  Decimal  WBASTAXLIN1, WDISBASLIN1
+Local  Decimal  WAMTTAXLIN1, WAMTTAXLIN2, WAMTTAXLIN3
+Local  Decimal  WAMTTAXRCP,  WAMTTAXISS,  WAMTTAXOTH1, WAMTTAXOTH2
+Local  Decimal  WDEDTAXLIN1, WDEDTAXLIN2, WDEDTAXLIN3
+Local  Decimal  WDEDTAXRCP,  WDEDTAXISS,  WDEDTAXOTH1, WDEDTAXOTH2
+# Issue 71937 - 2012-03-27 by SR
+Local Integer  WRET
+#-----
+Case ABREV
+  When "PSD"
+    WCLASSE="[F:PSD]"
+    WNOMIND=""
+    WCUR   =[F:PSD]CUR
+    WITMREF=[F:PSD]ITMREF
+    WBPSNUM=[F:PSD]BPSNUM
+    WVAT1  =[F:PSD]VAT(0)
+    WQTYPUU=[F:PSD]QTYPUU
+    WNOL   =-1
+    WDOCDAT=[F:PSH]PRQDAT
+    WVACBPR=[F:PSD]VACBPR
+    WVACTYP=[F:PSD]VACTYP
+    WLINAMT=[F:PSD]LINAMT
+  When "PSH1"
+    WCLASSE="[M:PSH1]"
+    WNOMIND="(NOL)"
+    WCUR   =[M:PSH1]CUR(NOL)
+    WITMREF=[M:PSH1]ITMREF(NOL)
+    WBPSNUM=[M:PSH1]BPSNUM(NOL)
+    WVAT1  =[M:PSH1]VAT1(NOL)
+    WQTYPUU=[M:PSH1]QTYPUU(NOL)
+    WNOL   =NOL
+    WDOCDAT=[M:PSH0]PRQDAT
+    WVACBPR=[M:PSH1]VACBPR(NOL)
+    WVACTYP=[M:PSH1]VACTYP(NOL)
+    WLINAMT=[M:PSH1]LINAMT(NOL)
+  When "POH2"
+    WCLASSE="[M:POH2]"
+    WNOMIND="(NOL)"
+    WCUR   =[M:POH1]CUR
+    WITMREF=[M:POH2]ITMREF(NOL)
+    WBPSNUM=[M:POH0]BPSNUM
+    WVAT1  =[M:POH2]VAT1(NOL)
+    WQTYPUU=[M:POH2]QTYUOM(NOL)
+    WNOL   =NOL
+    WDOCDAT=[M:POH0]ORDDAT
+    WVACBPR=[M:POH1]VACBPR
+    WVACTYP=[M:POH1]VACTYP
+    WLINAMT=[M:POH2]LINAMT(NOL)
+  When "PTH1"
+    WCLASSE="[M:PTH1]"
+    WNOMIND="(NOL)"
+    WCUR   =[M:PTH0]CUR
+    WITMREF=[M:PTH1]ITMREF(NOL)
+    WBPSNUM=[M:PTH0]BPSNUM
+    WVAT1  =[M:PTH1]VAT1(NOL)
+    WQTYPUU=[M:PTH1]QTYUOM(NOL)
+    WNOL   =NOL
+    WDOCDAT=[M:PTH0]RCPDAT
+    WVACBPR=[M:PTH0]VACBPR
+    WVACTYP=[M:PTH0]VACTYP
+    WLINAMT=[M:PTH1]LINAMT(NOL)
+  When "PND"
+    WCLASSE="[F:PND]"
+    WNOMIND=""
+    WCUR   =[F:PND]NETCUR
+    WITMREF=[F:PND]ITMREF
+    WBPSNUM=[F:PND]BPSNUM
+    WVAT1  =[F:PND]VAT(0)
+    WQTYPUU=[F:PND]QTYUOM
+    WNOL   =-1
+    WDOCDAT=[F:PND]RTNDAT
+    WVACBPR=[F:PNH]VACBPR
+    WVACTYP=[F:PNH]VACTYP
+    WLINAMT=[F:PND]LINAMT
+  When "PNH1"
+    WCLASSE="[M:PNH1]"
+    WNOMIND="(NOL)"
+    WCUR   =[M:PNH1]NETCUR(NOL)
+    WITMREF=[M:PNH1]ITMREF(NOL)
+    WBPSNUM=[M:PNH1]BPSNUM
+    WVAT1  =[M:PNH1]VAT1(NOL)
+    WQTYPUU=[M:PNH1]QTYUOM(NOL)
+    WNOL   =NOL
+    WDOCDAT=[M:PNH1]RTNDAT
+    WVACBPR=[M:PNH1]VACBPR
+    WVACTYP=[M:PNH1]VACTYP
+    WLINAMT=[M:PNH1]LINAMT(NOL)
+  When Default
+    End
+Endcase
+#----- Calcul des taxes du montant ligne (marchandise) -----#
+Call ALICLCAMT2(WITMREF,WQTYPUU,WNOL,ABREV,WCLCAMT) From TRTX3
+#-----
+For I=1 To X
+  If left$(WCLASSE,3)="[F:"
+    Case I
+      When 1 : TAXE(1)=evalue(WCLASSE+"VAT(0)")
+      When 2 : TAXE(2)=evalue(WCLASSE+"VAT(1)")
+      When 3 : TAXE(3)=evalue(WCLASSE+"VAT(2)")
+      When 4 : TAXE(4)=evalue(WCLASSE+"TAXRCP")
+      When 5 : TAXE(5)=evalue(WCLASSE+"TAXISS")
+      When 6 : TAXE(6)=evalue(WCLASSE+"TAXOTH1")
+      When 7 : TAXE(7)=evalue(WCLASSE+"TAXOTH2")
+    Endcase
+  Else
+    Case I
+      When 1 : TAXE(1)=evalue(WCLASSE+"VAT1(NOL)")
+      When 2 : TAXE(2)=evalue(WCLASSE+"VAT2(NOL)")
+      When 3 : TAXE(3)=evalue(WCLASSE+"VAT3(NOL)")
+      When 4 : TAXE(4)=evalue(WCLASSE+"TAXRCP(NOL)")
+      When 5 : TAXE(5)=evalue(WCLASSE+"TAXISS(NOL)")
+      When 6 : TAXE(6)=evalue(WCLASSE+"TAXOTH1(NOL)")
+      When 7 : TAXE(7)=evalue(WCLASSE+"TAXOTH2(NOL)")
+    Endcase
+  Endif
+Next I
+#-----
+Call CALTAXE2(GSOCIETE,WDOCDAT,WVACBPR,WCUR,X,TAXE,1,WLINAMT,
+&             WCLCAMT,MONTANT,MONTDED,TYPREG,STAT) From SUBTVT
+#-----
+For I=1 To X
+  Case I
+    When 1
+      Raz WDISBASLIN1
+      WBASTAXLIN1=WLINAMT
+      WAMTTAXLIN1=MONTANT(1)
+      WDEDTAXLIN1=MONTDED(1)
+    When 2
+      If TAXE(2)=""
+        Raz WAMTTAXLIN2, WDEDTAXLIN2
+      Else
+        WAMTTAXLIN2=MONTANT(2)
+        WDEDTAXLIN2=MONTDED(2)
+        If !clalev([F:TVT])  Local File TABVAT [TVT] : Endif
+        # Issue 71937 - 2012-03-27 by SR : comment
+        Call LEC_TVT_LEG(GCURLEG,TAXE(2),WRET) From TRTLECLEG
+        If WRET : Raz [F:TVT] : Endif
+        #Read [TVT] TVT0=TAXE(2) : If fstat  Raz [F:TVT] : Endif
+        If [F:TVT]VATCHA=2  WBASTAXLIN1+=WAMTTAXLIN2 : Endif
+      Endif
+    When 3
+      If TAXE(3)=""
+        Raz WAMTTAXLIN3, WDEDTAXLIN3
+      Else
+        WAMTTAXLIN3=MONTANT(3)
+        WDEDTAXLIN3=MONTDED(3)
+        If !clalev([F:TVT])  Local File TABVAT [TVT] : Endif
+        # Issue 71937 - 2012-03-27 by SR : comment
+        Call LEC_TVT_LEG(GCURLEG,TAXE(3),WRET) From TRTLECLEG
+        If WRET : Raz [F:TVT] : Endif
+        #Read [TVT] TVT0=TAXE(3) : If fstat  Raz [F:TVT] : Endif
+        If [F:TVT]VATCHA=2  WBASTAXLIN1+=WAMTTAXLIN3 : Endif
+      Endif
+    When 4
+      If TAXE(4)=""
+        Raz WAMTTAXRCP, WDEDTAXRCP
+      Else
+        WAMTTAXRCP=MONTANT(4)
+        WDEDTAXRCP=MONTDED(4)
+        If !clalev([F:TVT])  Local File TABVAT [TVT] : Endif
+        # Issue 71937 - 2012-03-27 by SR : comment
+        Call LEC_TVT_LEG(GCURLEG,TAXE(4),WRET) From TRTLECLEG
+        If WRET : Raz [F:TVT] : Endif
+        #Read [TVT] TVT0=TAXE(4) : If fstat  Raz [F:TVT] : Endif
+        If [F:TVT]VATCHA=2  WBASTAXLIN1+=WAMTTAXRCP : Endif
+      Endif
+    When 5
+      If TAXE(5)=""
+        Raz WAMTTAXISS, WDEDTAXISS
+      Else
+        WAMTTAXISS=MONTANT(5)
+        WDEDTAXISS=MONTDED(5)
+        If !clalev([F:TVT])  Local File TABVAT [TVT] : Endif
+        # Issue 71937 - 2012-03-27 by SR : comment
+        Call LEC_TVT_LEG(GCURLEG,TAXE(5),WRET) From TRTLECLEG
+        If WRET : Raz [F:TVT] : Endif
+        #Read [TVT] TVT0=TAXE(5) : If fstat  Raz [F:TVT] : Endif
+        If [F:TVT]VATCHA=2  WBASTAXLIN1+=WAMTTAXISS : Endif
+      Endif
+    When 6
+      If TAXE(6)=""
+        Raz WAMTTAXOTH1, WDEDTAXOTH1
+      Else
+        WAMTTAXOTH1=MONTANT(6)
+        WDEDTAXOTH1=MONTDED(6)
+        If !clalev([F:TVT])  Local File TABVAT [TVT] : Endif
+        # Issue 71937 - 2012-03-27 by SR : comment
+        Call LEC_TVT_LEG(GCURLEG,TAXE(6),WRET) From TRTLECLEG
+        If WRET : Raz [F:TVT] : Endif
+        #Read [TVT] TVT0=TAXE(6) : If fstat  Raz [F:TVT] : Endif
+        If [F:TVT]VATCHA=2  WBASTAXLIN1+=WAMTTAXOTH1 : Endif
+      Endif
+    When 7
+      If TAXE(7)=""
+        Raz WAMTTAXOTH2, WDEDTAXOTH2
+      Else
+        WAMTTAXOTH2=MONTANT(7)
+        WDEDTAXOTH2=MONTDED(7)
+        If !clalev([F:TVT])  Local File TABVAT [TVT] : Endif
+        # Issue 71937 - 2012-03-27 by SR : comment
+        Call LEC_TVT_LEG(GCURLEG,TAXE(7),WRET) From TRTLECLEG
+        If WRET : Raz [F:TVT] : Endif
+        #Read [TVT] TVT0=TAXE(7) : If fstat  Raz [F:TVT] : Endif
+        If [F:TVT]VATCHA=2  WBASTAXLIN1+=WAMTTAXOTH2 : Endif
+      Endif
+  Endcase
+Next I
+If WVACTYP<>4
+  WLINATIAMT=WLINAMT
+  For I=1 To X
+    Case I
+      When 1 : WLINATIAMT+=WAMTTAXLIN1
+      When 2 : WLINATIAMT+=WAMTTAXLIN2
+      When 3 : WLINATIAMT+=WAMTTAXLIN3
+      When 4 : WLINATIAMT+=WAMTTAXRCP
+      When 5 : WLINATIAMT+=WAMTTAXISS
+      When 6 : WLINATIAMT+=WAMTTAXOTH1
+      When 7 : WLINATIAMT+=WAMTTAXOTH2
+    Endcase
+  Next I
+Else
+  WLINATIAMT=WLINAMT
+Endif
+#----- Calcul de la taxe des montants remises/frais de la ligne tarif -----#
+If [F:BPS]BPSNUM<>WBPSNUM
+  Read [BPS] BPS0=WBPSNUM : If fstat  Raz [F:BPS] : Endif
+Endif
+#----- Chargement arrondi devise commande -----#
+If [F:TCU]CUR<>WCUR
+  Read [TCU] TCU0=WCUR
+  If !fstat  WRND=[F:TCU]CURRND  Else  WRND=0.01 : Endif
+Else
+  WRND=[F:TCU]CURRND
+Endif
+#-----
+Call TYPREM(2,[F:BPS]PLISTC) From TRTPRICE
+For I=1 To 9
+  If evalue("dim("+WCLASSE+"DISCRGVAL"+num$(I)+WNOMIND+")")>0
+    If GNPRNOTFLG(I-1)=1 & GINVDTALIN(I-1)<>0
+      Read [PFI] PFI0=GINVDTALIN(I-1) : If fstat  Raz [F:PFI] : Endif
+      If [F:PFI]VATRUL=1
+        Raz TAXE : TAXE(1)=WVAT1
+        #----- C'est un montant -----#
+        If GDISCRGTYP(I-1)=1
+          If GCLCRUL(I-1)=1 : # Par unité
+            BASE=arr(evalue(WCLASSE+"DISCRGVAL"+num$(I)+WNOMIND)*WQTYPUU,WRND)
+          Else              : # Par ligne
+            BASE=evalue(WCLASSE+"DISCRGVAL"+num$(I)+WNOMIND)
+          Endif
+        #----- C'est un pourcentage -----#
+        Else
+          BASE=arr(WLINAMT*evalue(WCLASSE+"DISCRGVAL"+num$(I)+WNOMIND)/100,WRND)
+        Endif
+        #----- Inversion de la base si minoration -----#
+        If GINCDCR(I-1)=2  BASE=-BASE : Endif
+        #-----
+        If BASE<>0
+          Call CALTAXE(GSOCIETE,WDOCDAT,WVACBPR,WCUR,1,TAXE,1,
+&                      BASE,MONTANT,MONTDED,TYPREG,STAT) From SUBTVT
+          WBASTAXLIN1+=BASE
+          WAMTTAXLIN1+=MONTANT(1)
+          WDEDTAXLIN1+=MONTDED(1)
+        Endif
+      Endif
+    Endif
+  Endif
+Next I
+#-----
+If ABREV="POH2" | ABREV="PTH1"
+  #----- Calcul de la taxe des montants remises/frais de pied répartis -----#
+  For I=1 To 9
+    If evalue(WCLASSE+"INVDTALIN2(I-1)")<>0 & evalue(WCLASSE+"INVDTAVAT2(I-1)")=""
+      Raz TAXE : TAXE(1)=WVAT1
+      BASE=evalue(WCLASSE+"DISCRGAMT"+num$(I)+"(NOL)")
+      If BASE<>0
+        Call CALTAXE(GSOCIETE,WDOCDAT,WVACBPR,WCUR,1,TAXE,1,
+&                    BASE,MONTANT,MONTDED,TYPREG,STAT) From SUBTVT
+        WBASTAXLIN1+=BASE
+        WAMTTAXLIN1+=MONTANT(1)
+        WDEDTAXLIN1+=MONTDED(1)
+        # Issue 70985 - 2012-05-11 by MUARN : landed cost taxe ajouté au montant TTC
+        WLINATIAMT+=MONTANT(1)
+      Endif
+    Endif
+  Next I
+  #----- Positionnement de l'indicateur de calcul en sortie de tableau -----#
+  Assign WCLASSE+"CLCFLG" With 2
+Endif
+#-----
+If ABREV="POH2"  [M:POH2]LINATI(NOL)=WLINATIAMT : Endif
+If evalue("dim("+WCLASSE+"DISBASLIN1)")>0  Assign WCLASSE+"DISBASLIN1"+WNOMIND With 0 : Endif
+#-----
+Assign WCLASSE+"CLCAMT1"   +WNOMIND With WCLCAMT(1)
+Assign WCLASSE+"CLCAMT2"   +WNOMIND With WCLCAMT(2)
+Assign WCLASSE+"CLCAMT3"   +WNOMIND With WCLCAMT(3)
+Assign WCLASSE+"LINATIAMT" +WNOMIND With WLINATIAMT
+Assign WCLASSE+"BASTAXLIN1"+WNOMIND With WBASTAXLIN1
+Assign WCLASSE+"AMTTAXLIN1"+WNOMIND With WAMTTAXLIN1
+Assign WCLASSE+"AMTTAXLIN2"+WNOMIND With WAMTTAXLIN2
+Assign WCLASSE+"AMTTAXLIN3"+WNOMIND With WAMTTAXLIN3
+Assign WCLASSE+"DEDTAXLIN1"+WNOMIND With WDEDTAXLIN1
+Assign WCLASSE+"DEDTAXLIN2"+WNOMIND With WDEDTAXLIN2
+Assign WCLASSE+"DEDTAXLIN3"+WNOMIND With WDEDTAXLIN3
+If X=7
+  Assign WCLASSE+"CLCAMT4"   +WNOMIND With WCLCAMT(4)
+  Assign WCLASSE+"CLCAMT5"   +WNOMIND With WCLCAMT(5)
+  Assign WCLASSE+"CLCAMT6"   +WNOMIND With WCLCAMT(6)
+  Assign WCLASSE+"CLCAMT7"   +WNOMIND With WCLCAMT(7)
+  Assign WCLASSE+"AMTTAXRCP" +WNOMIND With WAMTTAXRCP
+  Assign WCLASSE+"AMTTAXISS" +WNOMIND With WAMTTAXISS
+  Assign WCLASSE+"AMTTAXOTH1"+WNOMIND With WAMTTAXOTH1
+  Assign WCLASSE+"AMTTAXOTH2"+WNOMIND With WAMTTAXOTH2
+  Assign WCLASSE+"DEDTAXRCP" +WNOMIND With WDEDTAXRCP
+  Assign WCLASSE+"DEDTAXISS" +WNOMIND With WDEDTAXISS
+  Assign WCLASSE+"DEDTAXOTH1"+WNOMIND With WDEDTAXOTH1
+  Assign WCLASSE+"DEDTAXOTH2"+WNOMIND With WDEDTAXOTH2
+Endif
+End
+
+# Issue 110325/125 - 2016-05-23 by SR : Solde/désolde POQ
+################################################################################
+# DIVPOQCLE : Solde/désolde d'une ligne de cde avec Engagement/désengagement   #
+# si besoin et suppression/création de l'encours                               #
+# ---------------------------------------------------------------------------- #
+# Subprog DIVPOQCLE (WPOHNUM,WPOPLIN,WPOQSEQ,WSENS,WMSGFLG)                     #
+# Il n'y a pas forcément de transaction en cours.                              #
+# ---------------------------------------------------------------------------- #
+#   WPOHNUM : Numéro de la commande                                            #
+#   WPOPLIN : Numéro de la ligne                                               #
+#   WPOQSEQ : Numéro de la séquence                                            #
+#   WSENS    : Sens l'appel : 1 = Solde 2 = Désolde                            #
+#   WMSGFLG : Indicateur message d'erreur (0 = pas de message d'erreur,        #
+#                                          1 = erreur à l'écran (Call ERREUR), #
+#                                          2 = GMESSAGE + GERR positionnés,    #
+#                                          3 = message dans une trace)         #
+################################################################################
+Subprog DIVPOQCLE(WPOHNUM,WPOPLIN,WPOQSEQ,WSENS,WMSGFLG)
+Value    Char    WPOHNUM
+Value    Integer WPOPLIN
+Value    Integer WPOQSEQ
+Value    Integer WSENS
+Value    Integer WMSGFLG
+#----- Variables locales -----#
+Local    Integer WORIFLG
+Local    Integer WADXLOG
+Local    Decimal WORDNOT, WORDATI
+Local    Char    WFCY(GLONFCY), WPARAME(10), WMSG(100)
+Local    Char   WGRPDEB(GLONVCR) : #Annule suivi de signatures
+
+Local    Integer SAV_GAPPPOH            : [L]SAV_GAPPPOH=GAPPPOH
+Local    Integer SAV_GOK                : [L]SAV_GOK=GOK
+Local    Char    SAV_FCY(GLONFCY)       : [L]SAV_FCY = GFCY
+Local    Char    SAV_GSOCIETE(GLONCPY)  : [L]SAV_GSOCIETE  =GSOCIETE
+Local    Char    SAV_GLOCALDEV(GLONCUR) : [L]SAV_GLOCALDEV =GLOCALDEV
+Local    Char    SAV_GFINRSP(GLONFCY)   : [L]SAV_GFINRSP   =GFINRSP
+Local    Integer WLOCK, WLINSOLD, STA, SIGN, WRET
+#----- Variables pour le point d'entrée POHCLE -----#
+Local   Integer  WCLEFLG, WTRAIT
+#-----
+WORIFLG=1 : # Appel hors Workflow (annulation suivi)
+GOK=1
+If !adxlog
+  [L]WADXLOG=0
+  Call DEBTRANS From GLOCK
+Else
+  [L]WADXLOG=1
+Endif
+#-----
+$TR_POQCLE
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin ADOVAL
+Endif
+#-----
+Gosub POQCLE
+If GOK=-1  Goto ROLL_POQCLE : Endif
+If GOK=0   Goto AB_POQCLE   : Endif
+#-----
+If [L]WADXLOG=0
+  Commit
+  #----- Envoi des messages groupe workflow signature -----#
+  If WGRPDEB<>""  Call ENVOI_GROUPE(WGRPDEB) From AWRK : WGRPDEB="" : Endif
+Endif
+End
+#-----
+$ROLL_POQCLE
+If [L]WADXLOG=0
+  Rollback : Call ROLL From GLOCK
+  If GROLL  End  Else  Goto TR_POQCLE : Endif
+Else
+  End
+Endif
+#-----
+$AB_POQCLE
+If [L]WADXLOG=0
+  Rollback
+  #----- Suppression des message groupe workflow signature -----#
+  If WGRPDEB<>""  Call VIRE_GROUPE(WGRPDEB)  From AWRK : WGRPDEB="" : Endif
+Endif
+End
+
+#------------------------------------------------#
+# Traitement du solde/désolde d'une ligne de CDE #
+#------------------------------------------------#
+$POQCLE
+Raz [L]WRET
+#-----
+If [L]WPOHNUM=""  [L]WRET=11 : Gosub TRT_ERR_POHCLE : Return : Endif
+If [L]WPOPLIN=0   [L]WRET=11 : Gosub TRT_ERR_POHCLE : Return : Endif
+If [L]WPOQSEQ=0   [L]WRET=11 : Gosub TRT_ERR_POHCLE : Return : Endif
+#-----
+If !clalev([F:POH])  Local File PORDER    [POH]   : Endif
+If !clalev([F:POP])  Local File PORDERP   [POP]   : Endif
+If !clalev([F:POQ])  Local File PORDERQ   [POQ]   : Endif
+If !clalev([F:POC])  Local File PORDERC   [POC]   : Endif
+If !clalev([F:ITM])  Local File ITMMASTER [ITM]   : Endif
+If !clalev([F:MVS])  Local File BPSUPPMVT [MVS]   : Endif
+If !clalev([F:GAC])  Local File GACCOUNT  [GAC]   : Endif
+If !clalev([F:TCO])  Local File TABCOEFF  [TCO]   : Endif
+If !clalev([F:TCU])  Local File TABCUR    [TCU]   : Endif
+If !clalev([F:ORD])  Local File ORDERS    [ORD]   : Endif
+If !clalev([F:ITV])   Local File ITMMVT    [ITV]  : Endif
+If !clalev([F:TCA])   Local File TABCOUAFF [TCA]  : Endif
+If GMODU(2)=2
+  If !clalev([F:BUP]) Local File BUDPAR    [BUP]  : Endif : # Si module compta présent
+Endif
+If GMODU(5)=2 : # Module Vente présent
+ If !clalev([F:SOQ])  Local File SORDERQ  [SOQ]   : Endif
+Endif
+
+If !clalev([M:ORDK]) Local Mask ORDK     [ORDK] : Endif
+If !clalev([M:SBCK]) Local Mask SBCK     [SBCK] : Endif
+#----- Lecture entête commande -----#
+Read [POH] POH0=[L]WPOHNUM
+If fstat
+  GOK=0 : [L]WRET=14 : Gosub TRT_ERR_POHCLE : Goto FIN_POQCLE
+Endif
+#---------------------------------------------------------#
+# On ne fait rien si :                                    #
+# le code traitement est à SOLDE et ligne déjà soldée     #
+# le code traitement est à annulation et ligne non soldée #
+#---------------------------------------------------------#
+Read [POQ]POQ0 = [L]WPOHNUM;[L]WPOPLIN;[L]WPOQSEQ
+If fstat : WRET= 16 : Gosub TRT_ERR_POHCLE : Return : Endif
+If WSENS=1 & [F:POQ]LINCLEFLG=2 : Return : Endif
+If WSENS=2 & [F:POQ]LINCLEFLG=1 : Return : Endif
+# ne pas annuler un solde sur un article non réceptionnable (jamais possible en expédition)
+If [F:ITM]ITMREF<>[F:POQ]ITMREF
+   Read [ITM] ITM0=[F:POQ]ITMREF : If fstat Raz [F:ITM] : Endif
+Endif
+If [F:ITM]RCPFLG=1 & WSENS=2 : Return : Endif
+
+# On ne peut pas annuler le solde d'une ligne de sous-traitance
+If [F:POQ]VCRTYPORI = 10 | [F:POQ]VCRTYPORI = 36 : Return : Endif
+
+# Si besoin, Pourra-t-on solder/Désolder la ligne de commande de vente ?
+If [F:POH]BETFCY=2 & [F:POQ]LINOCNNUM<>""
+  Raz GBIDI1
+  # On ne fait le controle que si demande de solde et ligne de commande de vente non soldée
+  # ou demande de désolde et commande de vente soldée
+  Read [SOQ]SOQ0=[F:POQ]LINOCNNUM;[F:POQ]OCNLIN;[F:POQ]OCNLIN
+  If !fstat & ((WSENS=1 & [F:SOQ]SOQSTA <> 3) |(WSENS=2 & [F:SOQ]SOQSTA = 3))
+      Call CTLMAJSOP("S",[F:POQ]LINOCNNUM,[F:POQ]OCNLIN,[F:POQ]OCNLIN,
+&                   GBIDI1) From TRTVENISOC
+  Endif
+  If GBIDI1<>0 : [L]WRET = 23 : Gosub TRT_ERR_POHCLE : Return : Endif
+Endif
+#----- Contrôle lock logique -----#
+Call JELOCKE("POH"+[L]WPOHNUM,[L]WRET) From OBJDIV
+If [L]WRET=0
+  Lock="POH"+[L]WPOHNUM
+  If fstat        [L]WRET=12 : Gosub TRT_ERR_POHCLE : Return : Endif
+  [L]WLOCK=1
+Else
+  Raz [L]WRET, [L]WLOCK
+Endif
+
+#-----
+[L]WFCY=[F:POH]POHFCY
+Call GETDEV([L]WFCY)  From DEVSUB : If GFINRSP=""  GFINRSP=[L]WFCY : Endif
+Call PARAML([L]WFCY,"APPPOH",[L]WPARAME) From ADOVAL
+GAPPPOH=val([L]WPARAME)
+#----- Mise à jour indicateur solde sur la ligne commande -----#
+Raz [L]WORDNOT, [L]WORDATI
+Readlock [POQ]POQ0 = [L]WPOHNUM;[L]WPOPLIN;[L]WPOQSEQ
+If fstat=1
+   GOK=-1  : GLOCK="$PORDERQ"-[L]WPOHNUM-num$([L]WPOPLIN)
+   [L]WRET=16 : Gosub TRT_ERR_POHCLE : Goto FIN_POQCLE
+  Elsif fstat
+    GOK=0   : Call RSTA("POQ",[L]WPOHNUM-num$([L]WPOPLIN)) From GLOCK
+    [L]WRET=17 : Gosub TRT_ERR_POHCLE : Goto FIN_POQCLE
+Endif
+#-----
+
+#----- Relire les paramètres budgets -----#
+If [F:POQ]POHFCY<>GFCY
+   GFCY=[F:POQ]POHFCY
+   Call DEFRCPFCY(GFCY)    From TRTACHDEF1
+   Call DEFSITE(GFCY)      From TRTACHDEF1
+   Call DEFBUD("POH",GFCY) From TRTACHDEF1
+   GCNTBUD=GCTLBUD
+Endif
+#
+Gosub SOLDE_LIG : If GOK<1  Goto FIN_POQCLE : Endif
+#
+#-----
+$FIN_POQCLE
+If [L]WLOCK  Unlock="POH"+[L]WPOHNUM : Endif
+#----- Rétablissement des globales -----#
+GSOCIETE =[L]SAV_GSOCIETE
+GLOCALDEV=[L]SAV_GLOCALDEV
+GFINRSP  =[L]SAV_GFINRSP
+GAPPPOH  =[L]SAV_GAPPPOH
+GFCY     =[L]SAV_FCY
+Return
+#-----
+
+############################################
+# Solde ou désolde de la ligne de commande #
+# ---------------------------------------- #
+# WSENS = 1 --> Solde                      #
+#       = 2 --> Annulation de solde        #
+############################################
+$SOLDE_LIG
+Read [POP] POP0=[F:POQ]POHNUM;[F:POQ]POPLIN;1
+If fstat
+  Raz [F:POP]
+  Read [POC] POC0=[F:POQ]POHNUM;[F:POQ]POPLIN
+  If fstat
+    Raz [F:POC]
+  Else
+    [F:POP]ITMREF=[F:POC]ITMREF
+    [F:POP]PRHFCY=[F:POC]PRHFCY
+  Endif
+Endif
+If WSENS=1        : # Solde
+  SIGN=-1 : Gosub CAL_MVS From SUBPOHA : # Calcul mts en commande HT et TTC
+Else             : # Désolde
+  SIGN=+1 : Gosub CAL_MVS From SUBPOHA : # Calcul mts en commande HT et TTC
+Endif
+#----- Maj qté en commande dans article-site -----#
+If [F:POP]ITMREF<>"" & ([F:POQ]QTYSTU-[F:POQ]RCPQTYSTU)>0
+  STA=0
+  Call LECITV([F:POP]PRHFCY,[F:POP]ITMREF,"",STA) From STKLIB
+  If STA>2
+    Infbox("Erreur : Le site ou l'article ne sont pas alimenté")
+    GOK=0
+  Endif
+  If GOK<>1
+    #----- On continue quand même sans mettre à jour ITV -----#
+    GOK=1
+  Else
+    If WSENS=1 : # Solde
+      If STA=0
+        Update [ITV] Where ITMREF=[F:POP]ITMREF & STOFCY=[F:POP]PRHFCY
+&                    With ORDSTO-=([F:POQ]QTYSTU-[F:POQ]RCPQTYSTU)
+      Endif
+    Else      : # Désolde
+      Update [ITV] Where ITMREF=[F:POP]ITMREF & STOFCY=[F:POP]PRHFCY
+&                  With ORDSTO+=([F:POQ]QTYSTU-[F:POQ]RCPQTYSTU)
+    Endif
+    If fstat  GOK=0 : Call FSTA ("ITV") From GLOCK : Return : Endif
+  Endif
+Endif
+#----- Maj du budget et de la ligne commande PORDERQ -----#
+Read [POH] POH0=[F:POQ]POHNUM
+If WSENS=1
+  SIGN=-1 :           : # Solde
+  [F:POQ]LINCLEFLG=2
+Else
+  SIGN=+1 :           : # Désolde
+  [F:POQ]LINCLEFLG=1
+Endif
+[F:POQ]RCPCLEFLG=1
+If [F:POQ]LINTYP<>2
+  Call TRTMAJCMM([F:POQ]POHNUM,[F:POQ]POPLIN,[F:POQ]POQSEQ,SIGN,2,"POQ2",0,GBIDI1) From TRTACHDIV1
+  If GOK<1  Return : Endif
+Endif
+#----- Relecture article si nécessaire -----#
+If [F:ITM]ITMREF<>[F:POQ]ITMREF
+  Read [ITM] ITM0=[F:POQ]ITMREF : If fstat Raz [F:ITM] : Endif
+Endif
+#-----
+Call GETDEV([F:POQ]POHFCY) From DEVSUB
+#----- Mise à jour opération de sous-traitance -----#
+# Issue 109433 by GA 09/2015 Subcontrated operation (WO) or Subcontracted product (EO)
+If find([F:POQ]VCRTYPORI,10,36) & [F:POQ]LINTYP<=2 : # Si achat sous-traitance
+  [M:SBCK]MAJCOD = "M"
+  [M:SBCK]VCRNUM = [F:POQ]POHNUM
+  [M:SBCK]VCRLIN = [F:POQ]POPLIN
+  [M:SBCK]VCRSEQ = [F:POQ]POQSEQ
+  [M:SBCK]ITMREF = [F:POQ]ITMREF                                 # Issue 109433 by GA 09/2015
+  If dim([M:SBCK]LINTYP)>0 [M:SBCK]LINTYP = [F:POQ]LINTYP Endif  # Issue 109433 by GA 09/2015
+  If [F:POQ]LINCLEFLG<>2
+    [M:SBCK]ORDQTY=[F:POQ]QTYSTU
+  Elsif [F:POQ]RCPQTYSTU<>0
+    [M:SBCK]ORDQTY=[F:POQ]RCPQTYSTU
+  Else
+    [M:SBCK]ORDQTY=0 : [M:SBCK]MAJCOD="A"
+  Endif
+  [M:SBCK]ORDDAT = [F:POQ]EXTRCPDAT-[F:POQ]OFS
+  [M:SBCK]RCPDAT = [F:POQ]EXTRCPDAT
+  Call CONVERT2([F:POH]CUR,GLOCALDEV,GLOCALDEV,[F:POH]CHGTYP,[F:POH]ORDDAT,
+&               [F:POQ]LINAMT,[M:SBCK]EXTPRI,STA) From TRTDEV
+  If [F:POQ]QTYSTU = 0
+    [M:SBCK]EXTPRI = arr([M:SBCK]EXTPRI,10^-GDECPRI)
+  Else
+    [M:SBCK]EXTPRI = arr([M:SBCK]EXTPRI/[F:POQ]QTYSTU,10^-GDECPRI)
+  Endif
+  [M:SBCK]OFS    = [F:POQ]OFS
+  [M:SBCK]MSGFLG = 1                        # llc 03.01 (inutile après tout)
+  [M:SBCK]CLEFLG = [F:POQ]LINCLEFLG         # 03.02 13517
+  #-----
+  Call MAJ_SBC From SBCLIB
+  If [M:SBCK]CODRET<>0
+     If [F:POQ]VCRTYPORI=10
+        GMESSAGE=mess(96,193,1)-":"-GMESSAGE
+      Elsif [F:POQ]VCRTYPORI=36
+        GMESSAGE=mess(913,196,1)-":"-GMESSAGE
+      Endif
+      GERR=1 : GOK=0 : Return
+  Endif
+Endif
+#----- Maj de l'encours ORDERS -----#
+If [F:POQ]WIPNUM<>""
+  #-----
+   Call LECTCA(7,GBIDI3) From SUBTCA
+  If fstat | !GBIDI3
+    GMESSAGE=mess(58,105,1)-mess(7,14,1)-mess(250,199,1) : GOK=0 : Return
+  Endif
+  GWIP=[F:TCA]CODNUM(8)
+  #-----
+  If WSENS=1          : # Solde
+    # affectations
+    Gosub SUP_MTO_POQ From PURMTOLIB
+
+    [M:ORDK]MAJCOD    = "A"
+    [M:ORDK]WIPTYP    = [F:POQ]WIPTYP
+    [M:ORDK]WIPNUM    = [F:POQ]WIPNUM
+    [M:ORDK]ITMREF    = [F:POQ]ITMREF
+
+  Else               : # Désolde
+    [M:ORDK]MAJCOD    = "M"
+    [M:ORDK]WIPTYP    = [F:POQ]WIPTYP
+    [M:ORDK]WIPSTA    = [F:POQ]WIPSTA
+    [M:ORDK]WIPNUM    = [F:POQ]WIPNUM
+    [M:ORDK]ITMREF    = [F:POQ]ITMREF
+    [M:ORDK]ORIFCY    = [F:POQ]POHFCY
+    [M:ORDK]STOFCY    = [F:POQ]PRHFCY
+    [M:ORDK]PJT       = [F:POP]PJT
+    [M:ORDK]BPRNUM    = [F:POQ]BPSNUM
+    [M:ORDK]STRDAT    = [F:POQ]ORDDAT
+    [M:ORDK]ENDDAT    = [F:POQ]EXTRCPDAT
+    [M:ORDK]VCRTYP    = 14
+    [M:ORDK]VCRNUM    = [F:POQ]POHNUM
+    [M:ORDK]VCRLIN    = [F:POQ]POPLIN
+    [M:ORDK]VCRSEQ    = [F:POQ]POQSEQ
+    [M:ORDK]EXTQTY    = [F:POQ]QTYSTU
+    [M:ORDK]CPLQTY    = [F:POQ]RCPQTYSTU
+    [M:ORDK]ALLQTY    = 0
+    [M:ORDK]SHTQTY    = 0
+    [M:ORDK]FMI       = 1
+    [M:ORDK]MRPMES    = 1
+    [M:ORDK]VCRTYPORI = 0
+    [M:ORDK]VCRNUMORI = ""
+    [M:ORDK]VCRLINORI = 0
+    [M:ORDK]VCRSEQORI = 0
+    [M:ORDK]BOMALT    = 0
+    [M:ORDK]ORI       = 1
+    If [F:POH]POHTYP=2 [M:ORDK]ABBFIL="POC" Else [M:ORDK]ABBFIL="POQ" : Endif
+  Endif
+  Call WIP From TRTWIP : If GOK<1 Return : Endif
+
+  # affectations si désolde
+  If WSENS <> 1
+    # affectations
+    Gosub MAJ_MTO_POQ From PURMTOLIB
+  Endif
+Endif
+#----- Appel du point d'entrée POHCLE solde/désolde ligne de commande -----#
+WTRAIT=2
+If WSENS=1  WCLEFLG=1  Else  WCLEFLG=2 : Endif
+Gosub POINT_POHCLE From TRTACHCDE1
+#-----
+Rewrite [POQ]
+If fstat GOK = 0 : Call FSTA("POQ") From GLOCK
+ [L]WRET=18 : Gosub TRT_ERR_POHCLE : Return
+Endif
+# Issue 82703 - 2013-03-28 by SR : Régul valo stock : Flag solde modifié #
+# Pour chaque réception existante, il faudra faire ou défaire la PEC des FCC
+If [F:POQ]RCPQTYSTU <> 0
+   If [F:POQ]LINCLEFLG = 2
+    Call REGPRIX_FCC(2,"",0) From TRTACHFAC1
+   Else
+    Call REGPRIX_FCC(3,"",0) From TRTACHFAC1
+   Endif
+Endif
+
+If WSENS=1
+  WLINSOLD+=1      : # Solde
+Else
+  WLINSOLD-=1      : # Désolde
+Endif
+#Maj du flag solde de la ligne de commande de vente si besoin
+If [F:POH]BETFCY=2 & [F:POQ]LINOCNNUM<>""
+  #--- Solde de ligne d'une commande de vente
+  Call DIVCLESOQ([F:POQ]LINOCNNUM, [F:POQ]OCNLIN, [F:POQ]OCNSEQ, GBIDC1) From TRTVENCDE
+  If GOK<1
+      [L]WRET=22 : Gosub TRT_ERR_POHCLE : Return
+  Endif
+Endif
+If GOK < 1: Return : Endif
+#
+#-----  Maj de l'entête cde PORDER -----#
+Readlock [POH] POH0=[L]WPOHNUM
+If fstat=1
+  GOK=-1 : GLOCK = "$PORDER" :
+  [L]WRET=12 : Gosub TRT_ERR_POHCLE : Return
+Elsif fstat
+  GOK= 0 : Call RSTA("POH",[L]WPOHNUM) From GLOCK
+ [L]WRET=13 : Gosub TRT_ERR_POHCLE : Return
+Endif
+[F:POH]CLELINNBR+=WLINSOLD
+If [F:POH]CLELINNBR<0  [F:POH]CLELINNBR=0 : Endif
+If [F:POH]CLELINNBR>[F:POH]LINNBR  [F:POH]CLELINNBR=[F:POH]LINNBR : Endif
+If [F:POH]CLELINNBR=[F:POH]LINNBR
+  [F:POH]CLEFLG=2
+Else
+  [F:POH]CLEFLG=1
+Endif
+Rewrite [POH]
+If fstat  GOK=0 : Call FSTA("POH") From GLOCK
+ [L]WRET=15 : Gosub TRT_ERR_POHCLE : Return
+Endif
+#
+#----- Maj en commande dans mouvements fournisseur -----#
+Call MAJENC_BPS([F:POH]BPSNUM,3,[F:POH]POHFCY,[F:POH]CUR,[F:POH]CHGTYP,[F:POH]ORDDAT,
+&               [F:POH]POHNUM,WORDNOT,WORDATI,[F:POH]TTVORD) From TRTBPMVT
+If GOK<1  Return : Endif
+#----- Positionnement indicateur "Annulé" sur les lignes de suivi de workflow -----#
+#----- Uniquement si appel hors évènement de Workflow ! -----#
+If WSENS = 1 & [L]WORIFLG=1 &  GAPPPOH>1 & [F:POH]CLEFLG=2 & [F:POH]APPFLG<3
+   If [F:POH]POHTYP=1
+    Call ANNULE_SUIVI("POH",mess(654,197,1),1,[L]WRET) From TRTACHDIV1
+  Else
+    Call ANNULE_SUIVI("POC",mess(654,197,1),1,[L]WRET) From TRTACHDIV1
+  Endif
+  If GOK<1  Return : Endif
+#----- Réactivation de la ligne de suivi de workflow -----#
+#----- Uniquement si appel hors évènement de Workflow ! -----#
+Elsif WSENS = 2 & [L]WORIFLG=1 & GAPPPOH > 1 & [F:POH]CLEFLG <> 2 & [F:POH]APPFLG<3
+  If [F:POH]POHTYP=1
+    Call REACTIV_SUIVI("POH",[F:POH]POHNUM) From TRTACHDIV1
+  Else
+    Call REACTIV_SUIVI("POC",[F:POH]POHNUM) From TRTACHDIV1
+  Endif
+  If GOK<1  Return : Endif
+Endif
+Return
+
+
+# Issue 116808 - 2016-05-26 by SR : Reactivation du suivi des signatures
+# Appelé par exemple par FUNCLEAR/ DICPOQCLE de TRTACHDIV1
+################################################################################
+# REACTIV_SUIVI : S/P Positionnement indicateur "A signer"                     #
+#                sur la ligne  de suivi de workflow                            #
+# ---------------------------------------------------------------------------- #
+# Subprog REACTIV_SUIVI(LABROBJ,LCLEOBJ)                                       #
+# ---------------------------------------------------------------------------- #
+#   LABROBJ  : Code l'objet ("PSH","PSD","POH","POC")                          #
+#   LCLEOBJ  : Clé de l'objet                                                  #
+#               Exemple : N° de commande                                       #
+################################################################################
+Subprog REACTIV_SUIVI(LABROBJ,LCLEOBJ)
+Value    Char    LABROBJ : # Abréviation de l'objet : exemple "POH"
+Value    Char    LCLEOBJ : # Clé de l'objet
+
+If clalev([F:AWS])=0  : Local File AWRKHISSUI [AWS] : Endif
+# Ne réactiver que la dernière annulée (une autre a pû être annulée
+# suite à l'annulation manuelle de la signature précédente)
+Filter [F:AWS] Where ABROBJ = LABROBJ & CLEDEC=LCLEOBJ & FLGSIG = 1
+Readlock [F:AWS]AWS0 Last
+If ! fstat
+  [F:AWS]FLGSIG = 3
+  Raz [F:AWS]REASON
+  Rewrite [F:AWS]
+Endif
+Filter [F:AWS]
+If fstat
+    GOK=0   : Call FSTA("AWS") From GLOCK
+    End
+Endif
+End
+# End issue 116808
+

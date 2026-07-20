@@ -1,0 +1,346 @@
+#<AdxTL>@(#)6.0.0.0 $Revision$
+
+Subprog DEVALID(FACTURE)
+Value Char FACTURE
+
+GPOINT = "DELVCRINV" : Gosub ENTREE From EXEFNC
+If GPE=1 : End : Endif
+
+If clalev([F:BAL])=0 : Local File BALANCE    [BAL] : Endif
+If clalev([F:BLA])=0 : Local File BALANA     [BLA] : Endif
+If clalev([F:BLQ])=0 : Local File BLAQTY     [BLQ] : Endif
+If clalev([F:DUD])=0 : Local File GACCDUDATE [DUD] : Endif
+If clalev([F:PIH])=0 : Local File PINVOICE   [PIH] : Endif
+If clalev([F:MVS])=0 : Local File BPSUPPMVT  [MVS] : Endif
+If clalev([F:LSM])=0 : Local File LASTSUPMVT [LSM] : Endif
+If clalev([F:TCU])=0 : Local File TABCUR     [TCU] : Endif
+If clalev([F:TCH])=0 : Local File TABCHANGE  [TCH] : Endif
+If clalev([F:PYD])=0 : Local File PAYMENTD   [PYD] : Endif
+If clalev([F:TVD])=0 : Local File TRCVCRDOC  [TVD] : Endif
+If clalev([F:JST])=0 : Local File GAJOUSTA   [JST] : Endif
+
+Local File GACCENTRY [HAE] , GACCENTRYD [DAE], GACCENTRYA [DAA] , GACCENTRYD [DAE0]
+Local File GACCENTRY [HAE2]
+
+Local Char    TYPPCE(GLONGTE) , PIECE(GLONVCR) , SYMBOLE(30)
+Local Integer STAT , OK , WIFFTYP, BATCH_NOT_ACTIVE
+Local Decimal MONTFOU
+
+# Vérifs
+# Confimration d'annulation
+OK = 1 : Call OUINON(mess(28,100,1),OK) From GESECRAN
+If OK<>2 : End : Endif
+
+Read [PIH]PIH0 = FACTURE
+If fstat : End : Endif
+If [F:PIH]STA<>3 : End : Endif
+TYPPCE = [F:PIH]GTE
+PIECE  = [F:PIH]NUM
+Read [HAE]HAE0 = TYPPCE;PIECE
+If fstat
+  #Issue X3-89090 – 2018-05-18 by MADOR - Invoice cancellation & Accounting task
+  Call PRESENCE(BATCH_NOT_ACTIVE) From CPTBATCH
+  If BATCH_NOT_ACTIVE
+    Call ECR_TRACE(mess(49,134,1),1) From GESECRAN
+  Endif
+  #Issue end
+  End
+Endif
+
+SYMBOLE = "HAE"+PIECE+"\"+TYPPCE
+Lock =SYMBOLE
+If fstat=1
+ Call ECR_TRACE(TYPPCE-PIECE-mess(12,110,1),1) From GESECRAN
+ GOK=0 : End
+Endif
+
+If [F:HAE]STA=2
+ # Ecriture définitive, annulation impossible
+ Call ECR_TRACE(mess(67,119,1),1) From GESECRAN
+ Unlock =SYMBOLE
+ GOK = 0 : End
+Endif
+
+OK = 1
+
+Read[JST]JST0=[F:HAE]CPY;[F:HAE]JOU
+If !fstat & (([F:JST]OPGSTRDAT<>[0/0/0] & [F:JST]OPGSTRDAT>[F:HAE]ACCDAT) | ([F:JST]OPGENDDAT<>[0/0/0] & [F:HAE]ACCDAT>[F:JST]OPGENDDAT))
+ Call ECR_TRACE(mess(7,106,1)-"\"-mess(49,117,1),1) From GESECRAN  # Journal inactif. Annulation impossible.
+ Unlock =SYMBOLE
+ GOK = 0 : End
+Endif
+
+For [DAE0]DAE0 Where TYP=TYPPCE & NUM=PIECE & MTC<>""
+ OK = 0 : Break
+Next
+If !OK
+ # Ecriture lettrée, annulation impossible
+ Call ECR_TRACE(mess(64,119,1),1) From GESECRAN
+ Unlock =SYMBOLE
+ GOK = 0 : End
+Endif
+OK = 1
+For [DUD] Where TYP=TYPPCE & NUM=PIECE & (TMPCUR>0 | TMPLOC>0)
+ OK = 0 : Break
+Next
+If !OK
+ # Echéance en cours de règlement. Annulation impossible
+ Call ECR_TRACE(mess(50,119,1)-"."-mess(49,117,1),1) From GESECRAN
+ Unlock =SYMBOLE
+ GOK = 0 : End
+Endif
+For [PYD] Where VCRTYP=TYPPCE & VCRNUM=PIECE
+ OK = 0 : Break
+Next
+If !OK
+ # Echéance en cours de règlement. Annulation impossible
+ Call ECR_TRACE(mess(50,119,1)-"."-mess(49,117,1),1) From GESECRAN
+ Unlock =SYMBOLE
+ GOK = 0 : End
+Endif
+
+# FQ83883
+# Contrôle de la présence de dépenses immobilisés si lien avec AbelX3
+If GMODU(14)=2
+  Gosub DEVALID From SUBLOF2
+  If GOK=0 : End : Endif
+Endif
+
+# Module Achat
+If GFONCTION="GESPIH"
+ Call OUVRE_TRACE(mess(136,197,1))  From LECFIC
+Endif
+
+Call TEMPON("A") From GESECRAN
+Call DEBTRANS From GLOCK
+Gosub TR1
+Unlock =SYMBOLE
+Call TEMPOFF From GESECRAN
+
+# Module Achat
+If GFONCTION="GESPIH"
+ Call FERME_TRACE From LECFIC
+ Call LEC_TRACE   From LECFIC
+Endif
+
+End
+
+$TR1
+GOK = 1
+Trbegin [PIH] , [HAE]
+ Readlock [PIH]PIH0 = FACTURE
+ If fstat=1
+  GOK = -1 : GLOCK = "$PINVOICE"-FACTURE : Goto ROLL_TR1
+ Elsif fstat
+  GOK = 0 : Call RSTA("PIH",FACTURE) From GLOCK : Goto AB_TR1
+ Endif
+
+ # Pièce "A validée"
+ [F:PIH]STA = 2
+ Rewrite [PIH]
+ If fstat
+  GOK = 0 : Call FSTA("PIH") From GLOCK : Goto AB_TR1
+ Endif
+
+ # Gestion de l'en-cours
+ Gosub MAJFOU
+ If    GOK<0  : Goto ROLL_TR1
+ Elsif !GOK   : Goto AB_TR1
+ Endif
+
+ # Anulation des mouvements
+ Filter [TVD] Where ACCNUM=[F:PIH]ACCNUM
+ If rowcount([TVD])>0
+  For [TVD]
+   Call ANUPCE([F:TVD]TYPVCR,[F:TVD]NUMVCR)
+   If GOK<=0 : Break : Endif
+  Next
+ Else
+  Call ANUPCE(TYPPCE,PIECE)
+ Endif
+ Filter [TVD]
+ If    GOK<0  : Goto ROLL_TR1
+ Elsif !GOK   : Goto AB_TR1
+ Endif
+
+ Filter [HAE2] Where REFINT="TR"+[F:PIH]PIVTYP+PIECE Order By Key CLE = REFINT
+ For [HAE2]CLE
+  Call ANUPCE([F:HAE2]TYP,[F:HAE2]NUM)
+  If GOK<1 : Break : Endif
+ Next
+ If    GOK<0  : Goto ROLL_TR1
+ Elsif !GOK   : Goto AB_TR1
+ Endif
+ Filter [HAE2]
+
+ # Module Achat
+ If GFONCTION="GESPIH"
+  If clalev([F:PID])=0 : Local File PINVOICED  [PID] : Endif
+  Gosub MAJ_ANUBIS From SUBPIHA
+  If    GOK<0  : Goto ROLL_TR1
+  Elsif !GOK   : Goto AB_TR1
+  Endif
+ Endif
+
+ # FQ83883
+ # Module Immo
+ If GMODU(14)=2
+  Gosub MAJ_ANUBIS From SUBLOF2
+  If    GOK<0  : Goto ROLL_TR1
+  Elsif !GOK   : Goto AB_TR1
+  Endif
+ Endif
+
+ # Point d'entrée
+ GPE = 0
+ GPOINT = "BEFDELBIS" : Gosub ENTREE From EXEFNC
+ If GPE : Goto AB_TR1 : Endif
+
+Commit
+Return
+
+$AB_TR1
+Rollback
+Return
+
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+
+
+############################
+## Annulation pièce
+############################
+
+Subprog ANUPCE(TYPPCE,PIECE)
+Value Char TYPPCE
+Value Char PIECE
+Local Date SVGDAT
+
+Local Char LSTTYPLED(10) : # Liste des types référentiels flagués 'Double Entry Method'
+
+# Dévalorisation des balances
+If !clalev([F:LED]) : Local File =GTABCPT+"GLED"  [LED] : Endif
+
+Read [HAE]HAE0 = TYPPCE;PIECE
+Call LEDTYPDEM([F:HAE]CPY,LSTTYPLED) From CPTDIV
+SVGDAT=[F:HAE]ACCDAT
+For [DAE] Where TYP=TYPPCE & NUM=PIECE
+ Call VALSTA("GAS",-1) From SUBPS2
+ If GOK<1 : Break : Endif
+ If [F:HAE]CAT<>3 & [F:HAE]CAT<>5
+
+  If [F:LED]LED<>[F:DAE]LED
+   Read [LED]LED0 = [F:DAE]LED
+   If fstat  : Raz [LED] :  Endif
+  Endif
+
+  # Mise à jour de la balance générale
+  If [F:LED]GEN=2
+   Call BALANCE(-1) From CPTBAL
+   If GOK<1 : Break : Endif
+  Endif
+
+  # Mise à jour de la balance analytique
+  If [F:LED]ANA=2
+   For [DAA]DAA0 Where TYP=TYPPCE & NUM=PIECE & LIN=[F:DAE]LIN & LEDTYP=[F:DAE]LEDTYP
+    Call BALANA(-1) From CPTBAL
+    If GOK<1 : Break 2 : Endif
+    ## Mise à jour Balance Russe si on est sur le référentiel Russe et sur une ligne éclatée
+    If instr(1,LSTTYPLED,num$([F:DAE]LEDTYP)) & [F:DAE]ACCNUMDOE = 0 : # On est sur un référentiel Russe et une ligne éclatée
+     Call BALDEM(-1) From CPTBAL
+     If GOK<1 : Break 2 : Endif
+    Endif
+   Next
+  Endif
+ Endif
+Next
+If GOK<0 : End : Endif
+
+# Effacement pièce
+
+Delete [HAE] Where TYP=TYPPCE & NUM=PIECE
+If fstat=1
+ GOK = -1 : GLOCK = "$GACCENTRY"-TYPPCE-PIECE : End
+Endif
+Delete [DAE] Where TYP=TYPPCE & NUM=PIECE
+If fstat=1
+ GOK = -1 : GLOCK = "$GACCENTRYD"-TYPPCE-PIECE : End
+Endif
+Delete [DAA] Where TYP=TYPPCE & NUM=PIECE
+If fstat=1
+ GOK = -1 : GLOCK = "$GACCENTRYA"-TYPPCE-PIECE : End
+Endif
+GPOINT = "AFTDELVCR" : Gosub ENTREE From EXEFNC
+If GOK<1 : End : Endif
+
+# Mise à jour échéances
+# Cas multi-collectif
+Local Integer XSOI, XPAZ, CAS, SVG_SAC
+Raz SVG_SAC, XSOI, XPAZ, CAS
+
+For [DUD] Where TYP=TYPPCE & NUM=PIECE
+ If XSOI=0 : XSOI = [F:DUD]SOI    : Endif
+ If XPAZ=0 : XPAZ = [F:DUD]FLGPAZ : Endif
+ If [F:DUD]SAC<>""
+  If [L]SVG_SAC=0
+   [L]SVG_SAC = [F:DUD]LIG
+  Elsif [L]SVG_SAC<>[F:DUD]LIG
+   CAS=1
+  Endif
+ Endif
+Next
+
+If !CAS
+ For [DUD] Where TYP=TYPPCE & NUM=PIECE
+  [F:DUD]DUDSTA = 1
+  Rewrite [DUD]
+  If fstat
+   GOK = 0 : Call FSTA("DUD") From GLOCK : Break
+  Endif
+  Call HISTOECH("DUD",1,SVGDAT)From MODECHE
+ Next
+Else
+ Call HISTOSUPPR ("TYP='"+TYPPCE+"' & NUM='"+PIECE+"'") From MODECHE
+ Delete [DUD] Where TYP=TYPPCE & NUM=PIECE
+ If fstat=1
+  GOK = -1 : GLOCK = "$GACCDUDATE"-TYPPCE-PIECE : End
+ Endif
+ Call CREECHE(2,[L]XSOI,0,[L]XPAZ) From SUBBIH
+Endif
+
+# Effacement dans la table de lien
+Delete [TVD] Where TYPVCR=TYPPCE & NUMVCR=PIECE
+If fstat=1
+ GOK = -1 : GLOCK = "$TRCVCRDOC"-TYPPCE-PIECE : End
+Endif
+
+If func AFNC.ACTIV("INTCO") & func AFNC.PARAM("INTCPYINV",[F:HAE]CPY)="2"
+ If !clalev([F:ICF]) : Local File INTCOFLO  [ICF] : Endif
+ Update [ICF] Where TYPVCR=TYPPCE & NUMVCR=PIECE With NUMVCR=""
+ If fstat=1
+  GOK=-1 : GLOCK="$INTCOFLO"-TYPPCE-PIECE : End
+ Elsif fstat
+  GOK=0 : Call RSTA("ICF",TYPPCE-PIECE) From GLOCK : End
+ Endif
+Endif
+End
+
+###############################################
+## MAJ mvts fournisseurs (modif MBT 15/11/06) #
+###############################################
+$MAJFOU
+Local Integer WIFFTYP
+Local Decimal WINVAMT
+
+Case [F:PIH]INVTYP
+  When 1,3 : WINVAMT=+[F:PIH]AMTATI : WIFFTYP=6
+  When 2,4 : WINVAMT=-[F:PIH]AMTATI : WIFFTYP=7
+Endcase
+
+Call GETDEV([F:PIH]FCY) From DEVSUB
+Call MAJENC_BPS([F:PIH]BPR,WIFFTYP,[F:PIH]FCY,[F:PIH]CUR,[F:PIH]CURTYP,[F:PIH]ACCDAT,
+&               [F:PIH]NUM,0,WINVAMT,[F:PIH]AMTATI) From TRTBPMVT
+Return
+

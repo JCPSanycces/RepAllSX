@@ -1,0 +1,501 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+# JALLIBA                                                  MC 22/03/01
+#
+# Librairie de sous-programmes de déjalonnement des OF
+#########################################################################
+# Subprog DEJALONNE                                                     #
+#########################################################################
+#########################################################################
+# déjalonnement OF
+#
+# Les paramètres sont passés par le masque JALK:
+# CODMAJ      : Code mise à jour (0 = complète, 1 = sans déchargement WORKLOAD)
+# CODTRS      : Code transaction (0 = non transactionnel, 1 = transactionnel)
+# MFGNUM      : No OF à traiter
+# MFGSTA      : Statut de l'ordre
+#
+#########################################################################
+Subprog DEJALONNE
+#
+Local Date    WSTRDAT
+Local Date    WENDDAT
+Local Integer WCOR      : WCOR = 2
+Local Integer WRET      : WRET = 0
+Local Integer WSCDFLG
+Local Integer WWSTTYP
+Local Decimal WCOELAB
+Local Char    WTAB(GLONABR)
+Local Char    WCLE(GLONVCR), WCAL(3)
+Local Char    WMFGFCY(GLONFCY)
+Local Integer OPTIM     : OPTIM = 0    # pour les OF optimisé (LLC)
+#
+Local Integer I,WNBR
+#
+Local Integer NBOPMX   : NBOPMX=GMFOMAX   : # dimension tables op                llc 09.02 15655
+Local Integer NBJCAL   : NBJCAL=2000      : # dimension tables calendrier
+#
+Local Integer WOPENUM (NBOPMX)           : # numéro oper    # FQ 70035 avant Shortint
+Local Shortint WOPESPLNUM (NBOPMX)        : # fract. oper
+#
+Local Char    WWST    (GLONWST) (NBOPMX)        : # poste
+Local Char    WLAB    (GLONWST) (NBOPMX)        : # main d'oeuvre
+Local Integer WWSTN (NBOPMX)              : # nb de postes
+Local Integer WLABN (NBOPMX)              : # nb de personnes
+Local Decimal WOPTTIM (NBOPMX)            : # Temps opératoire total précédent
+Local Decimal WSETLABR (NBOPMX)           : # coeff réglage MO precédent
+Local Decimal WOPELABR (NBOPMX)           : # coeff oper MO précédent
+Local Date    WINFSTRD (NBOPMX)           : # date début à capa inf
+Local Decimal WINFSTRF (NBOPMX)           : # fraction de jour début
+Local Date    WSETENDD (NBOPMX)           : # date fin réglage
+Local Decimal WSETENDF (NBOPMX)           : # fraction de jour fin réglage
+Local Date    WINFENDD (NBOPMX)           : # date fin à capa inf
+Local Decimal WINFENDF (NBOPMX)           : # fraction de jour fin
+#
+Local Decimal WCAP (NBJCAL)               : # capacité journalière poste
+Local Integer WNBRD (NBJCAL)              : # Nb exemplaires disponible journalier poste
+Local Integer WORI                        : # origine charge (PDP/CBN) llc 03.02 13344
+
+Raz [M:JALK]CODRET
+#########################################################################
+#
+GOK=1
+If [M:JALK]CODTRS = 1
+    Call DEBTRANS From GLOCK
+    Trbegin ADOVAL
+Endif
+Goto TEST_STA
+#
+#########################################################################
+#
+# teste statut OF
+#     si OF ferme ou planifié : on charge l'OF à partir de MFGHEAD et
+#                               SCHEDULING+MFGOPE
+#     si OF suggéré : on charge l'OF à partir de SCHEDULING+OPERATIONS
+#
+$TEST_STA
+#
+Case [M:JALK]MFGSTA
+  When 1,2 : Goto LOAD_OFFP
+  When 3   : Goto LOAD_OFS
+  When 4   : Goto END_DEJAL
+Endcase
+#
+#########################################################################
+#
+# chargement OF ferme ou planifié
+#
+$LOAD_OFFP
+#
+#   ouverture des fichiers
+#
+If clalev([F:TWD])  = 0 : Local File TABWEEDIA  [TWD]  : Endif
+If clalev([F:MWS])  = 0 : Local File WORKSTATIO [MWS]  : Endif
+If clalev([F:SCH])  = 0 : Local File SCHEDULING [SCH]  : Endif
+If clalev([F:MFG])  = 0 : Local File MFGHEAD    [MFG]  : Endif
+If clalev([F:MFO])  = 0 : Local File MFGOPE     [MFO]  : Endif
+If clalev([F:WKL])  = 0 : Local File WORKLOAD   [WKL]  : Endif
+If clalev([F:FCY])  = 0 : Local File FACILITY   [FCY]  : Endif
+If clalev([F:TUV]) = 0  : Local File TABUNAVAIL [TUV]  : Endif
+If clalev([F:CPV]) = 0  : Local File CAPVAR     [CPV]  : Endif
+
+# FQ 65699 Local File ORDERS [ORD]
+If clalev([F:ORDW])  = 0 : Local File ORDERS    [ORDW]  : Endif
+
+# llc 10126 08.01
+If [F:FCY]FCY <> [M:JALK]MFGFCY
+    # lecture site
+    Call LECTURE ("FCY", [M:JALK]MFGFCY, "") From CONTOBJ
+Endif
+
+# llc 10126 08.01
+If [F:TUV]UVYCOD <> [F:FCY]UVYCOD
+    # lecture indisponibilités
+    Read [F:TUV]UVY0=[F:FCY]UVYCOD
+    If fstat : Raz [F:TUV] : Endif
+Endif
+
+Readlock [MFG]MFG0=[M:JALK]MFGNUM
+If fstat : WTAB="MFG" : WCLE=[M:JALK]MFGNUM : Goto AB_DEJAL : Endif
+
+# mémorisation état optimisé (LLC)
+If [F:MFG]SCDFLG = 4 : OPTIM = 2 : Else : OPTIM = 0 : Endif
+
+# Issue X3-23527 - 2017-02-02 by ALSHE : No reschedule of WO when it is being optimized
+If (func AFNC.ACTIV("POPS") & ([F:MFG]OPTFLG=2 | [F:MFG]SCDFLG=4))
+    If GTRACE<>""
+        Call ECR_TRACE(mess(156,197,1)-tolower(mess([F:MFG]MFGSTA,317,1))-[F:MFG]MFGNUM-":"-tolower(mess(122,193,1)),-1) From GESECRAN
+    Else
+        Call ERREUR(mess(156,197,1)-tolower(mess([F:MFG]MFGSTA,317,1))-[F:MFG]MFGNUM-":"-tolower(mess(122,193,1))) From GESECRAN
+    Endif
+    WRET=1 : Goto AB_DEJAL
+
+# Issue 91273 GA 01/2014 ne pas déjalonner les OF optimisés si GOPTSCDRAZ=Non
+Elsif [F:MFG]SCDFLG=4 & GFONCTION<>"FUNMAUTD"
+   GPE=0 : GPOINT="OPTSCDRAZ" : Gosub ENTREE From EXEFNC
+   If (GPE |  dim(GOPTSCDRAZ)>0 & GOPTSCDRAZ=1)
+      If GTRACE<>""
+         Call ECR_TRACE("JALLIBA: OF non déjalonné selon OPTSCDRAZ"-[F:MFG]MFGNUM,0) From GESECRAN
+      Endif
+      WRET=1 : Goto AB_DEJAL
+   Endif
+Endif
+
+WSTRDAT = [F:MFG]STRDAT
+WENDDAT = [F:MFG]ENDDAT
+WSCDFLG = [F:MFG]SCDFLG
+WMFGFCY = [F:MFG]MFGFCY
+#
+[F:MFG]SCDFLG = 1
+# 33384 mm 12.06
+[F:MFG]UPDDAT    = date$
+[F:MFG]UPDUSR    = GUSER
+#
+Rewrite [MFG]
+If fstat : WTAB="MFG" : WCLE=[M:JALK]MFGNUM : Goto AB_DEJAL : Endif
+#Unlock [MFG] : # GH 28/08/12 inutile : tout ce qui est locké dans une transaction n'est délocké qu'à la fin de celle-ci
+#
+If WSCDFLG <= 1 : Goto END_DEJAL : Endif
+#
+#   chargement des opérations en mémoire
+#
+
+Link [MFO] With [SCH]SCH0=[F:MFO]MFGNUM;[F:MFO]OPENUM;[F:MFO]OPESPLNUM
+&          As   [SCOP]
+&          Where MFGNUM=[M:JALK]MFGNUM
+&          Order By Key MFO0
+
+I=0
+Onerrgo ERRGO_DEJAL  # Issue 105547 GA 01/2015
+For [SCOP]
+  WOPENUM(I)    = [F:MFO]OPENUM
+  WOPESPLNUM(I) = [F:MFO]OPESPLNUM
+  If [F:MFO]CPLWSTNBR = 0
+    WWSTN(I)    = [F:MFO]EXTWSTNBR
+  Else
+    WWSTN(I)    = [F:MFO]CPLWSTNBR
+  Endif
+  If [F:MFO]CPLLABNBR = 0
+    WLABN(I)    = [F:MFO]EXTLABNBR
+  Else
+    WLABN(I)    = [F:MFO]CPLLABNBR
+  Endif
+#
+  WWST(I)       = [F:SCH]CLCWST
+  WLAB(I)       = [F:SCH]CLCLAB
+  WOPTTIM(I)    = [F:SCH]CLCEXTTIM
+  WSETLABR(I)   = [F:SCH]SETLABCOE
+  WOPELABR(I)   = [F:SCH]OPELABCOE
+  # si OF optimisé, prise en compte dates à capacité finie (LLC)
+  If !OPTIM
+      WINFSTRD(I)   = [F:SCH]INFCAPSTR
+      WINFSTRF(I)   = [F:SCH]INFCAPSTF
+      WSETENDD(I)   = [F:SCH]SETENDDAT
+      WSETENDF(I)   = [F:SCH]SETENDFRD
+      WINFENDD(I)   = [F:SCH]INFCAPEND
+      WINFENDF(I)   = [F:SCH]INFCAPENF
+  Else
+      WINFSTRD(I)   = [F:SCH]FITCAPSTR
+      WINFSTRF(I)   = [F:SCH]FITCAPSTF
+      WINFENDD(I)   = [F:SCH]FITCAPEND
+      WINFENDF(I)   = [F:SCH]FITCAPENF
+  Endif
+#
+  I +=1
+Next
+Onerrgo   # Issue 105547 GA 01/2015
+#
+NBOP = I
+Goto STR_DEJAL
+#
+#########################################################################
+#
+# chargement OF suggéré
+#
+$LOAD_OFS
+#
+#   ouverture des fichiers
+#
+If clalev([F:TWD])  = 0 : Local File TABWEEDIA  [TWD]  : Endif
+If clalev([F:MWS])  = 0 : Local File WORKSTATIO [MWS]  : Endif
+If clalev([F:SCH])  = 0 : Local File SCHEDULING [SCH]  : Endif
+If clalev([F:OPS])  = 0 : Local File OPERATIONS [OPS]  : Endif
+If clalev([F:WKL])  = 0 : Local File WORKLOAD   [WKL]  : Endif
+If clalev([F:FCY])  = 0 : Local File FACILITY   [FCY]  : Endif
+If clalev([F:TUV]) = 0  : Local File TABUNAVAIL [TUV]  : Endif
+If clalev([F:CPV]) = 0  : Local File CAPVAR     [CPV]  : Endif
+
+# FQ 65699 Local File ORDERS [ORD]
+If clalev([F:ORDW])  = 0 : Local File ORDERS    [ORDW]  : Endif
+
+# llc 10126 08.01
+If [F:FCY]FCY <> [M:JALK]MFGFCY
+    # lecture site
+    Call LECTURE ("FCY", [M:JALK]MFGFCY, "") From CONTOBJ
+Endif
+
+# llc 10126 08.01
+If [F:TUV]UVYCOD <> [F:FCY]UVYCOD
+    # lecture indisponibilités
+    Read [F:TUV]UVY0=[F:FCY]UVYCOD
+    If fstat : Raz [F:TUV] : Endif
+Endif
+
+# recherche si optimisé
+For [ORDW] Where WIPTYP = 5 & WIPNUM = [M:JALK]MFGNUM
+    If [F:ORDW]OPTFLG = 2 : OPTIM = 2 : Else : OPTIM = 0 : Endif
+    Break
+Next
+# Issue X3-23527 - 2017-02-02 by ALSHE : No reschedule of suggestion when it is being optimized
+If (func AFNC.ACTIV("POPS") & OPTIM = 2)
+    If GTRACE<>""
+        Call ECR_TRACE(mess(156,197,1)-tolower(mess([F:ORDW]WIPSTA,317,1))-[M:JALK]MFGNUM-":"-tolower(mess(122,193,1)),0) From GESECRAN
+    Else
+        Call ERREUR(mess(156,197,1)-tolower(mess([F:ORDW]WIPSTA,317,1))-[M:JALK]MFGNUM-":"-tolower(mess(122,193,1))) From GESECRAN
+    Endif
+    WRET=1 : Goto AB_DEJAL
+Endif
+
+#
+#   chargement des opérations en mémoire
+#
+Link [OPS] With [SCH]SCH0=[F:OPS]MFGNUM;[F:OPS]OPENUM;[F:OPS]OPESPLNUM
+&          As   [SCOP]
+&          Where MFGNUM=[M:JALK]MFGNUM
+&          Order By Key OPS1
+
+I=0
+Onerrgo ERRGO_DEJAL  # Issue 105547 GA 01/2015
+For [SCOP]
+# llc 13344
+  Case [F:OPS]OPSTYP
+      When 1: WORI = 2
+      When 2: WORI = 3
+  Endcase
+  WMFGFCY       = [F:OPS]MFGFCY
+  WOPENUM(I)    = [F:OPS]OPENUM
+  WOPESPLNUM(I) = [F:OPS]OPESPLNUM
+  WWSTN(I)      = [F:OPS]EXTWSTNBR
+  WLABN(I)      = [F:OPS]EXTLABNBR
+#
+  WWST(I)       = [F:SCH]CLCWST
+  WLAB(I)       = [F:SCH]CLCLAB
+  WOPTTIM(I)    = [F:SCH]CLCEXTTIM
+  WSETLABR(I)   = [F:SCH]SETLABCOE
+  WOPELABR(I)   = [F:SCH]OPELABCOE
+  # si OF optimisé, prise en compte dates à capacité finie (LLC)
+  If !OPTIM
+      WINFSTRD(I)   = [F:SCH]INFCAPSTR
+      WINFSTRF(I)   = [F:SCH]INFCAPSTF
+      WSETENDD(I)   = [F:SCH]SETENDDAT
+      WSETENDF(I)   = [F:SCH]SETENDFRD
+      WINFENDD(I)   = [F:SCH]INFCAPEND
+      WINFENDF(I)   = [F:SCH]INFCAPENF
+  Else
+      WINFSTRD(I)   = [F:SCH]FITCAPSTR
+      WINFSTRF(I)   = [F:SCH]FITCAPSTF
+      WINFENDD(I)   = [F:SCH]FITCAPEND
+      WINFENDF(I)   = [F:SCH]FITCAPENF
+  Endif
+#
+  I +=1
+Next
+Onerrgo   # Issue 105547 GA 01/2015
+#
+NBOP = I
+#
+Goto STR_DEJAL
+#
+#########################################################################
+#
+# Déjalonnement
+#
+$STR_DEJAL
+#
+#   traite les opérations de l'OF en partant de la première
+#
+WTAB=""
+For I = 0 To NBOP-1
+#
+    If [M:JALK]CODMAJ = 1 : Goto UPD_DEJAL : Endif
+#
+#     lecture poste
+#
+    If WWST(I) <> ""
+        Read [MWS]WST0=WWST(I);WMFGFCY
+        If fstat : WTAB="MWS" : WCLE=WWST(I) : Break : Endif
+        WWSTTYP = [F:MWS]WSTTYP
+#
+        If WINFSTRD(I) > WINFENDD(I) | (WINFSTRD(I) = WINFENDD(I) & WINFSTRF(I) > WINFENDF(I))
+          Goto UPD_DEJAL
+        Endif
+        WSTRDAT = WINFSTRD(I)
+        WENDDAT = WINFENDD(I) + 1
+#
+#     chargement calendrier correspondant au poste
+#
+#  (llc 08.00 v130) nouvelle gestion des capacités
+        # Issue 96561 GA 02/2014 ne pas planter ici le dejalonnement
+        If WSTRDAT<>[0/0/0] & WENDDAT<>[0/0/0]
+          Call LOACAPN (WSTRDAT,WENDDAT,WCAP,WNBRD,WRET) From JALLIBB
+          If WRET > 0 : WTAB="CAP" : WCLE=WWST(I)-WMFGFCY : Break : Endif
+        Endif
+#
+#     dechargement WORKLOAD
+#
+        WCOELAB = 1
+        WNBR    = WWSTN(I)
+
+        # --------- Initialisation pour PE WORKLOAD 10.06
+        If dim(GCAPACITY) > 0
+            GWKLACT = "U"
+            GWKLMFG = [M:JALK]MFGNUM
+            GWKLOPE = WOPENUM(I)
+            GWKLSPL = WOPESPLNUM(I)
+        Endif
+
+        # 03.06 35162
+        Call WSTUNLD(WMFGFCY,WWST(I),[M:JALK]MFGSTA,WORI,WCAL,WCAP,WINFSTRD(I),WINFSTRF(I),
+&                    WINFENDD(I),WINFENDF(I),WNBRD,WNBR,WCOELAB,0,WNBR,WRET)
+&                    From JALLIBB
+        If WRET > 0 : WTAB="WKL" : WCLE=WWST(I) : Break : Endif
+#
+        If WLAB(I) <> ""
+          Read [MWS]WST0=WLAB(I);WMFGFCY
+          If fstat : WTAB="MWS" : WCLE=WLAB(I) : Break : Endif
+#
+#       dechargement WORKLOAD main d'oeuvre
+          # pas de distinction entre les 2 coeffs dans ILOG donc un seul déchargement (LLC)
+          If !OPTIM
+              WCOELAB = WSETLABR(I)
+              WNBR    = WLABN(I)
+              # 03.06 35162
+              Call WSTUNLD(WMFGFCY,WLAB(I),[M:JALK]MFGSTA,WORI,WCAL,WCAP,WINFSTRD(I),WINFSTRF(I),
+&                          WSETENDD(I),WSETENDF(I),WNBRD,WNBR,WCOELAB,1,WWSTN(I),WRET)
+&                          From JALLIBB
+              If WRET > 0 : WTAB="WKL" : WCLE=WLAB(I) : Break : Endif
+
+              WCOELAB = WOPELABR(I)
+              WNBR    = WLABN(I)
+               # 03.06 35162
+               Call WSTUNLD(WMFGFCY,WLAB(I),[M:JALK]MFGSTA,WORI,WCAL,WCAP,WSETENDD(I),WSETENDF(I),
+&                           WINFENDD(I),WINFENDF(I),WNBRD,WNBR,WCOELAB,1,WWSTN(I),WRET)
+&                           From JALLIBB
+              If WRET > 0 : WTAB="WKL" : WCLE=WLAB(I) : Break : Endif
+          Else
+              WCOELAB = WOPELABR(I)
+              WNBR    = WLABN(I)
+               # 03.06 35162
+               Call WSTUNLD(WMFGFCY,WLAB(I),[M:JALK]MFGSTA,WORI,WCAL,WCAP,WINFSTRD(I),WINFSTRF(I),
+&                          WINFENDD(I),WINFENDF(I),WNBRD,WNBR,WCOELAB,1,WWSTN(I),WRET)
+&                           From JALLIBB
+              If WRET > 0 : WTAB="WKL" : WCLE=WLAB(I) : Break : Endif
+          Endif
+#
+      Endif
+#
+$UPD_DEJAL
+#
+      Update [SCH] Where MFGNUM=[M:JALK]MFGNUM
+&                        & OPENUM=WOPENUM(I)
+&                        & OPESPLNUM=WOPESPLNUM(I)
+&                  With  CLCEXTTIM = 0,
+&                        CLCPRPDUR = 0,
+&                        CLCSETDUR = 0,
+&                        CLCOPEDUR = 0,
+&                        CLCWORDUR = 0,
+&                        CLCPSTDUR = 0,
+&                        CLCWAIDUR = 0,
+&                        CLCAFTDUR = 0,
+&                        CLCWST    = "",
+&                        CLCLAB    = "",
+&                        SETLABCOE = 0,
+&                        OPELABCOE = 0,
+&                        INFCAPSTR = [0/0/0],
+&                        INFCAPSTF = 0,
+&                        SETENDDAT = [0/0/0],
+&                        SETENDFRD = 0,
+&                        INFCAPEND = [0/0/0],
+&                        INFCAPENF = 0,
+&                        OPESTRDAT = [0/0/0],
+&                        OPESTRFRD = 0,
+&                        OPEENDDAT = [0/0/0],
+&                        OPEENDFRD = 0,
+&                        OPEFITSTD = [0/0/0],
+&                        OPEFITSTF = 0,
+&                        FITCAPSTR = [0/0/0],
+&                        FITCAPSTF = 0,
+&                        FITCAPEND = [0/0/0],
+&                        FITCAPENF = 0,
+&                        FITOPEEND = [0/0/0],
+&                        FITOPEENF = 0,
+&                        FITPRPDUR = 0,
+&                        FITWORDUR = 0,
+&                        FITPSTDUR = 0,
+&                        FITDELAY  = 0,
+&                        UPDDAT    = date$,
+&                        UPDUSR    = GUSER
+#
+ Endif
+#   itération
+#
+Next I
+If WTAB<>"" : Goto AB_DEJAL : Endif
+#
+Goto END_DEJAL
+#
+#########################################################################
+#
+# fin normale :
+#   synchronisation
+#
+$END_DEJAL
+# si ordre optimisé, raz flag optimisation
+If OPTIM
+    Update [ORDW] Where WIPTYP=5
+&                    & STOFCY=WMFGFCY
+&                    & VCRTYP=11
+&                    & VCRNUM=[M:JALK]MFGNUM
+&                    & VCRLIN=0
+&                    & VCRSEQ=0
+&                With  OPTFLG = 1,
+&                      UPDDAT = date$,
+&                      UPDUSR = GUSER
+    If fstat
+      WTAB="ORDW"
+      WCLE=WMFGFCY-num$(11)-[M:JALK]MFGNUM
+      Goto AB_DEJAL
+    Endif
+Endif
+
+If [M:JALK]CODTRS = 1 : Commit : Endif
+#
+End
+#
+#########################################################################
+#
+# fin anormale :
+#   rollback
+#   écriture d'un message
+#
+$AB_DEJAL
+#
+[M:JALK]CODRET = 1
+
+If [M:JALK]CODTRS = 1
+   If WRET = 0
+      GOK=0 : Call RSTA(WTAB,WCLE) From GLOCK
+   Endif
+   Rollback
+Endif
+#
+End
+
+# Issue 105547 GA 01/2015
+$ERRGO_DEJAL
+Onerrgo
+GPE=0 : GPOINT="ERRGODEJAL" : Gosub ENTREE From EXEFNC      #CHECK IGNORE_LINE
+If GTRACE<>""
+   Call ECR_TRACE("DEJALONNE("+num$(I)+")"-[M:JALK]MFGNUM-errmes$([L]ER)+"\"+errm, 1) From GESECRAN
+Endif
+Resume
+

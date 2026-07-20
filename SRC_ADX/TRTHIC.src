@@ -1,0 +1,173 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+#------------------------------------------------------------------------------------------------------
+# TRTHIC : Historisation du contexte d'un calcul de paie
+#------------------------------------------------------------------------------------------------------
+# (C) PROSPER 25/01/11 - On nous demande de conserver les éléments utilisés pour le calcul d'une paie
+#                        On a averti plusieurs fois de l'inflation que cela allait entraîner
+#                        Cette historisation est soumise à un code activité "HIC" de manière à
+#                        n'être activée qu'à la demande.
+#                        On va utiliser une table générique HISTOCTX [HIC] qui contiendra l'ensemble
+#                        des données historisées rangées par élément déclencheur (le bulletin xxx)
+#                        et par table et zone.
+#                        A terme : prévoir un système de paramétrage pour indiquer par origine 
+#                        d'événement les éléments à historiser afin de ne garder que l'essentiel.
+#------------------------------------------------------------------------------------------------------
+#                        V0.99 : L'archivage se borne à recopier EMPLOCTR/EMPLOID du contexte en
+#                                cours.
+#------------------------------------------------------------------------------------------------------
+
+Subprog HISTOCTX(ORIGINE, IDCLE, CLE)
+Value Integer ORIGINE
+Value Char IDCLE(), CLE()
+
+# Si pas actif, on sort ... Voir s'il ne serait pas mieux de tester une variable GHISTOCTX 
+# pour améliorer les temps de réponse
+If func AFNC.ACTIV("HIC") <= 0 : End : Endif
+
+If [L]ORIGINE < 1 or [L]ORIGINE > 2 : End : Endif    : # Sécurité pour les petits malins
+
+Local Integer TRANSACTION_LOCALE
+Local Integer NBTABLE, I, J, K, POS_ABREV
+Local Char TTABLE([V]GLONATB)(1..10)
+Local Char TABREV(5)(1..10), ABR(5)
+Local Char HICATZ(30), HICATB(30), VARIA(250), HICVAL(250)
+
+Local File HISTOCTX [HIC]
+
+[L]TRANSACTION_LOCALE = 1
+If not(adxlog)
+    Call DEBTRANS From GLOCK
+    [V]GOK = 1
+    [L]TRANSACTION_LOCALE = 2
+
+    Trbegin [HIC]
+
+Endif
+
+Raz [L]NBTABLE, [L]TTABLE, [L]TABREV
+
+Case [L]ORIGINE
+    When 1
+        # Bulletin
+        Gosub TABLE_VEP
+    When 2
+        # Fiche de rétroactivité (calcul des rappels)
+        Gosub TABLE_RET
+    When Default
+Endcase
+
+[V]GPE = 0
+GPOINT = "LOAD_CTX" : Gosub ENTREE From EXEFNC
+
+# Faire péter d'éventuels enregistrements (recalcul de bulletin)
+Delete [F:HIC] Where [F:HIC]HICORI = [L]ORIGINE
+&            & [F:HIC]HICCLE = [L]CLE
+
+For [L]I = 1 To [L]NBTABLE
+    # Rechercher si la table avec l'abréviation prévue est dans le contexte
+
+    [L]POS_ABREV = find([L]TABREV([L]I), fileabre)
+    [L]POS_ABREV -= 1
+
+    If [L]POS_ABREV >= 0
+
+        [L]HICATB = [L]TTABLE([L]I)
+        [L]ABR = [L]TABREV([L]I)
+
+        # FSTA From GLOCK ou le dump d'une classe en mémoire tout comme en V3 :)
+
+        For [L]J = 1 To evalue("clanbs([F:"+ABR+"],1)")
+            [L]VARIA=evalue("clavar([F:"+ABR+"],"+num$(J)+")")
+            If !find(evalue("type([F:"+ABR+"]"+VARIA+")"),522,523) : # Blob, Clob
+                For [L]K = 1 To evalue("dim([F:"+ABR+"]"+VARIA+")")
+                    [L]HICATZ = [L]VARIA + "(" + num$([L]K-1) + ")"
+                    [L]HICVAL = num$(evalue("[F:"+ABR+"]"+VARIA+"("+num$(K-1)+")"))
+                    Gosub WRITE_HIC
+                Next 
+            Endif
+        Next
+
+        # Evolutions possible : 
+        # - avoir une liste des variables à sauvegarder pour limiter les dégats au niveau du volume
+        # - liste paramétrable par le distributeur pour chaque "origine"
+        # - liste paramétrable avec une condition évaluée pour chaque zone que l'on veut sauver
+        # - système de préchargement de la liste en fonction des variables "stables" [F:ID], [F:HRCTR]
+        #   utilisée dans le calcul de la paye (parsing des rubriques pour les detecter)
+
+   Endif
+Next I
+
+If [L]TRANSACTION_LOCALE = 2
+    If [V]GOK = 1
+        Commit
+    Else
+        Rollback
+    Endif
+Endif
+
+Close Local File [HIC]
+
+End
+
+$WRITE_HIC
+Raz [F:HIC]
+[F:HIC]HICNUM = uniqid([HIC])
+[F:HIC]HICORI = [L]ORIGINE
+[F:HIC]HICIDCLE = [L]IDCLE
+[F:HIC]HICCLE = [L]CLE
+[F:HIC]HICATB = [L]HICATB
+[F:HIC]HICATZ = [L]HICATZ
+[F:HIC]HICVAL = [L]HICVAL
+[F:HIC]HICDAT = date$
+[F:HIC]HICHEU = ctrans(time$,":","")
+[F:HIC]USR = [V]GUSER
+
+# Point d'entrée permettant de modifier ou d'annuler l'écriture d'un enregistrement 
+# d'historisation contexte.
+
+[V]GPE = 0
+GPOINT = "WRITE_HIC" : Gosub ENTREE From EXEFNC
+
+If not([V]GPE)
+    Write [F:HIC]
+    If fstat <> 0
+        [V]GOK = 0
+        Call FSTA("HIC") From GLOCK
+        Return
+    Endif
+Endif
+
+Return
+
+
+$TABLE_VEP
+
+#--------------------------------------------------------------------------------------------------
+# Liste des tables à sauvegarder - On suppose que les enregistrements qui nous intéressent
+#                                  sont dans la classe TABR qui va bien.
+#                                  Dans la mesure ou on se borne à stocker des éléments dans
+#                                  le cadre d'une origine connue on ne prends pas trop de risques
+#--------------------------------------------------------------------------------------------------
+
+[L]NBTABLE += 1
+[L]TTABLE([L]NBTABLE) = "EMPLOCTR"
+[L]TABREV([L]NBTABLE) = "HRCTR"
+
+[L]NBTABLE += 1
+[L]TTABLE([L]NBTABLE) = "EMPLOID"
+[L]TABREV([L]NBTABLE) = "ID"
+
+Return
+
+$TABLE_RET
+
+[L]NBTABLE += 1
+[L]TTABLE([L]NBTABLE) = "EMPLOCTR"
+[L]TABREV([L]NBTABLE) = "HRCTR"
+
+[L]NBTABLE += 1
+[L]TTABLE([L]NBTABLE) = "EMPLOID"
+[L]TABREV([L]NBTABLE) = "ID"
+
+Return
+

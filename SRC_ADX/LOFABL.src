@@ -1,0 +1,1397 @@
+#<AdxTL>@(#)12.0.0.0 $Revision$
+#CHECK UNUSED_SOURCE
+####################################################
+#  Traitement d'interface Facture X3 => Abel
+#    Version IAS + interface X3v13x du 20-07-2004
+# Fonctionne dans les 6 configurations suivantes :
+# - X3 Version 13x => Abel Entreprise (export)
+# - X3 Version 13x => AbelX3 (export)
+# - X3 Version 14x => Abel Entreprise (export)
+# - X3 Version 14x => AbelX3 (Mise à jour directe)
+# - X3 Version  5x => Abel Entreprise (export)
+# - X3 Version  5x => AbelX3 (Mise à jour directe)
+####################################################
+#
+# GLE - 29.08.2007 (FQ42810) : problème montant en devise société. Explication : certains clients utilise la
+#                              ligne 2 de la pièce automatique de validation des factures avec un montant
+#                              HT, d'autres avec un montant HT+TVA-TVArec (voir correction 35742). Comme les
+#                              deux cas sont possible, il ne faut pas se baser sur le montant contenu dans
+#                              la ligne mais sur le montant HT devise facture, et éventuellement faire la
+#                              conversion.
+# GLE - 14.05.2007 (FQ41355) : problème de montant de TVA en devise société si montant de TVA forcée
+# GLE - 25.04.2007 (FQ35387) : erreur en validation de facture achat si la facture est issue d'une commande
+# GLE - 24.04.2007 (FQ41105) : les montants négatifs d'une facture devenaient positifs dans AbelX3 en cas de répartition ou de ventilation
+# GLE - 24.04.2007 (FQ41100) : si les montants en devise transaction d'une facture étaient négatifs les montants en devise société étaient positifs
+# GLE - 19.02.2007 (FQ39752) : prise en compte des informations "Immobilisable" et "Famille" au niveau de l'article
+# GLE - 11.01.2007 (FQ38448) : message clair en cas de dépassement des limites des tableaux de travail
+# GLE - 28.11.2006 (FQ38125) : les imputations analytiques et économiques n'étaient pas renseignées si le compte PCG n'était pas suivi dans Abel
+# GLE - 27.11.2006 (FQ38121) : correction plantage sur masque BIS1 si validation des factures en batch
+# GLE - 28.09.2006 (FQ37845) : montants non renseigné si ventilation + pièce auto sans IAS
+# GLE - 28.09.2006 (FQ37827) : erreur d'arrondi dans les valorisations Société dans AbelX3
+# GLE - 26.07.2006 (FQ37136) : correction mauvaises imputations comptables au-delà de la dixième ligne de facture achat
+# GLE - 19.04.2006 (FQ35742) : correction mauvais montant HT en devise société dans la dépense AbelX3
+# GLE - 13.02.2006 (FQ34751) : correction erreur de classe inexistante [M:VLOF]lors d'un ventilation analytique manuelle
+#
+####################################################
+Raz GPILOBJ, GBIDC1, GBIDC2
+Call OBJET("BIS",GBIDC1,GBIDC2) From GOBJET
+End
+
+$CONFIG_TEST
+############### TEST #############
+#G_CFGITF = 2
+#Local Char GTABIMM
+#GTABIMM="srv_recette:1841@ABELX3."
+##################################
+Return
+
+##############################################
+# Fonctions de branchement pour la version 130
+##############################################
+$AP_LIENS
+Gosub INIT
+Return
+
+$AV_CREAT_X
+Case [F:GAD]LINNUM
+  When 2         : Gosub LIGFAC From LOFABL
+  When 6         : Gosub GROUP From LOFABL
+  When 7         : Gosub GROUP From LOFABL
+  When 8         : Gosub GROUP From LOFABL
+  When 9         : Gosub LIGPIED From LOFABL
+  When 10        : Gosub GROUP From LOFABL
+  When 11        : Gosub GROUP From LOFABL
+  When 12        : Gosub GROUP From LOFABL
+  When 13        : Gosub GROUP From LOFABL
+  When 14        : Gosub LIGREM From LOFABL
+  When 15        : Gosub LIGREM From LOFABL
+  When 16        : Gosub LIGREM From LOFABL
+  When 17        : Gosub LIGREM From LOFABL
+Endcase
+Return
+
+###################################################################
+# Initialisation - Etiquette appelée en Après_lien de la pièce auto
+###################################################################
+$INIT
+If dim(GNRIASDIF) < 0 | !GNRIASDIF
+  Global Integer G_CFGITF   : # Configuration interface (1: X3 130   -AE, 2: X3 130   -AbelX3,
+#                                                        3: X3 140/v5-AE, 4: X3 140/v5-AbelX3)
+  Global Integer G_FACACH   : # Indicateur d'origine Achat
+  Global Integer G_FACTIE   : # Indicateur d'origine Tiers
+  Global Integer G_PIEIAS   : # Indicateur Pièce IAS
+Endif
+
+If dim(GNRIASDIF) > 0 & GNRIASDIF
+  G_PIEIAS=1
+Endif
+
+# On continue ?
+
+If G_PIEIAS & !G_CFGITF : Return : Endif : # Pièce IAS et Appel hors contexte prévu
+
+If !find([F:GAU]TBL,"PINVOICE","PINVOICEV") : Return : Endif : # Appel hors contexte prévu
+
+# On continue
+Local    Integer OUVACVFLG  : # Flag ouverture table des codes activités
+Local    Integer OUVADWFLG  : # Flag ouverture table des valeurs paramètres
+Local    Integer ANA        : # Indicateur d'existence d'imputations analytiques
+Local    Integer IASIDE     : # Indicateur de génération d'une pièce IAS identique à la pièce de compta légale
+Local    Integer NOGROUP    : # Indicateur "A ne pas grouper"
+Local    Integer NUMLIG     : # Compteur pour numérotation des lignes écrites
+Local    Char    ABRPIH     : # Abréiation de la table En-tête facture
+Local    Integer PIELIG     : # Indicateur ligne ou pied (1:pied, 2:ligne, 3:pied avec remontée)
+Local    Char    DEFUOM     : # Unité par défaut dans le produit Biens
+Local    Integer EXPNUM     : # Compteur d''export dans le produit Biens
+Local    Integer AXE        : # Indice de parcours des axes analytique
+Local    Integer I_TLOF     : # Indice de parcours de la table de travail
+Local    Integer I_VT       : # Indice de parcours des masques de ventilations analytiques
+Local    Integer MAX_TLOF   : # Nombre de postes de la table de travail
+Local    Char    COMPANY    : # Société pour lecture taux de TVA
+Local    Char    TAX        : # Code TVA pour lecture taux de TVA
+Local    Date    DAT        : # Date de référence pour lecture taux de TVA
+Local    Decimal TAUX1      : # Taux de TVA
+Local    Decimal TAUX2      : # Taux de TVA récupérable
+Local    Integer RET        : # statut d'erreur (0 => OK, 1 => KO)
+Local    Char    LIBERR(250): # message d'erreur
+Local    Decimal AMTCUR     : # Montant en devise facture (zone de travail pour les conversions)
+Local    Decimal AMTCPY     : # Montant en devise société (zone de travail pour les conversions)
+Local    Decimal AMTNOTLIN(2)  : # Montant HT ligne                              |
+Local    Decimal AMTVATLIN(2)  : # Montant TVA ligne                             |
+Local    Decimal AMTVATRLIN(2) : # Montant TVA récup. ligne                      | poste 0 : en devise société
+Local    Decimal AMTNOTCUM(2)  : # Montant HT - cumul lignes analytiques         | poste 1 : en devise facture
+Local    Decimal AMTVATCUM(2)  : # Montant TVA - cumul lignes analytiques        |
+Local    Decimal AMTVATRCUM(2) : # Montant TVA récup. - cumul lignes analytiques |
+Local    Decimal TMPLOC(max(dim([M:VTL]AMT),dim([M:VT2]TBAMT))) : # travail pour conversion répart analytiques
+Local    Char    WTABIMM(70)   : # adresse, port et nom du dossier ABELX3
+
+If !G_PIEIAS
+# Détermination de la configuration de l'interface (G_CFGITF)
+#
+# En 130, le code activité ABL détermine si la gestion des biens se fait dans un produit ABEL. Si le
+# paramètre ABELX3 du chapitre IMM est à Non -> Abel Entreprise, s'il est à Oui -> AbelX3
+# En 140 et en V5, le code activité ABL détermine si la gestion des biens se fait dans Abel Entreprise,
+# et le code activité ABX si le gestion des biens se fait dans AbelX3.
+#
+
+  If clalev ([F:ACV])=0 : Local File ACTIV [ACV] : OUVACVFLG=1 : Endif
+  Read [ACV] CODACT="ABL"
+  If fstat : Raz [F:ACV] : Endif
+  If [F:ACV]FLACT=2    : # Abel Entreprise ou si X3 130 AbelX3 si le paramètre ABELX3 est à "Oui"
+    If clalev ([F:ADW])=0 : Local File ADOVAL [ADW] : OUVADWFLG=1 : Endif
+    Read [ADW] ADW0="";"";"ABELX3"
+    If fstat : Raz [F:ADW] : Endif
+    If [F:ADW]VALEUR="2"
+      G_CFGITF=4           : # Abel X3
+    Else
+      G_CFGITF=3           : # Abel Entreprise
+    Endif
+  Else
+    Read [ACV] CODACT="ABX"
+    If fstat : Raz [F:ACV] : Endif
+    If [F:ACV]FLACT=2      : # Abel X3
+      G_CFGITF=4
+    Endif
+  Endif
+  If GVERSION < "1.4.0" & G_CFGITF  : # X3 130
+    G_CFGITF -= 2
+  Endif
+
+  # Détermination du module d'origine de la facture
+  If [F:GAU]MDU=6                                                         : # facture Achat
+    G_FACACH=1
+  Elsif [F:GAU]MDU=3                                                      : # facture Tiers
+    G_FACTIE=1
+  Else
+    G_CFGITF=0                                                               : # Appel hors contexte prévu
+  Endif
+Endif
+
+If !G_CFGITF : Return : Endif # Gbn - 140508 (Modif INTRUTILA)
+
+If GVERSION < "1.4.0"
+  [L]WTABIMM=GTABIMM
+Else
+  Call INIVARIMM(STAT,MESSA) From GLOBCPT
+  If GTABIMM="*"
+    [L]WTABIMM=""
+  Else
+    [L]WTABIMM=GTABIMM
+  Endif
+Endif
+
+############### TEST #############
+Gosub CONFIG_TEST
+##################################
+
+If G_CFGITF
+  If !G_PIEIAS
+    # Déclaration des tableaux de travail (globales)
+    Read [ACV] CODACT="PIH"
+    If fstat : Raz [F:ACV] : Endif
+    [L]MAX_TLOF = max([F:ACV]DIME+15,dim([M:HAE2]NUMLIG),dim([M:VT2]TBAMT))
+    Global   Integer G_LIGORI([L]MAX_TLOF)                                   : # N° de ligne de facture
+    Global   Integer G_NOL([L]MAX_TLOF)                                      : # N° ligne du MHT dans la piéce
+    Global   Integer G_REMLIG([L]MAX_TLOF)                                   : # N° lig remontée (piéce auto)
+    Global   Integer G_INDICE([L]MAX_TLOF)                                   : # N° élément de facturation
+    Global   Char    G_CRITIMP(7)([L]MAX_TLOF)                               : # Critère de regroupement (140) FQ37136 passe de (5) à (7)
+    Global   Char    G_LIBELL(GLONDES)([L]MAX_TLOF)                          : # Libellé ligne dans la piéce
+    Global   Integer G_FLGABL([L]MAX_TLOF)                                   : # Indicateur "A interfacer"
+                                                                               #   1 : pas de dépense à créer
+                                                                               #   2 : compte PCG (et éventuellement IAS) suivi dans Abel
+                                                                               #   3 : compte IAS uniquement suivi dans Abel
+    Global   Integer G_NOGROUP([L]MAX_TLOF)                                  : # Indicateur "A ne pas grouper"
+    Global   Char    G_FCY(GLONFCY)([L]MAX_TLOF)                             : # Site
+    Global   Integer G_GACACN([L]MAX_TLOF)                                   : # Nature comptable CG
+    Global   Char    G_GAC(GLONGAC)([L]MAX_TLOF)                             : # Compte CG
+    Global   Integer G_IASACN([L]MAX_TLOF)                                   : # Nature comptable IAS
+    Global   Char    G_IASACC(GLONGAC)([L]MAX_TLOF)                          : # Compte IAS
+    Global   Char    G_SCT1(GLONADI)([L]MAX_TLOF)                            : # Secteur IAS N° 1
+    Global   Char    G_SCT2(GLONADI)([L]MAX_TLOF)                            : # Secteur IAS N° 2
+    Global   Char    G_CNA(GLONCNA)([L]MAX_TLOF)                             : # Nature analytique
+    Global   Char    G_DSP(GLONDSP)([L]MAX_TLOF)                             : # Répartition analytique
+    Global   Char    G_CCE(GLONCCE)(1..max(1,GOPTCANA), [L]MAX_TLOF)         : # Sections analytiques
+    Global   Integer G_PTV([L]MAX_TLOF)                                      : # Pointeur ventilation ana
+    Global   Integer G_PTF([L]MAX_TLOF)                                      : # Pointeur ventilation ana fin
+    Global   Decimal G_AMTNOTCUR([L]MAX_TLOF)                                : # Mt HT en devise de la facture
+    Global   Decimal G_AMTVATCUR([L]MAX_TLOF)                                : # Mt TVA en dev. de la facture
+    Global   Decimal G_AMTVATRCUR([L]MAX_TLOF)                               : # TVA R. en dev. de la facture
+    Global   Decimal G_AMTNOTCPY([L]MAX_TLOF)                                : # Mt HT en devise société
+    Global   Decimal G_AMTVATCPY([L]MAX_TLOF)                                : # Mt TVA en dev. société
+    Global   Decimal G_AMTVATRCPY([L]MAX_TLOF)                               : # TVA R. en dev. société
+    Global   Decimal G_RATVAT([L]MAX_TLOF)                                   : # Taux de TVA
+    Global   Decimal G_RATVATREC([L]MAX_TLOF)                                : # Taux de TVA récup.
+    Global   Char    G_VAT(GLONVAT)([L]MAX_TLOF)                             : # Code TVA
+    Global   Char    G_ORDBUY(GLONVCR)([L]MAX_TLOF)                          : # Réf. commande
+    Global   Char    G_ITMREF(GLONITM)([L]MAX_TLOF)                          : # Article
+    Global   Char    G_DES(GLONDES)([L]MAX_TLOF)                             : # Libellé dans la facture
+    Global   Char    G_UOM(GLONUOM)([L]MAX_TLOF)                             : # Unité
+    Global   Decimal G_QTY([L]MAX_TLOF)
+    # FQ108134                                     : # Quantité
+    #Global   Char    G_GEOFCY(GLONFCY)([L]MAX_TLOF)                          : # Site géographique
+    # FQ39752
+    Global   Char     G_ACGGRP(12)([L]MAX_TLOF)                              : # Famille de l'article
+    Global   Shortint G_FLGFAS([L]MAX_TLOF)                                  : # Article immobilisable
+
+    If OUVACVFLG : Close Local File [ACV] : Endif
+    If OUVADWFLG : Close Local File [ADW] : Endif
+
+    # Ouverture tables
+    If clalev([F:GAC])=0 : Local File GACCOUNT             [GAC] : Endif   : # Comptes généraux
+    # FQ39752
+    If G_CFGITF=4 Then
+      If clalev([F:ITM])=0  : Local File ITMMASTER            [ITM]  : Endif   : # Articles
+      If clalev([F:RDE])=0  : Local File =WTABIMM+"RUBASSDEF" [RDE]  : Endif   : # Associations : définition
+      If clalev([F:RVA])=0  : Local File =WTABIMM+"RUBASSVAL" [RVA]  : Endif   : # Associations : valeurs
+      If clalev([F:ZATZ])=0 : Local File =WTABIMM+"ATABZON"   [ZATZ] : Endif   : # Tables : rubriques
+      If clalev([F:ZATY])=0 : Local File =WTABIMM+"ATYPE"     [ZATY] : Endif   : # Types
+    Endif
+  Endif
+
+  If (!G_PIEIAS & (dim([F:GAU]CODIAS)<0 | [F:GAU]CODIAS="")) | G_PIEIAS
+    # Ouverture tables
+    If find(G_CFGITF,1,2,3)                                                    : # interface X3 130 vers AE ou AbelX3
+      If clalev([F:LOF])=0 : Local File LAYOUTFAS    [LOF] : Endif : # Dépenses pour AE
+    Else                                                                       : # interface X3 140 vers AbelX3
+      If WTABIMM=""
+        # Création de dépense Abel - Pas de dossier Abel X3 paramétré
+        [L]MESSA = mess(62,104,1)-"-"-mess(74,104,1) : [L]STAT=99 : Return
+      Endif
+      Onerrgo ERR_DOSABEL
+      Local File =WTABIMM+"LAYOUTFAS" [LOF]                        : # Dépenses Biens
+      Local File =WTABIMM+"ADOVAL"    [ADW]                        : # Paramètres Biens
+      Local File =WTABIMM+"APLCOM"    [ACM]                        : # Compteurs Biens
+      Onerrgo
+      If [L]RET
+        # Création de dépense Abel - machine:port@DOSSIER : Dossier inaccessible
+        [L]MESSA = mess(62,104,1)-"-"-left$(WTABIMM,len(WTABIMM)-1)-":"-mess(75,104,1) : [L]STAT=99 : Return
+      Endif
+      Read [ACM]COMCLE="EXPORT";0
+      If fstat
+        Call RSTA("ACM","EXPORT 0") From GLOCK : [L]STAT=99 : Return
+      Else
+        [L]EXPNUM = val([F:ACM]COMFLD)                             : # Compteur d'export
+      Endif
+      Close Local File [ACM]
+      Close Local File [ADW]
+    Endif
+    Call PARAM("","DEFUOM",[L]DEFUOM) From ADOVAL                  : # code unité par défaut
+  Endif
+
+  # Détermination de l'abréviation de la table En-tête facture
+  If [F:GAU]TBL="PINVOICE"
+   [L]ABRPIH="TB0"
+  Else
+   [L]ABRPIH="PIH"
+  Endif
+
+  # Ouverture des masques supplémentaires FQ34751
+  Local Char DBGSTR_SAV(255)
+  If clalev([M:VLOF])=0
+    DBGSTR_SAV=dbgstr(1)       : # sauvegarde de la liste des masques par défaut
+    Local Mask VENTILE2 [VLOF] : # ouverture de [VLOF]
+    # FQ38121
+    If G_CFGITF=2 and [L]ABRPIH="TB0" and !clalev([M:BIS1])
+      # En validation batch des factures fournisseurs, les masques BIS0 et BIS1 ne sont pas ouverts.
+      # Ils sont nécessaires en 130 avec AbelX3 pour déterminer le cours de la devise
+      If !clalev([M:BIS0]) : Local Mask BIS0 [BIS0] : Raz [M:BIS0] : Endif
+      If !clalev([M:BIS1]) : Local Mask BIS1 [BIS1] : Raz [M:BIS1] : Endif
+    Endif
+    Default Mask DBGSTR_SAV    : # restauration de la liste des masques
+  Endif
+Endif
+Return
+
+#################################################################################
+# Ligne facture - Etiquette appelée en Avant_ligne des lignes HT de la pièce auto
+#################################################################################
+$LIGFAC
+If dim(G_CFGITF)<0 | !G_CFGITF | [F:GAD]LINTYP<>3 : Return : Endif               : # Appel hors contexte prévu
+[L]PIELIG=[F:GAD]LINTYP-1
+Gosub LIGNE
+Return
+
+######################################################################################
+# Ligne de pied - Etiquette appelée en Avant_ligne des lignes de pied de la pièce auto
+######################################################################################
+$LIGPIED
+If dim(G_CFGITF)<0 | !G_CFGITF | !G_FACACH | [F:GAD]LINTYP<>2 : Return : Endif   : # Appel hors contexte prévu
+[L]PIELIG=[F:GAD]LINTYP-1
+Gosub LIGNE
+Return
+
+##############################################################################################################
+# Ligne de pied avec remontée (PIHI3) - Etiquette appelée en Avant_ligne des lignes remontées de la pièce auto
+##############################################################################################################
+$LIGREM
+If dim(G_CFGITF)<0 | !G_CFGITF | !G_FACACH | [F:GAD]LINTYP<>3 : Return : Endif   : # Appel hors contexte prévu
+[L]PIELIG=[F:GAD]LINTYP
+Gosub LIGNE
+Return
+
+#########################################################################
+# Gestion du critère pour éviter le regroupement de lignes passées à Abel
+#  Etiquette appelée en Avant_ligne des lignes de TVA de la pièce auto
+#########################################################################
+$GROUP
+If dim(G_CFGITF)<0 | !G_CFGITF : Return : Endif                                  : # Appel hors contexte prévu
+# Eviter le groupement ?
+If [F:GAD]LINTYP=3 & G_FACACH
+  I_TLOF = find([F:TB1]PIDLIN,G_LIGORI)-1
+Elsif [F:GAD]LINTYP=3 & G_FACTIE
+  I_TLOF = find([F:TB1]LIG,G_LIGORI)-1
+Elsif [F:GAD]LINTYP=2
+  I_TLOF = find(indice,G_INDICE)-1
+Endif
+If I_TLOF >= 0 & G_NOGROUP(I_TLOF)
+  Gosub NOGROUP
+Endif
+Return
+
+###############################################################
+# Fin - Etiquette appelée en fin de traitement de la pièce auto
+###############################################################
+$FIN
+If dim(G_CFGITF)<0 | !G_CFGITF : Return : Endif                                  : # Appel hors contexte prévu
+
+If !G_PIEIAS & (dim([F:GAU]CODIAS)<0 | [F:GAU]CODIAS="")
+# Pas de pièce IAS à venir : Ecriture dans LAYOUTFAS des lignes à passer à Abel
+# Mémorisation des ventilations analytiques
+  [M:VLOF] = [M:VT2] : # FQ37845 : alimentation des ventilations analytiques dans le masque de travail
+  If GIAS
+    ## Génération pièce IAS identique à celle de la compta légale ?
+    Call LECTURE("GTE",[M:HAE0]TYP,"") From CONTOBJ
+    If [F:GTE]GNRIAS = 2 & [M:HAE0]CAT = 1
+      [L]IASIDE = 1
+    Endif
+  Endif
+  For [L]I_TLOF=0 To dim(G_FCY)-1
+    If G_FCY(I_TLOF) <> ""
+      If G_FLGABL(I_TLOF)=2
+        # FQ39752
+        If G_CFGITF=4 & G_FACACH & G_ITMREF(I_TLOF)<>"" & G_FLGFAS(I_TLOF)<>2 Then
+          # l'article n'est pas immobilisable alors que le compte PCG est suivi dans AbelX3 et
+          # qu'il n'y a pas de pièce IAS à venir -> Erreur
+          [L]RET=1 : [L]LIBERR=mess(125,104,1) : GOK=0 : Break
+        Endif
+        # Recherche de la ligne HT de la pièce correspondant à la ligne de facture
+        If G_CFGITF < 3                                                           : # X3 130
+          G_NOL(I_TLOF)=find(G_LIBELL(I_TLOF),[M]DES)-1
+        Else                                                                      : # X3 140
+          G_NOL(I_TLOF)=find(G_CRITIMP(I_TLOF),[M]CRITGRPIMP)-1
+        Endif
+        If G_NOL(I_TLOF) < 0
+          #Infbox "problême pour retrouver la ligne HT, I_TLOF="+num$(I_TLOF)
+        Endif
+        # Calcul des montants en devise société
+        Gosub AMTCPY
+        # Si pièce IAS = pièce de compta légale, report des imputations de compta légale dans les imput. IAS
+        If [L]IASIDE
+          Gosub GLTOIAS
+        Endif
+        # Préparation traitement des imputations analytiques
+        Gosub PREP_ANALYTIQUE
+        # Création de la dépense
+        Gosub CRE_DEP
+        If [L]RET : Break : Endif
+      Else
+        # FQ39752
+        If G_CFGITF=4 & G_FACACH & G_ITMREF(I_TLOF)<>"" & G_FLGFAS(I_TLOF)=2 Then
+          # l'article est immobilisable alors que le compte PCG n'est pas suivi dans AbelX3 et
+          # qu'il n'y a pas de pièce IAS à venir -> Erreur
+          [L]RET=1 : [L]LIBERR=mess(125,104,1) : GOK=0 : Break
+        Endif
+      Endif
+    Else
+      Break
+    Endif
+  Next
+  Gosub KILL_GLOB
+
+Elsif !G_PIEIAS & dim([F:GAU]CODIAS)>0 & [F:GAU]CODIAS<>""
+# Pièce IAS à venir : Calcul des montants en devise société pour les lignes à passer à Abel
+  For [L]I_TLOF=0 To dim(G_FCY)-1
+    If G_FCY(I_TLOF) <> ""
+      If G_NOGROUP(I_TLOF)
+        # Recherche de la ligne HT de la pièce correspondant à la ligne de facture
+        If G_CFGITF < 3                                                           : # X3 130
+          G_NOL(I_TLOF)=find(G_LIBELL(I_TLOF),[M]DES)-1
+        Else                                                                      : # X3 140
+          G_NOL(I_TLOF)=find(G_CRITIMP(I_TLOF),[M]CRITGRPIMP)-1
+        Endif
+        If G_NOL(I_TLOF) < 0
+          #Infbox "problème pour retrouver la ligne HT, I_TLOF="+num$(I_TLOF)
+        Endif
+        # Calcul des montants en devise société
+        Gosub AMTCPY
+        # Préparation traitement des imputations analytiques
+        Gosub PREP_ANALYTIQUE
+      Endif
+    Else
+      Break
+    Endif
+  Next
+# Mémorisation des ventilations analytiques
+  Local Mask VENTILE2 [VLOF]
+  [M:VLOF] = [M:VT2]
+
+Elsif G_PIEIAS
+# Pièce IAS : Ecriture dans LAYOUTFAS des lignes à passer à Abel
+  For [L]I_TLOF=0 To dim(G_FCY)-1
+    If G_FCY(I_TLOF) <> ""
+      If G_FLGABL(I_TLOF)>1
+        # FQ39752
+        If G_CFGITF=4 & G_FACACH & G_ITMREF(I_TLOF)<>"" & G_FLGFAS(I_TLOF)<>2 Then
+          # l'article n'est pas immobilisable alors que le compte IAS ou PCG est suivi dans AbelX3
+          # -> Erreur
+          [L]RET=1 : [L]LIBERR=mess(125,104,1) : GOK=0 : Break
+        Endif
+
+        If G_FLGABL(I_TLOF)=3
+          # Recherche de la ligne HT de la pièce correspondant à la ligne de facture (lignes immos IAS seul)
+          If G_CFGITF < 3                                                         : # X3 130
+            G_NOL(I_TLOF)=find(G_LIBELL(I_TLOF),[M]DES)-1
+          Else                                                                    : # X3 140
+            G_NOL(I_TLOF)=find(G_CRITIMP(I_TLOF),[M]CRITGRPIMP)-1
+          Endif
+          If G_NOL(I_TLOF) < 0
+            #Infbox "problême pour retrouver la ligne HT, I_TLOF="+num$(I_TLOF)
+          Endif
+          # Calcul des montants en devise société
+          Gosub AMTCPY
+        Endif
+        # Récupération des secteurs IAS
+        Gosub SCTIAS
+        # Création de la dépense
+        Gosub CRE_DEP
+        If [L]RET : Break : Endif
+      Else
+        # FQ39752
+        If G_CFGITF=4 & G_FACACH & G_ITMREF(I_TLOF)<>"" & G_FLGFAS(I_TLOF)=2 Then
+          # l'article est immobilisable alors que les comptes IAS et PCG ne sont pas suivis dans AbelX3
+          # -> Erreur
+          [L]RET=1 : [L]LIBERR=mess(125,104,1) : GOK=0 : Break
+        Endif
+      Endif
+    Else
+      Break
+    Endif
+  Next
+  Gosub KILL_GLOB
+Endif
+
+# Mise en forme message d'erreur et gestion STAT
+Gosub AV_RETOUR
+Return
+
+####################################
+# Préparation des lignes de dépenses
+####################################
+$LIGNE
+# On ne prend pas en compte les lignes nulles
+If [L]MONTLIG = 0 : Return : Endif
+
+# Lecture paramétrage du compte de la ligne
+Call LECTURE("GAC",[L]COMPTE,"") From CONTOBJ
+
+# Gestion du critêre pour éviter le regroupement de lignes passées à Abel, dans la pièce générée en compta
+Raz [L]NOGROUP
+
+#If [F:GAC]FLGABL=2
+#If [F:GAC]FLGABL=2 | (!G_PIEIAS & dim([F:GAU]CODIAS)>0 & [F:GAU]CODIAS<>"" & G_FACTIE
+#&   & [F:TB1]ACCIAS<>[L]COMPTE & [L]NATURE<>"")
+#  Gosub NOGROUP
+#Endif
+
+# FQ38125 : Cas des factures Tiers et Achat
+#           Dans le cas de la facture achat en 130, il n'y a pas de compte IAS. Si le compte PCG n'est
+#           pas suivi en analytique, le compte IAS ne le sera pas plus puisque c'est le même !
+If G_CFGITF < 3
+  # X3 130
+  If    ([F:GAC]FLGABL=2)
+&    or (!G_PIEIAS and dim([F:GAU]CODIAS)>0 and [F:GAU]CODIAS<>""
+&       and  (G_FACTIE & [F:TB1]ACCIAS<>[L]COMPTE) and  [L]NATURE<>"")
+    Gosub NOGROUP
+  Endif
+Else
+  # X3 140
+  If    ([F:GAC]FLGABL=2)
+&    or (!G_PIEIAS & dim([F:GAU]CODIAS)>0 and [F:GAU]CODIAS<>""
+&       and  ((G_FACTIE and [F:TB1]ACCIAS<>[L]COMPTE) or (G_FACACH and [F:TB1]LINACCIAS<>[L]COMPTE))
+&       and  [L]NATURE<>"")
+    Gosub NOGROUP
+  Endif
+Endif
+
+# Alimentation table de travail depuis la ligne
+If !G_PIEIAS
+  Gosub FIL_TAB
+Else
+  Gosub CMP_TAB
+Endif
+
+# Mise en forme message d'erreur et gestion STAT
+Gosub AV_RETOUR
+Return
+
+#########################################################################
+# Gestion du critêre pour éviter le regroupement de lignes passées à Abel
+#########################################################################
+$NOGROUP
+
+[L]NOGROUP=1
+If G_CFGITF < 3                                                           : # X3 130
+  If [F:GAD]LINTYP=2
+    [L]LIBEL=left$([L]LIBEL,GLONDES-3)-format$("N:2",indice)
+  Elsif G_FACACH & [L]PIELIG = 2
+    #[L]LIBEL=left$([L]LIBEL,GLONDES-5)-format$("N:4",[F:TB1]PIDLIN) : # FQ37136
+    [L]LIBEL=left$([L]LIBEL,GLONDES-8)-format$("N:7",[F:TB1]PIDLIN)
+  Elsif G_FACACH & [L]PIELIG = 3
+    [L]LIBEL=left$([L]LIBEL,GLONDES-4)-"R"+format$("N:2",[F:GAD]LINNUM)
+  Elsif G_FACTIE
+    [L]LIBEL=left$([L]LIBEL,GLONDES-4)-format$("N:3",[F:TB1]LIG)
+  Endif
+Else                                                                       : # X3 140
+  ## DEBUT FQ37136
+  ##If [F:GAD]LINTYP=2
+  ##  [L]CRITIMP=left$([L]CRITIMP,type([L]CRITIMP)-13)-format$("N:2",indice)
+  ##Elsif G_FACACH & [L]PIELIG = 2
+  ##  [L]CRITIMP=left$([L]CRITIMP,type([L]CRITIMP)-15)-format$("N:4",[F:TB1]PIDLIN)
+  ##Elsif G_FACACH & [L]PIELIG = 3
+  ##  [L]CRITIMP=left$([L]CRITIMP,type([L]CRITIMP)-14)-"R"+format$("N:2",[F:GAD]LINNUM)
+  ##Elsif G_FACTIE
+  ##  [L]CRITIMP=left$([L]CRITIMP,type([L]CRITIMP)-14)-format$("N:3",[F:TB1]LIG)
+  ##Endif
+  If [F:GAD]LINTYP=2
+    [L]CRITIMP=format$("N:2",indice)
+  Elsif G_FACACH & [L]PIELIG = 2
+    [L]CRITIMP=format$("N:7",[F:TB1]PIDLIN)
+  Elsif G_FACACH & [L]PIELIG = 3
+    [L]CRITIMP="R"+format$("N:2",[F:GAD]LINNUM)
+  Elsif G_FACTIE
+    [L]CRITIMP=format$("N:3",[F:TB1]LIG)
+  Endif
+  ## FIN FQ37136
+Endif
+Return
+
+#####################################
+# Alimentation du tableau de travail
+#####################################
+$FIL_TAB
+If [L]PIELIG = 3
+  [L]I_TLOF=find([F:GAD]LINNUM,G_REMLIG)-1
+  If [L]I_TLOF < 0
+    [L]I_TLOF=find("",G_FCY)-1
+  Else
+    # addition
+    G_AMTNOTCUR(I_TLOF) += [L]MONTLIG
+    Return
+  Endif
+Endif
+# Recherche premier poste vide
+[L]I_TLOF=find("",G_FCY)-1
+
+# FQ38448
+If [L]I_TLOF < 0
+  # On a atteint le nombre de lignes d'écriture géré dans LOFABL. Voir la détermination de [L]MAX_TLOF
+  # et les codes activités PIH, GAS et VTP.
+  [L]RET=1
+  [L]LIBERR = mess(45,116,1)-"("+num$(dim(G_FCY))+")" : # Trop de lignes (xxx)
+  GOK=0
+  Return
+Endif
+
+# Alimentation nouveau poste de la table
+G_FLGABL(I_TLOF)  = [F:GAC]FLGABL                           : # Indicateur ligne à envoyer dans Abel
+G_NOGROUP(I_TLOF) = [L]NOGROUP                              : # Indicateur ligne à ne pas grouper
+G_FCY(I_TLOF)     = [L]SITE                                 : # Site
+If dim([F:GAC]GACACN)>0
+  G_GACACN(I_TLOF)  = [F:GAC]GACACN                         : # Nature PCG
+Endif
+If !find(G_GACACN(I_TLOF),1,2)
+  G_GACACN(I_TLOF) = 3
+Endif
+G_GAC(I_TLOF)     = [L]COMPTE                               : # Compte PCG
+G_CNA(I_TLOF)     = [L]NATURE                               : # Nature analytique
+G_LIBELL(I_TLOF)  = [L]LIBEL                                : # Désignation
+# FQ108134
+#G_GEOFCY(I_TLOF)  = [L]SITE                                 : # Site (localisation géographique)
+If G_CFGITF > 2                                                             : # X3 140
+  G_CRITIMP(I_TLOF) = [L]CRITIMP                            : # Critêre de regroupement
+Endif
+
+If G_FACACH                                                                 : # facture Achat
+  Case [L]PIELIG
+    When 1                                                                   : # pied
+      G_VAT(I_TLOF) = [F:TB0]INVDTAVAT(indice)              : # Code TVA
+      G_INDICE(I_TLOF) = indice                             : # Ligne de facture
+      If G_CFGITF < 3                                       : # Désignation
+        G_DES(I_TLOF)    = [F:PFI]FOODES
+      Else                         : # En 140 l'intitulé de l'élément de facturation est un texte traduisible
+        Call LECTEXTRA(G_DES(I_TLOF),"PFOOTINV","DESAXX",num$([F:TB0]INVDTA(indice)),"") From ATEXTRA
+      Endif
+    When 2                                                                   : # ligne
+      G_VAT(I_TLOF)    = [F:TB1]VAT                         : # Code TVA
+      G_LIGORI(I_TLOF) = [F:TB1]PIDLIN                      : # Ligne de facture
+      G_ORDBUY(I_TLOF) = [F:TB1]POHNUM                      : # Numéro de commande
+      G_ITMREF(I_TLOF) = [F:TB1]ITMREF                      : # Article
+      G_DES(I_TLOF)    = [F:TB1]ITMDES                      : # Désignation
+      G_UOM(I_TLOF)    = [F:TB1]UOM                         : # Unité
+      G_QTY(I_TLOF)    = [F:TB1]QTYUOM                      : # Quantité
+
+      # FQ39752
+      If (G_CFGITF=4) and (G_ITMREF(I_TLOF) <> "") Then
+        Read [ITM]ITM0=G_ITMREF(I_TLOF)
+        If !fstat Then
+          G_ACGGRP(I_TLOF) = [F:ITM]ACGGRP
+          G_FLGFAS(I_TLOF) = [F:ITM]FLGFAS
+        Endif
+      Endif
+    When 3                                                                   : # pied remonté
+      G_VAT(I_TLOF) = [F:TB0]INVDTAVAT(find([F:TB0]INVDTALIN2([F:GAD]LINNUM-14),[F:TB0]INVDTA)-1) : # Code TVA
+      G_REMLIG(I_TLOF) = [F:GAD]LINNUM                      : # Ligne de remontée
+      # FQ35387
+      If dim([F:TB0]DES)<0 Then
+        G_DES(I_TLOF)  = [F:TB0]NUM                       : # Référence
+      Else
+        G_DES(I_TLOF)  = [F:TB0]DES                       : # Désignation
+      Endif
+  Endcase
+Else                                                                         : # facture Tiers
+  G_VAT(I_TLOF)    = [F:TB1]VAT                             : # Code TVA
+  G_LIGORI(I_TLOF) = [F:TB1]LIG                             : # Ligne de facture
+  G_QTY(I_TLOF)    = [F:TB1]QTY                             : # Quantité
+  G_UOM(I_TLOF)    = [F:TB1]UOM                             : # Unité
+  G_DES(I_TLOF)    = [F:TB1]DES                             : # Désignation
+Endif
+Gosub LIN_RAT                                               : # taux TVA
+If [L]RET : Return : Endif
+Gosub LIN_AMT                                               : # Montants
+Return
+
+#########################################
+# Recherche des taux associés au code TVA
+#########################################
+$LIN_RAT
+If G_VAT(I_TLOF) <> ""
+  If clalev([F:TRA])=0 : Local File TABRATVAT [TRA] : Endif
+  [L]COMPANY = [M]CPY
+  [L]TAX     = G_VAT(I_TLOF)
+  If evalue("[F:"+[L]ABRPIH+"]INVNUM") = ""
+    [L]DAT   = [M]ACCDAT
+  Else
+    If clalev([F:PIH2])=0 : Local File PINVOICE [PIH2] : Endif
+    Read [PIH2]PIH0 = evalue("[F:"+[L]ABRPIH+"]INVNUM")
+    If !fstat : [L]DAT = [F:PIH2]ACCDAT : Endif
+  Endif
+  Gosub LECTAX From SUBTVT
+  If ![L]STAT
+    G_RATVAT(I_TLOF)    = [L]TAUX1 / 100
+    G_RATVATREC(I_TLOF) = [L]TAUX2 / 100
+  Else
+    Call ERR_CALTAXE([L]STAT,[L]LIBERR) From SUBTVT
+    [L]RET = 1
+    [L]LIBERR = [L]LIBERR-"("+mess(61,100,1)-num$(G_LIGORI(I_TLOF))+","-mess(37,100,1)-[L]TAX+")"
+  Endif
+Endif
+Return
+
+############################################
+# Calcul des montants de la ligne de dépense
+############################################
+$LIN_AMT
+# Montants en devise de la facture
+G_AMTNOTCUR(I_TLOF)=[L]MONTLIG                              : # Montant HT
+
+If G_FACACH & [L]PIELIG=1                                                   : # facture Achat - Pied
+  G_AMTVATCUR(I_TLOF)=[F:TB0]DTAAMTTAX(indice)              : # Montant TVA
+  G_AMTVATRCUR(I_TLOF)=[F:TB0]DTADEDTAX(indice)             : # Montant TVA récupérée
+Elsif G_FACACH & [L]PIELIG=2                                                : # facture Achat - Ligne
+  G_AMTVATCUR(I_TLOF)=[F:TB1]AMTTAXLIN1                     : # Montant TVA
+  G_AMTVATRCUR(I_TLOF)=[F:TB1]DEDTAXLIN1                    : # Montant TVA récupérée
+Elsif G_FACACH & [L]PIELIG=3                                                : # facture Achat - Pied remonté
+  G_AMTVATCUR(I_TLOF)=[F:TB0]DTAAMTTAX(find([F:TB0]INVDTALIN2([F:GAD]LINNUM-14),[F:TB0]INVDTA)-1)
+  G_AMTVATRCUR(I_TLOF)=[F:TB0]DTADEDTAX(find([F:TB0]INVDTALIN2([F:GAD]LINNUM-14),[F:TB0]INVDTA)-1)
+Else                                                                         : # facture Tiers
+  G_AMTVATCUR(I_TLOF)=[F:TB1]AMTVAT                         : # Montant TVA
+  G_AMTVATRCUR(I_TLOF)=[F:TB1]DEDVAT                        : # Montant TVA récupérée
+Endif
+
+Return
+
+################################################
+# Mise en forme message d'erreur et gestion STAT
+################################################
+$AV_RETOUR
+If [L]RET
+  [L]STAT=99
+  # création de dépense Abel - XXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+  If [L]LIBERR<>"" : [L]MESSA = mess(62,104,1)-"-"-[L]LIBERR : Endif
+Endif
+Return
+
+############################################
+# Compléments IAS dans le tableau de travail
+############################################
+$CMP_TAB
+If [F:GAD]LINTYP=3 & G_FACACH
+  I_TLOF = find([F:TB1]PIDLIN,G_LIGORI)-1
+Elsif [F:GAD]LINTYP=3 & G_FACTIE
+  I_TLOF = find([F:TB1]LIG,G_LIGORI)-1
+Elsif [F:GAD]LINTYP=2
+  I_TLOF = find(indice,G_INDICE)-1
+Endif
+
+If I_TLOF >= 0
+  G_IASACC(I_TLOF)  = [L]COMPTE                               : # Compte IAS
+
+  If  G_FLGABL(I_TLOF) < 2 & [F:GAC]FLGABL = 2
+    G_FLGABL(I_TLOF)  = [F:GAC]FLGABL + 1                     : # Indicateur ligne à envoyer dans Abel
+  Endif
+  If [F:GAC]FLGABL < 2 & G_NOGROUP(I_TLOF)
+    Gosub NOGROUP                                             : #
+  Endif
+  If dim([F:GAC]GACACN)>0
+    G_IASACN(I_TLOF)  = [F:GAC]GACACN                         : # Nature IAS
+  Endif
+  If !find(G_IASACN(I_TLOF),1,2)
+    G_IASACN(I_TLOF) = 3
+  Endif
+Endif
+Return
+
+##################################
+# Traitement d'une dépense à créer
+##################################
+$CRE_DEP
+Raz [F:LOF]
+If [L]ABRPIH="PIH"
+  [F:LOF] = [F:PIH]
+Else
+  [F:LOF] = [F:TB0]
+Endif
+[F:LOF]CODLOF     = evalue("[F:"+[L]ABRPIH+"]NUM")              : # Numéro de pièce
+[F:LOF]DATVCR     = evalue("[F:"+[L]ABRPIH+"]BPRDAT")           : # Date d'achat
+[F:LOF]DATIMP     = evalue("[F:"+[L]ABRPIH+"]ACCDAT")           : # Date d'imputation comptable
+[F:LOF]FCY        = G_FCY(I_TLOF)                               : # Site
+[F:LOF]AMTNOTCPY  = G_AMTNOTCPY(I_TLOF)                         : # Montant HT en dev. société
+[F:LOF]RATVAT     = G_RATVAT(I_TLOF)                            : # Taux de TVA
+[F:LOF]AMTVATCPY  = G_AMTVATCPY(I_TLOF)                         : # Montant TVA en dev. société
+[F:LOF]RATVATREC  = G_RATVATREC(I_TLOF)                         : # Taux de TVA récup.
+[F:LOF]AMTVATRCPY = G_AMTVATRCPY(I_TLOF)                        : # Montant TVA récup. en dev. société
+[F:LOF]DES        = G_DES(I_TLOF)                               : # Désignation
+[F:LOF]QTY        = G_QTY(I_TLOF)                               : # Quantité
+If GIAS
+  [F:LOF]IASACC   = G_IASACC(I_TLOF)                            : # Compte IAS
+Endif
+If G_CFGITF > 3                                             : # X3 140 et AbelX3 140
+  [F:LOF]EXPNUM     = [L]EXPNUM                                 : # Compteur d'export
+Else
+  [F:LOF]EXPNUM     = [C]EXPORT                                 : # Compteur d'export
+Endif
+If find(G_CFGITF,1,3)                                       : # interface vers AE
+  [F:LOF]TYPVCR     = evalue("[F:"+[L]ABRPIH+"]PIVTYP")         : # Type document
+  [F:LOF]ACCGLE     = G_GAC(I_TLOF)                             : # Compte
+Else                                                        : # interface vers Abel X3
+  If G_CFGITF > 3                                           : # X3 140 et AbelX3 140
+    Raz [F:LOF]UPDDAT, [F:LOF]UPDUSR
+    [F:LOF]FLGGRA     = 1                                       : # Flag subventionnée
+    [F:LOF]FLGAMTGRA  = 1                                       : # Flag Force Mt subvention
+    [F:LOF]FLGLIKAAS  = 1                                       : # Flag liaison Bien
+    [F:LOF]FLGLOFMAI  = 1                                       : # Flag dépense principale
+    [F:LOF]CREORI     = 4                                       : # Origine saisie Interface
+    [F:LOF]CREUSR     = GUSER                                   : # Opérateur création
+    [F:LOF]CREDAT     = date$                                   : # Date création
+    [F:LOF]FLGVATFCR  = 1                                       : # Flag Force TVA
+    [F:LOF]FLGRECFVR  = 1                                       : # Flag Force TVA récupérée
+    [F:LOF]GACACN     = G_GACACN(I_TLOF)                        : # Nature PCG
+    [F:LOF]IASACN     = G_IASACN(I_TLOF)                        : # Nature IAS
+    [F:LOF]RATCUR     = [M]RATCUR                               : # Cours devise
+    If evalue("[F:"+[L]ABRPIH+"]INVTYP") < 3                    : # Type document
+      [F:LOF]TYPVCR = evalue("[F:"+[L]ABRPIH+"]INVTYP")
+    Else
+      [F:LOF]TYPVCR = evalue("[F:"+[L]ABRPIH+"]INVTYP") - 2
+    Endif
+  Else                                                      : # X3 130 et AbelX3 140
+    If evalue("[F:"+[L]ABRPIH+"]INVTYP") < 3                    : # Type document
+      [F:LOF]TYPVCR = num$(evalue("[F:"+[L]ABRPIH+"]INVTYP"))
+    Else
+      [F:LOF]TYPVCR = num$(evalue("[F:"+[L]ABRPIH+"]INVTYP") - 2)
+    Endif
+    If [L]ABRPIH="TB0"                                      : # Recherche du cours pour les factures tiers
+      # FQ38121
+      # - en X3 140, [M:BIS1]RATCUR contient toujours quelque chose : le cours théorique ([M:BIS1]RATCUR0) par défaut,
+      #   le cours forcé s'il est précisé. Le champ RATCUR de PINVOICE contient [M:BIS1]RATCUR.
+      # - en X3 130, [M:BIS1]RATCUR n'est alimenté que si on a forcé le cours. Le champ RATCUR de PINVOICE
+      #   est alimenté avec RATCUR et peut être vide (cas où on applique le cours théorique).
+      # Ici, on est en 130.
+      #If [M:BIS1]RATCUR <> 0
+      #  [F:LOF]RATCUR   = [M:BIS1]RATCUR                          : # Cours devise forcé
+      #Else
+      #  [F:LOF]RATCUR   = [M:BIS1]RATCUR0                         : # Cours devise
+      #Endif
+      If [F:TB0]RATCUR <> 0
+        # On passe ici uniquement si le cours est forcé.
+        [F:LOF]RATCUR   = [F:TB0]RATCUR                          : # Cours devise (forcé ou pas)
+      Else
+        # On passe si le cours n'est pas forcé.
+        # Il faut retrouver la devise courante au moment de la facture.
+        [M:BIS0]CPY    = [F:TB0]CPY
+        [M:BIS1]CUR    = [F:TB0]CUR
+        [M:BIS1]RATDAT = [F:TB0]RATDAT
+        Gosub DEV From SUBBIS
+        [F:LOF]RATCUR   = [M:BIS1]RATCUR0                         : # Cours devise
+      Endif
+    Endif
+  Endif
+
+  # Si c'est un avoir, on stocke sur DES2 le numéro de facture à laquelle il se rapporte
+  If find(evalue("[F:"+[L]ABRPIH+"]INVTYP"),2,4)
+    If evalue("[F:"+[L]ABRPIH+"]INVNUM") <> "" Then
+      [F:LOF]DES2 = mess(6,159,1)-":"-evalue("[F:"+[L]ABRPIH+"]INVNUM")
+                                                                : # Référence : <numéro de facture>
+    Else
+      [F:LOF]DES2 = mess(9,119,1)                               : # Avoir sans numéro de facture
+    Endif
+  Endif
+
+  [F:LOF]CURTYP     = [M]TYPRAT                                 : # Type de cours
+  # FQ108134
+  #[F:LOF]GEOFCY     = G_GEOFCY(I_TLOF)                          : # Site (localisation géographique)
+  [F:LOF]UOM        = G_UOM(I_TLOF)                             : # Unité
+  [F:LOF]GAC        = G_GAC(I_TLOF)                             : # Compte
+  [F:LOF]GACORI     = G_GAC(I_TLOF)                             : # Compte origine
+  [F:LOF]IASACCORI  = G_IASACC(I_TLOF)                          : # Compte IAS origine
+  [F:LOF]SCT1       = G_SCT1(I_TLOF)                            : # Secteur IAS N° 1
+  [F:LOF]SCT2       = G_SCT2(I_TLOF)                            : # Secteur IAS N° 2
+  [F:LOF]AMTNOTCUR  = G_AMTNOTCUR(I_TLOF)                       : # Montant HT en dev. société
+  [F:LOF]AMTVATCUR  = G_AMTVATCUR(I_TLOF)                       : # Montant TVA en dev. société
+  [F:LOF]AMTVATRCUR = G_AMTVATRCUR(I_TLOF)                      : # Montant TVA récup. en dev. société
+  [F:LOF]ORDBUY     = G_ORDBUY(I_TLOF)                          : # Numéro de commande
+  [F:LOF]ITMREF     = G_ITMREF(I_TLOF)                          : # Article
+  If G_FACACH                                                               : # facture Achat
+    [F:LOF]CPMCREORI = 1                                        : # Origine complément X3 Achats
+    If G_LIGORI(I_TLOF) <> 0
+      [F:LOF]LIGORI = G_LIGORI(I_TLOF)                          : # Ligne de facture
+    Elsif G_INDICE(I_TLOF) <> 0
+      [F:LOF]LIGORI = G_INDICE(I_TLOF)                          : # Ligne de pied
+    Elsif G_REMLIG(I_TLOF) <> 0
+      [F:LOF]LIGORI = G_REMLIG(I_TLOF)                          : # Ligne de pied remontée
+    Endif
+    If G_CFGITF=4 Then
+      # FQ39752 Alimentation de la famille et exécution des associations
+      [F:LOF]ACGGRP     = G_ACGGRP(I_TLOF)                          : # Famille
+      If [F:LOF]ACGGRP <> ""
+        Gosub GERER_ASSOCIATION
+        If [L]RET Then
+          [L]LIBERR = mess(124,104,1)-"("+[F:LOF]ACGGRP+")" : # Erreur dans les associations AbelX3 (Famille)
+          GOK=0
+        Endif
+      Endif
+    Endif
+  Else                                                                       : # facture Tiers
+    [F:LOF]CPMCREORI = 2                                        : # Origine complément X3 Tiers
+    [F:LOF]LIGORI   = G_LIGORI(I_TLOF)                          : # Ligne de facture
+  Endif
+Endif
+Gosub GERE_ANALYTIQUE
+If ![L]ANA
+  Gosub RAZ_CCE
+  Gosub ECRI_DEP
+Endif
+Return
+
+###########################################################################
+# Préparation gestion des sections et des ventilations dans la cas de l'IAS
+###########################################################################
+$PREP_ANALYTIQUE
+# Mémorisation des infos d'imputations analytiques pour la ligne
+If G_CNA(I_TLOF)<>"" & G_NOGROUP(I_TLOF)
+  If [M:HAE2]DSP(G_NOL(I_TLOF))=""                     : # pas de répart./ventil. => sections dans [M:HAE2]
+    For [L]AXE=1 To GOPTCANA
+      G_CCE([L]AXE, I_TLOF) = evalue("[M:HAE2]CCE"+num$([L]AXE)+"(G_NOL(I_TLOF))")
+    Next
+  Elsif [M:HAE2]PTV(G_NOL(I_TLOF))=0                   : # répartition
+    G_DSP(I_TLOF) = [M:HAE2]DSP(G_NOL(I_TLOF))
+  Else                                                 : # ventilation
+    G_DSP(I_TLOF) = "$"
+    G_PTV(I_TLOF) = [M:HAE2]PTV(G_NOL(I_TLOF))
+    G_PTF(I_TLOF) = [M:HAE2]PTF(G_NOL(I_TLOF))
+  Endif
+Endif
+Return
+
+##########################################
+# Gestion des sections et des ventilations
+##########################################
+$GERE_ANALYTIQUE
+Raz [L]ANA
+# Recherche existence d'imputations analytiques pour la ligne
+If G_CNA(I_TLOF)<>""
+  [L]ANA=1
+  If G_DSP(I_TLOF)=""                                  : # pas de répart./ventil. => sections dans G_CCE
+    For [L]AXE=1 To GOPTCANA
+      If find(G_CFGITF,1,2,3)                                       : # interface vers AE ou AbelX3 (X3 130)
+        Assign "[F:LOF]CCE"+num$([L]AXE) With G_CCE([L]AXE, I_TLOF)
+      Else                                                          : # interface vers AbelX3
+        [F:LOF]CCE([L]AXE-1) = G_CCE([L]AXE, I_TLOF)
+      Endif
+    Next
+    If find(G_CFGITF,2,4)                                           : # interface vers AbelX3
+      [F:LOF]ANALIGORI = 1
+    Endif
+    Gosub ECRI_DEP
+  Elsif G_PTV(I_TLOF)=0                                : # répartition => on la fait à la main dans [M:VTL]
+    [M:VTL]TOTREP  = G_AMTNOTCUR(I_TLOF) + G_AMTVATCUR(I_TLOF) - G_AMTVATRCUR(I_TLOF)
+    [M:VTL]QTOTREP = [F:LOF]QTY
+    Call LECTURE("TCU",[M]CUR,"") From CONTOBJ
+    Call CHARGE_VTE(G_DSP(I_TLOF),G_UOM(I_TLOF),G_CNA(I_TLOF)
+&                                     ,G_GAC(I_TLOF),"") From VENTILE
+    Call LECTURE("TCU",[M]CPYCUR,"") From CONTOBJ
+    Call CONVERT_DEV([M]CUR,[M]CPYCUR,[M]CPYCUR,[M:VTL]BAS,[M:VTL]AMT,TMPLOC,[M]RATCUR
+&                                     ,[M]TYPRAT,[M]RATDAT,[F:TCU]CURRND) From CPTSUB
+    Raz [L]AMTNOTCUM, [L]AMTVATCUM, [L]AMTVATRCUM
+    For [L]I_VT=0 To [M:VTL]BAS-1
+      [F:LOF]QTY    = [M:VTL]QTY([L]I_VT)                       : # Quantité
+      For [L]AXE=1 To GOPTCANA                                  : # Sections
+        If find(G_CFGITF,1,2,3)                                 : # interface vers AE ou AbelX3 (X3 130)
+          Assign "[F:LOF]CCE"+num$([L]AXE) With evalue("[M:VTL]CCE"+num$([L]AXE)+"([L]I_VT)")
+        Else                                                          : # interface vers AbelX3
+          [F:LOF]CCE([L]AXE-1) = evalue("[M:VTL]CCE"+num$([L]AXE)+"([L]I_VT)")
+        Endif
+      Next [L]AXE
+      If [L]I_VT<>[M:VTL]BAS-1                           : # ttes lignes sauf la dernière
+        Gosub LIA_AMT                                           : # Montants
+      Else                                               : # dernière ligne
+        Gosub ECARTS                                            : # Montants + écarts
+      Endif
+      If find(G_CFGITF,2,4)                                         : # interface vers AbelX3
+        [F:LOF]ANALIGORI = [L]I_VT+1                            : # N° de ligne analytique
+      Endif
+      Gosub ECRI_DEP
+      If [L]RET : Break : Endif
+    Next
+  Else                                                 : # ventilation => on exploite [M:VLOF]
+    Call LECTURE("TCU",[M]CPYCUR,"") From CONTOBJ
+    Call CONVERT_DEV([M]CUR,[M]CPYCUR,[M]CPYCUR,G_PTF(I_TLOF)-G_PTV(I_TLOF)+1
+&                                     ,[M:VLOF]TBAMT(G_PTV(I_TLOF)..G_PTF(I_TLOF))
+&                                     ,TMPLOC(G_PTV(I_TLOF)..G_PTF(I_TLOF))
+&                                     ,[M]RATCUR,[M]TYPRAT,[M]RATDAT,[F:TCU]CURRND) From CPTSUB
+    Raz [L]AMTNOTCUM, [L]AMTVATCUM, [L]AMTVATRCUM
+    For [L]I_VT=G_PTV(I_TLOF) To G_PTF(I_TLOF)
+      [F:LOF]QTY = [M:VLOF]TBQTY([L]I_VT)                      : # Quantité
+      For [L]AXE=1 To GOPTCANA                                  : # Sections
+        If find(G_CFGITF,1,2,3)                                         : # interface vers AE ou AbelX3 (X3 130)
+          Assign "[F:LOF]CCE"+num$([L]AXE) With evalue("[M:VLOF]TBCCE"+num$([L]AXE)+"([L]I_VT)")
+        Else                                                          : # interface vers AbelX3
+          [F:LOF]CCE([L]AXE-1) = evalue("[M:VLOF]TBCCE"+num$([L]AXE)+"([L]I_VT)")
+        Endif
+      Next [L]AXE
+      If [L]I_VT<>G_PTF(I_TLOF)                          : # ttes ventilations sauf la dernière
+        Gosub LIA_AMT                                           : # Montants
+      Else                                               : # dernière ventilation
+        Gosub ECARTS                                            : # Montants + écarts
+      Endif
+      If find(G_CFGITF,2,4)                                           : # interface vers AbelX3
+        [F:LOF]ANALIGORI = [L]I_VT-G_PTV(I_TLOF)+1 : # N° de ligne analytique
+      Endif
+      Gosub ECRI_DEP
+      If [L]RET : Break : Endif
+    Next
+  Endif
+Endif
+Return
+
+#####################################
+# Ecriture dans la table des dépenses
+#####################################
+$ECRI_DEP
+# positionnement des flags de forçage TVA
+Gosub PUT_FLG_FORCE
+# Inversion des montants sur les avoirs pour Abel X3
+Gosub AVOIR_AMT
+# pas de quantité à zéro pour Abel Entreprise et Abel X3
+If [F:LOF]QTY = 0 : [F:LOF]QTY = 1 : Endif
+# pas de quantité sans unité pour AbelX3
+If find(G_CFGITF,2,4) & [F:LOF]UOM = ""
+  [F:LOF]UOM = [L]DEFUOM                                        : # Unité
+Endif
+# pas de désignation vide pour AbelX3
+If find(G_CFGITF,2,4) & [F:LOF]DES = ""
+  If G_LIBELL(I_TLOF) <> ""
+    [F:LOF]DES = G_LIBELL(I_TLOF)
+  Else
+    [F:LOF]DES = mess(evalue("[F:"+[L]ABRPIH+"]INVTYP"),645,1)-evalue("[F:"+[L]ABRPIH+"]BPRNAM")
+  Endif
+Endif
+
+# Point d'entrée permettant de compléter la dépense avant écriture
+GPE=0
+GPOINT="ECRI_DEP" : Gosub ENTREE From EXEFNC
+If GPE : GOK=0 : [L]RET=1 : Return : Endif
+
+[L]NUMLIG += 1                                                  : # Incrémentation du compteur de lignes
+[F:LOF]LINLOF = [L]NUMLIG                                       : # Ligne
+Write [LOF]
+If fstat
+  GOK = 0 : Call RSTA("LOF",[F:LOF]CODLOF-num$([F:LOF]LINLOF)) From GLOCK : [L]RET=1 : Return
+Endif
+Return
+
+#######################################################################
+# Recalcul des montants en cas de répartition ou ventilation analytique
+#######################################################################
+$LIA_AMT
+# FQ41105 : les montants [M:VLOF]TBAMT et [M:VTL]AMT sont toujours positifs, car ils représentent la valeur absolue d'un débit
+#           ou d'un crédit. Si le montant de transaction est négatif, il faut les multiplier par -1
+Local Decimal AMT
+If G_DSP(I_TLOF)="$"                              : # ventilation manuelle
+  [L]AMT=[M:VLOF]TBAMT([L]I_VT)
+Else
+  [L]AMT=[M:VTL]AMT([L]I_VT)
+Endif
+
+If G_AMTNOTCUR(I_TLOF) < 0
+  [L]AMT=-[L]AMT
+Endif
+
+# Montants en devise de la facture
+Call MTS_FROM_IMO ([L]AMTNOTLIN(1), [L]AMTVATLIN(1), [L]AMTVATRLIN(1), [L]AMT
+&                      , G_RATVAT(I_TLOF), G_RATVATREC(I_TLOF), [M]CUR)
+
+[L]AMT=[L]TMPLOC([L]I_VT)
+If G_AMTNOTCUR(I_TLOF) < 0
+  [L]AMT=-[L]AMT
+Endif
+
+# Montants en devise société
+Call MTS_FROM_IMO ([L]AMTNOTLIN(0), [L]AMTVATLIN(0), [L]AMTVATRLIN(0), [L]AMT
+&                        , G_RATVAT(I_TLOF), G_RATVATREC(I_TLOF), [M]CPYCUR)
+
+# Cumul pour gestion des écarts
+[L]AMTNOTCUM(0)  += [L]AMTNOTLIN(0)
+[L]AMTVATCUM(0)  += [L]AMTVATLIN(0)
+[L]AMTVATRCUM(0) += [L]AMTVATRLIN(0)
+[L]AMTNOTCUM(1)  += [L]AMTNOTLIN(1)
+[L]AMTVATCUM(1)  += [L]AMTVATLIN(1)
+[L]AMTVATRCUM(1) += [L]AMTVATRLIN(1)
+
+# Mise en place des montants calculés
+[F:LOF]AMTNOTCPY  = [L]AMTNOTLIN(0)
+[F:LOF]AMTVATCPY  = [L]AMTVATLIN(0)
+[F:LOF]AMTVATRCPY = [L]AMTVATRLIN(0)
+If find(G_CFGITF,2,4)                                   : # interface vers AbelX3
+  [F:LOF]AMTNOTCUR  = [L]AMTNOTLIN(1)
+  [F:LOF]AMTVATCUR  = [L]AMTVATLIN(1)
+  [F:LOF]AMTVATRCUR = [L]AMTVATRLIN(1)
+Endif
+Return
+
+##########################################################################################
+# Gestion de l'écart sur la dernière ligne en cas de répartition ou ventilation analytique
+##########################################################################################
+$ECARTS
+[F:LOF]AMTNOTCPY  = G_AMTNOTCPY(I_TLOF) - [L]AMTNOTCUM(0)
+[F:LOF]AMTVATCPY  = G_AMTVATCPY(I_TLOF) - [L]AMTVATCUM(0)
+[F:LOF]AMTVATRCPY = G_AMTVATRCPY(I_TLOF) - [L]AMTVATRCUM(0)
+If find(G_CFGITF,2,4)                                   : # interface vers AbelX3
+  [F:LOF]AMTNOTCUR  = G_AMTNOTCUR(I_TLOF) - [L]AMTNOTCUM(1)
+  [F:LOF]AMTVATCUR  = G_AMTVATCUR(I_TLOF) - [L]AMTVATCUM(1)
+  [F:LOF]AMTVATRCUR = G_AMTVATRCUR(I_TLOF) - [L]AMTVATRCUM(1)
+Endif
+Return
+
+########################################################
+# Gestion des flags de montant forcé (TVA et TVA récup.)
+########################################################
+$PUT_FLG_FORCE
+# si les montants de TVA ou de TVA récupérable sont différents des montants qu'on calculerait avec les taux
+# de TVA et de TVA récupérable, on positionne les flags de montant forcé
+If find(G_CFGITF,1,3)                                   : # interface vers AE
+  [L]AMTVATLIN(0) = [F:LOF]AMTNOTCPY * G_RATVAT(I_TLOF)
+  Call ARRDEV([L]AMTVATLIN(0),[M]CPYCUR) From TRTDIV
+  If [F:LOF]AMTVATCPY <> [L]AMTVATLIN(0)
+    [F:LOF]FLGVATFCR = 1
+  Endif
+  [L]AMTVATRLIN(0) = [F:LOF]AMTVATCPY * G_RATVATREC(I_TLOF)
+  Call ARRDEV([L]AMTVATRLIN(0),[M]CPYCUR) From TRTDIV
+  If [F:LOF]AMTVATRCPY <> [L]AMTVATRLIN(0)
+    [F:LOF]FLGRECFVR = 1
+  Endif
+Else
+  [L]AMTVATLIN(1) = [F:LOF]AMTNOTCUR * G_RATVAT(I_TLOF)
+  Call ARRDEV([L]AMTVATLIN(1),[M]CUR) From TRTDIV
+  If [F:LOF]AMTVATCUR <> [L]AMTVATLIN(1)
+    [F:LOF]FLGVATFCR = 2
+  Endif
+  [L]AMTVATRLIN(1) = [F:LOF]AMTVATCUR * G_RATVATREC(I_TLOF)
+  Call ARRDEV([L]AMTVATRLIN(1),[M]CUR) From TRTDIV
+  If [F:LOF]AMTVATRCUR <> [L]AMTVATRLIN(1)
+    [F:LOF]FLGRECFVR = 2
+  Endif
+  [F:LOF]RATVAT    = G_RATVAT(I_TLOF) * 100
+  [F:LOF]RATVATREC = G_RATVATREC(I_TLOF) * 100
+Endif
+Return
+
+####################################################################################
+# Calcul des montants en devise société à partir des montants figurant dans la pièce
+####################################################################################
+$AMTCPY
+Local Decimal MNTTEMP : #FQ41355
+
+# Montant HT
+# FQ42810 début
+#G_AMTNOTCPY(I_TLOF)=[M]AMTLOC(G_NOL(I_TLOF))
+If [M]CUR = [M]CPYCUR Then
+  # Si devise société est identique à la devise facture, on prend directement le montant en devise de la facture
+  G_AMTNOTCPY(I_TLOF)=G_AMTNOTCUR(I_TLOF)
+Else
+  # sinon on convertit le montant en devise facture
+  G_AMTNOTCPY(I_TLOF)=G_AMTNOTCUR(I_TLOF)*[M]RATCUR
+  Call ARRDEV(G_AMTNOTCPY(I_TLOF),[M]CPYCUR) From TRTDIV
+Endif
+# FQ42810 fin
+
+# FQ41100 : le montant AMTLOC est toujours positif, car il représente la valeur absolue d'un débit
+#           ou d'un crédit. Si le montant de transaction est négatif, il faut le multiplier par -1
+If (G_AMTNOTCUR(I_TLOF) < 0)
+  G_AMTNOTCPY(I_TLOF)=-G_AMTNOTCPY(I_TLOF)
+Endif
+
+#------------
+## DEBUT FQ37827 : le code ci-dessous s'appuie sur un montant HT + TVA - TVR. Or le montant contenu
+#                  dans l'écriture est le montant HT.
+
+## Montant TVA & TVA récup : on cherche la ligne de la pièce contenant le montant de TVA récup.
+#If G_AMTVATCUR(I_TLOF) <> 0
+#  For [L]I_VT=G_NOL(I_TLOF) To [M:HAE2]NBLIG-1
+#    If ([M]CDT([L]I_VT)+[M]DEB([L]I_VT)) = G_AMTVATRCUR(I_TLOF) & ((G_CFGITF<3 & [M]DES([L]I_VT)
+#&     = G_LIBELL(I_TLOF)) | (G_CFGITF>2 & [M]CRITGRPIMP([L]I_VT) = G_CRITIMP(I_TLOF)))            : # trouvé
+#      G_AMTVATRCPY(I_TLOF)=[M]AMTLOC([L]I_VT)
+#      G_AMTVATCPY(I_TLOF)=G_AMTVATRCPY(I_TLOF)/G_RATVATREC(I_TLOF)
+#      Call ARRDEV(G_AMTVATCPY(I_TLOF),[M]CPYCUR) From TRTDIV
+#      # FQ35742
+#      #G_AMTNOTCPY(I_TLOF)=G_AMTNOTCPY(I_TLOF)-(G_AMTVATCPY(I_TLOF)-G_AMTVATRCPY(I_TLOF))
+#      G_AMTNOTCPY(I_TLOF)=G_AMTVATCPY(I_TLOF)/G_RATVAT(I_TLOF)
+#      Call ARRDEV(G_AMTNOTCPY(I_TLOF),[M]CPYCUR) From TRTDIV
+#      Break
+#    Endif
+#  Next
+#  If G_AMTVATRCPY(I_TLOF) = 0
+#  # On n'a pas trouvé la ligne de la pièce contenant le montant de TVA récup. attendu
+#    Call MTS_FROM_IMO (G_AMTNOTCPY(I_TLOF), G_AMTVATCPY(I_TLOF), G_AMTVATRCPY(I_TLOF), G_AMTNOTCPY(I_TLOF)
+#&                          , G_RATVAT(I_TLOF), G_RATVATREC(I_TLOF), [M]CPYCUR)
+#  Endif
+#Endif
+
+# Début FQ14355
+# Montant TVA : on regarde si le montant de TVA en devise de transaction a été forcé. Si c'est le cas on
+# convertit le montant de TVA en devise transaction, sinon on le détermine à partir du montant HT en devise société
+[L]MNTTEMP = G_AMTNOTCUR(I_TLOF) * G_RATVAT(I_TLOF)
+Call ARRDEV(MNTTEMP,[M]CUR) From TRTDIV
+If G_AMTVATCUR(I_TLOF) <> MNTTEMP
+  # Montant forcé
+  G_AMTVATCPY(I_TLOF)=G_AMTVATCUR(I_TLOF)*[M]RATCUR
+  Call ARRDEV(G_AMTVATCPY(I_TLOF),[M]CPYCUR) From TRTDIV
+Else
+  # Montant non forcé. On calcule le montant de TVA à partir du montant HT
+  G_AMTVATCPY(I_TLOF)=G_AMTNOTCPY(I_TLOF)*G_RATVAT(I_TLOF)
+  Call ARRDEV(G_AMTVATCPY(I_TLOF),[M]CPYCUR) From TRTDIV
+Endif
+
+# Montant TVA récupérée : on regarde si le montant de TVA récupérée en devise de transaction a été forcé. Si c'est le cas on
+# convertit le montant de TVA récupérée en devise transaction, sinon on le détermine à partir du montant de TVA en devise société
+
+MNTTEMP = G_AMTVATCUR(I_TLOF) * G_RATVATREC(I_TLOF)
+Call ARRDEV(MNTTEMP,[M]CUR) From TRTDIV
+If G_AMTVATRCUR(I_TLOF) <> MNTTEMP
+  # Montant forcé
+  G_AMTVATRCPY(I_TLOF)=G_AMTVATRCUR(I_TLOF)*[M]RATCUR
+  Call ARRDEV(G_AMTVATRCPY(I_TLOF),[M]CPYCUR) From TRTDIV
+Else
+  # Montant non forcé. On calcule le montant de TVA récupérée à partir du montant de TVA
+  G_AMTVATRCPY(I_TLOF)=G_AMTVATCPY(I_TLOF)*G_RATVATREC(I_TLOF)
+  Call ARRDEV(G_AMTVATRCPY(I_TLOF),[M]CPYCUR) From TRTDIV
+Endif
+# Fin FQ41355
+
+# FIN FQ37827
+#------------
+
+Return
+
+##############################
+# Raz des sections analytiques
+##############################
+$RAZ_CCE
+For [L]AXE=1 To GOPTCANA
+  If find(G_CFGITF,1,2,3)                                 : # interface vers AE ou AbelX3 (X3 130)
+    Assign "[F:LOF]CCE"+num$([L]AXE) With ""
+  Else                                                    : # interface X3 140 vers AbelX3
+    [F:LOF]CCE([L]AXE-1)=""
+  Endif
+Next
+Return
+
+#------------
+# FQ37827 : le code ci-dessous s'appuie sur un montant HT + TVA - TVR. Or les montants
+#           sont simplement des montant HT.
+
+###############################################################################################
+#Subprog MTS_FROM_IMO(P_MHT, P_TVA, P_TVR, P_IMO, P_VATRAT, P_DEDRAT, P_CUR)
+## Rend les montants HT, de TVA et de TVA récup. à partir du montant immobilisé (HT+TVA-TVR) et
+##         des taux de TVA et de TVA récup. avec arrondi en fonction de la devise
+###############################################################################################
+#Variable Decimal P_MHT      : # Montant HT
+#Variable Decimal P_TVA      : # Montant TVA
+#Variable Decimal P_TVR      : # Montant TVA récup.
+#Value    Decimal P_IMO      : # Montant immobilisé
+#Value    Decimal P_VATRAT   : # Taux de TVA (en décimale)
+#Value    Decimal P_DEDRAT   : # Taux de TVA récup. (en décimale)
+#Value    Char    P_CUR      : # Devise
+#
+#P_MHT = P_IMO / (1 + P_VATRAT * (1 - P_DEDRAT))  : # Montant HT
+#Call ARRDEV(P_MHT, P_CUR) From TRTDIV
+#
+#P_TVA = P_MHT * P_VATRAT                         : # Montant TVA
+#Call ARRDEV(P_TVA, P_CUR) From TRTDIV
+#
+#P_TVR = P_MHT + P_TVA - P_IMO                    : # Montant TVA récup.
+#
+#End
+
+##############################################################################################
+Subprog MTS_FROM_IMO(P_MHT, P_TVA, P_TVR, P_IMO, P_VATRAT, P_DEDRAT, P_CUR)
+# Rend les montants HT, de TVA et de TVA récup. à partir du montant HT et
+#         des taux de TVA et de TVA récup. avec arrondi en fonction de la devise
+##############################################################################################
+Variable Decimal P_MHT      : # Montant HT
+Variable Decimal P_TVA      : # Montant TVA
+Variable Decimal P_TVR      : # Montant TVA récup.
+Value    Decimal P_IMO      : # Montant immobilisé
+Value    Decimal P_VATRAT   : # Taux de TVA (en décimale)
+Value    Decimal P_DEDRAT   : # Taux de TVA récup. (en décimale)
+Value    Char    P_CUR      : # Devise
+
+P_MHT = P_IMO
+
+P_TVA = P_MHT * P_VATRAT                         : # Montant TVA
+Call ARRDEV(P_TVA, P_CUR) From TRTDIV
+
+P_TVR = P_TVA * P_DEDRAT                         : # Montant TVA récup.
+Call ARRDEV(P_TVR, P_CUR) From TRTDIV
+
+End
+
+# FIN FQ37827
+#------------
+
+####################################################################################
+# kill des globales
+####################################################################################
+$KILL_GLOB
+Kill G_CFGITF, G_FACACH, G_FACTIE, G_PIEIAS
+Kill G_LIGORI, G_NOL, G_REMLIG, G_INDICE, G_CRITIMP, G_LIBELL, G_FLGABL, G_NOGROUP, G_FCY, G_GACACN, G_GAC
+Kill G_IASACN, G_IASACC, G_CNA, G_SCT1, G_SCT2, G_DSP, G_CCE, G_PTV, G_PTF, G_AMTNOTCUR, G_AMTVATCUR
+Kill G_AMTVATRCUR, G_AMTNOTCPY, G_AMTVATCPY, G_AMTVATRCPY, G_RATVAT, G_RATVATREC, G_VAT, G_ORDBUY, G_ITMREF, G_DES
+# FQ108134 Kill G_UOM, G_QTY, G_GEOFCY
+Kill G_UOM, G_QTY
+Return
+
+####################################################################################
+# Report des imputations de compta légale dans les imputations IAS
+####################################################################################
+$GLTOIAS
+# Compte IAS = Compte de CG
+G_IASACC(I_TLOF)=G_GAC(I_TLOF)
+# Nature IAS = Nature de CG
+G_IASACN(I_TLOF)=G_GACACN(I_TLOF)
+Gosub SCTIAS
+Return
+
+####################################################################################
+# Récupération des secteurs IAS dans la ligne correspondante de la pièce comptable
+####################################################################################
+$SCTIAS
+# Secteurs IAS
+G_SCT1(I_TLOF)=[M:HAE2]SCT1(G_NOL(I_TLOF))
+G_SCT2(I_TLOF)=[M:HAE2]SCT2(G_NOL(I_TLOF))
+Return
+
+####################################################################################
+# Inversion des montant sur les avoirs pour l'interface vers Abel X3
+####################################################################################
+$AVOIR_AMT
+If ( G_CFGITF=2 & [F:LOF]TYPVCR="2" ) or ( G_CFGITF=4 & [F:LOF]TYPVCR=2 )
+  [F:LOF]AMTNOTCUR = -[F:LOF]AMTNOTCUR
+  [F:LOF]AMTVATCUR = -[F:LOF]AMTVATCUR
+  [F:LOF]AMTVATRCUR= -[F:LOF]AMTVATRCUR
+  [F:LOF]AMTNOTCPY = -[F:LOF]AMTNOTCPY
+  [F:LOF]AMTVATCPY = -[F:LOF]AMTVATCPY
+  [F:LOF]AMTVATRCPY= -[F:LOF]AMTVATRCPY
+Endif
+Return
+
+####################################################################################
+# Récupération des erreurs d'ouverture des tables Abel X3
+####################################################################################
+$ERR_DOSABEL
+[L]RET=1
+Resume
+
+####################################################################################
+# Associations à partir de la famille sur le dépense AbelX3
+# Ces traitements sont des simplifications des traitements AbelX3 de TRTASSO
+####################################################################################
+$GERER_ASSOCIATION
+Local Integer J
+
+#* On recherche s'il existe une association pour la société
+Read [RDE]RDE0=1;1;[F:LOF]CPY
+If fstat | [F:RDE]ENAFLG <> 2
+  # Ou par défaut
+  Read [RDE]RDE0=1;1;""
+Endif
+If !fstat & [F:RDE]ENAFLG = 2
+  # Il y a une association de définie et elle est active
+  Read [RVA]RVA0="11"+[F:RDE]CPY;[F:LOF]ACGGRP
+  If fstat=0
+    # Il y a une associatin pour cette famille
+    For J = 0 To [F:RDE]NBRUB0-1
+      If [F:RDE]RUBRAS(J)<>"" & [F:RDE]MGTFLG(J) = 2
+        I=find([F:RDE]RUBRAS(J),[F:RVA]RUBRAS(0..[F:RVA]NBLIG-1))-1
+        If I >= 0
+          If [F:RVA]VALDETEAS(I) <> ""
+            # Lecture du type de la rubrique dans la table LAYOUTFAS
+            Read [ZATZ]CODZONE="LAYOUTFAS";[F:RVA]RUBRAS(I)
+            If fstat Then
+              [L]RET=1
+              Return
+            Endif
+
+            # Lecture du type dans la table des type pour avoir le type interne
+            Read [ZATY]CODTYP=[F:ZATZ]CODTYP
+            If fstat Then
+              [L]RET=1
+              Return
+            Endif
+
+            # Formats définis dans le menu local 30
+            Case [F:ZATY]TYPTYP
+              When 1, 2, 3, 4, 5, 6
+                Assign "[F:LOF]"+[F:RVA]RUBRAS(I) With val([F:RVA]VALDETEAS(I))
+              When 8
+                # on ne traite pas les dates
+              When Default
+                Assign "[F:LOF]"+[F:RVA]RUBRAS(I) With [F:RVA]VALDETEAS(I)
+            Endcase
+          Endif
+        Endif
+      Endif
+    Next J
+  Endif
+Endif
+Return
+

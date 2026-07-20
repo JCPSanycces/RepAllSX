@@ -1,0 +1,946 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$
+Gosub $WEB    # test <=> web par PF5   (Nota: GBROWS = 0)
+End
+
+# -----------------------------------------------------------
+# SUBAPSMON
+# Version 0104 - 160
+#    Moniteur de traitement des requêtes émises par un browser (portail notamment)
+#    Non compatible V5
+#
+#    E45806 - Vignette-affichage message trop de données
+#    E51009 - Pb statistique + de 2 niveaux (Subprog Clobexp)
+#    E52357 - Gestion prévisionnelle débordement taille clob
+#    M00001 - Gestion Clob append pour portail standard
+#    E56116 - Gestion LinkVue avec utilisation de APTLOBJ
+#
+#    Rq:
+#     E46704 source de données écran (dév non finalisé) -  Variable M_SRCMSKON=1  pour test avec vue JPJMSK et JPJMSK1
+# -----------------------------------------------------------
+#
+#     La query string (ou le tableau en mode Web) contient les valeurs remarquables suivantes:
+#        HTCPRVTYP: Provider de la demande                     ex: HTCPRVTYPE=PORTALPAGE
+#        ACTION   : Action demandée par le Provider            ex: ACTION=FIRST
+#
+#     Pour tester un prgrm, le plus simple est de lancer par PF5 en mode WEB en ayant au préalable chargé
+#     le tableau des paramètres
+#
+
+# ------------------------------------------------------------
+# Point d'entrée des appels du portail via un ACK_CALL depuis
+# le serveur "Adonix Web Serveur
+#
+# Reçoit un liste de n paramètres avec leur 
+# valeur sous la forme :
+#  - ANBPARAM   : nombre de paramètres
+#  - APARAMID   : tableau des n identifiants
+#  - APARAMVALUE: tableau des n valeurs
+#
+# Retourne dans ACLOBOUT un flot XML sans header et ayant la forme:
+# <X3PORTAL>
+#   <Data>
+#   ...
+#   </Data>
+#   <Technical>
+#   ...
+#   </Technical>
+# </X3PORTAL>
+#
+# le paramètre variable "ACLOBOUT" à une size fixé par le
+# traitement d'appel javascript.
+# Voir la constante KCLOBOUTZIZE déclarée dans les js du portail
+#
+# ------------------------------------------------------------
+
+Subprog MONITEUR( ANBPARAM, APARAMIDS , APARAMVALUES, ACLOBOUT)
+  Value Integer ANBPARAM
+  Value Char APARAMID ()(0..)
+  Value Char APARAMVALUE()(0..)
+  Variable Clbfile ACLOBOUT
+  Gosub M_INIT
+
+  #U_TRACEON=1             # Activation trace X3 pour test
+  #     nota:    Le code de la trace se retrouve dans le flux XML 'X3Trace'
+
+  #If find(GUSER,"CCORA","JPJ","JPJ1") : Local Integer TDEB : TDEB=time : endif
+  
+  M_MODE=MC_MODEWEB
+  Gosub M_EXECUTE
+
+  #If find(GUSER,"CCORA","JPJ","JPJ1")
+  #  Infbox "M_FILEOUTMODE IsBlb?:" - num$(M_FILEOUTMODE=MC_NONE ) - "U_OPTYP IsBlb?:" - num$(U_OPTYP=UC_OPTYPBLB )
+  #&            -"Time elpased (sec):"-num$(time-TDEB) 
+  #Endif
+
+End
+
+
+# ------------------------------------------------------------
+#  Appel par fonction de type affichage divers  - Utiliser par le mode C/S
+$ACTION
+
+#Call MESSAGE("Status en retour adxpam: " + QS ) From GESECRAN
+If ACTION="TRT_DIV"
+    Case TRAIT
+    When "MONITEUR"
+        Gosub M_INIT
+
+        #U_TRACEON=1             # Activation trace X3 pour test
+        #     nota:    Le code de la trace se retrouve dans le flux XML 'X3Trace'
+
+        M_MODE=""    # Non défini pour gérer des évol. en CS
+        M_QS=adxpam     # Query string avec + de 10 car...
+        Gosub M_EXECUTE 
+    Endcase
+Endif
+Return
+
+# ------------------------------------------------------------
+$M_INIT
+    Gosub M_VAR                    # init var et trace
+    Gosub U_VAR From SUBAPSUTI     # init var des utilitaires
+    U_ROOTXML=MC_ROOTXML
+    
+    # E46704 
+    Local Integer M_SRCMSKON
+    M_SRCMSKON=0    # Src mask non active en diffusion
+Return
+
+
+# ------------------------------------------------------------
+$M_EXECUTE                         # Init + type de dialogue
+
+    GTRACE=""    # Pour eviter l'ecrasement d'un appel précédent
+    U_TRAMES="Moniteur des demandes du portail"
+    Gosub U_TRAOPEN From SUBAPSUTI        # cas où la trace est activée par une ligne U_TRACEON=1
+
+#    U_TECMES="<TR11>- " + GTRACE - num$(GLTRACE) + "</TR11>" : Gosub U_TECPUT From SUBAPSUTI  # test
+
+    If M_MODE=MC_MODEWEB    # Web
+        Gosub M_WEB_OPEN : If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+    Else                    # C/S
+        Gosub M_CSF_OPEN : If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+    Endif
+
+    # Entete XML en sortie (tous est xml...)
+    Gosub U_PUTXMLHEADER From SUBAPSUTI  
+
+    # Mode client serveur analyse QS
+    If M_MODE=MC_MODECSF : Gosub M_CSF_QSANA : If U_ERR=UC_ERRG : Goto M_ENDKO : Endif : Endif
+
+    # Autorisation fonction portail (à faire car mon fait si accès par le web)
+    GFONCTION=MC_PTLFNC :  Call AUTORIS From EXEFNC
+    If GNBAUZ=0
+        U_MESCODE="X3FNCNOTAUTHORIZE" : U_MESP1=GFONCTION : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Goto M_ENDKO
+    Endif
+    # Htc type
+    U_QSCODE=MC_QSHTCTYPE : Gosub U_QSREAD_UC From SUBAPSUTI
+    M_HTCTYPE=U_QSVAL
+    If (not U_QSEXIST)        # erreur 
+        U_MESCODE="X3QSCODEUNKNOWN" : U_MESP1=U_QSCODE : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Goto M_ENDKO
+    Endif
+    # trace en zone technique
+    If (M_SRCMSKON and (U_VIEWCODE="JPJMSK" or U_VIEWCODE="JPJMSK1")) : MW_STR1=M_HTCTYPE : M_HTCTYPE="PORTALREQ" : Endif   # E46704
+    U_TECMES=M_HTCTYPE : Gosub U_TECPUTTYPE From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif
+    If (M_SRCMSKON and  (U_VIEWCODE="JPJMSK" or U_VIEWCODE="JPJMSK1")) : M_HTCTYPE=MW_STR1: Endif                           # E46704
+
+    # Vérification type HTC provider
+    If !find(M_HTCTYPE,"PORTALPAGE","PORTALBRW", "PORTALSTA", "PORTALREQ", "PORTALREQS", "PORTALTBL", "PORTALCNS", "PORTALMLT","PORTALAGD","PORTALTRT")
+          U_MESCODE="X3HTCPROVUNKNOWN" : U_MESP1=M_HTCTYPE : U_ERR=UC_ERRG 
+          Gosub U_MESPUT From SUBAPSUTI : Goto M_ENDKO
+    Endif
+
+    # Vue demandée
+    Raz [F:APV], U_VIEWCODE
+    If M_HTCTYPE<>"PORTALPAGE"    # lecture de la vue portail
+        U_QSCODE=UQ_VIEWCODE : Gosub U_QSREAD_UC From SUBAPSUTI
+        U_VIEWCODE=U_QSVAL
+        #
+        #U_VIEWCODE="TESTMLT" : U_QSEXIST=1 :  [F:APV]SRCCOD="TEST-ALL"     # test
+        If !U_QSEXIST
+            U_MESCODE="X3QSCODEUNKNOWN" : U_MESP1=U_QSCODE : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Goto M_ENDKO
+        Endif
+        # Recherche de la vue
+        Call LECTURE(UC_VIEWOBJ,U_VIEWCODE ,"")From CONTOBJ
+        If fstat <> 0
+            U_MESCODE="X3VIEWUNKNOWN" : U_MESP1=U_VIEWCODE : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Goto M_ENDKO
+        Endif
+        # Ajout infos vue en zone technique
+        If !(M_SRCMSKON and  (U_VIEWCODE="JPJMSK" or U_VIEWCODE="JPJMSK1"))  # E46704
+         Gosub $M_TECVIEW
+        Endif
+        If U_ERR=UC_ERRG : Goto M_ENDKO : Endif    # erreur 
+    Endif
+
+    # Action demandée (option)
+    U_QSCODE=MC_QSACTION : Gosub U_QSREAD_UC From SUBAPSUTI
+    M_ACTION=U_QSVAL
+    # trace en zone technique
+    U_TECMES= M_ACTION : Gosub U_TECPUTACT From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif
+
+    # Habilitation         a faire...
+    ##U_MESCODE="X3NOTAUTHORIZE" : U_MESP1="" : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Goto M_ENDKO
+
+    # Gestion de la demande
+    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    If M_HTCTYPE="PORTALPAGE"        # page portail
+       Gosub P_EXECUTE From SUBAPSPAGE
+       If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+    Else
+       Case [F:APV]SRCCODTYP
+            When "AGD"
+               Call EXISTE_ADX("","",MC_AGDTRT,OKTRT) From ORDSYS
+               If OKTRT>0
+                   Onerrgo TRT_ERR
+                   Gosub T_EXECUTE From =MC_AGDTRT
+                   Onerrgo
+               Else
+                   U_MESCODE="X3AGDTRTNOTFOUND" : U_MESP1=MC_AGDTRT : U_ERR=UC_ERRG 
+                   Gosub U_MESPUT From SUBAPSUTI
+               Endif
+               If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+            When "CNS"                                # consultation
+               Gosub C_EXECUTE From SUBAPSCNS
+               If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+            When "MLT"                                # multi_liste
+               Gosub B_EXECUTE From SUBAPSBRW
+               If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+            When "REQ","REQS"                         # requête   #E27096 Sql
+               Gosub R_EXECUTE From SUBAPSREQ
+               If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+            When "STA"                                # statistique
+               Gosub S_EXECUTE From SUBAPSSTA
+               If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+            When "TRT"
+               If (M_SRCMSKON and  (U_VIEWCODE="JPJMSK" or U_VIEWCODE="JPJMSK1"))  # E46704
+                   Onerrgo TRT_ERR
+                   Gosub T_EXECUTE From SUBAPSMSK     :#CHECK IGNORE_LINE
+                   Onerrgo
+                   Goto M_ENDKO
+               Endif
+
+               Call EXISTE_ADX("","",[F:APV]SRCCOD,OKTRT) From ORDSYS
+               If OKTRT>0
+                   Onerrgo TRT_ERR
+                   Gosub T_EXECUTE From =[F:APV]SRCCOD
+                   Onerrgo
+               Else
+                   U_MESCODE="X3TRTNOTFOUND" : U_MESP1=[F:APV]SRCCOD : U_ERR=UC_ERRG 
+                   Gosub U_MESPUT From SUBAPSUTI
+               Endif
+               If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+            When "CNS"                                # statistique
+               Gosub C_EXECUTE From SUBAPSCNS
+               If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+            When Default    
+                U_MESCODE="X3VIEWSRCTYPUNKNOWN" : U_VIEWCODE : U_MESP2=[F:APV]SRCCODTYP : U_ERR=UC_ERRG 
+                Gosub U_MESPUT From SUBAPSUTI : Goto M_ENDKO
+       Endcase
+    Endif
+    #    When "PORTALVAR"
+    #   Gosub V_EXECUTE From SUBAPSVAR    # a mettre dans un est qs PTLVAR existe...
+    #   If U_ERR=UC_ERRG : Goto M_ENDKO : Endif
+    
+    $M_ENDKO    # Etiquette Fin anormale:  U_ERR est valorisé à U_ERRG
+
+    M_RETOUR=U_ERR    : U_ERR=UC_ERRNO    # L'erreur est traitée
+    If M_HTCTYPE<>"PORTALPAGE" : Gosub $M_TECSRCPAR : Endif            # Paramètres sources de données
+    Gosub U_TECTOFILE From SUBAPSUTI                                   # ecriture zones techniques
+    Gosub U_MESTOFILE From SUBAPSUTI        # ecriture messages
+    Gosub U_PUTXMLEND From SUBAPSUTI        # fin XML
+    Gosub U_CLOSE From SUBAPSUTI            # fermeture de la sortie
+
+    # Vérification taille sortie
+    Gosub M_VEROUTPUTEND
+    
+    # Fin Mode 
+    Case M_MODE
+    When MC_MODECSF :    # client serveur
+         Gosub M_CSF_END
+    When MC_MODEWEB :    # web
+         Gosub M_WEB_END
+    Endcase
+
+    # Trace
+    If M_RETOUR=UC_ERRG    # Pb bloquant
+        U_TRAMES="Fin anormale : " + "Moniteur des demandes du portail" +" - Code retour: " + num$(M_RETOUR)
+    Else           # OK
+        U_TRAMES="--> Fin  : " + "Moniteur des demandes du portail"
+    Endif
+    Gosub U_TRAPUT From SUBAPSUTI 
+
+    # U_TRAMES="GTRACE: " + GTRACE - "GLTRACE:"- num$(GLTRACE): Gosub U_TRAPUT From SUBAPSUTI
+    Gosub U_TRACLOSE From SUBAPSUTI     # fermeture de la trace
+Return
+
+
+# erreur en appel de traitement
+$TRT_ERR
+U_MESCODE="X3TRTERR" : U_MESP1=errmes$(errn) : U_MESP2=[F:APV]SRCCOD-"T_EXECUTE" : U_ERR=UC_ERRG 
+Gosub U_MESPUT From SUBAPSUTI
+Resume
+Return
+
+  
+# ------------------------------------------------------------
+$M_CSF_OPEN                # Open mode CSF
+    # gestion QS
+    U_QS_ENCODED=M_QS    # init QS
+    
+    # trace ouverte à la demande du browser
+    If !U_TRACEON
+        Gosub U_QSTRACECSF From SUBAPSUTI
+        U_TRAMES="Moniteur des demandes du portail" : Gosub U_TRAOPEN From SUBAPSUTI
+    Endif
+
+    U_TRAMES="--> Debut: " + "Moniteur des demandes du portail" : Gosub U_TRAPUT From SUBAPSUTI 
+    
+    # Analyse QS de l'URL
+    Gosub U_QSINIT From SUBAPSUTI  : If U_ERR=UC_ERRG : Return : Endif
+    # Mode
+    If instr(0,M_QS, MC_MODECSF)     # Mode client serveur par fichier
+        M_MODE=MC_MODECSF 
+    Else
+        U_TRAMES="Mode non géré en Client-Serveur." 
+        U_ERR=UC_ERRG : Gosub U_TRAPUT From SUBAPSUTI : Return
+    Endif
+    
+    U_TRAMES="--> Moniteur des demandes en mode Client/Serveur par fichiers" : Gosub U_TRAPUT From SUBAPSUTI 
+
+    # Recherche fichier Query
+    U_QSCODE=MC_MODECSF : Gosub U_QSREAD_UC From SUBAPSUTI
+    U_QS_FILENAME=U_QSVAL
+    If (not U_QSEXIST)        # erreur dans la trace (rien d'ouvert...)
+        U_TRAMES="QS - Paramétre Fichier query non trouvé: " + U_QSCODE 
+        U_ERR=UC_ERRG : Gosub U_TRAPUT From SUBAPSUTI : Return 
+    Endif
+
+    # Alimentation couple Code/Valeur à partir du fichier query (type ini)
+    Gosub U_QSINITBYFILE From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif 
+    # traces des parametres
+    Gosub U_QSPARTRACE From SUBAPSUTI
+
+    # Fichier de réponse
+    U_QSCODE=MC_QSANSFILE : Gosub U_QSREAD_UC From SUBAPSUTI
+    If (not U_QSEXIST)        # erreur dans la trace
+        U_TRAMES="Fichier Query - Nom complet du fichier de réponse non trouvé: " + U_QSCODE 
+        U_ERR=UC_ERRG : Gosub U_TRAPUT From SUBAPSUTI : Return
+    Endif
+    M_ANSFULLFILE=U_QSVAL       
+
+    # Ouverture fichier de réponse en fonction du mode
+    M_FILEOUTMODE=MC_BYSRV    # Serveur - Autre option MC_ONCLI
+    U_TRAMES="  Ecriture en mode:"-M_FILEOUTMODE : Gosub U_TRAPUT From SUBAPSUTI 
+    U_OUTMAXLEN = 1000000  # pas de limite théorique -> defaut 1 Moctets
+
+    # E52357 - gestion préventive débordement
+    U_OUTMAXDAT = U_OUTMAXLEN - UC_MAXTECH
+
+    If M_FILEOUTMODE=MC_ONCLI     # direct client
+        # Caractéristiques fichier sortie
+        U_OPTYP=UC_OPTYPFIL : U_OPWHR=UC_OPWHRCLI
+        U_SEQNAM=M_ANSFULLFILE
+        Gosub U_OPENNAM From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif    # Ouverture sortie
+    Elsif M_FILEOUTMODE=MC_BYSRV  # par le serveur
+        # Caractéristiques fichier sortie
+        U_SEQEXT=MC_SEQEXT : M_SRVFILNAM=num$(adxpid) : U_SEQNAM=M_SRVFILNAM
+        U_OPTYP=UC_OPTYPFIL : U_OPWHR=UC_OPWHRSRV   
+        Gosub U_OPENNAM From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif    # Ouverture sortie
+    Else
+        U_TRAMES="  Mode d'écriture non reconnu:"-M_FILEOUTMODE
+        U_ERR=UC_ERRG : Gosub U_TRAPUT From SUBAPSUTI : Return 
+    Endif
+Return
+
+# ------------------------------------------------------------
+$M_CSF_OPENCLI                # Open file on client
+Return
+
+# ------------------------------------------------------------
+$M_CSF_QSANA               # Analyse QS mode CSF
+    # Fichier d'erreur
+    #U_QSCODE=MC_QSERRFILE : Gosub U_QSREAD_UC From SUBAPSUTI
+    #If (not U_QSEXIST)        # erreur dans la trace
+    #    U_MESCODE="X3QSERRFILE" : U_MESP1=MC_QSERRORFILE : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+    #    U_MES="Fichier Query - Nom complet du fichier d'erreur non trouvé: " + U_QSCODE 
+    #    U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+    #Endif
+    #M_ERRFULLFILE=U_QSVAL       
+
+    # Fichier de fin
+    U_QSCODE=MC_QSENDFILE : Gosub U_QSREAD_UC From SUBAPSUTI
+    If (not U_QSEXIST)        # erreur dans la trace
+        U_MESCODE="X3QSENDFILE" : U_MESP1=MC_QSENDFILE : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+    Endif
+    M_ENDFULLFILE=U_QSVAL       
+Return
+
+# ------------------------------------------------------------
+$M_CSF_END                # Fin mode CSF
+  # Gestion en mode BYSERV
+  If M_FILEOUTMODE=MC_BYSRV 
+        U_TRAMES="  Ecriture fichier sur le client - mode:"-M_FILEOUTMODE : Gosub U_TRAPUT From SUBAPSUTI 
+        # recherche du nom du fichier client
+        MW_STR1=M_ANSFULLFILE    
+        While 1
+             MW_I=instr(1,MW_STR1,"/")
+             If MW_I=0 : Break : Endif
+             MW_STR1=right$(MW_STR1,MW_I+1)
+        Wend
+        M_ANSFILNAM=MW_STR1
+        # transfert fichier du serveur vers le client 
+        Callui U_CALLUIRET="" With     "UIAction="+chr$(1)+"GetFileAlways",
+&                         "UIRemoteFile="+chr$(1)+MC_SRVTMPDIR+"/"+M_SRVFILNAM+"."+MC_SEQEXT,
+&                         "UILocalDir="+ chr$(1) +"RtsTemp",
+&                         "UILocalFile="+ chr$(1) +M_ANSFILNAM
+
+        If right$(U_CALLUIRET,len(U_CALLUIRET))="0"
+            U_TRAMES="  Anomalie ecriture fichier sur le client:" - U_CALLUIRET +" - "+MC_SRVTMPDIR+"/"+M_SRVFILNAM+"."+MC_SEQEXT
+&                -"vers: RtsTemp/"-M_ANSFILNAM
+            U_ERR=UC_ERRG : Gosub U_TRAPUT From SUBAPSUTI 
+        Else
+            MW_STR1=filpath(MC_SRVTMPDIR,M_SRVFILNAM,MC_SEQEXT)
+            Call EFFACE(MW_STR1,MW_I) From ORDSYS
+        Endif
+  Endif
+
+  # Ecriture fichier fin de traitement
+  U_OPTYP=UC_OPTYPFIL : U_OPWHR=UC_OPWHRCLI
+  U_TRAMES="Mode Client/Serveur par fichiers: Ecriture fichier fin" : Gosub U_TRAPUT From SUBAPSUTI 
+  U_SEQNAM=M_ENDFULLFILE
+  Gosub U_OPENNAM From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif    
+  Gosub U_PUTXMLHEADER From SUBAPSUTI
+  U_SEQPUT=" <X3>END</X3>" : Gosub U_PUT From SUBAPSUTI 
+  Gosub U_PUTXMLEND From SUBAPSUTI
+  Gosub U_CLOSE From SUBAPSUTI
+Return
+
+
+# ------------------------------------------------------------
+$M_VEROUTPUTEND                # Vérification taille sortie ecriture clob 
+
+    # Verification si ( mode web et gestion fichier) ou blob (option non encore activée)
+    If (M_MODE = MC_MODEWEB & U_OPTYP= UC_OPTYPFIL) or ( U_OPTYP= UC_OPTYPBLB)
+        If U_OUTMAXLEN < U_OUTCURLEN    # pb sur la taille - destruction des données et message
+            # RAZ contenu sortie
+            Case U_OPTYP
+            When UC_OPTYPFIL
+                # Effacement fichier serveur
+                MW_STR1=filpath(MC_SRVTMPDIR,M_SRVFILNAM,MC_SEQEXT)
+                Call EFFACE(MW_STR1,MW_I) From ORDSYS
+                Gosub U_OPENNAM From SUBAPSUTI              # Ré-ouverture
+            When UC_OPTYPBLB
+                # Effacement Blob (à faire)
+                Raz ACLOBOUT  # M00001
+            Endcase
+            # message
+            Gosub M_BLBSIZEERR    
+        Else
+            U_TRAMES=" Longueur réponse"-num$(U_OUTCURLEN) : Gosub U_TRAPUT From SUBAPSUTI 
+        Endif
+    Endif
+Return
+
+# ------------------------------------------------------------
+$M_BLBSIZEERR                # Message sur erreur de taille 
+        # Init diverses - 
+        Gosub U_MESRAZ From SUBAPSUTI           # E52357 
+        # Entete XML en sortie (tous est xml...)
+        Gosub U_PUTXMLHEADER From SUBAPSUTI  
+        # Message d'erreur
+        U_MESCODE="X3BLOBTOSMALL" : U_MESP1=num$(U_OUTCURLEN) : U_MESP2=num$(512*(2^M_CLOBSIZE)-2)-"("-num$(M_CLOBSIZE)-")"
+        #  U_MESCODE="X3DATATOOMANYREC" : U_MESP1=num$(U_OUTCURLEN) : U_MESP2=num$(U_OUTMAXLEN)    #U_OUTNB)
+        U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI 
+        If M_HTCTYPE<>"PORTALPAGE" : Gosub $M_TECSRCPAR : Endif            # Paramètres sources de données
+        Gosub U_TECTOFILE From SUBAPSUTI                                   # ecriture zones techniques
+        Gosub U_MESTOFILE From SUBAPSUTI        # ecriture messages
+        Gosub U_PUTXMLEND From SUBAPSUTI        # fin XML
+        Gosub U_CLOSE From SUBAPSUTI            # fermeture de la sortie
+Return
+
+
+
+# ------------------------------------------------------------
+$M_WEB_OPEN                # Open mode WEB
+    U_TRAMES="--> Moniteur des demandes en mode Web" : Gosub U_TRAPUT From SUBAPSUTI 
+
+    # Alimentation couple Code/Valeur à partir du blob
+    Gosub U_QSINITBYWEB From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif 
+
+    # trace ouverte à la demande du browser
+    If !U_TRACEON
+        Gosub U_QSTRACEWEB From SUBAPSUTI
+        U_TRAMES="Moniteur des demandes du portail" : Gosub U_TRAOPEN From SUBAPSUTI
+    Endif
+    # traces des parametres
+    Gosub U_QSPARTRACE From SUBAPSUTI
+
+    # Taille blob utilisé (provient du code javascript)
+    U_QSCODE=MC_CLOBSIZE : Gosub U_QSREAD_UC From SUBAPSUTI
+    If (not U_QSEXIST)        # erreur 
+        U_MESCODE="X3QSCODEUNKNOWN" : U_MESP1=U_QSCODE : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+    Endif
+    M_CLOBSIZE=val(U_QSVAL)    # Taille maxi
+    U_OUTMAXLEN = (512*(2^M_CLOBSIZE)-2)      # limite clob  
+
+    # E52357 - gestion préventive débordement
+    U_OUTMAXDAT = U_OUTMAXLEN - UC_MAXTECH
+
+    # Gestion en fonction du mode
+    #    MC_BYSRV -->  ecriture fichier sur serveur avant transfert
+    #    MC_NONE  -->  ecriture direct blob de sortie
+    M_FILEOUTMODE=MC_NONE 
+
+    U_TRAMES="  Ecriture en mode:"-M_FILEOUTMODE : Gosub U_TRAPUT From SUBAPSUTI 
+    If M_FILEOUTMODE=MC_BYSRV                          # Ecriture fichier sur le serveur
+        # Caractéristiques fichier sortie
+        U_SEQEXT=MC_SEQEXT : M_SRVFILNAM=num$(adxpid) : U_SEQNAM=M_SRVFILNAM
+        U_OPTYP=UC_OPTYPFIL : U_OPWHR=UC_OPWHRSRV   
+        Gosub U_OPENNAM From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif    # Ouverture sortie
+    Elsif M_FILEOUTMODE=MC_NONE                         # Ecriture direct dans blob M00001
+        U_OPTYP=UC_OPTYPBLB
+        Gosub U_OPENNAM From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif    # Ouverture sortie
+    Else
+        U_TRAMES="  Mode d'écriture non reconnu:"-M_FILEOUTMODE
+        U_ERR=UC_ERRG : Gosub U_TRAPUT From SUBAPSUTI : Return 
+    Endif
+Return
+# ------------------------------------------------------------
+$M_WEB_END                # Fin en mode WEB
+  # Gestion en mode BYSERV
+  If M_FILEOUTMODE=MC_BYSRV and dim(GRAPHBLOC1)<0 
+        U_TRAMES="  Transfert dans le blob"-M_FILEOUTMODE : Gosub U_TRAPUT From SUBAPSUTI 
+        MW_STR1=filpath(MC_SRVTMPDIR,M_SRVFILNAM,MC_SEQEXT)
+        Openi MW_STR1,0 Using [FSEQ]
+        U_SVADXIRS=adxirs : U_SVADXIFS=adxifs : U_SVADXIUM=adxium
+        adxirs="" : adxifs="" : adxium=U_ADXIUM  # Pas de séparateur pour tout lire en un seul ordre
+        Rdseq ACLOBOUT Using [FSEQ]
+        Openi Using [FSEQ]
+        adxirs=U_SVADXIRS : adxifs=U_SVADXIFS : adxium=U_SVADXIUM
+#$$$ Ecriture test PF5 en C/S par Callui
+#If GUSER="JPJ" & GBROWS = 0  #& U_VIEWCODE="ZZJPJCNS"
+#        Callui U_CALLUIRET="" With     "UIAction="+chr$(1)+"GetFileAlways",
+#&                         "UIRemoteFile="+chr$(1)+MW_STR1,
+#&                         "UILocalDir="+ chr$(1) +"Temp",
+#&                         "UILocalFile="+ chr$(1) + "CNSTest.xml"
+#    Infbox "Retour (1=OK)" +num$(U_CALLUIRET)
+#Endif
+#$$$
+        # Effacement fichier serveur
+        Call EFFACE(MW_STR1,MW_I) From ORDSYS
+  Elsif M_FILEOUTMODE=MC_NONE                         # Ecriture direct dans blob M00001
+#       Rien à faire
+  Endif
+Return
+
+# ------------------------------------------------------------
+#     G O S U B
+# ------------------------------------------------------------
+# Variables
+# - - - - - - - - - - - - - - - - - -
+$M_VAR
+Local Integer E_RETOUR     # Retour d'execution 
+
+# MODE
+Local Char MC_MODECSF : MC_MODECSF='CSFILEINPUT'    # mode C/S par fichier
+Local Char MC_MODEWEB : MC_MODEWEB='WEB'            # mode Web
+Local Char M_MODE                                   # mode encours
+
+# Paramêtres du query
+Local Char M_QS(250)        # Query sting en entrée pour C/S
+#Char PARCODE (30)(1..20)
+#Char PARVALUE (200)(1..20)
+Local Char MC_PTLFNC : MC_PTLFNC="APTLREQ"                        # code fonction associée au portail 
+Local Char M_HTCTYPE, MC_QSHTCTYPE : MC_QSHTCTYPE="HTCPRVTYP"     # Type du provider Htc
+Local Char M_M_ACTION, MC_QSACTION : MC_QSACTION="ACTION"         # Action demandée (ex: GETPAGE - FIRST)    
+Local Char MC_CLOBSIZE: MC_CLOBSIZE="HTCCLBSIZ"                   # Taille du blob passé en parametre (mode Web)
+Local Decimal M_CLOBSIZE
+
+# Root XML
+Local Char MC_ROOTXML : MC_ROOTXML="X3PORTAL"
+
+# Gestion erreur grave de type technique
+Local Char M_ERRCODE                                # Voir etiquette 
+
+# Variables mode CSF et WEB
+Local Char M_FILEOUTMODE                        # Mode de sortie: ecriture sur client ou en passant par le serveur
+Local Char MC_BYSRV :     MC_BYSRV="BYSRV"      #  ecriture fichier sur serveur avant transfert (Web ou C/S)
+
+# Variables mode CSF
+    Local Char MC_ONCLI: MC_ONCLI="ONCLI"                      #  ecriture fichier sur client direct (C/S uniquement)
+    Local Char MC_QSANSFILE : MC_QSANSFILE='ANSWERFILEPATH'    # identification fichier réponse
+    Local Char M_ANSFULLFILE(200)                              # Valeur  C://adonix/...../..ms_
+    Local Char M_ANSFILNAM(40)                                 # Valeur  ms_id120_data.xml
+    Local Char MC_QSENDFILE : MC_QSENDFILE='ENDFILEPATH'       # identification fichier fin de réponse
+    Local Char M_ENDFULLFILE(200)                              # Valeur  
+    Local Char MC_QSERRFILE : MC_QSERRFILE='ERRORFILEPATH'     # identification fichier erreur
+    Local Char M_ERRFULLFILE(200)
+    Local Char M_SRVFILNAM(20)                                 # En mode M_FILEOUTMODE=MC_BYSERV, non du fichier temporaire
+    Local Char MC_SEQEXT(3):MC_SEQEXT="ptl"                    # extension fichier séquentiel
+    Local Char MC_SRVTMPDIR(3):MC_SRVTMPDIR="tmp"              # répertoire tempo sur serveur
+# Variables mode Web
+    Local Char MC_NONE : MC_NONE="NONE"                        # par d'ecriture fichier (Web uniquement)
+    Local Decimal M_FILELEN, M_BLOBLEN                         # Longueur fichier et blob
+
+# Agenda 
+Local Char MC_AGDTRT : MC_AGDTRT="AGENDA"         # Code trt banalisé pour l'agenda
+
+# Travail
+Local Integer MW_I
+Local Char MW_STR1(200)
+Local Integer OKTRT
+Return
+
+# JPJ E28939 ->    à enlever à terme
+# Gestion erreur bloquante
+# - - - - - - - - - - - - - - - - - -
+#$M_SETERROR
+#    If M_MODE=MC_MODECSF           # Mode client serveur par fichier
+#        # Ouverture fichier de réponse
+#        U_OPTYP=UC_OPTYPFIL : U_OPWHR=UC_OPWHRCLI
+#        U_SEQWHLNAM=M_ERRFULLFILE
+#        Gosub U_OPENWHLNAM From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif    
+#        # entete
+#        Gosub U_PUTXMLHEADER From SUBAPSUTI
+#        # message
+#        Gosub U_MESTOFILE From SUBAPSUTI
+#        # fin
+#        Gosub U_PUTXMLEND From SUBAPSUTI
+#        Gosub U_CLOSE From SUBAPSUTI        # fermeture de la sortie
+#    Endif
+#
+#Return
+# JPJ E28939 <-
+
+
+# Ecriture infos de la vue
+# - - - - - - - - - - - - - - - - - -
+$M_TECVIEW
+U_TECMES='<pView Code="' +[F:APV]APVCOD+'" />' : Gosub U_TECPUT From SUBAPSUTI
+U_TECMES='<DataSrc Type="'+[F:APV]SRCCODTYP+'" Code="' +[F:APV]SRCCOD+'" />' : Gosub U_TECPUT From SUBAPSUTI
+
+U_TECMES='<VisCmp Type="' +[F:APV]CMPCODTYP
+U_TECMES+='" >' : Gosub U_TECPUT From SUBAPSUTI
+    # Ajout para composant visuel en zone technique
+    Gosub $M_TECCMPPAR
+U_TECMES='</VisCmp>' : Gosub U_TECPUT From SUBAPSUTI
+
+Return
+
+# Ecriture des paramètres du composant visuel
+# - - - - - - - - - - - - - - - - - -
+$M_TECCMPPAR
+For MW_I=0 To [F:APV]CMPPARNBR-1
+    U_CTXFOR=mess(40,137,1)-[F:APV]APVCOD-mess(44,137,1)-[F:APV]CMPCODTYP
+    U_EVAFOR=[F:APV]CMPPARFOR(MW_I) : Gosub U_EVAFOR From SUBAPSUTI
+    If U_ERR=UC_ERRG : Break : Endif    # erreur 
+    U_HEXTOTXT=U_RESFOR : Gosub U_TXTTOHEX From SUBAPSUTI
+    U_TECMES='  <'+[F:APV]CMPPARCOD(MW_I)+'>'+U_TXTTOHEX+'</'+[F:APV]CMPPARCOD(MW_I)+'>': Gosub U_TECPUT From SUBAPSUTI
+Next
+Return
+
+# Ecriture des paramètres utilisés de la source de données pour informations dans le xml
+#    nota: les évaluations des paramètres doivent être chargées dans U_SRCPARVAL(xx)
+#            par les traitements REQ, STA, TRT
+# - - - - - - - - - - - - - - - - - -
+$M_TECSRCPAR
+U_TECMES='<UsedDataSrcPar>' : Gosub U_TECPUT From SUBAPSUTI
+For MW_I=0 To [F:APV]SRCPARNBR-1
+    If U_SRCPARVAL(MW_I)<>"$N/A$"    # non utilisé
+        U_HEXTOTXT=U_SRCPARVAL(MW_I) : Gosub U_TXTTOHEX From SUBAPSUTI
+        U_TECMES='  <'+[F:APV]SRCPARCOD(MW_I)+'>'+U_TXTTOHEX+'</'+[F:APV]SRCPARCOD(MW_I)+'>': Gosub U_TECPUT From SUBAPSUTI
+    Endif
+Next
+U_TECMES='</UsedDataSrcPar>' : Gosub U_TECPUT From SUBAPSUTI
+Return
+
+# ------------------------------------------------------------
+#  S E C T I O N  T E S T S
+# ------------------------------------------------------------
+# Traitement de test du sous programme "MONITEUR". Appel via F5
+# ------------------------------------------------------------
+$WEB
+  Local Char WPARAMID(50)(1..10)
+  Local Char WPARAMVALUE(250)(1..10)
+  Local Integer WI,WNBPARAM
+
+  Local Clbfile WCLOBOUT(13)        # Attention doit être en phase avec HTCCLBSIZ
+
+  # Paramètres
+  #  technique
+  [L]WPARAMID(1) = "HTCCLBSIZ" :   [L]WPARAMVALUE(1) = "13"     # Taille blob (spécif WEB)
+  #  demande
+  [L]WPARAMID(2) = "HTCPRVTYP" :   [L]WPARAMVALUE(2) = "PORTALPAGE"
+  [L]WPARAMID(3) = "ACTION"    :   [L]WPARAMVALUE(3) = "FIRST"
+  #  en fonction de la demande
+  [L]WPARAMID(4) = "PAGE"      :   [L]WPARAMVALUE(4) = "null"
+  [L]WNBPARAM = 4
+
+  #maxmem = maxmem + 10000000
+  #Infbox("Free: "-num$(freemem) -"max: "- num$(maxmem))
+
+  #Appel du point d'entrée du portail 
+  Call MONITEUR( [L]WNBPARAM ,[L]WPARAMID ,[L]WPARAMVALUE, [L]WCLOBOUT)
+
+  #Infbox("Taille de ClobOut=["+ num$(len([L]WCLOBOUT)) +"]")
+  Local Char WSTROUT(250)(1..100) :# 25 Ko Max !
+  Setlob [L]WSTROUT With [L]WCLOBOUT
+  Call OUVRE_TRACE("Clob en sortie") From LECFIC
+  Call ECR_TRACE("Taille de ClobOut=["+ num$(len([L]WCLOBOUT)) +"]", 0) From GESECRAN
+  For WI=1 To 100
+    If WSTROUT(WI)="" : Break : Endif
+    Call ECR_TRACE(WSTROUT(WI), 0) From GESECRAN
+  Next  
+  Call FERME_TRACE From LECFIC 
+  Call LEC_TRACE From LECFIC
+End
+
+
+
+# ------------------------------------------------------------
+        Callui U_CALLUIRET="" With     "UIAction="+chr$(1)+"GetFileAlways",
+&                         "UIRemoteFile="+chr$(1)+"tmp/46128.ptl",
+&                         "UILocalDir="+ chr$(1) +"RtsTemp",
+&                         "UILocalFile="+ chr$(1) +"PTL__1408_PORTALPAGE_1_DATA.XML"
+Call MESSAGE("U_CALLUIRET"-U_CALLUIRET) From GESECRAN
+
+End
+
+
+# ------------------------------------------------------------
+#   Récupération dans un CLOB du résultat d'une vue portail
+
+Subprog CLOBEXP(COD,CLOBOUT)
+Value Char COD            : # Code la requête ou de la statistique dans le portail
+Variable Clbfile CLOBOUT()  : # Résultat
+Local Char CODE(250),CODE1(250)
+Local Char PAR1(100)(1..10),VAL1(100)(1..10)
+Local Integer P1,P2,NBPAR
+#  Décodage de CODE1 si on est en zoom
+CODE=COD
+P1=instr(1,CODE,",")
+If P1<>0
+  CODE=left$(COD,P1-1)
+  CODE1=right$(COD,P1+1)
+  P2=instr(1,CODE1,",")
+  If P2=0 : P2=len(CODE1)+1 : Endif
+  While P2<>0
+    NBPAR+=1
+    P1=instr(1,CODE1,"=")
+    P2=instr(1,CODE1,",")
+    If P2=0 : P2=len(CODE1)+1 : Endif
+    PAR1(NBPAR)=toupper(left$(CODE1,P1-1))
+    If PAR1(NBPAR)="LEVEL" : PAR1(NBPAR)="NIVEAU" : Endif
+    If left$(PAR1(NBPAR),9)="CRITERION" : PAR1(NBPAR)="CRIT"+right$(PAR1(NBPAR),10) : Endif
+    VAL1(NBPAR)=mid$(CODE1,P1+1,P2-P1-1)
+    CODE1=right$(CODE1,P2+1)
+    P2=instr(1,CODE1,",")
+    If P2=0 and instr(1,CODE1,"=")<>0 : P2=len(CODE1)+1 : Endif
+  Wend
+Endif
+
+If dim(GPRE_VIEW)>0 : End : Endif
+
+Local Char TYP
+If clalev([F:APV])=0 : Local File APTLVW [APV] : Endif
+Read [APV]APV0=CODE
+If fstat<>0 : End : Endif
+TYP=[F:APV]SRCCODTYP
+
+Local Char WPARAMID(50)(1..10)
+Local Char WPARAMVALUE(250)(1..10)
+Local Integer WI,WNBPARAM
+[L]WPARAMID(1) = "HTCCLBSIZ"      :   [L]WPARAMVALUE(1) = "10"     
+[L]WPARAMID(2) = "HTCPRVTYP"      :   [L]WPARAMVALUE(2) = "PORTAL"+TYP
+[L]WPARAMID(3) = "ACTION"         :   [L]WPARAMVALUE(3) = "LOAD"
+If TYP="MLT" :   [L]WPARAMVALUE(3) = "FIRSTALL" : Endif
+If TYP="AGD" :   [L]WPARAMVALUE(3) = "INIT" : Endif
+[L]WPARAMID(4) = "PVIEWCODE"      :   [L]WPARAMVALUE(4) =  CODE
+[L]WNBPARAM = 4
+
+#  Traitement des descentes et remontées de niveau
+If CLOBOUT<>"" 
+  Local Integer IPOS,IPOS1
+  Local Char LEV,CRIT1(100),CRIT2(100)
+  IPOS=instr(1,CLOBOUT,"Level>")
+  If IPOS<>0
+    IPOS1=instr(IPOS+1,CLOBOUT,"</")
+    LEV=mid$(CLOBOUT,IPOS+6,IPOS1-IPOS-6)
+   [L]WNBPARAM += 1
+   [L]WPARAMID([L]WNBPARAM) = "NIVEAU"         :   [L]WPARAMVALUE([L]WNBPARAM) = LEV
+  Endif
+
+  # Criterion --> CRIT
+  For WI=1 To 8                                        # E51009 - Pb statistique + de 2 niveaux
+      IPOS=instr(1,CLOBOUT,"Criterion"+num$(WI)+">")
+      If IPOS<>0
+       IPOS1=instr(IPOS+1,CLOBOUT,"</")
+       CRIT1=mid$(CLOBOUT,IPOS+11,IPOS1-IPOS-11)
+       [L]WNBPARAM += 1
+       [L]WPARAMID([L]WNBPARAM) = "CRIT"+num$(WI)     :   [L]WPARAMVALUE([L]WNBPARAM) = CRIT1
+      Else
+        Break
+      Endif
+  Next
+
+Endif
+
+Raz CLOBOUT
+
+For IP1=1 To NBPAR
+ [L]WNBPARAM += 1
+ [L]WPARAMID([L]WNBPARAM) = PAR1(IP1)         :   [L]WPARAMVALUE([L]WNBPARAM) = VAL1(IP1)
+Next IP1
+
+If dim(GSTAPORT)>0 : GSTAPORT=1 : Endif
+Call MONITEUR( [L]WNBPARAM ,[L]WPARAMID ,[L]WPARAMVALUE, [L]CLOBOUT) From SUBAPSMON
+If dim(GSTAPORT)>0 : GSTAPORT=0 : Endif
+End
+
+Subprog CLOBEXPSAV(COD,CLOBOUT)
+# ------------------------------------------------------------
+
+Value Char COD            : # Code la requête ou de la statistique dans le portail
+Variable Clbfile CLOBOUT()  : # Résultat
+
+Local Char CODE(250),CODE1(250)
+Local Char PAR1(100)(1..10),VAL1(100)(1..10)
+Local Integer P1,P2,NBPAR
+#  Décodage de CODE1 si on est en zoom
+CODE=COD
+P1=instr(1,CODE,",")
+If P1<>0
+  CODE=left$(COD,P1-1)
+  CODE1=right$(COD,P1+1)
+  P2=instr(1,CODE1,",")
+  If P2=0 : P2=len(CODE1)+1 : Endif
+  While P2<>0
+    NBPAR+=1
+    P1=instr(1,CODE1,"=")
+    P2=instr(1,CODE1,",")
+    If P2=0 : P2=len(CODE1)+1 : Endif
+    PAR1(NBPAR)=toupper(left$(CODE1,P1-1))
+    If PAR1(NBPAR)="LEVEL" : PAR1(NBPAR)="NIVEAU" : Endif
+    If left$(PAR1(NBPAR),9)="CRITERION" : PAR1(NBPAR)="CRIT"+right$(PAR1(NBPAR),10) : Endif
+    VAL1(NBPAR)=mid$(CODE1,P1+1,P2-P1-1)
+    CODE1=right$(CODE1,P2+1)
+    P2=instr(1,CODE1,",")
+    If P2=0 and instr(1,CODE1,"=")<>0 : P2=len(CODE1)+1 : Endif
+  Wend
+Endif
+
+If dim(GPRE_VIEW)>0 : End : Endif
+
+Local Char TYP
+Raz CLOBOUT
+If clalev([F:APV])=0 : Local File APTLVW [APV] : Endif
+Read [APV]APV0=CODE
+If fstat<>0 : End : Endif
+TYP=[F:APV]SRCCODTYP
+
+Local Char WPARAMID(50)(1..10)
+Local Char WPARAMVALUE(250)(1..10)
+Local Integer WI,WNBPARAM
+[L]WPARAMID(1) = "HTCCLBSIZ"      :   [L]WPARAMVALUE(1) = "10"     
+[L]WPARAMID(2) = "HTCPRVTYP"      :   [L]WPARAMVALUE(2) = "PORTAL"+TYP
+[L]WPARAMID(3) = "ACTION"         :   [L]WPARAMVALUE(3) = "LOAD"
+If TYP="MLT" :   [L]WPARAMVALUE(3) = "FIRSTALL" : Endif
+If TYP="AGD" :   [L]WPARAMVALUE(3) = "INIT" : Endif
+[L]WPARAMID(4) = "PVIEWCODE"      :   [L]WPARAMVALUE(4) =  CODE
+[L]WNBPARAM = 4
+
+For IP1=1 To NBPAR
+ [L]WNBPARAM += 1
+ [L]WPARAMID([L]WNBPARAM) = PAR1(IP1)         :   [L]WPARAMVALUE([L]WNBPARAM) = VAL1(IP1)
+Next IP1
+
+
+Global Integer GRAPHBLOC   : # Pour forcer l'écriture dans le Clob
+Global Integer IGBL1
+#Global Char GRAPHBLOC1(200)(1..2000)
+Global Integer GRAPHBLOC1
+Global Char GRAPHBLOC2(250)
+GRAPHBLOC2= filpath("tmp","F"+num$(adxuid(1))+"_"+CODE+"_"+num$(int(rnd(200))),"par",nomap)
+Openo GRAPHBLOC2,0 Using [P_OT]
+Iomode adxifs ""  Using [P_OT]
+Iomode adxirs ""  Using [P_OT]
+
+Call MONITEUR( [L]WNBPARAM ,[L]WPARAMID ,[L]WPARAMVALUE, [L]CLOBOUT) From SUBAPSMON
+Openo Using [P_OT]
+
+Openi GRAPHBLOC2 Using [P_IT]
+Iomode adxifs ""  Using [P_IT]
+Iomode adxirs ""  Using [P_IT]
+Local Clbfile CL1(12)
+Rdseq CL1 Using [P_IT]
+Openi Using [P_IT]
+Call EFFACE(GRAPHBLOC2,P1) From ORDSYS
+CLOBOUT=CL1
+Kill GRAPHBLOC,GRAPHBLOC1,IGBL1,GRAPHBLOC2
+End
+
+
+
+# ------------------------------------------------------------
+#   Activation d'un lien sur une vue portail
+
+Subprog LINKVUE(FONCTION,OBJET,PARAM)
+Value Char FONCTION
+Value Char OBJET
+Value Char PARAM
+
+#  FONCTION :  Nom de la fonction à appeler
+#  OBJET    :  Code de l'objet
+#  PARAM    :  Paramètres à passer (clé objet par exemple)
+
+Local Char CLE1(30),CLE2(30)
+Local Integer I,OK
+
+#   Pour la CRM on donne la main au programme ad-hoc si il existe
+
+If find(OBJET,"TSK","CLL","BAP")
+  Call EXISTE_ADX("","","CRMAINTERFL",OK) From ORDSYS
+  If OK=1
+    Call CRMLINK(FONCTION,OBJET,PARAM) From CRMAINTERFL
+    End
+  Endif
+Endif
+
+GFONCTION1="APTLOBJ"   :#  CC   07/10/2010   Bug 66495
+If  GPILNAV<2
+ FLGNAV = 1
+ GPILNAV += 1
+ GNAVIG(GPILNAV) = GFONCTION1
+Endif
+
+
+If OBJET = "_"  # E56116 - Appel generique
+    Local Char O_QS(250)
+    O_QS=PARAM
+    Gosub O_EXECUTE From SUBAPSOBJ
+    If GPILNAV=1 and GNAVIG(GPILNAV)="APTLOBJ" : GPILNAV=0 : Endif
+    End
+Endif
+
+
+If PARAM<>""
+  I=instr(1,PARAM,"~")
+  If I <> 0     
+    CLE1=left$(PARAM,I-1)
+    CLE2=right$(PARAM,I+1)
+  Else
+    CLE1=PARAM : CLE2=""
+  Endif
+Endif
+
+    # Appel objet
+    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+If OBJET<>""
+  Call OBJET(OBJET,CLE1,CLE2) From GOBJET
+Endif
+
+If GPILNAV=1 and GNAVIG(GPILNAV)="APTLOBJ" : GPILNAV=0 : Endif
+
+End
+
+

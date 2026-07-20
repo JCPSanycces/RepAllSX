@@ -1,0 +1,366 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ 
+# ##########    SUBJECT :    SEPA SDD - Mandate closing tool (batch task enabled)               #
+# ##########                                                                                    #
+# ##########    AUTHOR  :    DNE                                                                #
+# ##########    DATE    :    2013-07-02                                                         #
+# ##########    UPDATES :    2014-01-30 DNE - Correct handling for inactive activity code LEG   #
+# ##########                 (SAM #95451)                                                       #
+# ##########                 2015-05-07 DNE - Correction of #SAM 108153                         #
+# ##########                                                                                    #
+# ############################################################################################# #
+
+# < DEBUG> #################################################################################### #
+Local Char PARAM(10)(1..2), VALEUR(10) : Call TRAITE_CHAR(VALEUR, PARAM, "", "MDTCLS","MDTCLS", 4, "SPEMDTCLS" ) From GTRAITE : End
+# </DEBUG> #################################################################################### #
+
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  ACTION
+#*
+#* Purpose:    Standard action dispatcher.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param ACTION      Name of the event (action).
+#*
+#*! #####################################################################################
+
+$ACTION
+    If GSERVEUR
+        # Batch server mode
+        Case ACTION
+            When "INIT"        : Gosub BATCH_INIT
+            When "EXEC"        : Gosub BATCH_EXEC
+        Endcase
+    Else
+        # Interactive mode
+        Case ACTION
+            When "OUVRE"       : Gosub OUVRE
+            When "DEBUT"       : Gosub DEBUT
+            When "OK"          : If !GBATCH : Gosub OK : Endif # Do not execute while batch parameterization.
+        Endcase
+    Endif
+Return
+
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  OUVRE
+#*
+#* Purpose:    Handles OURVE event from supervisor. Introduces process's static variables
+#*             and opens additional tables.
+#*
+#*! #####################################################################################
+
+$OUVRE
+    If !clalev([F:CPY])  : Local File COMPANY  [CPY]  : Endif
+    If !clalev([F:MDT])  : Local File MANDATE  [MDT]  : Endif
+    If !clalev([F:HMDT]) : Local File HISTOMDT [HMDT] : Endif
+
+    Local Integer B_LOG            : B_LOG = 1                  # Flag: Log data?
+    Local Integer B_SIM            : B_SIM = 0                  # Flag: Simulation only?
+    Local Integer N_NBPROCESSED    : N_NBPROCESSED = 0          # Number of successfully validated mandates
+    Local Integer N_NBNOTPROCESSED : N_NBNOTPROCESSED = 0       # Number of not sucessfully validated mandates
+    Local Char MESSA(255)                                       # Contains messages to log.
+    Local Char MANDATEINFO(255)                                 # Contains the mandate's short information (key)
+    Local Char SYMBOLE(255)                                     # Contains the symbol to lock while updates are in progress.
+    Date REFDATE                   : Raz REFDATE                # Reference date for 14 and 36 month ranges to close mandates
+    Local Char WFILCPY(255)        : WFILCPY        = "1=1"     # Company filter
+    Local Char WFILLEG(255)        : WFILLEG        = "1=1"     # Legislation filter
+    Local Char WFILBPC(255)        : WFILBPC        = "1=1"     # Customer filter
+    Local Char WFILUMRNUM(255)     : WFILUMRNUM     = "1=1"     # Mandate reference filter
+    Local Char WFILGEN(255)        : WFILGEN        = "1=1"     # General filter (from PRD)
+    Local Char WFILOPT(255)        : WFILOPT        = "1=1"     # Optional filter (e. g. for entry points)
+
+    If GFONCTION = "" : GFONCTION = "MDTCLS" : Endif
+Return
+
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  DEBUT
+#*
+#* Purpose:    Handler for the DEBUT event. Initializes field states (enabling and
+#*             disabling).
+#*
+#*! #####################################################################################
+
+$DEBUT
+    # Initialize the fields's grayed/disabled states.
+    Call AM_ALLCPY(    [M]ALLCPY    )
+    Call AM_ALLBPC(    [M]ALLBPC    )
+    Call AM_ALLUMRNUM( [M]ALLUMRNUM )
+
+    # 2014-01-30 DNE SAM #95451 BEGIN
+    #
+    # Remove legislation field if activity code LEG is set to inactive.
+    If !func AFNC.ACTIV( "LEG" )
+        Chgfmt [M]LEG  With "-K:20"
+        Chgfmt [M]ZLEG With "-K:20"
+    Endif
+    # 2014-01-30 DNE SAM #95451 END
+
+    # Update screen.
+    Affzo [M]1-99
+Return
+
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  OK
+#*
+#* Purpose:    Handler for the OK button. Does all the validation work.
+#*
+#* NOTE:       OK is called from the BATCH_EXEC handler in batch mode, too.
+#*
+#*! #####################################################################################
+
+$OK
+    B_LOG = [M]FLGLOG - 1
+    B_SIM = [M]FLGSIM - 1
+
+    # If not in batch mode and simulation is off ask a final querstion (for after that closing
+    # mandates is final irreversible action).
+    If !B_SIM and !GSERVEUR
+        MESSA = mess(313,117,1) # "The closing of mandates is irreversible. Do you want to continue?"
+        OK = 2
+        Call OUINON(MESSA,OK) From GESECRAN
+        If OK <> 2
+            Return
+        Endif
+    Endif
+
+    # Open a log file and export the screen fields to the log file.
+    If B_LOG
+        Gosub OPEN_LOG From VALMDT
+    Endif
+
+    # If in interactive mode open a "Wait..." box.
+    If !GSERVEUR
+        Call TEMPON("V") From GESECRAN
+    Endif
+
+    # Close mandates.
+    Gosub SETUP_FILTER
+    Gosub QUERY
+    Gosub MDTCLS
+
+    # If in interactive close the previously opened "Wait..." box.
+    If !GSERVEUR
+        Call TEMPOFF From GESECRAN
+    Endif
+
+    # Close the log file.
+    If B_LOG
+        Gosub CLOSE_LOG From VALMDT
+    Endif
+Return
+
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  BATCH_INIT
+#*
+#* Purpose:    Handler for the INIT event in batch mode. Initializes MDTCLS mask.
+#*
+#*! #####################################################################################
+
+$BATCH_INIT
+    # Open the dialog window's screen:
+    #
+    # Note: We do this because we need the mask accessible in batch tasks.
+    #
+    If clalev([M:MDTCLS])=0 : Local Mask MDTCLS [MDTCLS] : Endif
+Return
+
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  BATCH_EXEC
+#*
+#* Purpose:    Handler for the EXEC event in batch mode. Starts the validation process.
+#*
+#*! #####################################################################################
+
+$BATCH_EXEC
+    # Initialize
+    Gosub OUVRE
+    Gosub DEBUT
+
+    # Start mandate validation.
+    Gosub OK
+Return
+
+
+
+
+# ############################################################################################# #
+# ##########                                                                                    #
+# ########## Screen/Window handling                                                             #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ############################################################################################# #
+
+Subprog AM_ALLCPY(VALEUR)
+Variable Integer VALEUR
+
+    Call AM_ALLCPY(VALEUR) From VALMDT
+End
+
+Subprog AM_CPY(VALEUR)
+Variable Char  VALEUR()
+
+    Call AM_CPY( VALEUR ) From VALMDT
+End
+
+Subprog AM_ALLBPC(VALEUR)
+Variable Integer VALEUR
+
+    Call AM_ALLBPC( VALEUR ) From VALMDT
+End
+
+Subprog AM_ALLUMRNUM(VALEUR)
+Variable Integer VALEUR
+
+    Call AM_ALLUMRNUM( VALEUR ) From VALMDT
+End
+
+
+
+
+# ############################################################################################# #
+# ##########                                                                                    #
+# ########## Mass mandate closing tool kit                                                      #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ############################################################################################# #
+
+$SETUP_FILTER
+    WFILCPY    = "1=1"    # Company filter
+    WFILLEG    = "1=1"    # Legislation filter
+    WFILBPC    = "1=1"    # Customer filter
+    WFILUMRNUM = "1=1"    # Mandate reference filter
+    WFILGEN    = "1=1"    # General filter
+    WFILOPT    = "1=1"    # Optional filter
+
+    If [M]ALLCPY = 1
+        WFILCPY = "[F:MDT]CPY = [M]CPY"
+    Else
+        WFILLEG = "[F:CPY]LEG = [M]LEG"
+    Endif
+    If [M]ALLBPC = 1
+        WFILBPC = "([F:MDT]BPCNUM >= [M]BPCSTR and [F:MDT]BPCNUM <= [M]BPCEND)"
+    Endif
+    If [M]ALLUMRNUM = 1
+        WFILUMRNUM = "([F:MDT]UMRNUM >= [M]UMRNUMSTR and [F:MDT]UMRNUM <= [M]UMRNUMEND)"
+    Endif
+
+    # Only "Approved" (2), "Revoked" (4), and "Expired" (5) status are to be taken into account.
+    WFILGEN = "[F:MDT]STA = 2 | [F:MDT]STA = 4 | [F:MDT]STA = 5"
+Return
+
+
+
+$QUERY
+    Link [F:MDT] With
+&      [F:CPY]CPY0 ~= [F:MDT]CPY
+&       As [LNK]
+&       Where evalue(WFILCPY)
+&           & evalue(WFILLEG)
+&           & evalue(WFILBPC)
+&           & evalue(WFILUMRNUM)
+&           & evalue(WFILGEN)
+&           & evalue(WFILOPT)
+&           & 1=1
+&       Order By Key CLE = [F:MDT]CPY; [F:MDT]BPCNUM; [F:MDT]UMRNUM
+Return
+
+
+
+$MDTCLS
+    If rowcount( [LNK] ) = 0
+        MESSA = mess(299,117,1) : Gosub LOGINFO From VALMDT # "No items to be processed"
+    Else
+        N_NBPROCESSED= 0
+        N_NBNOTPROCESSED= 0
+
+        For [LNK]
+            MANDATEINFO = [F:MDT]CPY + "/" + [F:MDT]BPCNUM + "/" + [F:MDT]UMRNUM
+            If [F:MDT]DES <> ""
+                MANDATEINFO -= "(" + [F:MDT]DES + ")"
+            Endif
+
+            # Try to get the last pay date of the mandete.
+            Raz REFDATE
+            Filter [F:HMDT]
+&               Where CPY = [F:MDT]CPY & UMRNUM = [F:MDT]UMRNUM
+&               Order By PAYDAT Desc
+
+            Read [F:HMDT] First
+            If !fstat
+                # Get the last pay date of the mandete.
+                REFDATE = [F:HMDT]PAYDAT
+            Else
+                # Otherwise use the signiture date.
+                REFDATE = [F:MDT]SIGDAT
+            Endif
+            Filter [F:HMDT]
+
+            If REFDATE = [0/0/0]
+                MESSA = MANDATEINFO - "-" - mess(311,117,1) - "-" - mess(312,117,1) : Gosub LOGERR From VALMDT # "This mandate cannot be closed" "Missing signature or last debit date"
+                N_NBNOTPROCESSED += 1
+            Else
+                If    (   ( [F:MDT]STA = 2 )                         and ( addmonth( REFDATE, 36 ) < date$ ) )
+&                  or ( ( ( [F:MDT]STA = 4 ) or ( [F:MDT]STA = 5 ) ) and ( addmonth( REFDATE, 14 ) < date$ ) )
+
+                    # Try to lock the current MDT object.
+                    SYMBOLE = "MDT" + [F:MDT]UMRNUM +"\" + [F:MDT]CPY
+                    Lock =SYMBOLE With lockwait = 0
+                    If fstat
+                        # Locking was not possible.
+                        MESSA = MANDATEINFO - "-" - mess(124,187,1) : Gosub LOGERR From VALMDT # "Locked document: update is impossible "
+                        N_NBNOTPROCESSED += 1
+                    Else
+                        If B_SIM
+                            # Simulate mandate closing
+                            N_NBPROCESSED += 1
+                            MESSA = MANDATEINFO : Gosub LOGMESS From VALMDT
+                        Else
+                            # Real mandate closing
+                            [F:MDT]STA = 6       # Status "Closed" (ENG)
+                            [F:MDT]MAIMDTFLG = 1 # Cannot be "Main mandate" anymore
+                            Rewrite [F:MDT]
+                            If fstat
+                                # Update failed.
+                                MESSA = MANDATEINFO - "-" - mess(311,117,1) - "-" - mess(27,125,1) : Gosub LOGERR From VALMDT  # "This mandate cannot be closed" "Re-write Error"
+                            Else
+                                # Update was successful
+                                N_NBPROCESSED += 1
+                                MESSA = MANDATEINFO : Gosub LOGMESS From VALMDT
+                            Endif
+                        Endif
+                        Unlock =SYMBOLE
+                    Endif
+                Endif
+            Endif
+        Next
+
+
+        # Output a small summary.
+        MESSA = string$( 115, "-" ): Gosub LOGMESS From VALMDT
+        MESSA = mess(307,117,1) - num$( N_NBPROCESSED )    : Gosub LOGMESS From VALMDT # "Validated items"
+        MESSA = mess(308,117,1) - num$( N_NBNOTPROCESSED ) : Gosub LOGMESS From VALMDT # "Non-validated items"
+    Endif
+Return
+
+

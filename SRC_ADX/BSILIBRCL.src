@@ -1,0 +1,279 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+######################################################################################################
+# Project       : Bank statement import (MT940/CAMT)
+# File          : BSILIBRCL
+# Version       : 1.0
+# Authors       : U. Bader
+# Creation Date : 2017-09-15
+######################################################################################################
+# Module        : Finance
+# Description   : Library for bank statement import: reconsiliation
+#                 For each BSI statement a statement in RELBANK is created (consisting of several database records):
+#                 1 record for the starting balance
+#                 1 record for each bank transaction
+#                 1 record for the ending balance
+######################################################################################################
+# Updates       :
+# Date          | Author | Version | Description
+######################################################################################################
+
+Local Char TESTSTMCOD(30), TESTMSG(250)
+Local File RELBANK [RBK]
+Local Integer TESTSTA
+TESTSTMCOD = "00000004"
+TESTSTA    = 0
+TESTMSG    = ""
+Trbegin [F:RBK]
+Call BSI_RECONCILE(TESTSTMCOD,TESTSTA,TESTMSG,1)
+If TESTSTA <> 0
+    # Rollback transaction and display error message.
+    Rollback
+    Errbox(TESTMSG)
+Else
+    # Commit transaction and update screen.
+    Commit
+Endif
+End
+
+#**
+#* Purpose: Creating data in RELBANK for a bank file import statement
+#*
+#* @param PSTMCOD      primary key for reading record in table BSIIMP.
+#* @param PSTA         status: 0: OK, 1 : already created, 2 : import/statement not found,
+#*                             3: error creating a new ID in RELBANK, 4 : various.
+#* @param PMSG         Message corresponding to status.
+#* @param PLOG         Write detailed log? 1 = yes, 0 = no
+#*!
+Subprog BSI_RECONCILE(PSTMCOD,PSTA,PMSG,PLOG)
+Value Char PSTMCOD     # file number of statement, part of key to table BSIIMP/BSIIMPD
+Variable Integer PSTA  # status of matching 0 : OK, 1 : already matched, 2 : import/statement not found,
+                       # 3: error creating a new ID in RELBANK, 4 : various
+Variable Clbfile PMSG  # Message corresponding to status
+Value Integer PLOG     # Write detailed log? 1 = yes, 0 = no
+
+PSTA = 0
+Gosub INIT
+
+If PLOG
+    If FLGTRACE : Call OUVRE_TRACE(mess(237,7703,1)) From LECFIC : Endif           # Open trace file.
+    Call ECR_TRACE (func AFNC.MES1(mess(238,7703,1),PSTMCOD),0) From GESECRAN
+Endif
+
+Read [F:BSIIMP]BSIIMP0 = PSTMCOD  # read statement (import header)
+If !fstat
+  Read [F:BSIIP]BSIIP0 = [F:BSIIMP]CODIMPPAR # read settings
+  If !fstat
+    If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(86,7703,1),[F:BSIIMP]CODIMPPAR),0) From GESECRAN Endif
+
+    LINRBK = 1                      # init line counter for RELBANK
+    Gosub CREATE_RBK_ID             # creates new id for RELBANK
+    Gosub CREATE_HEADER             # creates header record in RELBANK for starting balance (RECTYP = 1)
+    LINRBK += 1                     # increment line counter for RELBANK
+
+    Filter [F:BSIIMPD] Where STMCOD = PSTMCOD
+    # loop over transactions of statement and create one record in RELBANK for each (RECTYP = 2)
+    For [F:BSIIMPD]
+      If [F:BSIIMPD]FLGCRE>=2 | left$([F:BSIIMPD]LET,1) <> ""
+        PSTA = 1
+        PMSG = PSTMCOD - mess(9,7703,1) # "Statement already matched or payment created"
+      Else
+        Filter [F:BSIIMPS] Where STMCOD = PSTMCOD and TRSLIN = [F:BSIIMPD]LIN     # check if subdetails exist
+        NUMIMPS = rowcount([F:BSIIMPS])
+        If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(197,7703,1),num$(NUMIMPS)),0) From GESECRAN Endif
+
+        If [F:BSIIMPD]SNS="C"
+           If PLOG : Call ECR_TRACE (mess(88,7703,1),0) From GESECRAN : Endif
+        Else #  D
+           If PLOG : Call ECR_TRACE (mess(89,7703,1),0) From GESECRAN : Endif
+        Endif
+
+        Gosub CREATE_TRANSACTION    # write record in relbank for transaction
+      Endif
+      [F:BSIIMPD]FLGCRE = 4         # set status to "Manually completed"
+      Rewrite [F:BSIIMPD]
+    Next
+
+    Gosub CREATE_FOOTER             # creates footer record in RELBANK for ending balance (RECTYP = 3)
+    [F:BSIIMP]FLGMTC = 4            # set status to "Reconciled"
+    Rewrite [F:BSIIMP]
+  Else
+     PSTA = 2
+     PMSG = [F:BSIIMP]CODIMPPAR - mess(6,7703,1) # "Import settings not found"
+  Endif
+Else
+   PSTA = 2
+   PMSG = PSTMCOD - mess(1,7703,1) # 'Statement does not exist'
+Endif
+
+$ENDRECONCILE
+If PLOG
+    If PSTA : Call ECR_TRACE (PMSG,1) From GESECRAN : Endif
+    # Close and show trace file.
+    If !FLGTRACE
+        Call ECR_TRACE ("#########################################################################################",0) From GESECRAN
+        Call ECR_TRACE ("#########################################################################################",0) From GESECRAN
+    Else
+        Call FERME_TRACE From LECFIC
+        Call LEC_TRACE From LECFIC
+    Endif
+Endif
+End
+
+
+############################################################################################
+$INIT
+If !clalev ([F:BSIIMP])   : Local File BSIIMP      [BSIIMP]  : Endif # header import
+If !clalev ([F:BSIIMPD])  : Local File BSIIMPD     [BSIIMPD] : Endif # details import
+If !clalev ([F:BSIIMPS])  : Local File BSIIMPDS    [BSIIMPS] : Endif # subdetails import
+If !clalev ([F:BSIIP])    : Local File BSIIMPPAR   [BSIIP]   : Endif # import parameters
+If !clalev ([F:RBK])      : Local File RELBANK     [RBK]     : Endif # French bank account statement
+If !clalev ([F:BAN])      : Local File BANK        [BAN]     : Endif
+If !clalev ([F:CPY])      : Local File COMPANY     [CPY]     : Endif
+If !clalev ([F:TCA])      : Local File TABCOUAFF   [TCA]     : Endif
+
+Local Integer FLGTRACE : If GTRACE = "" : FLGTRACE = 1 : Else : FLGTRACE = 0 : Endif # Check for an existing log file (FLGTRACE = 1, 0 otherwise).
+Local Integer NUMIMPS             # counts the number of subdetails found
+Local Integer LINRBK              # counts the lines in RELBANK for a statement
+Local Char    RBKNUMBER(GLONVCR)  # identifier in RELBANK for statement
+Local Integer I
+Return
+
+
+############################################################################################
+# Creates a new ID for the statement in RELBANK using sequence numbering "RBK"
+############################################################################################
+$CREATE_RBK_ID
+Local Char    NUMANM(GLONANM)
+Local Integer OK_TCA
+Local Integer STAT
+NUMANM = ""
+Call LEC_BAN([F:BSIIMP]BAN) From CPTLEC
+Call LEC_CPY([F:BAN]CPY) From CPTLEC
+If [F:CPY]MAIFCY=""
+  # no main site attached to the company
+  PSTA = 3
+  PMSG = mess(68,107,1)-[F:BAN]CPY
+  If PLOG : Call ECR_TRACE(mess(68,107,1)-[F:BAN]CPY,1) From GESECRAN : Endif
+  Goto ENDRECONCILE
+Else
+  Call GETSOC([F:CPY]MAIFCY) From DEVSUB
+  Call LECTCA(3,OK_TCA) From SUBTCA
+  If OK_TCA : NUMANM = [F:TCA]CODNUM(5) : Endif
+  If NUMANM="" : NUMANM = "RBK" : Endif
+  Call NUMERO(NUMANM,[F:CPY]MAIFCY,datesyst,"",[L]RBKNUMBER,STAT) From SUBANM
+  If STAT | GOK<1
+    # Problem when creating the number
+    Gosub MESSAGE From SUBANM
+    PSTA = 4
+    PMSG = mess(60,199,1)-"("+NUMANM+") : "+MESSA
+    If PLOG : Call ECR_TRACE(mess(60,199,1)-"("+NUMANM+") : "+MESSA,1) From GESECRAN : Endif
+    Goto ENDRECONCILE
+  Endif
+Endif
+Return
+
+
+############################################################################################
+# Initialization of RELBANK record for common fields (same in every record)
+############################################################################################
+$INIT_RBK_COMMON
+Raz [F:RBK]
+[F:RBK]RBKNUM = [L]RBKNUMBER
+[F:RBK]BAN    = [F:BSIIMP]BAN
+[F:RBK]RBKLIN = [L]LINRBK
+[F:RBK]NUMRBK = uniqid([F:RBK])
+[F:RBK]CUR    = [F:BSIIMP]CUR
+[F:RBK]ENTNUM = ""
+[F:RBK]INDCOM = 0
+[F:RBK]INDUVY = 0
+[F:RBK]ORI    = 1                   # 1 = Imported, 2 = Entered > in our case always 1
+[F:RBK]BSISTM = PSTMCOD
+Return
+
+
+############################################################################################
+# Creates a header record in RELBANK for the starting balance of the statement.
+# Record type (RECTYP) = 1
+############################################################################################
+$CREATE_HEADER
+Gosub INIT_RBK_COMMON
+[F:RBK]RECTYP = 1                   # starting balance
+[F:RBK]OPEDAT = [F:BSIIMP]DATSTR
+Raz [F:RBK]VALDAT
+[F:RBK]AMTCUR = [F:BSIIMP]BLCSTR
+If [F:BSIIMP]BLCSTRSNS   = "C"
+    [F:RBK]SNS    = 1               # Credit
+Else
+    [F:RBK]SNS    = -1              # Debit
+Endif
+#[F:RBK]SNS    = 1                   # TODO: as soon as the sign field for BLCSTR in table BSIIMP exists > use it!!!!
+Write [F:RBK]
+Return
+
+
+############################################################################################
+# Creates a footer record in RELBANK for the ending balance of the statement.
+# Record type (RECTYP) = 3
+############################################################################################
+$CREATE_FOOTER
+Gosub INIT_RBK_COMMON
+[F:RBK]RECTYP = 3                   # ending balance
+[F:RBK]OPEDAT = [F:BSIIMP]DATEND
+Raz [F:RBK]VALDAT
+[F:RBK]AMTCUR = [F:BSIIMP]BLCEND
+If [F:BSIIMP]BLCENDSNS  = "C"
+    [F:RBK]SNS    = 1               # Credit
+Else
+    [F:RBK]SNS    = -1              # Debit
+Endif
+#[F:RBK]SNS    = 1                   # TODO: as soon as the sign field for BLCEND in table BSIIMP exists > use it!!!!
+Write [F:RBK]
+Return
+
+
+############################################################################################
+# Creates a record in RELBANK for the current transaction of the statement.
+# Record type (RECTYP) = 2
+############################################################################################
+$CREATE_TRANSACTION
+Gosub INIT_RBK_COMMON
+[F:RBK]RECTYP = 2                   # single transaction
+[F:RBK]OPEDAT = [F:BSIIMPD]VALDAT
+[F:RBK]VALDAT = [F:BSIIMPD]VALDAT
+If [F:BSIIMPD]SNS = "C"
+    [F:RBK]SNS    = 1               # Credit
+Else
+    [F:RBK]SNS    = -1              # Debit
+Endif
+If NUMIMPS = 0                      # no subdetails found (MT940, CSV)
+    #[F:RBK]BANCIB = ???            # Interbank code > where to get from?????
+    #[F:RBK]RENREJ = ???            # Reject reason > where to get from?????
+    [F:RBK]AMTCUR = [F:BSIIMPD]AMTCUR
+    For I=0 To dim([F:BSIIMPD]FREREF)-1
+       If [F:BSIIMPD]FREREF(I)<>""
+          [F:RBK]DES = [F:BSIIMPD]FREREF(I)
+          Break
+       Endif
+    Next
+    Write [F:RBK]
+    LINRBK += 1                   # increment line counter for RELBANK
+Else
+    For [F:BSIIMPS]                               # loop over all subdetail records
+        Raz [F:RBK]DES
+        [F:RBK]AMTCUR = [F:BSIIMPS]AMTCURS
+        [F:RBK]NUMRBK = uniqid([F:RBK])           # unique identifier
+        [F:RBK]RBKLIN = [L]LINRBK
+        #[F:RBK]BANCIB = ???                      # Interbank code > where to get from?????
+        #[F:RBK]RENREJ = ???                      # Reject reason > where to get from?????
+        For I = 0 To dim([F:BSIIMPS]RMTREF)-1     # Loop over all 10 RMTREF fields
+            If [F:BSIIMPS]RMTREF(I) <> ""
+                [F:RBK]DES = left$([F:BSIIMPS]RMTREF(I),GLONDES)
+                Break
+            Endif
+        Next
+        Write [F:RBK]
+        LINRBK += 1                   # increment line counter for RELBANK
+    Next
+Endif
+Return
+

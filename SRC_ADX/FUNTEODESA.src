@@ -1,0 +1,825 @@
+#<AdxTL>@(#)12.0.0.0 $Revision$
+#########################################################################
+#                                                          GA 08/2006   #
+# Fonction de désallocation automatique des Ordres de sous-traitance    #
+#                       (selon FUNDESALL et FUNMDESA )                  #
+#                                                                       #
+# Fenetre:  DTEODESA     Ecran: TEODESA [M:DIA]                         #
+# Actions:                                                              #
+# - TRTTEODESA : Action traitement de désallocation automatique         #
+#                                                                       #
+#########################################################################
+# Etiquettes ACTION                                                     #
+#########################################################################
+$ACTION
+Case ACTION
+ When "INIT"          : Gosub INIT
+ When "INIT_DIA"      : Gosub INIT_DIA
+ When "CONTROLE"      : Gosub CONTROLE
+ When "EXEC"          : Gosub EXEC
+ When "TERMINE"       : Gosub TERMINE
+ When "SORTIE"        : Gosub SORTIE
+ When Default
+Endcase
+Return
+
+########################################################################
+$INIT
+# En batch , il vaut mieux mettre onerrgo
+If GSERVEUR
+    Onerrgo ERRBATCH
+Endif
+
+GFCY   = GFCYDEF(6)
+Gosub OUVRE
+Return
+
+########################################################################
+$INIT_DIA
+Local    Char    LFCY(GLONFCY) : LFCY = PARAM(1)
+Local    Char    LDAT          : LDAT = PARAM(2)
+Local    Char    LTYP          : LTYP = PARAM(3)
+Local    Char    LVCR(GLONVCR) : LVCR = PARAM(4)
+Local    Char    LITM(GLONITM) : LITM = PARAM(5)
+Local    Integer LRET          : LRET = 0
+
+# titre de la boîte
+TIT = mess(118,197,1)
+Raz [M:DIA]
+
+# Issue 89445 GA 04/2013
+#If LFCY <> ""  : [M:DIA]POHFCY    = LFCY  : Endif
+If LFCY <> ""
+   Read [F:FCY]FCY0=LFCY
+   If !fstat
+      If [F:FCY]WRHFLG=2 & dim([M:DIA]PRHFCY)>0 [M:DIA]PRHFCY=LFCY Endif
+      If [F:FCY]PURFLG=2                        [M:DIA]POHFCY=LFCY Endif
+   Endif
+Endif
+
+If LDAT <> ""
+    If instr(1,LDAT,"/")
+        [M:DIA]STRDAT = "["+LDAT+"]"
+    Else
+        [M:DIA]STRDAT = LDAT
+    Endif
+Endif
+Case LTYP
+    When "1":     [M:DIA]ALLTYP = 1
+    When "3":     [M:DIA]ALLTYP = 2
+Endcase
+If LVCR <> "" : [M:DIA]SCONUMDEB = LVCR : [M:DIA]SCONUMFIN = LVCR : Endif
+If LITM <> "" : [M:DIA]CPNITMDEB = LITM : [M:DIA]CPNITMFIN = LITM : Endif
+Return
+
+########################################################################
+$CONTROLE
+TIT=" "
+TMP=1
+Return
+
+
+#########################################################################
+$EXEC
+If !GSERVEUR
+    TRA = 1
+    Call OUVRE_TRACE(TIT) From LECFIC
+    Call ECR_TRACE(" ",0) From GESECRAN
+    Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+    Call PRTSCR("TEODESA","DIA","",0,1) From ATRTX3
+    Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+    Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+# préparation des critères de filtre
+Gosub SEL_MAT
+
+# traitement des désallocations
+Gosub TRT_MAT
+
+# Cas particulier: raz des allocations pour certains EO
+If [M:DIA]SCONUMDEB<>"" & [M:DIA]SCONUMFIN<>""
+  # préparation des critères de filtre
+  Gosub SEL_SCM
+
+  # traitement des désallocations
+  Gosub TRT_SCM
+Endif
+
+Return
+
+#########################################################################
+$TERMINE
+If !GSERVEUR
+    # fermeture trace
+    Call FERME_TRACE From LECFIC
+    # aucune allocation effectuee ou lecture trace
+    If !NBDES
+        GERR = 2 : GMESSAGE = mess(71,193,1)
+    Endif
+    # lecture trace
+    #    Call LEC_TRACE From LECFIC
+Endif
+Return
+
+#########################################################################
+$SORTIE
+# FQ 53586 Filtrer les listes sur le type de données SCO
+If dim(GSCOFILTRE)>0 Kill GSCOFILTRE Endif
+Return
+
+###########################################################################
+$OUVRE
+Local Integer  MODE
+Local Integer  OK
+Local Integer  NBDES
+Local Char     TIT(50)
+Local Char     CRITERE(255)
+Local Char     CRITERE2(255)
+# sr 09.01 CUSFLT zone de filtres supplémentaires demande 10405
+Local Char     CUSFLT(255)
+#
+Local Char     FORMULE1(255)
+#
+Local Char     WMESS(85)
+Local Char     WMESS1(85)
+Local Char     WMESS2(85)
+Local Decimal  WALL
+Local Decimal  WSHT
+Local Integer  WRET
+Local Char     WTRTLIG(1)
+Local Char     WTRT(1)
+Local Integer  WALLTYP
+Local Char     WITMREF
+Local Char     WSTOFCY
+Local Char     WVCRNUM
+Local Integer  WVCRLIN
+Local Integer  WVCRSEQ
+Local Date     WSTRDAT
+
+# Issue X3-76885 - 2018-03-06 by MUARN : Matière sur bon de prépa
+Local Integer WSRGQTY
+
+Gosub CHARG_PARAM
+
+#---------------------------------------#
+# Ouverture des fichiers utilisés       #
+#---------------------------------------#
+If clalev([F:ORD])  = 0 : Local File ORDERS      [ORD]  : Endif
+If clalev([F:ORD1]) = 0 : Local File ORDERS      [ORD1] : Endif
+If clalev([F:SCO])  = 0 : Local File SCOHEAD     [SCO]  : Endif
+If clalev([F:SCI])  = 0 : Local File SCOITM      [SCI]  : Endif
+If clalev([F:SCM])  = 0 : Local File SCOMAT      [SCM]  : Endif
+If clalev([F:ITM])  = 0 : Local File ITMMASTER   [ITM]  : Endif
+If clalev([F:ITV])  = 0 : Local File ITMMVT      [ITV]  : Endif
+If clalev([F:ITF])  = 0 : Local File ITMFACILIT  [ITF]  : Endif
+If clalev([F:TFO])  = 0 : Local File TABFOR      [TFO]  : Endif
+
+# Issue X3-76885 - 2018-03-06 by MUARN : Matière sur bon de prépa
+If clalev([F:STA])  = 0 : Local File STOALL      [STA]  : Endif
+
+# --- Déclaration classe ecran pour les encours --- #
+Local Mask ORDK    [ORDK]
+
+# V6 Affectations
+Gosub OPEN_MTO From MTOLINKLIB
+
+Return
+
+########################################################################
+# Préparation du filtre sur la table encours (matières)                #
+########################################################################
+$SEL_MAT
+
+MODE = 0
+# critères liés aux articles lancés
+CRITERE  = 'STOFCY ="'+[M:DIA]PRHFCY+'"'            # site de réception # Issue 89445 GA 04/2013 avant POHFCY
+CRITERE -= '& VCRTYP = 36'                          # ordre de sous-traitance
+CRITERE -= '& WIPSTA = 1'                           # statut ferme
+
+CRITERE -= '& PIO >=' +num$([M:DIA]PIODEB)           # borne début priorité
+CRITERE -= '& PIO <=' +num$([M:DIA]PIOFIN)           # borne fin   priorité
+
+If [M:DIA]SCONUMDEB <> ""                               # borne début OF
+   CRITERE -= '& VCRNUM >="'+[M:DIA]SCONUMDEB+'"'
+Endif
+If [M:DIA]SCONUMFIN <> ""                               # borne fin   OF
+   CRITERE -= '& VCRNUM <="'+[M:DIA]SCONUMFIN+'"'
+Endif
+
+# affaire
+If [M:DIA]PJTDEB <> ""
+   CRITERE -= '& PJT >="'+[M:DIA]PJTDEB+'"'             # borne début affaire
+Endif
+If [M:DIA]PJTFIN <> ""
+   CRITERE -= '& PJT <="'+[M:DIA]PJTFIN+'"'             # borne fin   affaire
+Endif
+
+# fournisseur
+If [M:DIA]BPRNUMDEB <> ""
+   CRITERE -= '& BPRNUM >="'+[M:DIA]BPRNUMDEB+'"'       # borne début destin.
+Endif
+If [M:DIA]BPRNUMFIN <> ""
+   CRITERE -= '& BPRNUM <="'+[M:DIA]BPRNUMFIN+'"'       # borne fin   destin.
+Endif
+
+# no commande achat
+If [M:DIA]VCRNUMDEB <> ""
+   CRITERE -= '& VCRNUMORI >="'+[M:DIA]VCRNUMDEB+'"'    # borne début n° commande
+Endif
+If [M:DIA]VCRNUMFIN <> ""
+   CRITERE -= '& VCRNUMORI <="'+[M:DIA]VCRNUMFIN+'"'    # borne fin   n° commande
+Endif
+If [M:DIA]VCRNUMDEB <> "" | [M:DIA]VCRNUMFIN <> ""
+   CRITERE -= '& VCRTYPORI = 14'                        # type pièce =   commande achat
+Endif
+
+If [M:DIA]ITMREFDEB <> "" | [M:DIA]ITMREFFIN <> ""
+    MODE = 1
+    CRITERE -= '& WIPTYP = 13'                          # type EO
+    If [M:DIA]ITMREFDEB <> ""
+       CRITERE -= '& ITMREF >="'+[M:DIA]ITMREFDEB+'"'       # borne début article lancé
+    Endif
+    If [M:DIA]ITMREFFIN <> ""
+       CRITERE -= '& ITMREF <="'+[M:DIA]ITMREFFIN+'"'       # borne fin   article lancé
+    Endif
+    CRITERE2 = 'WIPTYP = 3'                             # type MS
+    If [M:DIA]CPNITMDEB <> ""
+       CRITERE2 -= '& ITMREF >="'+[M:DIA]CPNITMDEB+'"'   # borne début matière
+    Endif
+    If [M:DIA]CPNITMFIN <> ""
+       CRITERE2 -= '& ITMREF <="'+[M:DIA]CPNITMFIN+'"'   # borne fin   matière
+    Endif
+Else
+    CRITERE -= '& WIPTYP = 3'                           # type MS
+    If [M:DIA]CPNITMDEB <> ""
+       CRITERE -= '& ITMREF >="'+[M:DIA]CPNITMDEB+'"'   # borne début matière
+    Endif
+    If [M:DIA]CPNITMFIN <> ""
+       CRITERE -= '& ITMREF <="'+[M:DIA]CPNITMFIN+'"'   # borne fin   matière
+    Endif
+Endif
+#
+Gosub ANALYSE_FORMULE
+If FORMULE1 = "" : FORMULE1 = "1=1" : Endif
+
+
+Return
+
+##################################################
+$ANALYSE_FORMULE
+# analyse présence formule de sélection
+If [M:DIA]FORMULE  = ""
+    If FORMULE1 = "" :  FORMULE1 = "1=1" : Endif
+Else
+    Read [F:TFO]TFO0=36;[M:DIA]FORMULE
+    If fstat
+        If FORMULE1 = "" :  FORMULE1 = "1=1" : Endif
+    Else
+        If FORMULE1 = ""
+            FORMULE1  = [F:TFO]FORFOR
+        Else
+            FORMULE1 += "&"
+            FORMULE1 += [F:TFO]FORFOR
+        Endif
+    Endif
+Endif
+
+Return
+
+
+#---------------------------------------------------------------------#
+# Traitement des matières                                             #
+#---------------------------------------------------------------------#
+$TRT_MAT
+# Point d'entrée pour permettre à l'utilisateur de rajouter des sélections
+# sr 09.01 demande 10405
+Raz CUSFLT
+GPOINT = "CUSSELFLT" : Gosub ENTREE From EXEFNC
+If CUSFLT = "" : CUSFLT = "1=1" : Endif
+#
+# link en tenant compte des critères sur date ou sur code priorité
+Case [M:DIA]SORPAR
+    When 1: Filter [ORD] Where (evalue(CRITERE) & STRDAT <= [M:DIA]STRDAT) &
+&                               evalue(CUSFLT) & evalue(FORMULE1)
+&                        Order By STRDAT Desc; PIO Asc
+    When 2: Filter [ORD] Where (evalue(CRITERE) & STRDAT <= [M:DIA]STRDAT) &
+&                               evalue(CUSFLT) & evalue(FORMULE1)
+&                        Order By PIO Asc; STRDAT Desc
+Endcase
+
+# boucle de lecture des matières
+For  [ORD] With Nohint                                # 10.02 Performances
+      # FQ 70409 GA 01/2011 limiter le nb de maj de [F:SCO], on maj l'OF précédent
+      If [F:ORD]VCRNUM<>WVCRNUM & WVCRNUM<>""
+         Gosub TRTSCO
+      Endif
+      If MODE = 1
+        Filter [ORD1] Where (evalue(CRITERE2) & STRDAT<=[M:DIA]STRDAT & VCRNUM=[F:ORD]VCRNUM)
+&                     Order By STRDAT Asc; PIO Desc
+        For [ORD1] With Nohint                        # 10.02 Performances
+                WITMREF = [F:ORD1]ITMREF
+                WSTOFCY = [F:ORD1]STOFCY
+                WVCRNUM = [F:ORD1]VCRNUM
+                WVCRLIN = [F:ORD1]VCRLIN
+                WVCRSEQ = [F:ORD1]VCRSEQ
+                WSTRDAT = [F:ORD1]STRDAT
+                Gosub SEL_MATCOMPL
+                If OK = 1 : Goto NXT1 : Endif
+                #
+                WTRTLIG = "A"
+                Gosub TRTALL
+        $NXT1
+        Next
+        Filter [ORD1]
+        Goto NXT2
+      Endif
+      WITMREF = [F:ORD]ITMREF
+      WSTOFCY = [F:ORD]STOFCY
+      WVCRNUM = [F:ORD]VCRNUM
+      WVCRLIN = [F:ORD]VCRLIN
+      WVCRSEQ = [F:ORD]VCRSEQ
+      WSTRDAT = [F:ORD]STRDAT
+      Gosub SEL_MATCOMPL
+      If OK = 1 : Goto NXT2 : Endif
+      #
+      WTRTLIG = "A"
+      Gosub TRTALL
+$NXT2
+Next
+#
+Filter [ORD]
+# FQ 70409 GA 01/2011 limiter le nb de maj de [F:SCO], traiter le dernier OF
+If WVCRNUM<>""
+   Gosub TRTSCO
+Endif
+#
+Return
+
+#-----------------------------------------------------------------------#
+# Sélections complémentaires sur la matière                             #
+#-----------------------------------------------------------------------#
+$SEL_MATCOMPL
+OK=1
+# lecture article
+If [F:ITM]ITMREF <> WITMREF
+    Read [ITM]ITM0=WITMREF
+    If fstat : Raz [F:ITM] : Return : Endif
+Endif
+
+# lecture article/site
+If [F:ITF]ITMREF <> WITMREF | [F:ITF]STOFCY <> WSTOFCY
+    Read [ITF]ITF0=WITMREF;WSTOFCY
+    If fstat : Raz [F:ITF] : Return : Endif
+Endif
+
+# lecture enregistrement entête EO
+If [F:SCO]SCONUM <> WVCRNUM
+    Read [SCO]SCO0=WVCRNUM
+    If fstat : Raz [F:SCO] : Return : Endif
+Endif
+
+# lecture enregistrement article lancé
+If [F:SCI]SCONUM <> WVCRNUM | [F:SCI]SCILIN <> WVCRLIN
+    Read [SCI]SCI0=WVCRNUM;WVCRLIN
+    If fstat : Raz [F:SCI] : Return : Endif
+Endif
+
+# lecture enregistrement matière
+Read [SCM]SCM0=WVCRNUM;WVCRLIN;WVCRSEQ
+If fstat : Raz [F:SCM] : Return : Endif
+
+# ces 2 cas ne devraient pas se produire car on ne devrait pas avoir d'encours MSx (!!!)
+If [F:SCM]CPNTYP > 1 : Return : Endif    # si composant Texte
+If [F:SCM]SCOFLG = 3 : Return : Endif    # si matière fournie par le sous-traitant
+
+If [M:DIA]ENCOURFLG=1 & [F:SCM]MATSTA = 2 : Return : Endif    # si matière en cours et case non cochée
+If [F:SCM]MATSTA >= 3 : Return : Endif    # si matière soldée ou exclue
+
+If [F:SCM]ALLSTA  = 1 : Return : Endif    # si matière non allouée
+If [M:DIA]DESMOD = 2   # par type
+    Case [M:DIA]ALLTYP
+        When 1:    If [F:SCM]ALLSTA >= 4 : Return : Endif     # si alloué détail
+        When 2:    If [F:SCM]ALLSTA <  4 : Return : Endif     # si alloué global
+    Endcase
+Endif
+#
+
+# Issue X3-76885 - 2018-03-06 by MUARN : Matière sur bon de prépa
+WSRGQTY=0
+For [STA]STA1 Where VCRTYP=36 & VCRNUM=WVCRNUM
+&              & VCRLIN=[F:SCM]SCILIN & VCRSEQ=[F:SCM]SCMLIN & STOCOU=0
+  If [F:STA]SRGQTYSTU > 0 : WSRGQTY+=[F:STA]SRGQTYSTU : Break : Endif
+Next
+If WSRGQTY > 0 : Return : Endif
+# End issue X3-76885
+
+OK=2
+Return
+
+#-----------------------------------------------------------------------#
+# Traitement d'une allocation                                           #
+#-----------------------------------------------------------------------#
+$TRTALL
+Gosub VERROU
+If !OK : Return : Endif
+Call DEBTRANS From GLOCK
+GOK = 1
+Gosub MAJALL
+Gosub DEVERROU
+Return
+
+#-----------------------------------------------------------------------#
+# Mise à jour des allocations                                           #
+#-----------------------------------------------------------------------#
+$MAJALL
+Local Char    WTRTORD
+Local Decimal WCPLQTY
+Local Integer MEMSTA : MEMSTA = [F:SCM]ALLSTA # mémo statut
+
+#
+WALLTYP = [M:DIA]ALLTYP
+WMESS   = mess(641,197,1)+" "+WVCRNUM+" "+mess(157,197,1)+" "+WITMREF+" "+
+&         mess(158,197,1)+" "+num$(WSTRDAT)
+#
+Trbegin [SCO],[SCM]
+    # traitement matière
+    Readlock [SCM]SCM0 Curr
+    If fstat = 1
+        GOK = -1 : GLOCK="$SCOMAT"+WVCRNUM-num$(WVCRLIN)-num$(WVCRSEQ)
+        Goto ROL_TRTALL
+    Elsif fstat
+        GOK = 0  : Call RSTA("SCM",WVCRNUM-num$(WVCRLIN)-num$(WVCRSEQ)) From GLOCK
+        Goto AB_TRTALL
+    Endif
+    #
+    WTRT = "A"
+    WALL = [F:SCM]ALLQTY
+    WSHT = [F:SCM]SHTQTY
+    If DESMOD = 1
+        Case [F:SCM]ALLSTA
+            When 2,3: WALLTYP = 1
+            When 4,5: WALLTYP = 2
+        Endcase
+    Endif
+    # appel à la routine de gestion des allocations
+    Call ALLOCATION(WTRT, WALLTYP, WALL, WSHT, WRET) From SCOALL
+    If WRET <> 0 Goto AB_TRTALL : Endif
+
+    # mise à jour matière
+    [F:SCM]ALLQTY     = 0
+    [F:SCM]SHTQTY     = 0
+    [F:SCM]ALLSTA     = 1
+
+    # mise à jour matière
+    Rewrite [SCM]
+    If fstat : GOK=0 : Call FSTA("SCM") From GLOCK : Goto AB_TRTALL : Endif
+
+    # mise à jour encours
+    Case MODE
+        When 0 : Readlock [ORD] Curr
+                 [F:ORD]ALLQTY = 0
+                 [F:ORD]SHTQTY = 0
+                 Rewrite [ORD]
+        When 1 : Readlock [ORD1] Curr
+                 [F:ORD1]ALLQTY = 0
+                 [F:ORD1]SHTQTY = 0
+                 Rewrite [ORD1]
+    Endcase
+    If fstat : GOK=0 : Call FSTA("ORD") From GLOCK : Goto AB_TRTALL : Endif
+
+    # traces
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+    Raz WMESS, WMESS1, WMESS2
+
+    # FQ 70409 GA 01/2011 Maj déplacée + tard pour performances
+    # mise à jour entête
+    # Gosub MAJSCOHEAD
+
+    # v6 affectations
+    Gosub MAJ_MTO_SCM From SCOMTOLIB
+
+    NBDES += 1
+Commit
+Return
+
+
+
+########################################################################
+# Préparation du filtre sur la table matières de l'EO                  #
+########################################################################
+$SEL_SCM
+
+#--- Issue 106433
+#CRITERE="1=1"
+CRITERE  = 'STOFCY ="'+[M:DIA]PRHFCY+'"'
+#---
+If [M:DIA]SCONUMDEB <> ""                               # borne début EO
+   CRITERE -= '& SCONUM >="'+[M:DIA]SCONUMDEB+'"'
+Endif
+If [M:DIA]SCONUMFIN <> ""                               # borne fin   EO
+   CRITERE -= '& SCONUM <="'+[M:DIA]SCONUMFIN+'"'
+Endif
+
+If [M:DIA]ITMREFDEB <> ""
+   CRITERE -= '& ITMREF >="'+[M:DIA]ITMREFDEB+'"'       # borne début article lancé
+Endif
+If [M:DIA]ITMREFFIN <> ""
+   CRITERE -= '& ITMREF <="'+[M:DIA]ITMREFFIN+'"'       # borne fin   article lancé
+Endif
+If [M:DIA]CPNITMDEB <> ""
+   CRITERE -= '& CPNITMREF >="'+[M:DIA]CPNITMDEB+'"'   # borne début matière
+Endif
+If [M:DIA]CPNITMFIN <> ""
+   CRITERE -= '& CPNITMREF <="'+[M:DIA]CPNITMFIN+'"'   # borne fin   matière
+Endif
+#
+Return
+
+#---------------------------------------------------------------------#
+# Traitement des matières (<> Fournie par sous-traitant)              #
+#---------------------------------------------------------------------#
+$TRT_SCM
+If CRITERE="1=1" : Return : Endif
+Filter [SCM] Where evalue(CRITERE) & SCOFLG<>3
+
+MODE=3 # ne pas maj [ORD]
+# boucle de lecture des matières
+For  [SCM] With Nohint
+      WITMREF = [F:SCM]CPNITMREF
+      WSTOFCY = [F:SCM]STOFCY
+      WVCRNUM = [F:SCM]SCONUM
+      WVCRLIN = [F:SCM]SCILIN
+      WVCRSEQ = [F:SCM]SCMLIN
+      WSTRDAT = [F:SCM]DLVDAT
+      Gosub SEL_MATCOMPL : # GH 31/10/12 bug 84821
+      If OK = 2
+         WTRTLIG = "A"
+         Gosub TRTALL
+      Endif
+Next
+#
+Filter [SCM]
+Return
+
+#-----------------------------------------------------------------------#
+# Maj globale d'un EO après allocations                                 #
+#-----------------------------------------------------------------------#
+$TRTSCO                                           # FQ 70409 GA 01/2011 #
+Gosub VERROU
+If !OK : Return : Endif
+Call DEBTRANS From GLOCK
+GOK = 1
+Gosub MAJSCO
+Gosub DEVERROU
+Return
+#-----------------------------------------------------------------------#
+# Mise à jour de l'entete EO                                            #
+#-----------------------------------------------------------------------#
+$MAJSCO                                           # FQ 70409 GA 01/2011 #
+Local Integer XTOT
+Local Integer I
+#
+If WVCRNUM="" Return Endif
+
+Trbegin [SCO]
+#
+  Readlock [SCO]SCO0=WVCRNUM
+  If fstat = 1
+     GOK = -1 : GLOCK = "$SCOHEAD"+[F:SCO]SCONUM
+     Goto ROL_TRTSCO
+  Elsif fstat
+     GOK = 0  : Call RSTA("SCO",   [F:SCO]SCONUM) From GLOCK
+     Goto AB_TRTSCO
+  Endif
+#
+  Gosub MAJSCOHEAD From SCOLIB
+#
+  Rewrite [SCO]
+  If fstat
+     GOK = 0 : Call FSTA("SCO") From GLOCK
+     Goto AB_TRTSCO
+  Endif
+#
+Commit
+#
+Return
+
+$ROL_TRTSCO
+Rollback
+Call ROLL From GLOCK
+If GROLL
+     Call ECR_TRACE(mess(17,107,1),1) From GESECRAN
+Endif
+Return
+
+$AB_TRTSCO
+Rollback
+Call ECR_TRACE(mess(17,107,1),1) From GESECRAN
+Return
+
+#-----------------------------------------------------------------------#
+# Positionnement d'un verrou sur l'entête OF                            #
+#-----------------------------------------------------------------------#
+$VERROU
+SYMBOLE = "SCO"+[F:SCO]SCONUM
+Lock = SYMBOLE With lockwait = 0
+OK = 1
+If fstat
+    Call ECR_TRACE([F:SCO]SCONUM - mess(10,100,1),1) From GESECRAN
+    OK = 0
+Endif
+Return
+
+#-----------------------------------------------------------------------#
+# Suppression du verrou sur l'entête OF                                 #
+#-----------------------------------------------------------------------#
+$DEVERROU
+Unlock=SYMBOLE
+Return
+
+$ROL_TRTALL
+Rollback
+Call ROLL From GLOCK
+If GROLL
+     Call ECR_TRACE(mess(17,107,1),1) From GESECRAN
+Else Goto MAJALL :Endif
+Return
+
+$AB_TRTALL
+Rollback
+Call ECR_TRACE(mess(17,107,1),1) From GESECRAN
+Return
+
+########################################################################
+$CHARG_PARAM
+#----- Variables globales stock
+Call GLOBVAR(GFCY)    From WWGLOBSTO
+#----- Variables globales GPAO
+Call GLOBVAR(GFCY)    From WWGLOBGPA
+Return
+
+
+##########################################################################
+# pour les batchs                                                        #
+##########################################################################
+Subprog PARAM(DOSSIER,USER,P1,P2,OK)
+#-----------------------------#
+# obligatoire pour les batchs #
+#-----------------------------#
+Value    Char    DOSSIER   : # dossier de lancement
+Value    Char    USER      : # utilisateur
+Variable Char    P1()(1..) : # on peut avoir 2 fois 50 chaînes de 15 caractères
+Variable Char    P2()(1..)
+Variable Integer OK
+
+
+Gosub OUVRE
+
+Local Char    WIN (GLONFEN)
+WIN="DTEODESA"
+Call PARAM (DOSSIER,USER,P1,P2,OK,TIT,WIN) From CPTTRT
+
+End
+###########################################################################################
+$ERRBATCH
+Call ECR_TRACE(errmes$(errn)-num$(errl)-errm,1) From GESECRAN
+End
+
+#######################################################################
+#                     ETIQUETTES                                      #
+#######################################################################
+
+########################################
+Subprog AM_POHFCY(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> GFCY                   # mm 12.02
+    GFCY=VALEUR                     # mm 12.02
+    Gosub CHARG_PARAM
+Endif                               # mm 12.02
+# Issue 89445 GA 04/2013
+If [F:FCY]WRHFLG=2 & dim([M:DIA]PRHFCY)>0 & [M:DIA]PRHFCY=""
+   [M:DIA]PRHFCY=VALEUR : Affzo [M:DIA]PRHFCY
+Endif
+End
+########################################
+# Issue 89445 GA 04/2013
+########################################
+Subprog AM_PRHFCY(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> GFCY                   # mm 12.02
+    GFCY=VALEUR                     # mm 12.02
+    Gosub CHARG_PARAM
+    [M:DIA]STRDAT = date$+ GALLHOR  # mm 12.02
+Endif                               # mm 12.02
+End
+########################################
+Subprog AM_PIODEB(VALEUR)
+Variable Integer VALEUR
+[M:DIA]PIOFIN = VALEUR
+End
+
+########################################
+Subprog C_PIOFIN(VALEUR)
+Variable Integer VALEUR
+If VALEUR < [M:DIA]PIODEB : GMESSAGE= mess(44,199,1) : mkstat=2 : Endif
+End
+
+########################################
+Subprog AS_BPRNUMDEB(VALEUR)
+Variable Char    VALEUR()
+GBOUT1=mess(72,198,1)
+GBOUT2=mess(154,198,1)
+End
+
+########################################
+Subprog AS_BPRNUMFIN(VALEUR)
+Variable Char    VALEUR()
+GBOUT1=mess(72,198,1)
+GBOUT2=mess(154,198,1)
+End
+
+########################################
+Subprog AS_SCONUMDEB(VALEUR)
+Variable Char    VALEUR()
+# FQ 53586 Filtrer les listes sur le type de données SCO
+Gosub SCOFILTRE
+End
+Subprog AS_SCONUMFIN(VALEUR)
+Variable Char     VALEUR
+If VALEUR="" VALEUR=[M]SCONUMDEB Endif
+# FQ 53586 Filtrer les listes sur le type de données SCO
+Gosub SCOFILTRE
+End
+$SCOFILTRE
+If dim(GSCOFILTRE)<=0 Global Char GSCOFILTRE(250) Endif
+# Issue 89445 GA 04/2013
+If dim([M]PRHFCY)>0 & [M]PRHFCY<>""
+   GSCOFILTRE='PRHFCY="'+[M]PRHFCY+'"'
+   If [M]POHFCY<>""
+      GSCOFILTRE-='& POHFCY="'+[M]POHFCY+'"'
+   Endif
+Elsif [M]POHFCY<>""
+   GSCOFILTRE='POHFCY="'+[M]POHFCY+'"'
+Endif
+Return
+
+########################################
+Subprog AM_SCONUMDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]SCONUMFIN = VALEUR : Endif
+End
+########################################
+Subprog AM_PJTDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]PJTFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_BPRNUMDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]BPRNUMFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_ITMREFDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]ITMREFFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_CPNITMDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]CPNITMFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_VCRNUMDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]VCRNUMFIN = VALEUR : Endif
+End
+
+Subprog B1_BPRNUMDEB(VALEUR)
+Variable Char    VALEUR()
+# 06.03 WEB MM
+If dim (GBPRSEL)>0  : Kill GBPRSEL : Endif
+#
+End
+Subprog B1_BPRNUMFIN(VALEUR)
+Variable Char    VALEUR()
+# 06.03 WEB MM
+If dim (GBPRSEL)>0  : Kill GBPRSEL : Endif
+#
+End
+
+Subprog AS_VCRNUMDEB(VALEUR)
+Variable Char    VALEUR()
+End
+
+Subprog AS_VCRNUMFIN(VALEUR)
+Variable Char    VALEUR()
+If VALEUR="" VALEUR=[M]VCRNUMDEB Endif
+End
+
+######################################################################################
+

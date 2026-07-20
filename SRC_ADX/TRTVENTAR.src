@@ -1,0 +1,1528 @@
+#<AdxTL>@(#)10.0.0.0 $Revision$
+#######################################################################
+# TRTVENTAR                                                           #
+#      TRAITEMENTS LIES aux TARIFS dans les VENTES                    #
+#                                                                     #
+#######################################################################
+#---------------------------------------------------------------------#
+# Traitements e_commerce                                              #
+#---------------------------------------------------------------------#
+# ACTIONS                                                             #
+# ------------------                                                  #
+# Affichages divers                                                   #
+# ------------------                                                  #
+# DIVDISCRG  : Chargement des Motifs manuels Frais/remises            #
+# -------------------                                                 #
+# Traitement standard                                                 #
+# -------------------                                                 #
+# TRTRECTAR  : Traitement de recherche tarif sur toutes les lignes    #
+# TRTRECTARD : Traitement de recherche tarif sur une ligne            #
+#                                                                     #
+#---------------------------------------------------------------------#
+# Traitements non e_commerce                                          #
+#---------------------------------------------------------------------#
+# Subprog RECH_TARIF(TYPRECH, ITMREF, NLIG, QTY, TYPALI, GROPRI)      #
+#     Recherche du tarif                                              #
+# Subprog RECH_GROUPE(TYPALI)                                         #
+#     Recherche du tarif groupe                                       #
+# Subprog RECH_INTERDIT(ITMREF, BPAADD, REP, FUNCTION)                #
+#      Recherche interdit                                             #
+#######################################################################
+# Issue 112065 - 20151207 by LD : Reinit EECNUM from bill to custom when order modification
+# Issue X3-59514 - 20171025 by LD : The message, “Recalculate Prices / Discounts?” is not working when copying a Sales Order.
+# Issue X3-24710 - 20171106 by LD : Sales price and rounding issue with pack unit
+# Issue X3-59918 - 20180427 by LD : Grouped pricing doesn't work in an order created from a quote
+
+$ACTION
+#--- Actions liés au type traitement et affichage divers
+Case ACTION
+ When "TRT_DIV"     : Gosub TRT_DIV
+Endcase
+
+#--- Actions liés au type traitement standard
+Case ACTION
+ When "INIT"       : Gosub INIT
+ When "EXEC"       : Gosub EXEC
+ When "SORTIE"     : Gosub SORTIE    : # 79705 : V7 : SAT in SPRICLINK
+Endcase
+
+Return
+#########################################################################
+#    Actions liés au type traitement et affichage divers                #
+#########################################################################
+$TRT_DIV
+# 84596 : Recalcul tarif/taxe en gestion livraison
+#Case TRAIT
+Case GACTION
+ When "DIVDISCRG"   : Gosub D_DISCRG
+ When "DIVCLCPRI"   : Gosub DIVCLCPRI   : # 84596 : Recalcul tarif/taxe en gestion livraison
+Endcase
+Return
+#########################################################################
+#    Actions liés au type traitement standard                           #
+#########################################################################
+$INIT
+Case GACTION
+ When "TRTRECTAR"    : Gosub INI_TRTRECTAR
+ When "TRTRECTARD"   : Gosub INI_TRTRECTARD   : # 79705 : SAT in SPRICLINK : Step 2
+Endcase
+Return
+
+$EXEC
+
+Case GACTION
+ When "TRTRECTAR"    : Gosub EXEC_TRTRECTAR
+ When "TRTRECTARD"   : Gosub EXEC_TRTRECTARD  : # 79705 : SAT in SPRICLINK : Step 2
+Endcase
+Return
+
+$SORTIE
+
+Case GACTION
+ When "TRTRECTAR"    : Gosub SORTIE_TRTRECTAR : # 79705 : V7 : SAT in SPRICLINK
+Endcase
+Return
+
+################################################################################
+# DETAIL DES ACTIONS                                                           #
+################################################################################
+################################################################################
+# DIVDISCRG : Chargement des Motifs manuels Frais/remises                      #
+################################################################################
+$D_DISCRG
+Local Char    WABMSK    :    WABMSK = PARAM(1)
+Local Integer DISCRGNUM :    DISCRGNUM =val(PARAM(2))
+Local Integer NOLIG     :    NOLIG=val(PARAM(3))
+
+If DISCRGNUM > 0 & DISCRGNUM < 10
+   If !GIMPORT & VALEUR=evalue("[M:"+WABMSK+"]DISCRGVAL"+num$(DISCRGNUM)+"(NOLIG)") Return : Endif
+   Assign "[M:"+WABMSK+"]DISCRGREN"+num$(DISCRGNUM)+"(NOLIG)" With GDACMANSAL
+Elsif DISCRGNUM = 0
+   If !GIMPORT & VALEUR=evalue("[M:"+WABMSK+"]GROPRI(NOLIG)") Return : Endif
+   Assign "[M:"+WABMSK+"]PRIREN(NOLIG)" With GDACMANSAL
+Endif
+
+Return
+################################################################################
+# TRTRECTAR : Demande de recherche tarif                                       #
+################################################################################
+$INI_TRTRECTAR
+
+Local Char    WABMSK     : WABMSK  = left$(PARAM(1),3)     # FGR 07/07/2015 : X3SUIVI109325 WABMSK  = PARAM(1)
+Local Char    WZONCOU    : WZONCOU = PARAM(2)
+Local Char    FFLGMOD    : Raz FFLGMOD
+# 89812 : Pb accès depuis les retours
+#Local Char    WANCCUR    : WANCCUR=[M]CUR
+#Local Char    WANCVACBPR : WANCVACBPR=[M]VACBPR
+#Local Integer WANCPRITYP : WANCPRITYP=[M]PRITYP
+#Local Integer INICPRPRI  : INICPRPRI=1
+#Local Char    WFLGTOT    : Raz WFLGTOT                : # 89275
+# 89812
+
+Local Integer SAVMKSTAT : SAVMKSTAT=mkstat : # 79705 : V7 : SAT in SPRICLINK
+
+Local Integer WFLGERR   : WFLGERR=0        : # 101874 : V9 : Taxe code control
+
+FIN=1
+# 71065 : PJT
+# Si on est sur le chp Affaire, faire la recherche ssi le chp est reporté sur les lignes
+If WZONCOU="PJT" & (dim(GPJTACTMOD)<0 | GPJTACTMOD<>"1") Return Endif
+# 71065 : PJT
+
+# 79705 : V7 : SAT in SPRICLINK
+# Déclenchement de la dde de recherche tarif Si :
+# Modification du chp adresse de livraison avec report sur les lignes
+# Bouton adresse sur le chp adresse de livraison
+# Bouton adresse sur le menu adresse
+# FGR 07/07/2015 : X3SUIVI109325 : vu avec Lucie : Déclenchement de la dde de recherche tarif sf si on vient des retours
+#If WABMSK="" & WZONCOU="" Return Endif
+If find(WABMSK, "", "SRH","SRL","SRS") & WZONCOU="" Return Endif
+# FGR 07/07/2015 : X3SUIVI109325
+
+If WZONCOU="BPAADD" & (dim(GADDACTMOD)<0 | GADDACTMOD<>"1") Return Endif
+# 79705 : V7 : SAT in SPRICLINK
+
+# 89812 : Pb accès depuis les retours
+Local Char    WANCCUR    : WANCCUR=[M]CUR
+Local Char    WANCVACBPR : WANCVACBPR=[M]VACBPR
+Local Integer WANCPRITYP : WANCPRITYP=[M]PRITYP
+Local Integer INICPRPRI  : INICPRPRI=1
+Local Char    WFLGTOT    : Raz WFLGTOT                : # 89275
+# 89812
+
+# On regarde d'abord dans quel cas on peut demander la recherche tarif
+Case WABMSK
+    When "SQH" :
+        Case WZONCOU
+            When "QUODAT"
+                If GREP = "D" | [M]QUODAT <> VALEUR Gosub CTL_TRTRECTAR_EXEC : Endif
+            # 71065 : PJT
+            #When "CUR", "PRITYP"
+            When "CUR", "PRITYP", "PJT"
+            # 71065 : PJT
+                # Si import, on passe dans la boucle de recalcul mais sans poser la question
+                If GIMPORT TYPPRG=1 Endif
+                Gosub CTL_TRTRECTAR_EXEC
+            # 79705 : V7 : SAT in SPRICLINK
+            When "BPAADD"
+                # Si import, on passe dans la boucle de recalcul mais sans poser la question
+                If GIMPORT TYPPRG=1 Endif
+                Gosub CTL_TRTRECTAR_EXEC
+            # 79705 : V7 : SAT in SPRICLINK
+            When Default
+        Endcase
+    When "SOH" :
+        Case WZONCOU
+            When "ORDDAT"
+                If GREP = "D" | [M]ORDDAT <> VALEUR Gosub CTL_TRTRECTAR_EXEC : Endif
+            When "CUR", "PRITYP", "PJT", "BPCINV"  # FGR 07/02/2014 : X3SUIVI95380 : ajout BPRINV
+                # Si import, on passe dans la boucle de recalcul mais sans poser la question
+                If GIMPORT TYPPRG=1 Endif
+                Gosub CTL_TRTRECTAR_EXEC
+            # 79705 : V7 : SAT in SPRICLINK
+            When "BPAADD"
+                # Si import, on passe dans la boucle de recalcul mais sans poser la question
+                If GIMPORT TYPPRG=1 Endif
+                Gosub CTL_TRTRECTAR_EXEC
+            # 79705 : V7 : SAT in SPRICLINK
+            When Default
+        Endcase
+    When "SDH" :
+        Case WZONCOU
+            When "SHIDAT"                   : # 84596  : Recalcul tarif/taxe en gestion livraison
+                # Si liv de cde, recherche tarif ssi le paramètre Recherche prix livraison cde = "Oui"
+                If [M:SDH1]NBLIG>0 & sigma(0,[M:SDH1]NBLIG-1,[M:SDH1]XSOHNUM(indcum)) <> "" & GSDHRECPRI<>2 Return Endif
+                Gosub CTL_TRTRECTAR_EXEC
+                # 84596
+            # 71065 : PJT
+            When "PJT"
+#               Si on passe dans la boucle de recalcul mais ne pas poser de question
+                If GIMPORT TYPPRG=1 Endif
+                Gosub CTL_TRTRECTAR_EXEC
+            # 71065 : PJT
+            # 79705 : V7 : SAT in SPRICLINK
+            When "BPAADD"
+                # Si import, on passe dans la boucle de recalcul mais sans poser la question
+                If GIMPORT TYPPRG=1 Endif
+                Gosub CTL_TRTRECTAR_EXEC
+            # 79705 : V7 : SAT in SPRICLINK
+            When Default
+        Endcase
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+#    When "TNH" :
+#        Case WZONCOU
+#            When "SHIDAT"
+#                Gosub CTL_TRTRECTAR_EXEC
+#            When "BPAADD"
+#                # Si import, on passe dans la boucle de recalcul mais sans poser la question
+#                If GIMPORT TYPPRG=1 Endif
+#                Gosub CTL_TRTRECTAR_EXEC
+#            When Default
+#        Endcase
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+    When "SIH" :
+        Case WZONCOU
+            When "INVDAT"
+                If GREP = "D" | [M:SIH0]INVDAT <> VALEUR Gosub CTL_TRTRECTAR_EXEC : Endif
+            # 71065 : PJT
+#            When "CUR", "PRITYP"
+#            When "CUR", "PRITYP", "PJT"                : # 95785 : Recalcul tarif/taxe si modification VATDAT
+            When "CUR", "PRITYP", "PJT", "VATDAT"       : # 95785
+            # 71065 : PJT
+#               Si on passe dans la boucle de recalcul mais ne pas poser de question
+                If GIMPORT TYPPRG=1 Endif
+                Gosub CTL_TRTRECTAR_EXEC
+            # 79705 : V7 : SAT in SPRICLINK
+            When "BPAADD"
+                # Si import, on passe dans la boucle de recalcul mais sans poser la question
+                If GIMPORT TYPPRG=1 Endif
+                Gosub CTL_TRTRECTAR_EXEC
+            # 79705 : V7 : SAT in SPRICLINK
+            When Default
+        Endcase
+    When Default
+Endcase
+TIT= mess(21,191,1)
+
+Return
+
+$CTL_TRTRECTAR_EXEC
+
+Case WABMSK
+    When "SQH" :
+        # Recalcul ssi devis non commandé
+        If [M:SQH2]NBLIG <> 0  & [M:SQH1]QUOSTA = 1 FIN=0 : Endif
+    When "SOH" :
+        # Recalcul ssi aucune ligne n'est soldée et si la commande est non livrée ou non facturée
+        # 107888 : Scheduled invoices : (LD:30/05/16)
+#        If [M:SOH4]NBLIG <> 0  & find(3, [M:SOH4]SOQSTA(0..[M:SOH4]NBLIG-1)) = 0
+#&            & (([M:SOH1]DLVSTA = 1 & [M:SOH0]SOHCAT <> 3)
+#&            |  ([M:SOH1]INVSTA = 1 & [M:SOH0]SOHCAT = 3))
+#            FIN=0
+#        Endif
+        # --> Cde normale/prêt          : La cde doit être non livrée (pr les articles livrables) et non facturée (pr les articles non livrables)
+        # --> Cde à facturation directe : La cde doit être non facturée
+        If [M:SOH4]NBLIG <> 0  & find(3, [M:SOH4]SOQSTA(0..[M:SOH4]NBLIG-1)) = 0
+&            & (([M:SOH1]DLVSTA = 1 & [M:SOH1]INVSTA = 1 & [M:SOH0]SOHCAT <> 3)
+&            |  ([M:SOH1]INVSTA = 1 & [M:SOH0]SOHCAT = 3))
+            FIN=0
+        Endif
+        # 107888 : Scheduled invoices : (LD:30/05/16)
+    When "SDH" :
+# 84596 : Recalcul tarif/taxe en gestion livraison
+#        # Recalcul ssi livraison non validée directe
+#        If [M:SDH1]NBLIG  <> 0 & [M:SDH1]CFMFLG = 1 &
+#&          sigma(0,[M:SDH1]NBLIG-1,[M:SDH1]XSOHNUM(indcum)) = ""
+#            FIN=0
+#        Endif
+        Case WZONCOU
+            When "PJT"                             :            # 71065 : PJT
+                # Recalcul ssi livraison non validée directe
+                If [M:SDH1]NBLIG  <> 0 & [M:SDH1]CFMFLG = 1 &
+&                 sigma(0,[M:SDH1]NBLIG-1,[M:SDH1]XSOHNUM(indcum)) = ""
+                    FIN=0
+                Endif
+            When "SHIDAT"                          :
+                # Recalcul ssi livraison non validée
+                If [M:SDH1]NBLIG <> 0 & [M:SDH1]CFMFLG = 1 FIN=0 Endif
+            When Default
+        Endcase
+# 84596
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+#    When "TNH" :
+#        Case WZONCOU
+#            When "SHIDAT"                          :
+#                # Recalcul ssi note de transport non validée
+#                If [M:TNH1]NBLIG <> 0 & [M:TNH1]CFMFLG = 1 FIN=0 Endif
+#            When Default
+#        Endcase
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+    When "SIH" :
+        # 95785 : Recalcul tarif/taxe si modification VATDAT
+        ## Recalcul ssi facture ou avoir direct
+        #If [M:SIH4]NBLIG  <> 0 & [M:SIH1]SIHORI = 1 FIN=0 : Endif
+        Case WZONCOU
+            When "INVDAT","CUR","PRITYP","PJT","BPAADD"  :      # 71065 : PJT
+            #When "INVDAT","CUR","PRITYP","BPAADD"  :           # 71065 : PJT
+                # Recalcul ssi facture ou avoir direct
+                If [M:SIH4]NBLIG  <> 0 & [M:SIH1]SIHORI = 1 FIN=0 : Endif
+            When "VATDAT"                                :
+                # Recalcul quelquesoit l'origine de la facture/avoir
+                If [M:SIH4]NBLIG  <> 0 FIN=0 : Endif
+            When Default
+        Endcase
+        # 95785
+    When Default
+Endcase
+Return
+
+$EXEC_TRTRECTAR
+Local Integer NLIG
+Local Date    WANCDATE        : # 101874 : V9 : : Taxe code control
+
+GTARFLG = "1"
+
+Case WABMSK
+    When "SQH" :
+        Case WZONCOU
+            When "QUODAT","PJT","BPAADD" :   # 71065 : PJT
+            #When "QUODAT", "BPAADD"     :   # 71065 : PJT
+            #When "QUODAT"          :   # 87398 : Pb Pas de recalcul tarif
+            #When "BPAADD"          :   # 79705 : V7 : SAT in SPRICLINK : # 87398
+#               On redescend la modification sur tous les détails
+                Raz NLIG
+                Raz [M]QUONOT,QUOATI,PFMTOT
+                Raz [M]DSPTOTQTY,DSPTOTVOL,DSPTOTWEI       :#--CPO 80622 Il faut refaire les totaux
+                # 101874 : V9 : Taxe code control
+                #If WZONCOU="QUODAT" [M]QUODAT = VALEUR Endif
+                If WZONCOU="QUODAT"
+                    WANCDATE=[M]QUODAT : [M]QUODAT = VALEUR
+                Endif
+                # 101874
+                While NLIG < [M]NBLIG
+                   Call LECT_FIC(NLIG) From SUBSQHB
+                   Gosub RECALC_TARIF From SUBSQHB
+                   NLIG+=1
+                Wend
+                Raz GTARFLG
+                # Ne pas faire VALTTC en import,il sera fait une seule fois à la création (INICRE)
+
+                # 101874 : V9 : Taxe code control
+                #If !GIMPORT : Call VALTTC ("GESSQH") From TRTVENFACR : Endif
+                If !GIMPORT
+                    # Valuation is done in this case
+                    GVALTTC=2
+                    #---- Paramètres complementaires appel valorisation
+                    # PARAM_T(0) : Flag contrôle des taxes             (1=Non/2=Oui)
+                    # PARAM_T(1) : Lecture de la trace par le sous-pro (1=Non/2=Oui)
+                    # PARAM_T(2) : Flag retour (1=KO/2=OK)
+                    Local    Char     PARAM_T (25) (0..10)
+                    PARAM_T(0)=num$(1)      : # Pas de contrôle des taxes sur le bouton valorisation
+                    PARAM_T(1)=num$(1)      : # Pas de lecture de la trace
+                    PARAM_T(2)=num$(0)
+                    Call VALTTC ("GESSQH", PARAM_T) From TRTVENFACR
+                    If PARAM_T(2)="1"
+                        WFLGERR=1
+                        If WZONCOU="QUODAT" [M]QUODAT = WANCDATE : Endif
+                        Return
+                    Endif
+                Endif
+                # 101874
+
+                Affzo [M:SQH2]5,10,15,20
+            When "CUR" , "PRITYP"
+#               On redescend la modification sur tous les détails
+                Raz NLIG
+                Raz [M]QUONOT,QUOATI,PFMTOT
+                Raz [M]DSPTOTQTY,DSPTOTVOL,DSPTOTWEI       :#--CPO 80622 Il faut refaire les totaux
+#               Il faut être sûr qu'on aura la bonne valeur
+                If WZONCOU="CUR" [M]CUR=VALEUR Endif
+                If WZONCOU="PRITYP" [M:SQH1]PRITYP = VALEUR Endif
+                While NLIG < [M]NBLIG
+                    Call LECT_FIC(NLIG) From SUBSQHB
+                    Gosub RECALC_TARIF From SUBSQHB
+                    NLIG+=1
+                Wend
+                # Ne pas faire VALTTC en import,il sera fait une seule fois à la création (INICRE)
+                # 101874 : V9 : Taxe code control
+                #If !GIMPORT : Call VALTTC ("GESSQH") From TRTVENFACR : Endif
+                If !GIMPORT
+                    # Valuation is done in this case
+                    GVALTTC=2
+                    #---- Paramètres complementaires appel valorisation
+                    # PARAM_T(0) : Flag contrôle des taxes             (1=Non/2=Oui)
+                    # PARAM_T(1) : Lecture de la trace par le sous-pro (1=Non/2=Oui)
+                    # PARAM_T(2) : Flag retour (1=KO/2=OK)
+                    Local    Char     PARAM_T (25) (0..10)
+                    PARAM_T(0)=num$(1)      : # Pas de contrôle des taxes sur le bouton valorisation
+                    PARAM_T(1)=num$(1)      : # Pas de lecture de la trace
+                    PARAM_T(2)=num$(0)
+                    Call VALTTC ("GESSQH", PARAM_T) From TRTVENFACR
+                    If PARAM_T(1)="2"
+                        WFLGERR=1
+                        If WZONCOU="CUR" [M]CUR=WANCCUR Endif
+                        If WZONCOU="PRITYP" [M:SQH1]PRITYP = WANCPRITYP Endif
+                        Return
+                    Endif
+                Endif
+                # 101874
+
+                Affzo [M:SQH2]5,10,15,20
+            When Default
+        Endcase
+
+    When "SOH" :
+        Case WZONCOU
+            When "ORDDAT","PJT","BPAADD" :   # 71065 : PJT  : # Issue X3-59514
+            #When "QUODAT","PJT","BPAADD" :   # 71065 : PJT : # Issue X3-59514
+            #When "QUODAT", "BPAADD"     :   # 71065 : PJT
+            #When "ORDDAT"              # 87398 : Pb Pas de recalcul tarif
+            #When "BPAADD"          :   # 79705 : V7 : SAT in SPRICLINK : # 87398
+                If WZONCOU="ORDDAT" [M:SOH0]ORDDAT = VALEUR Endif
+                Gosub RECALC_LIGNE From SUBSOHB
+                Raz GTARFLG
+            When "CUR", "PRITYP"
+                If WZONCOU="CUR" [M]CUR = VALEUR  Endif
+                If WZONCOU="PRITYP" [M:SOH1]PRITYP = VALEUR Endif
+                Gosub RECALC_LIGNE From SUBSOHB
+            When "BPCINV"
+                # Issue 112065
+                ## FGR 07/02/2014 : X3SUIVI95380 : Cas BPCINV
+                #Call ALICDE(1,"F",VALEUR) From TRTVENCDE
+                If GREP="C" Call ALICDE(1,"F",VALEUR) From TRTVENCDE Endif
+                # End issue 112065
+                Gosub RECALC_LIGNE From SUBSOHB
+            When Default
+        Endcase
+
+    When "SDH" :
+        Case WZONCOU
+            When "SHIDAT"           :   # 84596 : Recalcul tarif/taxe en gestion livraison
+                [M]SHIDAT=VALEUR
+                Gosub RECALC_LIGNE From SUBSDHB
+            # 84596
+            When "PJT", "BPAADD"    :   # 71065 : PJT
+            #When "BPAADD"          :   # 71065 : PJT
+                Gosub RECALC_LIGNE From SUBSDHB
+                Raz GTARFLG
+            When Default
+        Endcase
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+#    When "TNH" :
+#        Case WZONCOU
+#            When "SHIDAT"
+#                [M]SHIDAT=VALEUR
+#                Gosub RECALC_LIGNE From SUBTNHB
+#            When "BPAADD"
+#                Gosub RECALC_LIGNE From SUBTNHB
+#                Raz GTARFLG
+#            When Default
+#        Endcase
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+    When "SIH" :
+           Case WZONCOU
+            When "INVDAT", "PJT", "BPAADD", "VATDAT"     : # 71065 : PJT
+            #When "INVDAT", "BPAADD", "VATDAT"           : # 71065 : PJT
+            #When "INVDAT", "BPAADD"                     : # 95785 : Recalcul tarif/taxe si modification VATDAT
+            #When "INVDAT"                               : # 87398
+            #When "BPAADD"                               : # 79705 : V7 : SAT in SPRICLINK : # 87398
+                If WZONCOU="INVDAT" [M:SIH0]INVDAT = VALEUR Endif
+                # 98434 : Raz [M]BPAADD if we went from Address window from Address menu
+                # In this case VALEUR is not charged
+                #If WZONCOU="BPAADD" [M]BPAADD = VALEUR Endif    :    # 79705 : V7 : SAT in SPRICLINK
+                If WZONCOU="BPAADD" & VALEUR<>""
+                    [M]BPAADD = VALEUR
+                Endif
+                # 98434
+                If WZONCOU="VATDAT" [M]VATDAT = VALEUR Endif    :    # 95785 : Recalcul tarif/taxe si modification VATDAT
+                Gosub RECALC_LIGNE From SUBSIHB
+                Raz GTARFLG
+            When "CUR", "PRITYP"
+                If WZONCOU="CUR"
+                  # Recalcul de l'en-cours et de l'en-cours autorise et des montants de facturation
+                  Call CONVERT_MONTANT (VALEUR, [M:SIH2]CUR, [M:SIH2]CURTYP) From SUBSIHB
+                  [M:SIH2]CUR = VALEUR
+                  [M:SIH0]CUR = VALEUR
+                Endif
+                If WZONCOU="PRITYP" [M:SIH1]PRITYP = VALEUR Endif
+                Gosub RECALC_LIGNE From SUBSIHB
+            When Default
+        Endcase
+
+    When Default
+Endcase
+
+Return
+
+$SORTIE_TRTRECTAR
+
+# 84596 : Recalcul tarif/taxe en gestion livraison
+# Si modif date expé et on a pas demandé de nvelle recherche tarif : on force un recalcul des taxes (GTARFLG=2)
+If WABMSK="SDH" & WZONCOU="SHIDAT" & GTARFLG="" GTARFLG="2" Endif
+# 84596
+
+# 91606 :(04/08/14) Transportation notes (Sales part dev)
+# Si modif date expé et on a pas demandé de nvelle recherche tarif : on force un recalcul des taxes (GTARFLG=2)
+#If WABMSK="TNH" & WZONCOU="SHIDAT" & GTARFLG="" GTARFLG="2" Endif
+# 91606 :(04/08/14) Transportation notes (Sales part dev)
+
+# 95785 : Recalcul tarif/taxe en gestion facture
+# Si modif VATDAT et on a pas demandé de nvelle recherche tarif : on force un recalcul des taxes (GTARFLG=2)
+If WABMSK="SIH" & WZONCOU="VATDAT" & GTARFLG="" GTARFLG="2" Endif
+# 95785
+
+If dim(GPJTACTMOD)>0 Kill GPJTACTMOD Endif    : # 71065 : PJT
+If dim(GADDACTMOD)>0 Kill GADDACTMOD Endif    : # 79705 : V7 : SAT in SPRICLINK
+
+mkstat=SAVMKSTAT                              : # 79705 : V7 : SAT in SPRICLINK
+
+# 101874 : V9 : Taxe code control
+# There are errors and the control is blocking
+If WFLGERR=1 mkstat=2 Endif
+
+Return
+
+################################################################################
+# TRTRECTARD : Demande de recherche tarif sur une ligne                        #
+################################################################################
+$INI_TRTRECTARD
+
+Local Char    WABREV     : WABREV  = PARAM(1)
+Local Char    WFLDNAM    : WFLDNAM = PARAM(2)
+Local Char    WCUR       : WCUR    = PARAM(3)
+Local Integer WLIG       : WLIG    = val(PARAM(4))
+Local Char    WABREVMSK
+
+# En import, l'action est exécutée mais il ne faut pas poser de question
+# --> Pas d'affichage de la fenêtre Oui/Non
+If GIMPORT TYPPRG=1 Endif
+
+FIN=1
+Gosub CTL_TRTRECTARD_EXEC
+
+TIT= mess(21,191,1)
+
+Return
+
+$CTL_TRTRECTARD_EXEC
+
+Case WABREV
+    When "SQH" :
+        # Recalcul ssi :
+        # Ligne non commandée et non gratuite
+        If [M:SQH2]DSOHNUM(WLIG)="" & [M:SQH2]FOCFLG(WLIG)<>3 FIN=0 Endif
+    When "SOH" :
+        # Recalcul ssi :
+        # Commande non soldée, Ligne non soldée
+        # Ligne non livrée, non facturée, non gratuite
+        If [M:SOH1]ORDSTA <> 2 & [M:SOH4]SOQSTA(WLIG) <> 3 &
+&          [M:SOH4]ODLQTY(WLIG) = 0 & [M:SOH4]DLVQTY(WLIG) = 0 & [M:SOH4]INVQTY(WLIG) = 0 &
+&          [M:SOH4]FOCFLG(WLIG) <> 3
+           FIN=0
+        Endif
+    When "SDH" :
+        # Recalcul ssi :
+        # Ligne directe, non gratuite
+        If [M:SDH1]XSOHNUM(WLIG)="" & [M:SDH1]FOCFLG(WLIG)<>3 FIN=0 Endif
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+#    When "TNH" :
+#        # Recalcul ssi :
+#        # Ligne  non gratuite
+#        If [M:TNH1]FOCFLG(WLIG)<>3 FIN=0 Endif
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+    When "SIH" :
+        # Recalcul ssi :
+        # Facture ou (avoir direct)
+        # Document non validé
+        # Ligne directe
+        # Qté renseignée (pas de recalcul ligne d'avoir en montant)
+        # Ligne non gratuite
+        If ([M:SIH0]INVTYP=1 | ([M:SIH0]INVTYP=2 & [M:SIH1]SIHORI=1)) &
+&          [M:SIH1]INVSTA<>3 &
+&          ([M:SIH4]SOHNUM(WLIG)="" & [M:SIH4]SDHNUM(WLIG)="" & [M:SIH4]SQHNUM(WLIG)="" &
+&           [M:SIH4]CONNUM(WLIG)="" & [M:SIH4]SRENUM(WLIG)="" & [M:SIH4]SGHNUM(WLIG)="" &
+&           [M:SIH4]XSIHORINUM(WLIG)="") &
+&          [M:SIH4]QTY(WLIG)<>0 &
+&          [M:SIH4]FOCFLG(WLIG) <> 3
+          FIN=0
+        Endif
+    When Default
+Endcase
+Return
+
+$EXEC_TRTRECTARD
+
+Case WABREV
+ When "SQH" : WABREVMSK="SQH2"
+ When "SOH" : WABREVMSK="SOH4"
+ When "SDH" : WABREVMSK="SDH1"
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+ #When "TNH" : WABREVMSK="TNH1"
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+ When "SIH" : WABREVMSK="SIH4"
+Endcase
+
+Assign ("[M:"+WABREVMSK+"]"+WFLDNAM+"("+num$(WLIG)+")") With VALEUR
+
+Call TRTRECTARD(WABREV, WCUR, WLIG)
+
+Return
+# 79705 : SAT in SPRICLINK : Step 2
+
+#########################################################################
+#-----------------------------------------------------------------------#
+# Traitements non e_commerce                                            #
+#-----------------------------------------------------------------------#
+#########################################################################
+#                                                                       #
+# Subprog RECH_TARIF(TYPRECH, ITMREF, NLIG, QTY, TYPALI, GROPRI)        #
+#     Recherche du tarif                                                #
+#                                                                       #
+# Subprog RECH_GROUPE(TYPALI)                                           #
+#     Recherche du tarif groupe                                         #
+#                                                                       #
+# Subprog RECH_INTERDIT(ITMREF, BPAADD, REP, FUNCTION)                  #
+#      Recherche interdit                                               #
+#                                                                       #
+#########################################################################
+#-----------------------------------------------------------
+# RECH_TARIF : Recherche tarif
+#-----------------------------------------------------------
+# Entrée  TYPRECH   : Type recherche (1:normal 4:composant)
+#         ITMREF    : Article
+#         NLIG      : Ligne tableau
+#         QTY       : Quantité UV
+#         TYPALI    : Type alimentation
+#                     SQH:devis , SOH:cde , SDH:liv , SIH:fac
+#                                           SDD:liv auto
+#                     SCS:trf inter-soc
+# Sortie  GROPRI    : Prix brut
+#-----------------------------------------------------------
+Subprog RECH_TARIF(TYPRECH, ITMREF, NLIG, QTY, TYPALI, GROPRI)
+Value    Integer  TYPRECH
+Value    Char     ITMREF
+Value    Integer  NLIG
+Value    Decimal  QTY
+Value    Char     TYPALI
+Variable Decimal  GROPRI
+
+Local    Decimal  MONTANT   (0..10), MNTDES
+Local    Shortint MOTIF     (0..10), PRIORITE (0..10)
+Local    Char     PLI       (GLONSPC) (0..10)
+Local    Char     PLICRD    (GLONVCR) (0..10)
+Local    Integer  PLILIN              (0..10)
+Local    Char     FOCITMREF (GLONITM)
+Local    Char     FOCUOM    (GLONUOM)
+Local    Decimal  FOCQTY
+Local    Char     CLIREF    (GLONBPR)
+Local    Shortint FOCMOTIF
+Local    Date     PLISTRDAT, PLIENDDAT, DATREF
+Local    Libelle  INTERDIT,  ERR
+Local    Char     VAT       (GLONVAT)(3)
+Local    Integer  SPSTAT
+Local    Shortint WPRIREN
+
+Local    Char     LSAU      (GLONUOM)
+Local    Integer  LCHGTYP
+Local    Char     LCUR      (GLONCUR)
+Local    Integer  LPRITYP
+Local    Decimal  LPRIX, LAMT1, LAMT2
+Local    Char     LVACBPR   (GLONTVB)
+Local    Decimal  WRATRPT, WCOEFDEVISE  : Raz WRATRPT : # Bug 65663
+Local    Integer  WI                                  : # Bug 65663
+
+#---- Paramètres complementaires appel recherche tarifs
+Local    Char     PARAM_T (25) (0..5) : # indice 0 = coef. multiplicateur UV --> US : # indice 1 = régime de taxe
+                                      : # indice 1 = Régime de taxe
+                                      : # indice 2 = coef. conversion devise (si facture)
+                                      : # indice 3 = Date pour conversion prix HT/TTC   : # Bug 84596
+Raz PARAM_T(3) : # Bug 84596 : Date pour conversion prix HT/TTC
+
+#----------------------------------------------------------------#
+# Appel au sous prog de recherche tarif                          #
+# Lecture des enr. succeptibles d'être des critères de recherche #
+#----------------------------------------------------------------#
+Case TYPALI
+ When "SDD"   : CLIREF=[F:SDH]BPCORD
+ When "CRM"   : CLIREF=[M:SPSW]BPCREF
+ When "SCS"   : CLIREF=[M:SCS1]BPCNUM
+ When Default : CLIREF=[M]BPCORD
+Endcase
+Case TYPALI
+ When "CRM"   : DATREF=[M:SPSW]DATREF
+ When "SQH"   : DATREF=[M]QUODAT
+ When "SOH"   : DATREF=[M]ORDDAT
+ When "SDH"   : DATREF=[M]SHIDAT
+                PARAM_T(3)=[M]DLVDAT     : # Bug 84596 : Date pour conversion prix HT/TTC
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+# When "TNH"   : DATREF=[M]SHIDAT
+#                PARAM_T(3)=[M]DLVDAT
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+ When "SDD"   : DATREF=[F:SDH]SHIDAT
+                PARAM_T(3)=[F:SDH]DLVDAT : # Bug 84596 : Date pour conversion prix HT/TTC
+ When "SIH"   : DATREF=[M]INVDAT
+                # Bug 95337 : Paramètre date pour le calcul des taxes :
+                # Utiliser [M]VATDAT si le champ est renseigné (sinon ce sera [M]INVDAT par défaut)
+                If dim([M:SIH2]VATDAT)>0 & [M:SIH2]VATDAT<>[0/0/0]
+                    PARAM_T(3)=[M]VATDAT
+                Endif
+                # Bug 95337
+ When "SCS"   : DATREF=[M:SCS1]IPTDAT
+Endcase
+
+#-- 80866
+If clalev([F:REP]) = 0 Local File SALESREP [REP] Endif
+
+# X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+#Read [ITM]ITM0=ITMREF : #Call LECTURE ("ITM",ITMREF,"") From CONTOBJ
+#Read [ITS]ITS0=ITMREF : #Call LECTURE ("ITS",ITMREF,"") From CONTOBJ
+#Read [BPR]BPR0=CLIREF
+#Read [BPC]BPC0=CLIREF
+
+If [F:ITM]ITMREF<>ITMREF
+    Read [ITM]ITM0=ITMREF : #Call LECTURE ("ITM",ITMREF,"") From CONTOBJ
+Endif
+If [F:ITS]ITMREF<>ITMREF
+    Read [ITS]ITS0=ITMREF : #Call LECTURE ("ITS",ITMREF,"") From CONTOBJ
+Endif
+If [F:BPR]BPRNUM<>CLIREF
+    Read [BPR]BPR0=CLIREF
+Endif
+If [F:BPC]BPCNUM<>CLIREF
+    Read [BPC]BPC0=CLIREF
+Endif
+# X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+
+#Call LECTURE ("MVC",GFINRSP,CLIREF) From CONTOBJ
+If TYPALI = "SQH" | TYPALI = "SOH"
+   # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+#   Read [BPD]BPD0=CLIREF;[M]DBPAADD(NLIG)
+
+   If [F:BPD]BPCNUM<>CLIREF | [F:BPD]BPAADD<>[M]DBPAADD(NLIG)
+      Read [BPD]BPD0=CLIREF;[M]DBPAADD(NLIG)
+   Endif
+   # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+Elsif TYPALI="SDD"
+   Read [BPD]BPD0=CLIREF;[F:SDH]BPAADD : #Call LECTURE ("BPD",[F:SDH]BPAADD,CLIREF) From CONTOBJ
+   #-- 80866
+   Read [REP]REP0=[F:SDD]REP1          : #Call LECTURE ("REP",[F:SDD]REP1,"") From CONTOBJ
+Elsif TYPALI="CRM"
+   #-- 80866
+   Read [AUS]CODUSR=[M:SPSW]USRREF     : #Call LECTURE ("AUS",[M:SPSW]USRREF,"") From CONTOBJ
+Elsif TYPALI="SCS"
+   Read [BPD]BPD0=CLIREF;[M:SCS1]FCYADD :
+Else
+   Read [BPD]BPD0=CLIREF;[M]BPAADD
+Endif
+If dim([M]REP1(NLIG)) >0
+   #-- 80866
+   # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+#   Read [REP]REP0=[M]REP1(NLIG)        : #Call LECTURE ("REP",[M]REP1(NLIG),"") From CONTOBJ
+
+   If [F:REP]REPNUM<>[M]REP1(NLIG)
+      Read [REP]REP0=[M]REP1(NLIG)        : #Call LECTURE ("REP",[M]REP1(NLIG),"") From CONTOBJ
+   Endif
+   # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+
+   If fstat : Raz [F:REP] : Endif :#--CPO 103320
+Endif
+
+# Bug 72588 : Lecture de l'article-site
+If find(TYPALI, "SQH","SOH","SIH")
+   # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+#   Read [ITF]ITF0=ITMREF;[M]DSTOFCY(NLIG)
+
+   If [F:ITF]ITMREF<>ITMREF| [F:ITF]STOFCY<>[M]DSTOFCY(NLIG)
+      Read [ITF]ITF0=ITMREF;[M]DSTOFCY(NLIG)
+   Endif
+   # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+   If fstat Raz [F:ITF] : Endif
+Elsif TYPALI="SDD"
+   Read [ITF]ITF0=ITMREF;[F:SDH]STOFCY
+   If fstat Raz [F:ITF] : Endif
+Elsif TYPALI="SCS"
+   Read [ITF]ITF0=ITMREF;[M:SCS1]STOFCY
+   If fstat Raz [F:ITF] : Endif
+Elsif TYPALI="SDH"
+   Read [ITF]ITF0=ITMREF;[M]STOFCY
+   If fstat Raz [F:ITF] : Endif
+# 91606 :(04/08/14) Transportation notes (Sales part dev)
+#Elsif TYPALI="TNH"
+#   Read [ITF]ITF0=ITMREF;[M]STOFCY
+#   If fstat Raz [F:ITF] : Endif
+# 91606 :(04/08/14) Transportation notes (Sales part dev)
+Endif
+# Bug 72588
+
+nolign=NLIG+1
+Call ALIPLK  (TYPALI) From TRTPRICE
+
+Case TYPALI
+ When "CRM"   : VAT(0)     = [M:SPSW]VAT(0)
+                VAT(1)     = [M:SPSW]VAT(1)
+                VAT(2)     = [M:SPSW]VAT(2)
+                LSAU       = [M:SPSW]SAU
+                LCHGTYP    = [M:SPSW]CHGTYP
+                LVACBPR    = [M:SPSW]VACBPR
+                LCUR       = [M:SPSW]CUR
+                LPRITYP    = [M:SPSW]PRITYP
+                LAMT1      = [M:SPSW]CLCAMT1
+                LAMT2      = [M:SPSW]CLCAMT2
+ When "SDD"   : VAT(0)     = [F:SDD]VAT(0)
+                VAT(1)     = [F:SDD]VAT(1)
+                VAT(2)     = [F:SDD]VAT(2)
+                LSAU       = [F:SDD]SAU
+                LSAUSTUCOE = [F:SDD]SAUSTUCOE
+                LCHGTYP    = [F:SDH]CHGTYP
+                LVACBPR    = [F:SDH]VACBPR
+                LCUR       = [F:SDH]CUR
+                LPRITYP    = [F:SDH]PRITYP
+                LAMT1      = [F:SDD]CLCAMT1
+                LAMT2      = [F:SDD]CLCAMT2
+                If dim([F:SDD]SAUSTUCOE)>0 : PARAM_T(0)=num$([F:SDD]SAUSTUCOE) Endif
+ When "SCS"   : VAT(0)  = [M:SCS1]VAT1(NLIG)
+                VAT(1)  = [M:SCS1]VAT2(NLIG)
+                VAT(2)  = [M:SCS1]VAT3(NLIG)
+                LSAU    = [M:SCS1]PCU(NLIG)
+                LCHGTYP = [M:SCS1]CHGTYP
+                LVACBPR = [M:SCS1]VACBPR
+                LCUR    = [M:SCS1]CUR
+                LPRITYP = [M:SCS1]PRITYP
+                LAMT1   = [M:SCS1]CLCAMT1(NLIG)
+                LAMT2   = [M:SCS1]CLCAMT2(NLIG)
+                PARAM_T(0)=num$([M]PCUSTUCOE(NLIG))
+When Default :  VAT(0)  = [M]VAT1(NLIG)
+                VAT(1)  = [M]VAT2(NLIG)
+                VAT(2)  = [M]VAT3(NLIG)
+                LSAU    = [M]SAU(NLIG)
+                LCHGTYP = [M]CHGTYP
+                LVACBPR = [M]VACBPR
+                LCUR    = [M]CUR
+                LPRITYP = [M]PRITYP
+                LAMT1   = [M]CLCAMT1(NLIG)
+                LAMT2   = [M]CLCAMT2(NLIG)
+                If dim([M]SAUSTUCOE)>0 : PARAM_T(0)=num$([M]SAUSTUCOE(NLIG)) Endif
+                # Bug 60443
+                If TYPALI="SIH" & dim([M]RATDIV)>0 & [M]RATDIV(GTYPGEN-1)<>0
+                  If dim([M]RATMLT)>0 & [M]RATMLT(GTYPGEN-1)<>0 :# FQ 67415
+                    PARAM_T(2)=num$(arr((1/([M]RATMLT(GTYPGEN-1)/[M]RATDIV(GTYPGEN-1))), 10^-GDECRCU)) : # Bug 65663
+                  Endif
+                Endif
+                # Bug 65663
+                If TYPALI="SIH" & dim([M]RATDIV)>0
+                    WI=find(GSYSCUR,[M]CURLED)
+                    If WI & [M]RATDIV(WI-1)<>0
+                      If dim([M]RATMLT)>0 & [M]RATMLT(WI-1)<>0 :# FQ 67415
+                        WRATRPT=arr((1/([M]RATMLT(WI-1)/[M]RATDIV(WI-1))), 10^-GDECRCU)
+                      Endif
+                    Endif
+                Endif
+Endcase
+
+PARAM_T(1)=LVACBPR
+
+Gosub PE_RECHTARIF   : # GPOINT="RECHTARIF"
+
+Call TARIFRECH(5, TYPRECH, TYPALI, DATREF, QTY, LSAU, LCHGTYP,
+&         LCUR, LPRITYP, VAT, PARAM_T,
+&         MONTANT, MOTIF, PRIORITE,
+&         PLI, PLICRD, PLILIN,
+&         FOCITMREF, FOCQTY, FOCUOM, FOCMOTIF,
+&         PLISTRDAT, PLIENDDAT, INTERDIT, ERR) From TRTPRICE
+
+#----------------------------------------------------------------#
+# Alimentation de l'ecran de simulation SPSIMUL1 s'il est actif  #
+#----------------------------------------------------------------#
+If dim([M:SPM1]XMOTIFA)>0 & dim([M:SPM1]XMOTIFB)>0
+  For I=0 To 9
+    [M:SPM1]PLI(I)    = PLI(I)
+    [M:SPM1]PIO(I)    = PRIORITE(I)
+    [M:SPM1]PLICRD(I) = PLICRD(I)
+    [M:SPM1]PLILIN(I) = PLILIN(I)
+  Next I
+Endif
+
+#----------------------------------------------------------------#
+# Alimentation des frais/remises                                 #
+#----------------------------------------------------------------#
+Case TYPALI
+ When "CRM" :
+     For I = 1 To 9
+         If evalue ("dim([M:SPSW]DISCRGVAL"+num$(I)+")") > 0
+             Assign "[M:SPSW]DISCRGVAL"+num$(I) With MONTANT(I)
+             Assign "[M:SPSW]DISCRGREN"+num$(I) With MOTIF(I)
+         Endif
+     Next
+ When "SDD" :
+     For I = 1 To 9
+         If evalue ("dim([F:SDD]DISCRGVAL"+num$(I)+")") > 0
+             Assign "[F:SDD]DISCRGVAL"+num$(I) With MONTANT(I)
+             Assign "[F:SDD]DISCRGREN"+num$(I) With MOTIF(I)
+         Endif
+     Next
+     [F:SDD]REPCOE = MONTANT(10)
+ When "SCS" :
+     For I = 1 To 9
+        If evalue ("dim([M:SCS1]DISCRGVAL"+num$(I)+"(NLIG))") > 0
+            Assign "[M:SCS1]DISCRGVAL"+num$(I)+"(NLIG)" With MONTANT(I)
+        Endif
+     Next
+ When Default :
+    For I = 1 To 9
+        If evalue ("dim([M]DISCRGVAL"+num$(I)+"(NLIG))") > 0
+            Assign "[M]DISCRGVAL"+num$(I)+"(NLIG)" With MONTANT(I)
+            Assign "[M]DISCRGREN"+num$(I)+"(NLIG)" With MOTIF(I)
+        Endif
+    Next
+    [M]REPCOE(NLIG) = MONTANT(10)
+Endcase
+#-------------------------------------------------------------------------------#
+# Prix brut à 0 : Application du prix de base sf pour composants                #
+#                                             sf pour les articles non vendus   #
+#                                             sf pour les articles sous-traités #
+#                 --> Conversion prix de base dans unité  cde                   #
+#                 --> Conversion prix de base dans devise cde                   #
+#-------------------------------------------------------------------------------#
+
+If MONTANT(0) = 0 & MOTIF(0) = 0 & TYPRECH = 1 & [F:ITM]SALFLG=2 & !find([F:SPK]LINTYP, 10)
+   If LSAU <> [F:ITM]SAU
+      GBIDD1=val(PARAM_T(0)) : # indice 0 = coef. conversion UV --> US
+      If GBIDD1=0
+          Call SREC_COE(ITMREF,CLIREF,[F:ITM]SAU, LSAU,GBIDD1) From TRTVENQTE
+      Else
+          # calcul coef. conversion UV cde --> UV article  car le prix de base est exprimé ds l'UV article
+          # coef. conversion UV --> US / coef. conversion UV --> US de la fiche article
+          GBIDD1=GBIDD1/[F:ITM]SAUSTUCOE
+          # Issue X3-24710
+          # Like in SREC_COE From TRTVENQTE Used in price search when a conversion in document unit is necessary
+          # Do not round the coefficient to calculate the good price
+          #GBIDD1=arr(GBIDD1,0.000001)
+          # End issue X3-24710
+          If GBIDD1=0 : GBIDD1=1 : Endif
+      Endif
+      If GBIDD1 <> 0
+         GROPRI = [F:ITS]BASPRI * GBIDD1
+      Else
+         GROPRI = 0
+      Endif
+   Else
+      GROPRI = [F:ITS]BASPRI
+   Endif
+   If LCUR <> GSYSCUR & GROPRI <> 0
+       # Bug 65663
+       If WRATRPT<>0
+           WCOEFDEVISE=WRATRPT
+       Else
+           Call CONVERT(GSYSCUR,LCUR,GLOCALDEV,LCHGTYP,DATREF,1000000000000.00,WCOEFDEVISE,GBIDI3) From TRTDEV
+           If GBIDI3=0 & WCOEFDEVISE<>0 WCOEFDEVISE=WCOEFDEVISE/1000000000000.00 Else WCOEFDEVISE=1 Endif
+       Endif
+       GROPRI = GROPRI*WCOEFDEVISE
+       #Call CONVERT2(GSYSCUR,LCUR,GLOCALDEV,LCHGTYP,DATREF,GROPRI,MNTDES,SPSTAT) From TRTDEV
+       #GROPRI = MNTDES
+   Endif
+
+   # Si document avec type prix en TTC, il faut passer le prix de base (HT) en TTC
+   If LPRITYP=2
+      # Bug 84596 : Date pour conversion prix HT/TTC
+      Local Date WDATCONVPRI
+      If PARAM_T(3)<>"" WDATCONVPRI=PARAM_T(3) Else WDATCONVPRI=DATREF Endif
+      #Call CLCTAXEPRIV(GROPRI,VAT,1,GSOCIETE,DATREF,QTY,LVACBPR,LAMT1,LAMT2,LPRIX) From TRTX3
+      Call CLCTAXEPRIV(GROPRI,VAT,1,GSOCIETE,WDATCONVPRI,QTY,LVACBPR,LAMT1,LAMT2,LPRIX) From TRTX3
+      # Bug 84596
+      GROPRI = LPRIX
+   Endif
+
+   GROPRI  = arr(GROPRI,10^-GDECPRI)
+
+   WPRIREN = GUPDPRISAL
+Else
+   GROPRI  = MONTANT (0)
+   WPRIREN = MOTIF(0)
+Endif
+
+Case TYPALI
+ When "CRM"   : [M:SPSW]PRIREN  =WPRIREN
+ When "SDD"   : [F:SDD]PRIREN  =WPRIREN
+ When "SCS"   :
+ When Default : [M]PRIREN(NLIG)=WPRIREN
+Endcase
+
+Gosub PE_RECHTARIF1  : # GPOINT="RECHTARIF1"
+
+#----------------------------------------------------------------#
+# Gestion des gratuits                                           #
+#----------------------------------------------------------------#
+#If find(TYPALI,"SDD","SCS") End : Endif        : # Bug 83114
+If find(TYPALI,"SDD","SCS","CRM") End : Endif   : # Bug 83114
+
+If TYPRECH = 4 End : Endif
+GFOCQTY    = FOCQTY
+GFOCITMREF = FOCITMREF
+GFOCUOM    = FOCUOM
+GFOCMOTIF  = FOCMOTIF
+If GFOCQTY <> 0 & GFOCITMREF = ""
+   GFOCITMREF = [M]ITMREF(NLIG)
+   GFOCUOM    = [M]SAU(NLIG)
+Endif
+End
+
+#----------
+$PE_RECHTARIF
+GPOINT="RECHTARIF" : Gosub ENTREE From EXEFNC
+Return
+
+$PE_RECHTARIF1
+GPOINT="RECHTARIF1" : Gosub ENTREE From EXEFNC
+Return
+
+#-------------------------------------------------------------#
+# Recherche tarif groupe                                      #
+# Entrée  TYPALI    : Type alimentation                       #
+#                     SQH:devis , SOH:cde , SDH:liv , SIH:fac #
+#-------------------------------------------------------------#
+Subprog RECH_GROUPE(TYPALI)
+Value    Char     TYPALI
+
+If dim([V]GGRPNBRFOC)<=0 : Global Integer GGRPNBRFOC : GGRPNBRFOC=6 : Endif
+
+Local    Decimal  QTY
+Local    Char     UOM       (GLONUOM)
+Local    Char     CLIREF    (GLONBPR)
+Local    Char     VAT       (GLONVAT) (3)
+Local    Decimal  MONTANT             (0..10)
+Local    Shortint MOTIF (0..10), PRIORITE (0..10)
+Local    Char     PLI       (GLONSPC) (0..10)
+Local    Char     PLICRD    (GLONVCR) (0..10)
+Local    Integer  PLILIN              (0..10)
+# 87921 : Param Nb de gratuit issu de groupé=0
+#Local    Char     FOCITMREF (GLONITM) (0..GGRPNBRFOC-1)
+#Local    Decimal  FOCQTY              (0..GGRPNBRFOC-1)
+#Local    Char     FOCUOM    (GLONUOM) (0..GGRPNBRFOC-1)
+#Local    Shortint FOCMOTIF            (0..GGRPNBRFOC-1)
+Local    Char     FOCITMREF (GLONITM) (0..(max(1,GGRPNBRFOC))-1)
+Local    Decimal  FOCQTY              (0..(max(1,GGRPNBRFOC))-1)
+Local    Char     FOCUOM    (GLONUOM) (0..(max(1,GGRPNBRFOC))-1)
+Local    Shortint FOCMOTIF            (0..(max(1,GGRPNBRFOC))-1)
+# 87921
+Local    Date     PLISTRDAT, PLIENDDAT, DATREF
+Local    Libelle  INTERDIT,  ERR
+Local    Integer  I, J, WRET
+Local    Integer  FUNCTION
+
+Local    Integer  LCHGTYP
+Local    Char     LCUR      (GLONCUR)
+Local    Integer  LPRITYP
+
+#---- Paramètres complementaires appel recherche tarifs
+Local    Char     PARAM_T (25) (0..5) : # indice 0 = coef. multiplicateur UV --> US : # indice 1 = régime de taxe
+                                      : # indice 1 = Régime de taxe
+                                      : # indice 2 = coef. conversion devise (si facture)
+                                      : # indice 3 = date pour conversion prix HT/TTC  : # Bug 84596
+Raz PARAM_T(3) : # Bug 84596 : Date pour conversion prix HT/TTC
+
+CLIREF  = [M]BPCORD
+Case TYPALI
+ When "SQH" :
+    FUNCTION = 1 : DATREF=[M]QUODAT
+ When "SOH" :
+    FUNCTION = 2 : DATREF=[M]ORDDAT
+ When "SDH" :
+    FUNCTION = 3 : DATREF=[M]SHIDAT
+    PARAM_T(3)=[M]DLVDAT     : # Bug 84596 : Date pour conversion prix HT/TTC
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+# When "TNH" :
+#    FUNCTION = 3 : DATREF=[M]SHIDAT
+#    PARAM_T(3)=[M]DLVDAT
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+ When "SIH" :
+    FUNCTION = 4 : DATREF=[M]INVDAT
+    # Bug 60443
+    If dim([M]RATDIV)>0 & [M]RATDIV(GTYPGEN-1)<>0
+        PARAM_T(2)=num$(arr([M]RATMLT(GTYPGEN-1)/[M]RATDIV(GTYPGEN-1), 10^-GDECRCU))
+    Endif
+    # Bug 95337 : Paramètre date pour le calcul des taxes :
+    # Utiliser [M]VATDAT si le champ est renseigné (sinon ce sera [M]INVDAT par défaut)
+    If dim([M:SIH2]VATDAT)>0 & [M:SIH2]VATDAT<>[0/0/0]
+        PARAM_T(3)=[M]VATDAT
+    Endif
+    # Bug 95337
+Endcase
+#--> Suppression des gratuits existants
+Raz I
+While I <  [M]NBLIG
+   If [M]FOCFLG(I) = 3 & [M]ORILIN(I) = 0
+      Call SUPGRA(I-1, FUNCTION, WRET) From TRTVENBOM
+#     Si pas de suppression de la ligne, il faut lire la suivante
+      If WRET = 1 I +=1 : Endif
+   Else I+=1
+   Endif
+Wend
+# --> Appel au sous prog de recherche tarif
+# --> Lecture des enregistrements succeptible d'être des critères de recherche
+Read [BPR]BPR0=CLIREF
+Read [BPC]BPC0=CLIREF
+#Call LECTURE ("MVC",GFINRSP,CLIREF) From CONTOBJ
+If dim([M]GRPFLG)>0 : Raz [M]GRPFLG : Endif
+
+LCHGTYP = [M]CHGTYP
+LCUR    = [M]CUR
+LPRITYP = [M]PRITYP
+
+PARAM_T(1)=[M]VACBPR
+
+Gosub PE_RECHGROUP0   : # GPOINT="RECHGROUP0"
+
+# --> Recherche du tarif
+Call TARIFRECH(5, 2, TYPALI, DATREF, QTY, UOM, LCHGTYP, LCUR, LPRITYP,
+&             VAT, PARAM_T,
+&             MONTANT, MOTIF, PRIORITE,
+&             PLI, PLICRD, PLILIN,
+&             FOCITMREF, FOCQTY, FOCUOM, FOCMOTIF,
+&             PLISTRDAT, PLIENDDAT,INTERDIT, ERR) From TRTPRICE
+#Dbgaff
+# --> Chargement des montants facturations
+#If sum(MONTANT) <> 0 & (dim([M]BETCPY)<=0 | (dim([M]BETCPY)>0 & [M]BETCPY<=1))
+# Pas de chargmt des mnts fac doc. inter-site car les achats n'ont pas l'équivalent
+
+# X3-85542 : Apply a grouping price list equal to zero on an invoicing element - Sales orders/Sales quotes : (LD:04/27/18)
+# (Bug story for Issue X3-59918)
+# A group price can return the 0 value, so we have to take it into account
+#If sum(MONTANT) <> 0 & (dim([M]BETFCY)<=0 | (dim([M]BETFCY)>0 & [M]BETFCY<=1))
+If (dim([M]BETFCY)<=0 | (dim([M]BETFCY)>0 & [M]BETFCY<=1))
+# X3-85542 : Apply a grouping price list equal to zero on an invoicing element - Sales orders/Sales quotes : (LD:04/27/18)
+   For J=0 To 9
+       If MOTIF(J) <> 0
+          I= find(MOTIF(J), [M]INVDTA(0..[M]NBFAC-1))
+          If I <> 0
+            [M]INVDTAAMT(I-1) = MONTANT (J)
+            If dim([M:SIH0]INVCLCFLG)>0
+              [M:SIH0]INVCLCFLG=2 :        # en facture on doit refaire le calcul
+            Endif
+          Endif
+       Endif
+   Next
+Endif
+
+GPE = 0                                    # demande 16946
+GPOINT="RECHGROUP" : Gosub ENTREE From EXEFNC
+If GPE : End : Endif
+
+# --> Traitement des gratuits
+Local Integer ORI
+Local Integer NL
+Local Integer RET
+#If (dim([M]BETCPY)>0 & [M]BETCPY=2) End Endif    :   # Pas de gestion des gratuits si inter-société
+If (dim([M]BETFCY)>0 & [M]BETFCY=2) End Endif  :   # Pas de gestion des gratuits si inter-site (pas de gratuit côté achat)
+If FOCITMREF(0) = "" End Endif
+If GGRPNBRFOC=0      End Endif   : # 87921 : Param Nb de gratuit issu de groupé=0 ne rien générer
+
+ORI=[M]NBLIG-1
+For J=0 To dim(FOCITMREF)-1
+    If FOCITMREF(J) <> "" & FOCQTY(J) <> 0
+       GFOCQTY    = FOCQTY (J)
+       GFOCITMREF = FOCITMREF (J)
+       GFOCUOM    = FOCUOM (J)
+       GFOCMOTIF  = FOCMOTIF (J)
+       ITM = FOCITMREF
+       NL  = ORI+1
+       Call CREGRA("P", 0, ORI, DATREF, FUNCTION,NL, RET) From TRTVENBOM
+       If RET = 0  ORI+=1 Endif
+    Endif
+Next
+End
+
+$PE_RECHGROUP0
+GPOINT="RECHGROUP0" : Gosub ENTREE From EXEFNC
+Return
+
+$RECHGROUP1
+GPOINT="RECHGROUP1" : Gosub ENTREE From EXEFNC
+Return
+
+#----------------------------------------------------------------#
+# Recherche interdit                                             #
+#----------------------------------------------------------------#
+# Entrée  ITMREF   : Article                                     #
+#         BPAADD   : Client livré                                #
+#         REP      : Representant                                #
+#         FUNCTION : 1 devis / 2 commande / 3 livraison / 4 fact / 22 notes transport # : # 91606 :(10/07/14) Transportation notes (Sales part dev)
+#----------------------------------------------------------------#
+Subprog RECH_INTERDIT(ITMREF, BPAADD, REP,FUNCTION)
+Value    Char     ITMREF
+Value    Char     BPAADD
+Value    Char     REP
+Value    Integer  FUNCTION
+
+Local    Decimal  QTY
+Local    Char     SAU       (GLONUOM)
+Local    Char     VAT       (GLONVAT)(3)
+Local    Decimal  MONTANT  (0..10)
+Local    Shortint MOTIF    (0..10), PRIORITE (0..10)
+Local    Char     PLI       (GLONSPC) (0..10)
+Local    Char     PLICRD    (GLONVCR) (0..10)
+Local    Integer  PLILIN              (0..10)
+Local    Char     FOCITMREF (GLONITM)
+Local    Decimal  FOCQTY
+Local    Char     FOCUOM    (GLONUOM)
+Local    Shortint FOCMOTIF
+Local    Date     PLISTRDAT, PLIENDDAT
+Local    Libelle  INTERDIT,  ERR
+#---- Paramètres complementaires appel recherche tarifs
+Local    Char     PARAM_T (25) (0..5) : # indice 0 = coef. multiplicateur UV --> US : # indice 1 = régime de taxe
+
+#-- 80866
+If clalev([F:REP]) = 0 : Local File SALESREP   [REP] : Endif
+If clalev([F:ITF]) = 0 : Local File ITMFACILIT [ITF] : Endif #--CPO 107024
+
+# --> Appel au sous prog de recherche tarif
+# --> Lecture des enregistrements succeptible d'être des critères de recherche
+# X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+#Read [ITM]ITM0=ITMREF : #Call LECTURE ("ITM",ITMREF,"") From CONTOBJ
+#Read [ITS]ITS0=ITMREF : #Call LECTURE ("ITS",ITMREF,"") From CONTOBJ
+
+If [F:ITM]ITMREF<>ITMREF
+    Read [ITM]ITM0=ITMREF : #Call LECTURE ("ITM",ITMREF,"") From CONTOBJ
+Endif
+If [F:ITS]ITMREF<>ITMREF
+    Read [ITS]ITS0=ITMREF : #Call LECTURE ("ITS",ITMREF,"") From CONTOBJ
+Endif
+# X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+
+#-- 80866
+
+Read [REP]REP0=REP     : #Call LECTURE ("REP",REP,"") From CONTOBJ
+Case FUNCTION
+  When 1  : # devis
+      Read [BPR]BPR0=[M:SQH0]BPCORD
+      Read [BPC]BPC0=[M:SQH0]BPCORD
+#      Call LECTURE ("MVC",GFINRSP,[M:SQH0]BPCORD) From CONTOBJ
+      Read [BPD]BPD0=[M:SQH0]BPCORD;BPAADD
+      PARAM_T(1)=[M:SQH1]VACBPR
+      Call ALIPLK  ("SQH") From TRTPRICE
+      # --> Recherche si interdit
+      Call TARIFRECH(5, 3, "SQH", [M:SQH0]QUODAT, QTY, SAU, [M:SQH0]CHGTYP,[M:SQH1]CUR,
+&             [M:SQH1]PRITYP, VAT, PARAM_T,
+&             MONTANT, MOTIF, PRIORITE,
+&             PLI, PLICRD, PLILIN,
+&             FOCITMREF, FOCQTY, FOCUOM, FOCMOTIF,
+&             PLISTRDAT, PLIENDDAT, INTERDIT, ERR) From TRTPRICE
+  When 2  : # commande
+      # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+#      Read [BPR]BPR0=[M:SOH0]BPCORD
+#      Read [BPC]BPC0=[M:SOH0]BPCORD
+
+      If [F:BPR]BPRNUM<>[M:SOH0]BPCORD
+          Read [BPR]BPR0=[M:SOH0]BPCORD
+      Endif
+      If [F:BPC]BPCNUM<>[M:SOH0]BPCORD
+          Read [BPC]BPC0=[M:SOH0]BPCORD
+      Endif
+      # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+#      Call LECTURE ("MVC",GFINRSP,[M:SOH0]BPCORD) From CONTOBJ
+      # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+#      Read [BPD]BPD0=[M:SOH0]BPCORD;BPAADD
+       If [F:BPD]BPCNUM<>[M:SOH0]BPCORD | [F:BPD]BPAADD<>BPAADD
+          Read [BPD]BPD0=[M:SOH0]BPCORD;BPAADD
+       Endif
+      # X3-69134 : Performance enhancements for sales order import : X3-74049 : Restricted prices (LD:05/29/18)
+      PARAM_T(1)=[M:SOH1]VACBPR
+      #--CPO 107024
+      If [L]ITMREF<>"" and [M:SOH2]STOFCY<>"" and ([F:ITF]ITMREF<>[L]ITMREF or [F:ITF]STOFCY<>[M:SOH2]STOFCY)
+        Read [ITF]ITF0=[L]ITMREF;[M:SOH2]STOFCY
+        If fstat : Raz [F:ITF] : Endif
+      Endif
+      #--/
+      Call ALIPLK  ("SOH") From TRTPRICE
+      # --> Recherche si interdit
+      Call TARIFRECH(5, 3, "SOH", [M:SOH0]ORDDAT, QTY, SAU, [M:SOH0]CHGTYP,[M:SOH1]CUR,
+&             [M:SOH1]PRITYP, VAT, PARAM_T,
+&             MONTANT, MOTIF, PRIORITE,
+&             PLI, PLICRD, PLILIN,
+&             FOCITMREF, FOCQTY, FOCUOM, FOCMOTIF,
+&             PLISTRDAT, PLIENDDAT, INTERDIT, ERR) From TRTPRICE
+  When 3  : # livraison
+      Read [BPR]BPR0=[M:SDH0]BPCORD
+      Read [BPC]BPC0=[M:SDH0]BPCORD
+#      Call LECTURE ("MVC",GFINRSP,[M:SDH0]BPCORD) From CONTOBJ
+      Read [BPD]BPD0=[M:SDH0]BPCORD;BPAADD
+      PARAM_T(1)=[M:SDH2]VACBPR
+      #--CPO 107024
+      If [L]ITMREF<>"" and [M:SDH0]STOFCY<>"" and ([F:ITF]ITMREF<>[L]ITMREF or [F:ITF]STOFCY<>[M:SDH0]STOFCY)
+        Read [ITF]ITF0=[L]ITMREF;[M:SDH0]STOFCY
+        If fstat : Raz [F:ITF] : Endif
+      Endif
+      #--/
+      Call ALIPLK  ("SDH") From TRTPRICE
+      # --> Recherche si interdit
+      Call TARIFRECH(5, 3, "SDH", [M:SDH1]SHIDAT, QTY, SAU, [M:SDH0]CHGTYP,[M:SDH1]CUR,
+&             [M:SDH1]PRITYP, VAT, PARAM_T,
+&             MONTANT, MOTIF, PRIORITE,
+&             PLI, PLICRD, PLILIN,
+&             FOCITMREF, FOCQTY, FOCUOM, FOCMOTIF,
+&             PLISTRDAT, PLIENDDAT, INTERDIT, ERR) From TRTPRICE
+# 91606 :(04/08/14) Transportation notes (Sales part dev)
+#  When 22  : # Transportation notes
+#      Read [BPR]BPR0=[M:TNH0]BPCORD
+#      Read [BPC]BPC0=[M:TNH0]BPCORD
+#      Read [BPD]BPD0=[M:TNH0]BPCORD;BPAADD
+#      PARAM_T(1)=[M:TNH2]VACBPR
+#      Call ALIPLK  ("TNH") From TRTPRICE
+#      # --> Recherche si interdit
+#      Call TARIFRECH(5, 3, "TNH", [M:TNH1]SHIDAT, QTY, SAU, [M:TNH0]CHGTYP,[M:TNH1]CUR,
+#&             [M:TNH1]PRITYP, VAT, PARAM_T,
+#&             MONTANT, MOTIF, PRIORITE,
+#&             PLI, PLICRD, PLILIN,
+#&             FOCITMREF, FOCQTY, FOCUOM, FOCMOTIF,
+#&             PLISTRDAT, PLIENDDAT, INTERDIT, ERR) From TRTPRICE
+# 91606 :(04/08/14) Transportation notes (Sales part dev)
+  When 4  : # facture
+      Read [BPR]BPR0=[M:SIH1]BPCORD
+      Read [BPC]BPC0=[M:SIH1]BPCORD
+#      Call LECTURE ("MVC",GFINRSP,[M:SIH1]BPCORD) From CONTOBJ
+      Read [BPD]BPD0=[M:SIH1]BPCORD;BPAADD
+      PARAM_T(1)=[M:SIH1]VACBPR
+      #--CPO 107024
+      If [L]ITMREF<>"" and [M:SIH1]STOFCY<>"" and ([F:ITF]ITMREF<>[L]ITMREF or [F:ITF]STOFCY<>[M:SIH1]STOFCY)
+        Read [ITF]ITF0=[L]ITMREF;[M:SIH1]STOFCY
+        If fstat : Raz [F:ITF] : Endif
+      Endif
+      #--/
+      Call ALIPLK  ("SIH") From TRTPRICE
+      # --> Recherche si interdit
+      Call TARIFRECH(5, 3, "SIH", [M:SIH0]INVDAT, QTY, SAU, [M:SIH0]CHGTYP,[M:SIH0]CUR,
+&             [M:SIH1]PRITYP, VAT, PARAM_T,
+&             MONTANT, MOTIF, PRIORITE,
+&             PLI, PLICRD, PLILIN,
+&             FOCITMREF, FOCQTY, FOCUOM, FOCMOTIF,
+&             PLISTRDAT, PLIENDDAT, INTERDIT, ERR) From TRTPRICE
+Endcase
+If INTERDIT=1:GMESSAGE = mess(27,192,1):mkstat=2:Endif
+End
+
+#----------------------------------------------------------------#
+# Recherche tarif sur une ligne                                  #
+#----------------------------------------------------------------#
+# Entrée  WABREV   : Abreviation de l'objet                      #
+#         WCUR     : Devise                                      #
+#         WLIG     : Ligne tableau                               #
+#----------------------------------------------------------------#
+Subprog TRTRECTARD(WABREV, WCUR, WLIG)
+Value Char     WABREV
+Value Char     WCUR
+Value Integer  WLIG
+
+Local Char     WABREVMSK
+Local Integer  INICPRPRI : INICPRPRI=1    : # 79705 : SAT in SPRICLINK : Step 2
+Local Integer  WPRITYP, WCHGTYP           : # 79705 : SAT in SPRICLINK : Step 2
+Local Char     WSTOFCY(GLONFCY)           : # 79705 : SAT in SPRICLINK : Step 2
+Local Date     WDAT                       : # 79705 : SAT in SPRICLINK : Step 2
+
+If [M]QTY(WLIG) = 0 End Endif
+If [M]FOCFLG(WLIG) = 3  End Endif : # Si ligne gratuite : Pas de recherche tarif : # 79705 : SAT in SPRICLINK : Step 2
+
+Case WABREV
+ When "SQH" :
+    WABREVMSK="SQH2"
+    WDAT=[M:SQH0]QUODAT    : WSTOFCY=[M:SQH2]DSTOFCY(WLIG) : # 79705 : SAT in SPRICLINK : Step 2
+    WPRITYP=[M:SQH1]PRITYP : WCHGTYP=[M:SQH0]CHGTYP        : # 79705 : SAT in SPRICLINK : Step 2
+ When "SOH" :
+    WABREVMSK="SOH4"
+    WDAT=[M:SOH0]ORDDAT : WSTOFCY=[M:SOH4]DSTOFCY(WLIG)    : # 79705 : SAT in SPRICLINK : Step 2
+    WPRITYP=[M:SOH1]PRITYP : WCHGTYP=[M:SOH0]CHGTYP        : # 79705 : SAT in SPRICLINK : Step 2
+ When "SDH" :
+    WABREVMSK="SDH1"
+    WDAT=[M:SDH1]SHIDAT : WSTOFCY=[M:SDH0]STOFCY           : # 79705 : SAT in SPRICLINK : Step 2
+    WPRITYP=[M:SDH1]PRITYP : WCHGTYP=[M:SDH0]CHGTYP        : # 79705 : SAT in SPRICLINK : Step 2
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+# When "TNH" :
+#    WABREVMSK="TNH1"
+#    WDAT=[M:TNH1]SHIDAT : WSTOFCY=[M:TNH0]STOFCY
+#    WPRITYP=[M:TNH1]PRITYP : WCHGTYP=[M:TNH0]CHGTYP
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+ When "SIH" :
+    WABREVMSK="SIH4"
+    WDAT=[M:SIH0]INVDAT : WSTOFCY=[M:SIH4]DSTOFCY(WLIG)    : # 79705 : SAT in SPRICLINK : Step 2
+    WPRITYP=[M:SIH1]PRITYP : WCHGTYP=[M:SIH0]CHGTYP        : # 79705 : SAT in SPRICLINK : Step 2
+Endcase
+
+Call ALICLCAMT([M]ITMREF(WLIG), [M]QTY(WLIG), WLIG, WABREVMSK, [M]CLCAMT1(WLIG), [M]CLCAMT2(WLIG)) From TRTX3
+# 79705 : SAT in SPRICLINK : Step 2
+#If [M]PRITYP=2
+#    Local Integer OK : OK=1
+#    If !GIMPORT : Call OUINON (mess(21,191,1),OK) From GESECRAN : Endif
+#    If OK=2
+# 79705 : SAT in SPRICLINK : Step 2
+        Local Integer TYPRECH
+        If find ([M]LINTYP (WLIG),1,2,6,10) TYPRECH=1
+        Else TYPRECH = 4 : Endif
+        Call RECH_TARIF(TYPRECH,[M]ITMREF(WLIG),WLIG,[M]QTY(WLIG),WABREV,[M]GROPRI(WLIG)) From TRTVENTAR
+        Call CLCNETPRI([M]QTY(WLIG), WCUR, WLIG) From TRTVENPRI
+        Call CLCPFM(WSTOFCY, WPRITYP, WCHGTYP, WDAT, WCUR, WLIG, INICPRPRI) From TRTVENPRI : # 79705 : SAT in SPRICLINK : Step 2
+        Affzo [M]GROPRI(WLIG)
+        If dim([M]DISCRGVAL1(WLIG))>0 Affzo [M]DISCRGVAL1(WLIG) Endif
+        If dim([M]DISCRGVAL2(WLIG))>0 Affzo [M]DISCRGVAL2(WLIG) Endif
+        If dim([M]DISCRGVAL3(WLIG))>0 Affzo [M]DISCRGVAL3(WLIG) Endif
+        If dim([M]DISCRGVAL4(WLIG))>0 Affzo [M]DISCRGVAL4(WLIG) Endif
+        If dim([M]DISCRGVAL5(WLIG))>0 Affzo [M]DISCRGVAL5(WLIG) Endif
+        If dim([M]DISCRGVAL6(WLIG))>0 Affzo [M]DISCRGVAL6(WLIG) Endif
+        If dim([M]DISCRGVAL7(WLIG))>0 Affzo [M]DISCRGVAL7(WLIG) Endif
+        If dim([M]DISCRGVAL8(WLIG))>0 Affzo [M]DISCRGVAL8(WLIG) Endif
+        If dim([M]DISCRGVAL9(WLIG))>0 Affzo [M]DISCRGVAL9(WLIG) Endif
+        Affzo [M]NETPRI(WLIG)                           : # 79705 : SAT in SPRICLINK : Step 2
+        Affzo [M]NETPRI(WLIG), CPRPRI(WLIG), PFM(WLIG)
+#    Endif
+# 79705 : SAT in SPRICLINK : Step 2
+#Endif
+# 79705 : SAT in SPRICLINK : Step 2
+
+End
+
+# 84596 : Recalcul tarif/taxe en gestion livraison si modif date expe, délai ou date livraison
+###################################################################################
+# DIVCLCPRI  : Action de recalcul des prix HT/TTC pour un document vente          #
+###################################################################################
+# Sur un document vente :                                                         #
+# A partir d'un champ d'un masque recalcul des prix de chaque ligne d'un document #
+# Le recalcul des prix permet le recalcul les taxes sur les prix                  #
+###################################################################################
+#---------------------------------------------------------------------------------#
+# Entrée  WABREV   : Abreviation de l'objet                                       #
+#         WFLDNAM  : Nom de la zone courante                                      #
+#---------------------------------------------------------------------------------#
+$DIVCLCPRI
+Local Char    WABREV     : WABREV  = PARAM(1)
+Local Char    WFLDNAM    : WFLDNAM = PARAM(2)
+
+Case WABREV
+   When "SDH" :
+      If [M:SDH1]NBLIG=0 Return Endif
+      If WFLDNAM="DLVDAT" [M:SDH1]DLVDAT=VALEUR Endif
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+#   When "TNH" :
+#      If [M:TNH1]NBLIG=0 Return Endif
+#      If WFLDNAM="DLVDAT" [M:TNH1]DLVDAT=VALEUR Endif
+ # 91606 :(04/08/14) Transportation notes (Sales part dev)
+   When "SIH" :                                         : # 95785 : Recalcul tarif/taxe si modification VATDAT
+      If [M:SIH4]NBLIG=0 Return Endif                   : # 95785
+      If WFLDNAM="VATDAT" [M:SIH2]VATDAT=VALEUR Endif   : # 95785
+   When Default
+Endcase
+
+Call TRTCLCPRI(WABREV, WFLDNAM)
+
+Return
+
+###################################################################################
+# TRTCLCPRI  : sous-pro de recalcul des prix HT/TTC pour un document vente        #
+###################################################################################
+# Sur un document vente :                                                         #
+# A partir d'un champ d'un masque recalcul des prix de chaque ligne d'un document #
+# Le recalcul des prix permet le recalcul les taxes sur les prix                  #
+###################################################################################
+#---------------------------------------------------------------------------------#
+# Entrée  WABREV   : Abreviation de l'objet                                       #
+#         WZONCOU  : Nom de la zone courante                                      #
+#---------------------------------------------------------------------------------#
+Subprog TRTCLCPRI (WABMSK, WZONCOU)
+Value Char     WABMSK
+Value Char     WZONCOU
+
+Local Char    FFLGMOD    : Raz FFLGMOD
+Local Char    WANCCUR    : WANCCUR=[M]CUR
+Local Char    WANCVACBPR : WANCVACBPR=[M]VACBPR
+Local Integer WANCPRITYP : WANCPRITYP=[M]PRITYP
+Local Integer INICPRPRI  : INICPRPRI=1
+
+Local Integer SAVMKSTAT : SAVMKSTAT=mkstat
+
+Local Integer NLIG
+
+Case WABMSK
+    When "SQH" :
+        Case WZONCOU
+            When Default
+        Endcase
+    When "SOH" :
+        Case WZONCOU
+            When Default
+        Endcase
+    When "SDH" :
+        Case WZONCOU
+            When "SHIDAT" :
+                Gosub RECALC_LIGNE From SUBSDHB
+            When "DAYLTI","DLVDAT" :
+                # La valeur 1 est utilisée pour le recalcul des tarifs
+                # La valeur 2 est utilisée pour le recalcul des taxes
+                GTARFLG="2"
+                Gosub RECALC_LIGNE From SUBSDHB
+            When Default
+        Endcase
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+#    When "TNH" :
+#        Case WZONCOU
+#            When "SHIDAT" :
+#                Gosub RECALC_LIGNE From SUBTNHB
+#            When "DAYLTI","DLVDAT" :
+#                # La valeur 1 est utilisée pour le recalcul des tarifs
+#                # La valeur 2 est utilisée pour le recalcul des taxes
+#                GTARFLG="2"
+#                Gosub RECALC_LIGNE From SUBTNHB
+#            When Default
+#        Endcase
+    # 91606 :(04/08/14) Transportation notes (Sales part dev)
+    When "SIH" :
+        Case WZONCOU
+            When "VATDAT" :                           : # 95785 : Recalcul tarif/taxe si modification VATDAT
+                GTARFLG="2"                           : # 95785
+                Gosub RECALC_LIGNE From SUBSIHB       : # 95785
+            When Default
+        Endcase
+
+    When Default
+Endcase
+Raz GTARFLG
+mkstat=SAVMKSTAT
+
+End
+# 84596
+

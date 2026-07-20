@@ -1,0 +1,1731 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+#<AdxTJ>@(#)4.0.0.0 $Revision$
+###############################################################
+# Written by Dominique BOPP
+# (C) ADONIX 2002
+# This program is program which should not be used whithout written authorization of an official of ADONIX
+# Normal use on a running ADONIX folder cannot be guaranteed
+#
+###############################################################
+#  Traitement de vérification des accès à la base de données
+#  par analyse syntaxique (assez grossière) et recherche des
+#  index optimaux pour ces accès
+#
+#  Instructions analysées :
+#  - File [ Where... ] [ Order By... ]
+#  - Filter [ Where... ] [ Order By... ]
+#  - For [ Where... ]
+#  - Read / Look / Readlock
+#  - Update [ Where... ]
+#  - Link
+#  Limites actuelles :
+#  - ne recherche pas les Where evalue(CRITERE)
+#  ------------------------------------------------------------
+#  Dominique BOPP 2002 
+#
+#  (c) 1999-2002 ADONIX
+###############################################################
+# Dom 29/05/2002 : si l'index utilisé est complet et sans homonymes, ne pas faire d'erreur
+# Dom 07/10/2002 : on teste la syntaxe Hint Key et With Nohint
+# Dom 08/10/2002 : on gère les [F:ABV]
+# Dom 27/12/2002 : passage en mode "traitement"
+#                  Désormais, on ne teste plus que les traitements spécifiques
+#                  [ Sauf s'il existe un champ
+# Dom 30/12/2002 : Correction d'un bug (le Where sur le Link désactive le Filter sur la table d'origine)
+#                  Rajout dans la trace des champs considérés comme critères
+#                  Test correct sur les Link (dans la plupart des cas, le test n'était pas fait)
+###############################################################
+
+#Infbox num$(filinfo("/x3130/X3IND130/TRT/SUBSTO.src",5))
+#End
+
+#Call VERIFIDX("#@D:\X3 - Activité de Test\Tests Moulinettes","","","X3IND130","*",0,0)
+#End
+
+#------------------------------------------------------------------------------------------------------------------------#
+
+Subprog AVERIFIDX(CHEMINTRA,PATCH,SRCPATCH,DOSSIER,NOMTRT,MODULE,OWNER, ECREXP, EXCLSUP,
+&                PORT, MACHINE, CHEMINTRAW, NBERRTOT, NBWARTOT, PBINDUS)
+
+Value Char CHEMINTRA       :  # Chemin où seront créés les fichiers de trace
+Value Char PATCH        :  # Si patch, on ne vérifie que les traitement modifiés
+Value Char SRCPATCH     :  # Si patch, chemin où sont les sources patchés
+Value Char DOSSIER      :  # Si non patch, dossier analysé
+Value Char NOMTRT       :  # Nom du source à analyser (jokers autorisés)
+Value Integer MODULE    :  # Si travail sur sources d'un module particulier
+Value Integer OWNER     :  # Si on veut travailler sur les sources d'un owner particulier
+
+Value Integer ECREXP    :  # écrire les exceptions dans le compte-rendu
+Value Integer EXCLSUP   :  # exclure le module superviseur
+Value Integer PORT      :  # port du dossier
+Value Char MACHINE      :  # machine du dossier
+Value Char CHEMINTRAW
+Variable Integer NBERRTOT, NBWARTOT, PBINDUS
+
+
+MAX_NBFIC=1200    :# 1000 avant
+
+#---------------------------------------------------------------------#
+# Si on veut travailler sur les traitements d'un user unix particulier
+# mbt    211  # hn     331
+# ts     223  # jl     222  # ld     224
+# llc    239  # sr     218  # mm     349
+# by     203  # mb     208  # ls     241
+# gb     199  # pp     209  # cp     298  # gh     205
+# gm     217  # cc     381  # tb     213
+# sde    318
+# ccora  255
+# adonix 201  # jpj    262  # eb     214
+# ig     220  # cn     228  # cg     219
+#---------------------------------------------------------------------#
+
+#------------ Table des exceptions (tables et traitements) -----------#
+Local Char EXCEPT(30)(1..1000)
+Local Integer NEX, NEX1
+Local Char FIC_SS_CLE(GLONATB)(1..MAX_NBFIC)
+Local Integer NB_FIC_SS_CLE, WMIGRATE
+
+Gosub LISTEX
+
+# Variables diverses pour améliorer la trace
+Local Integer TRACEDET :# 0=non, 1=à demi, 2=totale
+Local Integer WARNING : # Si 1, pas de warning
+                        # Si 2, on avertit si on utilise un index par défaut 
+Local Integer WARNOR  : # Warning pour les or (1 : oui / 2 : non)
+Local Integer CLESPE  : # Si 1, on ne détaille pas les "clé d'optimisation posible"
+                        # Si 2, détail des requêtes "With Nohint"
+Local Integer TRASPE  : # 0=test traitements standard, 1=test spécifiques, 2=test complet
+TRACEDET=0 : WARNING=1 : TRASPE=0 : CLESPE=1 : WARNOR=1
+
+# Si on veut des erreurs de type clé inexistante
+# Il faut mettre ce paramètre à 2
+# Mais elles correspondent en général à des clés issues d'Order By mal analysés (approximation)
+Local Integer ERR_CLE_INEX : ERR_CLE_INEX=2
+
+
+#CBO 2009.04.14
+Local Char WFILE(10), WABREV(5), TXTERR(200)
+Local Integer WIGNWRSEQ, WIGNWRTRT, ILF, BOK
+
+#------------------------------------------#
+#Fichier de trace et répertoire des sources
+#------------------------------------------#
+Local Char REPER_TRT(200)
+
+REPER_TRT="TRT" : # Recherche dans le dossier des traitements
+
+
+
+# Variables diverses
+Local Integer II,IJ,IK,IL,IM,IS
+Local Integer NB_ERR, NB_WRN, NB_TRT,ALERT_OR
+Local Char COND_TB_FI(255), DOSSIER2(100)
+
+If MACHINE = ""
+    DOSSIER2 = DOSSIER
+Else
+    DOSSIER2 = MACHINE + ":" + num$(PORT) + "@" + DOSSIER
+Endif
+
+# Déclaration des tables utiles
+
+If clalev ([F:ATB])
+    Close File [ATB]
+Endif
+If clalev ([F:ATZ])
+    Close File [ATZ]
+Endif
+If clalev ([F:ATI])
+    Close File [ATI]
+Endif
+If clalev ([F:AST])
+    Close File [AST]
+Endif
+If clalev ([F:ADC])
+    Close File [ADC]
+Endif
+
+
+Local File = DOSSIER2 + ".ATABLE"
+Local File = DOSSIER2 + ".ATABZON"
+Local File = DOSSIER2 + ".ATABIND"
+Local File = DOSSIER2 + ".APLSTD"
+Local File = DOSSIER2 + ".ADICTRT"     : # table des traitements 
+
+Call TEMPON("Vérification des performances index...") From GESECRAN
+
+# Pointeurs divers
+Local Integer NBFIC : # Le nombre de traitements à analyser
+Local Integer NF    : # Indice dans la table des traitements
+Local Integer NLIG  : # Numéro de ligne dans le traitement courant
+Local Integer NPAR  : # Nombre de parenthèses
+
+# Variables utiles pour les analyses syntaxiques
+Local Char ALPHA(27) : ALPHA="ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+Local Char ALPHAN(37) : ALPHAN=ALPHA+"0123456789"
+Local Char SPACEN(37) : SPACEN=space$(len(ALPHAN))
+Local Char ESPACES(100) : ESPACES=space$(100)
+Local Char MOT_CLE(20)
+
+# Buffers de reconnaissance syntaxique
+#Local Char CHAINE(255),CHAINE1(255), CHAINE3(255),CHAINE4(255), CHAININS(255)
+Local Clbfile CHAINE, CHAINE1, CHAINE3, CHAINE4, CHAININS, CHAINCPT
+
+Local Integer FST : # statut de lecture
+Local Integer NSK : # pointeur de lecture
+
+# Table des fichiers trouvés dans le traitement
+
+Local Integer MAX_FICTRT : MAX_FICTRT=200
+Local Integer MAX_LGNOMFIC : MAX_LGNOMFIC=12
+Local Integer MAX_LGABVFIC : MAX_LGABVFIC=4
+
+Local Char TAB_FIC(MAX_LGNOMFIC)(1..MAX_FICTRT),TAB_ABV(MAX_LGABVFIC)(1..MAX_FICTRT)
+Local Char TAB_LKF(MAX_LGNOMFIC)(1..MAX_FICTRT)
+Local Integer NB_TABLES_TRT, NUMFIC_COUR
+Local Char TXTEXEPT(50)
+
+# CBO 2009.02.20
+Local Char TAB_ORDER(MAX_LGABVFIC)(1..MAX_FICTRT)
+Local Char CHAINEIDX(10)
+
+# Fichier / abréviation en cours de traitement
+Local Char FIC_COUR(MAX_LGNOMFIC), ABV_COUR(MAX_LGABVFIC),ABV_LINK(MAX_LGABVFIC)
+
+# Tableau des champs, des index, et des descriptions
+Local Integer MAX_LGNOMCHAMP : MAX_LGNOMCHAMP=20
+Local Integer MAX_LGNOMIND : MAX_LGNOMIND=9
+#Local Integer MAX_CHAMPFIC : MAX_CHAMPFIC=255 : # Nombre maximum de champs dans un fichier
+Local Integer MAX_CHAMPFIC : MAX_CHAMPFIC=400 : # Nombre maximum de champs dans un fichier
+
+Local Integer MAX_INDFIC : MAX_INDFIC=20      : # Nombre maximum d'index sur un fichier
+#Local Integer MAX_CHPIND : MAX_CHPIND=8 : # Nombre de champs max concaténés dans une clé
+Local Integer MAX_CHPIND : MAX_CHPIND=20 : # Nombre de champs max concaténés dans une clé    : c'était 14
+
+Local Char CHAMPS_TB(MAX_LGNOMCHAMP)(1..MAX_FICTRT,1..MAX_CHAMPFIC)
+Local Char INDEX_TB(MAX_LGNOMIND)(1..MAX_FICTRT,1..MAX_INDFIC)
+Local Libelle INDEX_HM(1..MAX_FICTRT,1..MAX_INDFIC) : # Flag homonymes
+Local Char INDEX_DEFAUT(MAX_LGNOMIND)(1..MAX_FICTRT)
+Local Char DESC_IND(MAX_LGNOMCHAMP)(1..MAX_FICTRT,1..MAX_INDFIC,1..MAX_CHPIND)
+
+# Traitements à analyser
+Local Integer MAX_TRT : MAX_TRT=25000
+Local Char TRAITEMENTS(GLONADC)(1..MAX_TRT)
+
+# Variables utilisées pour la notation des clés
+Local Integer NB_MATCH(1..MAX_INDFIC), MAX_MATCH, CUR_MATCH
+
+# Tableau des clauses Where détectées sur chaque fichier
+Local Integer MAX_CHPWHERE : MAX_CHPWHERE=100
+Local Char CHAMPS_WHERE(MAX_LGNOMCHAMP)(1..MAX_FICTRT,1..MAX_CHPWHERE)
+
+# Nb champs du File Where, des Filter, et de l'ordre courant
+Local Integer NB_CHAMPS_WHERE(1..MAX_FICTRT), NB_FILE_WHERE(1..MAX_FICTRT), NB_FILT_WHERE(1..MAX_FICTRT)
+Local Integer NB_CHAMPS(1..MAX_FICTRT),NB_IND(1..MAX_FICTRT),NB_SCLES(1..MAX_FICTRT,1..MAX_INDFIC), ERREUR
+Local Integer SI_HOMONY(1..MAX_FICTRT,1..MAX_INDFIC)
+Local Integer NB_COMP_LUS : # Composants de clés pour lecture
+
+Local Char CLE_WHERE(MAX_LGNOMIND) : # Le nom de la clé sur laquelle on fait un Where
+
+# Flag égal à 0 si seul des critères d'égalité ont été trouvés
+Local Libelle CRIT_EGAL(1..MAX_FICTRT)
+
+# Buffers des messages d'erreur
+Local Integer MAX_LG_ERR : MAX_LG_ERR=180
+Local Integer MAX_LIGERR : MAX_LIGERR=500
+Local Integer NB_LGN, NB_LGNW
+Local Char ERR_MESS(MAX_LG_ERR)(1..MAX_LIGERR), WRN_MESS(MAX_LG_ERR)(1..MAX_LIGERR)
+Local Char CH_WH_CONNUS(250)
+Local Shortint SAUVEMENU, BSPECIF
+SAUVEMENU = -1
+
+Local Char WTITRE(150), WTITRE2(150)
+Local Integer IB
+
+
+
+# Recherche des tables qui ont plus de NNN lignes uniquement
+
+If left$(FIC_SS_CLE(1),1)="+"
+    NB_FIC_SS_CLE=1
+    II=val(right$(FIC_SS_CLE(1),2))
+    COND_TB_FI=string$(TRASPE=0,"CODFIC<'X'")+string$(TRASPE<>0,"1=1")
+    For [ATB] Where evalue(COND_TB_FI)
+        If clalev ([F:FFF])
+            Close File [FFF]
+        Endif
+        Local File = DOSSIER2 + "." + [ATB]CODFIC [FFF]
+        If nbrecord([FFF])>II
+            NB_FIC_SS_CLE+=1
+            FIC_SS_CLE(NB_FIC_SS_CLE)=[ATB]CODFIC
+        Endif
+        Close File [FFF]
+    Next
+# Recherche de toutes les tables, sauf celles listées
+Elsif left$(FIC_SS_CLE(1),1)="-"
+    II=0
+    For [ATB] Where find([ATB]CODFIC, FIC_SS_CLE(1..NB_FIC_SS_CLE))=0
+        II+=1
+        FIC_SS_CLE(II)=[ATB]CODFIC
+    Next
+    NB_FIC_SS_CLE=II
+Endif
+
+#--------------------------------#
+# Tableau des traitements source
+#--------------------------------#
+
+
+If NOMTRT <> "" and NOMTRT <> "*" and instr(1, NOMTRT, "*") = 0
+    NBFIC = 1
+    TRAITEMENTS(1) = NOMTRT
+Else
+    If MACHINE = ""
+        Call SYSTEME2("", 'lsadx -a' - DOSSIER - 'TRT adx  | grep "^[A-V]"', "", NBFIC, TRAITEMENTS) From ORDSYS
+    Else
+#    Call SYSTEME2(MACHINE + ":" + num$(PORT), 'lsadx -a' - DOSSIER - 'TRT src', "", NBFIC, TRAITEMENTS) From ORDSYS
+        Call SYSTEME2(MACHINE + ":" + num$(PORT), 'lsadx -a' - DOSSIER - 'TRT adx  | grep "^[A-V]"', "", NBFIC, TRAITEMENTS) From ORDSYS
+    Endif
+Endif
+
+# Séparateurs de ligne
+ZADXIFS=adxifs : ZADXIRS=adxirs
+adxifs=chr$(0):adxirs=chr$(10)
+
+#----------------------------------#
+#Traitement itératif sur les sources
+#----------------------------------#
+Openo CHEMINTRA,-1
+
+Wrseq '                    ###-----------------------------------------------###'
+Wrseq '--------------------### Vérification des performances index (ERREURS) ###'
+Wrseq '                    ###-----------------------------------------------###'
+Wrseq
+If ECREXP = 2
+    Gosub ECRIREEXCPT
+Endif
+Wrseq '-----------------------------------------------------------------------------------------------------'
+
+
+Openo
+Openo CHEMINTRAW,-1
+
+Wrseq '                    ###-------------------------------------------------###'
+Wrseq '--------------------### Vérification des performances index (ANOMALIES) ###'
+Wrseq '                    ###-------------------------------------------------###'
+Wrseq
+If ECREXP = 2
+    Gosub ECRIREEXCPT
+Endif
+Wrseq '-----------------------------------------------------------------------------------------------------'
+
+
+Openo
+Openo CHEMINTRA,-1
+
+
+For NF=1 To NBFIC
+
+    Raz FIC_COUR, ABV_COUR, NB_TABLES_TRT, NB_LGN, NB_LGNW
+    
+    Gosub ANALYSE
+
+
+    If fstat
+        [F:ADC]MODULE = 0
+    Endif
+    If NB_LGN or NB_LGNW
+        Read [ADC]ADC0=TRAITEMENTS(NF)
+        If fstat
+            [F:ADC]MODULE = 0
+            [F:ADC]DES = ""
+        Endif
+        
+        WTITRE  = TRAITEMENTS(NF) + ".src (" + [F:ADC]DES + ")   "
+        WTITRE2 = "   (MODULE" - num$([F:ADC]MODULE) - ":" - func AVERIFSRC.LIBMODULE ([F:ADC]MODULE, SAUVEMENU) - ")"
+        IB = len(WTITRE) + len(WTITRE2)
+        IB = 120 - IB
+    
+        If IB > 0
+            WTITRE = WTITRE + string$(IB, "_") + WTITRE2
+        Else
+            WTITRE = WTITRE - WTITRE2
+        Endif
+    Endif
+
+    If NB_LGN
+        Wrseq
+        Wrseq WTITRE
+        For II=1 To NB_LGN
+            If left$(ERR_MESS(II), 4) = "CBCB"
+                Wrseq "  -->" - right$(ERR_MESS(II), 5)
+                Wrseq
+            Else
+                Wrseq "  ***" - ERR_MESS(II)
+            Endif
+        Next II
+        Wrseq
+    Endif
+
+
+   If NB_LGNW
+        Openo
+        Openo CHEMINTRAW,-1
+        
+        Wrseq
+        Wrseq WTITRE
+        For II=1 To NB_LGNW
+   
+            If left$(WRN_MESS(II), 4) = "CBCB"
+                Wrseq "  -->" - right$(WRN_MESS(II), 5)
+                Wrseq
+            Else
+                Wrseq "  ***" - WRN_MESS(II)
+            Endif
+        Next II
+        Wrseq
+        Openo
+        Openo CHEMINTRA,-1
+    Endif
+Next NF
+
+Wrseq
+Wrseq
+Wrseq "-----------------------------------------"
+Wrseq "Fin d'analyse des "-num$(NB_TRT)-"traitements"-time$
+Wrseq "-----------------------------------------"
+Wrseq "Nombre d'erreurs        : "+num$(NB_ERR)
+Wrseq "Nombre d'avertissements : "+num$(NB_WRN)
+Wrseq "-----------------------------------------"
+Wrseq
+Wrseq
+Openo
+
+Openo CHEMINTRAW,-1
+
+Wrseq
+Wrseq
+Wrseq "-----------------------------------------"
+Wrseq "Fin d'analyse des "-num$(NB_TRT)-"traitements"-time$
+Wrseq "-----------------------------------------"
+Wrseq "Nombre d'erreurs        : "+num$(NB_ERR)
+Wrseq "Nombre d'avertissements : "+num$(NB_WRN)
+Wrseq "-----------------------------------------"
+Wrseq
+Wrseq
+Openo
+
+NBERRTOT += NB_ERR
+NBWARTOT += NB_WRN
+Call TEMPOFF From GESECRAN
+
+adxifs=ZADXIFS : adxirs=ZADXIRS
+Openo
+
+    Close File [ATB]
+    Close File [ATZ]
+    Close File [ATI]
+    Close File [AST]
+    Close File [ADC]
+
+End
+
+
+
+#----------------------------------------------------------------------------------------------
+
+$ANALYSE
+
+
+# Si source inexistant, ou commence par X/Y/Z sans que les spécifiques soient concernés
+# ou dans les exceptions => fin
+    BOK = func AVERIFSRC.SRCAPASTRAITER (TRAITEMENTS(NF), NOMTRT, DOSSIER2, MODULE, EXCLSUP, PATCH, SRCPATCH, OWNER, TXTERR, 0)
+
+    If find(TRAITEMENTS(NF), EXCEPT(1..NEX))
+        Return
+    Endif
+   If BOK = 1
+        Return
+    Elsif BOK = 2
+        NBERREUR += 1
+        Wrseq TXTERR
+        Wrseq
+        
+        Return
+    Elsif BOK = 3
+        Openo
+        Openo CHEMINTRAW, -1
+        NB_WRN +=1
+        Wrseq TXTERR
+        Wrseq
+        Openo
+        Openo CHEMINTRA, -1
+               
+        Return
+    Elsif BOK = 4
+        Openo
+        Openo CHEMINTRAW, -1
+        NB_WRN +=1
+        Wrseq TXTERR
+        Wrseq
+        Openo
+        Openo CHEMINTRA, -1
+     Endif
+     
+     
+   If TRASPE=1 & TRAITEMENTS(NF)<="X"
+        Return
+    Endif
+
+
+
+# On traite le source
+    If mod(NF,100)=0
+        Call TEMPON("VERIFIDX :" - TRAITEMENTS(NF) + ".src" - num$(NF) + "/" + num$(NBFIC)) From GESECRAN
+    Endif
+
+    NB_TRT+=1
+    If TRACEDET=1 or TRACEDET=2
+        If mod(NF,1)=0
+            Wrseq time$-"** Traitement"-TRAITEMENTS(NF)-num$(NF)
+            Openo
+            Openo CHEMINTRA,-1
+        Endif
+    Endif
+   
+#-------------------------------#
+# Ouverture du source à analyser
+#-------------------------------#
+ 
+    Raz FST, FIC_COUR, ABV_COUR, NB_TABLES_TRT
+    # CBO 2008.02.20
+    Raz TAB_ORDER
+    #CBO 2009.04.14
+    Raz WFILE, WABREV, WIGNWRSEQ, WIGNWRTRT
+
+    Onerrgo ERR_ABS
+    If PATCH=""
+        Openi filpath("TRT", TRAITEMENTS(NF), "src", DOSSIER2),0
+    Else
+        Openi SRCPATCH+"/"+TRAITEMENTS(NF)+".src",0
+    Endif
+
+    Onerrgo
+    If FST
+        Return
+    Endif
+
+
+    NLIG=-1
+    While FST=0
+
+        Rdseq CHAINE
+        FST=fstat
+        NLIG+=1
+
+# Y a-t-il des lignes suite ?
+        While FST=0
+            NSK=adxseek(0)
+            Rdseq CHAINE1
+            If left$(CHAINE1,1)= "&"
+                FST=fstat
+                NLIG+=1
+                NSK=adxseek(0)
+                If len(vireblc(vireblc(CHAINE,5),2)) - len(vireblc(vireblc(CHAINE1,5),2)) <= 1024
+                    CHAINE= CHAINE - CHAINE1
+                Endif
+            Else
+                Seek First+NSK
+                Break
+            Endif
+        Wend
+
+        # Pour ne pas se laisser tromper par des mots-clés enfermés dans des constantes chaînes de caractère
+        # On en profite aussi pour ne laisser qu'un espace au maximum entre les mots
+#        CHAINE=vireblc(vireblc(format$("KT:1024X",toupper(ctrans(CHAINE,chr$(10)+chr$(13),""))),2),5)
+        CHAINE=vireblc(vireblc(ctrans(CHAINE,chr$(10)+chr$(13),""),2),5)
+        Call FMTCLOB(CHAINE) From AVERIFSRC
+#       Call VIRECOMMEN(CHAINE) From AVERIFSRC
+#CBO 2009.04.14
+        Call VIRECOMCHK (CHAINE, 1, 1, WFILE, WABREV, WIGNWRSEQ, WIGNWRTRT, WMIGRATE) From AVERIFSRC
+        If WIGNWRTRT = 1
+            Return
+        Endif
+#    If WFILE <> "" and WABREV <> ""
+#        Read [ATB]CODFIC = WFILE
+#        If fstat = 0
+            # ne pas mettre X fois la même abréviation
+#            ILF = find(WABREV, TABRFICNS(1..NBABRNS))
+#            If ILF = 0
+#                NBABRNS += 1
+#                ILF = NBABRNS
+#            Endif
+#            TABRFICSTD(ILF) = [F:ATB]ABRFIC
+#            TABRFICNS(ILF) = WABREV
+#            PCHAINE = ""
+#        Endif
+#    Endif
+        CHAININS = CHAINE
+        CHAINCPT = CHAINE
+        CHAINE = func AVERIFSRC.DECOUPCH (CHAININS)
+        While CHAINE <> ""
+
+
+
+                CHAINE4=CHAINE
+
+                # On analyse ici les ordres de lecture ou de parcours des tables
+                If pat(CHAINE,"*File*") & pat(vireblc(CHAINE,4),"*DefaultFile*")=0 & pat(vireblc(CHAINE,4),"*CloseFile*")=0
+                    Gosub ANAFILE
+                Elsif pat(CHAINE,"*Filter*[*]*")
+                    Gosub ANAFILTER
+                Elsif pat(CHAINE,"*For[*") or pat(CHAINE,"*For [*") & pat(CHAINE,"*For [M:*")=0 & pat(CHAINE,"*For[M:*")=0 
+                    Gosub ANAFOR
+                Elsif pat(CHAINE,"*Readlock[*") or pat(CHAINE,"*Readlock [*")
+                    MOT_CLE="Readlock"
+                    Gosub ANAREAD
+                Elsif pat(CHAINE,"*Read[*") or pat(CHAINE,"*Read [*")
+                    MOT_CLE="Read"
+                    Gosub ANAREAD
+                Elsif pat(CHAINE,"*Look[*") or pat(CHAINE,"*Look [*")
+                    MOT_CLE="Look"
+                    Gosub ANAREAD
+                Elsif pat(CHAINE,"*Update[*") or pat(CHAINE,"*Update [*")
+                    Gosub ANAUPDA
+                Elsif pat(CHAINE,"*Link[*") or pat(CHAINE,"*Link [*")
+                    Gosub ANALINK
+                Endif
+
+                CHAINE = func AVERIFSRC.DECOUPCH (CHAININS)
+        Wend
+    Wend  
+Return
+
+$ERR_ABS
+    Wrseq "*** ! Source " + TRAITEMENTS(NF)+" non trouvé dans la livraison"
+    FST = 1
+Resume
+
+
+$ANAFILE
+If TRACEDET=2
+    Wrseq "Chaine="+CHAINE
+    Openo
+    Openo CHEMINTRA,-1
+Endif
+
+# On coupe le File
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,'File')+4),0)
+
+$ANA_F1
+
+# On extrait le nom de la table
+Raz FIC_COUR
+If instr(1,ALPHA,left$(CHAINE,1))
+    CHAINE1=vireblc(ctrans(CHAINE,"["," "),3)
+    CHAINE=vireblc(right$(CHAINE,len(CHAINE1)+1),0)
+    FIC_COUR=vireblc(left$(CHAINE1,len(CHAINE1)-len(vireblc(ctrans(CHAINE1,ALPHAN,SPACEN),0))),1)
+Endif
+
+# On extrait l'abréviation si elle est donnée, sinon on la lit dans ATABLE
+If left$(CHAINE,1)="["
+    ABV_COUR=seg$(CHAINE,2*(1+pat(CHAINE,"[F:*")),instr(1,CHAINE+"]","]")-1)
+    CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE+"]","]")+1),0)
+Else
+    Read [ATB]CODFIC=FIC_COUR
+    If fstat=0
+        ABV_COUR=[ATB]ABRFIC
+    Else
+        Return : # Pas d'abréviation, fichier inconnu, on abandonne...
+    Endif
+Endif
+
+# Si on ouvre la table par son abréviation, on va rechercher son nom
+If FIC_COUR=""
+    Read [ATB]ABRFIC=ABV_COUR
+    If fstat=0
+        FIC_COUR=[ATB]CODFIC
+    Else
+        Return : # Fichier inconnu, on abandonne
+    Endif
+Endif
+
+# On recherche dans le tableau des fichiers ouverts par le traitement : subtil algorithme !
+IL=1
+IK=0 : # test
+Repeat
+    IK=IL-1+find(FIC_COUR,TAB_FIC(IL..NB_TABLES_TRT),FIC_COUR)
+    IL=IK-1+find(ABV_COUR,TAB_ABV(IK..NB_TABLES_TRT),ABV_COUR)
+Until IK=IL
+
+# Si le fichier n'est pas encore répertorié, on le charge
+If IK>NB_TABLES_TRT
+    If NB_TABLES_TRT<MAX_FICTRT
+        NB_TABLES_TRT+=1
+        NUMFIC_COUR=NB_TABLES_TRT
+        TAB_FIC(NB_TABLES_TRT)=FIC_COUR
+        TAB_ABV(NB_TABLES_TRT)=ABV_COUR
+        Gosub CHARGE_FIC
+    Else
+        Errbox "Trop de tables ouvertes"
+    Endif
+Else
+    NUMFIC_COUR=IK
+Endif
+
+# On considère que le premier index est l'index par défaut (l'analyse de l'Order By peut changer celà)
+INDEX_DEFAUT(NUMFIC_COUR)=INDEX_TB(NUMFIC_COUR,1)
+
+# Pour le moment pas de clause Where trouvée
+NB_CHAMPS_WHERE(NUMFIC_COUR)=0
+NB_FILE_WHERE(NUMFIC_COUR)=0
+NB_FILT_WHERE(NUMFIC_COUR)=0
+CRIT_EGAL(NUMFIC_COUR)=0
+
+# Si on trouve une virgule, il y a un deuxième fichier derrière
+If left$(CHAINE,1)=","
+    CHAINE=vireblc(right$(CHAINE,2),0)
+    Goto ANA_F1
+Endif
+
+# Si une clause Where existe, on l'analyse
+If pat(CHAINE,"Where*")
+    CHAINE=vireblc(right$(CHAINE,6),0)
+    Gosub ANAWHERE
+    NB_FILE_WHERE(NUMFIC_COUR)=NB_CHAMPS_WHERE(NUMFIC_COUR)
+    NB_FILT_WHERE(NUMFIC_COUR)=NB_CHAMPS_WHERE(NUMFIC_COUR)
+Endif
+
+# Si on trouve une virgule, il y a un deuxième fichier derrière (on reteste !)
+If left$(CHAINE,1)=","
+    CHAINE=vireblc(right$(CHAINE,2),0)
+    Goto ANA_F1
+Endif
+
+# S'il y a une clause Order By Key, on l'analyse
+If pat(CHAINE,"Order By Key*")
+    CHAINE=vireblc(right$(CHAINE,13),0)
+    Gosub ANAORDER
+Endif
+
+# Si on trouve une virgule, il y a un deuxième fichier derrière (on reteste encore !)
+If left$(CHAINE,1)=","
+    CHAINE=vireblc(right$(CHAINE,2),0)
+    Goto ANA_F1
+Endif
+
+Return
+
+$ANALINK
+If TRACEDET=2
+    Wrseq "Chaine="+CHAINE
+    Openo
+    Openo CHEMINTRA,-1
+Endif
+
+# On coupe le Link
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,'Link')+4),0)
+
+Raz FIC_COUR
+
+# On extrait l'abréviation
+If left$(CHAINE,1)="["
+    ABV_COUR=seg$(CHAINE,2*(1+pat(CHAINE,"[F:*")),instr(1,CHAINE+"]","]")-1)
+    CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE+"]","]")+1),0)
+Else
+    Return : # Rien compris
+Endif
+
+# On va rechercher son nom de la table principale
+Read [ATB]ABRFIC=ABV_COUR
+If fstat=0
+    FIC_COUR=[ATB]CODFIC
+Else
+    Return : # Fichier inconnu, on abandonne
+Endif
+
+# On recherche dans le tableau des fichiers ouverts par le traitement : subtil algorithme !
+IL=1
+Repeat
+    IK=IL-1+find(FIC_COUR,TAB_FIC(IL..NB_TABLES_TRT),FIC_COUR)
+    IL=IK-1+find(ABV_COUR,TAB_ABV(IK..NB_TABLES_TRT),ABV_COUR)
+Until IK=IL
+
+# Si le fichier principal n'est pas encore répertorié, on le charge
+If IK>NB_TABLES_TRT
+    If NB_TABLES_TRT<MAX_FICTRT
+        NB_TABLES_TRT+=1
+        NUMFIC_COUR=NB_TABLES_TRT
+        TAB_FIC(NB_TABLES_TRT)=FIC_COUR
+        TAB_ABV(NB_TABLES_TRT)=ABV_COUR
+        Gosub CHARGE_FIC
+        INDEX_DEFAUT(NUMFIC_COUR)=INDEX_TB(NUMFIC_COUR,1)
+        CRIT_EGAL(NUMFIC_COUR)=0
+    Else
+        Errbox "Trop de tables ouvertes"
+    Endif
+Else
+    NUMFIC_COUR=IK
+Endif
+
+# On saute toute la partie du With... pour retrouver la nouvelle abréviation
+If pat(CHAINE,"*As [*") or pat(CHAINE,"*As[*") 
+    CHAINE=vireblc(right$(CHAINE,2+instr(1,CHAINE,"As")),0)
+Else
+    Return : # Rien compris !
+Endif
+
+ABV_LINK=mid$(CHAINE,2,instr(1,CHAINE+"]","]")-2)
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE+"]","]")+1),0)
+
+# On recherche dans le tableau des Link ouverts par le traitement : subtil algorithme !
+IL=1
+Repeat
+    IK=IL-1+find("Link",TAB_FIC(IL..NB_TABLES_TRT),"Link")
+    IL=IK-1+find(ABV_COUR,TAB_ABV(IK..NB_TABLES_TRT),ABV_COUR)
+Until IK=IL
+
+# On recharge en fonction du fichier principal quoi qu'il arrive
+If IK>NB_TABLES_TRT
+    If NB_TABLES_TRT<MAX_FICTRT
+        NB_TABLES_TRT+=1
+    Else
+        Call ERREUR ("Trop de tables ouvertes") From GESECRAN
+    Endif
+Endif
+
+# Chargement des caractéristiques du link à partir du fichier principal
+# (on hérite de ses Where et des Where faits sur un précédent Filter s'il y en a...)
+NB_CHAMPS_WHERE(IK)=NB_CHAMPS_WHERE(NUMFIC_COUR)
+NB_FILE_WHERE(IK)=NB_FILE_WHERE(NUMFIC_COUR)
+NB_FILT_WHERE(IK)=NB_FILT_WHERE(NUMFIC_COUR)
+CRIT_EGAL(IK)=CRIT_EGAL(NUMFIC_COUR)
+ABV_COUR=ABV_LINK
+FIC_COUR="Link"
+TAB_FIC(IK)=FIC_COUR
+TAB_ABV(IK)=ABV_COUR
+
+# Tableau des index
+NB_IND(IK)=NB_IND(NUMFIC_COUR)
+For II=1 To NB_IND(IK)
+    INDEX_TB(IK,II)=INDEX_TB(NUMFIC_COUR,II)
+    INDEX_HM(IK,II)=INDEX_HM(NUMFIC_COUR,II)
+    NB_SCLES(IK,II)=NB_SCLES(NUMFIC_COUR,II)
+    For IJ=1 To NB_SCLES(IK,II)
+        DESC_IND(IK,II,IJ)=DESC_IND(NUMFIC_COUR,II,IJ)
+    Next
+Next
+INDEX_DEFAUT(IK)=INDEX_DEFAUT(NUMFIC_COUR)
+
+# Tableau des champs
+NB_CHAMPS(IK)=NB_CHAMPS(NUMFIC_COUR)
+For II=1 To NB_CHAMPS(IK)
+    CHAMPS_TB(IK,II)=CHAMPS_TB(NUMFIC_COUR,II)
+Next
+
+# Tableau des champs déjà trouvés dans les Where
+For II=1 To NB_CHAMPS_WHERE(IK)
+    CHAMPS_WHERE(IK,II)=CHAMPS_WHERE(NUMFIC_COUR,II)
+Next
+
+# Désormais, la table utilisée est la table "Link"
+# Mais on stocke dans une variable la table d'origine 
+TAB_LKF(IK)=TAB_FIC(NUMFIC_COUR)
+NUMFIC_COUR=IK
+
+# Si une clause Where existe, on l'analyse
+# Mais dans ce cas, le Filter fait sur la table d'origine du Link est perdu
+If pat(CHAINE,"Where*")
+    CHAINE=vireblc(right$(CHAINE,6),0)
+    NB_CHAMPS_WHERE(NUMFIC_COUR)=NB_FILE_WHERE(NUMFIC_COUR)
+    Gosub ANAWHERE
+    NB_FILE_WHERE(NUMFIC_COUR)=NB_CHAMPS_WHERE(NUMFIC_COUR)
+    NB_FILT_WHERE(NUMFIC_COUR)=NB_CHAMPS_WHERE(NUMFIC_COUR)
+Endif
+
+# S'il y a une clause Order By Key, on l'analyse
+If pat(CHAINE,"Order By Key*")
+    CHAINE=vireblc(right$(CHAINE,13),0)
+    Gosub ANAORDER
+Endif
+Return
+
+# Analyse Where utilisé dans les instructions For, File, Update, Filter
+$ANAWHERE
+If pat(CHAINE,"*Order By Key*")
+  CHAINE1=left$(CHAINE,instr(1,CHAINE,"Order By Key")-1)
+  CHAINE=right$(CHAINE,instr(1,CHAINE,"Order By Key"))
+Elsif pat(CHAINE4,"*Update*") & pat(CHAINE,"*With*")
+  CHAINE1=left$(CHAINE,instr(1,CHAINE,"With")-1)
+  CHAINE=right$(CHAINE,instr(1,CHAINE,"With"))
+Else
+  CHAINE1=CHAINE
+  CHAINE=""
+Endif
+
+NBPAR=0
+Repeat
+  If left$(CHAINE1,1)="("
+      NBPAR+=1
+      CHAINE1=right$(CHAINE1,2)
+  Elsif left$(CHAINE1,1)=")"
+      NBPAR-=1
+      CHAINE1=right$(CHAINE1,2)
+  Elsif left$(CHAINE1,1)='"' or left$(CHAINE1,1)="'" 
+      CHAINE1=right$(CHAINE1,instr(2,CHAINE1+left$(CHAINE1,1),left$(CHAINE1,1))+1)
+  Elsif left$(CHAINE1,1)="," & NBPAR=0
+      Break
+  Elsif left$(CHAINE1,1)="|" or left$(CHAINE1,2)="or"
+      ALERT_OR=1 : # Pour alerte (uniquement exploité dans l'analyse du For ... Where)
+      CHAINE1=right$(CHAINE1,2+(left$(CHAINE,1)<>"|"))
+  Elsif pat(CHAINE1,"["+ABV_COUR+"]*")
+      CHAINE1=right$(CHAINE1,3+len(ABV_COUR))
+  Elsif pat(CHAINE1,"[F:"+ABV_COUR+"]*")
+      CHAINE1=right$(CHAINE1,5+len(ABV_COUR))
+  Elsif pat(CHAINE1,"[F]*")
+      CHAINE1=right$(CHAINE1,4)
+  Elsif pat(CHAINE1,"[M:*") or pat(CHAINE1,"[F:*") : # si masque ou autre table, on saute la variable
+      If instr(1,CHAINE1,"]")=0
+          CHAINE1=""
+      Else
+          CHAINE1=right$(CHAINE1,1+instr(1,CHAINE1,"]"))
+          IS=len(CHAINE1)-len(vireblc(ctrans(CHAINE1,ALPHAN,SPACEN),0))
+          CHAINE1=vireblc(right$(CHAINE1,IS+1),0)
+      Endif
+  Elsif instr(1,ALPHA,left$(CHAINE1,1))
+      IS=len(CHAINE1)-len(vireblc(ctrans(CHAINE1,ALPHAN,SPACEN),0))
+      CHAINE3=vireblc(left$(CHAINE1,IS),3)
+      CHAINE1=vireblc(right$(CHAINE1,IS+1),0)
+      If find(CHAINE3,CHAMPS_TB(NUMFIC_COUR,1..NB_CHAMPS(NUMFIC_COUR)))
+        # On ne retient pas le champ si on recherche sur différence
+        If left$(vireblc(CHAINE1,4),2)<>"<>"
+            If find(CHAINE3,CHAMPS_WHERE(NUMFIC_COUR,1..NB_CHAMPS_WHERE(NUMFIC_COUR)))=0
+                NB_CHAMPS_WHERE(NUMFIC_COUR)+=1
+                CHAMPS_WHERE(NUMFIC_COUR,NB_CHAMPS_WHERE(NUMFIC_COUR))=CHAINE3
+            Endif
+        Endif
+        # Si l'opérateur est > ou <, on met à 1 le flag CRIT_EGAL
+        If find(left$(vireblc(CHAINE1,4),1),"<",">")
+            CRIT_EGAL(NUMFIC_COUR)=1
+        Endif
+      Endif
+  Else
+# petite optimisation : on saute d'un coup les caractères minuscules et $
+      CHAINE1=vireblc(right$(ctrans(CHAINE1,"abcdefghijklmnopqrstuvwxyz$",""),2),0)
+  Endif
+Until CHAINE1=""
+CHAINE=CHAINE1+CHAINE
+Return
+
+# Analyse de la clé de l'Order By (sur champ CHAINE : il peut rester quelque chose à analyser dedans)
+$ANAORDER
+IS=len(CHAINE)-len(vireblc(ctrans(CHAINE,ALPHAN,SPACEN),0))
+CHAINE3=vireblc(left$(CHAINE,IS),1)
+CHAINE=vireblc(right$(CHAINE,IS+1),0)
+IK=find(CHAINE3,INDEX_TB(NUMFIC_COUR,1..NB_IND(NUMFIC_COUR)))
+If IK
+    INDEX_DEFAUT(NUMFIC_COUR)=CHAINE3
+Else
+    If left$(CHAINE,1)="="
+        INDEX_DEFAUT(NUMFIC_COUR)="*"+CHAINE3 : # Signifie qu'il s'agit (sauf bug) d'un tri (à améliorer !!!)
+    Else
+        INDEX_DEFAUT(NUMFIC_COUR)="*" : # A analyser plus finement
+    Endif
+Endif
+
+NBPAR=0
+While (left$(CHAINE,1)<>"," or NBPAR<>0) & CHAINE<>""
+    If left$(CHAINE,1)="("
+        NBPAR+=1
+        CHAINE=right$(CHAINE,2)
+    Elsif left$(CHAINE,1)=")"
+        NBPAR-=1
+        CHAINE=right$(CHAINE,2)
+    Elsif instr(1,ALPHA,left$(CHAINE,1))
+        CHAINE=vireblc(right$(CHAINE,len(CHAINE)-len(vireblc(ctrans(CHAINE,ALPHAN,SPACEN),0))+1),0)
+    Else
+        CHAINE=vireblc(right$(CHAINE,2),0)
+    Endif
+Wend
+Return
+
+# Analyse de l'Update
+$ANAUPDA
+If TRACEDET=2
+    Wrseq "Chaine="+CHAINE
+    Openo
+    Openo CHEMINTRA,-1
+Endif
+
+# On coupe le For
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,'Update')+6),0)
+
+# Il faut éviter d'analyser tout ce qui n'est pas For [TTT]AAA ... Where ...  ou For [TTT] Where ...
+ABV_COUR=seg$(CHAINE,2*(1+pat(CHAINE,"[F:*")),instr(1,CHAINE+"]","]")-1)
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE+"]","]")+1),0)
+
+# Cette abréviation est-elle déjà chargée ?
+IK=find(ABV_COUR,TAB_ABV(1..NB_TABLES_TRT)) : # Il n'y a pas deux fichiers ouverts avec la même abrév
+
+If IK=0
+    Read [ATB]ABRFIC=ABV_COUR
+    If fstat
+        Return
+    Endif
+    FIC_COUR=[ATB]CODFIC
+    If NB_TABLES_TRT<MAX_FICTRT
+        NB_TABLES_TRT+=1
+        NUMFIC_COUR=NB_TABLES_TRT
+        TAB_FIC(NB_TABLES_TRT)=FIC_COUR
+        TAB_ABV(NB_TABLES_TRT)=ABV_COUR
+        Gosub CHARGE_FIC
+        INDEX_DEFAUT(NUMFIC_COUR)=INDEX_TB(NUMFIC_COUR,1)
+    Else
+        Errbox "Trop de tables ouvertes"
+    Endif
+Else
+    NUMFIC_COUR=IK
+    FIC_COUR=TAB_FIC(NUMFIC_COUR)
+Endif
+
+# Il n'y a pas de clé par défaut : on est dans la même situation qu'avec un Nohint
+CLE_WHERE="+"
+
+# S'il y avait un Filter avant, en tenir compte
+NB_CHAMPS_WHERE(NUMFIC_COUR)=NB_FILT_WHERE(NUMFIC_COUR)
+
+If pat(CHAINE,"Where*")
+    CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,'Where')+5),0)
+    Gosub ANAWHERE
+Endif
+
+# On ignore le reste de la chaine (With...) et on passe à l'analyse de pertinence
+Gosub PERTINENCE
+
+Return
+
+
+# Analyse du Read et des équivalents
+$ANAREAD
+If TRACEDET=2
+    Wrseq "Chaine="+CHAINE
+    Openo
+    Openo CHEMINTRA,-1
+Endif
+
+# On coupe le mot-clé
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,MOT_CLE)+len(MOT_CLE)),0)
+ABV_COUR=seg$(CHAINE,2*(1+pat(CHAINE,"[F:*")),instr(1,CHAINE+"]","]")-1)
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE+"]","]")+1),0)
+
+NB_COMP_LUS=0
+
+# Analyse du nom de la clé : on prend tous les caractères A-Z,chiffres, ()
+If left$(CHAINE,4)="Curr" : # Pas de problème normalement (mais j'espère qu'un Read a été fait auparavant)
+    IK=find(ABV_COUR,TAB_ABV(1..NB_TABLES_TRT))
+    If IK=0 & WARNING=2 : # Bizarre, on n'a pas vu d'ordre sur cette table avant...
+        If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+            NB_WRN  += 1
+            NB_LGNW += 1
+            WRN_MESS(NB_LGNW)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+            NB_LGNW +=1
+            WRN_MESS(NB_LGNW)="       Table"-FIC_COUR-" : avertissement : pas de lecture vue avant sur la table ["+ABV_COUR+"]"
+            NB_LGNW +=1
+            WRN_MESS(NB_LGNW)= "CBCB" + CHAINCPT
+        Endif
+        Return
+    Else
+        Return
+    Endif
+Elsif left$(CHAINE,5)="First" or find(left$(CHAINE,4),"Last","Next","Prev") : # Pas de clé
+    CLE_WHERE="-"
+Elsif instr(1,ALPHA,left$(CHAINE,1)) : # on cherche la clé
+    IS=min(len(CHAINE)-len(vireblc(ctrans(CHAINE,ALPHAN+"()",SPACEN+"  "),0))
+&         ,instr(1,CHAINE+"First","First")-1
+&         ,instr(1,CHAINE+"Last","Last")-1
+&         ,instr(1,CHAINE+"Next","Next")-1
+&         ,instr(1,CHAINE+"Prev","Prev")-1)
+    CHAINE3=vireblc(left$(CHAINE,IS),1)
+    CHAINE=vireblc(right$(CHAINE,IS+1),0)
+
+    # Si la clé est donnée complète et que l'on donne une valeur de type =, c'est optimisé
+    IS=instr(1,CHAINE3,"(")
+    If IS=0
+        If left$(CHAINE,1)="="
+            Return
+        Endif
+    Else 
+        NB_COMP_LUS=val(right$(CHAINE3,IS+1))
+        If left$(CHAINE,1)="=" & NB_COMP_LUS>0 : # Si lecture égale sur une clé partielle, c'est optimisé
+            Return
+        Endif
+    Endif    
+
+    # On vire la parenthèse du nom de la clé
+    CLE_WHERE=vireblc(ctrans(CHAINE3,"("," "),3)
+Else
+    Return
+Endif
+
+# Cette abréviation est-elle déjà chargée ?
+IK=find(ABV_COUR,TAB_ABV(1..NB_TABLES_TRT)) : # Il n'y a pas deux fichiers ouverts avec la même abrév
+
+If IK=0
+    Read [ATB]ABRFIC=ABV_COUR
+    If fstat
+        Return
+    Endif
+    FIC_COUR=[ATB]CODFIC
+    If NB_TABLES_TRT<MAX_FICTRT
+        NB_TABLES_TRT+=1
+        NUMFIC_COUR=NB_TABLES_TRT
+        TAB_FIC(NB_TABLES_TRT)=FIC_COUR
+        TAB_ABV(NB_TABLES_TRT)=ABV_COUR
+        Gosub CHARGE_FIC
+        INDEX_DEFAUT(NUMFIC_COUR)=INDEX_TB(NUMFIC_COUR,1)
+    Else
+        Errbox "Trop de tables ouvertes"
+    Endif
+Else
+    NUMFIC_COUR=IK
+    FIC_COUR=TAB_FIC(NUMFIC_COUR)
+Endif
+
+# Si la clé n'est pas indiquée, c'est l'index par défaut, sinon on affecte l'index par défaut
+If CLE_WHERE=""
+    CLE_WHERE=INDEX_DEFAUT(NUMFIC_COUR)
+Elsif find(CLE_WHERE,INDEX_TB(NUMFIC_COUR,1..NB_IND(NUMFIC_COUR)))
+    INDEX_DEFAUT(NUMFIC_COUR)=CLE_WHERE
+Endif
+
+# S'il y avait un Filter avant, en tenir compte
+NB_CHAMPS_WHERE(NUMFIC_COUR)=NB_FILT_WHERE(NUMFIC_COUR)
+
+# Si on fait une lecture > ou < sur une valeur de clé partielle, signaler un problème potentiel
+If instr(1,"<>",left$(CHAINE,1)) & NB_COMP_LUS>0
+    IK=find(CLE_WHERE,INDEX_TB(NUMFIC_COUR,1..NB_IND(NUMFIC_COUR)))
+    If IK
+        If NB_COMP_LUS<NB_SCLES(NUMFIC_COUR,IK)
+            If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+                NB_ERR+=1
+                NB_LGN+=1
+                ERR_MESS(NB_LGN)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+                NB_LGN+=1
+                ERR_MESS(NB_LGN)="       Table"-FIC_COUR-"["+ABV_COUR+"]"-
+&                                 "lecture partielle sur index"-CLE_WHERE
+                NB_LGN += 1
+                ERR_MESS(NB_LGN)= "CBCB" + CHAINCPT
+            Endif
+        Endif
+    Endif
+Endif
+
+Gosub PERTINENCE
+Return
+
+
+
+# Analyse du For
+$ANAFOR
+If TRACEDET=2
+    Wrseq "Chaine="+CHAINE
+    Openo
+    Openo CHEMINTRA,-1
+Endif
+
+# On coupe le For
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,'For')+3),0)
+
+# Si une clause With Lock traîne, il faut la couper
+IS=instr(1,CHAINE,"With Lock")
+If IS
+    CHAINE=left$(CHAINE,IS-1)-left$(CHAINE,IS+9)
+Endif
+
+# Il faut éviter d'analyser tout ce qui n'est pas For [TTT]AAA ... Where ...  ou For [TTT] Where ...
+ABV_COUR=seg$(CHAINE,2*(1+pat(CHAINE,"[F:*")),instr(1,CHAINE+"]","]")-1)
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE+"]","]")+1),0)
+
+# CBO 2009.02.20
+# il y a 1 ORDER BY dans le filter
+If find (ABV_COUR, TAB_ORDER) > 0
+    # Il faut rechercher l'index associé
+
+    CHAINEIDX = right$(CHAINE, instr(1, CHAINE, " ") + 1)
+    IK=find(CHAINEIDX, INDEX_TB(NUMFIC_COUR,1..NB_IND(NUMFIC_COUR)))
+    If IK > 0
+        NB_WRN  += 1
+        NB_LGNW += 1
+        WRN_MESS(NB_LGNW) = "["+format$("N0:4#",NLIG)+"] " + CHAINE
+        NB_LGNW += 1
+        WRN_MESS(NB_LGNW)="       Table" - ABV_COUR - ": Order By Key défini dans le Filter et indexe indiqué dans le For"
+        NB_LGNW +=1
+        WRN_MESS(NB_LGNW)= "CBCB" + CHAINCPT
+    Endif
+Endif
+
+# Analyse du nom de la clé : on prend tous les caractères A-Z,chiffres, ()
+If left$(CHAINE,5)="Where"
+    If pat(CHAINE,"*With Nohint*") : #  Syntaxe With Nohint
+        IS=instr(1,CHAINE,"With Nohint")
+        CHAINE=vireblc(left$(CHAINE,IS-1),0) : # On supprime le With Nohint
+        CLE_WHERE="+" : # Si Nohint, il faudra rechercher s'il existe une bonne clé
+    Else
+        CLE_WHERE="-" : # On est dans le cas du For [abv] Where : on ne sait pas quelle est la clé !
+    Endif
+Elsif pat(CHAINE,"*Hint Key*") : # Syntaxe Hint Key (suivi éventuellement de Where)
+    IS=instr(1,CHAINE,"Hint Key")
+    CHAINE=vireblc(right$(CHAINE,IS+9),0)
+    If find(left$(CHAINE,2),'="',"='")or find(left$(CHAINE,3),"= '",'= "') : # Syntaxe Hint Key ="CONSTANTE"
+        CHAINE3=mid$(vireblc(CHAINE,4),2,1)
+        CHAINE=right$(CHAINE,3+(mid$(CHAINE,2,1)=" "))
+        IS=instr(1,CHAINE,CHAINE3)
+        If IS
+            CHAINE3=left$(CHAINE,IS-1)
+            CHAINE=vireblc(right$(CHAINE,IS+1),0)
+            If instr(1,ALPHA,left$(CHAINE3,1))
+                IS=len(CHAINE3)-len(vireblc(ctrans(CHAINE3,ALPHAN+"()",SPACEN+"  "),0))
+                CHAINE3=vireblc(left$(CHAINE3,IS),1)
+                CLE_WHERE=CHAINE3
+            Else
+                Return
+            Endif
+        Else
+            Return
+        Endif
+    Elsif instr(1,ALPHA,left$(CHAINE,1)) : # Syntaxe Hint Key NOM_CLE
+        IS=min(len(CHAINE)-len(vireblc(ctrans(CHAINE,ALPHAN+"()",SPACEN+"  "),0))
+&             ,instr(1,CHAINE+"Where","Where")-1)
+        CHAINE3=vireblc(left$(CHAINE,IS),1)
+        CHAINE=vireblc(right$(CHAINE,IS+1),0)
+        CLE_WHERE=vireblc(ctrans(CHAINE3,"("," "),3)
+    Endif
+Elsif pat(CHAINE,"*With Nohint*") : #  Syntaxe With Nohint (précédée éventuellement de Where)
+    IS=instr(1,CHAINE,"With Nohint")
+    CHAINE=vireblc(left$(CHAINE,IS-1),0) : # On supprime le With Nohint
+    CLE_WHERE="+" : # Si Nohint, il faudra rechercher s'il existe une bonne clé
+Elsif instr(1,ALPHA,left$(CHAINE,1))
+    IS=min(len(CHAINE)-len(vireblc(ctrans(CHAINE,ALPHAN+"()",SPACEN+"  "),0))
+&         ,instr(1,CHAINE+"Where","Where")-1)
+    CHAINE3=vireblc(left$(CHAINE,IS),1)
+    CHAINE=vireblc(right$(CHAINE,IS+1),0)
+
+    # On vire la parenthèse du nom de la clé
+    CLE_WHERE=vireblc(ctrans(CHAINE3,"("," "),3)
+Else
+    Return
+Endif
+
+# Cette abréviation est-elle déjà chargée ?
+IK=find(ABV_COUR,TAB_ABV(1..NB_TABLES_TRT)) : # Il n'y a pas deux fichiers ouverts avec la même abrév
+
+If IK=0
+    Read [ATB]ABRFIC=ABV_COUR
+    If fstat
+        Return
+    Endif
+    FIC_COUR=[ATB]CODFIC
+    If NB_TABLES_TRT<MAX_FICTRT
+        NB_TABLES_TRT+=1
+        NUMFIC_COUR=NB_TABLES_TRT
+        TAB_FIC(NB_TABLES_TRT)=FIC_COUR
+        TAB_ABV(NB_TABLES_TRT)=ABV_COUR
+        Gosub CHARGE_FIC
+        INDEX_DEFAUT(NUMFIC_COUR)=INDEX_TB(NUMFIC_COUR,1)
+        CRIT_EGAL(NUMFIC_COUR)=0
+    Else
+        Errbox "Trop de tables ouvertes"
+    Endif
+Else
+    NUMFIC_COUR=IK
+    FIC_COUR=TAB_FIC(NUMFIC_COUR)
+Endif
+
+# Inutile d'analyser un For clé sans clauses Where
+If CLE_WHERE<>"" and pat(CHAINE,"*Where*")=0 and NB_CHAMPS_WHERE(NUMFIC_COUR)=0
+    Return
+Endif
+
+# Si la clé n'est pas indiquée, c'est l'index par défaut, sinon on affecte la clé par défaut
+If CLE_WHERE=""
+    CLE_WHERE=INDEX_DEFAUT(NUMFIC_COUR)
+Elsif find(CLE_WHERE,INDEX_TB(NUMFIC_COUR,1..NB_IND(NUMFIC_COUR)))
+    INDEX_DEFAUT(NUMFIC_COUR)=CLE_WHERE
+Endif
+
+# S'il y avait un Filter avant, en tenir compte
+NB_CHAMPS_WHERE(NUMFIC_COUR)=NB_FILT_WHERE(NUMFIC_COUR)
+If pat(CHAINE,"*Where*")
+    CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,'Where')+5),0)
+    ALERT_OR=0
+    Gosub ANAWHERE
+Endif
+
+If WARNOR=2 & ALERT_OR=1 : # Problème potentiel car un or a été détecté
+    If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+        NB_WRN  += 1
+        NB_LGNW += 1
+        WRN_MESS(NB_LGNW)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+        NB_LGN += 1
+        WRN_MESS(NB_LGNW)="       Table"-FIC_COUR-": avertissement : la clause Where contient un 'or'"
+&                                        +"(performances potentiellement mauvaises)"
+        NB_LGNW +=1
+        WRN_MESS(NB_LGNW)= "CBCB" + CHAINCPT
+    Endif
+Endif
+
+Gosub PERTINENCE
+Return
+
+
+# Début de l'analyse de pertinence de la clé (utilisé pour Read et For)
+$PERTINENCE
+
+If NB_CHAMPS_WHERE(NUMFIC_COUR)=0
+    CH_WH_CONNUS="      Pas de critères de filtrage sur la lecture"
+Else
+    CH_WH_CONNUS="      Critères de filtrage sur champs ("
+    For IL=1 To NB_CHAMPS_WHERE(NUMFIC_COUR)
+        CH_WH_CONNUS+=string$(IL>1,",")+CHAMPS_WHERE(NUMFIC_COUR,IL)
+    Next IL
+    CH_WH_CONNUS+=")"
+Endif
+
+If CLE_WHERE="*"
+    # Clé définie par un ordre de tri
+    Return
+Endif
+
+# Quelle clé est la plus pertinente ?
+For IL=1 To NB_IND(NUMFIC_COUR)
+    NB_MATCH(IL)=0
+    For IM=1 To NB_SCLES(NUMFIC_COUR,IL)
+        If find(DESC_IND(NUMFIC_COUR,IL,IM),CHAMPS_WHERE(NUMFIC_COUR,1..NB_CHAMPS_WHERE(NUMFIC_COUR)))
+            NB_MATCH(IL)+=1
+        Else
+            Break
+        Endif
+    Next IM
+Next IL
+
+MAX_MATCH=max(NB_MATCH(1..NB_IND(NUMFIC_COUR)))
+
+# Quelle clé est utilisée ?
+IM=find(CLE_WHERE,INDEX_TB(NUMFIC_COUR,1..NB_IND(NUMFIC_COUR)))
+If IM : CUR_MATCH=NB_MATCH(IM) : Else CUR_MATCH=0 : Endif
+If CLE_WHERE="-" : # On n'a pas donné d'index (et pas de nohint non plus)
+    If left$(INDEX_DEFAUT(NUMFIC_COUR),1)="*" : # On utilise un Order By, pas d'analyse simple possible
+        Return
+    Elsif MAX_MATCH>0 : # Mais il existe une clé qui serait utile
+        If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+&       or (TAB_FIC(NUMFIC_COUR)="Link" & find(TAB_LKF(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE)))
+            IL=find(INDEX_DEFAUT(NUMFIC_COUR),INDEX_TB(NUMFIC_COUR,1..NB_IND(NUMFIC_COUR)))
+            If IL and MAX_MATCH=NB_MATCH(IL)
+                If WARNING=2 : # La clé trouvée est celle par défaut
+                    NB_WRN  += 1
+                    NB_LGNW += 1
+                    WRN_MESS(NB_LGNW)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+                    NB_LGNW +=1
+                    WRN_MESS(NB_LGNW)=CH_WH_CONNUS
+                    NB_LGNW +=1
+                    WRN_MESS(NB_LGNW)="       Table"-FIC_COUR-": avertissement : l'index par défaut "
+&                                    +"("+INDEX_TB(NUMFIC_COUR,IL)+")"+" est le bon ("
+&                                    +num$(MAX_MATCH)+"/"+num$(NB_SCLES(NUMFIC_COUR,IL))+")"
+                    NB_LGNW +=1
+                    WRN_MESS(NB_LGNW)= "CBCB" + CHAINCPT
+                Endif
+            Elsif IL
+                IK=find(MAX_MATCH,NB_MATCH(1..NB_IND(NUMFIC_COUR)))
+                # Si l'index utilisé est donné complètement et sans homonymes et uniquement avec des critères d'égalité
+                # Il n'y a pas d'erreur
+                If NB_MATCH(IL)<NB_SCLES(NUMFIC_COUR,IL) or INDEX_HM(NUMFIC_COUR,IL)=2 or CRIT_EGAL(NUMFIC_COUR)=1
+                    NB_LGNW+=1
+                    NB_WRN+=1
+                    WRN_MESS(NB_LGNW)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+                    NB_LGNW+=1
+                    WRN_MESS(NB_LGNW)=CH_WH_CONNUS
+                    NB_LGNW+=1
+                    WRN_MESS(NB_LGNW)="       Table"-FIC_COUR-": l'index"-INDEX_TB(NUMFIC_COUR,IK)-"est meilleur ("+num$(MAX_MATCH)
+&                                +"/"+num$(NB_SCLES(NUMFIC_COUR,IK))+") que celui utilisé par défaut "
+&                                +"("+INDEX_DEFAUT(NUMFIC_COUR)+":"
+&                                +num$(NB_MATCH(IL))+"/"+num$(NB_SCLES(NUMFIC_COUR,IL))+")"
+                    NB_LGNW += 1
+                    ERR_MESS(NB_LGNW)= "CBCB" + CHAINCPT
+
+                Endif
+            Else
+                NB_LGN+=1
+                NB_ERR+=1
+                ERR_MESS(NB_LGN)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+                NB_LGN+=1
+                ERR_MESS(NB_LGN)=CH_WH_CONNUS
+                NB_LGN+=1
+                ERR_MESS(NB_LGN)="       Table"-FIC_COUR-": index par défaut"-INDEX_DEFAUT(NUMFIC_COUR)-"non trouvé dans table des index !!!"
+                NB_LGN += 1
+                ERR_MESS(NB_LGN)= "CBCB" + CHAINCPT
+
+            Endif                
+        Endif
+    Elsif NB_CHAMPS_WHERE(NUMFIC_COUR)>0 : # Il n'y a pas de clé utile, mais une clause Where existe
+        If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+&       or (TAB_FIC(NUMFIC_COUR)="Link" & find(TAB_LKF(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE)))
+            NB_ERR+=1
+            NB_LGN+=1
+            ERR_MESS(NB_LGN)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+            NB_LGN+=1
+            ERR_MESS(NB_LGN)=CH_WH_CONNUS
+            NB_LGN+=1
+            ERR_MESS(NB_LGN)="       Table"-FIC_COUR-": pas de clé correspondant aux critères ("
+            For IL=1 To NB_CHAMPS_WHERE(NUMFIC_COUR)
+                ERR_MESS(NB_LGN)+=CHAMPS_WHERE(NUMFIC_COUR,IL)+string$(IL<>NB_CHAMPS_WHERE(NUMFIC_COUR),",")
+            Next IL
+            ERR_MESS(NB_LGN)+=")"
+            NB_LGN += 1
+            ERR_MESS(NB_LGN)= "CBCB" + CHAINCPT
+
+        Endif
+    Endif
+    Return
+Elsif CLE_WHERE="+" : # C'est une clause Nohint, on regarde si un index est utilisable
+    If MAX_MATCH=0 : # Aucun bon index n'existe
+        If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+&       or (TAB_FIC(NUMFIC_COUR)="Link" & find(TAB_LKF(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE)))
+            NB_ERR+=1
+            NB_LGN+=1
+            ERR_MESS(NB_LGN)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+            NB_LGN+=1
+            If CLESPE=2
+
+               ERR_MESS(NB_LGN)="       Table"-FIC_COUR-": pas de clé correspondant aux critères ("
+               For IL=1 To NB_CHAMPS_WHERE(NUMFIC_COUR)
+                   ERR_MESS(NB_LGN)+=CHAMPS_WHERE(NUMFIC_COUR,IL)+string$(IL<>NB_CHAMPS_WHERE(NUMFIC_COUR),",")
+               Next IL
+               ERR_MESS(NB_LGN)+=") mais cle d'optimisation possible"
+            Else
+                ERR_MESS(NB_LGN)="       ==> Clé d'optimisation possible"
+            Endif
+            NB_LGN += 1
+            ERR_MESS(NB_LGN)= "CBCB" + CHAINCPT
+        Endif
+    Endif
+Endif
+    
+IK=find(CLE_WHERE,INDEX_TB(NUMFIC_COUR,1..NB_IND(NUMFIC_COUR)))
+If IK
+    If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+&      or (TAB_FIC(NUMFIC_COUR)="Link" & find(TAB_LKF(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE)))
+        If MAX_MATCH<>NB_MATCH(IK)
+            IL=find(MAX_MATCH,NB_MATCH(1..IL-1))
+
+            # Si l'index utilisé est donné complètement et sans homonymes et uniquement avec des critères d'égalité
+            # Il n'y a pas d'erreur
+            If CUR_MATCH<NB_SCLES(NUMFIC_COUR,IL) or INDEX_HM(NUMFIC_COUR,IL)=2 or CRIT_EGAL(NUMFIC_COUR)=1
+                NB_LGNW+=1
+                WRN_MESS(NB_LGNW)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+                NB_LGNW+=1
+                WRN_MESS(NB_LGNW)=CH_WH_CONNUS
+                NB_LGNW+=1
+                NB_WRN+=1
+                WRN_MESS(NB_LGNW)="       Table"-FIC_COUR-"l'index"-INDEX_TB(NUMFIC_COUR,IL)-"est meilleur ("+num$(MAX_MATCH)+"/"
+&                            +num$(NB_SCLES(NUMFIC_COUR,IL))+")"-"que celui utilisé ("+CLE_WHERE+":"
+&                                +num$(CUR_MATCH)+"/"+num$(NB_SCLES(NUMFIC_COUR,IL))+")"
+                NB_LGNW += 1
+                WRN_MESS(NB_LGNW)= "CBCB" + CHAINCPT
+            Endif
+        Elsif MAX_MATCH=0 & NB_CHAMPS_WHERE(NUMFIC_COUR)<>0
+            If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+&           or (TAB_FIC(NUMFIC_COUR)="Link" & find(TAB_LKF(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE)))
+                NB_LGN+=1
+                NB_ERR+=1
+                ERR_MESS(NB_LGN)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+                NB_LGN+=1
+                ERR_MESS(NB_LGN)="       Table"-FIC_COUR-": pas de clé correspondant aux critères ("
+                For IL=1 To NB_CHAMPS_WHERE(NUMFIC_COUR)
+                    ERR_MESS(NB_LGN)+=CHAMPS_WHERE(NUMFIC_COUR,IL)+string$(IL<>NB_CHAMPS_WHERE(NUMFIC_COUR),",")
+                Next IL
+                ERR_MESS(NB_LGN)+=")"
+                NB_LGN += 1
+                ERR_MESS(NB_LGN)= "CBCB" + CHAINCPT
+            Endif
+        Endif
+    Endif
+Elsif CLE_WHERE<>"+"
+    If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+&       or (TAB_FIC(NUMFIC_COUR)="Link" & find(TAB_LKF(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE)))
+        If ERR_CLE_INEX=2 & "*"+CLE_WHERE<>INDEX_DEFAUT(NUMFIC_COUR) : # Pour gérer l'Order By CLE=...
+            If CLE_WHERE="CLE" : # Souvent, CLE est utilisée pour Order By Key CLE=...
+                NB_LGNW +=1
+                WRN_MESS(NB_LGNW)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+                NB_LGNW +=1
+                WRN_MESS(NB_LGNW)=CH_WH_CONNUS
+                NB_LGNW +=1
+
+                WRN_MESS(NB_LGNW)="       Avertissement : Table"-FIC_COUR-"["+ABV_COUR+"]"-"index"-CLE_WHERE-"inconnu"
+&                                +", clé de tri probable"
+                NB_LGNW +=1
+                WRN_MESS(NB_LGNW)= "CBCB" + CHAINCPT
+
+                NB_WRN+=1
+            Else
+                NB_LGN +=1
+                ERR_MESS(NB_LGN)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+                NB_LGN +=1
+                ERR_MESS(NB_LGN)=CH_WH_CONNUS
+                NB_LGN +=1
+
+                ERR_MESS(NB_LGN)="       Table"-FIC_COUR-"["+ABV_COUR+"]"-"index"-CLE_WHERE-"inconnu"
+                NB_LGN += 1
+                ERR_MESS(NB_LGN)= "CBCB" + CHAINCPT
+                NB_ERR+=1
+            Endif
+        Endif
+    Endif
+Endif
+
+
+Return
+
+#Analyse des ordres Filter [..] Where...
+$ANAFILTER
+If TRACEDET=2
+    Wrseq "Chaine="+CHAINE
+    Openo
+    Openo CHEMINTRA,-1
+Endif
+
+# On coupe le Filter
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,'Filter')+6),0)
+
+# On extrait le nom de la table
+Raz FIC_COUR
+
+# On extrait l'abréviation
+If left$(CHAINE,1)="["
+    ABV_COUR=seg$(CHAINE,2*(1+pat(CHAINE,"[F:*")),instr(1,CHAINE+"]","]")-1)
+    CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE+"]","]")+1),0)
+Else
+    Return
+Endif
+
+# Cette abréviation est-elle déjà chargée ?
+IK=find(ABV_COUR,TAB_ABV(1..NB_TABLES_TRT))
+
+If IK=0
+    Read [ATB]ABRFIC=ABV_COUR : If fstat : Return : Endif
+    FIC_COUR=[ATB]CODFIC
+    If NB_TABLES_TRT<MAX_FICTRT
+        NB_TABLES_TRT+=1
+        NUMFIC_COUR=NB_TABLES_TRT
+        TAB_FIC(NB_TABLES_TRT)=FIC_COUR
+        TAB_ABV(NB_TABLES_TRT)=ABV_COUR
+        Gosub CHARGE_FIC
+        
+        # Si le fichier n'était pas encore déclaré, index par défaut=1er index
+        INDEX_DEFAUT(NUMFIC_COUR)=INDEX_TB(NUMFIC_COUR,1)
+    Else
+        Errbox "Trop de tables ouvertes"
+    Endif
+Else
+    NUMFIC_COUR=IK
+    FIC_COUR=TAB_FIC(NUMFIC_COUR)
+Endif
+
+# On hérite des filtres du File et on en rajoute éventuellement
+NB_CHAMPS_WHERE(NUMFIC_COUR)=NB_FILE_WHERE(NUMFIC_COUR)
+NB_FILT_WHERE(NUMFIC_COUR)=NB_FILE_WHERE(NUMFIC_COUR)
+
+# CBO 2009.02.20
+TAB_ORDER(NUMFIC_COUR) = ""
+
+# S'il y a un Where, on le coupe et on analyse la clause Where, sinon, c'était un Filter simple et on arrête
+If instr(1,CHAINE,'Where')=0
+    Return
+Endif
+
+CHAINE=vireblc(right$(CHAINE,instr(1,CHAINE,'Where')+5),0)
+ALERT_OR=0
+Gosub ANAWHERE
+
+NB_FILT_WHERE(NUMFIC_COUR)=NB_CHAMPS_WHERE(NUMFIC_COUR)
+
+# S'il y a une clause Order By Key, on l'analyse
+If pat(CHAINE,"Order By Key*")
+    CHAINE=vireblc(right$(CHAINE,13),0)
+    Gosub ANAORDER
+    # CBO 2009.02.20
+    TAB_ORDER(NUMFIC_COUR) = ABV_COUR
+
+Else
+#   Alerter le Filter Where s'il y a un or et pas de Order By dedans
+    If WARNOR=2 & ALERT_OR=1
+        If FIC_SS_CLE(1)='*' or find(TAB_FIC(NUMFIC_COUR),FIC_SS_CLE(1..NB_FIC_SS_CLE))
+            NB_WRN +=1
+            NB_LGNW+=1
+            WRN_MESS(NB_LGNW)="["+format$("N0:4#",NLIG)+"] "+CHAINE4
+            NB_LGNW+=1
+            WRN_MESS(NB_LGNW)=CH_WH_CONNUS
+            NB_LGNW+=1
+            WRN_MESS(NB_LGNW)="       Table"-FIC_COUR-": avertissement : la clause Where contient un 'or'"
+&                                    +"(performances potentiellement mauvaises)"
+            NB_LGNW +=1
+            WRN_MESS(NB_LGNW)= "CBCB" + CHAINCPT
+        Endif
+    Endif
+Endif
+
+Return
+
+# Chargement des caractéristiques d'un fichier
+$CHARGE_FIC
+NB_CHAMPS_WHERE(NUMFIC_COUR)=0
+NB_FILE_WHERE(NUMFIC_COUR)=0
+NB_FILT_WHERE(NUMFIC_COUR)=0
+
+Read [ATB]ABRFIC=ABV_COUR
+If fstat
+    Read [ATB]CODFIC=FIC_COUR
+    If  fstat : Return : Endif
+Endif
+
+FIC_COUR=[ATB]CODFIC
+NB_CHAMPS(NUMFIC_COUR)=0
+NB_IND(NUMFIC_COUR)=0
+
+# Index
+II=0
+IJ=0 : # test
+
+For [ATI]CODIND Where CODFIC=[ATB]CODFIC
+    II+=1
+    INDEX_TB(NUMFIC_COUR,II)=[ATI]CODIND
+    INDEX_HM(NUMFIC_COUR,II)=[ATI]HOMONYM
+    CHAINE3=right$(vireblc([ATI]DESCRIPT,0),1+(find(left$(vireblc([ATI]DESCRIPT,0),1),"+","-")<>0))
+    IJ=1
+    Repeat
+#If IJ = 15
+#    Infbox FIC_COUR -num$(IJ) - CHAINE3
+#Endif
+        DESC_IND(NUMFIC_COUR,II,IJ)=
+&         vireblc(left$(CHAINE3,len(CHAINE3)-len(vireblc(ctrans(CHAINE3,ALPHAN+"()",SPACEN+"  "),0))),1)
+        CHAINE3=vireblc(right$(CHAINE3,
+&                               1+len(CHAINE3)-len(vireblc(ctrans(CHAINE3,ALPHAN+"()",SPACEN+"  "),0))+1),0)
+        IJ+=1
+    Until CHAINE3=""
+    NB_SCLES(NUMFIC_COUR,II)=IJ-1
+    SI_HOMONY(NUMFIC_COUR,II)=[ATI]HOMONYM
+Next
+NB_IND(NUMFIC_COUR)=II
+
+# Champs
+For [ATZ]CODZONE Where CODFIC=[ATB]CODFIC
+    NB_CHAMPS(NUMFIC_COUR)+=1
+    CHAMPS_TB(NUMFIC_COUR,NB_CHAMPS(NUMFIC_COUR))=[ATZ]CODZONE
+Next
+Return
+
+$LISTEX
+#----------------------------------------------------------------------------------------------------------------------
+# Liste d'exceptions de traitements
+#----------------------------------------------------------------------------------------------------------------------
+NEX+=1 : EXCEPT(NEX)="*FUNBPSMVT"  : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*FUNCNVSOH"  : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*IAEXPITM"   : #ne sert plus
+NEX+=1 : EXCEPT(NEX)="*INTRAD020"  : #peu utilisé
+NEX+=1 : EXCEPT(NEX)="*STOLIBM"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIDEB"     : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIACH0"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIACH1"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIACH2"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIACH3"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIACH4"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIACH5"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIACH6"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIACH7"    : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIVEN01"   : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UTIVEN02"   : #utilitaire peu fréquemment utilisé
+NEX+=1 : EXCEPT(NEX)="*UUCRM005"
+
+#----------------------------------------------------------------------------------------------------------------------
+# Liste d'exceptions de tables :
+# Liste des fichiers sur lesquels on veut savoir si on fait des requêtes sans qu'il n'existe de clef
+# Si on met '*' dans la première valeur, tous sont testés
+# Si on met '+NNN' dans la première valeur, les tables de plus de NNN lignes sont testées uniquement
+# Si on met '-' dans la première valeur, toutes sont testées, sauf celles définies dans la liste
+#----------------------------------------------------------------------------------------------------------------------
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="-"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="ASERIMP"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="DEBPAR"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="SFOOTINV"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="SINCENT"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="SPRICFICH"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="STOSERW"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="STOWRK"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="TABPAYTYP"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="TABPIVTYP"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="TABBOMALT"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="TABROUALT"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="TABSIVTYP"
+NB_FIC_SS_CLE+=1 : FIC_SS_CLE(NB_FIC_SS_CLE)="TABSOHTYP"
+
+NB_FIC_SS_INIT = NB_FIC_SS_CLE + 1
+
+If left$(FIC_SS_CLE(1),1) = "+"
+    TXTEXEPT = "Liste complétée par les tables qui ont plus de NNN lignes uniquement."
+Elsif left$(FIC_SS_CLE(1),1) = "-"
+    TXTEXEPT = "Liste complétée par toutes les tables, sauf celles listées."
+Endif
+
+Return
+
+
+
+$ECRIREEXCPT
+
+If NEX = 0 and NB_FIC_SS_CLE = 0
+    Wrseq "Pas d'exception pour ce traitement"
+    Wrseq
+    Return
+Endif
+
+Wrseq
+Wrseq
+Wrseq "Exceptions du traitement :"
+Wrseq "__________________________"
+
+Wrseq
+Wrseq
+Wrseq "Liste d'exceptions de traitements :"
+Wrseq
+
+NEX1= 1
+While EXCEPT(NEX1) <> ""
+    Wrseq num$(NEX1) - EXCEPT(NEX1)
+    NEX1 += 1
+Wend
+
+Wrseq
+Wrseq
+Wrseq "Liste d'exceptions de tables :"
+Wrseq "Liste des fichiers sur lesquels on veut savoir si on fait des requêtes sans qu'il n'existe de clef."
+Wrseq
+Wrseq TXTEXEPT
+Wrseq
+
+NEX1= 1
+While FIC_SS_CLE(NEX1) <> ""
+    Wrseq num$(NEX1) - FIC_SS_CLE(NEX1)
+    NEX1 += 1
+Wend
+
+
+Wrseq
+Wrseq
+Wrseq "________________________________________________________________________________________________________"
+Wrseq
+Wrseq
+
+
+Return
+
+
+

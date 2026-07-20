@@ -1,0 +1,915 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$ Gestion du masque DADXTR
+#**********************************************************
+#* Modifications :
+#*    FQ81491 - 17/10/13 - prise en compte date d'effet
+#**********************************************************
+#*!
+
+Local Char PARAM(10)(1..2) , VALEUR(10)
+GFLAG="1"
+Call TRAITE_CHAR(VALEUR,PARAM,"","TRTDXTR","DADXTR",4,"") From GTRAITE
+End
+
+######################
+$ACTION
+Case ACTION
+ When "INIT"        : Gosub OUVRE
+ When "CONTROLE"    : Gosub CONTROLE
+ When "DEBUT"       : Affzo [M:DIA]: Setmok [DIA] With 0
+ When "EXEC"        : Gosub EXEC
+ When "OK"          : FIN = 1 : GOK = 1
+ When "END"         : FIN = 1
+ When "SORTIE"      : Gosub SORTIE
+Endcase
+Return
+
+######################
+$OUVRE
+Local Mask DADXTR [DIA]
+Local Date DEBANN, FINANN, LSTFRIDAY    :#79266
+Local Char CRITEMP (250)
+Raz [M:DIA]
+If clalev([F:CPY2])=0 : Local File COMPANY  [CPY2] : Endif
+If dim(GCURLEG)>0 : Local Char SAV_GCURLEG(GLONADI) : SAV_GCURLEG = GCURLEG   : Endif
+
+Gosub OUVFIC From EXTRACTION
+#Extraction indiv
+If dim([M:DAE0]EMPDDS)>=0 : Gosub INIT_ECR : Endif
+Gosub DECLARATION From EXTRACTION
+#Affecte l'année défini dans les paramètres
+Gosub ANNEE From EXTRACTION
+#Recherche les code évènement maladie, maternité... pour les S60.
+Gosub SITPART From EXTRACTION
+Return
+
+######################
+$INIT_ECR
+Read[F:FCY]FCY0=[M:DAE0]ETRFCY
+If !fstat : [M:DIA]CPYDDS=[F:FCY]LEGCPY : Endif
+[M:DIA]ALLFCYDDS=1 :[M:DIA]FCYDDS=[M:DAE0]ETRFCY
+[M:DIA]ALLEMPDDS=1 :[M:DIA]EMPDDS=[M:DAE0]EMPDDS
+#SEGAY US1840 US1933 81085 25/09/2013 - Homogénéisation nom prénom
+Call UPD_NAMSRN([M:DIA]EMPDDS,"[M:DIA]","NAM","SRN",0,0) From DIVPAYE
+[M:DIA]ALLCTRNUM=1 :[M:DIA]CTRNUM=[M:DAE0]CTRNUM
+Affzo [M:DIA]
+Return
+
+######################
+$CONTROLE
+If GSTATUT<>GSTAOK
+ FIN = 1
+Else
+ VSOCIETE=[M:DIA]CPYDDS
+ #63907
+ VNATFIL=[M:DIA]NATFIL
+ VDNA=val(GFLAG)
+ Gosub PARAMTDS From EXTRACTION
+ TMP = 1
+ TRA = 1
+Endif
+Return
+
+######################
+$EXEC
+
+#79048
+Local Integer SITOK
+SITOK=1
+
+# ouverture de la trace et écriture de l'en-tête
+#Extraction données-Société XXX
+TIT=mess(67,125,1)-"-"-mess(2,45,1)-[M:DIA]CPYDDS
+If !GSERVEUR
+ Call OUVRE_TRACE(TIT) From LECFIC
+Endif
+Call ECR_TRACE(TIT,0) From GESECRAN
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+
+SYMBOLE = "DAE"+[M:DIA]YEADDS+[M:DIA]CPYDDS+num$([M:DIA]STRDAT)+num$([M:DIA]ENDDAT)+GFLAG
+Lock =SYMBOLE
+If fstat
+ GMESSAGE = mess(30,100,1) : # Opération en cours sur autre poste
+ GERR = 1 : SAI = 1
+ Return
+Endif
+
+CRITEMP="1=1"
+If [M:DIA]ALLEMPDDS<>2
+ CRITEMP-="& REFNUM='"+[M:DIA]EMPDDS+"'"
+Endif
+If [M:DIA]ALLCTRNUM<>2
+ CRITEMP-="& CTRNUM='"+[M:DIA]CTRNUM+"'"
+Endif
+
+Call DEBTRANS From GLOCK
+
+# En extraction individuelle on touche pas à DADFCY1 (sauf DNA)!
+If [M:DIA]EMPDDS="" | VDNA=2
+ Trbegin [DFY]
+ Gosub TR_ANU
+ If !GOK : Rollback : Endif
+ Commit
+Endif
+
+Trbegin [DFY],[DFP],[DFR],[DFQ]
+&       ,[DAE],[DAS],[DAP],[DAC],[DAG],[DAH],[DAI],[DAJ],[DAK],[DAL],[DAM],[DAQ]
+&       ,[DQE],[DPE],[DPP]
+&       ,[DNA],[DNB],[DNC],[DND],[DNE],[DNF],[DNG]
+
+Gosub TR1
+
+#IMPORT DADS-U
+If GOK<>0
+ Gosub TR2 From TRTDXTR2
+Endif
+
+If GOK<>0
+ #Opération réalisée
+ Call ECR_TRACE(mess(3,10705,1),0) From GESECRAN
+Else
+ #Opération interrompue : Erreur lors de la transaction.
+ Call ECR_TRACE(mess(4,10705,1),1) From GESECRAN
+Endif
+Unlock =SYMBOLE
+If !GSERVEUR
+ Call FERME_TRACE From LECFIC
+Endif
+
+If !GOK : Rollback : Endif
+Commit
+Return
+
+######################
+$TR_ANU
+GOK=1
+#Un site donné
+If [M:DIA]FCYDDS<>""
+ Read [F:FCY]FCY0=[M:DIA]FCYDDS
+ If !fstat
+  Gosub DECALAGE
+  Gosub ANNU_DFY
+ Endif
+Else
+ #un groupe de sites
+ For [F:FGR]FGR0 Where CPY=[M:DIA]CPYDDS
+  Read[FCY]FCY0=[F:FGR]FCY
+  If !fstat
+   Gosub DECALAGE
+   Gosub ANNU_DFY
+  Endif
+ Next
+Endif
+Return
+
+#################
+$ANNU_DFY
+If VDNA=2 | VTYPDEC=3
+ Read[F:DFY]DFY0=[F:FCY]FCY;[M:DIA]YEADDS;DEBANN;FINANN;VDNA
+ If !fstat : Delete : Endif
+Else
+ Filter [F:DFY] Where FCY=[F:FCY]FCY & YEA=[M:DIA]YEADDS & FLGDNA=1
+ Read[F:DFY]DFY0 First
+ Filter [F:DFY]
+ If !fstat : Delete : Endif
+Endif
+If fstat=1
+ GOK =-1 : GLOCK = "$DADFCY1" : Return
+Endif
+Return
+
+######################
+$TR1
+GOK=1
+Read [F:CPY2]CPY0=[M:DIA]CPYDDS
+If !fstat
+  GCURLEG=[F:CPY2]LEG
+Endif
+#Un site donné
+If [M:DIA]FCYDDS<>""
+ Read [F:FCY]FCY0=[M:DIA]FCYDDS
+ If !fstat
+  Gosub DECALAGE
+  Gosub FILTRE_EMPLOYE                         :# A appeler avant pour le calcul de l'effectif dans les sites...
+  #79048
+  If SITOK
+   If [M:DIA]EMPDDS="" | VDNA=2 :  Gosub AFFECTE_DADFCY1 :  Endif
+  Endif
+ Endif
+Else
+ For [F:FGR]FGR0 Where CPY=[M:DIA]CPYDDS
+  Read[FCY]FCY0=[F:FGR]FCY
+  If !fstat
+   Gosub DECALAGE
+   Gosub FILTRE_EMPLOYE                         :# A appeler avant pour le calcul de l'effectif dans les sites...
+   #79048
+   If SITOK
+    If [M:DIA]EMPDDS=""| VDNA=2 : Gosub AFFECTE_DADFCY1 :  Endif
+   Endif
+  Endif
+ Next
+Endif
+Return
+
+######################
+$DECALAGE
+Call PARAM([F:FCY]FCY,"DMA",VALPAR) From ADOVAL
+If VALPAR=""
+ LASTMOIS=12
+Else
+ LASTMOIS=val(VALPAR)
+Endif
+DEBANN=[M:DIA]STRDAT
+FINANN=[M:DIA]ENDDAT
+
+#79266
+LSTFRIDAY=FINANN
+While dayn(LSTFRIDAY)<>5
+ LSTFRIDAY-=1
+Wend
+Return
+
+#################
+$AFFECTE_DADFCY1
+Local Integer FLAGFCY
+#69395
+Local Char SITCOD (GLONFCY)
+ SITCOD=[F:FCY]FCY
+
+ If VDNA=2 | VTYPDEC=3
+  Readlock[F:DFY]DFY0=SITCOD;[M:DIA]YEADDS;DEBANN;FINANN;VDNA
+ Else
+  Filter [F:DFY] Where FCY=SITCOD & YEA=[M:DIA]YEADDS & FLGDNA=1
+  Read[F:DFY]DFY0 First
+  Filter [F:DFY]
+ Endif
+ If fstat :#Enreg inexistant
+  FLAGFCY=1
+  Raz [F:DFY]
+  [F:DFY]YEA=[M:DIA]YEADDS
+  [F:DFY]STRDAT=DEBANN
+  [F:DFY]ENDDAT=FINANN
+  [F:DFY]FLGDNA=VDNA
+ Endif
+ [F:DFY]=[F:FCY]
+ [F:DFY]FCY=SITCOD
+ [F:DFY]STRDAT=DEBANN
+ [F:DFY]ENDDAT=FINANN
+ [F:DFY]DADCRN=[F:FCY]CRN
+ [F:DFY]DADNAF=[F:FCY]NAF
+ [F:DFY]CRAM=[F:FCY]CODCRA
+ [F:DFY]TOTNUMYEA += EFFECTIF
+ [F:DFY]BASAPP  += BASTAXAPP
+ If BASTAXAPP<>0
+  [F:DFY]FLGAPP   = 2
+ Else
+  [F:DFY]FLGAPP   = 1
+ Endif
+ [F:DFY]BASFOR1 += BASTAXFOR(0)
+ [F:DFY]BASFOR2 += BASTAXFOR(1)
+ If BASTAXFOR(0)<>0 | BASTAXFOR(1)<>0
+  [F:DFY]FLGFOR   = 2
+ Else
+  [F:DFY]FLGFOR   = 1
+ Endif
+ [F:DFY]AMTAPPSUP  += AMTAPPSUP
+ If AMTAPPSUP<>0
+  [F:DFY]FLGAPPSUP   = 2
+ Else
+  [F:DFY]FLGAPPSUP   = 1
+ Endif
+ If FLAGFCY=1
+  If dim([F:DFY]CREDAT)>0 : [F:DFY]CREDAT = date$ : Endif
+  If dim([F:DFY]CREUSR)>0 : [F:DFY]CREUSR = GUSER : Endif
+  If dim([F:DFY]CRETIM)>0 : [F:DFY]CRETIM = time  : Endif
+  Write [F:DFY]
+ Else
+  If dim([F:DFY]UPDDAT)>0 : [F:DFY]UPDDAT = date$ : Endif
+  If dim([F:DFY]UPDUSR)>0 : [F:DFY]UPDUSR = GUSER : Endif
+  If dim([F:DFY]UPDTIM)>0 : [F:DFY]UPDTIM = time  : Endif
+  Rewrite [F:DFY]
+ Endif
+ If fstat<>0
+  GOK = 0 : Call FSTA("DFY") From GLOCK
+ Endif
+ If GOK<1
+  Gosub AB_TR From EXTRACTION : Return
+ Endif
+EFFECTIF=0
+BASTAXAPP=0
+BASTAXFOR(0)=0
+BASTAXFOR(1)=0
+AMTAPPSUP=0
+Return
+
+######################
+$FILTRE_EMPLOYE
+Local Integer OK, K, NBPERIO
+#Site : XXX
+Call ECR_TRACE(mess(3,45,1)-":"-[F:FCY]FCY,0) From GESECRAN
+
+#79048
+SITOK=1
+
+ #79048 : Ajout filtre site coché 'Paye' !
+ If [FCY]PAYFLG<>2
+  Call ECR_TRACE([F:FCY]FCY-":"-mess(2,10704,1),-1) From GESECRAN   #n'est pas un site de paie
+  SITOK=0 : Return
+ Endif
+ #79048 : erreur bloquante désormais...
+ If [F:FCY]CRN=""
+  Call ECR_TRACE(mess(5,10705,1)-[F:FCY]FCY,1) From GESECRAN   #N° de SIRET non renseigné pour le site :
+  SITOK=0 : Return
+ Endif
+ If VDNA <> 2
+   # Traitement standard d'extration "DADS"
+   Gosub METHODE_DADS
+ Else
+   Gosub METHODE_AED
+ Endif
+Return
+
+#---------------------------
+# Extraction en mode "DADS"
+#---------------------------
+$METHODE_DADS
+[L]SLDOK=1
+If clalev([F:HRCGD])=0 : Local File HRCTRGRD [HRCGD] : Endif
+Local Date    DATREF
+
+For [ECT]ECT0 Where evalue(CRITEMP)
+    OK=1
+    NBPERIO=0 : K=0
+    # FQ81491 - 15/10/13 - Prise en compte de la date d'effet au lieu de la date du contrat, pour déterminer la présence du salarié
+#    For [HRCTR]CTR0 Where REFNUM=[ECT]REFNUM & CTRNUM=[ECT]CTRNUM & ETRFCY=[F:FCY]FCY & CTRDAT<=FINANN & (XITDAT=[0/0/0] | XITDAT>=DEBANN)
+    For [HRCTR]CTR0 Where REFNUM=[ECT]REFNUM & CTRNUM=[ECT]CTRNUM & ETRFCY=[F:FCY]FCY & (CTRDAT<=FINANN | (FLGRET=2 & RETDATEFF<=FINANN)) & (XITDAT=[0/0/0] | XITDAT>=DEBANN)
+       If VTYPDEC=3 & [F:HRCTR]DNACCP<>1 : OK=0 : Break : Endif
+        ##Read[F:ADI]CODE=10386;[F:HRCTR]CTRGRD
+        Read[F:HRCGD]HRCGD0=[F:HRCTR]CTRGRD;GCURLEG
+        ##If !fstat & ([F:ADI]A1<>"" | [F:HRCTR]CTRDAT=DEBANN)    :#70187 : cas de contrat au 01/01 aevc motif sans code TDS.
+        If !fstat & ([F:HRCGD]CODN4H<>"" | [F:HRCTR]CTRDAT=DEBANN)
+            NBPERIO+=1
+        Endif
+    Next
+    If OK
+    # FQ81491 - 15/10/13 - Prise en compte de la date d'effet au lieu de la date du contrat, pour déterminer la présence du salarié
+#        For [HRCTR]CTR0 Where REFNUM=[ECT]REFNUM & CTRNUM=[ECT]CTRNUM & ETRFCY=[F:FCY]FCY & CTRDAT<=FINANN & (XITDAT=[0/0/0] | XITDAT>=DEBANN)
+        For [HRCTR]CTR0 Where REFNUM=[ECT]REFNUM & CTRNUM=[ECT]CTRNUM & ETRFCY=[F:FCY]FCY & (CTRDAT<=FINANN | (FLGRET=2 & RETDATEFF<=FINANN)) & (XITDAT=[0/0/0] | XITDAT>=DEBANN)
+            DERANN(K)=99 :#pour que le min ne prenne pas 0 dans EXTRACTION
+            K+=1
+            # FQ81491 - 15/0/13 - La date d'effet sert de référence, si elle existe
+            DATREF=[F:HRCTR]CTRDAT
+            If [F:HRCTR]FLGRET=2 & [F:HRCTR]RETDATEFF<>[0/0/0] Then DATREF=[F:HRCTR]RETDATEFF : Endif
+            #70187 ajout du =
+#            If [F:HRCTR]CTRDAT<=DEBANN
+            If DATREF<=DEBANN
+                ENTREE=DEBANN
+                If [F:HRCTR]CTRDAT<DEBANN
+                    ##Read[F:ADI]CODE=10386;[F:HRCTR]CTRGRD
+                    Read[F:HRCGD]HRCGD0=[F:HRCTR]CTRGRD;GCURLEG
+                    ##If !fstat & [F:ADI]A1="095"         #VAR
+                    If !fstat & [F:HRCGD]CODN4H="095"
+                     EMOTIF=[F:HRCTR]CTRGRD
+                    Else
+                     #Call MOTIF_ADI (10386,"097",EMOTIF)
+                     Call GROUND_COD("HRCGD","097",EMOTIF)
+                    Endif
+                #70187 ajout Else
+#                Elsif [F:HRCTR]CTRDAT=DEBANN
+                Elsif DATREF=DEBANN
+                    ##Read[F:ADI]CODE=10386;[F:HRCTR]CTRGRD
+                    Read[F:HRCGD]HRCGD0=[F:HRCTR]CTRGRD;GCURLEG
+                ##If !fstat & [F:ADI]A1<>""
+                If !fstat & [F:HRCGD]CODN4H<>""
+                     EMOTIF=[F:HRCTR]CTRGRD
+                    Else
+                     #77443
+                     #Call MOTIF_ADI (10386,"097",EMOTIF)
+                     Call GROUND_COD("HRCGD","097",EMOTIF)
+                    Endif
+                Endif
+            Else
+                #36132 : Rupture que pour les motif ayant un code TDS
+                ##Read[F:ADI]CODE=10386;[F:HRCTR]CTRGRD
+                Read[F:HRCGD]HRCGD0=[F:HRCTR]CTRGRD;GCURLEG
+                ##If !fstat & [F:ADI]A1<>""
+                If !fstat & [F:HRCGD]CODN4H<>""
+                    If [F:HRCTR]FLGRET=2 & [F:HRCTR]RETDATEFF<>[0/0/0]
+                        ENTREE=max([F:HRCTR]RETDATEFF,DEBANN)            #79048
+                    Else
+                        ENTREE=[F:HRCTR]CTRDAT
+                    Endif
+                    EMOTIF=[F:HRCTR]CTRGRD
+                Endif
+            Endif
+            If [F:HRCTR]XITDAT=[0/0/0] | [F:HRCTR]XITDAT>FINANN
+                SORTIE=FINANN
+                #Call MOTIF_ADI (10359,"098",SMOTIF)
+                Call GROUND_COD("HRXGD","098",SMOTIF)
+            Else
+                Call SIMPLEREAD([F:HRCTR]XITGRD,GCURLEG,GERRHRM) From SUBHRXGD
+                If !GERRHRM & [F:HRXGD]CODN4H<>""
+                    SORTIE=[F:HRCTR]XITDAT
+                    SMOTIF=[F:HRCTR]XITGRD
+                Endif
+            Endif
+            # Si VAR en début alors VAR en fin obligatoire
+            If EMOTIF='VAR' : SMOTIF=EMOTIF : Endif
+            If EMOTIF<>"" & SMOTIF<>""
+                #Présence au dernier vendredi de l'année #79266
+                If SORTIE>LSTFRIDAY :   PRESENT=2 : Else : PRESENT=1 : Endif
+                #Au moins une paie sur la période pour creer une fiche dads-u !
+                Filter [F:VEP] Where EMP=[F:HRCTR]REFNUM & FCY=[F:HRCTR]ETRFCY & CTRNUM=[F:HRCTR]CTRNUM
+&                   & STRDAT>=ENTREE & STRDAT<=SORTIE & RVSDAT=[0/0/0] & ORIDAT=[0/0/0] :#On exclut les extournes et les extournées
+                Read [F:VEP]VEP0 Last
+                Filter [F:VEP]
+                If !fstat
+                    Gosub AFFECTE_EMPLOYE From EXTRACTION
+                    Gosub AFFECTE_SITPART From EXTRACTION
+                Endif
+                Raz ENTREE, EMOTIF, SORTIE, SMOTIF
+            Endif
+        Next
+    Endif
+Next
+Return
+
+#-------------
+#Subprog MOTIF_ADI(NUM,COD,VALEUR)
+#Value Integer NUM
+#Value Char COD ()
+#Variable Char VALEUR ()
+#Filter [F:ADI] Where NUMTAB=NUM & left$(A1,3)=COD
+#Read[F:ADI]CODE First
+#Filter [F:ADI]
+#If !fstat
+# VALEUR=[F:ADI]CODE
+#Else
+# VALEUR="ACT" :# au cas où...
+#Endif
+#End
+
+Subprog GROUND_COD(OBJECT,COD,VALEUR)
+Value Char OBJECT
+Value Char COD ()
+Variable Char VALEUR ()
+
+If clalev([F:HRGD])=0
+  If OBJECT="HRXGD" : Local File HRXITGRD [HRGD] : Endif
+  If OBJECT="HRCGD" : Local File HRCTRGRD [HRGD] : Endif
+Endif
+
+Filter [F:HRGD] Where LEG=GCURLEG & left$(CODN4H,3)=COD
+Read[F:HRGD] First
+If !fstat
+  VALEUR=[F:HRGD]COD
+Else
+  VALEUR="ACT"
+Endif
+Close Local File [HRGD]
+End
+
+#-------------
+# METHODE_AED
+#-------------
+$METHODE_AED
+
+# Extraction pour l'AED
+# Principe : on cherche les contrats avec sortie définitive sur la période demandée. On va ensuite balayer tous les bulletins en remontant sur douze mois (*)
+#            Chaque bulletin génère une période d'activité cadrée sur sa période de paye
+#            (*) on s'arrete si on trouve un bulletin qui fait référence à un contrat en sortie définitive
+#            => Comment savoir les contrats / bulletins qui n'ont pas déjà servi à une AED
+#              (on peut regarder dans DAE éventuellement ou mieux flagguer les contrats / bulletins avec le numéro d'AED si on parvenait à les numéroter)
+#            => Que se passe - t -il sur periode d'activité bulletin est > 1 mois ( voire à 1 an chez certains )
+#            =>
+
+# Idée FL pour sécuriser l'extraction
+# => Ajouter dans DADEMP et consort une zone "numéro de fiche de sortie" => Servira a identifier clairement les DADEMP associées à une sortie.
+#    Déclencher la génération de l'AED depuis la fiche de sortie ( + traitement en masse )
+#    Les "bornes" de bulletin à prendre en compte sont explicitement les bornes de période d'activité saisies sur la fiche : cela permet de prendre en compte les cas particuliers
+
+If not clalev([F:CTR2]) : Local File EMPLOCTR [CTR2] : Endif
+If not clalev([F:VEP2]) : Local File VALEMP [VEP2] : Endif
+
+Local Integer NBMAXBUL    : [L]NBMAXBUL = 100    : # 100 bulletins pour une personne sur les douze derniers mois, faut vraiment vouloir ....
+Local Integer NBBUL, IBUL
+
+Local Date DATDEB, DATFIN, CTRDAT
+Local Integer FLGDBL     :# Dernière période AED (Solde de tout compte)
+Local Date TBULENDDAT([L]NBMAXBUL)
+Local Date TBULPYRDAT([L]NBMAXBUL)
+Local Char TBUL(type([F:VEP2]BUL)-10)([L]NBMAXBUL)
+
+For [ECT]ECT0 Where evalue(CRITEMP)
+
+    [L]OK = 1
+    NBPERIO=0 : K=0
+    For [CTR2]CTR0 Where REFNUM=[ECT]REFNUM & CTRNUM=[ECT]CTRNUM & ETRFCY=[F:FCY]FCY & XITFNL=2 & XITDAT>=DEBANN & XITDAT<=FINANN & PRUCTR<>2
+
+        Raz [L]CTRDATMIN
+
+        # ENTREE = Date de debut de période DADEMP
+        # SORTIE = Date de fin de période DADEMP
+        # EMOTIF / SMOTIF = motifs entrée / sortie
+
+        # On a une sortie définitive , on va chercher douze mois à rebours à compter du bulletin "avant" la sortie
+        # On prends comme base de travail la zone "XITDAT" car elle est normalement toujours postérieure à la date de dernière présence.
+
+        [L]DATFIN = [F:CTR2]XITDAT
+        [L]DATDEB = addmonth([L]DATFIN, -12) :# -12 (pas -13 car dans AED_BOUCLE on sort par un break sur un < et pas un <=)
+
+#-------< DBA : réajustement
+
+        # ASA dit "12 mois à rebours par rapport à la date du dernier jour travaillé" (cas de longue maladie au milieu)
+        [L]SLDOK=1             :# Inclus dans DATDEB & DATFIN
+        [L]FLGDBL=0            :# 2 Appels à AED_BOUCLE (0=Non 1=Oui)
+
+        If [F:CTR2]LSTDAY<>[0/0/0] & [F:CTR2]LSTDAY<[F:CTR2]XITDAT
+           [L]DATFIN=[F:CTR2]LSTDAY
+           [L]DATDEB = addmonth([L]DATFIN, -12)
+           [L]FLGDBL=1         :# 2 Appels à AED_BOUCLE (0=Non 1=Oui)
+        Endif
+#-------DBA >
+
+        Raz ENTREE, EMOTIF, SORTIE, SMOTIF
+        Gosub AED_BOUCLE
+
+#-------< DBA
+        If [F:CTR2]LSTDAY<>[0/0/0] & [F:CTR2]LSTDAY<[F:CTR2]XITDAT
+           [L]SLDOK=0    :#Exclu de DATDEB & DATFIN
+        Endif
+        # + 1 période = au mois du dernier jour travaillé (cumulant les VAR si il y en a jusqu'à la date de sortie)
+        If ![L]SLDOK                :#A inclure !
+         [L]DATDEB = DATFIN+1
+         [L]DATFIN = [F:CTR2]XITDAT
+         Gosub AED_BOUCLE
+        Endif
+#-------DBA >
+
+    Next
+Next
+Return
+
+##################################
+$AED_BOUCLE
+
+# V2 - On passe par une étape de récupération des bulletins à traiter car on va devoir modifier les motifs entrée / sortie.
+# on filtre pas sur le site car mutation possible sur la période
+
+Filter [F:VEP2] Where EMP=[F:CTR2]REFNUM  & CTRNUM=[F:CTR2]CTRNUM
+&                       & RVSDAT=[0/0/0] & ORIDAT=[0/0/0]
+&                       & [F:VEP2]ENDDAT <= [L]DATFIN
+&                       & [F:VEP2]PRFSUP=""
+&                       Order By Key BULLETIN = [F:VEP2]ENDDAT Desc ; [F:VEP2]PYRDAT Desc ; [F:VEP2]BUL Desc
+
+# On exclut les extournes et les extournées
+
+Raz [L]TBUL, [L]TBULENDDAT, [L]TBULPYRDAT, [L]NBBUL
+
+For [F:VEP2]BULLETIN     #CHECK IGNORE_LINE
+
+    # On balaye les bulletins à compter de la sortie ... on s'arrete si on dépasse n mois ou si on tombe sur un bulletin
+    # associé à une sortie définitive.
+
+    #78382 : Add 'or NBBUL>=13'
+    #79005 : replace NBBUL>=13 by eomonth$ ()
+    #80462  :Add & [L]NBBUL
+    If [F:VEP2]ENDDAT < eomonth([L]DATDEB) & [L]NBBUL
+        # Fini
+        Break
+    Endif
+
+    # La zone CTRDAT a été rajoutée, elle n'existait pas à la base dans la V6, on se méfie donc de sa présence et de son contenu.
+    If dim([F:VEP2]CTRDAT) > 0 & [F:VEP2]CTRDAT <> [0/0/0]
+        [L]CTRDAT = [F:VEP2]CTRDAT
+    Else
+        [L]CTRDAT = [F:VEP2]ENDDAT
+    Endif
+
+  # FQ81491 - 15/10/13 - Prise en compte de la date d'effet au lieu de la date du contrat, pour déterminer les contrats concernés
+#    Filter [F:HRCTR] Where [F:HRCTR]REFNUM = [F:VEP2]EMP & [F:HRCTR]CTRNUM = [F:VEP2]CTRNUM & [F:HRCTR]CTRDAT <= [L]CTRDAT
+    Filter [F:HRCTR] Where [F:HRCTR]REFNUM = [F:VEP2]EMP & [F:HRCTR]CTRNUM = [F:VEP2]CTRNUM & ([F:HRCTR]CTRDAT <= [L]CTRDAT | ([F:HRCTR]FLGRET=2 & [F:HRCTR]RETDATEFF<=[L]CTRDAT))
+    Read [F:HRCTR]CTR0 Last
+    Filter [F:HRCTR]
+    If fstat <= 2
+        # cas particulier : si ce contrat à une sortie définitive ( et que ce n'est pas celui sur lequel on travaille )
+        #, on s'arrête : il y a une AED liée à ce contrat en son temps
+
+        If [F:HRCTR]XITFNL = 2 & [F:HRCTR]CTRDAT <> [F:CTR2]CTRDAT
+            Break
+        Endif
+
+        # On mémorise qu'il faut traiter ce bulletin
+
+        [L]TBUL([L]NBBUL) = [F:VEP2]BUL
+        [L]TBULPYRDAT([L]NBBUL) = [F:VEP2]PYRDAT
+        [L]TBULENDDAT([L]NBBUL) = [F:VEP2]ENDDAT
+
+        [L]NBBUL += 1
+
+    Endif
+Next                  #CHECK IGNORE_LINE
+
+Filter [F:VEP2]
+
+# On va trier les périodes
+
+Sorta [L]NBBUL [L]TBULENDDAT, [L]TBULPYRDAT, [L]TBUL
+
+NBPERIO=0 : K=0
+Raz ENTREE, EMOTIF, SORTIE, SMOTIF
+
+For [L]IBUL = 0 To [L]NBBUL - 1
+
+    Read [F:VEP2]VEP5 = [L]TBUL([L]IBUL)
+
+    # Allons chercher le contrat correspondant à notre bulletin
+
+    If dim([F:VEP2]CTRDAT) > 0 & [F:VEP2]CTRDAT <> [0/0/0]
+        [L]CTRDAT = [F:VEP2]CTRDAT
+    Else
+        [L]CTRDAT = [F:VEP2]ENDDAT
+    Endif
+
+    # FQ81491 - 15/10/13 - Prise en compte de la date d'effet au lieu de la date du contrat, pour déterminer les contrats concernés
+#    Filter [F:HRCTR] Where [F:HRCTR]REFNUM = [F:VEP2]EMP & [F:HRCTR]CTRNUM = [F:VEP2]CTRNUM & [F:HRCTR]CTRDAT <= [L]CTRDAT
+    Filter [F:HRCTR] Where [F:HRCTR]REFNUM = [F:VEP2]EMP & [F:HRCTR]CTRNUM = [F:VEP2]CTRNUM & ([F:HRCTR]CTRDAT <= [L]CTRDAT | ([F:HRCTR]FLGRET=2 & [F:HRCTR]RETDATEFF<=[L]CTRDAT))
+    Read [F:HRCTR]CTR0 Last
+    Filter [F:HRCTR]
+    If fstat <= 2
+
+      # FQ81491 - 17/10/13 - Prise en compte de la date d'effet
+      Local Date CTRDATREF : CTRDATREF=[F:HRCTR]CTRDAT
+      If [F:HRCTR]FLGRET=2 & [F:HRCTR]RETDATEFF<>[0/0/0] Then CTRDATREF=[F:HRCTR]RETDATEFF : Endif
+      # Si n contrat dans la période sans rupture définitive au milieu alors on prend la min() de date début
+#      If [L]CTRDATMIN=[0/0/0]
+#       [L]CTRDATMIN=[F:HRCTR]CTRDAT
+#      Else
+#       [L]CTRDATMIN=min([L]CTRDATMIN,[F:HRCTR]CTRDAT)
+#      Endif
+      If [L]CTRDATMIN=[0/0/0]
+       [L]CTRDATMIN=DATREF
+      Else
+       [L]CTRDATMIN=min([L]CTRDATMIN,DATREF)
+      Endif
+      # Fin FQ81491
+
+        # Ok, on a sous les pieds le "bon" contrat de ce bulletin
+#-------< DBA
+        If [L]SLDOK
+#------- DBA >
+          Raz ENTREE, EMOTIF, SORTIE, SMOTIF
+          [L]ENTREE = [F:VEP2]STRDAT : [L]SORTIE = [F:VEP2]ENDDAT
+          If [L]IBUL = 0
+            [L]EMOTIF = [F:HRCTR]CTRGRD
+          Else
+           #Call MOTIF_ADI (10386,"097",EMOTIF)
+           Call GROUND_COD("HRCGD","097",EMOTIF)
+          Endif
+          If [L]IBUL = [L]NBBUL - 1 & ![L]FLGDBL
+            # Dernier bulletin, on prends le vrai motif de sortie
+            [L]SMOTIF = [F:HRCTR]XITGRD
+          Else
+            #Call MOTIF_ADI (10359,"098",SMOTIF)
+             Call GROUND_COD("HRXGD","098",SMOTIF)
+          Endif
+          # Si VAR en début alors VAR en fin obligatoire
+          If EMOTIF='VAR' : SMOTIF=EMOTIF : Endif
+          # Variables utilisées dans l'extraction
+          [L]DERANN([L]K) = 99
+          [L]K += 1
+          [L]NBPERIO += 1
+          Gosub AFFECTE_EMPLOYE From EXTRACTION
+          Gosub AFFECTE_SITPART From EXTRACTION
+#-------< DBA
+        Else
+          # Début= 1ier bulletin (motif= ACT)
+          If [L]IBUL = 0
+            [L]ENTREE = [F:VEP2]STRDAT
+            #Call MOTIF_ADI (10386,"097",EMOTIF)
+            Call GROUND_COD("HRCGD","097",EMOTIF)
+          Endif
+          #Fin=dernier bulletin (motif=celui de la sortie)
+          If [L]IBUL = [L]NBBUL - 1
+            [L]SORTIE = [F:VEP2]ENDDAT
+            [L]SMOTIF = [F:HRCTR]XITGRD
+          Endif
+          # Si VAR en début alors VAR en fin obligatoire
+          If EMOTIF='VAR' : SMOTIF=EMOTIF : Endif
+        Endif
+#------- DBA >
+      Else
+        # Pas de contrat correspondant, aie ...
+    Endif
+
+Next
+
+#-------< DBA
+If ![L]SLDOK & ENTREE<>[0/0/0] & SORTIE>ENTREE
+ # Variables utilisées dans l'extraction
+ [L]DERANN([L]K) = 99
+ [L]NBPERIO = 1
+ [L]K =1
+ Gosub AFFECTE_EMPLOYE From EXTRACTION
+ Gosub AFFECTE_SITPART From EXTRACTION
+Endif
+#------- DBA>
+Return
+
+###########################
+$SORTIE
+  If dim(SAV_GCURLEG)>0 : GCURLEG = SAV_GCURLEG : Endif
+Return
+
+
+################################################################################
+#                         Etiquettes [M:DIA]
+################################################################################
+
+Subprog C_CPYDDS(VALEUR)
+Variable Char    VALEUR()
+If clalev([F:TD0])=0 : Local File PRMTDS0  [TD0] : Endif
+Filter [F:TD0] Where LEV=2 & CPY=VALEUR & FLGDNA=val(GFLAG)
+Read [F:TD0]TD00 First
+Filter [F:TD0]
+If !fstat
+ [M]NATFIL=[F:TD0]NATFIL
+ Call INITREF ([M]NATFIL)
+Else
+ #78196
+ #<Societe> Opération impossible : Paramètres TDS inexistant
+ GMESSAGE=VALEUR-":"-mess(2,10705,1)
+ mkstat=2 : End
+Endif
+
+End
+
+Subprog AM_CPYDDS(VALEUR)
+Variable Char    VALEUR()
+#Effacement du site et du salarié choisi
+If [M:DIA]ALLFCYDDS<>2
+ [M:DIA]ALLFCYDDS=2
+ Call C_ALLFCYDDS([M:DIA]ALLFCYDDS)
+Endif
+If dim([M:DIA]EMPDDS)>0
+ If [M:DIA]EMPDDS <>""
+  Effzo [M:DIA]EMPDDS
+ Endif
+Endif
+End
+
+#63907
+Subprog AM_NATFIL(VALEUR)
+Variable Char    VALEUR()
+Read [F:TD0]TD00=2;[M]CPYDDS;VALEUR;val(GFLAG)
+If fstat
+ #<Societe> Opération impossible : Paramètres TDS inexistant
+ GMESSAGE=[M]CPYDDS-":"-mess(2,10705,1)
+ mkstat=2 : End
+Endif
+Call INITREF (VALEUR)
+End
+
+Subprog INITREF (VALEUR)
+Variable Char    VALEUR()
+Local Char VALPAR (2)
+If VALEUR="04"
+ [M:DIA]STRDAT=gdat$(01,04,val([M:DIA]YEADDS))
+ [M:DIA]ENDDAT=addmonth([M:DIA]STRDAT,12)-1
+Else
+ If val(GFLAG)=2
+  [M:DIA]YEADDS=num$(year(GMOIPAY))
+  [M:DIA]STRDAT=GMOIPAY
+  [M:DIA]ENDDAT=eomonth(GMOIPAY)
+ Else
+  If [M:DIA]FCYDDS<>"" : Call PARAM([M:DIA]FCYDDS,"DMA",VALPAR) From ADOVAL : Endif
+  If VALPAR="" : VALPAR="12" : Endif
+  If VALPAR="12"
+   [M:DIA]STRDAT=gdat$(01,01,val([M:DIA]YEADDS))
+  Else
+   [M:DIA]STRDAT=gdat$(01,val(VALPAR)+1,val([M:DIA]YEADDS)-1)
+  Endif
+  [M:DIA]ENDDAT=addmonth([M:DIA]STRDAT,12)-1
+ Endif
+Endif
+End
+
+Subprog C_ALLFCYDDS(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+ Effzo [M:DIA]FCYDDS
+ Grizo [M:DIA]FCYDDS
+Else
+ Actzo [M:DIA]FCYDDS
+Endif
+End
+
+Subprog AS_FCYDDS(VALEUR)
+Variable Char    VALEUR()
+If [M:DIA]ALLFCYDDS=2 : mkstat = 1 : End : Endif
+End
+
+Subprog C_ALLEMPDDS(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+ [M:DIA]ALLCTRNUM=2
+ Effzo [M:DIA]EMPDDS,CTRNUM
+ Grizo [M:DIA]EMPDDS,CTRNUM,ALLCTRNUM
+Else
+ Actzo [M:DIA]EMPDDS,ALLCTRNUM
+Endif
+End
+
+Subprog AS_EMPDDS(VALEUR)
+Variable Char    VALEUR()
+If [M:DIA]ALLEMPDDS=2 : mkstat = 1 : End : Endif
+End
+
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran DAPC) 26/09/2013 12:10:29 (SEGAY)
+######################################################################################
+Subprog AM_EMPDDS(VALEUR)
+Variable Char    VALEUR()
+#SEGAY US1840 US1933 81085 25/09/2013 - Homogénéisation nom prénom
+Call UPD_NAMSRN(VALEUR,"[M:DIA]","NAM","SRN",0,0) From DIVPAYE
+End
+
+Subprog C_ALLCTRNUM(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+ Effzo [M:DIA]CTRNUM
+ Grizo [M:DIA]CTRNUM
+Else
+ Actzo [M:DIA]CTRNUM
+Endif
+End
+
+Subprog AS_CTRNUM(VALEUR)
+Variable Char    VALEUR()
+If [M:DIA]ALLCTRNUM=2 : mkstat = 1 : End : Endif
+End
+
+Subprog D_INI(VALEUR)
+Variable Char VALEUR ()
+Gosub GRISE
+End
+
+$GRISE
+If dim([M]ALLFCYDDS)>=0
+ If [M]ALLFCYDDS=2 : Effzo FCYDDS : Grizo FCYDDS : Else : Actzo FCYDDS : Endif
+Endif
+If dim([M]ALLEMPDDS)>=0
+ If [M]ALLEMPDDS=2
+  Effzo EMPDDS : Grizo EMPDDS
+  If dim([M]ALLCTRNUM)>=0
+   [M]ALLCTRNUM=2
+   Effzo CTRNUM
+   Grizo CTRNUM,ALLCTRNUM
+  Endif
+ Else
+  Actzo EMPDDS
+  If dim([M]ALLCTRNUM)>=0
+    Actzo ALLCTRNUM
+  Endif
+ Endif
+Endif
+Return
+
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran DADXTR) 26/10/2010 10:56:25 (DBA)
+######################################################################################
+Subprog C_NATFIL(VALEUR)
+Variable Char    VALEUR()
+Call  C_NATFIL(VALEUR) From SUBTDS
+If mkstat : End : Endif
+End
+
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran DADXTR) 23/11/2011 15:47:03 (DBA)
+######################################################################################
+Subprog AM_STRDAT(VALEUR)
+Variable Date    VALEUR
+If val(GFLAG)=2 :
+ [M:DIA]YEADDS=num$(year(VALEUR))
+ [M:DIA]ENDDAT=eomonth(VALEUR)
+Else
+ [M:DIA]ENDDAT=addmonth(VALEUR,12)-1
+Endif
+End
+
+Subprog AS_ENDDAT(VALEUR)
+Variable Date    VALEUR
+If val(GFLAG)=2 : mkstat=2 : End : Endif
+End
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran DADXTR) 30-05-2013 05:10:55 (EL)
+######################################################################################
+Subprog C_N4DVER(VALEUR)
+Variable Char    VALEUR()
+End
+
+Subprog S_N4DVER(VALEUR)
+Variable Char    VALEUR()
+End
+
+
+######################################################################################

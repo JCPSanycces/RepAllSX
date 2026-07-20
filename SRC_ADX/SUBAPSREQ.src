@@ -1,0 +1,902 @@
+#<AdxTL>@(#)11.0.0.0 $Revision$
+#  Local Char VALBOUT(250) , PARBOUT(250)(1..20)
+#  PARBOUT(1) = "ZZMBSQL2"
+#  PARBOUT(2) = num$(0)
+#  PARBOUT(3) = num$(1)
+#  FLGEXE = 1
+#  GSERVEUR=0  # illusion batch
+#    GBATCH=1
+#  If GTRACE="" : GSILENCE=1 : Endif             
+#  
+#  GACTION = "CALALQ"
+#  If clalev([M:LST])=0 : Local Mask ="WNZZMBSQL2" [LST] : Endif
+#Dbgaff
+#
+#  Call TRAITE_CHAR(VALBOUT,PARBOUT,"","SUBALQ9","ALQ9",4,"SPEALQ") From GTRAITE
+End
+
+# Sequence debugger java
+$DBG        # Gosub DBG 
+#If GUSER="LV"
+#    If GBROWS<>0 : End : Endif
+#    If dim([V]GIAADXCTX)<0 : Global Char GIAADXCTX(250) : Endif
+#    [V]GIAADXCTX = "X3_CS:NA1:"               : # entête "X3_CS:session client X3" + "NA1:session primaire"
+#    Call SET_DEBUG_ON(1) From DEBUGGERJ       : # 0=debugger socket "off"
+#    Call SET_PORT("1789") From DEBUGGERJ      : # Port*
+#    
+#    Local Char RETOUR(200)
+#    Local Integer K
+#    Call SET_HOST("172.28.9.11") From DEBUGGERJ : # @ip du pc
+#    Call SET_HOST("ecjullienc.sagefr.adinternal.com") From DEBUGGERJ : # dns
+#Endif
+Return
+
+# ------------------------------------------------------------
+# SUBAPSREQ
+# Version 0017
+#    Serveur de requetes
+#        U_VIEWCODE        Code de la vue portail
+#        [F:APV]           Enreg. en ligne de la table Vue portail (APTLVW)
+#        M_ACTION          Code de l'action à traiter soumis par le provider Htc
+#
+#    Paramètres vue portail
+#        FRQ menu 2914:    fréquence de mise à jour
+#
+#     E45527 - 04/02/2008: Prise ne compte du cas GEODE
+#     E46291 - 11/03/2008: Pb tunnel requete SQL
+#     E50629 - 08/12/2008: Gestion nb décimal 
+#     E47640 - 21/01/2009: Ne pas afficher les par. de requête SQL
+#     E52357 - 06/02/2009: Gestion débordement previsionnel
+#     E54551 - 28/04/2009: Type VCR
+#     E54486 - 29/04/2009  Exclure les colonnes non affichés
+#     E55189 - 15/05/2009  Clé en 2 parties inversées - ex: Type ITF -> table ITMFACILIT -> clé ITMREF+STOFCY
+#                                                           STOFCY est la partie primaire mais la partie "initulé paramètre" sur l'objet 
+#     E63940 - 05/05/2010  Title avec caract. spéciaux
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+$R_EXECUTE                         # Init + type de dialogue
+    # Trace
+    U_TRAMES="--> Debut: " + "Serveur de requêtes du portail": Gosub U_TRAPUT From SUBAPSUTI 
+
+    # init
+    Gosub R_INIT
+
+    # Lecture objet standard
+    R_REQCOD=[F:APV]SRCCOD 
+    If clalev([F:ALH])  = 0 : Local File ALISTEH [ALH] : Endif
+    Call LECTURE(PC_REQOBJ, R_REQCOD ,"")From CONTOBJ
+    If fstat <> 0
+        U_MESCODE="X3REQUNKNOWN" : U_MESP1=R_REQCOD : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+    Endif
+
+    # Gestion autorisation std
+    If [F:ALH]FCTLNK<>"" & [F:ALH]ALLUSR<>2
+        GFONCTION = [F:ALH]FCTLNK : Call AUTORIS From EXEFNC  
+        If GNBAUZ=0
+            U_MESCODE="X3FNCNOTAUTHORIZE" : U_MESP1=GFONCTION : U_MESP2="" : U_ERR=UC_ERRG 
+            Gosub U_MESPUT From SUBAPSUTI : Return
+        Endif
+    Endif
+    # Verif du code d'accès eventuel
+    If [F:ALH]ACS<>"" & [F:ALH]ALLUSR<>2
+        Raz mkstat
+        Call ACCES2([F:ALH]ACS) From OBJDIV 
+        If mkstat
+           U_MESCODE="X3CODACCNOTAUTHORIZE" : U_MESP1=R_REQCOD : U_MESP2="" : U_ERR=UC_ERRG
+           Gosub U_MESPUT From SUBAPSUTI : Return
+        Endif
+    Endif
+
+
+    #-- XML
+    U_SEQPUT=' <Data>' : Gosub U_PUT From SUBAPSUTI         
+    ### Gestion Action titres ou données
+    Case M_ACTION
+        When RQ_ACTTITLE                                                ## Demande de titres
+            U_TRAMES="Titres seuls": Gosub U_TRAPUT From SUBAPSUTI 
+            Gosub R_TIT : If U_ERR=UC_ERRG : Goto ERRXMLCLOSE : Endif
+        When RQ_ACTLOAD, RQ_ACTINIT                                                  ## Demande de données (calcul auto)
+            U_TRAMES="Données en mode de calcul automatique.": Gosub U_TRAPUT From SUBAPSUTI 
+            Gosub R_DATAINIT : If U_ERR=UC_ERRG : Goto ERRXMLCLOSE : Endif
+            If R_HASRESULTS     # verification en fonction de la fréquence de mise à jour
+                # lecture para fréquence menu 2914
+                U_PARCODE=RC_FRQ : Gosub $U_PARSRCREAD From SUBAPSUTI
+                If !U_PAREXIST : U_PARVAL="1" : Endif        # A chaque utilisation
+                U_TRAMES="  Fréquence: " + mess(val(U_PARVAL), 2914, 1) : Gosub U_TRAPUT From SUBAPSUTI 
+                Case val(U_PARVAL)
+                When 3    # par jour
+                    If (nday(date$)> nday([F:ALR]CREDAT))
+                        Gosub R_DATAREFRESH
+                    Else
+                        Gosub R_DATANOREFRESH
+                    Endif
+                When 2    # par heure
+                    If (nday(date$)>nday([F:ALR]CREDAT) )
+                        Gosub R_DATAREFRESH
+                    Else
+                        RW_T1=60*val(format$("hh",[F:ALR]CRETIM)) + val(format$("mm",[F:ALR]CRETIM)) +60
+                        RW_T2=60*val(format$("hh",time$)) + val(format$("mm",time$))
+                        If (RW_T2 > RW_T1)
+                            Gosub R_DATAREFRESH
+                        Else
+                            Gosub R_DATANOREFRESH
+                        Endif
+                    Endif
+                When 4    # semaine
+                    If ( week(date$)<> week([F:ALR]CREDAT) | year(date$) <> year([F:ALR]CREDAT) )
+                        Gosub R_DATAREFRESH
+                    Else
+                        Gosub R_DATANOREFRESH
+                    Endif
+                When 5    # mois
+                    If ( month(date$)<> month([F:ALR]CREDAT) | year(date$) <> year([F:ALR]CREDAT) )
+                        Gosub R_DATAREFRESH
+                    Else
+                        Gosub R_DATANOREFRESH
+                    Endif
+                When 6    # première fois
+                    If !R_HASRESULTS
+                        Gosub R_DATAREFRESH
+                    Else
+                        Gosub R_DATANOREFRESH
+                    Endif
+                When Default
+                    Gosub R_DATAREFRESH
+                Endcase 
+            Else
+                U_TRAMES="  Pas de résultat :calcul" : Gosub U_TRAPUT From SUBAPSUTI 
+                Gosub R_DATAREFRESH
+            Endif
+            Gosub R_DATA : If U_ERR=UC_ERRG : Goto ERRXMLCLOSE : Endif
+        When RQ_ACTREF                                                  ## Demande de données (calcul forcé)
+            U_TRAMES="  Données avec calcul forcé" : Gosub U_TRAPUT From SUBAPSUTI 
+            Gosub R_DATAINIT : If U_ERR=UC_ERRG : Goto ERRXMLCLOSE : Endif
+            If [F:ALH]ALLUSR<>2    # A la demande de DBopp, pas de recalcul si requête partagée
+                Gosub R_DATAREFRESH
+            Else
+                Gosub R_DATANOREFRESH
+            Endif
+            Gosub R_DATA : If U_ERR=UC_ERRG : Goto ERRXMLCLOSE : Endif
+        When Default
+            U_MESCODE="X3ACTUNKNOWN" : U_MESP1=M_ACTION : U_MESP2=  [F:APV]SRCCODTYP : U_ERR=UC_ERRG 
+            Gosub U_MESPUT From SUBAPSUTI : Goto ERRXMLCLOSE
+    Endcase     ### fin gestion Action titres ou données
+
+    #-- XML 
+    U_SEQPUT=' </Data>' : Gosub U_PUT From SUBAPSUTI
+
+    # Trace
+    U_TRAMES="--> Fin: " + "Serveur de browseurs du portail": Gosub U_TRAPUT From SUBAPSUTI 
+
+Return
+
+$ERRXMLCLOSE    # fermeture XML listes
+    U_SEQPUT=' </Data>' : Gosub U_PUT From SUBAPSUTI
+Return
+
+
+  
+# ------------------------------------------------------------
+#     G O S U B
+# ------------------------------------------------------------
+# 
+# ------------------------------------------------------------
+#  Données
+# ------------------------------------------------------------
+# init
+# ------------------------------------------------------------
+$R_DATAINIT
+    #U_MESCODE="ENTRAVAIL" : U_MESP1="" : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Goto R_ERR
+
+    # If clalev([F:ALR])=0 : Local File ALISTER [ALR] : Endif : # GH 02/09/05 bug 31900
+    If dim([F:ALH]TYPENV)>0 & GPRODUIT<>-1 & dim([F:ALR]DEP)<0
+     If clalev([F:ALR]) : Close Local File [ALR] : Endif 
+     Local File ALISTENV [ALR]     :#CHECK IGNORE_LINE
+    Elsif clalev([F:ALR])=0
+     Local File ALISTER  [ALR]
+    Endif
+
+    R_HASRESULTS=0
+    If [F:ALH]ALLUSR=2    # Tous
+        Read [F:ALR]ALR0(1) = [F:ALH]COD
+        If fstat=0 : R_HASRESULTS=1 : Endif
+    Else
+#CHECK IGNORE_BEGIN
+        Read [F:ALR]ALR0(2) = [F:ALH]COD; GUSER
+        If fstat=0 : R_HASRESULTS=1 : Endif
+#CHECK IGNORE_END
+    Endif 
+
+    # Recherche infos
+    If clalev([F:ALD])=0 : Local File ALISTED [ALD] : Endif
+    If clalev([F:ATY])=0  : Local File ATYPE    [ATY]  : Endif
+    If clalev([F:AOB])=0  : Local File AOBJET   [AOB]  : Endif
+    If clalev([F:ATB])=0  : Local File ATABLE   [ATB]  : Endif
+    If clalev([F:AMP])=0  : Local File AMSKPAR  [AMP]  : Endif        # 54551 - Type VCR
+    Raz R_COLLINK,R_COLLINKPRI,R_COLLKSECL,R_COLLKSECT
+    Local Integer BRKLOOP
+
+    For [F:ALD]ALD0 From R_REQCOD To R_REQCOD  # les colonnes
+        If ([F:APV]SRCCODTYP="REQS" and [ALD]LIG>100) : Break : Endif     # 47640 - exclure les paramétres req SQL
+        If [F:ALD]STREND<=2                                              # 54486 - exclure les colonnes non affichés
+            R_NBCOL+=1
+            If R_NBCOL > RC_NBMAXCOL              # JPJ E33250 
+               U_MESCODE="X3REQTOOMUCHCOL" : U_MESP1= num$(RC_NBMAXCOL) : U_MESP2="" : U_ERR=UC_ERRG : 
+               Gosub U_MESPUT From SUBAPSUTI : BRKLOOP=1 : Break 1
+                #U_TRAMES="  Nombre maxi de colonne atteint: " + num$(RC_NBMAXCOL): Gosub U_TRAPUT From SUBAPSUTI       
+            Endif
+            R_COLTAB(R_NBCOL)=[F:ALD]TBL          # table
+            R_COLRUB(R_NBCOL)=[F:ALD]FLD         # rubrique
+            Call LECTEXTRA(R_COLTITLE(R_NBCOL),"ALISTED","INTITLIG",[F:ALD]COD,num$([ALD]LIG)) From ATEXTRA # titre
+            R_COLCUMUL(R_NBCOL)=([F:ALD]CUM=2)    # col cumul
+            R_COLGROUP(R_NBCOL)=([F:ALD]GRP=2)    # col cumul
+            R_COLNOMENU(R_NBCOL)=[F:ALD]NOLIB       # numero section message
+            R_COLNIV(R_NBCOL)   =[F:ALD]NIV       # niveau    # JPJ E25158
+            R_COLTYP(R_NBCOL)   =[F:ALD]CODTYP    # Type    E45527$
+            R_COLLNG(R_NBCOL)   =[F:ALD]LNG       # Format zone (ex: 12.4)   JPJ E50629
+            If R_MAXNIV < [F:ALD]NIV : R_MAXNIV=[F:ALD]NIV : Endif    # niveau maxi
+            # recherche obj lié
+            If [F:ALD]CODTYP<>"VCR"    # Std
+                Read [ATY]CODTYP = [F:ALD]CODTYP
+                If fstat=0
+                       R_COLLINK(R_NBCOL)= [F:ATY]OBJLIEN
+                Endif
+            Else                     # 54551-type VCR (issu de SubALh1 lg 1077 - Marc)
+               If instr(0,[F:ALD]FLD,"(")
+                    R_COLRUB(R_NBCOL)= left$([F:ALD]FLD,instr(0,[F:ALD]FLD,"(")-1)
+               Endif
+               Read [F:AMP]CODPAR = 2;R_COLTAB(R_NBCOL);R_COLRUB(R_NBCOL);"VCROBJ"
+               If !fstat
+                    Case left$([F:AMP]VALPAR,1)
+                    When '"',"'"
+                        R_COLLINK(R_NBCOL)=mid$([F:AMP]VALPAR,2,len([F:AMP]VALPAR)-2)
+                    When Default
+                        R_COLLINK(R_NBCOL)=[F:AMP]VALPAR
+                    Endcase
+               Endif
+            Endif        
+        Endif
+    Next
+    If BRKLOOP=1 : Return : Endif
+    #E27096  En Sql, un seul niveau (nota: info non à jour sur ALD=0 )
+    If [F:APV]SRCCODTYP="REQS" :  R_MAXNIV=1 : Endif   
+
+
+        # Lien pour l'obj liée le cas échéant
+        #     avec gestion des clés composite et de type surchargé dans la définition de la requête
+        For RW_COL=1 To R_NBCOL
+            If R_COLLINK(RW_COL)<>""
+                # Recherches des clés table principale
+                Call EXISTE_ADX("","","WO"+R_COLLINK(RW_COL),OKTRT) From ORDSYS
+                If OKTRT>0  # trt objet existe
+
+                    #--- E45527 - Kil variable objet GX ----------------------------------------------------
+                    If dim([L]CLEVALEUR)>0 : Kill  [L]CLEVALEUR : Endif 
+
+                    Gosub NOMFIC From ="WO"+R_COLLINK(RW_COL)        # en retour: NOMFIC table principale de l'objet, TYPGES gestion 
+                    Gosub SETCLE From ="WO"+R_COLLINK(RW_COL)        # en retour: CLEPRIM et CLESEC()
+
+                    # Table avec accès Geode
+                    R_COLGXTAB(RW_COL)=(GPRODUIT=1 and dim([L]CLEVALEUR)>0)
+
+#
+#            Hyp: La colonne en-cours contient toujours la partie primaire de la clé.
+#                 Pour les tables à clé composite, ex ATABDIV: NUMTAB+CODE
+#                             CODE sera la partie primaire (colonne en-cours)
+#                             NUMTAB sera cherchée sur la même table et même rubrique dans la requête
+#                                    si non trouvé: pas de lien (pas de zone à prendre...)
+#
+                    R_COLLINKPRI(RW_COL)=RW_COL
+                    
+# - - - - - - - -
+                    If [F:APV]SRCCODTYP="REQ"    # Requete standard <E46291$>
+
+                        #  <E45527$>
+                        #
+                        # Utilisation TUNLIEN - Vu avec MB 05/02/2008 
+                        #   Tableau des cas...
+                        # - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+                        #   Objet            Cle en 1 partie => indice des variables TTYP et TLIEN
+                        #   ------            
+                        #                      Partie primaire      
+                        #   TYPGES indifférent       (1)              
+                        #
+                        #   Objet               Cle en 2 parties => indice des variables TTYP et TLIEN
+                        #   ------            
+                        #                       Partie primaire        Partie secondaire  
+                        #   TYPGES=3 Combiné         (1)                    (2)
+                        #   TYPGES<>3 Std            (2)ou(1)               (1)ou(2)   # ou suite E55189
+                        #
+                        #   Objet            Cle en n parties => indice des variables TTYP et TLIEN
+                        #   ------            
+                        #                      Partie primaire        Partie secondaire  
+                        #   TYPGES indifférent       (2)                    (1), (3),(4)...
+                        #   
+                        # E54551 - Cas VCR
+                        # ----------------
+                        #   Pour ce type, exeption à la régle ! 
+                        #   Toujours
+                        #                      Partie primaire        Partie secondaire 
+                        #                            (2)                    (1)  une seule info suplementaire...
+                        # 
+
+                        RW_TYPGES=0        # 0: Clé à une seule partie
+                                           # 1: Clé à n parties arrangement std
+                                           # 2: Clé à 2 parties objet combiné
+    
+                        If R_COLGXTAB(RW_COL)    # Gx
+                            If dim([L]CLESUPP)>1
+                                RW_TYPGES=1
+                            Else
+                                 If [L]CLESUPP<>"" 
+                                     If TYPGES=3 : RW_TYPGES=2 : Else : RW_TYPGES=1 : Endif 
+                                 Endif 
+                            Endif
+                        Else                     # Std
+                            If dim([L]CLESEC)>1
+                                RW_TYPGES=1
+                            Else
+                                 If [L]CLESEC<>"" 
+                                     If TYPGES=3 : RW_TYPGES=2 : Else : RW_TYPGES=1 : Endif 
+                                 Endif 
+                            Endif
+                        Endif
+                        #
+                        Local Integer NOBOUT
+                        RW_T1=0
+                        For NOBOUT=1 To 20        # Recherche du bouton à simuler
+                            Gosub TUNLIEN From ="WMM"+R_REQCOD
+                            # 54551 - Type VCR (pas de test sur type dans ce cas)
+                            If (TTYP(2)="VCR" and val([L]TLIEN(2))=RW_COL)
+                                RW_T1=2
+                                Break
+                            Endif
+                            #
+                            If RW_TYPGES=2
+                                If (TTYP(1)=R_COLTYP(RW_COL) and val([L]TLIEN(1))=RW_COL) 
+                                    RW_T1=1
+                                    Break 
+                                Endif
+                            Elsif RW_TYPGES=1
+                                If (TTYP(2)=R_COLTYP(RW_COL) and val([L]TLIEN(2))=RW_COL)
+                                    RW_T1=2
+                                    Break 
+                                Endif
+                            Else        # Clé simple
+                                If (TTYP(1)=R_COLTYP(RW_COL) and val([L]TLIEN(1))=RW_COL)
+                                    RW_T1=1
+                                    Break 
+                                Endif
+                            Endif
+                        Next
+
+                        # 55189 - l'ordre sur l'objet n'est pas tj clé secondaire en (1) et clé primaire en (2)
+                        #   Ex: accès type ITF - table ITMFACILIT
+                        If RW_T1=0 and RW_TYPGES=1            # Rien trouvé et clé en n parties
+                            For NOBOUT=1 To 20        # Recherche du bouton à simuler
+                                Gosub TUNLIEN From ="WMM"+R_REQCOD
+                                If (TTYP(1)=R_COLTYP(RW_COL) and val([L]TLIEN(1))=RW_COL)
+                                    RW_T1=2
+                                    R_COLLINKPRI(RW_COL) = val([L]TLIEN(2))    # Permutation ordre
+                                    Break 
+                                Endif
+                            Next
+                        Endif
+
+
+                        # Clé primaire trouvée - Chgt clé secondaire
+                        If RW_T1<>0 
+                            If RW_TYPGES<>0   # E54551
+                                RW_T2=0
+                                For RW_IND=1 To dim([L]TLIEN)
+                                    If [L]TLIEN(RW_IND)="" : Break : Endif
+                                    If RW_IND<>RW_T1
+                                        R_COLLKSECL(RW_T2,RW_COL)=[L]TLIEN(RW_IND)    # Num col. ou valeur
+                                        R_COLLKSECT(RW_T2,RW_COL)=[L]TTYP(RW_IND)     # Type
+                                        RW_T2+=1
+                                    Endif
+                                Next
+                           Endif 
+                        Else
+                            R_COLLINK(RW_COL)=""
+                        Endif
+                        #  <\E45527$>
+    
+# - - - - - - - -
+                    Elsif [F:APV]SRCCODTYP="REQS"        # Cas requete SQL     <E46291$>
+                        RW_TYPGES=0        # 0: Clé à une seule partie   - 9: Autre cas (voir ci-dessus)
+                        If R_COLGXTAB(RW_COL)    # Gx
+                            If dim([L]CLESUPP)>1
+                                RW_TYPGES=9
+                            Else
+                                 If [L]CLESUPP<>"" : RW_TYPGES=9 : Endif 
+                            Endif
+                        Else                     # Std
+                            If dim([L]CLESEC)>9
+                                RW_TYPGES=1
+                            Else
+                                 If [L]CLESEC<>"" : RW_TYPGES=9 : Endif 
+                            Endif
+                        Endif
+                        If RW_TYPGES             # clé composite - non gérée
+                            R_COLLINK(RW_COL)="" # annulation lien
+                        Endif  
+# - - - - - - - -
+                    Else
+                        R_COLLINK(RW_COL)="" # annulation lien
+                    Endif
+
+                Else    # annulation lien
+                    R_COLLINK(RW_COL)=""
+                Endif
+            Endif
+# - - - - - - - -
+        Next
+Return
+
+# refresh de la requête
+# ------------------------------------------------------------
+$R_DATAREFRESH     
+  U_TECMES="<X3RequestData>Refresh</X3RequestData>" : Gosub U_TECPUT From SUBAPSUTI
+  If [F:APV]SRCCODTYP="REQS"    #E27096 Sql
+     Gosub R_DATAREFSQL
+  Else
+     Gosub R_DATAREFSTD
+  Endif
+Return
+
+
+$R_DATAREFSTD 
+  Local Char VALBOUT(250) , PARBOUT(250)(1..20)
+  PARBOUT(1) = R_REQCOD
+  PARBOUT(2) = num$(0)
+  PARBOUT(3) = num$(1)
+  # PARBOUT(7) = "300"   E52115 - sup limite
+  FLGEXE = 1
+  GSERVEUR=1  # illusion batch
+  If GTRACE="" : GSILENCE=1 : Endif              # JPJ E24428
+  GACTION = "CALALH"
+  If clalev([M:LST])=0 : Local Mask ="WN"+R_REQCOD [LST] : Endif
+#  If clalev([M:LST])=0 : Local Mask WNJPJCOM2 [LST] : Endif
+  Call TRAITE_CHAR(VALBOUT,PARBOUT,"","SUBALH9","",4,"SPEALH") From GTRAITE
+  
+  # Fin 
+  Local Char SYMBOLE(30) : SYMBOLE = "ALH"-PARBOUT(1)-GUSER
+  Unlock =SYMBOLE
+  GSILENCE=0             # JPJ E24428
+  GSERVEUR=0
+Return
+
+$R_DATAREFSQL            #E27096 Sql
+  Local Char VALBOUT(250) , PARBOUT(250)(1..20)
+  PARBOUT(1) = R_REQCOD
+  PARBOUT(2) = num$(0)
+  PARBOUT(3) = num$(1)
+  FLGEXE = 1
+  GSERVEUR=1  # illusion batch
+  If GTRACE="" : GSILENCE=1 : Endif             
+  GACTION = "CALALQ"
+  If clalev([M:LST])=0 : Local Mask ="WN"+R_REQCOD [LST] : Endif
+  Call TRAITE_CHAR(VALBOUT,PARBOUT,"","SUBALQ9","",4,"SPEALQ") From GTRAITE
+  
+  # Fin 
+  Local Char SYMBOLE(30) : SYMBOLE = "ALQ"-PARBOUT(1)-GUSER
+  Unlock =SYMBOLE
+  GSILENCE=0             # JPJ E24428
+  GSERVEUR=0
+Return
+
+$R_DATANOREFRESH
+  U_TECMES="<X3RequestData>NoRefresh</X3RequestData>" : Gosub U_TECPUT From SUBAPSUTI
+Return
+    
+# génération XML
+# ------------------------------------------------------------
+$R_DATA
+    # Niveau demandé
+    If  M_ACTION=RQ_ACTINIT    # niveau par défaut sur le paramètrage
+        Gosub R_INITLEVEL : If U_ERR=UC_ERRG : Return : Endif
+        RW_FILTER(2)='NIV=' + U_PARVAL 
+        U_TECMES=' <Level>'+U_PARVAL+'</Level>' : Gosub U_TECPUT From SUBAPSUTI
+    Else                      # Recherche en QS du niveau
+        U_QSCODE=RQ_NIVEAU : Gosub U_QSREAD_UC From SUBAPSUTI
+        If (U_QSEXIST)
+            If U_QSVAL<>RC_ALLNIV
+                RW_FILTER(2)='NIV=' + U_QSVAL 
+            Else        # ts niveaux
+                RW_FILTER(2)='1=1'
+            Endif
+            U_TECMES=' <Level>' + U_QSVAL + '</Level>' : Gosub U_TECPUT From SUBAPSUTI
+        Else            # niveau par défaut sur le paramètrage
+            Gosub R_INITLEVEL : If U_ERR=UC_ERRG : Return : Endif
+            RW_FILTER(2)='NIV=' + U_PARVAL 
+            U_TECMES=' <Level>'+U_PARVAL+'</Level>' : Gosub U_TECPUT From SUBAPSUTI
+        Endif
+    Endif
+
+    # filtre sur table des résultats
+    If [F:ALH]ALLUSR=2    # Tous
+        RW_FILTER(1)="COD=[F:ALH]COD"
+    Else
+        RW_FILTER(1)="COD=[F:ALH]COD & USR=GUSER"
+    Endif 
+    If GPRODUIT=1    # Gx - Filtre sup. en fonction de TYPENV
+        Case [F:ALH]TYPENV
+            When 1 : RW_FILTER(1)+=" & FCY=GFCY" 
+            When 2 : RW_FILTER(1)+=" & FCY=GFCY & DEP=GDEP"
+        Endcase
+    Endif
+
+    U_TRAMES="  Filtre à evaluer: " + RW_FILTER(1) + " & " + RW_FILTER(2): Gosub U_TRAPUT From SUBAPSUTI 
+    Filter [F:ALR] Where evalue(RW_FILTER(1)) & evalue(RW_FILTER(2))
+
+    U_SEQPUT=' <Lines>' : Gosub R_SEQPUTDEC
+
+    # parcours des résultats
+    For [F:ALR]
+        RW_NBREC+=1
+        RW_NEWLIG=(RW_LIG <> [F:ALR]LIG)
+        RW_LIG=[F:ALR]LIG
+        RW_COL=[F:ALR]COL
+
+        If RW_NBREC=1
+            U_TECMES=' <LastUpdate Name="' + [F:ALR]USR + '" Date="' + num$([F:ALR]CREDAT) +'" Hour="' + format$("hh[:]mm",[F:ALR]CRETIM) + '" />'
+            Gosub U_TECPUT From SUBAPSUTI
+            U_TECMES=' <MaxLevel>' + num$(R_MAXNIV) + '</MaxLevel>' : Gosub U_TECPUT From SUBAPSUTI
+        Endif
+
+        If RW_NEWLIG and RW_LINEOPEN    # ligne précédente
+            U_SEQPUT='   </Line>' : Gosub R_SEQPUTDEC   
+            RW_LINEOPEN=0
+        Endif
+
+        If ([F:ALR]NIV <> 999 and [F:ALR]LIG<>0)
+            If RW_NEWLIG              # nelle ligne
+                RW_STR1="No"        # Level
+                If [F:ALR]NIV=R_MAXNIV : RW_STR1="Yes" : Endif
+                U_SEQPUT='   <Line ID="L' + num$(RW_NBREC) + '" Level="' + num$([F:ALR]NIV) + '" FinalLevel="' + RW_STR1 + '" >' : Gosub R_SEQPUTDEC
+                RW_LINEOPEN=1
+            Endif
+           
+            # E45527 - Cas GEODE
+            If GPRODUIT=1
+                If RW_NEWLIG
+                    Raz R_COLGXFCY,R_COLGXDEP
+                Endif
+                If RW_COL=-1
+                    R_COLGXFCY=[F:ALR]VLR : Goto GTNEXT
+                Elsif RW_COL=-2
+                    R_COLGXDEP=[F:ALR]VLR : Goto GTNEXT
+                Endif
+            Endif
+    
+            # lecture données
+            #If R_MAXNIV=[F:ALR]NIV or R_COLCUMUL(RW_COL) or R_COLGROUP(RW_COL)  # calcul std requeteur:
+                                    #    pb d'informations valide sur lignes de détail
+                                    #    ou sur colonnes de cumul ou de groupes
+            If (R_COLNIV(RW_COL) <= [F:ALR]NIV  or R_COLCUMUL(RW_COL))        # JPJ E25158   - JPJ E27993
+                # Type de données
+                Case [F:ALR]TYP      # valeurs issues du menu local 30
+                    When 1            # menu local
+                        RW_STRINTVAL=num$([F:ALR]NUM)
+    
+                        If R_COLNOMENU(RW_COL)<>0 and [F:ALR]NUM>0    # récupération message    bug 71733 - CC 22/02/2011
+                            U_HEXTOTXT=mess([F:ALR]NUM,R_COLNOMENU(RW_COL),1) : Gosub U_TXTTOHEX From SUBAPSUTI
+                            RW_STRVAL=U_TXTTOHEX
+                        Else
+                            RW_STRVAL=""
+                        Endif
+                    When 2,3    # entier
+                        RW_STRINTVAL=num$([F:ALR]NUM)
+#  On traite quand même si un menu local est précisé  - Bug 74661   CC  11/07/2011
+                        If R_COLNOMENU(RW_COL)<>0    # récupération message
+                            U_HEXTOTXT=mess([F:ALR]NUM,R_COLNOMENU(RW_COL),1) : Gosub U_TXTTOHEX From SUBAPSUTI
+                            RW_STRVAL=U_TXTTOHEX
+                        Else
+                            RW_STRVAL=format$("Nz:8#",[F:ALR]NUM)
+                        Endif
+                    When 4,5,6        # décimal
+                        RW_STRINTVAL=num$([F:ALR]NUM)
+                        If R_COLLNG(RW_COL) <> 0    #  JPJ 50629
+                            RW_STRVAL=format$("N3zZ:" + num$(R_COLLNG(RW_COL)),[F:ALR]NUM)         # JPJ 50629
+                        Else 
+                            RW_STRVAL=format$("N3zZ:" + GFM92,[F:ALR]NUM)         # JPJ E24321
+                        Endif
+                    When 7            # texte
+                        U_HEXTOTXT=[F:ALR]VLR : Gosub U_TXTTOHEX From SUBAPSUTI     # JPJ E27480
+                        RW_STRVAL=U_TXTTOHEX  
+                        RW_STRINTVAL=RW_STRVAL
+                        #RW_STRINTVAL=""   
+                    When 8            # date
+                        RW_STRINTVAL=format$("D:YYYYMMDD",[F:ALR]DAT)        #num$([F:ALR]DAT)
+                        RW_STRVAL=format$("DPZ:"+GFMDAT, [F:ALR]DAT)
+                    When Default
+                        RW_STRINTVAL=""
+                        RW_STRVAL=""
+                Endcase
+            Else         # pas de données
+                RW_STRINTVAL=""
+                RW_STRVAL=""
+            Endif
+
+            # ecriture
+            #  debut col
+                U_SEQPUT='    <Col Num="' + num$([F:ALR]COL) + '" '
+                U_SEQPUT+=' X3Type="' + num$([F:ALR]TYP)  + '" '
+                If R_COLCUMUL(RW_COL) : U_SEQPUT += ' Cumul="Yes" ' : Endif
+                If R_COLGROUP(RW_COL) : U_SEQPUT += ' Group="Yes" ' : Endif
+                # Gestion des colonnes avec lien
+                If R_COLLINK(RW_COL)<>""    #   lien
+                    RW_URL=""
+
+                    # Rappel hyp: la clé primaire est tj la colonne en-cours    
+                    If R_COLLKSECL(0,RW_COL)=""    # Clé simple
+                        If R_COLGXTAB(RW_COL)<>1        # E45527
+                            Call GETURLCLEPRIM(R_COLLINK(RW_COL), RW_STRINTVAL, M_MODE, RW_URL) From SUBAPSOBJ
+                        Else
+                            Call GETURLCLEPGX(R_COLLINK(RW_COL), R_COLGXFCY, R_COLGXDEP, RW_STRINTVAL, M_MODE, RW_URL) From SUBAPSOBJ
+                        Endif
+                    Else                    # Clé composite
+                        # gestion des clés secondaires
+                        # If clalev([F:ALR1])=0 : Local File ALISTER [ALR1] : Endif : # GH 02/09/05 bug 31900
+                        If dim([F:ALH]TYPENV)>0 & GPRODUIT<>-1 & dim([F:ALR1]DEP)<0
+                         If clalev([F:ALR1]) : Close Local File [ALR1] : Endif 
+                         Local File ALISTENV [ALR1]    :#CHECK IGNORE_LINE
+                        Elsif clalev([F:ALR1])=0
+                         Local File ALISTER  [ALR1]
+                        Endif
+
+                        Raz RW_EVACLESEC, RW_EVACLEPRI
+                        RW_FLGSEC=1
+
+                        If RW_COL=R_COLLINKPRI(RW_COL)        # colonne courante = partie courante
+                            RW_EVACLEPRI=RW_STRINTVAL    # sauv
+                        Else                                  # 55189 - permutation cle en 2 parties
+                            RWATR1_COL=R_COLLINKPRI(RW_COL)
+                            Gosub LEC_ALR                    
+                            If !fstat
+                                RW_EVACLEPRI=RW_STRINTVAL
+                            Else
+                                RW_FLGSEC=0
+                            Endif
+                        Endif
+
+                        If RW_FLGSEC
+                            RW_IND=0  
+                            While R_COLLKSECL(RW_IND,RW_COL)<>""
+                              If R_COLLKSECT(RW_IND,RW_COL)<>""    # R_COLLKSECL contient un numéro de colonne
+                                    RWATR1_COL=val(R_COLLKSECL(RW_IND,RW_COL) )
+                                    Gosub LEC_ALR                    # 55189 
+                                    If !fstat
+                                        RW_EVACLESEC(RW_IND)=RW_STRINTVAL
+                                    Else
+                                        RW_FLGSEC=0 : Break
+                                    Endif
+                              Else                   # R_COLLKSECL contient une valeur (ex objet APM: partie secondaire="0")
+                                    RW_EVACLESEC(RW_IND)=R_COLLKSECL(RW_IND,RW_COL)
+                              Endif
+                              RW_IND+=1
+                            Wend
+                        Endif
+        
+                        If RW_FLGSEC
+                            If R_COLGXTAB(RW_COL)<>1        # E45527
+                                Call GETURLCLECMP(R_COLLINK(RW_COL), RW_EVACLEPRI,RW_EVACLESEC, M_MODE, RW_URL) From SUBAPSOBJ
+                            Else
+                                Call GETURLCLECGX(R_COLLINK(RW_COL), R_COLGXFCY, R_COLGXDEP, RW_EVACLEPRI,RW_EVACLESEC, M_MODE, RW_URL) From SUBAPSOBJ
+                            Endif
+                        Endif
+                    Endif 
+    
+                    # Attribut X3link
+                    If RW_URL<>""
+                         U_HEXTOTXT=RW_URL : Gosub U_TXTTOHEX From SUBAPSUTI
+                         U_SEQPUT+=' X3Link="' + U_TXTTOHEX + '" '
+                    Endif
+                Endif
+                U_SEQPUT +=  ' >': Gosub R_SEQPUTDEC
+            #  valeurs
+                If [F:ALR]TYP <> 7    # information non utile sur les textes
+                    If len(RW_STRINTVAL)>200 : RW_STRINTVAL=left$(RW_STRINTVAL,200)-"..." : Endif
+                    U_SEQPUT='     <X3IntVal>' + RW_STRINTVAL + '</X3IntVal>' : Gosub R_SEQPUTDEC
+                Endif
+                If len(RW_STRVAL)>200 : RW_STRVAL=left$(RW_STRVAL,200)-"..." : Endif
+                U_SEQPUT='     <X3Value>' + RW_STRVAL + '</X3Value>' : Gosub R_SEQPUTDEC    # valeur avec conversion
+            #  fin colonne
+                U_SEQPUT="    </Col>": Gosub R_SEQPUTDEC
+       Endif
+$GTNEXT
+        # E52357 - Prevision debordement
+        If U_OUTFLGMAX : Break : Endif
+    Next
+
+    If RW_LINEOPEN : U_SEQPUT='   </Line>' : Gosub R_SEQPUTDEC : Endif    # ligne précédente
+    U_SEQPUT='  </Lines>' : Gosub R_SEQPUTDEC
+
+    # Protection contre les requêtes sans résultats techniques -  JPJ E32160 
+    If RW_NBREC = 0
+        U_MESCODE="X3REQNOTECHRESULT" : U_MESP1=R_REQCOD : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+    Endif
+
+
+    # Titre
+    U_QSCODE=RQ_TITLEOPT : Gosub U_QSREAD_UC From SUBAPSUTI
+    If (!U_QSEXIST or (U_QSEXIST and  U_QSVAL<>UC_NO))
+            Gosub R_TIT : If U_ERR=UC_ERRG : Goto ERRXMLCLOSE : Endif
+    Endif      
+
+    # Raz filtre
+   Filter [F:ALR] 
+Return
+
+
+# Lecture ALR1 
+#   entrée: RWATR1_COL (numero colonne)
+#   sortie: fstat et RW_STRINTVAL  
+# 55189 - ordre inversé
+# ------------------------------------------------------------
+$LEC_ALR
+#CHECK IGNORE_BEGIN
+    If GPRODUIT<>1 
+        Read [F:ALR1]ALR0=[F:ALR]COD;[F:ALR]USR;[F:ALR]NIV;[F:ALR]LIG;RWATR1_COL
+    Else                                    # E45527
+        Read [F:ALR1]ALR0=[F:ALR]COD;[F:ALR]FCY;[F:ALR]DEP;[F:ALR]USR;[F:ALR]NIV;[F:ALR]LIG;RWATR1_COL
+    Endif
+#CHECK IGNORE_END
+
+    If fstat=0
+        # Type de données
+        Case [F:ALR1]TYP      # valeurs issues du menu local 30
+            When 1            # menu local
+                RW_STRINTVAL=num$([F:ALR1]NUM)
+            When 2,3    # entier
+                RW_STRINTVAL=num$([F:ALR1]NUM)
+            When 4,5,6        # décimal
+                RW_STRINTVAL=num$([F:ALR1]NUM)
+            When 7            # texte
+                RW_STRINTVAL=[F:ALR1]VLR
+            When 8            # date
+                RW_STRINTVAL=format$("D:YYYYMMDD",[F:ALR1]DAT)        #num$([F:ALR]DAT)
+            When Default
+                fstat=1
+        Endcase
+    Endif
+Return
+
+
+# niveau par défaut sur le paramètrage
+# ------------------------------------------------------------
+$R_INITLEVEL
+U_PARCODE=RC_INITLEVEL : Gosub $U_PARSRCREAD From SUBAPSUTI : If U_ERR=UC_ERRG : Return : Endif
+If !U_PAREXIST : U_PARVAL="1" : Endif                    # valeur par défaut
+U_PARVAL=num$(val(U_PARVAL))                             # conversion numérique
+If U_PARVAL="0" : U_PARVAL="1" : Endif                   # protections
+If val(U_PARVAL) > R_MAXNIV : U_PARVAL=num$(R_MAXNIV) : Endif
+U_TRAMES="  Niveau utilisé:" - U_PARVAL : Gosub U_TRAPUT From SUBAPSUTI 
+Return
+
+
+# ------------------------------------------------------------
+#  Accès aux titres des colonnes
+# ------------------------------------------------------------
+$R_TIT
+    #U_MESCODE="ENTRAVAIL" : U_MESP1="" : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Goto R_ERR
+#    If clalev([F:ALH])=0 : Local File ALISTEH [ALH] : Endif
+    # F:ALH est initialisé par la lecture de l'objet X3
+    If clalev([F:ALD])=0 : Local File ALISTED [ALD] : Endif
+
+    U_SEQPUT='<Titles>' : Gosub R_SEQPUTDEC
+#    Read [F:ALH]ALH0 # titre
+#    If fstat <> 0
+ #       U_MESCODE="X3OBJUNKNOWN" : U_MESP1=ABREV : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+  #  Endif
+
+
+    U_HEXTOTXT = func AFNC.TEXTRA("ALISTEH","INTIT",[F:ALH]COD,"") : Gosub U_TXTTOHEX From SUBAPSUTI    # 63940
+    U_SEQPUT=' <Title>' + U_TXTTOHEX + '</Title>' : Gosub R_SEQPUTDEC
+
+    For [F:ALD]ALD0 From R_REQCOD To R_REQCOD  # les colonnes
+      If ([F:APV]SRCCODTYP="REQS" and [ALD]LIG>100) : Break : Endif     # 47640 - exclure les paramétres req SQL
+      If [F:ALD]STREND<=2      :#  On ne prend pas les colonnes invisibles - CC 14/04/2008 - Bug 46873
+        # Type   
+        Read [ATY]CODTYP = [F:ALD]CODTYP
+        If [F:ALD]CODTYP="ATX"
+           R_COLX3TYP = "7"
+        Elsif find([F:ALD]CODTYP,"AXX","AX1","AX2","AX3")
+           R_COLX3TYP = "7"
+        Else
+           R_COLX3TYP = num$([F:ATY]TYPTYP)
+        Endif
+        # 
+        If dim([F:ALD]NUMTEX)>0 and [F:ALD]NUMTEX>0 
+          Call LECTEXTRA(U_HEXTOTXT,"ALISTED","INTITLIG",[F:ALD]COD,num$([ALD]NUMTEX)) From ATEXTRA
+        Else
+          Call LECTEXTRA(U_HEXTOTXT,"ALISTED","INTITLIG",[F:ALD]COD,num$([ALD]LIG)) From ATEXTRA
+        Endif
+        Gosub U_TXTTOHEX From SUBAPSUTI
+        U_SEQPUT=' <ColTitle Num="' + num$([F:ALD]LIG) +'" X3Type="'+ R_COLX3TYP +'">' + U_TXTTOHEX + '</ColTitle>' : Gosub R_SEQPUTDEC
+      Endif
+    Next
+
+    U_SEQPUT='</Titles>' : Gosub R_SEQPUTDEC
+Return
+
+
+
+# ------------------------------------------------------------
+#  Commun
+# ------------------------------------------------------------
+# Variables
+# - - - - - - - - - - - - - - - - - -
+$R_INIT
+# Objet X3 Standard Requete
+Local Char PC_REQOBJ : PC_REQOBJ="ALH"                             # Objet X3
+Local Char R_REQCOD(10)
+
+# Actions
+Local Char RQ_ACTTITLE(10) : RQ_ACTTITLE='TITLE'            # Titres seuls
+Local Char RQ_ACTINIT(10) : RQ_ACTINIT='INIT'               # Chargement en initialisation
+Local Char RQ_ACTLOAD(10) : RQ_ACTLOAD='LOAD'               # Chargement sortie avec calcul des résultats selon options de la fiche
+Local Char RQ_ACTREF(10) : RQ_ACTREF='REFRESH'              # Chargement sortie avec calcul forcé des résultats
+
+# Option en mode données
+Local Char RQ_TITLEOPT(5) : RQ_TITLEOPT='TITLE'               # Option (UC_YES ou UC_NO)
+Local Char RQ_NIVEAU(6) : RQ_NIVEAU='NIVEAU'                  # niveau demandé (numérique ou UC_ALL)
+Local Char RC_ALLNIV(3) : RC_ALLNIV="ALL"    # Demande tous les niveaux
+
+# Divers
+Local Integer R_FLGINFOS        # Flag pour écrire les infos de génération de la requête
+Local Integer R_HASRESULTS      # Flag pour indiquer si la requête à déjà des résultats
+Local Integer RC_NBMAXCOL : RC_NBMAXCOL=20    # nb maxi de colonnes du prgrm
+Local Integer R_NBCOL                         # nb de colonnes de la requête
+
+# JPJ E33250  dimension tableaux (RC_NBMAXCOL) -> (1..RC_NBMAXCOL)
+Local Char    R_COLTAB (GLONATB) (1..RC_NBMAXCOL)  # Table source de la colonne
+Local Char    R_COLRUB (15) (1..RC_NBMAXCOL)       # Rubrique source de la colonne
+Local Integer R_COLNIV    (1..RC_NBMAXCOL)       # Niveau de la colonne      # JPJ E25158
+Local Integer R_COLNOMENU (1..RC_NBMAXCOL)       # Pour des colonnes avec menu: Numéro de menu associé
+Local Integer R_COLCUMUL (1..RC_NBMAXCOL)        # Pour des colonnes avec cumul: vrai
+Local Integer R_COLGROUP (1..RC_NBMAXCOL)        # Pour des colonnes groupe: vrai
+Local Char    R_COLLINK(3)(1..RC_NBMAXCOL)       # Pour des colonnes liées à un objet: code objet X3 (ABREV)    (nota: une requête peut imposer un type)
+Local Integer R_COLLINKPRI(1..RC_NBMAXCOL)         # Indice colonne clé primaire
+Local Char    R_COLLKSECL(30)(0..5,1..RC_NBMAXCOL)        # Valeur ou indice de colonne = TLIEN() du trt généré WMM[req]/$TUNLIEN (R_COLINKSEC auparavent)
+Local Char    R_COLLKSECT(GLONATY)(0..5,1..RC_NBMAXCOL)   # Type colonne = TTYP() du trt généré WMM[req]/$TUNLIEN 
+
+Local Char    R_COLTYP(GLONATY)(1..RC_NBMAXCOL)    # Type de la colonne      # E45527$
+Local Decimal R_COLLNG(1..RC_NBMAXCOL)             # Format de la zone sous forme 12.4   # JPJ E50629
+
+# E45527 - Gestion GEODE
+Local Integer R_COLGXTAB(1..RC_NBMAXCOL)                    # Flag: 1=colonne liéée à une table Geode  
+If GPRODUIT=1
+    Local Char    R_COLGXFCY(GLONFCY)                       # Site GX de la ligne
+    Local Char    R_COLGXDEP(GLONDEP)                       # Deposant GX de la ligne
+Endif
+
+#
+Local Char    R_COLTITLE (20)(1..RC_NBMAXCOL)   # Titre
+Local Char    R_COLX3TYP(1)                     # Type X3 de la colonne
+Local Integer R_MAXNIV                          # niveau maxi de la requête
+
+#Paramètres sources de données
+Local Char RC_FRQ(3) : RC_FRQ="FRQ"    # Fréquence rafraichissement
+Local Char RC_INITLEVEL(10) : RC_INITLEVEL="INITLEVEL"    # Niveau pris sur le paramétrage en action INIT
+
+# Travail
+Local Integer RW_I, RW_T1, RW_T2, RW_IND, RW_TYPGES
+Local Char RW_URL(100)
+Local Char RW_FILTER(100)(1..2)            # filtres
+
+Local Integer RW_LIG, RW_NEWLIG, RW_LINEOPEN   # ligne de données
+Local Integer RW_COL, RW1_COL, RWATR1_COL                           # colonne
+Local Integer RW_NBREC, RW_FLGSEC
+Local Char RW_STR1(100), RW_STRINTVAL(200), RW_STRVAL(200)
+Local Char RW_EVACLEPRI(200), RW_EVACLESEC(200)(0..5)
+Local Integer OKTRT
+Return
+
+#-- Ecriture output avec decalage
+$R_SEQPUTDEC
+  U_SEQPUT=space$(4)+U_SEQPUT :  Gosub U_PUT From SUBAPSUTI
+Return

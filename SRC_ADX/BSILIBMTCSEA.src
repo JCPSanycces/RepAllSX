@@ -1,0 +1,296 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+######################################################################################################
+# Project       : Bank statement import (MT940)
+# File          : BSILIBMTCSEA
+# Version       : 1.0
+# Authors       : U. Bader
+# Creation Date : 2016-11-11
+######################################################################################################
+# Module        : Finance
+# Description   : Library for bank statement import: matching search term list
+#                 called from BSILIBMTC
+######################################################################################################
+# Updates       :
+# Date          | Author | Version | Description
+# 2016-11-25    | Bader  | U11_01  | X3-1501: Search term list: strip blanks from search term if MergeDescriptionField = "Always" or "Second pass"
+# 2017-02-17    | Bader  | U11_03  | Replace hard coded messages for logging by local menu entries
+# 2017-05-26    | Bader  | 2017.R3 | Subdetail matching for search term list (new table BSIIMPDS)
+######################################################################################################
+
+$MATCH_SEARCH_TERM_LIST
+Local Integer I, CRITCOUNT, CRITHIT, CRITHIT_ORG, TMP_SNS
+Local Clbfile ALLREFTMP(5), ALLREFBPR(5)
+Local Char SEARCHSTR(70), BTCSTRING(150)
+If !clalev ([F:BSILIS]) : Local File BSISEALIS  [BSILIS]  : Endif # Search term list header
+If !clalev ([F:BSILISD]): Local File BSISEALISD [BSILISD] : Endif # Search term list details
+If !clalev ([F:BSIMAN]) : Local File BSIMANENT  [BSIMAN]  : Endif # Manual entries
+If !clalev ([F:CDA])    : Local File GACCDENCOD [CDA]     : Endif # Payment attributes
+
+If [F:BSIIMPD]SNS="C" | [F:BSIIMPD]SNS="RD"
+   TMP_SNS = 2
+Else #  D or RC
+   TMP_SNS = 1
+Endif
+
+SEALIS_FOUND = 0
+
+# check if search term list for all 3 component (CPY + BAN + FILFMT) exists
+Read [F:BSILIS]BSILIS0 = [F:BSIIMPD]CPY;[F:BSIIMPD]BAN;[F:BSIIMPD]FILFMT
+If fstat # not found > check if search term list for CPY + BAN exists
+    Read [F:BSILIS]BSILIS0 = [F:BSIIMPD]CPY;[F:BSIIMPD]BAN;""
+Endif
+If fstat # not found > check if search term list for CPY + FILFMT exists
+    Read [F:BSILIS]BSILIS0 = [F:BSIIMPD]CPY;"";[F:BSIIMPD]FILFMT
+Endif
+If fstat # not found > check if search term list for CPY exists
+    Read [F:BSILIS]BSILIS0 = [F:BSIIMPD]CPY;"";""
+Endif
+
+If !fstat   # search term list found > loop over entries of list
+    If [F:BSIIP]MRGDESFLD = 2 or [F:BSIIP]MRGDESFLD = 3   # merge description field "always" or "second pass"
+        Gosub BUILD_ALLREFBPR
+    Endif
+
+    For [F:BSILISD] Where CPY = [F:BSILIS]CPY and BAN = [F:BSILIS]BAN and FILFMT = [F:BSILIS]FILFMT
+        If PLOG
+            Call ECR_TRACE ("-----------------------------------------------------------------------------------------",0) From GESECRAN
+            Call ECR_TRACE (func AFNC.MES1(mess(175,7703,1),[F:BSILIS]CPY+"/"+[F:BSILIS]BAN+"/"+[F:BSILIS]FILFMT+"/"+num$([F:BSILISD]LIN)),0) From GESECRAN
+        Endif
+        Call LEC_CDA_LEG([F:BSIIP]LEG,[F:BSILISD]DENCOD) From CPTLEC
+        If !fstat
+            # first step: do some controls that might cause the skipping of the search term
+            If [F:CDA]ACCTYP = 3                          # Acc <-> BP not allowed
+                If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(176,7703,1),[F:BSILISD]DENCOD),0) From GESECRAN : Endif
+                Goto TONEXT                               # skip [F:BSILISD]DENCOD-mess(59,106,1)
+            Endif
+            If [F:CDA]ACCSNS <> 1                         # if accounting sign not "Payment sign"
+              If TMP_SNS <> [F:CDA]ACCSNS - 1             # check if signs in attribute equals sign of transaction
+                If PLOG : Call ECR_TRACE (mess(177,7703,1),0) From GESECRAN : Endif
+                Goto TONEXT                               # skip mess(68,7703,1)
+              Endif
+            Endif
+
+            # second step: determine the number of filled criteria in the search term
+            Raz [L]CRITCOUNT, [L]CRITHIT
+            Gosub GET_CRITCOUNT
+
+            # third step: determine the number of criteria hits
+            If [F:BSILISD]SEAAMT <> 0 and [F:BSILISD]SEAAMT = [F:BSIIMPD]AMTCUR   # check amount
+                [L]CRITHIT +=1
+                If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(178,7703,1),num$([F:BSILISD]SEAAMT)),0) From GESECRAN : Endif
+            Elsif [F:BSILISD]SEAAMT <> 0
+                If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(179,7703,1),num$([F:BSILISD]SEAAMT)),0) From GESECRAN : Endif
+            Endif
+            Gosub CHECK_BTCREF                            # check BTC reference in BTC fields (subdetail matching)
+            Gosub CHECK_FREF                              # check payment reference in FREF fields
+            Gosub CHECK_BPRREF                            # check BP reference in BPRREF fields
+            If [F:BSILISD]SEAOTH <> ""                    # check payment description in DES field
+              If pat(toupper([F:BSIIMPD]DES),"*"+toupper([F:BSILISD]SEAOTH)+"*")  # check if search string found
+                  [L]CRITHIT +=1
+                  If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(180,7703,1),[F:BSILISD]SEAOTH),0) From GESECRAN : Endif
+              Else
+                  If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(181,7703,1),[F:BSILISD]SEAOTH),0) From GESECRAN : Endif
+              Endif
+            Endif
+
+            # check if all criteria are fulfilled
+            If [L]CRITCOUNT > 0 and [L]CRITCOUNT = [L]CRITHIT
+                If PLOG : Call ECR_TRACE (mess(182,7703,1),0) From GESECRAN : Endif
+                # write record into BSIMANENT table
+                Gosub CREATE_MANENT                       # create record in table BSIMANENT
+                Gosub UPDATE_BSIIMPD                      # Update record in BSIIMPD (LET, ...)
+
+                SEALIS_FOUND = 1  : Break
+            Endif
+
+        Else
+                                                          # [F:BSILISD]DENCOD-mess(23,100,1)
+        Endif
+$TONEXT
+    Next
+Endif
+Return
+
+
+############################################################################################
+$GET_CRITCOUNT
+Local Char CRITSTR(250) : CRITSTR = mess(194,7703,1)
+If [F:BSILISD]SEAPAYREF <> ""                   # Payment reference
+   CRITSTR -= func AFNC.MES1(mess(183,7703,1),[F:BSILISD]SEAPAYREF)
+   [L]CRITCOUNT +=1
+Endif
+If [F:BSILISD]SEABPRREF <> ""                   # BP reference
+   CRITSTR -= func AFNC.MES1(mess(184,7703,1),[F:BSILISD]SEABPRREF)
+   [L]CRITCOUNT +=1
+Endif
+If [F:BSILISD]SEAOTH <> ""                      # Payment description
+   CRITSTR -= func AFNC.MES1(mess(185,7703,1),[F:BSILISD]SEAOTH)
+   [L]CRITCOUNT +=1
+Endif
+If [F:BSILISD]SEAAMT <> 0                       # Amount
+   CRITSTR -= func AFNC.MES1(mess(186,7703,1),num$([F:BSILISD]SEAAMT))
+   [L]CRITCOUNT +=1
+Endif
+If [F:BSILISD]SEABTC <> ""                      # BTC reference
+   CRITSTR -= func AFNC.MES1(mess(221,7703,1),[F:BSILISD]SEABTC)
+   [L]CRITCOUNT +=1
+Endif
+If [L]CRITCOUNT > 0
+    If PLOG : Call ECR_TRACE (CRITSTR,0) From GESECRAN : Endif
+Else
+    If PLOG : Call ECR_TRACE (mess(187,7703,1),0) From GESECRAN : Endif
+Endif
+Return
+
+
+############################################################################################
+$BUILD_ALLREFBPR
+For I=0 To dim([F:BSIIMPD]BPRREF)-1
+   If [F:BSIIMPD]BPRREF(I)<>""
+      ALLREFBPR = ALLREFBPR + vireblc([F:BSIIMPD]BPRREF(I),2)
+   Endif
+Next
+ALLREFBPR = toupper(ALLREFBPR)
+Return
+
+
+############################################################################################
+$CHECK_FREF
+[L]CRITHIT_ORG = [L]CRITHIT
+If [F:BSILISD]SEAPAYREF <> ""                         # check payment reference in FREF fields
+    SEARCHSTR = "*"+toupper([F:BSILISD]SEAPAYREF)+"*"
+    Case [F:BSIIP]MRGDESFLD
+          When 2 # always concatenate reference lines
+              If pat(ALLREFLIN1,vireblc(SEARCHSTR,4))   # check if search string found
+                  [L]CRITHIT +=1
+              Endif
+          When 1 # handle reference lines one by one
+              For I=0 To dim([F:BSIIMPD]FREREF)-1
+                 If [F:BSIIMPD]FREREF(I)<>""
+                    If pat(toupper([F:BSIIMPD]FREREF(I)),SEARCHSTR) # check if search string found
+                        [L]CRITHIT +=1
+                        Break
+                    Endif
+                 Endif
+              Next
+          When 3 # handle reference lines in 2 steps: one by one and if not found concatenated
+              For I=0 To dim([F:BSIIMPD]FREREF)-1     # one by one
+                 If [F:BSIIMPD]FREREF(I)<>""
+                    If pat(toupper([F:BSIIMPD]FREREF(I)),SEARCHSTR) # check if search string found
+                        [L]CRITHIT +=1
+                        Break
+                    Endif
+                 Endif
+              Next
+              If [L]CRITHIT=[L]CRITHIT_ORG            # nothing found so far > search in concatenated lines
+                 If pat(ALLREFLIN1,vireblc(SEARCHSTR,4))  # check if search string found
+                     [L]CRITHIT +=1
+                 Endif
+              Endif
+    Endcase
+    If [L]CRITHIT<>[L]CRITHIT_ORG
+        If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(188,7703,1),[F:BSILISD]SEAPAYREF),0) From GESECRAN : Endif
+    Else
+        If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(189,7703,1),[F:BSILISD]SEAPAYREF),0) From GESECRAN : Endif
+    Endif
+Endif
+Return
+
+
+############################################################################################
+$CHECK_BTCREF
+[L]CRITHIT_ORG = [L]CRITHIT
+If [F:BSILISD]SEABTC <> ""                          # check BTC reference in BTC fields
+    If NUMIMPS > 0                                  # BTC reference check only possible if subdetails exist
+        SEARCHSTR = "*"+toupper([F:BSILISD]SEABTC)+"*"
+        For [F:BSIIMPS]                             # loop over all subdetail records
+            BTCSTRING = [F:BSIIMPS]BANTRSREF(0)+[F:BSIIMPS]BANTRSREF(1)+[F:BSIIMPS]BANTRSREF(2) # concatenate all BTC fields
+            If pat(toupper(BTCSTRING),vireblc(SEARCHSTR,4)) # check if search string found
+                [L]CRITHIT +=1
+                Break
+            Endif
+        Next
+        If [L]CRITHIT<>[L]CRITHIT_ORG
+            If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(222,7703,1),[F:BSILISD]SEABTC),0) From GESECRAN : Endif
+        Else
+            If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(223,7703,1),[F:BSILISD]SEABTC),0) From GESECRAN : Endif
+        Endif
+    Else
+        If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(224,7703,1),[F:BSILISD]SEABTC),0) From GESECRAN : Endif
+    Endif
+Endif
+Return
+
+
+############################################################################################
+$CHECK_BPRREF
+[L]CRITHIT_ORG = [L]CRITHIT
+If [F:BSILISD]SEABPRREF <> ""                          # check payment reference in BPRREF fields
+    SEARCHSTR = "*"+toupper([F:BSILISD]SEABPRREF)+"*"
+    Case [F:BSIIP]MRGDESFLD
+          When 2 # always concatenate reference lines
+              If pat(ALLREFBPR,vireblc(SEARCHSTR,2))   # check if search string found
+                  [L]CRITHIT +=1
+              Endif
+          When 1 # handle reference lines one by one
+              For I=0 To dim([F:BSIIMPD]BPRREF)-1
+                 If [F:BSIIMPD]BPRREF(I)<>""
+                    If pat(toupper([F:BSIIMPD]BPRREF(I)),SEARCHSTR) # check if search string found
+                        [L]CRITHIT +=1
+                        Break
+                    Endif
+                 Endif
+              Next
+          When 3 # handle reference lines in 2 steps: one by one and if not found concatenated
+              For I=0 To dim([F:BSIIMPD]BPRREF)-1      # one by one
+                 If [F:BSIIMPD]BPRREF(I)<>""
+                    If pat(toupper([F:BSIIMPD]BPRREF(I)),SEARCHSTR) # check if search string found
+                        [L]CRITHIT +=1
+                        Break
+                    Endif
+                 Endif
+              Next
+              If [L]CRITHIT=[L]CRITHIT_ORG             # nothing found so far > search in concatenated lines
+                 If pat(ALLREFBPR,vireblc(SEARCHSTR,2))           # check if search string found
+                     [L]CRITHIT +=1
+                 Endif
+              Endif
+    Endcase
+    If [L]CRITHIT<>[L]CRITHIT_ORG
+        If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(190,7703,1),[F:BSILISD]SEABPRREF),0) From GESECRAN : Endif
+    Else
+        If PLOG : Call ECR_TRACE (func AFNC.MES1(mess(191,7703,1),[F:BSILISD]SEABPRREF),0) From GESECRAN : Endif
+    Endif
+Endif
+Return
+
+
+############################################################################################
+$CREATE_MANENT
+Raz [F:BSIMAN]
+[F:BSIMAN]STMCOD  = [F:BSIIMPD]STMCOD
+[F:BSIMAN]LIN     = [F:BSIIMPD]LIN
+[F:BSIMAN]LIN1    = 1
+[F:BSIMAN]FCY     = [F:BSILISD]FCY
+[F:BSIMAN]DENCOD  = [F:BSILISD]DENCOD
+[F:BSIMAN]ACC     = [F:BSILISD]ACC
+[F:BSIMAN]BPR     = [F:BSILISD]BPR
+[F:BSIMAN]BPRSAC  = [F:BSILISD]BPRSAC
+[F:BSIMAN]ACCSAC  = [F:BSILISD]ACCSAC
+[F:BSIMAN]BPAINV  = [F:BSILISD]BPAINV
+[F:BSIMAN]REF     = ""
+[F:BSIMAN]AMT     = [F:BSIIMPD]AMTCUR
+[F:BSIMAN]VAT     = [F:BSILISD]VAT
+[F:BSIMAN]DSP     = [F:BSILISD]DSP
+[F:BSIMAN]DES     = [F:BSILISD]DES
+Write [F:BSIMAN]
+Return
+
+
+############################################################################################
+$UPDATE_BSIIMPD
+[F:BSIIMPD]FLGREFLIS = [V]CST_AYES          # set flag "search term list found"
+[F:BSIIMPD]LET = "AS"                       # set matching flag to "AS"
+Rewrite [F:BSIIMPD]
+Return
+

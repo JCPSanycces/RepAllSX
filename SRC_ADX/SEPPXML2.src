@@ -1,0 +1,925 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+####################################################################################################
+# SEPPXML2 is the interface between X3 applications and the JavaScript that makes API
+# calls to Sage Pay.
+#
+# Transaction types for Sage Pay:
+#   TOKEN...............(UI).........create a storage record for card data in Sage Pay
+#   REMOVETOKEN.........(No UI)......Remove a previously stored card
+#
+#   DEFERRED............(UI).........an account is verified to be valid and has not reached its limit
+#   RELEASE.............(No UI)......puts a DEFERRED transaction into a released state for settlement
+#   ABORT...............(No UI)......releases the hold created by a deferred transaction
+#   REFUND..............(No UI)......Refunds an existing transaction (Misc refunds not allowed)
+#
+####################################################################################################
+
+####################################################################################################
+# TOKEN create
+####################################################################################################
+Subprog TOKEN_CRE(PRCCOD,TXNID,ERR,ERRMSG)
+  Value    Char    PRCCOD
+  Value    Char    TXNID
+  Variable Integer ERR
+  Variable Char    ERRMSG
+
+  Local Char RESPSTAT(15), RESPDETAIL(255)
+  Local Char TXNTYP(15)
+  Local Char VPSTXID(38)
+
+  # Send the request to get the page to enter card details
+  TXNTYP="TOKEN"
+  Gosub SEND_TXN
+  If ERR : End : Endif
+
+  # Verify that the process is complete and store card details
+  TXNTYP="TOKEN_VERIFY"
+  Gosub SEND_TXN
+  If ERR : End : Endif
+
+End
+
+#---------------------------------------------------------------------------------------------------
+$TOKEN_CREATE   # Called from SEND_TXN
+  Local Char TMP(255)
+  Local Char NEXTURL(255)
+  Local Char PROTO(5), FIL(250)
+
+  # Build ARGUMENTS
+  Gosub COMMON_ARGS_APPLICATION
+  Call APPEND_ARGS(ARGUMENTS, 'VendorTxCode', [L]TXNID)
+  Call APPEND_ARGS(ARGUMENTS, 'Currency',     [F:SER]CUR)
+  Call APPEND_ARGS(ARGUMENTS, 'Profile',      'NORMAL')
+  [L]TMP = func GET_LANID()
+  Call APPEND_ARGS(ARGUMENTS, 'Language',     [L]TMP)
+
+  Call SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+  If ERR : Return : Endif
+
+  #Initial response to TOKEN create request
+  RESPSTAT    = func FINDVAL(RESBODY, "Status")
+  RESPDETAIL  = func FINDVAL(RESBODY, "StatusDetail")
+  VPSTXID     = func FINDVAL(RESBODY, "VPSTxId")
+  NEXTURL     = func FINDVAL(RESBODY, "NextURL")
+
+  If left$(RESPSTAT,2)<>"OK"
+    ERR=1
+    ERRMSG=RESPDETAIL
+    Return
+  Endif
+
+  #Strip the { } off of the VPSTxId
+  [L]VPSTXID = left$([L]VPSTXID, len([L]VPSTXID)-1)
+  [L]VPSTXID = right$([L]VPSTXID, 2)
+
+  Call BREAK_URL(NEXTURL, PROTO, FIL)
+
+  # Open Sage Pay window in browser.
+  Callui RETOUR="" With "UIAction="    + chr$(1) + "OpenFile"
+&                      ,"UILocalDir="  + chr$(1) + PROTO
+&                      ,"UILocalFile=" + chr$(1) + FIL
+
+Return
+
+#---------------------------------------------------------------------------------------------------
+$TOKEN_VERIFY   # Called from SEND_TXN
+  Local Char CRDTYP(15), TOKEN(38), ACCL4D(4), TMPDAT(4)
+  Local Date EXPDAT
+  Local Integer ISLP,SLP_TIME,MAX_WAIT
+  Local Char WAITSTATUS, SECSTATUS
+
+  Gosub INIT_SEP
+
+  # Build ARGUMENTS
+  Raz ARGUMENTS
+  Append ARGUMENTS, '"' + [L]VPSTXID + '"'
+
+  SLP_TIME = 5  # sleep for 5 seconds at a time
+  MAX_WAIT = [F:SEP]POLL/SLP_TIME
+
+  Onintgo END_SPS_QUERY
+  For ISLP=1 To MAX_WAIT
+    Sleep SLP_TIME
+    Call SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+    [L]WAITSTATUS = func FINDVAL(RESBODY, "WaitStatus")
+    If [L]WAITSTATUS<>"WAIT" : Break : Endif
+  Next
+  Onintgo
+
+  [L]SECSTATUS  = func FINDVAL(RESBODY, "SecurityStatus")
+  If [L]WAITSTATUS = "TIMEOUT" | [L]WAITSTATUS = "INVALID" | [L]SECSTATUS = "INVALID"
+    ERR=99
+    ERRMSG = func AFNC.MES1(mess(31,2092,1),mess(2,2098,1))  # Timed out or interrupted
+    Return
+  Endif
+
+  [L]RESPSTAT   = func FINDVAL(RESBODY, chr$(10)+"Status")        # Need to preceed with the delimiter here so we don't other Statuses
+  [L]RESPDETAIL = func FINDVAL(RESBODY, "StatusDetail")
+
+  If left$(RESPSTAT,2)="OK"
+    CRDTYP      = func FINDVAL(RESBODY, "CardType")
+    TOKEN       = func FINDVAL(RESBODY, "Token")
+    ACCL4D      = func FINDVAL(RESBODY, "Last4Digits")
+    TMPDAT      = func FINDVAL(RESBODY, "ExpiryDate")
+
+    #Strip the { } off of the TOKEN
+    [L]TOKEN = left$([L]TOKEN, len([L]TOKEN)-1)
+    [L]TOKEN = right$([L]TOKEN, 2)
+
+    # Translate the card type to the misc table like SE
+    CRDTYP = func GET_CRDTYP(CRDTYP)
+
+    # Get the date of the last day of the Exp month
+    If len(TMPDAT)=4
+      EXPDAT = eomonth(evalue("[1/"+num$(val(left$(TMPDAT,2)))+"/"+num$(2000+val(right$(TMPDAT,3)))+"]"))
+    Endif
+
+    [F:SEB]VLTGUID  = [L]TOKEN
+    [F:SEB]CRDTYP   = [L]CRDTYP
+    [F:SEB]VLTID    = [L]TXNID
+    [F:SEB]EXPDAT   = [L]EXPDAT
+    [F:SEB]ACCL4D   = [L]ACCL4D
+  Endif
+
+  If RESPSTAT<>"OK" & ERRMSG=""
+    ERR=99
+    ERRMSG = func AFNC.MES1(mess(31,2092,1),mess(2,2098,1))  # Timed out or interrupted
+  Endif
+
+  If [L]TOKEN="" : ERR=1 : ERRMSG = mess(28,2092,1) : Return : Endif
+
+Return
+
+####################################################################################################
+# REMOVETOKEN
+####################################################################################################
+Subprog TOKEN_DEL(ERR,ERRMSG)
+  Variable Char    RESP
+  Variable Integer ERR
+  Variable Char    ERRMSG
+
+  Local Char RESPSTAT(15), RESPDETAIL(255)
+  Local Char TXNTYP(15)
+
+  TXNTYP="REMOVETOKEN"
+  Gosub SEND_TXN
+
+End
+
+#---------------------------------------------------------------------------------------------------
+$TOKEN_DELETE   # Called from SEND_TXN
+  Local Char VAULTGUID(50)
+
+  If dim([F:SEB]VLTGUID)>0 : [L]VAULTGUID = [F:SEB]VLTGUID : Endif
+
+  # Build ARGUMENTS
+  Gosub COMMON_ARGS_APPLICATION
+  Call APPEND_ARGS(ARGUMENTS, 'TOKEN', [L]VAULTGUID)
+
+  Call SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+
+  RESPSTAT    = func FINDVAL(RESBODY, "Status")
+  RESPDETAIL  = func FINDVAL(RESBODY, "StatusDetail")
+
+  If RESPSTAT <> "OK"
+    ERR=1
+    ERRMSG=RESPDETAIL
+  Endif
+
+Return
+
+####################################################################################################
+# DEFERRED
+####################################################################################################
+Subprog DEFERRED(TXNID,VPSTXID,SPSTATUS,SPSECKEY,ERR,ERRMSG)
+  Variable Char     TXNID
+  Variable Char     VPSTXID
+  Variable Char     SPSTATUS
+  Variable Char     SPSECKEY
+  Variable Integer  ERR
+  Variable Char     ERRMSG
+
+  Local Char RESPSTAT(15), RESPDETAIL(255)
+  Local Char TXNTYP(15)
+
+  # Request the authentication
+  TXNTYP="DEFERRED"
+  Gosub SEND_TXN
+  If ERR : End : Endif
+
+  # Verify that the process is complete
+  TXNTYP="DEFERRED_VERIFY"
+  Gosub SEND_TXN
+  If ERR : End : Endif
+
+End
+
+#---------------------------------------------------------------------------------------------------
+$DEF_REQUEST   # Called from SEND_TXN
+  Local Integer USEBILL
+  Local Char TMP(255)
+  Local Char NEXTURL(255)
+  Local Char PROTO(5), FIL(250)
+
+  If !clalev([F:BPA])  : Local File BPADDRESS   [BPA]  : Endif
+
+  Gosub GET_SEB
+  If ERR : Return : Endif
+
+  Gosub GET_DELADD
+
+  # Build ARGUMENTS
+  Gosub COMMON_ARGS_APPLICATION
+  Call APPEND_ARGS(ARGUMENTS, 'VendorTxCode',       [L]TXNID)
+  [L]TMP = func SEPPXML.FORMATCURR([F:SEU]AUTAMT)
+
+  # X3-54611 BODEL .sn
+  # X3 does not operate as an ecommerce solution.
+  # Only AccountType "M" is supported.
+  # If no AccountType is passed then "E" defaults.
+  #
+  # Sage Pay protocol:
+  #   AccountType E = E-commerce
+  #   AccountType M = Mail Order / Telephone Order
+  #   AccountType C = Use the continous authority merchant account (if present)
+  Call APPEND_ARGS(ARGUMENTS, 'AccountType',        "M")
+  # X3-54611 BODEL .en
+
+  Call APPEND_ARGS(ARGUMENTS, 'Amount',             vireblc([L]TMP,4))
+  Call APPEND_ARGS(ARGUMENTS, 'Currency',           [F:SEU]CUR)
+  Call APPEND_ARGS(ARGUMENTS, 'Description',        [F:SEU]VCRNUM)
+  Call APPEND_ARGS(ARGUMENTS, 'Token',              [F:SEB]VLTGUID)
+  Call APPEND_ARGS(ARGUMENTS, 'BillingSurname',     [F:SEB]LSTNAM)
+  Call APPEND_ARGS(ARGUMENTS, 'BillingFirstnames',  [F:SEB]FSTNAM)
+  Call APPEND_ARGS(ARGUMENTS, 'BillingAddress1',    [F:SEB]ADDLIG(0))
+  Call APPEND_ARGS(ARGUMENTS, 'BillingAddress2',    [F:SEB]ADDLIG(1))
+  Call APPEND_ARGS(ARGUMENTS, 'BillingCity',        [F:SEB]CTY)
+  Call APPEND_ARGS(ARGUMENTS, 'BillingPostCode',    [F:SEB]POSCOD)
+  Call APPEND_ARGS(ARGUMENTS, 'BillingCountry',     [F:SEB]CRY)
+  If [F:SEB]CRY = "US" : Call APPEND_ARGS(ARGUMENTS, 'BillingState', [F:SEB]SAT) : Endif #MJH 118685.n 9/26/2016
+  Call APPEND_ARGS(ARGUMENTS, 'DeliverySurname',    [F:SEB]LSTNAM)
+  Call APPEND_ARGS(ARGUMENTS, 'DeliveryFirstnames', [F:SEB]FSTNAM)
+  If USEBILL
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryAddress1', [F:SEB]ADDLIG(0))
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryAddress2', [F:SEB]ADDLIG(1))
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryCity',     [F:SEB]CTY)
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryPostCode', [F:SEB]POSCOD)
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryCountry',  [F:SEB]CRY)
+    If [F:SEB]CRY = "US" : Call APPEND_ARGS(ARGUMENTS, 'DeliveryState', [F:SEB]SAT) : Endif #MJH 118685.n 9/26/2016
+  Else
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryAddress1', [F:BPA]BPAADDLIG(0))
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryAddress2', [F:BPA]BPAADDLIG(1))
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryCity',     [F:BPA]CTY)
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryPostCode', [F:BPA]POSCOD)
+    Call APPEND_ARGS(ARGUMENTS, 'DeliveryCountry',  [F:BPA]CRY)
+    If [F:BPA]CRY = "US" : Call APPEND_ARGS(ARGUMENTS, 'DeliveryState', [F:BPA]SAT) : Endif #MJH 118685.n 9/26/2016
+  Endif
+  Call APPEND_ARGS(ARGUMENTS, 'CustomerEmail',      [F:SEB]EMAIL)
+  #Call APPEND_ARGS(ARGUMENTS, 'ApplyAVSCV2',        '2')  # Force no AVS/CV2 checks
+  #Call APPEND_ARGS(ARGUMENTS, 'Apply3DSecure',      '2')  # Force no 3D Secure checks
+  Call APPEND_ARGS(ARGUMENTS, 'Profile',            'NORMAL')
+  Call APPEND_ARGS(ARGUMENTS, 'CreateToken',        '0')  # We already created a token, don't do it again
+  Call APPEND_ARGS(ARGUMENTS, 'StoreToken',         '1') # Always store the token for this call
+  [L]TMP = func GET_LANID()
+  Call APPEND_ARGS(ARGUMENTS, 'Language',           [L]TMP)
+
+  Call SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+  If ERR : Return : Endif
+
+  #Initial response to TOKEN create request
+  RESPSTAT    = func FINDVAL(RESBODY, "Status")
+  RESPDETAIL  = func FINDVAL(RESBODY, "StatusDetail")
+  VPSTXID     = func FINDVAL(RESBODY, "VPSTxId")
+  NEXTURL     = func FINDVAL(RESBODY, "NextURL")
+  SPSECKEY    = func FINDVAL(RESBODY, "SecurityKey")
+
+  If left$(RESPSTAT,2)<>"OK"
+    ERR=1
+    ERRMSG=RESPDETAIL
+    Return
+  Endif
+
+  #Strip the { } off of the VPSTxId
+  [L]VPSTXID = left$([L]VPSTXID, len([L]VPSTXID)-1)
+  [L]VPSTXID = right$([L]VPSTXID, 2)
+
+  Call BREAK_URL(NEXTURL, PROTO, FIL)
+
+  # Open Sage Pay window in browser.
+  Callui RETOUR="" With "UIAction="    + chr$(1) + "OpenFile"
+&                      ,"UILocalDir="  + chr$(1) + PROTO
+&                      ,"UILocalFile=" + chr$(1) + FIL
+
+Return
+
+#---------------------------------------------------------------------------------------------------
+$DEF_VERIFY   # Called from SEND_TXN
+  Local Char CRDTYP(15), TOKEN(38), ACCL4D(4), TMPDAT(4)
+  Local Date EXPDAT
+  Local Integer ISLP,SLP_TIME,MAX_WAIT
+  Local Char WAITSTATUS, SECSTATUS
+
+  Gosub INIT_SEP
+
+  # Build ARGUMENTS
+  Raz ARGUMENTS
+  Append ARGUMENTS, '"' + [L]VPSTXID + '"'
+
+  SLP_TIME = 5  # sleep for 5 seconds at a time
+  MAX_WAIT = [F:SEP]POLL/SLP_TIME
+
+  Onintgo END_SPS_QUERY
+  For ISLP=1 To MAX_WAIT
+    Sleep SLP_TIME
+    Call SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+    [L]WAITSTATUS = func FINDVAL(RESBODY, "WaitStatus")
+    If [L]WAITSTATUS<>"WAIT" : Break : Endif
+  Next
+  Onintgo
+
+  [L]SECSTATUS = func FINDVAL(RESBODY, "SecurityStatus")
+  If [L]WAITSTATUS = "WAIT" | [L]WAITSTATUS = "TIMEOUT" | [L]WAITSTATUS = "INVALID" | [L]SECSTATUS = "INVALID"
+    ERR=99
+    ERRMSG = func AFNC.MES1(mess(31,2092,1),"Sage Pay")  # Timed out or interrupted
+    Return
+  Endif
+
+  [L]RESPSTAT   = func FINDVAL(RESBODY, chr$(10)+"Status")        # Need to preceed with the delimiter here so we don't other Statuses
+  [L]RESPDETAIL = func FINDVAL(RESBODY, "StatusDetail")
+
+  SPSTATUS = [L]RESPSTAT
+
+Return
+
+####################################################################################################
+# RELEASE
+####################################################################################################
+Subprog RELEASE(TXNID,SPSTATUS,ERR,ERRMSG)
+  Variable Char    TXNID
+  Variable Char    SPSTATUS
+  Variable Integer ERR
+  Variable Char    ERRMSG
+
+  Local Char RESPSTAT(15), RESPDETAIL(255)
+  Local Char TXNTYP(15)
+
+  TXNID = [F:SEU]TXNID # Do not get a new TXNID here
+  TXNTYP="RELEASE"
+  Gosub SEND_TXN
+
+End
+
+#---------------------------------------------------------------------------------------------------
+$RELEASE_REQUEST   # Called from SEND_TXN
+  Local Char TMP(255)
+
+  # Build ARGUMENTS
+  Gosub COMMON_ARGS_APPLICATION
+  Call APPEND_ARGS(ARGUMENTS, 'VendorTxCode',   [F:SEU]TXNID)
+  Call APPEND_ARGS(ARGUMENTS, 'VPSTxID',        [F:SEU]VPSTXID)
+  Call APPEND_ARGS(ARGUMENTS, 'SecurityKey',    [F:SEU]SPSECKEY)
+  Call APPEND_ARGS(ARGUMENTS, 'TxAuthNo',       [F:SEU]AUTID)
+  [L]TMP = func SEPPXML.FORMATCURR([F:SEU]AUTAMT)
+  Call APPEND_ARGS(ARGUMENTS, 'ReleaseAmount',  vireblc([L]TMP,4))
+
+  Call SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+
+  [L]RESPSTAT   = func FINDVAL(RESBODY, chr$(10)+"Status")        # Need to preceed with the delimiter here so we don't other Statuses
+  [L]RESPDETAIL = func FINDVAL(RESBODY, "StatusDetail")
+
+  SPSTATUS = [L]RESPSTAT
+  If left$(RESPSTAT,2)<>"OK"
+    ERR=1
+    ERRMSG=RESPDETAIL
+  Endif
+
+Return
+
+####################################################################################################
+# ABORT
+####################################################################################################
+Subprog ABORT(TXNID,SPSTATUS,ERR,ERRMSG)
+  Variable Char    TXNID
+  Variable Char    SPSTATUS
+  Variable Integer ERR
+  Variable Char    ERRMSG
+
+  Local Char RESPSTAT(15), RESPDETAIL(255)
+  Local Char TXNTYP(15)
+
+  TXNTYP="ABORT"
+  Gosub SEND_TXN
+
+End
+
+#---------------------------------------------------------------------------------------------------
+$ABORT_REQUEST   # Called from SEND_TXN
+  Local Char TMP(255)
+
+  # Build ARGUMENTS
+  Gosub COMMON_ARGS_APPLICATION
+  Call APPEND_ARGS(ARGUMENTS, 'VendorTxCode',   [F:SEU]TXNID)
+  Call APPEND_ARGS(ARGUMENTS, 'VPSTxID',        [F:SEU]VPSTXID)
+  Call APPEND_ARGS(ARGUMENTS, 'SecurityKey',    [F:SEU]SPSECKEY)
+  Call APPEND_ARGS(ARGUMENTS, 'TxAuthNo',       [F:SEU]AUTID)
+
+  Call SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+
+  [L]RESPSTAT   = func FINDVAL(RESBODY, chr$(10)+"Status")        # Need to preceed with the delimiter here so we don't other Statuses
+  [L]RESPDETAIL = func FINDVAL(RESBODY, "StatusDetail")
+
+  SPSTATUS = [L]RESPSTAT
+  If left$(RESPSTAT,2)<>"OK"
+    ERR=1
+    ERRMSG=RESPDETAIL
+  Endif
+
+Return
+
+####################################################################################################
+# Refund
+####################################################################################################
+Subprog REFUND(TXNID,SPSTATUS,ERR,ERRMSG)
+  Variable Char    TXNID
+  Variable Char    SPSTATUS
+  Variable Integer ERR
+  Variable Char    ERRMSG
+
+  Local Char RESPSTAT(15), RESPDETAIL(255)
+  Local Char TXNTYP(15)
+
+  If [F:SEU]ORIGVPSTXID=""
+    ERR=1
+    ERRMSG = func AFNC.MES1(mess(56,2092,1),mess(2,2098,1))
+  Endif
+
+  TXNTYP="REFUND"
+  Gosub SEND_TXN
+
+End
+
+#---------------------------------------------------------------------------------------------------
+$REFUND_REQUEST   # Called from SEND_TXN
+  Local Char TMP(255)
+
+  # Build ARGUMENTS
+  Gosub COMMON_ARGS_APPLICATION
+  Call APPEND_ARGS(ARGUMENTS, 'VendorTxCode',         [L]TXNID)
+  [L]TMP = func SEPPXML.FORMATCURR([F:SEU]AUTAMT)
+  Call APPEND_ARGS(ARGUMENTS, 'Amount',               vireblc([L]TMP,4))
+  Call APPEND_ARGS(ARGUMENTS, 'Currency',             [F:SEU]CUR)
+  Call APPEND_ARGS(ARGUMENTS, 'Description',          [F:SEU]VCRNUM)
+  Call APPEND_ARGS(ARGUMENTS, 'RelatedVPSTxID',       [F:SEU]ORIGVPSTXID)
+  Call APPEND_ARGS(ARGUMENTS, 'RelatedVendorTxCode',  [F:SEU]ORIGTXNID)
+  Call APPEND_ARGS(ARGUMENTS, 'RelatedSecurityKey',   [F:SEU]SPSECKEY)
+  Call APPEND_ARGS(ARGUMENTS, 'RelatedTxAuthNo',      [F:SEU]ORIGAUTID)
+
+  Call SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+
+  [L]RESPSTAT   = func FINDVAL(RESBODY, chr$(10)+"Status")        # Need to preceed with the delimiter here so we don't other Statuses
+  [L]RESPDETAIL = func FINDVAL(RESBODY, "StatusDetail")
+
+  SPSTATUS = [L]RESPSTAT
+
+Return
+
+####################################################################################################
+$SEND_TXN
+
+  If !clalev([F:SER])  : Local File SEPRC       [SER]  : Endif
+  If !clalev([F:SEX])  : Local File SETXN       [SEX]  : Endif
+
+  If !clalev([M:SEX1]) : Local Mask SETXN       [SEX1] : Endif
+
+  If dim([L]PRCCOD)<=0 : Local Char PRCCOD(10) : Endif
+  If [L]PRCCOD=""
+    If dim([F:SEU]PRCCOD)>0 & [F:SEU]PRCCOD<>""
+      PRCCOD = [F:SEU]PRCCOD
+    Elsif dim([F:SEB]PRCCOD)>0 & [F:SEB]PRCCOD<>""
+      PRCCOD = [F:SEB]PRCCOD
+    Endif
+  Endif
+  # Don't call GET_SER if we already have the right record loaded
+  If [L]PRCCOD<>"" & [F:SER]PRCCOD<>[L]PRCCOD #MJH 118601.n
+    Call GET_SER([L]PRCCOD) From SEPPLIB
+    If fstat : ERR=1 : Return : Endif
+  Endif
+
+  If dim([L]TXNID)<=0 : Local Char TXNID(30) : Endif
+
+  If [L]TXNID=""
+    [L]TXNID = uuid$  # get new UUID for transaction
+  Endif
+
+  Local Clbfile ARGUMENTS(0)
+  Local Clbfile RESHEAD(0)
+  Local Clbfile RESBODY(6)
+
+  Case TXNTYP
+    When "TOKEN"            : Gosub TOKEN_CREATE
+    When "TOKEN_VERIFY"     : Gosub TOKEN_VERIFY
+    When "REMOVETOKEN"      : Gosub TOKEN_DELETE
+    When "DEFERRED"         : Gosub DEF_REQUEST
+    When "DEFERRED_VERIFY"  : Gosub DEF_VERIFY
+    When "RELEASE"          : Gosub RELEASE_REQUEST
+    When "ABORT"            : Gosub ABORT_REQUEST
+    When "REFUND"           : Gosub REFUND_REQUEST
+    When Default
+      ERRMSG = "transaction not supported"
+      ERR = 1 : Return
+  Endcase
+  If ERR : Return : Endif
+
+  Call TXNLOG(RESBODY,TXNTYP,TXNID,RESPSTAT,RESPDETAIL,1,ERR,ERRMSG)
+  If ERR : Return : Endif
+
+  Call TXNLOG(RESBODY,TXNTYP,TXNID,RESPSTAT,RESPDETAIL,2,ERR,ERRMSG)
+  If ERR : Return : Endif
+
+  # Save SP transaction
+  Call SAVE_TXN(ERR)
+
+Return
+
+####################################################################################################
+$COMMON_ARGS_APPLICATION
+
+  Raz ARGUMENTS
+  Append ARGUMENTS, '{'
+  Call APPEND_ARGS(ARGUMENTS, 'VPSProtocol', '3.00')
+  Call APPEND_ARGS(ARGUMENTS, 'TxType', [L]TXNTYP)
+  Call APPEND_ARGS(ARGUMENTS, 'Vendor', [F:SER]VENDID)
+
+Return
+
+####################################################################################################
+$INIT_SEP
+
+If !clalev([F:SEP])  : Local File SEPAR       [SEP]  : Endif  # Sage Exchange Parameters
+Call GET_SEP() From SEPPLIB
+If fstat : ERR=1 : End : Endif
+
+Return
+
+####################################################################################################
+Funprog GET_LANID()
+  Case GLANGUE
+    When "ENG" : End "en"
+    When "FRA" : End "fr"
+    When "SPA" : End "es"
+    When "GER" : End "de"
+  Endcase
+End "en"
+
+####################################################################################################
+$GET_SEB
+
+  If [F:SEU]VCRNUM=""
+    ERRMSG = mess(23,100,1)-"SEU"
+    ERR = 1 : Return
+  Endif
+
+  Call GET_SEB([F:SEU]BPCNUM,[F:SEU]ACCNCKNAM) From SEPPLIB
+  If fstat : ERR=1 : Return : Endif
+  If [F:SEB]VLTGUID=""
+    ERRMSG = mess(14,2092,1)-[F:SEB]BPCNUM-[F:SEB]ACCNCKNAM
+    ERR = 1 : Return
+  Endif
+
+Return
+
+####################################################################################################
+$GET_DELADD
+  Local Char ADDID(5)
+
+  # Get the address name from the document
+  Case [F:SEU]VCRTYP
+    When 2  # Order
+      If !clalev([F:SOH])  : Local File SORDER      [SOH]  : Endif
+
+      Read [SOH]SOH0=[F:SEU]VCRNUM
+      If fstat : USEBILL=1 : Return : Endif
+
+      ADDID = [F:SOH]BPAADD
+    When 4  # Shipment
+      If !clalev([F:SDH])  : Local File SDELIVERY   [SDH]  : Endif
+
+      Read [SDH]SDH0=[F:SEU]VCRNUM
+      If fstat : USEBILL=1 : Return : Endif
+
+      ADDID = [F:SDH]BPAADD
+    When 5,18,40,41  # Sales or Customer - Invoice or Credit
+      If !clalev([F:SIV])  : Local File SINVOICEV   [SIV]  : Endif
+
+      Read [SIV]SIV0=[F:SEU]VCRNUM
+      If fstat : USEBILL=1 : Return : Endif
+
+      ADDID = [F:SIV]BPAADD
+  Endcase
+
+  #If we did not find an address, just use the billing address
+  If ADDID="" : USEBILL=1 : Return : Endif
+
+  Filter [BPA] Where BPAADD=[L]ADDID & BPANUM=[F:SEB]BPCNUM
+  Read [BPA] First
+  Filter [BPA]
+  If fstat : USEBILL=1 : Return : Endif
+
+Return
+
+####################################################################################################
+Funprog GET_CRDTYP(CRDTYP)
+  Value Char CRDTYP
+  Case CRDTYP
+    When "AMEX"             : End "3"
+    When "VISA", "UKE"      : End "4"
+    When "MC"               : End "5"
+    When "DC"               : End "6"
+    When "DELTA", "MCDEBIT" : End "7"
+    When "MAESTRO"          : End "8"
+  Endcase
+End "8"
+
+####################################################################################################
+Subprog APPEND_ARGS(ARGUMENTS, ARGNAME, ARGVALUE)
+  Variable  Clbfile ARGUMENTS
+  Value     Char    ARGNAME, ARGVALUE
+
+  Append ARGUMENTS, '"' + ARGNAME + '":"' + ARGVALUE + '",'
+
+End
+
+####################################################################################################
+Funprog FINDVAL(RESP,PARAM)
+  Value    Clbfile  RESP
+  Value    Char     PARAM
+
+  Local Integer LOC1, LOC2
+  Local Char    RESPVAL
+
+  LOC1 = instr(1,RESP, PARAM + '=')
+  If !LOC1 : End "" : Endif
+  LOC1 += len(PARAM)+1
+
+  #Does the response contain CRLF or & between items?
+  LOC2 = instr(1,RESP,chr$(13))
+  If LOC2>0
+    LOC2 = instr(LOC1,RESP,chr$(13))-1
+    If LOC2<=0 : LOC2=len(RESP) : Endif
+  Else
+    LOC2 = instr(LOC1,RESP,"&")-1
+    If LOC2<=0 : LOC2=len(RESP) : Endif
+  Endif
+
+End seg$(RESP,LOC1,LOC2)
+
+####################################################################################################
+Subprog BREAK_URL(NEXTURL, PROTO, FIL)
+  Value    Char NEXTURL
+  Variable Char PROTO
+  Variable Char FIL
+
+  PROTO = toupper(left$(NEXTURL, instr(1,NEXTURL,'://')-1))
+  FIL = right$(NEXTURL, instr(1,NEXTURL,'://')+3)
+
+End
+
+####################################################################################################
+Subprog SEND_REQUEST(TXNTYP,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG)
+  Value     Char    TXNTYP
+  Value     Clbfile ARGUMENTS
+  Variable  Clbfile RESHEAD
+  Variable  Clbfile RESBODY
+  Variable  Integer ERR
+  Variable  Char    ERRMSG
+
+  Local Integer STATUSCODE
+  Local Char    MODULE(100)   : MODULE = 'bundles/sage-pay'
+  Local Char    FUNCTION(40)
+  Local Char    MODE(10)      : MODE   = 'wait'
+  Local Char    ENCODINGS(40)
+  Local Integer CALLBACKINDEX
+  Local Char    RETURNS(50)
+  Local Char    RETURNS_ENC(3)
+  Local Integer I
+  Local Char    URL(255)
+
+  Gosub INIT_SEP
+
+  #All of the VERIFY calls are to the Syracuse server only, no URL to add to parameters
+  If len([L]TXNTYP)<=5 | right$([L]TXNTYP,len([L]TXNTYP)-5) <> "VERIFY"
+    #First - finish off the ARGUMENTS JSON
+    I = len(ARGUMENTS)
+    If I>0 : ARGUMENTS = left$(ARGUMENTS,I-1) + "}" : Endif
+
+    # Add the request URL onto the parameters
+    Case [F:SEP]USEPRDURL
+      When 2        : URL = "https://live.sagepay.com/gateway/service/"  #LIVE
+      When Default  : URL = "https://test.sagepay.com/gateway/service/"  #Default to TEST
+    Endcase
+
+    # Get the proper URL and the corresponding function
+    Case [L]TXNTYP
+      When "DEFERRED"
+        URL       = URL+"vspserver-register.vsp"
+        FUNCTION  = "createPaymentRequest"
+      When "RELEASE"
+        URL       = URL+"release.vsp"
+        FUNCTION  = "createReleaseRequest"
+      When "ABORT"
+        URL       = URL+"abort.vsp"
+        FUNCTION  = "createAbortRequest"
+      When "REFUND"
+        URL       = URL+"refund.vsp"
+        FUNCTION  = "createRefundRequest"
+      When "TOKEN"
+        URL       = URL+"token.vsp"
+        FUNCTION  = "createTokenRequest"
+      When "REMOVETOKEN"
+        URL       = URL+"removetoken.vsp"
+        FUNCTION  = "removeTokenRequest"
+      When Default
+        ERR = 1
+        ERRMSG = "Send Request : transaction not supported"
+        End
+    Endcase
+    Append ARGUMENTS, ', {"url":"'+[L]URL+'"}'
+  Else
+    FUNCTION  = "getSPSResponse"
+  Endif
+
+  STATUSCODE = func ASYRWEBSER.EXEC_JS(MODULE,FUNCTION,MODE,ARGUMENTS,ENCODINGS,CALLBACKINDEX,RETURNS,RETURNS_ENC,RESHEAD,RESBODY)
+  If STATUSCODE<>200
+    ERR = 1
+    ERRMSG = FUNCTION+":"-num$(STATUSCODE)
+  Endif
+  RESBODY=unescJson(RESBODY) # 118578.n - Add call to clean up JSON response and remove ESC characters
+
+End
+
+####################################################################################################
+Subprog TXNLOG(RESBODY,TXNTYP,TXNID,RESPSTAT,RESPDETAIL,REQRSP,ERR,ERRMSG)
+  Value    Clbfile RESBODY
+  Value    Char    TXNTYP
+  Value    Char    TXNID
+  Value    Char    RESPSTAT
+  Value    Char    RESPDETAIL
+  Value    Integer REQRSP
+  Variable Char    ERRMSG
+  Variable Integer ERR
+
+  # Prevent going over dimension on screen
+  If dim([M:SEX1]TXNID)=[M:SEX1]NBLIG+1 : End : Endif
+
+  Local Integer I : I = [M:SEX1]NBLIG
+  Local Char    TMP(20)
+
+  [M:SEX1]PAYPRC(I)       = 2 # Sage Pay
+  [M:SEX1]REQRSP(I)       = [L]REQRSP
+  [M:SEX1]TXNID(I)        = [L]TXNID
+  If [M:SEX1]TXNID(I)     = ""  # if we still don't have a transaction ID, just create one
+    [M:SEX1]TXNID(I)      = uuid$
+  Endif
+  [M:SEX1]SPTXNID(I)      = func FINDVAL(RESBODY,"VPSTxId")
+  [M:SEX1]SPSECKEY(I)     = func FINDVAL(RESBODY,"SecurityKey")
+  [M:SEX1]SPTXNTYP(I)     = [L]TXNTYP
+  #X3-69153.sn
+  #Issue with [M:SEX1]TXNDATTIM date being set to MM/DD/YY for US and DD/MM/YY for UK
+  #Ensure format to always be MM/DD/YY
+  #[M:SEX1]TXNDATTIM(I)    = format$("DD2",date$)-time$
+  [M:SEX1]TXNDATTIM(I)    = format$("D:MM[/]DD[/]YY",date$)-time$
+  #X3-69153.en
+  [M:SEX1]RESP(I)         = [L]RESPSTAT
+  [M:SEX1]RSPMSG(I)       = [L]RESPDETAIL
+  [M:SEX1]RSPCOD(I)       = func FINDVAL(RESBODY,"TxAuthNo")
+  [M:SEX1]AVSCV2RESP(I)   = func FINDVAL(RESBODY,"AVSCV2")
+  [M:SEX1]AVS(I)          = func FINDVAL(RESBODY,"AddressResult")
+  [M:SEX1]POSTCODERESP(I) = func FINDVAL(RESBODY,"PostCodeResult")
+  [M:SEX1]CVV(I)          = func FINDVAL(RESBODY,"CV2Result")
+  [L]TMP                  = func FINDVAL(RESBODY,"CardType")
+  [M:SEX1]CRDTYP(I)       = func GET_CRDTYP([L]TMP)
+  [M:SEX1]DECLINECODE(I)  = func FINDVAL(RESBODY,"DeclineCode")
+  [M:SEX1]EXPDAT(I)       = func FINDVAL(RESBODY,"ExpiryDate")
+  [M:SEX1]VANREF(I)       = func FINDVAL(RESBODY,"BankAuthCode")
+  [M:SEX1]GUID(I)         = func FINDVAL(RESBODY,"Token")
+  [M:SEX1]AMT(I)          = [F:SEU]AUTAMT
+  [M:SEX1]CREUSR(I)       = GUSER
+
+  # Fill in missing fields with SEU
+  If dim([F:SEU]VCRNUM)>0 & [F:SEU]VCRNUM<>""
+    If [M:SEX1]BPCNUM(I)=""  : [M:SEX1]BPCNUM(I)  = [F:SEU]BPCNUM    : Endif
+    If [M:SEX1]REF1(I)=""    : [M:SEX1]REF1(I)    = func SEPPLIB.GET_SEUDOC([F:SEU]VCRTYPORI) : Endif
+    If [M:SEX1]REF2(I)=""    : [M:SEX1]REF2(I)    = [F:SEU]VCRNUM    : Endif
+    If [M:SEX1]PAYDES(I)=""  : [M:SEX1]PAYDES(I)  = [F:SEU]ACCL4D    : Endif
+    If [M:SEX1]CRDTYP(I)=""  : [M:SEX1]CRDTYP(I)  = [F:SEU]CRDTYP    : Endif
+    If [M:SEX1]EXPDAT(I)=""  : [M:SEX1]EXPDAT(I)  = format$("D:MMYY",[F:SEU]EXPDAT) : Endif
+  Endif
+
+  # Fill in missing fields with SEB
+  If dim([F:SEB]BPCNUM)>0 & [F:SEB]BPCNUM<>""
+    If [M:SEX1]BPCNUM(I)=""  : [M:SEX1]BPCNUM(I)  = [F:SEB]BPCNUM    : Endif
+    If [M:SEX1]ACCNAM(I)=""  : [M:SEX1]ACCNAM(I)  = [F:SEB]ACCNAM    : Endif
+    If [M:SEX1]ADDLIG0(I)="" : [M:SEX1]ADDLIG0(I) = [F:SEB]ADDLIG(0) : Endif
+    If [M:SEX1]ADDLIG1(I)="" : [M:SEX1]ADDLIG1(I) = [F:SEB]ADDLIG(1) : Endif
+    If [M:SEX1]CTY(I)=""     : [M:SEX1]CTY(I)     = [F:SEB]CTY       : Endif
+    If [M:SEX1]SAT(I)=""     : [M:SEX1]SAT(I)     = [F:SEB]SAT       : Endif
+    If [M:SEX1]POSCOD(I)=""  : [M:SEX1]POSCOD(I)  = [F:SEB]POSCOD    : Endif
+    If [M:SEX1]CRY(I)=""     : [M:SEX1]CRY(I)     = [F:SEB]CRY       : Endif
+    If [M:SEX1]PAYDES(I)=""  : [M:SEX1]PAYDES(I)  = [F:SEB]ACCL4D    : Endif
+    If [M:SEX1]CRDTYP(I)=""  : [M:SEX1]CRDTYP(I)  = [F:SEB]CRDTYP    : Endif
+    If [M:SEX1]EXPDAT(I)=""  : [M:SEX1]EXPDAT(I)  = format$("D:MMYY",[F:SEB]EXPDAT) : Endif
+  Endif
+
+  If [L]ERRMSG="" & left$([M:SEX1]RESP(I),2)<>"OK"
+    [L]ERRMSG = [M:SEX1]RSPMSG(I)
+  Endif
+
+  [M:SEX1]NBLIG += 1
+
+  # Set variable indicating there is screen data to be saved to the db
+  [M:SEX1]TOSAVE = 2
+
+End
+
+
+####################################################################################
+# Save the transaction
+####################################################################################
+Subprog SAVE_TXN(ERR)
+  Variable Integer ERR
+
+  # Skip if txn was already saved
+  If [M:SEX1]TOSAVE<>2 : End : Endif
+
+  WTRBEGIN = adxlog
+  If !WTRBEGIN : Trbegin [SEX] : Endif
+
+  # read from work screen and save to table
+  For I=0 To [M:SEX1]NBLIG-1
+    If [M:SEX1]TXNID(I)="" : I-=1 : Break : Endif
+
+    Look [SEX]SEX0=[M:SEX1]TXNDATTIM(I);[M:SEX1]REQRSP(I);[M:SEX1]TXNID(I)
+    If fstat
+      Raz [F:SEX]
+      [F:SEX]PAYPRC       = [M:SEX1]PAYPRC(I)
+      [F:SEX]REQRSP       = [M:SEX1]REQRSP(I)
+      [F:SEX]TXNID        = [M:SEX1]TXNID(I)
+      [F:SEX]SPTXNID      = [M:SEX1]SPTXNID(I)
+      [F:SEX]SPSECKEY     = [M:SEX1]SPSECKEY(I)
+      [F:SEX]SPTXNTYP     = [M:SEX1]SPTXNTYP(I)
+      [F:SEX]TXNDATTIM    = [M:SEX1]TXNDATTIM(I)
+      [F:SEX]RESP         = [M:SEX1]RESP(I)
+      [F:SEX]RSPMSG       = [M:SEX1]RSPMSG(I)
+      [F:SEX]RSPCOD       = [M:SEX1]RSPCOD(I)
+      [F:SEX]AVSCV2RESP   = [M:SEX1]AVSCV2RESP(I)
+      [F:SEX]AVS          = [M:SEX1]AVS(I)
+      [F:SEX]POSTCODERESP = [M:SEX1]POSTCODERESP(I)
+      [F:SEX]CVV          = [M:SEX1]CVV(I)
+      [F:SEX]CRDTYP       = [M:SEX1]CRDTYP(I)
+      [F:SEX]DECLINECODE  = [M:SEX1]DECLINECODE(I)
+      [F:SEX]EXPDAT       = [M:SEX1]EXPDAT(I)
+      [F:SEX]VANREF       = [M:SEX1]VANREF(I)
+      [F:SEX]GUID         = [M:SEX1]GUID(I)
+      [F:SEX]AMT          = [M:SEX1]AMT(I)
+      [F:SEX]CREUSR       = [M:SEX1]CREUSR(I)
+      [F:SEX]BPCNUM       = [M:SEX1]BPCNUM(I)
+      [F:SEX]REF1         = [M:SEX1]REF1(I)
+      [F:SEX]REF2         = [M:SEX1]REF2(I)
+      [F:SEX]PAYDES       = [M:SEX1]PAYDES(I)
+      [F:SEX]ACCNAM       = [M:SEX1]ACCNAM(I)
+      [F:SEX]ADDLIG(0)    = [M:SEX1]ADDLIG0(I)
+      [F:SEX]ADDLIG(1)    = [M:SEX1]ADDLIG1(I)
+      [F:SEX]CTY          = [M:SEX1]CTY(I)
+      [F:SEX]SAT          = [M:SEX1]SAT(I)
+      [F:SEX]POSCOD       = [M:SEX1]POSCOD(I)
+      [F:SEX]CRY          = [M:SEX1]CRY(I)
+      [F:SEX]TXNDAT       = func SEPPLIB.GET_DATE([M:SEX1]TXNDATTIM(I))
+      Write [SEX]
+      If fstat
+        Call FSTA("SEX") From GLOCK
+        ERR = 1 : Break
+      Endif
+    Endif
+  Next
+  If !WTRBEGIN
+    If ERR
+      Rollback
+    Else
+      # 111808.n - Since the data saved correctly - clear the screen
+      Raz [M:SEX1]
+
+      # Clear variable indicating data has been saved to the db
+      [M:SEX1]TOSAVE = 0
+      Commit
+    Endif
+  Else
+    # 111808.n - Since the data saved correctly - clear the screen
+    #   Unless PostAut - need to keep it longer - will RAZ second pass through here
+    If !ERR & !([F:SEU]POSTAUT=2 & [F:SEU]STAFLG<3) : Raz [M:SEX1] : Endif
+  Endif
+End
+
+$END_SPS_QUERY
+ISLP = MAX_WAIT
+Resume
+

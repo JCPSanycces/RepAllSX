@@ -1,0 +1,404 @@
+#<AdxTL>@(#)9.0.0.0 $Revision$
+#*X3-39795  MWA  Manage ORIGIN and ORICOD fields in GL Entry
+Raz GBIDC1, GBIDC2
+Call OBJET("REL",GBIDC1,GBIDC2) From GOBJET
+End
+
+$ACTION
+Case ACTION
+ When "INIT"     : Gosub INIT
+ When "CONTROLE" : Gosub CONTROLE
+ When "EXEC"     : Gosub EXEC
+Endcase
+Return
+
+$INIT
+Local Char    NUMREL(GLONVCR)
+Local Char    PCEAUTO(10)
+Call PARAM("","GAUSOI",[L]PCEAUTO) From ADOVAL
+If [L]PCEAUTO="" : [L]PCEAUTO="SOI" : Endif
+NUMREL = PARAM(1)
+Case GACTION
+ When "RELVAL" : # Validation relevé
+  Local Integer STAT
+  TIT = mess(63,117,1) : # Validation du relevé
+  TMP = 1
+ When "RELMAJ" : # Mise à jour
+  TIT = mess(71,117,1)+"\"+mess(72,117,1)-[M:REL0]SOINUM
+Endcase
+Return
+
+$CONTROLE
+Lock ="SOI"+NUMREL
+If fstat=1
+ # Modification en cours sur un autre poste
+ GERR = 1 : GMESSAGE = mess(10,100,1)
+ FIN = 1 : Return
+Endif
+Return
+
+$EXEC
+Case GACTION
+ When "RELVAL"
+  Call VALREL([M:REL0]SOINUM,[L]STAT) From VALREL
+  PARAM(2) = num$(STAT)
+ When "RELMAJ"
+  Call DEBTRANS From GLOCK
+  Gosub TR_MAJ From SUBREL
+Endcase
+Return
+
+Subprog VALREL(NUM_REL,STAT)
+Value    Char    NUM_REL()
+Variable Integer STAT
+[L]STAT=1
+
+Read [F:SOI]SOI0=[L]NUM_REL
+If fstat : End : Endif
+
+Gosub DECLARE
+
+## Vérification du "Réglé" du relevé
+Raz [L]REGLE, [L]DIFF_TIERS
+For [F:DUD]DUD2 Where SOINUM=[L]NUM_REL
+ [L]REGLE += ([F:DUD]PAYCUR+[F:DUD]TMPCUR)*[F:DUD]SNS
+ If [F:DUD]BPR<>[F:DUD]BPRPAY
+  [L]DIFF_TIERS = 2
+ Endif
+Next
+Filter [DUD]
+If [F:SOI]AMTCUR-[L]REGLE<=0
+ # Relevé soldé
+ Call AVERTIR(mess(46,121,1),[L]OK) From GESECRAN
+ If [L]OK=1 : End : Endif
+Endif
+
+Call DEBTRANS From GLOCK
+Gosub TR1
+If GOK=1
+ [L]STAT=0
+ # Pièce
+ GERR = 2 : GMESSAGE = mess(46,116,1)-[L]PCETYP-[L]PCENUM
+Endif
+End
+
+$TR1
+Trbegin [SOI] , [DUD]
+ Readlock [F:SOI]SOI0=[L]NUM_REL
+ If fstat=1
+  GOK=-1 : GROLL="$SOI"-[L]NUM_REL : Goto ROLL_TR1
+ Elsif fstat
+  GOK=0 : Call RSTA("SOI",[L]NUM_REL) From GLOCK
+  Goto AB_TR1
+ Endif
+ [F:SOI]TPYPAYCUR = [L]REGLE
+ If [F:SOI]FLGFWD<>2 & ([F:SOI]AMTCUR-[F:SOI]TPYPAYCUR)<0
+  [F:SOI]FLGFWD = 2  :# Relevé à reporter
+ Endif
+ If [F:SOI]AMTCUR>0  :# Relevé débiteur
+  [F:SOI]FLGPAZ = 0
+  Call LECTURE("BPC",[F:SOI]BPR,"") From CONTOBJ
+  If dim([F:BPC]FUPTYP)>0 & [F:BPC]FUPTYP=1
+   [F:SOI]FLGFUP = 1
+  Else
+   [F:SOI]FLGFUP = 2
+  Endif
+ Else                :# Relevé créditeur
+  [F:SOI]FLGFUP = 0
+  Call LECTURE("BPS",[F:SOI]BPR,"") From CONTOBJ
+  Call LECTURE("AUS",GUSER,"") From CONTOBJ
+  # X3-71518 Don't consider Payment hold flag of the supplier
+  #If dim([F:BPS]PAYLOKFLG)>0 & [F:BPS]PAYLOKFLG=2
+  # [F:SOI]FLGPAZ = 1
+  #Else
+  Local Char LLEVPAZ(3)
+  Call PARAMUTIL("NIVBONPAYE",LLEVPAZ,"","") From SUBAUS
+  [F:SOI]FLGPAZ =  min(len(mess(0,510,1)),val(LLEVPAZ))
+  #Endif
+ Endif
+
+ [F:SOI]OD = [L]DIFF_TIERS
+ Rewrite [F:SOI]
+ If fstat
+  GOK=0 : Call FSTA("SOI") From GLOCK : Goto AB_TR1
+ Endif
+
+ ## Génération de la pièce comptable
+ Raz [L]CLE_PCE_AUTO
+ [L]CLE_PCE_AUTO(0) = [L]NUM_REL
+ Raz  [V]GTYPPCE,GNUMPCE
+ # X3-39795 MWA start
+ #Call VALPCE([L]PCEAUTO,[L]CLE_PCE_AUTO,STAT,MESSA) From CPTAUTO
+ Local Char   TZONE(10)(1..10)     : # Table of the zones to be forced (Ex: ORICOD)
+ Local Char   TVAL(30)(1..10)      : # Table of values for zones to be forced
+ TZONE(5)= "ORIGIN" : TVAL(5)= "2"        :#Automatic loading
+ TZONE(6)= "ORICOD" : TVAL(6)= [L]PCEAUTO
+ Call VALPCE3([L]PCEAUTO,[L]CLE_PCE_AUTO,STAT,MESSA,TZONE,TVAL) From CPTAUTO
+ # X3-39795 MWA end
+ If [L]STAT
+  GOK = 0
+  Call ERREUR(MESSA) From GESECRAN
+  Goto AB_TR1
+ Elsif [V]GTYPPCE="" or [V]GNUMPCE=""
+  GOK = 0
+  # Pièce non générée
+  Call ERREUR(mess(35,117,1)) From GESECRAN
+  Goto AB_TR1
+ Endif
+ [L]PCETYP = [V]GTYPPCE
+ [L]PCENUM = [V]GNUMPCE
+
+ Call LECTURE("CPY",[M:HAE0]CPY,"") From CONTOBJ
+ Call SETCUR(1,[M:HAE0]CPY,DEVLOC) From CPTDIV
+
+ ## Création des échéances de relevé
+ For I=0 To [M:HAEW]NB-1
+  If [M:HAEW]LEDTYP(I)=GTYPGEN
+   If [M:HAEW]DEB(I)<>0
+    [L]ECHMNT(I+1) = [M:HAEW]DEB(I)
+   Else
+    [L]ECHMNT(I+1) = [M:HAEW]CDT(I)
+   Endif
+  Endif
+ Next I
+
+ ## Conversion en devise référentiel
+ Call CONVERT_TAB([M:HAE1]CUR,DEVLOC,DEVLOC
+&                ,[M:HAE1]TYPRAT,[M:HAE0]ACCDAT,ECHMNT(1..[M:HAEW]NB)
+&                ,ECHLOC,STAT) From TRTDEV
+ ILIG=0
+ For I=0 To [M:HAEW]NB-1
+  If [M:HAEW]LEDTYP(I)=GTYPGEN
+   Gosub CRE_ECHE
+   ILIG+=1
+   Call KEYDUD("DUD") From MODECHE
+   Call SLDECH("DUD")From MODECHE
+   If dim([F:DUD]CREDAT)>0 : [F:DUD]CREDAT = datesyst : Endif
+   If dim([F:DUD]CREUSR)>0 : [F:DUD]CREUSR = GUSER : Endif
+   Write [F:DUD]
+   If fstat
+    GOK=0 : Call FSTA("DUD") From GLOCK : Break
+   Endif
+   Call HISTOECH("DUD",1,[M:HAE0]ACCDAT)From MODECHE
+  Endif
+ Next I
+ If GOK<1 : Goto AB_TR1 : Endif
+
+ #####################################################################
+ # Problème des relévés comptabilisés pour la gestion  de la déclaration de TVA/encaissements
+ #  => on a maintenant qu'un seul groupe de lettrage : les deux lignes du relévé sont lettrées
+ #     avec les factures au moment de la comptabilisation du relevé.
+ #  Lors du règlement, les deux lignes du relévé + les factures seront lettrées avec la pièce de règlement
+ #  Si le relevé comporte plusieurs factures de tiers différents il faut lettrer par tiers...
+ #   Suggestion 3149, Tiers payeur=Tiers Facturé ?
+ #    PP La suggestion 3149 est incompatible avec la demande précédente => cette suggestion tombe...
+ Local Integer I, JK
+ Local Char TIERS(20)
+
+ Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]LEDTYP(indice),[M:HAEW]ACC(indice), [M:HAEW]BPR(indice)
+
+ J = -1
+ For I=0 To [M:HAEW]NB
+  If [M:HAEW]LEDTYP(I)=GTYPGEN
+   J+=1
+   If J < [M:HAEW]NB : TIERS = [M:HAEW]ACC(I)-[M:HAEW]BPR(I) : Endif
+   If J>0 & J<[M:HAEW]NB & TIERS = [M:HAEW]ACC(I-1)-[M:HAEW]BPR(I-1)
+    JK += 1
+    Gosub MNT
+   Elsif J=0 | J=[M:HAEW]NB | TIERS<>[M:HAEW]ACC(I-1)-[M:HAEW]BPR(I-1)
+    If J>0
+     # Le tiers change =>
+     # 1°) on lettre le groupe de pièces du tiers précédent...
+     For [F:DUD]DUD4 Where SOINUM=[L]NUM_REL & BPR=[M:HAEW]BPR(I-1)
+      JK += 1
+      [L]TBECR(JK) = [F:DUD]ACCNUM
+      [L]TBECH(JK) = [F:DUD]DUDLIG
+      [L]TBIPT(JK) = [F:DUD]AMTCUR
+     Next
+     Filter [DUD]
+     If JK>=2
+      Call LETDIF2(JK,[L]TBECR,[L]TBECH,[L]TBIPT,2) From CPTLET
+      If GOK<1 : Break : Endif
+     Endif
+     If !GOK
+      Goto AB_TR1
+     Endif
+    Endif
+    # 2°) on remplit le tableau du tiers suivant...
+    If J<[M:HAEW]NB
+     Raz [L]TBECR,[L]TBECH,[L]TBIPT
+     JK = 1
+     Gosub MNT
+    Endif
+   Endif
+  Else
+   # Le référentiel change => dernier lettrage
+   If J>0
+    For [F:DUD]DUD4 Where SOINUM=[L]NUM_REL & BPR=[M:HAEW]BPR(I-1)
+     JK += 1
+     [L]TBECR(JK) = [F:DUD]ACCNUM
+     [L]TBECH(JK) = [F:DUD]DUDLIG
+     [L]TBIPT(JK) = [F:DUD]AMTCUR
+    Next
+    Filter [DUD]
+    If JK>=2
+     Call LETDIF2(JK,[L]TBECR,[L]TBECH,[L]TBIPT,2) From CPTLET
+     If GOK<1 : Break : Endif
+    Endif
+    If !GOK
+     Goto AB_TR1
+    Endif
+    J=-1
+   Endif
+  Endif
+ Next
+
+ ## Maj flag 'validé'
+ Readlock [F:SOI]SOI0=[L]NUM_REL
+ If fstat=1
+  GOK=-1 : GROLL="$SOI"-[L]NUM_REL : Goto ROLL_TR1
+ Elsif fstat
+  GOK=0 : Call RSTA("SOI",[L]NUM_REL) From GLOCK
+  Goto AB_TR1
+ Endif
+ [F:SOI]FLGPST = 2
+ [F:SOI]TYPSOI = [L]PCETYP
+ [F:SOI]NUMSOI = [L]PCENUM
+ Rewrite [F:SOI]
+ If fstat
+  GOK=0 : Call FSTA("SOI") From GLOCK : Goto AB_TR1
+ Endif
+Commit
+Return
+
+$MNT
+[L]TBECR(JK) = [M:HAEW]ACCNUM(I)
+[L]TBECH(JK) = 1
+
+If [F:SOI]AMTCUR>0      :# Relevé débiteur
+ If [M:HAEW]LIGPCEAUTO(I)=1
+  [L]TBIPT(JK) = [M:HAEW]DEB(I)+[M:HAEW]CDT(I)
+ Else
+  [L]TBIPT(JK) = 0
+ Endif
+Else                    :# Relevé créditeur  (Bug 19649 : le relévé créditeur ne soldait pas les échéances)
+ If [M:HAEW]LIGPCEAUTO(I)=1
+  [L]TBIPT(JK) = [M:HAEW]DEB(I)+[M:HAEW]CDT(I)
+ Else
+  [L]TBIPT(JK) = 0
+ Endif
+Endif
+Return
+
+$AB_TR1
+Rollback
+Return
+
+$ROLL_TR1
+Rollback : Call ROLL From GLOCK
+If GROLL : Return Else Goto TR1 : Endif
+
+
+$DECLARE
+Local Integer STAT , OK
+Local Decimal REGLE
+Local Char    PCETYP(GLONGTE) , PCENUM(GLONVCR), NUMREL(GLONVCR), SDD(GLONADW)
+Local Char    MESSA(80), PCEAUTO(10)
+
+Local Integer DIFF_TIERS
+Local Char    CLE_PCE_AUTO(20)(3) : # 3 Composantes de clés pour CPTAUTO
+
+Call PARAM("","GAUSOI",[L]PCEAUTO) From ADOVAL
+If [L]PCEAUTO="" : [L]PCEAUTO="SOI" : Endif
+
+Local Decimal EXERCICE, PERIODE
+Local Char    DEVLOC(GLONCUR)
+Local Char    TIERS(GLONBPR)
+Local Integer FLGAUT
+
+
+Local Mask GACCENTFMT  [HAEF]        # Ouverture du masque pour diverses informations
+Local Mask GACCENTW    [HAEW]        # Ouverture du masque pour la gérer les lignes de pièces comtpables.
+Local Mask SAICURLED   [SCL]         # Ouverture du masque pour la gestion des devises
+
+Local Mask GACCENT0 [HAE0],  GACCENT1 [HAE1],   GACCENT2 [HAE2]
+&        , VENTILE  [VTL] ,  VENTILE2 [VT2] , GACCDUD [DUDD]
+
+
+Local Integer NB_LIG
+NB_LIG = dim([M:HAEW]ACC)
+Local Integer TBECR(1..NB_LIG+1) , TBECH(1..NB_LIG+1)
+Local Decimal TBIPT(1..NB_LIG+1)
+Local Decimal ECHMNT(1..NB_LIG) , ECHLOC(1..NB_LIG) , ECHRPT(1..NB_LIG)
+Return
+
+$CRE_ECHE
+Raz [F:DUD]
+[F:DUD]TYP    = [V]GTYPPCE
+[F:DUD]NUM    = [V]GNUMPCE
+[F:DUD]LIG    = [M:HAEW]LIN(I)
+[F:DUD]DUDLIG = 1
+[F:DUD]ACCNUM = [M:HAEW]ACCNUM(I)
+[F:DUD]CPY    = [M:HAE0]CPY
+[F:DUD]FCY    = [M:HAEW]FCYLIN(I)
+[F:DUD]CUR    = [M:HAE1]CUR
+[F:DUD]SAC    = [M:HAEW]SAC(I)
+[F:DUD]BPR    = [M:HAEW]BPR(I)
+[F:DUD]BPRTYP = [M:REL0]BPRTYP
+[F:DUD]BPRPAY = [F:SOI]BPR
+[F:DUD]DUDDAT = [F:SOI]DUDDAT
+[F:DUD]PAM    = [F:SOI]PAM
+[F:DUD]PAMTYP = 1
+If [M:HAEW]DEB(I)=0
+ [F:DUD]SNS= -1
+ [F:DUD]AMTCUR = [M:HAEW]CDT(I)
+Else
+ [F:DUD]SNS = 1
+ [F:DUD]AMTCUR = [M:HAEW]DEB(I)
+Endif
+[F:DUD]AMTLOC = abs([L]ECHLOC(I+1))
+If [F:SOI]AMTCUR>0  :# Relevé débiteur
+ [F:DUD]FLGPAZ = len(mess(0,510,1))
+ If [F:DUD]BPR=[F:SOI]BPR
+  [F:DUD]FLGFUP = [F:SOI]FLGFUP
+ Else
+  Call LECTURE("BPC",[F:DUD]BPR,"") From CONTOBJ
+  If dim([F:BPC]FUPTYP)>0 & [F:BPC]FUPTYP=1
+   [F:DUD]FLGFUP = 1
+  Else
+   [F:DUD]FLGFUP = 2
+  Endif
+ Endif
+Else                :# Relevé créditeur
+ If [F:DUD]BPR=[F:SOI]BPR
+  [F:DUD]FLGPAZ = [F:SOI]FLGPAZ
+ Else
+  Call LECTURE("BPS",[F:DUD]BPR,"") From CONTOBJ
+  Call LECTURE("AUS",GUSER,"") From CONTOBJ
+  # X3-71518 Don't consider Payment hold flag of the supplier
+  #If dim([F:BPS]PAYLOKFLG)>0 & [F:BPS]PAYLOKFLG=2
+  # [F:DUD]FLGPAZ = 1
+  #Else
+  Local Char LLEVPAZ(3)
+  Call PARAMUTIL("NIVBONPAYE",LLEVPAZ,"","") From SUBAUS
+  [F:DUD]FLGPAZ =  min(len(mess(0,510,1)),val(LLEVPAZ))
+  #Endif
+ Endif
+Endif
+[F:DUD]SOI = 1
+If mod(ILIG,2) & [F:SOI]FLGFWD=2
+ [F:DUD]SOI    = 2
+Endif
+Call GETPERSOC([F:DUD]CPY,GTYPGEN,[F:DUD]DUDDAT,EXERCICE,PERIODE) From CPTSUB
+[F:DUD]FIY = EXERCICE
+[F:DUD]PER = PERIODE
+[F:DUD]TYPDUD = 2 #DdM38498
+Call PARAML([F:DUD]CPY,"SDDMGT",SDD) From ADOVAL
+If SDD="2" & [F:DUD]BPRTYP=1
+ Call LEC_TAM([F:CPY]LEG,[F:DUD]PAM) From CPTLEC
+ If [F:TAM]SDDFLG=2
+  Call INIT_UMRNUM([F:DUD]CPY,[F:DUD]BPRPAY,2,2,[F:DUD]UMRNUM) From INVSDDLIB
+ Endif
+Endif
+Return
+

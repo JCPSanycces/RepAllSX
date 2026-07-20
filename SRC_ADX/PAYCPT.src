@@ -1,0 +1,220 @@
+#<AdxTL>@(#)10.0.0.0 $Revision$ Comptabilisation des règlements
+Local Char VALBOUT(30)
+Local Char PARBOUT(250)(1..3)
+PARBOUT(1) = "9"           : # Etape de comptabilisation 3,8,9
+PARBOUT(2) = "3"           : # 1:Bordereau de remise, 2:Avis de domiciliation, 3:Règlement
+PARBOUT(3) = "CHRD000001" : # Numéro de bordereau, d'avis ou de règlement
+GACTION="PAYCPT"
+Call TRAITE_CHAR(VALBOUT,PARBOUT,"","PAYCPT","DPAYCPT",3,"") From GTRAITE
+End
+
+$ACTION
+Case ACTION
+ When "INIT"     : Gosub INIT
+ When "INIT_DIA" : Gosub INIT_DIA
+ When "CONTROLE" : Gosub CONTROLE
+ When "EXEC"     : Gosub EXEC
+ When "SORTIE"   : Gosub SORTIE
+Endcase
+Return
+
+#####
+$INIT
+#####
+Local Integer T : T=time
+Local Char    OFONCTION(20), NFONCTION(20)
+Local Integer OKDAT
+Local Char    DACVALDAT(10), TITTRA(50), NOMOBJ(10)
+OFONCTION=GFONCTION
+Case PARAM(1)
+ When "3"  # Mise en portefeuille
+  NFONCTION="PAYMEP"
+ When "8" : # Remise sur compte intermédiaire
+  NFONCTION="REMCPT"
+ When "9" : # Remise en banque
+  NFONCTION="REMBAN"
+Endcase
+
+If GFONCTION<>NFONCTION
+ GFONCTION=NFONCTION : Call AUTORIS From EXEFNC
+Endif
+If GNBAUZ=0
+ GERR=1 : GMESSAGE=GFONCTION-mess(74,100,1) : FIN=1 :  # Fonction non autorisée
+Endif
+
+# Si on ne saisit pas la date comptable
+# et si le paramètre DACVALDAT est à non
+# on ne saisit pas la fenêtre
+
+If !clalev([F:TPY]) : Local File TABPAYTYP [TPY] : Endif
+If !clalev([F:PYH]) : Local File PAYMENTH  [PYH] : Endif
+If !clalev([F:CPY]) : Local File COMPANY   [CPY] : Endif
+OKDAT = 1
+Case PARAM(2)
+ When "1","2"
+  Read [PYH]PYH1(2) = val(PARAM(2));PARAM(3)
+ When Default
+  Read [PYH]PYH0 = PARAM(3)
+Endcase
+Call LECTURE("CPY",[F:PYH]CPY,"") From CONTOBJ
+Call LEC_TPY_LEG([F:CPY]LEG,[F:PYH]PAYTYP) From CPTLEC
+Case PARAM(1)
+ When "3"  # Mise en portefeuille
+  TIT = mess(55,117,1)
+  OKDAT = 0
+ When "8" : # Remise sur compte intermédiaire
+  TIT = mess(132,117,1)
+  If [F:TPY]STA3<>2
+   OKDAT = 0
+  Endif
+ When "9" : # Remise en banque
+  TIT = mess(133,117,1)
+  If ([F:TPY]STA3<>2 & [F:TPY]STA8<>2) or [F:TPY]DUDFLG=2
+   OKDAT = 0
+  Endif
+Endcase
+If !OKDAT
+ Call PARAM("","DACVALDAT",DACVALDAT) From ADOVAL
+ If val(DACVALDAT)=1
+  If !clalev([M:DIA]) : Local Mask DATCPT [DIA] : Endif
+  Raz [M:DIA]
+  BCRIT = ""
+ Endif
+Endif
+TITTRA=TIT
+Return
+
+#########
+$INIT_DIA
+#########
+# 1 -> Saisi et obligatoire
+# 2 -> Saisi et facultatif
+# 3 -> Non saisi
+
+Onerrgo ERREUR From CONTROLE
+If !clalev([F:TPY]) : Local File TABPAYTYP [TPY] : Endif
+If !clalev([F:PYH]) : Local File PAYMENTH  [PYH] : Endif
+If !clalev([F:CPY]) : Local File COMPANY   [CPY] : Endif
+Onerrgo
+If GERREUR : GERREUR=0 : FIN=1 : Return : Endif
+
+Case PARAM(2)
+ When "1","2"
+  Read [PYH]PYH1(2) = val(PARAM(2));PARAM(3)
+  If fstat>2 : FIN=1 : Return : Endif
+  [M:DIA]FCY=[F:PYH]FRMFCY
+ When Default
+  Read [PYH]PYH0 = PARAM(3)
+  If fstat : FIN=1 : Return : Endif
+  [M:DIA]FCY=[F:PYH]FCY
+Endcase
+
+If dim(GTYPGEN)<0
+ Global Integer GTYPGEN
+ Global Integer GTYPANA
+Endif
+## L'écran DATCPT effectue des contrôles sur les dates avec GTYPGEN passé en paramètre de l'action CONTPER...
+Call SETMAINREF([F:PYH]CPY,GTYPGEN,GTYPANA) From CPTDIV
+Call LECTURE("CPY",[F:PYH]CPY,"") From CONTOBJ
+GCURLEG = [F:CPY]LEG
+Call LEC_TPY_LEG(GCURLEG,[F:PYH]PAYTYP) From CPTLEC
+
+[M:DIA]DACDAT2=2
+Case PARAM(1)
+ When "3"  # Mise en portefeuille
+  [M:DIA]DACDAT1 = 3
+ When "8" : # Remise sur compte intermédiaire
+  If [F:TPY]STA3=2
+   [M:DIA]DACDAT1 = 1
+  Else
+   [M:DIA]DACDAT1 = 3
+  Endif
+ When "9" : # Remise en banque
+  If ([F:TPY]STA3=2 or [F:TPY]STA8=2) & [F:TPY]DUDFLG<>2
+   [M:DIA]DACDAT1 = 1
+  Else
+   [M:DIA]DACDAT1 = 3
+  Endif
+Endcase
+
+## Demande SDR 19940 : si on valide un bordereau et que la transaction associée est cochée 'Gestion par date échéance'
+## et que le type de remise est 'Escompte', il faut dégriser la date comptable de la fenêtre pop-up et l'initialiser
+## à la date courante (par ailleurs, elle pourra être modifiée).
+## Dans ce cas de figure, la date comptable des pièces de règlement générées vaut la date saisie dans cette fenêtre
+If [F:PYH]FRMFLG = 1 | [F:PYH]FRMFLG = 2
+ Read [FRM]FRM0 = [F:PYH]FRMFLG ; [F:PYH]FRMNUM
+ If !fstat & (find([F:FRM]FRMTYP,2,4))
+  [M:DIA]DACDAT1 = 1
+ Endif
+Endif
+Return
+
+
+#########
+$CONTROLE
+#########
+TMP=1  : TIT="T" : # Opération en cours
+Return
+
+#####
+$EXEC
+#####
+Local Date DAT1, DAT2
+Local Char NUM(20)
+NUM  = PARAM(3)
+DAT1 = [M:DIA]DAT1
+DAT2 = [M:DIA]DAT2
+Onerrgo ERREUR From CONTROLE
+If clalev([M:DIA]) : Close Local Mask [DIA] : Endif
+Case PARAM(1)
+ When "9" : Local Mask PAYREMBAN [DIA]
+ When "8" : Local Mask PAYREMCPT [DIA]
+ When "3" : Local Mask PAYMEP    [DIA]
+Endcase
+Onerrgo
+If GERREUR : GERREUR=0 : FIN=1 : Return : Endif
+
+Raz [M:DIA]
+[M:DIA]ALLCPY=2 : [M:DIA]ALLFCY=2 : [M:DIA]ALLTYP=2  : [M:DIA]ALLUSR=2
+[M:DIA]PRO=2    : [M:DIA]TRC=2    : [M:DIA]VALDAT=DAT2
+Case PARAM(1)
+ When "9"
+  [M:DIA]ACCSTA=9 : [M:DIA]ALLLOT=2
+  [M:DIA]ALLBAN=2 : [M:DIA]ALLFRMTYP=2 : [M:DIA]ACCDAT=DAT1
+  If PARAM(2)="1" : [M:DIA]PAY5=2 : Else [M:DIA]PAY5=1 : Endif
+  If PARAM(2)="2" : [M:DIA]PAY7=2 : Else [M:DIA]PAY7=1 : Endif
+  If PARAM(2)="3" : [M:DIA]PAY9=2 : Else [M:DIA]PAY9=1 : Endif
+ When "8"
+  [M:DIA]ACCSTA=8
+  [M:DIA]ALLBAN=2 : [M:DIA]ALLFRMTYP=2 : [M:DIA]ACCDAT=DAT1
+ When "3"
+  [M:DIA]ACCSTA=3 : [M:DIA]ALLLOT=2
+Endcase
+
+If !GSERVEUR
+ Call OUVRE_TRACE(TITTRA)From LECFIC
+Endif
+
+Call PAYCPT(NUM) From PAYCPTA
+
+If !GSERVEUR
+ Call FERME_TRACE From LECFIC
+ TRA=1
+Endif
+Return
+
+#######
+$SORTIE
+#######
+If OFONCTION<>GFONCTION
+ GFONCTION=OFONCTION : Call AUTORIS From EXEFNC
+Endif
+Return
+
+###################
+Subprog PAYCPT(NUM)
+###################
+Value Char NUM() : # No de règlement, de bordereau de remise ou d'avis de domiciliation
+Call PAYCPT(NUM) From PAYCPTA
+End
+

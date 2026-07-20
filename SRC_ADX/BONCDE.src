@@ -1,0 +1,312 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+#########################################################################
+# BONCDE : Impression du bon de commande achats                         #
+# --------------------------------------------------------------------- #
+# Chargement des paramètres et mise à jour de l'indicateur d'impression #
+#########################################################################
+
+
+###########################################
+# Appelé par le Call ETAT from AIMP3      #
+# --------------------------------------- #
+# Le Call ETAT effectue dans l'ordre :    #
+#   - Un Gosub ACTION  (ACTION="EXEC")    #
+#   - Un Call  IMPRIME (NBPAR,PARAMETRE)  #
+###########################################
+$ACTION
+Case ACTION
+  When "CONTPRT" : Gosub CONTPRT
+  When "EXEC"    : Gosub EXEC
+Endcase
+Return
+
+
+###########################################
+# Contrôle destination (choix imprimante) #
+# --------------------------------------- #
+#  Préchargement du nombre de copies      #
+#  Par défaut provient des destinations   #
+###########################################
+$CONTPRT
+#------ Préchargement si contexte gestion de commandes d'achat -----#
+If GFONCTION="GESPOH" & clalev([M:POH0])
+  If !find([M:RPT]IMPRIME,1,3,4)
+   #sr 08.11 Demande 74804-uniquement s'il y a un modèle d'impression sur le tiers
+    If [F:BPS]TPMCOD<>""
+     [M:RPT]NBRCPY=max([M:POH0]COPNBR,1) : # Nombre de copies
+    Endif
+  Else
+    [M:RPT]NBRCPY=0 : # pas de copie pour prévisu, message, fichier
+    Grizo [M:RPT]NBRCPY : Affzo [M:RPT]NBRCPY #Fq73266
+  Endif
+Endif
+#-----
+Return
+
+
+############################################################################
+# Avant l'impression du document, chargement paramètres si impression auto #
+# ------------------------------------------------------------------------ #
+# Nota : On force le nombre de copies à 1 car on a écrit dans la table     #
+#        AREPORTM, les enregistrements en fonction du nombre de copie.     #
+############################################################################
+$EXEC
+#----- Ne rien faire si pas impression auto, cela se fera par le Call IMPRIME -----#
+If dim([V]GWNUMREQ)<1 | dim([V]GWSEQREQ)<1 | dim([V]GWTRTAUTO)<1 | [V]GWTRTAUTO<>1
+  Return
+Endif
+#-----
+If dim(I)<1       Local Integer I             : Endif
+If dim(J)<1       Local Integer J             : Endif
+If dim([L]ETAT)<1 Local Char    ETAT(GLONARP) : Endif
+# Issue 92445 - 2013-09-13 by SR
+If dim([L]CRYCOD)<1 Local Char  LCRYCOD(GLONACR) : Endif
+#-----
+# Issue 92445 - 2013-09-13 by SR : Partir de I=0 et pas de I=1
+For I=0 To [L]NBPAR
+  J=instr(1,[L]PARAMETRE(I),"=")
+  If J
+    [L]PARAM=left$([L]PARAMETRE(I),J-1)
+    Case [L]PARAM
+      When "X3ETA"          : Call GETPARAM([L]PARAM,[L]NBPAR,[L]PARAMETRE,[L]ETAT) From ETAT
+      When "X3LAN"          : [L]PARAMETRE(I) = "X3LAN="+GLANGUE
+      When "__REQUETE"      : [L]PARAMETRE(I) = "__REQUETE="+num$([V]GWNUMREQ)
+      When "_PrinterCopies" : [L]PARAMETRE(I) = "_PrinterCopies="+chr$(1)+"1"
+      When "numedt"         : [L]PARAMETRE(I) = "numedt="+num$([V]GWNUMREQ)
+      When "seqedt"         : [L]PARAMETRE(I) = "seqedt="+num$([V]GWSEQREQ)
+      When "usr"            : [L]PARAMETRE(I) = "usr="+GUSER
+      When "etat"           : [L]PARAMETRE(I) = "etat="+[L]ETAT
+      When "euro"           : [L]PARAMETRE(I) = "euro="+GEURO
+      # Issue 92445 - 2013-09-13 by SR
+      # Si etat CR BONCDE2 et module vente inactif, on remplace l'etat CR par BONCDE2B
+      # Si état CR <> BONCDE2 ça veut dire que c'est un état spécifique client
+      # qui doit normalement prendre déjà en compte le fait que les ventes ne sont pas là, donc on ne touche pas
+      When "__REPORT"       : Call GETPARAM([L]PARAM,[L]NBPAR,[L]PARAMETRE,[L]CRYCOD) From ETAT
+                              If [L]LCRYCOD = "BONCDE2.rpt" & GMODU(5) <> 2
+                                [L]PARAMETRE(I) = "__REPORT="+"BONCDE2B.rpt"
+                              Endif
+    Endcase
+  Endif
+Next I
+#-----
+Return
+
+
+####################################
+# Appelé par le Call ETAT          #
+#   après l'action EXEC            #
+#   avant l'impression du document #
+####################################
+Subprog IMPRIME(NBPAR,PARAMETRE)
+Value    Integer NBPAR
+Variable Char    PARAMETRE()()
+#----- Si impression auto ne rien faire AREPORTM est déjà chargé -----#
+If dim([V]GWTRTAUTO)>0 & [V]GWTRTAUTO=1  End : Endif
+#----- Ouverture des tables -----#
+Local File AREPORTM [ARM]
+Local File PORDER   [POH]
+# Issue 101785 - 2015-12-31 by BRBAN
+Local File TMPPRPT    [TPPT]
+#----- Déclaration des variables locales -----#
+Local Char    CRITERE(255), CRITERE2(255), PARAM(30) , VALEUR(30) , ETAT(GLONARP)
+Local Integer WNUMLIG, NUMREQ, IMPR, I, J
+Local Date    DATREF
+#-----
+# Issue 101785 - 2015-12-31 by BRBAN
+Local Integer CKPO     : [L]CKPO     = 0
+Local Integer CKPOELEM : [L]CKPOELEM = 0
+
+[L]CRITERE ="1=1"
+[L]CRITERE2="1=1"
+#-----
+# Issue 101785 - 2015-12-31 by BRBAN
+If func AFNC.ACTIV('KPO')>0
+  CKPO     = 1
+Endif
+
+# Issue 92445 - 2013-09-13 by SR : Partir de I= 0 et pas de I=1
+For I=0 To [L]NBPAR
+  J=instr(1,[L]PARAMETRE(I),"=")
+  If J
+    [L]PARAM  = left$([L]PARAMETRE(I),J-1)
+    Call GETPARAM([L]PARAM,NBPAR,PARAMETRE,[L]VALEUR) From ETAT
+    Case [L]PARAM
+      When "X3ETA"          : [L]ETAT     = [L]VALEUR
+      When "__REQUETE"      : [L]NUMREQ   = val([L]VALEUR)
+      When "sitedeb"        : [L]CRITERE -= "& POHFCY>='"+[L]VALEUR+"'"
+      When "sitefin"        : [L]CRITERE -= "& POHFCY<='"+[L]VALEUR+"'"
+      When "signedeb"       : [L]CRITERE -= "& APPFLG>="+num$([L]VALEUR)
+      When "signefin"       : [L]CRITERE -= "& APPFLG<="+num$([L]VALEUR)
+      When "fournisseurdeb" : [L]CRITERE -= "& BPSNUM>='"+[L]VALEUR+"'"
+      When "fournisseurfin" : [L]CRITERE -= "& BPSNUM<='"+[L]VALEUR+"'"
+      When "commandedeb"    : [L]CRITERE -= "& POHNUM>='"+[L]VALEUR+"'"
+      When "commandefin"    : [L]CRITERE -= "& POHNUM<='"+[L]VALEUR+"'"
+      When "codimp"         : [L]CRITERE -= "& PRNFLG="+num$([L]VALEUR)
+                              [L]IMPR     = val([L]VALEUR)
+      #----- BONCDE2 : Trop de critères passage de CRITERE2 -----#
+      When "datedeb"        : [L]DATREF   =  gdat$(val(right$([L]VALEUR,7)),
+&                                            val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+                              [L]CRITERE2 -= "& ORDDAT >=["+format$(GFMD,[L]DATREF)+']'
+      When "datefin"        : [L]DATREF   =  gdat$(val(right$([L]VALEUR,7)),
+&                                            val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+                              [L]CRITERE2 -= "& ORDDAT <=["+format$(GFMD,[L]DATREF)+']'
+      When "devdeb"         : [L]CRITERE2 -= "& CUR>='"+[L]VALEUR+"'"
+      When "devfin"         : [L]CRITERE2 -= "& CUR<='"+[L]VALEUR+"'"
+      When "avenantdeb"     : [L]CRITERE2 -= "& REVNUM>="+num$([L]VALEUR)
+      When "avenantfin"     : [L]CRITERE2 -= "& REVNUM<="+num$([L]VALEUR)
+      When "comsolddeb"     : [L]CRITERE2 -= "& CLEFLG>="+num$(val([L]VALEUR)+1)
+      When "comsoldfin"     : [L]CRITERE2 -= "& CLEFLG<="+num$(val([L]VALEUR)+1)
+      When "etatlivdeb"     : [L]CRITERE2 -= "& RCPFLG>="+num$([L]VALEUR)
+      When "etatlivfin"     : [L]CRITERE2 -= "& RCPFLG<="+num$([L]VALEUR)
+      When "etatfacdeb"     : [L]CRITERE2 -= "& INVFLG>="+num$([L]VALEUR)
+      When "etatfacfin"     : [L]CRITERE2 -= "& INVFLG<="+num$([L]VALEUR)
+      #-----
+      When "numedt"         : [L]PARAMETRE(I) = "numedt="+num$([L]NUMREQ)
+      When "usr"            : [L]PARAMETRE(I) = "usr="+GUSER
+      When "etat"           : [L]PARAMETRE(I) = "etat="+[L]ETAT
+      When "euro"           : [L]PARAMETRE(I) = "euro="+GEURO
+      # Issue 92445 - 2013-09-13 by SR
+      # Si etat CR BONCDE2 et module vente inactif, on remplace l'etat CR par BONCDE2B
+      # Si état CR <> BONCDE2 ça veut dire que c'est un état spécifique client
+      # qui doit normalement prendre déjà en compte le fait que les ventes ne sont pas là, donc on ne touche pas
+      When "__REPORT"       :  If VALEUR = "BONCDE2.rpt" & GMODU(5) <> 2
+                                [L]PARAMETRE(I) = "__REPORT="+"BONCDE2B.rpt"
+                              Endif
+    Endcase
+  Endif
+Next I
+#-----
+[L]CRITERE -= "& POHTYP=1"
+# Issue 89114 - 2013-04-04 by SR : etat enchaine
+Look [ARM]ARM0 = [L]NUMREQ;GUSER;[F:ARP]RPTCOD;1
+If !fstat
+  # Enreg trouvé, car lancement enchainé
+  # On bloque la boucle
+  End
+  #On laisse GOK=1 sinon l'état ne sort pas
+Endif
+
+#------------------------------------------------------------------#
+#  - Création d'un seul enregistrement dans AREPORTM               #
+#  - Mise à jour indicateur d'impression sur l'entête de livraison #
+#------------------------------------------------------------------#
+Call DEBTRANS From GLOCK
+Trbegin [ARM], [POH], [TPPT]
+#----- Chargement buffer AREPORTM -----#
+Raz [F:ARM]
+[F:ARM]USR    = GUSER
+[F:ARM]RPTCOD = [F:ARP]RPTCOD
+[F:ARM]NUMREQ = [L]NUMREQ
+[F:ARM]CREDAT = date$
+#-----
+For [POH] POH0 Where evalue([L]CRITERE) & evalue([L]CRITERE2)
+  #----- Création d'un enregistrement dans la table AREPORTM -----#
+  [F:ARM]NUMLIG+= 1
+  [F:ARM]CLEA1  = [F:POH]POHNUM
+  Gosub ALIMETAT_PE From ETAT
+  Write [ARM]
+  If fstat  GOK=0 : Call FSTA("ARM") From GLOCK : Break : Endif
+  #----- Mise à jour table entête livraison si demande d'impression -----#
+  If [L]IMPR=1
+    Update [POH] Where POHNUM=[F:ARM]CLEA1 With PRNFLG=2
+    If fstat  GOK=0 : Call FSTA("POH") From GLOCK : Break : Endif
+  Endif
+  #-----
+  # Issue 101785 - 2015-12-31 by BRBAN
+  If CKPO = 1
+    Gosub ALIM_TMPPRPT
+    If GOK<1 : Break : Endif
+  Endif
+Next
+
+If GOK<1  Rollback  Else  Commit : Endif
+If CKPO = 1 & [L]CKPOELEM <> 1 : Call ECR_TRACE(mess(201,7711,1),1) From GESECRAN : GOK = 0  : Endif
+End
+
+
+###########################################################################
+# Appelé par Gosub depuis le traitement TRTX3ETA                          #
+# ----------------------------------------------------------------------- #
+#   - Création d'un enregistrement par copie désirée dans AREPORTM        #
+#   - Mise à jour indicateur d'impression sur l'entête du document        #
+# ----------------------------------------------------------------------- #
+# Les variables locales suivantes sont disponibles :                      #
+#     WADXLOG  = Indicateur transaction (0 = pas de transaction en cours) #
+#     ETAT     = Code de l'état                                           #
+#     REQUETE  = Numéro de requête                                        #
+#     LIGNE    = Numéro de ligne de AREPORTM                              #
+#     SEQUENCE = Numéro de séquence de AREPORTM                           #
+# Le buffer [F:POH] est chargé et l'entête est écrite                     #
+###########################################################################
+$ALIM_ETAT
+# Issue 101785 - 2015-12-31 by BRBAN
+If !clalev([F:TPPT])  : Local File TMPPRPT    [TPPT] : Endif
+Local Integer CKPO     : [L]CKPO     = 0
+Local Integer CKPOELEM : [L]CKPOELEM = 0
+
+If func AFNC.ACTIV('KPO')>0
+  CKPO     = 1
+Endif
+# -
+#-----
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin [ARM], [POH], [TPPT]
+Endif
+#----- Création des enregistrements dans la table AREPORTM -----#
+Raz [F:ARM]
+[F:ARM]NUMREQ = REQUETE
+[F:ARM]USR    = GUSER
+[F:ARM]RPTCOD = ETAT
+[F:ARM]NUMLIG = LIGNE
+[F:ARM]SEQREQ = SEQUENCE
+[F:ARM]CLEA1  = [F:POH]POHNUM
+[F:ARM]CREDAT = date$
+#-----
+For I=1 To max(NBRCOPIE,1)
+  [F:ARM]NUMLIG+=1
+  Gosub ALIMETAT_PE From ETAT
+  Write [ARM]
+  If fstat  GOK=0 : Call FSTA("ARM") From GLOCK : Break : Endif
+Next I
+#-----
+If fstat  Goto AB_ALIM_ETAT : Endif
+LIGNE   =[F:ARM]NUMLIG
+SEQUENCE=[F:ARM]SEQREQ
+#----- Mise à jour indicateur d'impression de l'entête commande -----#
+Update [POH] Where POHNUM=[F:ARM]CLEA1 With PRNFLG=2
+If fstat  GOK=0 : Call FSTA("POH") From GLOCK : Goto AB_ALIM_ETAT : Endif
+[F:POH]PRNFLG=2 : # La classe [F] n'est pas màj par l'Update
+#-----
+
+# Issue 101785 - 2015-12-31 by BRBAN
+If CKPO = 1
+  Gosub ALIM_TMPPRPT
+  If GOK<1 : Gosub AB_ALIM_ETAT : Endif
+Endif
+
+If [L]WADXLOG=0
+  Commit
+Endif
+If CKPO = 1 & [L]CKPOELEM <> 1 : Call ECR_TRACE(mess(201,7711,1),1) From GESECRAN : GOK = 0  : Endif
+Return
+#-----
+$AB_ALIM_ETAT
+If [L]WADXLOG=0
+  Rollback
+Endif
+Return
+#########################################################################
+#########################################################################
+$ALIM_TMPPRPT
+
+Raz [F:TPPT]
+
+[F:TPPT]       = [F:ARM]
+[F:TPPT]VCRNUM = [F:POH]POHNUM
+
+Write [F:TPPT]
+If fstat : GOK=0 : Call FSTA("TPPT") From GLOCK : Else : [L]CKPOELEM = 1 Endif
+
+Return
+

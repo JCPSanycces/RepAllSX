@@ -1,0 +1,872 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Class SHIPMENT method's
+# Commandes : 1111-0000001054 et 0906-0000000285
+# Issue 999999 - 2015-10-15 by CFF : Refactoring du code
+#######################################################################################
+
+$AINSERT_CONTROL_BEFORE
+  Gosub AINSERT_OR_UPDATE_CONTROL_BEFORE
+Return
+
+$AUPDATE_CONTROL_BEFORE
+  Gosub AINSERT_OR_UPDATE_CONTROL_BEFORE
+Return
+
+$AINSERT_OR_UPDATE_CONTROL_BEFORE
+  # 1- Controle qu'une ligne a été saisie
+  If maxtab(this.SHD) = 0
+    [L]ASTATUS = fmet this.ASETERROR("", mess(17,106,1), [V]CST_AERROR)
+    Return
+  Endif
+Return
+
+$AINSERT_CONTROL_AFTER
+  Gosub CTR_INSERT From SHIP_LIB
+  Gosub CTR_SHIPMENT
+  # Issue 111257
+  Gosub CTR_TRANSPORT
+  # Issue 111256 US3
+  Gosub CTR_CAPACITY
+
+Return
+
+#**
+#* 1- si l'expédition est réceptionnée, elle est non modifiable<br/>
+#* 2 - controle sur les données transport<br/>
+#* 3 - si l'expédition est pré-réceptionnée, pas de modifications autre que date d'arrivée et quantité pré-réceptionnée<br/>
+#* 4 - site non modifiable si expé ou pré-réception<br/>
+#* 5 - fournisseur non modifiable si expé ou pré-réception<br/>
+#* 6 - controle sur les lignes d'expéditions
+#*!
+$AUPDATE_CONTROL_AFTER
+  Local Char WTEXTE(100)
+  # 1- Si l'expédition est receptionnée ou soldée = non modifiable
+  #contrôle enlevé afin de pouvoir désolder une expédition
+#  If (this.SHIPSTAT >= 3)
+#    [L]ASTATUS = fmet this.ASETERROR("", mess(9,123,1) + " : " + mess(502,194,1), [V]CST_AERROR)
+#    Return
+#  Endif
+
+
+  # Issue 111257
+  #2 - CONTROLE SUR LES DONNÉES TRANSPORT
+  Gosub CTR_TRANSPORT
+
+  # 3 - si l'expédition est pré-réceptionnée, pas de modifications autre que date d'arrivée et quantité pré-réceptionnée
+  # Issue 6079
+  If this.SHIPSTAT = 3
+    If ((this.DPECRY<>this.snapshot.DPECRY)|(this.ARVCRY<>this.snapshot.ARVCRY)|(this.DPETPC<>this.snapshot.DPETPC)|
+&    (this.ARVTPC<>this.snapshot.ARVTPC)|(this.TRNNUM<>this.snapshot.TRNNUM)|(this.TRNMOD<>this.snapshot.TRNMOD) |
+&    (this.BPTNUM<>this.snapshot.BPTNUM)|((this.DPEDAT<>this.snapshot.DPEDAT)& (this.snapshot.DPEDAT<>AVOID.ADATE)))
+    [L]ASTATUS = fmet this.ASETERROR("", mess(539,194,1),[V]CST_AERROR)
+    Return
+   Endif
+  # Issue 6079
+  Elsif this.SHIPSTAT = 5
+    If((this.DPECRY<>this.snapshot.DPECRY)|(this.ARVCRY<>this.snapshot.ARVCRY)|(this.DPETPC<>this.snapshot.DPETPC)|
+&    (this.ARVTPC<>this.snapshot.ARVTPC)|(this.TRNNUM<>this.snapshot.TRNNUM)|(this.TRNMOD<>this.snapshot.TRNMOD) |
+&    (this.BPTNUM<>this.snapshot.BPTNUM)|(this.ARVDAT<>this.snapshot.ARVDAT)|((this.DPEDAT<>this.snapshot.DPEDAT)& (this.snapshot.DPEDAT<>AVOID.ADATE)))
+      [L]ASTATUS = fmet this.ASETERROR("", mess(9,123,1) + " : " + mess(533,194,1), [V]CST_AERROR)
+      Return
+    Endif
+  Endif
+  # End issue 111257
+
+  # 4- site non modifiable si expé ou pré-réception
+  If this.FCY <> this.snapshot.FCY
+    [L]ASTATUS = fmet this.ASETERROR(mess(3,45,1), mess(9,123,1), [V]CST_AERROR)
+  Endif
+
+  # 5- fournisseur non modifiable si expé ou pré-réception
+  If this.BPSNUM <> this.snapshot.BPSNUM
+    [L]ASTATUS = fmet this.ASETERROR(mess(17,7,1), mess(9,123,1), [V]CST_AERROR)
+  Endif
+
+  #7 controle sur les dates si la date d'arrivée est renseignée
+  #Gosub CTR_DATE
+  Gosub CTR_UPDATE From SHIP_LIB
+  #6 - controle sur les lignes d'expéditions
+  Gosub CTR_SHIPMENT
+  #déplacé dans SHIPTRNP_CSTD
+
+  #8 - controle sur les capacités
+  Gosub CTR_CAPACITY
+Return
+
+#**
+#* Rule : L'expédition a une quantité pré-réceptionnée ou réceptionnée
+#*!
+$ADELETE_CONTROL_AFTER
+# Issue 6079 - 2016-12-13 by MAE : si statut expédié, on peut supprimer
+If this.SHIPSTAT <> 1 & this.SHIPSTAT <> 2
+  [L]ASTATUS = fmet this.ASETERROR("", mess(54,123,1) + " : " + mess(502,194,1), [V]CST_AERROR)
+  Return
+Endif
+Return
+
+
+#**
+#* 0- update shipped qty impossible if in container
+#* 1- remplissage de la zone SHIMGT
+#* 2- unités de poids et unités de volume obligatoires si on est pas en pré-réception de commandes
+#* 3- tous les sites des lignes de commande doivent faire partie de la même sté juridique<br/>
+#* 4- si expédition, la qté ne peut pas être nulle
+#* 5- is all lines are in container
+#* 6- is that all container types are equal to that of the header ?
+#* 7- Mise à jour de la date de réception prévue avec la date d'arrivée attendue
+#* 8- calculation of available weight
+#* 9- calculation of available volume
+#*!
+$CTR_SHIPMENT
+Local Char WCPYLIN(GLONCPY)
+Local Char WTEXTE(50)
+Local Integer WLTI, WRET, WTYPCALC, WSHIPMGTOK, WCTRNUM
+#Local Integer WRECAL  #1 si la date d'arrivée prévue a été recalculée, 0 sinon
+Local Char SAVCTRNUM (GLONVCR)    # Issue 111256 US3
+Local Integer WNBRECEPT,WNBPRECEPT,WNBCREE, LVCRTYP,WNBSOLDE  # Issue 15350
+WSHIPMGTOK = 0
+#WRECAL = 0
+#Déplacé dans SIHIPTRNP_CSTD
+## Issue 111257 US 33
+##1- recalcul date arrivée prévue si (infos impactantes du délai modifiées ou si suppression du transport)
+#If (((this.ARVTPC<> this.snapshot.ARVTPC | this.DPETPC<> this.snapshot.DPETPC | this.BPTNUM<> this.snapshot.BPTNUM
+#& | this.TRNMOD<> this.snapshot.TRNMOD |this.DPEDAT <> this.snapshot.DPEDAT) & (this.TRNNUM =""))
+#& | (this.TRNNUM="" & this.snapshot.TRNNUM <> "") | (this.ARVEXPDAT= AVOID.ADATE)) & this.DPEDAT <> AVOID.ADATE
+#    Call CAL_LEADTIME(1,this.DPETPC,this.ARVTPC,this.BPTNUM, this.TRNMOD, WLTI) From STCLIB
+#    #on réapplique le décalage total sur la nouvelle date
+#    this.ARVEXPDAT  = this.DPEDAT + WLTI + this.SHIPLAG
+#    WRECAL = 1
+#Endif
+##2- ajout décalage saisi sur date d'arrivée prévue si date d'arrivée prévue renseignée.
+#If this.SHIPSLAG <> 0 & this.DPEDAT <> AVOID.ADATE
+#  this.ARVEXPDAT += this.SHIPSLAG
+#  this.SHIPLAG += this.SHIPSLAG
+#  this.SHIPSLAG = AVOID.ADEC
+#  WRECAL = 1
+#Endif
+
+#2 - unités de poids et unités de volume obligatoires si on est pas en pré-réception de commandes
+If this.DSPWEU = AVOID.ACHAR & this.SHIPTYP = 1
+  [L]ASTATUS = fmet this.ASETERROR("DSPWEU", mess(169,192,1), [V]CST_AERROR)
+  Return
+Endif
+If this.DSPVOU = AVOID.ACHAR & this.SHIPTYP = 1
+  [L]ASTATUS = fmet this.ASETERROR("DSPVOU", mess(628,199,1), [V]CST_AERROR)
+  Return
+Endif
+
+this.CRRWEI = 0
+this.CRRVOL = 0
+WCTRNUM = 0
+# End issue 111256 US3
+WNBRECEPT=0:WNBPRECEPT=0:WNBCREE=0:WNBSOLDE=0  # Issue 15350 - 2016-12-07 by MAE
+For I=1 To maxtab(this.SHD)
+  # 3 - Tous les sites des lignes de commande doivent faire partie de la même sté juridique
+  If this.SHD(I) <> null and find(this.SHD(I).ASTALIN, [V]CST_ADEL, [V]CST_ANEWDEL) < 1
+    If this.SHD(I).LEGCPY <> AVOID.ACHAR & WCPYLIN = AVOID.ACHAR
+      WCPYLIN = this.SHD(I).LEGCPY
+    Endif
+    If WCPYLIN <> AVOID.ACHAR & this.SHD(I).LEGCPY <> AVOID.ACHAR & WCPYLIN <> this.SHD(I).LEGCPY
+      [L]ASTATUS = fmet this.ASETERROR("FCY", mess(485,194,1), [V]CST_AERROR)
+      Break
+    Endif
+    #Mise à jour de la société de l'entête
+    this.LEGCPY = WCPYLIN
+    #4 - La qté ne peut pas être nulle si expédition
+    If this.SHIPTYP = 1
+      If this.SHD(I).SHIQTY = AVOID.ADEC
+        Call TEXTE(29285, WTEXTE) From OBJDIV
+        [L]ASTATUS = fmet this.ASETERROR(WTEXTE, mess(10,123,1), [V]CST_AERROR)
+        Break
+      Endif
+    Endif
+    #4.1 - update shipped qty impossible if in container
+    If this.SHD(I).CTRNUM<> AVOID.ACHAR & (this.SHD(I).SHIQTY<> this.SHD(I).snapshot.SHIQTY) & (this.SHD(I).snapshot.SHIQTY<>AVOID.ADEC)
+      [L]ASTATUS = fmet this.ASETERROR("", mess(566,194,1), [V]CST_AERROR)
+      Break
+    Endif
+    #4.2 - If container : chek that order ans qty are OK
+    If this.SHD(I).CTRNUM<> AVOID.ACHAR
+      If WCTRNUM = 2  #si une ligne est par commande => erreur
+        [L]ASTATUS = fmet this.ASETERROR("", mess(570,194,1), [V]CST_AERROR)
+        Break
+      Endif
+      WCTRNUM = 1 #par conteneur
+      Local File CONTAINERD [CTRD]
+      Read [CTRD] CTRD2=this.SHD(I).CTRNUM;this.SHD(I).POHNUM;this.SHD(I).POPLIN;this.SHD(I).POQSEQ
+      If fstat <> 0
+        WMESSAGE = func AFNC.MES2(mess(567,194,1), mess(16,535,1), mess(10,159,1))
+        [L]ASTATUS = fmet this.ASETERROR("", WMESSAGE, [V]CST_AERROR)
+        Break
+      Elsif [F:CTRD]QTYUOM <> this.SHD(I).SHIQTY
+        WMESSAGE = func AFNC.MES2(mess(567,194,1), mess(16,535,1), mess(163,154,1))
+        [L]ASTATUS = fmet this.ASETERROR("", WMESSAGE, [V]CST_AERROR)
+        Break
+      Endif
+      Close File [CTRD]
+    Else
+      If WCTRNUM = 1  #si une ligne par conteneur => erreur
+        [L]ASTATUS = fmet this.ASETERROR("", mess(570,194,1), [V]CST_AERROR)
+        Break
+      Endif
+      WCTRNUM = 2 #par commande
+    Endif
+    # Issue 111256 US3
+    #5- is all lines are in container
+    If this.TCTRNUM <> AVOID.ACHAR & this.SHD(I).CTRNUM = AVOID.ACHAR
+      [L]ASTATUS = fmet this.ASETERROR("", mess(554,194,1), [V]CST_AERROR)
+      Break
+    Endif
+
+    #6- is that all container types are equal to that of the header ?
+    If this.TCTRNUM <> AVOID.ACHAR & this.SHD(I).CTRNUM <> AVOID.ACHAR
+      #read CONTAINER class
+      Local Instance WCONTAINER Using C_CONTAINER
+      WCONTAINER = NewInstance C_CONTAINER AllocGroup null
+
+      If fmet WCONTAINER.AREAD(this.SHD(I).CTRNUM) = [V]CST_AOK
+        If this.TCTRNUM <> WCONTAINER.TCTRNUM
+          [L]ASTATUS = fmet this.ASETERROR("", mess(553,194,1), [V]CST_AERROR)
+          FreeGroup WCONTAINER
+          Break
+        Endif
+      Endif
+      FreeGroup WCONTAINER
+    Endif
+    # End issue 111256 US3
+    # Issue 111257 US 33
+    #7- update the expected receipt date with the expected arrival date
+    # Issue 119360 - 2016-11-03 by MAE : site de réception à la place du site de la commande
+    #If this.SHD(I).POHFCY <> AVOID.ACHAR & ((this.ARVEXPDAT <> this.snapshot.ARVEXPDAT | this.ARVDAT<>this.snapshot.ARVDAT)
+    If this.SHD(I).PRHFCY <> AVOID.ACHAR & ((this.ARVEXPDAT <> this.snapshot.ARVEXPDAT | this.ARVDAT<>this.snapshot.ARVDAT)
+&  | (this.SHD(I).ASTALIN = [V]CST_ANEW))
+      # Issue 119360 - 2016-11-03 by MAE : site de réception à la place du site de la commande
+      #Call CAL_LEADTIME(2, this.ARVTPC, this.SHD(I).POHFCY, "", 6, WLTI) From STCLIB
+      Call CAL_LEADTIME(2, this.ARVTPC, this.SHD(I).PRHFCY, "", 6, WLTI) From STCLIB
+        If this.ARVDAT <> AVOID.ADATE
+          this.SHD(I).EXTRCPDAT = this.ARVDAT + WLTI
+        Elsif this.ARVEXPDAT <> AVOID.ADATE
+          this.SHD(I).EXTRCPDAT = this.ARVEXPDAT + WLTI
+        Endif
+    Endif
+    # End issue 111257 US 33
+    # Issue 111256 US3
+    If this.SHD(I).CTRNUM <> SAVCTRNUM & this.SHD(I).CTRNUM<> AVOID.ACHAR
+      WRET = fmet this.SHD(I)._CALC_TOTAUX(1)   #calcul des totaux pour les conteneurs
+      SAVCTRNUM =  this.SHD(I).CTRNUM
+    Elsif this.SHD(I).CTRNUM  = AVOID.ACHAR     #calcul des totaux pour les commandes
+      WRET = fmet this.SHD(I)._CALC_TOTAUX(2)
+    Endif
+    # End issue 111256 US3
+     # Issue 111256 US3
+    #1 - remplissage de la zone SHIMGT
+    If WSHIPMGTOK =  0
+      If this.TCTRNUM <> ""   #Mono-container
+        this.SHIPMGT = 3 : WSHIPMGTOK = 1
+      Elsif this.SHD(I).CTRNUM <> ""  #Multi-container
+        this.SHIPMGT = 2 : WSHIPMGTOK = 1
+      Else
+        this.SHIPMGT = 1  : WSHIPMGTOK = 1  #lignes de commandes
+      Endif
+    Endif
+    # Issue 15350 - 2016-12-01 by MAE : calcul du statut de l'expé
+    If (this.SHD(I).CLEFLG = 2)
+      WNBSOLDE += 1
+    Elsif (this.SHD(I).RCPQTYPUU=this.SHD(I).SHIQTYPUU) #receptionné
+      WNBRECEPT += 1
+    Elsif (this.SHD(I).PRCPFLG=2)  #pre receptionné
+      WNBPRECEPT += 1
+    Else
+      WNBCREE += 1
+    Endif
+  Endif
+Next I
+If [L]ASTATUS = [V]CST_AERROR
+  Return
+Endif
+
+# Issue 15350 - 2016-12-01 by MAE : Affectation du statut
+# Issue 6079 - 2016-12-13 by MAE : ajout du statut expédié
+If WNBCREE > 0 & this.SHIPFLG<>2 : this.SHIPSTAT = 1
+Elsif WNBCREE > 0 & this.SHIPFLG=2 : this.SHIPSTAT = 2
+Elsif WNBPRECEPT > 0 : this.SHIPSTAT = 3
+Elsif WNBRECEPT > 0 : this.SHIPSTAT = 4
+Elsif WNBSOLDE >0 : this.SHIPSTAT = 5
+Endif
+
+#8- calculation of available weight
+this.AVAWEI = this.MAXWEI - this.CRRWEI
+If this.AVAWEI<0 : this.AVAWEI=0 : Endif
+
+#9- calculation of available volume
+this.AVAVOL = this.MAXVOL - this.CRRVOL
+If this.AVAVOL<0 : this.AVAVOL=0 : Endif
+
+Return
+
+# Issue 111257
+#**
+#* contrôle sur les données du transport
+#*1 - Transport: if informed transport, all the seized data have to be the same
+#*!
+$CTR_TRANSPORT
+  Local Char WMESSAGE(250)
+#déplacé dans SHIPTRNP_CSTD
+#  # 1 - Dates : si date d'arrivée renseignée : date de départ obligatoire, date d'arrivée sup à date de départ et inf à date du jour
+#  If this.ARVDAT <> AVOID.ADATE
+#    If this.DPEDAT = AVOID.ADATE
+#      [L]ASTATUS = fmet this.ASETERROR("", mess(521,194,1) + " : " + mess(10,123,1), [V]CST_AERROR)
+#      Return
+#    Endif
+#    If this.ARVDAT < this.DPEDAT | this.ARVDAT > date$
+#      [L]ASTATUS = fmet this.ASETERROR("", mess(536,194,1), [V]CST_AERROR)
+#      Return
+#    Endif
+#  Endif
+#
+#  If this.ARVEXPDAT <> AVOID.ADATE & this.ARVEXPDAT < this.DPEDAT
+#    [L]ASTATUS = fmet this.ASETERROR("", mess(538,194,1), [V]CST_AERROR)
+#    Return
+#  Endif
+#
+#  # 2 - Lieux : si lieu de départ renseigné : lieu d'arrivée renseigné (et inversement) et différent
+#  If this.DPETPC <> AVOID.ACHAR
+#    If this.ARVTPC <> AVOID.ACHAR
+#      If this.ARVTPC = this.DPETPC
+#        [L]ASTATUS = fmet this.ASETERROR("", mess(626,199,1), [V]CST_AERROR)
+#        Return
+#      Endif
+#    Else
+#      Call TEXTE(53837, WTEXTE) From OBJDIV
+#      [L]ASTATUS = fmet this.ASETERROR(WTEXTE, mess(10,123,1), [V]CST_AERROR)
+#      Return
+#    Endif
+#  Endif
+  #Mail de EBO du 25/03/2016, pas de controle si le lieu de départ n'est pas renseigné
+#  If this.ARVTPC<>AVOID.ACHAR & this.DPETPC = AVOID.ACHAR
+#    Call TEXTE(53836, WTEXTE) From OBJDIV
+#    [L]ASTATUS = fmet this.ASETERROR(WTEXTE, mess(10,123,1), [V]CST_AERROR)
+#    Return
+#  Endif
+  #1 - Transport: if informed transport, all the seized data have to be the same
+  Local Instance WTRANSPORT Using C_TRANSPORT
+  WTRANSPORT = NewInstance C_TRANSPORT AllocGroup null
+  If this.TRNNUM <> AVOID.ACHAR
+    If fmet WTRANSPORT.AREAD(this.TRNNUM) = [V]CST_AOK
+      Local Integer WERR : WERR = 0
+      If this.DPEDAT <> WTRANSPORT.DPEDAT | this.ARVDAT <> WTRANSPORT.ARVDAT | this.DPETPC <> WTRANSPORT.DPETPC |
+&     this.ARVTPC <> WTRANSPORT.ARVTPC | this.ARVEXPDAT <> WTRANSPORT.ARVEXPDAT | this.BPTNUM <> WTRANSPORT.BPTNUM |
+&     this.TRNMOD <> WTRANSPORT.TRNMOD
+        [L]ASTATUS = fmet this.ASETERROR("", mess(537,194,1), [V]CST_AERROR)
+        FreeGroup WTRANSPORT
+        Return
+      Endif
+    Else
+        WMESSAGE = func AFNC.MES1 (mess(644,199,1),mess(39,477,1))
+        [L]ASTATUS = fmet this.ASETERROR("TRNNUM", WMESSAGE, [V]CST_AERROR)
+        FreeGroup WTRANSPORT
+        Return
+    Endif
+  Endif
+FreeGroup WTRANSPORT
+Return
+# End issue 111257
+
+
+
+#**
+#* 1 - Gestion de la numérotation automatique
+#*!
+$AINSERT_BEFORE
+  Local Char WSEQ_CODE(25)
+  Local Integer WMANUAL
+  Local Char WCOMP(250)
+
+  # 1 - Gestion de la numérotation automatique
+  # If this.SHIPNUM = AVOID.ACHAR     # Issue X3-86304 - 2018-04-23 by MAE
+    Local Char WMESSAGE(250)
+    # Lecture du compteur
+    If func TCA_TOOL.LECTCA(this.ACTX, 6,
+&                         fmet this.ACTX.ACACHE.AFCY.AGETVALCHAR(this.FCY,"LEGCPY"),
+&                         fmet this.ACTX.ACACHE.AFCY.AGETVALCHAR(this.FCY,"LEG"), 18, WSEQ_CODE, WMANUAL, WMESSAGE) = [V]CST_AFALSE
+      [L]ASTATUS = fmet this.ASETERROR("SHIPNUM", mess(64,199,1), [V]CST_AERROR)
+      Return
+    Endif
+    # Appel du numéro
+    If (this.SHIPNUM = AVOID.ACHAR ) | (this.SHIPNUM <> AVOID.ACHAR & WMANUAL= [V]CST_ANO)  # Issue X3-86304 - 2018-04-23 by MAE : si affectation manuelle à Non, compteur obligatoire
+      [L]ASTATUS = func ANM_TOOL.NUMERO(this.ACTX, WSEQ_CODE, this.FCY, date$, WCOMP, this.SHIPNUM, WMESSAGE)
+      If [L]ASTATUS >= [V]CST_AERROR
+        [L]ASTATUS = fmet this.ASETERROR("SHIPNUM", WMESSAGE, [L]ASTATUS)
+        Return
+      Endif
+    Endif         # Issue X3-86304 - 2018-04-23 by MAE
+  # Si la numérotation auto n'a pas marché, pour ne pas avoir le retour d'erreur de la base
+  If this.SHIPNUM = AVOID.ACHAR
+    [L]ASTATUS = fmet this.ASETERROR("SHIPNUM", mess(10,123,1), [V]CST_AERROR)
+    Return
+  Endif
+Return
+
+#Init SHIPLIN
+$AUPDATE_BEFORE
+  Local Integer I, WSHIPLIN
+
+  WSHIPLIN = 1000 + max(this.SHD(1..maxtab(this.SHD)).SHIPLIN)
+  # Init CTRLIN for each new line
+  For I = 1 To maxtab(this.SHD)
+    If this.SHD(I) <> null and find(this.SHD(I).ASTALIN, [V]CST_ANEW) > 0
+      this.SHD(I).SHIPLIN = WSHIPLIN
+      WSHIPLIN += 1000
+    Endif
+  Next I
+
+Return
+# Issue 58314_2 : controle dépendances
+$AUPDATE_AFTER
+Gosub CONTROLE_DEP From SHIPTRACK_CSTD
+Return
+# Issue 53814_2
+
+#**
+#* Warning: Use of APARENT property
+#*!
+$SHD_AINSERT_BEFORE
+  If this.SHIPLIN = AVOID.ADEC
+    this.SHIPLIN = 1 + max(this.APARENT.SHD(1..maxtab(this.APARENT.SHD)).SHIPLIN)
+  Endif
+Return
+
+#**
+#* 1 - est ce que la commande est expédiable
+#*!
+$SHD_AINSERT_CONTROL_AFTER
+  Local Char WTEXTE(100)
+  Local Integer RET
+  Local Char SAV_CTRNUM (GLONCTRH)
+  Local Instance WPORDERQ Using C_PORDERQ
+  WPORDERQ = NewInstance C_PORDERQ AllocGroup null
+
+  #Si on est en expédition par conteneur, les tests sur la commande ont déjà été faits
+  If this.CTRNUM = AVOID.ACHAR
+    If fmet WPORDERQ.OPE_IS_SHIPPABLE(this.POHNUM, this.POPLIN, this.POQSEQ) = [V]CST_ANO
+      [L]RET = func SYRSTACKTOOLS.MSGSTACK_COPY_TO(WPORDERQ, this)
+      [L]ASTATUS = fmet this.AGETMAXERROR("")
+      # Issue X3-86303
+      FreeGroup WPORDERQ
+      Return
+    Endif
+
+#  Else
+#    #container exist ?
+#    # Issue 56547 - 2017-10-31 by MAE : plus de controle sur l'existence du conteneur
+#    If GUSER="MAE" : Dbgaff : Endif
+#    If this.CTRNUM<>SAV_CTRNUM
+#      Local Instance WCONTAINER Using C_CONTAINER
+#      WCONTAINER = NewInstance C_CONTAINER AllocGroup null
+#      # Container
+#      If fmet WCONTAINER.AREAD(this.CTRNUM) >= [V]CST_AERROR
+#        [L]RET = func SYRSTACKTOOLS.MSGSTACK_COPY_TO(WCONTAINER, this)
+#        [L]ASTATUS = fmet this.AGETMAXERROR("")
+#      Endif
+#      SAV_CTRNUM = this.CTRNUM    # Issue 56547 - 2017-10-31 by MAE
+#      FreeGroup WCONTAINER
+#    Endif   # Issue 56547 - 2017-10-31 by MAE
+  Endif
+  FreeGroup WPORDERQ  # Issue X3-86303
+
+Return
+
+#**
+#* 1- si qté réceptionnée ou pré-receptionnée, modification de la qté impossible<br/>
+#* Warning: Use of APARENT propertry
+#*!
+$SHD_AUPDATE_CONTROL_AFTER
+  Local Char WTEXTE(100)
+  # 1- En expédition : si qté réceptionnée, pré-receptionnée ou soldée, modification de la qté impossible
+  If this.APARENT.SHIPTYP = 1
+    If ((this.PRCPFLG = 2) | (this.CLEFLG = 2) | (this.RCPQTYSTU<>AVOID.ADEC)) & (this.SHIQTY <> this.snapshot.SHIQTY)
+      Call TEXTE(29285, WTEXTE) From OBJDIV
+      [L]ASTATUS = fmet this.ASETERROR(WTEXTE, mess(9,123,1) + " - " + mess(502,194,1), [V]CST_AERROR)
+    Endif
+  Else
+    If ((this.CLEFLG = 2) | (this.RCPQTYSTU<>AVOID.ADEC)) & (this.PRCPQTY <> this.snapshot.PRCPQTY)
+      Call TEXTE(53832, WTEXTE) From OBJDIV
+      [L]ASTATUS = fmet this.ASETERROR(WTEXTE, mess(9,123,1) + " - " + mess(502,194,1), [V]CST_AERROR)
+    Endif
+  Endif
+
+Return
+
+
+
+#**
+#* 1- update des lignes de commande pour entretenir la qté expédiée<br/>
+#* 2- update des conteneurs et de la ligne de conteneur avec le num d'expé
+#*!
+$SHD_AINSERT_AFTER
+Local Char WENV(20)
+Local Integer RET
+
+  # 1- entretien des quantités expédiées sur la ligne de commande
+  Local Instance WPORDERQ Using C_PORDERQ
+  WPORDERQ = NewInstance C_PORDERQ AllocGroup null
+  If fmet WPORDERQ.OPE_MANAGE_QTY(this.POHNUM, this.POPLIN, this.POQSEQ, this) >= [V]CST_AERROR
+    [L]RET = func SYRSTACKTOOLS.MSGSTACK_COPY_TO(WPORDERQ, this)
+    [L]ASTATUS = fmet this.AGETMAXERROR("")
+    FreeGroup WPORDERQ
+    Return
+  Endif
+
+  FreeGroup WPORDERQ      # Issue X3-86303 - 2018-04-23 by MAE
+
+  # 2 - update des conteneurs et de la ligne de conteneur avec le num d'expé
+  If this.CTRNUM <> AVOID.ACHAR
+    Local Instance WCONTAINER Using C_CONTAINER
+    WCONTAINER = NewInstance C_CONTAINER AllocGroup null
+    # Container
+    If fmet WCONTAINER.SET_SHIPNUM(this.CTRNUM, this.SHIPNUM) >= [V]CST_AERROR
+      #[L]ASTATUS=fmet this.AGETERRORSFROM(WCONTAINER,"") # ne fonctionne pas pour le moment
+      [L]RET = func SYRSTACKTOOLS.MSGSTACK_COPY_TO(WCONTAINER, this)
+      [L]ASTATUS = fmet this.AGETMAXERROR("")
+      FreeGroup WCONTAINER
+      Return
+    Endif
+    FreeGroup WCONTAINER
+  Endif
+Return
+
+#**
+#* 1- Update des lignes de commande avec la qté expédiée
+#* Si modif de qté expédiée : quantité en expédition de la commande = quantité déjà expédiée - diff de quantité
+#* Si solde de la ligne d'expé : qté en expé = qté déjà expédiée - qté réceptionnée
+#*!
+$SHD_AUPDATE_AFTER
+Local Integer RET
+# Issue 110325  - 2016-02-02 by MAE : Mise à jour de la qté expédiée de la cde en cas de solde
+
+  If ((this.snapshot.SHIQTYSTU <> this.SHIQTYSTU) & this.CTRNUM = AVOID.ACHAR) | (this.CLEFLG<>this.snapshot.CLEFLG)
+& | find(this.POHCLE,1,2)
+    Local Instance WPORDERQ Using C_PORDERQ
+    # 1 - update des lignes de commande avec la qté expédiée
+    WPORDERQ = NewInstance C_PORDERQ AllocGroup null
+    If fmet WPORDERQ.OPE_MANAGE_QTY(this.POHNUM, this.POPLIN, this.POQSEQ, this) >= [V]CST_AERROR
+      [L]RET = func SYRSTACKTOOLS.MSGSTACK_COPY_TO(WPORDERQ, this)
+      [L]ASTATUS = fmet this.AGETMAXERROR("")
+      FreeGroup WPORDERQ
+      Return
+    Endif
+    If (this.snapshot.SHIQTYSTU = this.SHIQTYSTU)
+      If ((this.CLEFLG<>this.snapshot.CLEFLG) & (this.CLEFLG = 2))
+        #régularisation FCC en solde
+        If this.RCPQTYSTU <> 0
+          Call REGPRIX_FCC(5,"",0) From TRTACHFAC1
+        Endif
+      Elsif ((this.CLEFLG<>this.snapshot.CLEFLG) & (this.CLEFLG = 1))
+        #régularisation FCC en désolde d'une ligne d'expé
+        If this.RCPQTYSTU <> 0
+          Call REGPRIX_FCC(6,"",0) From TRTACHFAC1
+        Endif
+      Endif
+    Endif
+    If find(this.POHCLE,1,2)
+      # Issue 110325/125 - 2016-05-23 by SR
+      Call DIVPOQCLE(WPORDERQ.POHNUM,WPORDERQ.POPLIN,WPORDERQ.POQSEQ,this.POHCLE,1) From TRTACHDIV1
+    Endif
+    FreeGroup WPORDERQ
+  Endif
+
+#fait dans l'opération WPORDERQ.OPE_MANAGE_QTY
+#    If fmet WPORDERQ.AREAD(this.POHNUM, this.POPLIN, this.POQSEQ) = [V]CST_AOK
+#  #TODO cfavre: Créer peut-être une methode (ou opération) ADJUST_QUANTITY() sur la classe PORDERQ
+#    If ((this.snapshot.SHIQTYSTU <> this.SHIQTYSTU) & this.CTRNUM = AVOID.ACHAR)
+#      WPORDERQ.SHIQTYSTU = WPORDERQ.SHIQTYSTU - this.snapshot.SHIQTYSTU + this.SHIQTYSTU
+#      If WPORDERQ.SHIQTYSTU < 0
+#        WPORDERQ.SHIQTYSTU = 0
+#      Endif
+#      WPORDERQ.SHIQTYPUU = WPORDERQ.SHIQTYPUU - this.snapshot.SHIQTYPUU + this.SHIQTYPUU
+#      If WPORDERQ.SHIQTYPUU < 0
+#        WPORDERQ.SHIQTYPUU = 0
+#      Endif
+#    #passage de pré-réception=1 à pré-réception=2 sur pré-reception d'expé (pré-réception à 0)
+#    Elsif ((this.CLEFLG<>this.snapshot.CLEFLG) & (this.CLEFLG = 2))
+#      WPORDERQ.SHIQTYSTU = WPORDERQ.SHIQTYSTU - (this.SHIQTYSTU - this.RCPQTYSTU )
+#      If WPORDERQ.SHIQTYSTU < 0
+#        WPORDERQ.SHIQTYSTU = 0
+#      Endif
+#      WPORDERQ.SHIQTYPUU = WPORDERQ.SHIQTYPUU - (this.SHIQTYPUU - this.RCPQTYPUU)
+#      If WPORDERQ.SHIQTYPUU < 0
+#        WPORDERQ.SHIQTYPUU = 0
+#      Endif
+#      #régularisation FCC en solde
+#      If this.RCPQTYSTU <> 0
+#        Call REGPRIX_FCC(5,"",0) From TRTACHFAC1
+#      Endif
+#     #passage de pré-réception=2 à pré-réception=1 sur pré-reception d'expé
+#     Elsif ((this.CLEFLG<>this.snapshot.CLEFLG) & (this.CLEFLG = 1))
+#      WPORDERQ.SHIQTYSTU = WPORDERQ.SHIQTYSTU + (this.SHIQTYSTU - this.RCPQTYSTU )
+#      WPORDERQ.SHIQTYPUU = WPORDERQ.SHIQTYPUU + (this.SHIQTYPUU - this.RCPQTYPUU)
+#      #régularisation FCC en désolde d'une ligne d'expé
+#      If this.RCPQTYSTU <> 0
+#        Call REGPRIX_FCC(6,"",0) From TRTACHFAC1
+#      Endif
+#    Endif
+#    # End issue 111257 US 72
+#      If fmet WPORDERQ.AUPDATE() <> [V]CST_AOK
+#        [L]ASTATUS = fmet this.ASETERROR("PORDERQ", mess(500,194,1), [V]CST_AERROR)
+#      Endif
+      # Issue 111257 US 72
+Return
+
+#**
+#* 1- Suppression impossible si qté pré-réceptionnée <> 0 (PRCPFLG) ou si qté réceptionnée <> 0 (RCPQTYSTU) ou si soldé (CLEFLG)
+#*!
+$SHD_ADELETE_CONTROL_BEFORE
+  # 1
+  If (this.PRCPFLG = 2) | (this.CLEFLG = 2) | (this.RCPQTYSTU<>AVOID.ADEC)
+    [L]ASTATUS = fmet this.ASETERROR("", mess(1,115,1) + " - " + mess(502,194,1), [V]CST_AERROR)
+    Return
+  Endif
+
+  Local File PINVOICED [PID]
+  Filter [PID] Where PIHTYP = 2
+  Look [PID] PID1(3)=6;this.SHIPNUM;this.SHIPLIN
+  Filter [PID]
+  If !fstat
+    [L]ASTATUS = fmet this.ASETERROR("", mess(527,194,1), [V]CST_AERROR)
+    Return
+  Endif
+Return
+
+#**
+#* 1- Update de la ligne de commande pour entretenir la qté expédiée<br/>
+#* 2- Update des conteneurs pour reinitialiser la zone SHIPNUM
+#*!
+$SHD_ADELETE_AFTER
+Local Integer RET
+  # 1
+  Local Instance WPORDERQ Using C_PORDERQ
+  WPORDERQ = NewInstance C_PORDERQ AllocGroup null
+  If fmet WPORDERQ.OPE_MANAGE_QTY(this.POHNUM, this.POPLIN, this.POQSEQ, this) >= [V]CST_AERROR
+    [L]RET = func SYRSTACKTOOLS.MSGSTACK_COPY_TO(WPORDERQ, this)
+    [L]ASTATUS = fmet this.AGETMAXERROR("")
+    FreeGroup WPORDERQ
+    Return
+  Endif
+  FreeGroup WPORDERQ    # Issue X3-86303
+  # 2
+  If this.CTRNUM <> AVOID.ACHAR
+    Local Instance WCONTAINER Using C_CONTAINER
+    WCONTAINER = NewInstance C_CONTAINER AllocGroup null
+    # Update de l'entête du conteneur
+    If fmet WCONTAINER.SET_SHIPNUM(this.CTRNUM, AVOID.ACHAR) >= [V]CST_AERROR
+      #[L]ASTATUS=fmet this.AGETERRORSFROM(WCONTAINER,"") # ne fonctionne pas pour le moment
+      [L]RET = func SYRSTACKTOOLS.MSGSTACK_COPY_TO(WCONTAINER, this)
+      [L]ASTATUS = fmet this.AGETMAXERROR("")
+      FreeGroup WCONTAINER
+      Return
+    Endif
+#   Endif
+    FreeGroup WCONTAINER
+  Endif
+Return
+
+
+#**
+#* Warning: Use of APARENT property
+#*!
+$SHD_ADDLINE_AFTER
+  # INIT Key
+  this.SHIPNUM = this.APARENT.SHIPNUM
+  this.SHIPLIN = 1 + max(this.APARENT.SHD(1..maxtab(this.APARENT.SHD)).SHIPLIN)
+Return
+# Issue 111257 US 33
+#**
+#* if arrival date is filled, no modification on departure date, departure and arrival place, carrier and carrier mode
+#*!
+#$CTR_DATE
+#Déplacé dans SHIP_LIB
+#Local Char WTEXTE (100)
+#Local Char WTEXTE1 (200)
+#Local Char WTEXTETMP (100)
+#If this.ARVDAT <> AVOID.ADATE & this.snapshot.ARVDAT<> AVOID.ADATE
+#  If (this.DPEDAT<>this.snapshot.DPEDAT) | (this.DPETPC<>this.snapshot.DPETPC) | (this.ARVTPC<>this.snapshot.ARVTPC)
+#&   | (this.TRNMOD<>this.snapshot.TRNMOD) | (this.BPTNUM<>this.snapshot.BPTNUM)
+#    Call TEXTE(52762, WTEXTE) From OBJDIV
+#    Call TEXTE(52763, WTEXTE1) From OBJDIV
+#    Call TEXTE(14436, WTEXTETMP) From OBJDIV
+#    WTEXTE1 = WTEXTE1 + "," + WTEXTETMP
+#    Call TEXTE(1434, WTEXTETMP) From OBJDIV
+#    WTEXTE1 = WTEXTE1 + "," + WTEXTETMP
+#    WTEXTETMP = mess(520,194,1)
+#    WTEXTE1 = WTEXTE1 + "," + WTEXTETMP
+#    WMESSAGE = func AFNC.MES2(mess(545,194,1), WTEXTE, WTEXTE1)
+#    [L]ASTATUS = fmet this.ASETERROR("", WMESSAGE, [V]CST_AERROR)
+#    Return
+#  Endif
+#Endif
+#Return
+# End issue 111257 US 33
+
+#**
+#* Warning: Use of APARENT property
+#*!
+$SHIPD_AINSERT_BEFORE
+  If this.VCRNUM = AVOID.ACHAR
+    this.VCRNUM = this.APARENT.SHIPNUM
+  Endif
+Return
+
+$SHIPD_AUPD_AINS_CONTROL_AFTER
+Local Char WTEXTE (100)
+  If this.SDTYPE = AVOID.ACHAR
+    Call TEXTE(865, WTEXTE) From OBJDIV
+    [L]ASTATUS = fmet this.ASETERROR(WTEXTE, mess(10,123,1), [V]CST_AERROR)
+  Endif
+Return
+
+#**
+#* capacity control :
+#* 1 - number of container filled : TCTRNUM msut be filled
+#* TCTRNUM <> ""
+#* 2 - unities control : weignth and volume
+#* 3 - total weight = number of container * current weight
+#*     total volume = number of container * volume
+#*!
+$CTR_CAPACITY
+#1 - number of container filled : TCTRNUM msut be filled
+If this.SHIPNBCTR <> 0 & this.TCTRNUM = AVOID.ACHAR
+  Call TEXTE(52437, WTEXTE) From OBJDIV
+  [L]ASTATUS = fmet this.ASETERROR(WTEXTE, mess(10,123,1), [V]CST_AERROR)
+  Return
+Endif
+If this.TCTRNUM <> AVOID.ACHAR
+  #read TABCONTAINER class
+  Local Instance WTABCONTAINER Using C_TABCONTAINER
+  WTABCONTAINER = NewInstance C_TABCONTAINER AllocGroup null
+
+  If fmet WTABCONTAINER.AREAD(this.TCTRNUM) = [V]CST_AOK
+    #2 - unities control : weignth and volume
+    If this.DSPWEU <> WTABCONTAINER.WEU | this.DSPVOU <> WTABCONTAINER.VOU
+      [L]ASTATUS = fmet this.ASETERROR("", mess(551,194,1), [V]CST_AERROR)
+      FreeGroup WTABCONTAINER
+      Return
+    Endif
+    #3 - TOTAL WEIGHT = NUMBER OF CONTAINER * CURRENT WEIGHT/ total volume = number of container * volume
+    If this.MAXWEI <> this.SHIPNBCTR * (WTABCONTAINER.TARWEI + WTABCONTAINER.MAXWEI)
+&      | this.MAXVOL <> this.SHIPNBCTR * WTABCONTAINER.TCTRVOL
+      [L]ASTATUS = fmet this.ASETERROR("", mess(552,194,1), [V]CST_AERROR)
+      FreeGroup WTABCONTAINER
+      Return
+    Endif
+  Endif
+FreeGroup WTABCONTAINER
+Endif
+Return
+#######################################################################################
+# Issue 111257 US 42
+$SHIPT_ADELLINE_AFTER
+If func SYRCOLLECTION.SORTDEL(this, "TRKSORT", this.TRKSORT, "SHIPT", 10) <> CST_AOK
+  [L]ASTATUS = fmet this.ASETERROR("",func ASYRFNC.MES2(mess(273,133,1), 'SHIPT', 'SHIPMENT'), [V]CST_AERROR)
+Endif
+Return
+#######################################################################################
+$SHIPT_GET_INDEX
+  [L]ARET_VALUE = find(LIGNE,this.SHIPT(1..maxtab(this.SHIPT)).STLIN)
+Return
+#######################################################################################
+# Issue 15350 - 2016-12-06 by MAE : Update quantities and status
+$_UPD_QTY_STAT
+
+Local Instance WSHIPMENTD Using C_SHIPMENTD
+WSHIPMENTD = NewInstance C_SHIPMENTD AllocGroup null
+Local Instance WSHIPMENT Using C_SHIPMENT
+WSHIPMENT = NewInstance C_SHIPMENT AllocGroup null
+
+#update the quantities on the line
+If fmet WSHIPMENTD.AREAD(SHIPNUM,NUMLINE) < [V]CST_AERROR
+  # Char QTYTYPE Quantity type (CST_RCP:receipt, CST_PRCP:pre-receipt, CST_SHP:shipped)
+  If fmet WSHIPMENTD._UPDQTYLIN(QTYTYPE,QTY,QTYPUU,QTYSTU,CLEFLG) < [V]CST_AERROR
+     If fmet WSHIPMENTD.AUPDATE() >= [V]CST_AERROR
+      WRET = fmet WSHIPMENTD.ASETERROR("SHIPMENTD", mess(581,194,1), [V]CST_AERROR)
+     Else
+      #Update the status on the header
+      If fmet WSHIPMENT.AREAD(SHIPNUM) < [V]CST_AERROR
+        If fmet WSHIPMENT._UPD_STATUS() < [V]CST_AERROR
+          If fmet WSHIPMENT.AUPDATE() >= [V]CST_AERROR
+            WRET = fmet WSHIPMENT.ASETERROR("SHIPMENT", mess(581,194,1), [V]CST_AERROR)
+          Endif
+        Endif
+      Endif
+    Endif
+  Endif
+Endif
+
+LMESS = func LCCLIB.MAXMSG(WSHIPMENT)
+If LMESS = AVOID.ACHAR | fmet WSHIPMENT.AGETMAXERROR("") < [V]CST_AERROR
+  LMESS = func LCCLIB.MAXMSG(WSHIPMENTD)
+Endif
+
+FreeGroup WSHIPMENT
+FreeGroup WSHIPMENTD
+
+Return
+
+#######################################################################################
+#**
+#* update the status in the header
+#*!
+$_UPD_STATUS
+Local Integer WNBRECEPT,WNBPRECEPT,WNBCREE, LVCRTYP,WNBSOLDE
+
+WNBRECEPT=0:WNBPRECEPT=0:WNBCREE=0:WNBSOLDE=0
+For I=1 To maxtab(this.SHD)
+# Issue 15176 - 2016-12-01 by MAE : calcul du statut de l'expé
+    If (this.SHD(I).CLEFLG = 2)
+      WNBSOLDE += 1
+    Elsif (this.SHD(I).RCPQTYPUU=this.SHD(I).SHIQTYPUU) #receptionné
+      WNBRECEPT += 1
+    Elsif (this.SHD(I).PRCPFLG=2)  #pre receptionné
+      WNBPRECEPT += 1
+    Else
+      WNBCREE += 1
+    Endif
+Next
+# Issue 6079 - 2016-12-13 by MAE : ajout du statut expédié
+If WNBCREE > 0 & this.SHIPFLG<>2 : this.SHIPSTAT = 1
+Elsif WNBCREE > 0 & this.SHIPFLG=2 : this.SHIPSTAT = 2
+Elsif WNBPRECEPT > 0 : this.SHIPSTAT = 3
+Elsif WNBRECEPT > 0 : this.SHIPSTAT = 4
+Elsif WNBSOLDE >0 : this.SHIPSTAT = 5
+Endif
+Return
+
+#######################################################################################
+#**
+#* Update the receipt quantity in the line and the sold if necessary. Update also the status in the header
+#*
+#* @param SHIPNUM shipment number
+#* @param NUMLINE shipment line
+#* @param QTYPUU quantity in UA
+#* @param QTYSTU quantity in STU
+#* @param CLEFLG sold
+#* @param LMESS message
+#*!
+Funprog MAJQTYRCP(SHIPNUM,NUMLINE,QTYPUU,QTYSTU,CLEFLG,LMESS)
+Value Char SHIPNUM()
+Value Integer NUMLINE
+Value Decimal QTYPUU
+Value Decimal QTYSTU
+Value Shortint CLEFLG
+Variable Char LMESS()
+
+Local Char QTYTYPE(10)
+Local Decimal QTY
+Local Integer WRET
+
+QTYTYPE = "CST_RCP"
+Gosub _UPD_QTY_STAT
+
+End WRET
+
+# End issue 15350
+

@@ -1,0 +1,205 @@
+#<AdxTL>@(#)5.0.0.0 $Revision$
+##########################################################################
+# UTIGPA17   Utilitaire de détection et suppression des allocations      #
+#            en trop sur des OF - matières non soldées (Bug 48662)       #  
+# ---------------------------------------------------------------------- #
+# Problème à résoudre suite au bug 45542                                 #
+#  Il subsiste des incohérences sur les OF - matières non soldées :      # 
+#  Incohérences entre les allocations détaillées (ruptures)dans STOALL   #
+#  et les quantités allouées/rupture dans MFGMAT.                        #
+#  Il peut y avoir également trop d'allocations dans STOALL              #
+#                                                                        #
+#  L'utilitaire :                                                        #
+#  - lit les matières non soldées et les allocations associées ds STOALL #
+#  - supprime de STOALL les allocations en trop par rapport à ce qu'il   #
+#    reste à allouer                                                     #
+#  - remet à jour les qtés ds MFGMAT et dans ORDERS                      #
+#                                                                        #
+##########################################################################
+
+#################################
+WSIMU=0
+#WSIMU=1
+#################################
+
+Call MAJ_UTIGPA17
+End
+
+Subprog MAJ_UTIGPA17
+Local Char DOSSIER(30) : DOSSIER=nomap
+Call SAIDOS(DOSSIER,"") From SAIDOS
+Call OUVRE_TRACE("UTIGPA17: Resynchronization STOALL with MFGMAT") From LECFIC
+Call TEMPON("O") From GESECRAN
+If DOSSIER<>"" Call EXE_UTIGPA17(DOSSIER) : Endif
+Call FERME_TRACE From LECFIC
+Call TEMPOFF     From GESECRAN
+Call LEC_TRACE From LECFIC
+End
+
+
+Subprog EXE_UTIGPA17(DOSSIER)
+Value Char DOSSIER
+
+Local Decimal WRESQTY, WALLQTY, WSHTQTY, WALL, WSHT
+Local Decimal WDIMQTY, LALLQTY, LSHTQTY
+Local Integer LRET 
+
+Call ECR_TRACE("UTIGPA17: Process Start on : "+DOSSIER,0) From GESECRAN
+#----- Ouverture des fichiers -----#
+If clalev([F:MFM])=0  Local File =DOSSIER+".MFGMAT"  [MFM] : Endif
+If clalev([F:STA])=0  Local File =DOSSIER+".STOALL"  [STA] : Endif
+If clalev([F:ORD])=0  Local File =DOSSIER+".ORDERS"  [ORD] : Endif
+
+Call DEBTRANS From GLOCK
+Trbegin [MFM]
+For [MFM] Where MFGSTA=1 & MATSTA<3 & MFMTRKFLG<5 & ALLSTA>1 & RETDAT > [01/01/2006]
+   Raz WALLQTY, WSHTQTY, WALL, WSHT
+   Raz LALLQTY, LSHTQTY
+   # Quantité restant à allouer sur la matière
+   WRESQTY = max(0,[F:MFM]RETQTY-[F:MFM]USEQTY)
+   For [STA]STA2 Where ITMREF=[F:MFM]ITMREF & VCRTYP=10 & VCRNUM=[F:MFM]MFGNUM &
+&                      VCRLIN=[F:MFM]MFGLIN & VCRSEQ=[F:MFM]BOMSEQ
+      # Calcul qtés allouées et ruptures initiales dans STOALL
+      Case [F:STA]ALLTYP
+       When 1,2 : WALLQTY += [F:STA]QTYSTUACT
+       When 4,5 : WSHTQTY += [F:STA]QTYSTUACT
+      Endcase
+   Next
+   WMFM = 0
+   WALL = WALLQTY
+   WSHT = WSHTQTY
+   # Quantités allouées et ruptures de STOALL > quantité restant à allouer
+   If WALLQTY + WSHTQTY > WRESQTY
+      WMFM=1
+      Call ECR_TRACE("---"-[F:MFM]MFGNUM-num$([F:MFM]MFGLIN)-num$([F:MFM]BOMSEQ)-[F:MFM]ITMREF,0) From GESECRAN
+      # Plus de quantité à allouer sur la matière
+      If WRESQTY = 0
+         If WSIMU=1
+            WALL = 0
+            WSHT = 0
+            Call ECR_TRACE("STOALL : Old All/Sht Qty ="+num$(WALLQTY)-"/"-num$(WSHTQTY)-
+&                          "New All/Sht Qty ="+num$(WALL)-"/"-num$(WSHT),0) From GESECRAN
+         Else
+            # Suppression des ruptures et des allocations 
+            Call DELALL(10,[F:MFM]MFGNUM,[F:MFM]MFGLIN,[F:MFM]BOMSEQ,[F:MFM]ITMREF,
+&                        0,LALLQTY,LSHTQTY,LRET) From STKALL
+            If LRET = 0
+               WALL = 0
+               WSHT = 0
+               Call ECR_TRACE("STOALL : Old All/Sht Qty ="+num$(WALLQTY)-"/"-num$(WSHTQTY)-
+&                             "New All/Sht Qty ="+num$(WALL)-"/"-num$(WSHT),0) From GESECRAN
+            Else
+               Call ECR_TRACE("Error in DELALL",1) From GESECRAN 
+            Endif
+         Endif                  
+      Else
+         # Quantité à diminuer dans les allocations
+         WDIMQTY = WALLQTY + WSHTQTY - WRESQTY
+         If WSIMU=1
+            If WDIMQTY<WSHTQTY
+               WSHT-=WDIMQTY
+            Else
+               WALL-=WDIMQTY-WSHT
+               WSHT =0
+            Endif
+            Call ECR_TRACE("STOALL : Old All/Sht Qty ="+num$(WALLQTY)-"/"-num$(WSHTQTY)-
+&                         "New All/Sht Qty ="+num$(WALL)-"/"-num$(WSHT),0) From GESECRAN
+         Else
+            # Diminution des ruptures puis allocations 
+            Call DIMALL(10,[F:MFM]MFGNUM,[F:MFM]MFGLIN,[F:MFM]BOMSEQ,[F:MFM]ITMREF,
+&                        0,WDIMQTY,LALLQTY,LSHTQTY,LRET) From STKALL
+            # Calcul des nouvelles quantités allouées et rupture sur la matière
+            If LRET = 0
+               WALL -= LALLQTY
+               WSHT -= LSHTQTY
+               Call ECR_TRACE("STOALL : Old All/Sht Qty ="+num$(WALLQTY)-"/"-num$(WSHTQTY)-
+&                            "New All/Sht Qty ="+num$(WALL)-"/"-num$(WSHT),0) From GESECRAN
+            Else
+               Call ECR_TRACE("Error in DIMALL",1) From GESECRAN 
+            Endif
+         Endif
+      Endif
+   Endif
+   If [F:MFM]ALLQTY<>WALL | [F:MFM]SHTQTY<>WSHT
+      If WMFM=0
+         Call ECR_TRACE("---"-[F:MFM]MFGNUM-num$([F:MFM]MFGLIN)-num$([F:MFM]BOMSEQ)-[F:MFM]ITMREF,0) From GESECRAN
+      Endif
+      # Sauvegarde des anciennes quantités allouées et rupture sur la matière
+      WALLQTY = [F:MFM]ALLQTY
+      WSHTQTY = [F:MFM]SHTQTY
+      # Alimentation des nouvelles quantités allouées et rupture sur la matière
+      [F:MFM]ALLQTY = WALL
+      [F:MFM]SHTQTY = WSHT
+      # Alimentation du statut allocation
+      If [F:MFM]SHTQTY <> 0
+         If !find([F:MFM]ALLSTA,2,4) [F:MFM]ALLSTA=4 Endif
+      Elsif [F:MFM]ALLQTY <> 0
+         If !find([F:MFM]ALLSTA,3,5) [F:MFM]ALLSTA=5 Endif
+      Else
+         [F:MFM]ALLSTA = 1
+      Endif
+      If WSIMU=1
+         Call ECR_TRACE("MFGMAT : Old All/Sht Qty ="+num$(WALLQTY)-"/"-num$(WSHTQTY)-
+&                       "New All/Sht Qty ="+num$(WALL)-"/"-num$(WSHT),0) From GESECRAN
+         # Resynchro de l'encours
+         Read [ORD]ORD0=6;[F:MFM]WIPNUM;[F:MFM]ITMREF
+         If fstat 
+            Call ECR_TRACE("File ORDERS"-"6"-num$([F:MFM]WIPNUM)-[F:MFM]ITMREF+", ERROR ="-num$(fstat),1) From GESECRAN
+         Endif
+      Else
+         # Réécriture de la matière
+         Rewrite [MFM]
+         If fstat
+            Call ECR_TRACE("File MFGMAT"-[F:MFM]MFGNUM-num$([F:MFM]MFGLIN)-num$([F:MFM]BOMSEQ)
+&                           -[F:MFM]ITMREF+", Error ="-num$(fstat),1) From GESECRAN
+         Else
+            Call ECR_TRACE("MFGMAT : Old All/Sht Qty ="+num$(WALLQTY)-"/"-num$(WSHTQTY)-
+&                          "New All/Sht Qty ="+num$(WALL)-"/"-num$(WSHT),0) From GESECRAN
+
+            # Resynchro de l'encours s'il reste quelque chose à traiter
+            If [F:MFM]RETQTY-[F:MFM]USEQTY>0
+               Readlock [ORD]ORD0=6;[F:MFM]WIPNUM;[F:MFM]ITMREF
+               If fstat 
+                  Call ECR_TRACE("File ORDERS"-"6"-num$([F:MFM]WIPNUM)-[F:MFM]ITMREF+", ERROR ="-num$(fstat),1) From GESECRAN
+               Else
+                  [F:ORD]ALLQTY= [F:MFM]ALLQTY
+                  [F:ORD]SHTQTY= [F:MFM]SHTQTY
+                  Rewrite [F:ORD] 
+                  If fstat
+                     Call ECR_TRACE("File ORDERS"-"6"-num$([F:MFM]WIPNUM)-[F:MFM]ITMREF+", ERROR ="-num$(fstat),1) From GESECRAN
+                  Endif
+               Endif
+            Endif
+
+         Endif
+      Endif
+   Endif
+Next
+
+Commit
+
+Call ECR_TRACE("UTIGPA17 : End Process",0) From GESECRAN
+End
+
+########################################################################
+# Pour exécution automatique  en gestion de patch                      #
+########################################################################
+Subprog PATCH(APPLI)
+Value Char    APPLI
+If APPLI="X3" : End : Endif
+If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+Read [ADS] DOSSIER=APPLI : If fstat Raz [F:ADS] : Endif
+Call EXE_UTIGPA17(APPLI)        
+End
+
+#######################################################################
+# Pour exécution depuis dosmaj6 (validation dossier)
+########################################################################
+Subprog UTI_MOUL (APPLI)
+Value Char    APPLI
+If APPLI="X3" End : Endif
+Call EXE_UTIGPA17(APPLI)       
+End
+
+
+

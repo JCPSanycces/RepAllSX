@@ -1,0 +1,620 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+Call EXTRACT_DATA
+End
+
+#**
+#* Extract Dates min & max for all documents using one of data types defined as "Reference" in AGDPRSETTING
+#*!
+Subprog EXTRACT_DATA
+Local Char DOSSIER(GLONADS)
+Local Char TYPLST(GLONATY)(1..1)
+Local Char CODSEA(30)
+Local Integer DEST
+Local Char MSG(250)
+Local Integer LADXUID(1..), LNBUID
+
+DOSSIER   = nomap
+TYPLST(1) = ""      # All data types defined in AGDPRSETTING
+CODSEA    = ""      # All codes
+DEST      = 4       # Record in file only
+
+# This process is mono user
+Lock ="AGDPR_BATCH" With lockwait=0
+If fstat=1
+    Call ERREUR(mess(30,100,1)) From GESECRAN
+    End
+Endif
+
+# Clean all records of old sessions
+Call LIST_UID_INT(LADXUID,LNBUID) From ASESSIONS
+
+Local File AGDPRVCR [AGVCR]
+
+Trbegin [AGVCR]
+Delete [AGVCR] Where UID=0 | find(UID,LADXUID(1..LNBUID))=0
+If fstat=[V]CST_AOK
+    Commit
+
+    If func SEARCH_MINMAX(DOSSIER,TYPLST,CODSEA,DEST,MSG)=[V]CST_AERROR
+        Call ERREUR(MSG) From GESECRAN
+    Endif
+Else
+    Rollback
+    Call ERREUR("[F:AGVCR]"-mess(28,125,1)-func GLOCK.GET_FSTAT_MSG(fstat)) From GESECRAN
+Endif
+
+Unlock ="AGDPR_BATCH"
+
+LogicClose File [AGVCR]
+End
+
+#**
+#* Search Min & Max date of transactions corresponding to a type+code
+#* The result can be displayed, logged or recorded
+#*
+#* @param PDOSSIER : Folder name
+#* @param PTYPLST  : list of data types
+#* @param PCODSEA  : code to look for
+#* @param PDEST    : destination of result can be a sum of 1=Mask AGDPRSEA1, 2=Log file (file using [AGDPR] abrev must be opened), 4=Table
+#* @param PMSG     : error message
+#* @return [V]CST_AERROR if an error occured otherwise [V]CST_AOK
+#*!
+Funprog SEARCH_MINMAX(PDOSSIER,PTYPLST,PCODSEA,PDEST,PMSG)
+Value Char PDOSSIER
+Value Char PTYPLST()(1..)
+Value Char PCODSEA
+Value Integer PDEST
+Variable Char PMSG
+
+Local File =PDOSSIER+".ATABLE"  [ATB]
+Local File =PDOSSIER+".ATABZON" [ATZ]
+Local File =PDOSSIER+".ATABZON" [ATZ2]
+Local File =PDOSSIER+".ATYPE"   [ATY]
+Local File =PDOSSIER+".ATABIND" [ATI]
+Local File =PDOSSIER+".ATEXTE"  [ATX]
+Local File AGDPRVCR [AGVCR]
+
+Local Clbfile QUERY(0)              # Used for SQL queries
+Local Char    QUERY_CHAR(250)(5)
+Local Integer I, LRET
+Local Integer LNBFLD                # Number of fields with same data type in a table
+Local Integer LMSK                  # is set to CST_ATRUE if the screen AGDPRSEA1 must be filled
+Local Integer LLOG                  # is set to CST_ATRUE if data must be written in log file
+Local Integer LTAB                  # is set to CST_ATRUE if data must be recorded in table AGDPRVCR
+Local Date LDATMIN, LDATMAX         # Date mini & maxi of creation/update in a "document"
+Local Char LCODSEA(len(PCODSEA)+2)  # Code to search in documents used for filters
+Local Integer LENGTH_CODE           # Maximum length of code (= length of [AGVCR]CODE)
+Local Integer LNBFIC                # Number of files using a data type
+Local Integer INTERRUPT             # need for AFF_BOITE
+Local Integer LUID                  # UID to record in AGDPRVCR: 0 for global search (batch mode) else adxuid(1)
+Local Char    LDATFLD(50)(2)        # Expression/field used to get min & max dates
+Local Integer NBTYP                 # Nb codes in PTYPLST
+
+LRET=[V]CST_AOK
+LENGTH_CODE = type([F:AGVCR]CODE)-10
+
+If mod(PDEST,2) =1 & clalev([M:AGSEA1]) : LMSK = [V]CST_ATRUE : Endif
+If mod(PDEST,4)>=2 & GTRACE<>""         : LLOG = [V]CST_ATRUE : Endif
+If mod(PDEST,8)>=4                      : LTAB = [V]CST_ATRUE : Endif
+
+If LMSK=[V]CST_ATRUE
+    Raz [M:AGSEA1]
+Endif
+
+# If global search (batch) => LUID=0
+# If search for a code => LUID<>0
+If PCODSEA<>""
+    LUID = adxuid(1)
+Endif
+
+Local File AGDPRSETTING [AGS] Where TYP=1 & ENAFLG=2  # References only
+If PTYPLST(1)<>""
+    NBTYP = find("",PTYPLST)
+    If NBTYP=0
+        NBTYP = dim(PTYPLST)
+    Endif
+    Filter [AGS] Where find(CODE,PTYPLST(1..NBTYP))
+Endif
+
+# Remove old records
+# For min/max date, VCRKEY=""
+Trbegin [AGVCR]
+If PCODSEA<>""
+    Delete [AGVCR] Where [F:AGVCR]UID=adxuid(1) & CODE=PCODSEA & VCRKEY=""
+Else
+    Delete [AGVCR] Where [F:AGVCR]UID=0 & VCRKEY=""
+Endif
+If fstat=[V]CST_AOK
+    Commit
+Else
+    Rollback
+    LRET = [V]CST_AERROR
+    PMSG = "[F:AGVCR]"-mess(28,125,1)-func GLOCK.GET_FSTAT_MSG(fstat)
+    If LLOG
+        Wrseq PMSG Using [AGDPR]
+    Endif
+    End
+Endif
+
+# Loop on each reference type
+For [AGS]
+    Read [ATY]CODTYP=[F:AGS]CODATY
+    If fstat
+        LRET = [V]CST_AERROR
+        PMSG = [F:AGS]CODATY-mess(51,139,1)
+        If LLOG
+            Wrseq PMSG Using [AGDPR]
+        Endif
+        Break
+    Else
+        # Data type must be numeric or alphanumeric
+        If [F:ATY]TYPTYP>7
+            LRET = [V]CST_AERROR
+            PMSG = [F:AGS]CODATY-mess(51,139,1)-mess([F:ATY]TYPTYP,30,1)
+            If LLOG
+                Wrseq PMSG Using [AGDPR]
+            Endif
+            Break
+        Endif
+        # LCODSEA is used to build easily the query
+        If [F:ATY]TYPTYP=7 & PCODSEA<>""
+            LCODSEA = "'"+PCODSEA+"'"
+        Else
+            LCODSEA = PCODSEA
+        Endif
+
+        If !GSERVEUR
+            Raz QUERY, LNBFIC
+            Append QUERY, "SELECT COUNT(DISTINCT CODFIC_0) From "+PDOSSIER+".ATABZON Where CODTYP_0='"+[F:AGS]CODATY+"'"
+            For (Integer NBFIC) From num$(GTYPDBA*2+1) Sql QUERY As [XXX]
+                LNBFIC = [F:XXX]NBFIC
+            Next
+            Call OUVRE_BOITE([F:AGS]CODATY, LNBFIC) From GESECRAN
+        Endif
+
+        # For each table containing at least 1 field with the data type...
+        Raz LNBFIC
+        For [ATZ]CODTYP(2) Where [F:ATZ]CODTYP=[F:AGS]CODATY
+&                              | [F:ATZ]CODFIC=[F:AGS]CODATB & [F:ATZ]CODZONE=[F:AGS]CODFLD
+            If !GSERVEUR
+                Call AFF_BOITE([F:ATZ]CODFIC, LNBFIC, INTERRUPT) From GESECRAN
+            Endif
+            LNBFIC+=1
+            Look [ATZ2]CODZONE=[F:ATZ]CODFIC;"UPDDATTIM"
+            If fstat<>[V]CST_AOK
+                Look [ATZ2]CODZONE=[F:ATZ]CODFIC;"UPDDAT"
+                If fstat<>[V]CST_AOK
+                    # UPDDATTIM & UPDDAT don't exist
+                    Case GTYPDBA
+                        When 1: # Oracle
+                            LDATFLD(0)="null"
+                            LDATFLD(1)="null"
+                        When 2: # SQL Server
+                            LDATFLD(0)="CAST(0 As datetime)"
+                            LDATFLD(1)="CAST(0 As datetime)"
+                    Endcase
+                Else
+                    # UPDDAT exists
+                    LDATFLD(0)="MVT.CREDAT_0"
+                    LDATFLD(1)="MVT.UPDDAT_0"
+                Endif
+            Else
+                # UPDDATTIM exists
+                LDATFLD(0)="MVT.CREDATTIM_0"
+                LDATFLD(1)="MVT.UPDDATTIM_0"
+            Endif
+            # check if the table exists
+            If filinfo(filpath("FIL",[F:ATZ]CODFIC,"fde",PDOSSIER),0)>=0
+                Link [ATB] With [ATX]NUMERO=GLANGUE;[F:ATB]INTITFIC
+&                          As [LNK]
+&                          Where [F:ATB]CODFIC=[F:ATZ]CODFIC
+                Read [LNK] First
+                If PCODSEA<>""
+                    Raz QUERY
+                    Append QUERY,"Select '"+PCODSEA+"', min("+LDATFLD(0)+"),max("+LDATFLD(0)+"), min("+LDATFLD(1)+"),max("+LDATFLD(1)+")"
+                    Append QUERY," From "+PDOSSIER+"."+[F:ATZ]CODFIC+" MVT"
+                    Append QUERY," Where ("
+                    Raz LNBFLD
+                    For [ATZ]CODTYP
+                        If LNBFLD>0
+                            Append QUERY, " or "
+                        Endif
+                        Append QUERY, [F:ATZ]CODZONE+"_0="+LCODSEA
+                        LNBFLD+=1
+                    Next
+                    Append QUERY,")"
+                    Append QUERY,"HAVING COUNT(*)>0"
+                    Gosub LOOP_QUERY
+                    If LRET<>[V]CST_AOK
+                        Break 2
+                    Endif
+                Else
+                    Raz LNBFLD
+                    For [ATZ]CODTYP
+                        Raz QUERY
+                        Append QUERY,"Select cast("+[F:ATZ]CODZONE+"_0 as varchar("+num$(LENGTH_CODE)+")), min("+LDATFLD(0)+"),max("+LDATFLD(0)+"), min("+LDATFLD(1)+"),max("+LDATFLD(1)+")"
+                        Append QUERY," From "+PDOSSIER+"."+[F:ATZ]CODFIC+" MVT"
+                        Append QUERY," Group by "+[F:ATZ]CODZONE+"_0"
+                        Append QUERY," HAVING COUNT(*)>0"
+                        Gosub LOOP_QUERY
+                        If LRET<>[V]CST_AOK
+                            Break 3
+                        Endif
+                        LNBFLD+=1
+                    Next
+                Endif
+            Endif
+        Next
+        If !GSERVEUR
+            Call FERME_BOITE From GESECRAN
+        Endif
+    Endif
+Next
+If LRET<>[V]CST_AOK
+    Call FERME_BOITE From GESECRAN
+Endif
+
+End LRET
+
+$LOOP_QUERY
+Trbegin [AGVCR]
+
+Raz QUERY_CHAR
+Setlob QUERY_CHAR With QUERY
+
+Raz LDATMAX, LDATMIN
+For (Char CODSEA, Datetime MINCREDAT, Datetime MAXCREDAT, Datetime MINUPDDAT, Datetime MAXUPDDAT)
+&                    From num$(GTYPDBA*2+1) Sql QUERY_CHAR As [XXX]
+    If LMSK=[V]CST_ATRUE & [M:AGSEA1]NBLIG>=dim([M:AGSEA1]CODATY)
+        LRET = [V]CST_AWARNING
+        PMSG = "[M:AGSEA1]NBLIG :"-mess(85,100,1)
+        If LLOG
+            Wrseq PMSG Using [AGDPR]
+        Endif
+        Break
+    Endif
+    LDATMIN = func DATMIN(func TODATE([XXX]MINUPDDAT), func TODATE([XXX]MINCREDAT))
+    LDATMAX = max(func TODATE([XXX]MAXUPDDAT),func TODATE([XXX]MAXCREDAT))
+    # Fill the screen
+    If LMSK=[V]CST_ATRUE
+&                    & [M:AGSEA1]NBLIG<dim([M:AGSEA1]CODATY)
+        [M:AGSEA1]CODATY([M:AGSEA1]NBLIG) = [F:AGS]CODATY
+        [M:AGSEA1]CODE  ([M:AGSEA1]NBLIG) = [F:AGS]CODE
+        [M:AGSEA1]CODFIC([M:AGSEA1]NBLIG) = [F:ATZ]CODFIC
+        [M:AGSEA1]DATMIN([M:AGSEA1]NBLIG) = LDATMIN
+        [M:AGSEA1]DATMAX([M:AGSEA1]NBLIG) = LDATMAX
+        [M:AGSEA1]VCRTYP([M:AGSEA1]NBLIG) = [F:ATX]TEXTE
+        [M:AGSEA1]NBLIG+=1
+    Endif
+
+    # Write in the log file
+    If LLOG=[V]CST_ATRUE
+        Wrseq [F:AGS]CODATY+";"+[F:ATX]TEXTE+";"+num$(LDATMIN)+";"+num$(LDATMAX)  Using [AGDPR]
+    Endif
+
+    # Record in AGDPRVCR table
+    If LTAB=[V]CST_ATRUE
+        [F:AGVCR]UID    = LUID
+        [F:AGVCR]CODATY = [F:AGS]CODATY
+        [F:AGVCR]CODFIC = [F:ATZ]CODFIC
+        [F:AGVCR]CODE   = [F:XXX]CODSEA
+        [F:AGVCR]VCRKEY = ""
+        Read [F:AGVCR]AGVCR0=[F:AGVCR]UID;[F:AGVCR]CODATY;[F:AGVCR]CODFIC;[F:AGVCR]CODE;[F:AGVCR]VCRKEY
+        # If record already exists => it has been created for a previous field with same data type
+        If fstat=[V]CST_AOK
+            [F:AGVCR]DATMIN = func DATMIN(LDATMIN,[F:AGVCR]DATMIN)
+            [F:AGVCR]DATMAX = max(LDATMAX,[F:AGVCR]DATMAX)
+            Rewrite [AGVCR]
+            If fstat<>[V]CST_AOK
+                LRET = [V]CST_AERROR
+                PMSG = "[F:AGVCR]"+num$([F:AGVCR]UID)+";"+[F:AGVCR]CODATY+";"+[F:AGVCR]CODFIC+";"+[F:AGVCR]CODE+";"+[F:AGVCR]VCRKEY-mess(27,125,1)-func GLOCK.GET_FSTAT_MSG(fstat)
+                If LLOG
+                    Wrseq PMSG Using [AGDPR]
+                Endif
+                Break
+            Endif
+        Else
+            [F:AGVCR]DATMIN = LDATMIN
+            [F:AGVCR]DATMAX = LDATMAX
+            Write [AGVCR]
+            If fstat<>[V]CST_AOK
+                LRET = [V]CST_AERROR
+                PMSG = "[F:AGVCR]"+num$([F:AGVCR]UID)+";"+[F:AGVCR]CODATY+";"+[F:AGVCR]CODFIC+";"+[F:AGVCR]CODE+";"+[F:AGVCR]VCRKEY-mess(26,125,1)-func GLOCK.GET_FSTAT_MSG(fstat)
+                If LLOG
+                    Wrseq PMSG Using [AGDPR]
+                Endif
+                Break
+            Endif
+        Endif
+    Endif
+Next
+If LRET = [V]CST_AERROR
+    Rollback
+Else
+    Commit
+Endif
+Return
+
+Funprog TODATE(D)
+Value Datetime D
+End gdat$(ctrans(left$(num$(D),10),"-",""))
+
+#**
+#* Return minimum date avoiding [0/0/0]
+#*
+#* @param D1 : Date 1 to compare
+#* @param D2 : Date 1 to compare
+#*!
+Funprog DATMIN(D1, D2)
+Value Date D1
+Value Date D2
+Local Date LDATMIN
+
+If D1=[0/0/0]
+    LDATMIN = D2
+Elsif D2=[0/0/0]
+    LDATMIN = D1
+Else
+    LDATMIN = min(D1,D2)
+Endif
+
+End LDATMIN
+
+#**
+#* Search for a code in tables with predefined data types
+#*
+#* @param PDOSSIER : Folder name
+#* @param PTYPLST  : List of data type to search (if any, use all data types stored in AGDPRSETTING)
+#* @param PCODSEA  : Code to search (if any, search without filter)
+#* @param PCODFIC  : File in which search must be done (if any, look for all tables containing a field with type in PTYPLST)
+#* @param PDEST    : destination of result can be a sum of 1=Mask AGDPRSEA1, 2=Log file (file using [AGDPR] abrev must be opened), 4=Table
+#* @param PMSG     : error message
+#* @return [V]CST_AERROR if an error occured otherwise [V]CST_AOK
+#*!
+Funprog SEARCH_CODE(PDOSSIER,PTYPLST,PCODSEA,PCODFIC,PDEST,PMSG)
+Value Char PDOSSIER
+Value Char PTYPLST()(1..)
+Value Char PCODSEA
+Value Char PCODFIC
+Value Integer PDEST
+Variable Char PMSG
+
+Local Integer LLOG, LTAB
+Local Integer LNBFLD, LRET
+Local Integer NBTYP
+Local Char LCODSEA(len(PCODSEA)+2)
+LRET = [V]CST_AOK
+
+If mod(PDEST,4)>=2 : LLOG = [V]CST_ATRUE : Endif
+If mod(PDEST,8)>=4 : LTAB = [V]CST_ATRUE : Endif
+
+Local File AGDPRSETTING [AGS] Where TYP=1 & ENAFLG=2  # References only
+If PTYPLST(1)<>""
+    NBTYP = find("",PTYPLST)
+    If NBTYP=0
+        NBTYP = dim(PTYPLST)
+    Endif
+    Filter [AGS] Where find(CODE,PTYPLST(1..NBTYP))
+Endif
+
+Local File AGDPRVCR [AGVCR]     # Recording will be done on current folder
+Local File =PDOSSIER+".ATABZON" [ATZ]
+Local File =PDOSSIER+".ATYPE"   [ATY]
+
+If LLOG=[V]CST_ATRUE
+    Wrseq mess(37,100,1)+";"+mess(21,115,1)+";"+mess(56,123,1)+";"+mess(55,123,1) Using [AGDPR]
+Endif
+# For each reference type
+For [AGS]
+    Read [ATY]CODTYP=[F:AGS]CODATY
+    If fstat
+        LRET = [V]CST_AERROR
+        PMSG = [F:AGS]CODATY-mess(51,139,1)
+        If LLOG
+            Wrseq PMSG Using [AGDPR]
+        Endif
+        Break
+    Else
+        # Data type must be numeric or alphanumeric
+        If [F:ATY]TYPTYP>7
+            LRET = [V]CST_AERROR
+            PMSG = [F:AGS]CODATY-mess(51,139,1)-mess([F:ATY]TYPTYP,30,1)
+            If LLOG
+                Wrseq PMSG Using [AGDPR]
+            Endif
+            Break
+        Endif
+        # Remove old records
+        Trbegin [AGVCR]
+        If PCODSEA<>""
+            Delete [AGVCR] Where [F:AGVCR]UID=adxuid(1) & [F:AGVCR]CODATY=[F:AGS]CODATY & CODE=PCODSEA
+        Else
+            Delete [AGVCR] Where [F:AGVCR]UID=0 & [F:AGVCR]CODATY=[F:AGS]CODATY
+        Endif
+        If fstat
+            Rollback
+            LRET = [V]CST_AERROR
+            PMSG = "[F:AGVCR]"-mess(28,125,1)-func GLOCK.GET_FSTAT_MSG(fstat)
+            If LLOG
+                Wrseq PMSG Using [AGDPR]
+            Endif
+            Break 1
+        Endif
+        Commit
+        # LCODSEA is used to build easily the query
+        If [F:ATY]TYPTYP=7 & PCODSEA<>""
+            LCODSEA = "'"+PCODSEA+"'"
+        Else
+            LCODSEA = PCODSEA
+        Endif
+        # For each table containing at least 1 field with the data type...
+        For [ATZ]CODTYP(2) Where ( [F:ATZ]CODTYP=[F:AGS]CODATY
+&                                | [F:ATZ]CODFIC=[F:AGS]CODATB & [F:ATZ]CODZONE=[F:AGS]CODFLD)
+&                              & (CODFIC=[L]PCODFIC | [L]PCODFIC="")
+            KEYFOR=func KEYFORM(PDOSSIER,[ATZ]CODFIC,"VCR")  # Get formula that allow to get the key of a record
+            # check if the table exists
+            If KEYFOR<>"" & filinfo(filpath("FIL",[F:ATZ]CODFIC,"fde",PDOSSIER),0)>=0
+                Local File =PDOSSIER+"."+[F:ATZ]CODFIC [VCR]
+                If LCODSEA=""
+                    FLT="1=1"
+                Else
+                    FLT="("
+                Endif
+                Raz LNBFLD
+                For [ATZ]CODTYP
+                    # If a code has been given, search only for this code
+                    If LCODSEA<>""
+                        If LNBFLD>0
+                            Append FLT, " or "
+                        Endif
+                        Append FLT, [F:ATZ]CODZONE+"="+LCODSEA
+                    Else
+                        # otherwise, get the list of fields with current data type
+                        VCRFLD(LNBFLD) = [F:ATZ]CODZONE
+                    Endif
+                    LNBFLD+=1
+                Next
+                If LCODSEA<>""
+                    Append FLT,")"
+                Endif
+                Gosub RECORD_VCR
+                LogicClose File [VCR]
+                If LRET=[V]CST_AERROR
+                    If LLOG
+                        Wrseq PMSG Using [AGDPR]
+                    Endif
+                    Break 2
+                Endif
+            Endif
+        Next
+    Endif
+Next
+
+LogicClose File [ATZ], [ATY]
+End LRET
+
+##################
+# Record key of all documents
+$RECORD_VCR
+# As reading of [VCR] will be done in function of AUUID, all values must be set
+If dim([F:VCR]AUUID) < 0
+    LRET = [V]CST_AERROR
+    PMSG = func AFNC.MES(mess(21,155,1),[F:ATZ]CODFIC)-mess(22,155,1)
+    Return
+Endif
+
+Filter [VCR] Where AUUID=NullUuid
+Look [VCR] First
+Filter [VCR]
+If fstat=[V]CST_AOK
+    LRET = [V]CST_AERROR
+    PMSG = func AFNC.MES(mess(20,155,1),[F:ATZ]CODFIC)-mess(22,155,1)
+    Return
+Endif
+
+Local Uuident VCRAUUID
+Local Integer IFLD, STOP, LNBVCR
+
+VCRAUUID = NullUuid
+
+$LOOP_VCR
+Trbegin [AGVCR]
+
+Raz STOP, LNBVCR
+# Order the reading with common and unique field in all tables to be able to manage GMAXUPDTRS
+Filter [VCR] Where evalue(FLT)
+&                & AUUID>VCRAUUID
+&            Order By AUUID
+For [VCR]
+    [F:AGVCR]UID = adxuid(1)
+    [F:AGVCR]CODATY = [F:AGS]CODATY
+    [F:AGVCR]CODFIC = [F:ATZ]CODFIC
+    [F:AGVCR]VCRKEY = evalue(KEYFOR)
+    [F:AGVCR]DATMIN = func DATMIN(func TODATE([F:VCR]UPDDATTIM), func TODATE([F:VCR]CREDATTIM))
+    [F:AGVCR]DATMAX = max(func TODATE([F:VCR]UPDDATTIM), func TODATE([F:VCR]CREDATTIM))
+    # Loop on all fields with current data type ([F:AGS]CODATY)
+    # If PCODSEA<>"" => the search has been done thanks to the filter on all fields concerned
+    #                   As we do not store field code, we don't need to loop
+    For IFLD=0 To (LNBFLD-1)*(PCODSEA="")
+        If PCODSEA=""
+            [F:AGVCR]CODE   = evalue("num$([F:VCR]"+VCRFLD(IFLD)+")")
+        Else
+            [F:AGVCR]CODE   = PCODSEA
+        Endif
+
+        If LLOG=[V]CST_ATRUE
+            Wrseq [F:AGVCR]CODE+";"+[F:AGVCR]CODATY+";"+[F:AGVCR]CODFIC+";"+[F:AGVCR]VCRKEY Using [AGDPR]
+        Endif
+        If LTAB
+            # Check if the record already exists
+            Look [F:AGVCR]AGVCR0=[F:AGVCR]UID;[F:AGVCR]CODATY;[F:AGVCR]CODFIC;[F:AGVCR]CODE;[F:AGVCR]VCRKEY
+            If fstat<>[V]CST_AOK
+                # If not -> create it
+                Write [AGVCR]
+                If fstat
+                    LRET = [V]CST_AERROR
+                    PMSG = "[F:AGVCR]"-mess(26,125,1)-func GLOCK.GET_FSTAT_MSG(fstat)
+                    Break 2
+                Endif
+                LNBVCR +=1
+            Endif
+        Endif
+    Next
+    If LNBVCR>GMAXUPDTRS
+        VCRAUUID = [F:VCR]AUUID
+        STOP=1
+    Endif
+Next
+Filter [VCR]
+If LRET=[V]CST_AOK
+    Commit
+    If STOP
+        Goto LOOP_VCR
+    Endif
+Else
+    Rollback
+Endif
+Return
+
+# Returns the main key formula of a table
+# (we use num$ regardless of the type to transform everything in string - num$ works for date, numeric and strings)
+Funprog KEYFORM(PDOSSIER,PTABLE,PABREV)
+Value Char PDOSSIER
+Value Char PTABLE
+Value Char PABREV
+
+Local Char CLEFOR(250),CLEIND(250),CLEFIELD(250),COMPNAME(250)
+Local File =PDOSSIER+".ATABIND" [ATI]
+Local File =PDOSSIER+".ATYPE"   [ATY]
+Local File =PDOSSIER+".ATABZON" [ATZ]
+
+CLEFOR=""
+Read [ATI]NUMLIG(2)=PTABLE;1
+If fstat=[V]CST_AOK
+    CLEIND=ctrans([ATI]DESCRIPT,"+-","  ")
+    COMPNAME=vireblc(CLEIND,3)
+    While COMPNAME<>""
+        Read [ATZ]CODZONE=PTABLE;COMPNAME
+        If fstat<>[V]CST_AOK
+            CLEFOR=""
+            Break
+        Endif
+        Read [ATY]CODTYP=[ATZ]CODTYP
+        If fstat<>[V]CST_AOK
+            CLEFOR=""
+            Break
+        Endif
+        If [ATY]TYPTYP<>7
+           CLEFOR+=string$(CLEFOR<>"","+'~'+") + "num$(["+PABREV+"]"+vireblc(CLEIND,3)+")"
+        Else
+           CLEFOR+=string$(CLEFOR<>"","+'~'+") + "["+PABREV+"]"+vireblc(CLEIND,3)
+        Endif
+        CLEIND=vireblc(right$(CLEIND,1+len(vireblc(CLEIND,3))),0)
+        COMPNAME=vireblc(CLEIND,3)
+    Wend
+Endif
+
+LogicClose File [ATI], [ATY], [ATZ]
+
+End CLEFOR
+

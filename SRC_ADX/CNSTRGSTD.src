@@ -1,0 +1,1612 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ German tax return
+#################################################################################################################
+#
+#   VAT declaration Germany
+#   AUTHORS :    angre
+#   DATE    :    2012-08-27
+#   UPDATES :    2015-06-22 ANGRE CORRECTION OF SAM #108806 (additional check for ledgertype)
+#                2015-06-22 ANGRE Missing index (LEG) for documenttype and function CHECKDOCTYPELEG added
+#                2015-08-19 DNE   Correction for SAM #110423
+#                2015-10-07 ANGRE DELETELINEITEMS changed SAM #111288
+#                2018-05-02 ANGRE X3-69522 new group handling
+#################################################################################################################
+
+
+
+
+
+
+# < DEBUG> ######################################################################################################
+Local Char XPARAM(10)(1..10)
+Call GCONSULT( "TRG", "", XPARAM ) From GCONSULT
+End
+# </DEBUG> ######################################################################################################
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  ACTION
+#*
+#* Purpose:    Standard action dispatcher.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param ACTION      Name of the event (action).
+#*
+#*! #############################################################################################################
+$ACTION
+#Infbox ACTION
+  Case ACTION
+   When "EXEBOUT"     : Gosub EXEBOUT
+   When "EXEC"        : Gosub EXEC_UVA
+   When "OUVRE"       : Gosub OUVRE
+   When "OK"          : GOK=1
+   When "APRES_MODIF" : Gosub APRES_MODIF
+   When "SEL_LISTE"   : If LISTE = "SELTRGCRN" : Gosub SELLISTTRGCRN : Endif
+   When "FERME"       : Gosub FERME
+   When "SETBOUT"     : Gosub SETBOUT
+  Endcase
+Return
+
+
+#** #############################################################################################
+#* SETBOUT disables inquiry export menu entries.
+#*! #############################################################################################
+
+$SETBOUT
+    Disable GSTAXLS
+    Disable GSTAXLS2
+Return
+
+
+#** #############################################################################################
+#* FERME deletes temporary records from database and reenables inquiry export menu entries.
+#*! #############################################################################################
+
+$FERME
+    Enable GSTAXLS
+    Enable GSTAXLS2
+    Call DELETELINEITEMS()
+Return
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  SELLISTTRGCRN
+#*
+#* Purpose:    Handler to the SEL_LISTE event for SELTRGCRN action.
+#*             Creates a list of the company's tax identifiers to choose from.
+#*
+#*! #############################################################################################################
+
+$SELLISTTRGCRN
+    Local Integer DIMTAXNUM : DIMTAXNUM = dim([CPY]GERTAXIDT)     # Number of possible tax identifiers
+    Local Char TEXTE(30)(1..DIMTAXNUM, 1..3)                      # Array for selection rows
+    Local Char TEX(30)(1..DIMTAXNUM)                              # Array for selection values
+    Local Integer I                                               # FOR loop counter
+    Local Char COMP(GLONCPY)
+
+    # Initialize row and column counter.
+    NBCOL = 0                                                     # Column counter
+    NBTEX = 0                                                     # Row counter
+
+    # Set selection title.
+    TIT(NBCOL) = mess(252,107,1)                                  # "Tax identifier"
+
+    # Set column titles.
+    NBCOL += 1
+    TIT(NBCOL) = mess(252,107,1)                                  # "Tax identifier"
+    NBCOL += 1
+    TIT(NBCOL) = mess(253,107,1)                                  # "Tax office"
+    NBCOL += 1
+    TIT(NBCOL) = ""
+
+    # Fill selection with tax identifier and tax office
+    If [M:TRG0]GRP <> ""
+      COMP = [M:TRG0]GRP
+    Else
+      COMP = [M:TRG0]CPY
+    Endif
+    Read [F:CPY]CPY0 = COMP
+    If !fstat
+        For I = 0 To DIMTAXNUM - 1
+
+            # Check if the last tax identifier was reached and break off.
+            If [CPY]GERTAXIDT( I ) = ""
+                Break
+            Endif
+
+            # Add row to selection list.
+            NBTEX += 1
+            TEX( NBTEX ) = [CPY]GERTAXIDT( I )
+            TEXTE( NBTEX, 1 ) = [CPY]GERTAXIDT( I )
+            TEXTE( NBTEX, 2 ) = [CPY]GERTAXCEN( I )
+            Read [F:BPR]BPR0 = [CPY]GERTAXCEN( I )
+            If !fstat
+                TEXTE( NBTEX, 3 ) = [F:BPR]BPRNAM
+            Endif
+        Next
+    Endif
+Return
+
+
+
+
+
+
+#** #############################################################################################
+#* EXEBOUT treats action when pressing a button
+#*! #############################################################################################
+$EXEBOUT
+
+
+  Case BOUT
+    When "A"
+      #Start VAT processing and calculation
+      Gosub EXEC_UVA
+    When "1"
+     # Alert if the site is set for a real reporting is only allowed for companies not sites.
+      If [M:TRG0]FCY <> ""
+          Call ERREURT( mess(280,107,1), 1 ) From GESECRAN # "Only companies/company groups can print/export recap. stat. Please empty site field."
+          Return
+      Endif
+      #start the screen for additional settings and for print and file output
+      Gosub ELSTERSCREEN
+    When "4"
+      #set modify flag when recall a memo
+      [L]MODIFFLAG = 1
+      If [TRG0]GRP <> "" : Call SETFIELDSFORGROUP([TRG0]GRP): Endif
+  Endcase
+Return
+
+
+#** #############################################################################################
+#* OUVRE declare variables and open defined tables
+#*! #############################################################################################
+$OUVRE
+  Local Integer NOL, J, IND, M, K, C, I, WARNING, WARNING2
+  Local Decimal SUM_TRANSVOLUME # sum of the transaction volume for a linecode
+  Local Decimal SUM_TAX # sum of the tax volume for a linecode
+  Local Integer COUNT #rowcount of the recordset from table replindef for a given Legislation
+  Local Char LEGISLATION(255)
+  Local Char GROUP(255)
+  Local Char OPT(255) # 1- nach Buchungsdatum, 2 - nach Belegdatum
+  Local Date DATEBEGIN, DATEEND
+  Local Decimal USTSUM #endsum of the ustva (linecode 83)
+  Local Decimal DFVSUM #crucial sum for 'Dauerfristverlängerung'
+  Local Integer EXTFLAG #flag for call from external
+  Local Integer MODIFFLAG : MODIFFLAG = 0 #flag that indicates if a calculation has to be done
+  Local Char FIL1(255), FIL2(255),FIL3(255),FIL4(255),FIL5(255),FIL6(255),FIL7(255) # filterstrings
+
+  If clalev([F:DAE])=0 : Local File GACCENTRYD    [DAE] : Endif
+  If clalev([F:BPR])=0 : Local File BPARTNER      [BPR] : Endif
+  If clalev([F:CPY])=0 : Local File COMPANY       [CPY] : Endif
+  If clalev([F:HAE])=0 : Local File GACCENTRY     [HAE] : Endif
+  If clalev([F:SIV])=0 : Local File SINVOICEV     [SIV] : Endif
+  If clalev([F:BPC])=0 : Local File BPCUSTOMER    [BPC] : Endif
+  If clalev([F:GAC])=0 : Local File GACCOUNT      [GAC] : Endif
+  If clalev([F:TRP])=0 : Local File VDGERTRP      [TRP] : Endif
+  If clalev([F:BAN])=0 : Local File BANK          [BAN] : Endif
+  If clalev([F:GTE])=0 : Local File GTYPACCENT    [GTE] : Endif
+  If clalev([F:AGC])=0 : Local File AGRPCPY       [AGC] : Endif
+  If clalev([F:FGR])=0 : Local File FACGROUP      [FGR] : Endif
+  If clalev([F:AXX])=0 : Local File ATEXTRA       [AXX] : Endif
+  If clalev([F:BPA])=0 : Local File BPADDRESS     [BPA] : Endif
+  If clalev([F:TVT])=0 : Local File TABVAT        [TVT] : Endif
+  If clalev([F:TRA])=0 : Local File TABRATVAT     [TRA] : Endif
+  If clalev([F:PIH])=0 : Local File PINVOICE      [PIH] : Endif
+  If clalev([F:COA])=0 : Local File GCOA          [COA] : Endif
+  If clalev([F:ADI])=0 : Local File ATABDIV       [ADI] : Endif
+  If clalev([F:GCM])=0 : Local File GACM          [GCM] : Endif
+  If clalev([F:LED])=0 : Local File GLED          [LED] : Endif
+  If clalev([F:RLI])=0 : Local File REPLINDEF     [RLI] : Endif
+  If clalev([F:VLI])=0 : Local File VATLINITMGER  [VLI] : Endif
+  If clalev([F:AWI])=0 : Local File AWINDOW       [AWI]  : Endif
+  If clalev([F:AMK])=0 : Local File AMSK          [AMK]  : Endif
+  If clalev([F:FIY])=0 : Local File FISCALYEAR    [FIY]  : Endif
+
+
+Return
+
+#** #############################################################################################
+#* APRES_MODIF set modify flag
+#*! #############################################################################################
+$APRES_MODIF
+  MODIFFLAG = 1
+Return
+
+#** #############################################################################################
+#* EXECUSTVAEXT
+#* Starts the calculation of the USTVA from an external process.
+#* In this process the following variables must accessible
+#* - char EXTCPY (Company)
+#* - char EXTGRP (Group)
+#* - char EXTFCY (Site)
+#* - char EXTLEG (Legislation)
+#* - date EXTDATEB (Startdate)
+#* - date EXTDATEE (Enddate)
+#* After running EXECUSTVAEXT the arrays KZDIST (Linecodes), TRANSVOLUME (transaction volume) and TTAX (Tax volume)
+#* are available in the calling process
+#*! #############################################################################################
+$EXECUSTVAEXT#(LEG, GRP, FCY, CPY, DATEB, DATEE, LCODE, TRANSVOL, TAXVOL)
+
+  Gosub OUVRE
+  # Flag that indicates call from external process
+  EXTFLAG = 1
+  #parameter which indicate if reference date is accounting date or document date
+  [L]OPT = func GETCOMPANYVATDAT(EXTCPY) #Call PARAM([M:TRG0]CPY,"DCLVATDAT",[L]OPT) From ADOVAL
+
+  #set start and enddate
+  Call SETSTARTANDENDDATE(DATEBEGIN, DATEEND, EXTDATEB, EXTDATEE )
+
+  #Set the filter string needed to get the required data
+  Call SETFILTERSTRINGS(EXTCPY, EXTGRP, EXTFCY, [L]OPT, DATEBEGIN, DATEEND, FIL1, FIL2, FIL3, FIL4, FIL5, FIL6, FIL7)
+
+  #Set the count of the linecodes in table replindef for a given legislation
+  [L]COUNT = func LINECODECOUNT(EXTLEG, 0)
+
+  #defining and setting of required data arrays
+  Gosub KEYDATA
+
+  Call SETLEGISLATIONANDGROUP(LEGISLATION, GROUP, EXTLEG, EXTGRP)
+
+  #Joins all required tables with FILTERSTRING
+  Gosub QUERY
+
+  J = 0 : I= 0 : M= 0 : K=0
+
+  #Sets data in the needed arrays and (if needed) in the grid
+  Gosub SETDATA
+
+
+
+  #additional calculation wich must be done for DFL and file output
+  Gosub SPECCALCULATIONFORFILE
+
+
+Return
+
+
+#** #############################################################################################
+#* sub chunk EXEC_UVA starts Tax validation preview depending on legislation
+#*! #############################################################################################
+$EXEC_UVA
+  If GOK=1 Then
+     #If german legislation then start
+   Gosub UVA_GER
+   MODIFFLAG = 0
+  Endif
+Return
+
+
+#** #############################################################################################
+#* UVA_GER starts Tax validation preview for german legislation.
+#* This includes the preview for the sum of the Linecodes as well as the detailed
+#* lines for each linecode
+#*! #############################################################################################
+$UVA_GER
+
+  NOL = 0 : J = 0 : I= 0 : K= 0 : M= 0 : C = 0
+  Raz [M:TRG1]
+  Raz [M:TRG2]
+  Effzo [M:TRG1]
+  Effzo [M:TRG2]
+
+  Call DELETELINEITEMS()
+
+  #Reset warning flag
+  WARNING = 0
+
+  #parameter which indicate if reference date is accounting date or document date
+  If [M:TRG0]CPY <> ""
+    [L]OPT = func GETCOMPANYVATDAT([M:TRG0]CPY) #Call PARAM([M:TRG0]CPY,"DCLVATDAT",[L]OPT) From ADOVAL
+  Elsif [M:TRG0]GRP <> ""
+    [L]OPT = func GETCOMPANYVATDAT([M:TRG0]GRP)
+  Endif
+  #set start and enddate
+  Call SETSTARTANDENDDATE(DATEBEGIN, DATEEND, [M:TRG0]DATDEB, [M:TRG0]DATFIN )
+
+  #Set the filter string needed to get the required data
+  Call SETFILTERSTRINGS([M:TRG0]CPY, [M:TRG0]GRP, [M:TRG0]FCY, OPT, DATEBEGIN, DATEEND, FIL1, FIL2, FIL3, FIL4, FIL5, FIL6, FIL7)
+
+  #Set the count of the linecodes in table replindef for a given legislation
+  [L]COUNT = func LINECODECOUNT([M:TRG0]LEG, 0)
+
+  #defining and setting of required data arrays
+  Gosub KEYDATA
+
+  Call SETLEGISLATIONANDGROUP(LEGISLATION, GROUP, [M:TRG0]LEG, [M:TRG0]GRP)
+
+  #Joins all required tables with FILTERSTRING
+  Gosub QUERY
+
+
+  #set lineitems and write lines in grid
+  Gosub SETDATA
+
+  #additional calculation for specific fields
+  #Gosub SPECCALCULATION
+
+
+
+  #set the preview of vat declaration in the grid
+  Gosub SETVATPREVIEWGRID
+
+  #do additional calculation for specific values in the grid
+  Gosub SPECCALCULATIONONGRID
+
+  [M:TRG1]NBLIG   = [L]NOL
+  [M:TRG2]NBLIG   = K
+
+  Affzo [M:TRG1]
+  Affzo [M:TRG2]
+
+  #if journals not finally validated show message
+  If WARNING : Call WARNINGMESSAGE(0): Endif
+
+Return
+
+#** #############################################################################################
+#* SPECCALCULATIONONGRID: additonal calculation for specific fields in the grid
+#*! #############################################################################################
+$SPECCALCULATIONONGRID
+ #Infbox num$([M:TRG1])
+ Local Integer INDOF61 : INDOF61 = -1
+ Local Decimal SUMOF61
+
+ [M:TRG1]NBLIG   = [L]NOL
+  For I= 0 To [M:TRG1]NBLIG-1
+    # notice index of report line 61
+    If [M:TRG1]REPLINE(I) = "61" : INDOF61 = I: Endif
+
+    #change leading sign of specific fields.
+    If find([M:TRG1]REPLINE(I), "41","44","49","43","48","81","86","35","77","76","42","68","60","21","45") #,"36","80"
+      [M:TRG1]AMTVATBASE(I) = [M:TRG1]AMTVATBASE(I) * -1
+    Elsif find([M:TRG1]REPLINE(I), "36","80", "65")
+      [M:TRG1]AMTVAT(I) = [M:TRG1]AMTVAT(I) * -1
+    Endif
+    # calculate tax for specific signs
+    If [M:TRG1]REPLINE(I) = "81" or [M:TRG1]REPLINE(I) = "89"
+      [M:TRG1]AMTVAT(I) = ar2([M:TRG1]AMTVATBASE(I)* 0.19)#func GETTAXRATE(81))
+    Elsif [M:TRG1]REPLINE(I) = "86" or [M:TRG1]REPLINE(I) = "93"
+      [M:TRG1]AMTVAT(I) = ar2([M:TRG1]AMTVATBASE(I)* 0.07)# func GETTAXRATE(86))
+    Endif
+
+    If find([M:TRG1]REPLINE(I), "89","93", "96","98")
+      SUMOF61 = SUMOF61 + [M:TRG1]AMTVAT(I)
+    Endif
+
+  Next
+  #set taxvalue for reportline 61
+  If INDOF61 >= 0
+    [M:TRG1]AMTVAT(INDOF61) = ar2(SUMOF61)
+  Endif
+  Affzo [M:TRG1]
+Return
+
+#** #############################################################################################
+#*  Shows a Warning/Blocking message when one or more journals in the selected date range
+#*  are not finally validated
+#*
+#*  @param WTYPE    Value Integer WTYPe 1 -> warning message; 2 -> blocking message
+#*
+#*! #############################################################################################
+Subprog WARNINGMESSAGE(WTYPE)
+Value Integer WTYPE
+Local Char MESSAGE(255)
+Local Integer MSG
+  Case WTYPE
+    When 0
+      MESSAGE = mess(308,107,1) - mess(424,107,1)
+    When 1
+      MESSAGE = mess(308,107,1) - mess(309,107,1)
+  Endcase
+  Call ERREURT(MESSAGE,WTYPE) From GESECRAN
+End
+
+
+#** #############################################################################################
+#* KEYDATA: definition and setting of needed arrays depending on the number of
+#* linecodes defined in the table REPLINDEF.
+#*! #############################################################################################
+
+$KEYDATA
+  Local Integer C : C = 0
+
+  #filtercriteria LEG = Legislation; RECTYP = Recordtye -> 1 = USTVA ; 2 = ZM
+  Local Char KZDIST(10)(COUNT)
+  Local Decimal TRANSVOLUME(COUNT)
+  Local Decimal TTAX(COUNT)
+  For [RLI]
+    [L]KZDIST(C) = [F:RLI]COD : C +=1
+  Next
+  Filter [RLI]
+Return
+
+
+#** #################################################################################################
+#* QUERY: Joins all required tables with the filterstring determined in the function GETFILTERSTRING
+#*! #################################################################################################
+
+
+$QUERY
+
+Local Integer MLEDGERTYPE
+Local Integer LEDINDEX
+Local Char GRPCPY(30)
+
+    If [M:TRG0]GRP <> ""
+      GRPCPY = [M:TRG0]GRP
+    Else
+      GRPCPY = [M:TRG0]CPY
+    Endif
+#Get the mainledgerindex for the company
+    If [L]EXTFLAG = 0
+        LEDINDEX = func GETMAINLEDORINDEX(GRPCPY,1)
+    Else
+        LEDINDEX = func GETMAINLEDORINDEX(EXTCPY,1)
+    Endif
+
+  If GROUP <>"" Then
+  Else
+ Link [DAE] With
+&  [F:CPY]CPY0  = [F:DAE]CPY
+& ,[F:HAE]HAE0 = [F:DAE]TYP ; [F:DAE]NUM
+& ,[F:GCM]GCM0 = [F:CPY]ACM
+& ,[F:LED]LED0 = [F:GCM]LED(LEDINDEX)
+& ,[F:COA]COA0 = [F:LED]COA
+& ,[F:GAC]GAC0 = [F:DAE]COA;[F:DAE]ACC
+& ,[F:GTE]GTE0 = [F:DAE]TYP
+& ,[F:TRP]TRPG4 = LEGISLATION;[F:DAE]TAX
+& ,[F:BPR]BPR0 = [F:DAE]OFFACC
+& As [LNK]
+& Where evalue(FIL1 + FIL2 + FIL3 + FIL4 + FIL5 + FIL6 + FIL7)
+& & [F:HAE]CAT = 1
+& & [F:TRP]REPLINE <>""
+& & [F:DAE]COA = [F:COA]COA
+& & [F:TRP]FLGVAT = [F:GAC]FLGVAT
+& & [F:TRP]VATIPT = [F:GAC]VATIPT
+& & ([F:GTE]VAT = 2 or [F:GTE]VATPAI = 2)
+& & ([F:GTE]LEG = LEGISLATION or [F:GTE]LEG = "")
+  Endif
+
+Return
+
+
+#** #####################################################################################################
+#* Get the index of mainledger for a given company
+#*
+#* @param COMP           Variable Char:           Legislation
+#* @param RETURNTYPE     Variable Integer:        Return type: 1-> Index ; 2 -> Mainledgertype
+#* @return         Local Integer Result:  index of the mainledger
+#*! #####################################################################################################
+Funprog GETMAINLEDORINDEX(COMP,RETURNTYPE)
+Value Char COMP
+Value Integer RETURNTYPE
+Local Integer RESULT
+Link [CPY] With
+& [F:GCM]GCM0  = [F:CPY]ACM
+& ,[F:LED]LED0  = [F:GCM]LED
+& As [LNK2]
+& Where [F:CPY]CPY = COMP
+
+For [LNK2]
+    If RETURNTYPE = 1
+      RESULT = [F:GCM]GENLEDTYP - 1
+    Else
+      RESULT = [F:GCM]GENLEDTYP
+    Endif
+Next
+
+End RESULT
+
+
+#** #############################################################################################
+#* SETDATA: Call the functionality for setting data in arrays and/or grid
+#*! #############################################################################################
+$SETDATA
+  J = 0 : I= 0 : M= 0 : K=0
+  Local Char USERID(30) : USERID = func GETUSERID
+  Local Integer ITMCOUNT : ITMCOUNT = 0
+  Local Integer MAX_OCCURRENCES : MAX_OCCURRENCES = dim([M:TRG2]SNS)
+
+ #X3-69522 new group handling
+   If [M:TRG0]GRP <> ""
+    Filter [F:AGC] Where [F:AGC]GRP = GROUP
+    For [F:AGC]
+      Call SETFILTERSTRINGS([F:AGC]CPY, "", [M:TRG0]FCY, OPT, DATEBEGIN, DATEEND, FIL1, FIL2, FIL3, FIL4, FIL5, FIL6, FIL7)
+      LEDINDEX = func GETMAINLEDORINDEX([F:AGC]CPY,1)
+      Link [DAE] With
+&  [F:CPY]CPY0  = [F:DAE]CPY
+& ,[F:HAE]HAE0 = [F:DAE]TYP ; [F:DAE]NUM
+& ,[F:GCM]GCM0 = [F:CPY]ACM
+& ,[F:LED]LED0 = [F:GCM]LED(LEDINDEX)
+& ,[F:COA]COA0 = [F:LED]COA
+& ,[F:GAC]GAC0 = [F:DAE]COA;[F:DAE]ACC
+& ,[F:GTE]GTE0 = [F:DAE]TYP
+& ,[F:TRP]TRPG4 = LEGISLATION;[F:DAE]TAX
+& ,[F:BPR]BPR0 = [F:DAE]OFFACC
+& As [LNK]
+& Where evalue(FIL1 + FIL2 + FIL3 + FIL4 + FIL5 + FIL6 + FIL7)
+& & [F:HAE]CAT = 1
+& & [F:TRP]REPLINE <>""
+& & [F:DAE]COA = [F:COA]COA
+& & [F:TRP]FLGVAT = [F:GAC]FLGVAT
+& & [F:TRP]VATIPT = [F:GAC]VATIPT
+& & ([F:GTE]VAT = 2 or [F:GTE]VATPAI = 2)
+& & ([F:GTE]LEG = LEGISLATION or [F:GTE]LEG = "")
+
+
+      Gosub SETITEMS
+      Filter [LNK]
+    Next
+    Filter [F:AGC]
+     #X3-69522 new group handling end
+  Else
+    Gosub SETITEMS
+  Endif
+  If EXTFLAG = 0
+    #Information when not all lines can be shown in the grid.
+     If ITMCOUNT > MAX_OCCURRENCES : Call ECR_TRACE (mess(321,107,1) + " " + mess(322,107,1) + " " + mess(323,107,1),0) From GESECRAN : Endif
+  Endif
+Return
+
+ #X3-69522 new group handling
+$SETITEMS
+#Loop through all linecodes
+    For I = 0 To dim([L]KZDIST) -1
+      SUM_TRANSVOLUME = 0
+      SUM_TAX = 0
+      #set the line items in the grid
+      Call SETLINEITEMS([L]KZDIST(I), SUM_TRANSVOLUME, SUM_TAX, K, WARNING, EXTFLAG,USERID, MAX_OCCURRENCES, ITMCOUNT)
+      #Setting of the transaction volume and the VAT volume depending on the given LINECODE
+      Call SETTRANSVOLUME([L]KZDIST(I), [L]TRANSVOLUME(I),[L]TTAX(I), SUM_TRANSVOLUME, SUM_TAX)
+    Next
+Return
+
+
+#** #############################################################################################
+#* SETVATPREVIEWGRID: Fill a line of the preview grid for VAT declaration.
+#*! #############################################################################################
+$SETVATPREVIEWGRID
+  NOL=0
+  #loop through all linecodes
+# DNE SAM #90740 MODIFIED
+  For I = 0 To [L]COUNT -1
+#  For I = 0 To dim([L]KZDIST) -1
+    #If transaction volume or tax write the data in the grid
+    If  [L]TRANSVOLUME(I)<> 0 or [L]TTAX(I)<> 0 Then
+
+      [M:TRG1]REPLINE([L]NOL) = [L]KZDIST(I)
+
+
+      #absolute value of transaction volume
+      [M:TRG1]AMTVATBASE([L]NOL) =  [L]TRANSVOLUME(I)#abs([L]TRANSVOLUME(I))
+
+      #absolute value of tax
+      [M:TRG1]AMTVAT([L]NOL) = [L]TTAX(I)#abs([L]TTAX(I))
+
+      [L]NOL +=1
+    Endif
+
+  Next
+Return
+
+
+#** #############################################################################################
+#* SPECCALCULATIONFORFILE: additional calculation for file output
+#*! #############################################################################################
+$SPECCALCULATIONFORFILE
+Local Integer INDEX
+Local Decimal TMPSUM
+Local Decimal ADVPAYMENT
+Local Integer INDEX61
+  For I = 0 To dim([L]KZDIST) -1
+
+    If [L]KZDIST(I) = "61" : [L]TTAX(I) = 0 : INDEX61 = I: Endif
+
+    If find([L]KZDIST(I), "41","44","49","43","48","81","86","35","77","76","42","68","60","21","45")
+        [L]TRANSVOLUME(I) = [L]TRANSVOLUME(I) * -1
+    Elsif find([L]KZDIST(I), "36","80", "65")
+      [L]TTAX(I) = [L]TTAX(I) * -1
+    Endif
+    If find([L]KZDIST(I), "81","89")
+      [L]TTAX(I) = ar2([L]TRANSVOLUME(I) * 0.19)#func GETTAXRATE(81))
+    Endif
+    If find([L]KZDIST(I), "86","93")
+      [L]TTAX(I) = ar2([L]TRANSVOLUME(I) * 0.07)# func GETTAXRATE(86))
+    Endif
+
+    #sum for tax of report line 61
+    If find([L]KZDIST(I), "89","93", "96","98")
+      TTAX(INDEX61) = TTAX(INDEX61) + TTAX(I)
+    Endif
+
+    If find ([L]KZDIST(I), "81","86","36","80","69","47","53","74","85","65","79") Then #89,93,96,98
+      DFVSUM += [L]TTAX(I)#abs([L]TTAX(I))
+    Elsif find ([L]KZDIST(I),"66","62","67","63","64","59")#61
+      DFVSUM -= [L]TTAX(I)
+    Endif
+
+
+    If [L]KZDIST(I) = "39"
+      [L]ADVPAYMENT = [L]TTAX(I)#abs([L]TTAX(I))
+    Endif
+ Next
+    #set sum for linecode 83
+    USTSUM = DFVSUM - ADVPAYMENT
+Return
+
+
+
+#** #############################################################################################
+#* ELSTERSCREEN Opens the screen where the user can do additional settings and print
+#* UVA and Validation reports as well as generate a xml file for ELSTER
+#*! #############################################################################################
+$ELSTERSCREEN
+    Local Char RESULT(255)      : RESULT = ""
+    Local Char PARAMS(10)(2)
+    Local Char WWINDOW(30), WSPEPROG(30), WACTPROG(30)
+
+    #if something is modified then start calculation before opening the parameter screen
+    If MODIFFLAG = 1 : Gosub EXEC_UVA : Endif
+
+    If (month([M:TRG0]DATDEB)=01 and month([M:TRG0]DATFIN)=12) #if date range is calendar year => return
+      Return
+    Endif
+    PARAMS(0) = "UST"
+    If WARNING = 1 : PARAMS(1) = "ERR" : Endif
+
+
+     #############################################################################################
+    # angre 08.01.2014 Call of specific windows per Legislation
+    [L]WWINDOW  = "TRGP"
+    [L]WACTPROG  = "TRGP"
+    [L]WSPEPROG = "SPETRGP"
+
+    Call GET_WINLEG ([M:TRG0]LEG, [L]WWINDOW, [L]WACTPROG,[L]WSPEPROG)
+
+    # Call SAISIE_CHAR( RESULT, PARAMS, "TRGP", "TRGP", "SPETRGP") From GSAISIE
+    Call SAISIE_CHAR( RESULT, PARAMS, [L]WWINDOW, [L]WACTPROG, [L]WSPEPROG) From GSAISIE
+    #############################################################################################
+
+
+
+   # Endif
+Return
+
+
+#** #####################################################################################################
+#* Get the rowcount of the linecodes for USTVA from table REPLINDEF for the given Legislation
+#*
+#* @param LEGISLATION     Variable Char:      Legislation
+#* @param FILTERFLAG      Value Integer:      Flag that indicates if the Filter of table RLI must be set back
+#*                                            0 = NO, 1 = YES
+#* @return                Local Char Result:  rowcount of the linecodes for USTVA from table REPLINDEF
+#*                                            for the given Legislation
+#*! #####################################################################################################
+Funprog LINECODECOUNT(LEGISLATION, FILTERFLAG)
+Variable Char LEGISLATION
+Value Integer FILTERFLAG
+Local Integer RESULT
+
+  If clalev([F:RLI])=0 : Local File REPLINDEF  [RLI] : Endif
+  #filtercriteria LEG = Legislation; RECTYP = Recordtye -> 1 = USTVA ; 2 = ZM
+  Filter [RLI] Where LEG = LEGISLATION and RECTYP = 1 Order By [RLI]COD
+
+  RESULT = rowcount([RLI])# + 1 #We add 1 for linecode 83 (sumfield) which should not be defined in replindef
+
+  If FILTERFLAG = 1
+    Filter [RLI]
+  Endif
+
+End RESULT
+
+#** #############################################################################################
+#* Returns a unique userid
+#*! #############################################################################################
+Funprog GETUSERID()
+End GUSER+num$(adxuid(2))
+
+
+#** #############################################################################################
+#* Get the taxnumber for a given company
+#*
+#* @param CPY     Value Char  Company
+#*
+#* @param CRN     Value Char  Tax number
+#*! #############################################################################################
+Funprog GETTAXNO(CPY, CRN)
+Value Char CPY
+Value Char CRN
+Local Char RESULT(255)
+Local Integer I
+
+  Read [F:CPY]CPY0 = CPY
+  If !fstat
+    #Get the default tax no for the given company
+    For I = 0 To dim([CPY]GERTAXIDT) - 1
+#      If [CPY]GERDEFVAL(I) - 1
+        #check if given taxno. exists
+        If CRN <> ""
+          If CRN = [CPY]GERTAXIDT(I)
+            RESULT = [CPY]GERTAXIDT(I)
+            Break
+          Endif
+        Else
+          RESULT = [CPY]GERTAXIDT(I)
+          Break
+        Endif
+#      Endif
+    Next
+  Endif
+End RESULT
+
+
+#** #############################################################################################
+#* Get the parameter 'DCLVATDAT' for a given company
+#*
+#* @param CPY     Value Char  Company
+#* @return        Local Char  Result: "1" for Accounting date (default)
+#*                                    "2" for Document date
+#*! #############################################################################################
+Funprog GETCOMPANYVATDAT(CPY)
+Value Char CPY
+Local Char RESULT(255)
+  Call PARAM(CPY, "DCLVATDAT", RESULT) From ADOVAL
+  If RESULT = "" : RESULT = "1" : Endif
+End RESULT
+
+
+
+#** #############################################################################################
+#* SETLEGISLATIONANDGROUP: Sets the variables LEGISLATION and GROUP with the values from
+#* the SCREEN TRG0 and/or external processes
+#*! #############################################################################################
+Subprog SETLEGISLATIONANDGROUP(LEGISLATION, GROUP, LEG, GRP)
+Variable Char LEGISLATION
+Variable Char GROUP
+Variable Char LEG
+Variable Char GRP
+
+  LEGISLATION = LEG
+  GROUP = GRP
+
+End
+
+
+
+#** #############################################################################################
+#* SETSTARTANDENDDATE: Sets the variables DATEBEGIN and DATEEND with the values from
+#* the SCREEN TRG0 and/or external processes
+#*! #############################################################################################
+Subprog SETSTARTANDENDDATE(DATEBEGIN, DATEEND, DS, DE)
+  Variable Date DATEBEGIN
+  Variable Date DATEEND
+  Value Date DS
+  Value Date DE
+
+  DATEBEGIN = DS
+  DATEEND = DE
+End
+
+
+
+
+
+
+#** #############################################################################################
+#* Setting of the transaction volume and the VAT volume depending on the given LINECODE
+#*
+#*  @param LINECODE     Value Char         Linecode
+#*
+#*  @param TRANSVOLUME       Variable Decimal   Transaction volume from array [L]TRANSVOLUME
+#*
+#*  @param TTAX          Variable Decimal   Transaction volume from array [L]TTAX
+#*
+#*  @param SUMTRANSVOLUME    Variable Decimal   Transaction volume refered to LINECODE
+#*
+#*  @param SUMTAX    Variable Decimal   VAT volume refered to LINECODE
+#*
+#*
+#*! #############################################################################################
+Subprog SETTRANSVOLUME(LINECODE ,TRANSVOLUME, TTAX, SUMTRANSVOLUME, SUMTAX)
+  Value Char LINECODE
+  Variable Decimal TRANSVOLUME
+  Variable Decimal TTAX
+  Value Decimal SUMTRANSVOLUME
+  Value Decimal SUMTAX
+    TRANSVOLUME += fix(SUMTRANSVOLUME)
+    TTAX += SUMTAX
+End
+
+
+#** #############################################################################################
+#* Setting of the line items for a given Linecode
+#*
+#*  @param LINECODE      Value Char         Linecode
+#*
+#*  @param SUM_TRANSVOLUME    Variable Decimal   Transaction volume
+#*
+#*  @param SUM_TAX    Variable Decimal   Vat volume
+#*
+#*  @param INDEX         INDEX              Index
+#*
+#*! #############################################################################################
+Subprog SETLINEITEMS(LINECODE, SUM_TRANSVOLUME, SUM_TAX, INDEX, WARNING,EXTFLAG,USERID, MAXOCC, ITMCOUNT)
+  Value Char LINECODE
+  Variable Decimal SUM_TRANSVOLUME
+  Variable Decimal SUM_TAX
+  Variable Integer INDEX
+  Variable Integer WARNING
+  Value Integer EXTFLAG
+  Value Char USERID
+  Value Integer MAXOCC
+  Variable Integer ITMCOUNT
+  #test
+  Local Char DOCTYPE(10)
+  Local Integer CHECKED(1)
+
+
+  Trbegin [F:VLI]
+  #filter all data with the given linecode
+   Filter [LNK] Where [F:TRP]REPLINE = LINECODE
+   #loop through data
+   For [LNK]
+      #SAM #108806
+        If DOCTYPE <> [F:GTE]TYP
+          DOCTYPE = [F:GTE]TYP
+        Endif
+        #test
+        If [F:DAE]LEDTYP = func GETMAINLEDORINDEX([F:DAE]CPY,2) and [F:GTE]LEG = func CHECKDOCTYPELEG(DOCTYPE, [M:TRG0]LEG)
+          Call SETTAXANDTRANS(LINECODE, SUM_TRANSVOLUME, SUM_TAX)
+
+          #if a accounting is not final set warning flag
+          If [F:HAE]STA <> 2
+            WARNING = 1
+          Endif
+          #if calculation not from an external process -> write line items in grid
+          If EXTFLAG = 0
+            #check if the grid is full
+            If INDEX < MAXOCC
+                Call WRITELINEITEMS(LINECODE, INDEX)
+                INDEX +=1
+          Endif
+          Call WRITELINEITEMSTODB(LINECODE,USERID)
+          If GOK = 0 : Rollback: End : Endif
+        Endif
+
+        ITMCOUNT +=1
+      Endif
+   Next
+
+ Commit
+ Filter [LNK]
+End
+
+
+
+#** #############################################################################################
+#* write lineitems in the database
+#*
+#*  @param LINECODE      Value Char         Linecode
+#*
+#*  @param USERID         USERID              USERID
+#*
+#*! #############################################################################################
+Subprog WRITELINEITEMSTODB(LINECODE,USERID)
+Value Char LINECODE
+Value Char USERID
+
+  Raz [F:VLI]
+  #write data in the grid
+  [F:VLI]REFNO  = LINECODE
+  [F:VLI]IVNUM = [F:DAE]NUM
+  [F:VLI]TYP = [F:DAE]TYP
+  If [F:DAE]BPR <>"" Then
+     [F:VLI]BPR = [F:DAE]BPR
+  Else
+     [F:VLI]BPR = [F:DAE]OFFACC
+  Endif
+
+  [F:VLI]ACC = [F:DAE]ACC
+  [F:VLI]OFFACC = [F:DAE]OFFACC
+  If [F:DAE]SNS = -1 Then
+     [F:VLI]SNS = "Haben"
+  Else
+     [F:VLI]SNS = "Soll"
+  Endif
+  [F:VLI]AMTLOC = [F:DAE]AMTLED
+  [F:VLI]TAXNO  = [F:DAE]TAX
+  [F:VLI]FLGVAT = [F:GAC]FLGVAT
+  [F:VLI]VATIPT = [F:GAC]VATIPT
+  [F:VLI]COA    = [F:DAE]COA
+
+
+  Call LEC_TVT_LEG([F:CPY]LEG,[F:DAE]TAX) From CPTLEC
+  Filter [TRA] Where VAT=[F:DAE]TAX  & STRDAT<=[M:TRG0]DATDEB & LEG=[F:TVT]LEG & (CPY=[F:DAE]CPY | CPY="") Order By CPY Asc
+  Read [TRA] Last
+  If !fstat
+    [F:VLI]VATRAT = [F:TRA]VATRAT
+    [F:VLI]DATSTR = [F:TRA]STRDAT
+  Endif
+
+
+  Filter [TRA]
+
+  [F:VLI]IDUSER = USERID
+
+   Write [F:VLI]
+    If fstat
+      GOK = 0 : Call FSTA("VLI") From GLOCK : End
+    Endif
+
+End
+
+
+
+#** #############################################################################################
+#* deletes lineitems from the database
+#*
+#*! #############################################################################################
+Subprog DELETELINEITEMS()
+Local Char UID(255) : UID = func GETUSERID()
+
+  Call DEBTRANS From GLOCK
+  Trbegin [VLI]
+  #angre 2015-10-07 SAM #111288 ("or UPDDATTIM <= gdatetime$(format$("D:YYYY[-]MM[-]DD",date$ - 1))" added)
+  Delete [VLI] Where IDUSER = UID or UPDDATTIM <= gdatetime$(format$("D:YYYY[-]MM[-]DD",date$ - 1))
+  If fstat=1
+    Call RSTA("VLI",UID) From GLOCK
+    Rollback : End
+  Endif
+
+Commit
+End
+
+
+#** #############################################################################################
+#* write lineitems in the grid
+#*
+#*  @param LINECODE      Value Char         Linecode
+#*
+#*  @param INDEX         INDEX              Index
+#*
+#*! #############################################################################################
+Subprog WRITELINEITEMS(LINECODE, INDEX)
+Value Char LINECODE
+Variable Integer INDEX
+
+  #write data in the grid
+  [M:TRG2]REFNO(INDEX)  = LINECODE
+  [M:TRG2]IVNUM(INDEX) = [F:DAE]NUM
+  [M:TRG2]TYP(INDEX) = [F:DAE]TYP
+  If [F:DAE]BPR <>"" Then
+     [M:TRG2]BPR(INDEX) = [F:DAE]BPR
+  Else
+     [M:TRG2]BPR(INDEX) = [F:DAE]OFFACC
+  Endif
+
+  [M:TRG2]ACC(INDEX) = [F:DAE]ACC
+  [M:TRG2]OFFACC(INDEX) = [F:DAE]OFFACC
+  If [F:DAE]SNS = -1 Then
+     [M:TRG2]SNS(INDEX) = "Haben"
+  Else
+     [M:TRG2]SNS(INDEX) = "Soll"
+  Endif
+  [M:TRG2]AMTLOC(INDEX) = [F:DAE]AMTLED
+  [M:TRG2]TAXNO(INDEX)  = [F:DAE]TAX
+  [M:TRG2]FLGVAT(INDEX) = [F:GAC]FLGVAT
+  [M:TRG2]VATIPT(INDEX) = [F:GAC]VATIPT
+  [M:TRG2]COA(INDEX)    = [F:DAE]COA
+
+  Read [TRA]TRA0(2) = [F:DAE]TAX;[F:DAE]CPY
+  If fstat
+     Read [TRA]TRA0(1) =  [F:DAE]TAX
+     If !fstat
+        Filter [TRA] Where VAT =  [F:DAE]TAX and [M:TRG0]DATDEB>=STRDAT
+        For [TRA]
+           [M:TRG2]VATRAT(INDEX) = [F:TRA]VATRAT
+           [M:TRG2]STRDAT(INDEX) = [F:TRA]STRDAT
+        Next
+    Endif
+  Endif
+  Filter [TRA]
+End
+
+#** #############################################################################################
+#*  Set tax and/or transaction volume for a given linecode
+#*
+#*  @param LINECODE      Value Char         Linecode
+#*
+#*  @param SUM_TRANSVOLUME    Variable Decimal   Transaction volume
+#*
+#*  @param SUM_TAX    Variable Decimal   Vat volume
+#*
+#*! #############################################################################################
+Subprog SETTAXANDTRANS(LINECODE, SUM_TRANSVOLUME, SUM_TAX)
+  Value Char LINECODE
+  Variable Decimal SUM_TRANSVOLUME
+  Variable Decimal SUM_TAX
+  Local Integer SIGN
+    #Set vat volumen and transaction volume
+    If ( [F:GAC]FLGVAT =3 or [F:GAC]FLGVAT =4 )  Then
+      SUM_TAX += [F:DAE]AMTLED*[F:DAE]SNS#* SIGN
+    Else
+      SUM_TRANSVOLUME += [F:DAE]AMTLED*[F:DAE]SNS#*SIGN
+    Endif
+End
+
+
+#** #############################################################################################
+#* Adding of a given value to the vat volume of a specific LINECODE
+#*
+#*  @param CODE     Value Char         Linecode
+#*
+#*  @param ADDVALUE Value Decimal      Value to add
+#*
+#*! #############################################################################################
+Subprog ADDVAT(CODE, ADDVALUE)
+    Value Char CODE
+    Value Decimal ADDVALUE
+    Local Integer C
+    For C = 0 To dim([L]KZDIST) -1
+      If [L]KZDIST(C) = CODE
+        [L]TTAX(C) = [L]TTAX(C) + ADDVALUE
+        Break
+      Endif
+    Next
+
+End
+
+
+#** #################################################################################################
+#* Set the additional filterconditions
+#*
+#*  @param CPY  Value Char  (Company)
+#*
+#*  @param GRP  Value Char  (Group)
+#*
+#*  @param FCY  Value Char  (Facility)
+#*
+#*  @param OPT  Value Char  (PARAM DCLVATDAT) "1" for Accounting date (default)
+#*                                            "2" for Document date
+#*
+#*  @param DATEBEGIN  VARIABLE DATE  (Startdate)
+#*
+#*  @param DATEEND    VARIABLE DATE    (Enddate)
+#*
+#*  @param FILX       VARIABLE Char    (Filterstrings) X filterstrings because of the 255 limitation
+#*
+#*! #################################################################################################
+Subprog SETFILTERSTRINGS(CPY, GRP, FCY, OPT, DATEBEGIN, DATEEND, FIL1, FIL2, FIL3, FIL4, FIL5, FIL6, FIL7)
+    Value Char CPY
+    Value Char GRP
+    Value Char FCY
+    Value Char OPT
+    Variable  Date DATEBEGIN
+    Variable Date DATEEND
+    Variable Char FIL1
+    Variable Char FIL2
+    Variable Char FIL3
+    Variable Char FIL4
+    Variable Char FIL5
+    Variable Char FIL6
+    Variable Char FIL7
+
+
+    Raz FIL1, FIL2, FIL3, FIL3, FIL4, FIL5, FIL6, FIL7
+
+    #conditions for group, company, ledger etc...
+    FIL1 = "1=1"
+    If GRP<>""
+    Elsif CPY<>""
+      FIL1 += " &[F:DAE]CPY = '" + CPY + "'"
+    Endif
+    If FCY<>""
+      FIL1 += " &[F:DAE]FCYLIN = '" + FCY + "'"
+    Endif
+
+    #conditions for the daterange of the accountings
+    If DATEBEGIN<>[0/0/0]
+      If OPT = "1" Then
+        FIL2 += " &[F:DAE]ACCDAT>=DATEBEGIN"
+      Else
+        FIL2 += " & (([F:HAE]BPRDATVCR>=DATEBEGIN & [F:HAE]BPRDATVCR <> [0/0/0]) | ([F:HAE]BPRDATVCR = [0/0/0] & [F:DAE]ACCDAT>=DATEBEGIN))"
+      Endif
+    Endif
+    If DATEEND<>[0/0/0]
+      If OPT = "1" Then
+        FIL3 += " &[F:DAE]ACCDAT<=DATEEND"
+      Else
+        FIL3 += " & (([F:HAE]BPRDATVCR<=DATEEND & [F:HAE]BPRDATVCR <> [0/0/0]) | ([F:HAE]BPRDATVCR = [0/0/0] & [F:DAE]ACCDAT<=DATEEND))"
+      Endif
+    Endif
+
+      #conditions for the startdate and enddate of vat linedefintion parameters
+     If OPT = "1" Then
+        FIL4 += " &(([F:TRP]STRDAT = [0/0/0] & [F:TRP]ENDDAT = [0/0/0])"
+        FIL4 += " | ([F:TRP]STRDAT = [0/0/0] & [F:TRP]ENDDAT >= [F:DAE]ACCDAT)"
+        FIL4 += " | ([F:TRP]STRDAT <= [F:DAE]ACCDAT & [F:TRP]ENDDAT = [0/0/0])"
+        FIL4 += " | ([F:TRP]STRDAT <= [F:DAE]ACCDAT & [F:TRP]ENDDAT >= [F:DAE]ACCDAT))"
+      Else
+        FIL4 += " &(([F:TRP]STRDAT = [0/0/0] & [F:TRP]ENDDAT = [0/0/0])"
+
+        FIL4 += " | ([F:TRP]STRDAT = [0/0/0]"
+        FIL4 += " & ([F:TRP]ENDDAT >= [F:HAE]BPRDATVCR & [F:HAE]BPRDATVCR <> [0/0/0]"
+        FIL4 += " | ([F:HAE]BPRDATVCR = [0/0/0] & [F:TRP]ENDDAT >= [F:DAE]ACCDAT)))"
+
+        FIL5 += " | ([F:TRP]ENDDAT = [0/0/0]"
+        FIL5 += " & ([F:TRP]STRDAT <= [F:HAE]BPRDATVCR & [F:HAE]BPRDATVCR <> [0/0/0]"
+        FIL5 += " | ([F:HAE]BPRDATVCR = [0/0/0] & [F:TRP]STRDAT <= [F:DAE]ACCDAT)))"
+##
+        FIL6 += " | (([F:TRP]STRDAT <= [F:HAE]BPRDATVCR & [F:HAE]BPRDATVCR <> [0/0/0]"
+        FIL6 += " | ([F:HAE]BPRDATVCR = [0/0/0] & [F:TRP]STRDAT <= [F:DAE]ACCDAT)))"
+
+        FIL7 += " &  ([F:TRP]ENDDAT >= [F:HAE]BPRDATVCR & [F:HAE]BPRDATVCR <> [0/0/0]"
+        FIL7 += " | ([F:HAE]BPRDATVCR = [0/0/0] & [F:TRP]ENDDAT >= [F:DAE]ACCDAT)))"
+
+      Endif
+End
+
+
+
+
+
+
+
+#** #############################################################################################
+#* Shows the item lines for the line ticked in the preview grid
+#*! #############################################################################################
+Subprog FILTERLINES()
+Local Integer K : K=0
+Local Integer MAX_OCCURRENCES : MAX_OCCURRENCES = dim([M:TRG2]SNS)
+Raz [M:TRG2]
+#test
+#Infbox "filterlines"
+Filter [VLI] Where REFNO = [M:TRG1]REPLINE(nolign-1) and IDUSER = func GETUSERID()
+For [F:VLI]
+  #If [M:XEV3]REFNO(I)=[M:XEV1]REPLINE(nolign-1) Then
+    [M:TRG2]REFNO(K) = [F:VLI]REFNO
+    [M:TRG2]IVNUM(K) = [F:VLI]IVNUM
+    [M:TRG2]TYP(K) = [F:VLI]TYP
+    [M:TRG2]BPR(K) = [F:VLI]BPR
+    [M:TRG2]ACC(K) = [F:VLI]ACC
+    [M:TRG2]OFFACC(K) = [F:VLI]OFFACC
+    [M:TRG2]SNS(K) = [F:VLI]SNS
+    [M:TRG2]AMTLOC(K) = [F:VLI]AMTLOC
+    [M:TRG2]TAXNO(K) = [F:VLI]TAXNO
+    [M:TRG2]VATIPT(K) = [F:VLI]VATIPT
+    [M:TRG2]FLGVAT(K) = [F:VLI]FLGVAT
+    [M:TRG2]VATRAT(K) = [F:VLI]VATRAT
+    [M:TRG2]STRDAT(K) = [F:VLI]DATSTR
+    [M:TRG2]COA(K) =    [F:VLI]COA
+
+    K=K+1
+    If K >= MAX_OCCURRENCES
+      # Grid is full!
+      Call ECR_TRACE (mess(321,107,1) + " " + mess(322,107,1) + " " + mess(322,107,1),0) From GESECRAN
+      Break
+    Endif
+  # Endif
+ Next
+
+[M:TRG2]NBLIG =K
+Affzo [M:TRG2]
+Filter [VLI]
+
+End
+
+
+
+
+#** #############################################################################################
+#* Get the data for a company and set the fields (Legislation, Group, Taxnumber)
+#*
+#* @param CPY         Value Char          Company
+#*
+#* @param LEG         Variable Char       Legislation
+#*
+#* @param GROUP       Value Char          Group
+#*
+#* @param TAXNO       Variable Char       Taxnumber
+#*! #############################################################################################
+Subprog GET_CPYDATA(CPY, LEG,GRP, TAXNO)
+Value Char CPY
+Variable Char LEG
+Value Char GRP
+Variable Char TAXNO
+Local Char TCPY(GLONCPY) : Raz [L]TCPY
+
+  #If no company and no group => End
+  If CPY = "" & GRP = "" Then
+     End
+  Endif
+  #Check if company or group
+  If CPY <>"" : TCPY = CPY : Elsif  GRP <>"" : TCPY = GRP : Endif
+
+  #Get Legislation and Taxnumber for comany/group
+  Read [F:CPY]CPY0 = TCPY
+  If !fstat
+     LEG = [F:CPY]LEG
+     TAXNO = func GETTAXNO(TCPY, "")
+  Endif
+
+  Affzo [M:TRG0]1-20
+End
+
+#** #####################################################################################################
+#* This function is checking if all required address data for a given company are available
+#*
+#* @param COMP     Variable Char:      Company
+#* @return         Local Char Result:  1 if required data are available; 0 if not all required data are available
+#*
+#*!#####################################################################################################
+Funprog CHECK_CPYADDRESS(COMP)
+Variable Char COMP
+Local Integer RESULT : RESULT = 0
+
+
+
+
+If clalev([F:CPY])=0 : Local File COMPANY    [CPY] : Endif
+If clalev([F:BPA])=0 : Local File BPADDRESS  [BPA] : Endif
+   Read [F:CPY]CPY0 = COMP
+    If !fstat
+      If func GERVATCSVLIB.GETFEDSTATE([CPY]STAFED) <> ""
+        RESULT = 1
+      Endif
+    Endif
+    # if fedstate is present, check address and name
+    If RESULT = 1
+      Link [F:CPY] With
+&  [F:BPA]BPA0 = 2;[F:CPY]CPY ; [F:CPY]BPAADD
+&  As [LNKCA]
+&  Where [F:CPY]CPY = COMP
+& & [F:BPA]BPATYP = 2
+& & [F:BPA]BPANUM = COMP
+
+Columns [LNKCA] ([F:CPY]CPYNAM, [F:BPA]BPAADDLIG, [F:BPA]POSCOD, [F:BPA]CTY)
+    For [LNKCA]
+      If [F:BPA]BPAADDLIG = "" or [F:BPA]POSCOD = "" or [F:BPA]CTY = "" or [F:CPY]CPYNAM = ""
+        RESULT = 0
+      Endif
+    Next
+    Endif
+End RESULT
+
+
+
+#** #############################################################################################
+#* After_Modification field action of the company field
+#*! #############################################################################################
+Subprog AM_CPY(VALEUR)
+Variable Char VALEUR()
+
+  If VALEUR <>"" Then
+   #clear group field
+   [M:TRG0]GRP = ""
+   Affzo [M:TRG0]GRP
+   #Set Legislation for Company
+   Read [F:CPY]CPY0 = VALEUR
+   If fstat=0 Then
+      Call GET_CPYDATA(VALEUR, [M:TRG0]LEG, [M:TRG0]GRP,[M:TRG0]CRN)
+      #[TRG0]LEG = [F:CPY]LEG
+   Endif
+  Endif
+End
+
+
+Funprog CHECK_DATE_FISCAL(VALEUR )
+Variable Date VALEUR
+Local Integer CHECK_DATE_FISCAL
+
+Local Integer LEDINDEX
+LEDINDEX = func GETMAINLEDORINDEX([M:TRG0]CPY,2)
+Read [FIY]FIY1 = [M:TRG0]CPY;LEDINDEX
+
+
+  If !fstat
+    For [FIY]
+    CHECK_DATE_FISCAL = 0
+       If [FIY]FIYEND =VALEUR
+          If [FIY]FIYSTR =   [M:TRG0]DATDEB
+           CHECK_DATE_FISCAL =1
+           Break
+          Endif
+       Endif
+    Next
+  Endif
+End CHECK_DATE_FISCAL
+
+#** #############################################################################################
+#* Controle field action of the 'date to' field
+#*! #############################################################################################
+Subprog C_DATFIN(VALEUR)
+Variable Date VALEUR
+Local Integer CHECK_DATE
+
+  WARNING2 = 0
+
+  If VALEUR <> [0/0/0] and [M:TRG0]DATDEB <> [0/0/0]
+# 2017-11-27 DNE MODIF BEGIN (X3-60132)
+    If GFONCTION = "CONSPPG"
+        # Make sure 1/11 pre-payment only accepts full calender years as selection parameter.
+        If (day(VALEUR) <> 31 | month(VALEUR) <> 12 | year(VALEUR) <> year( [M:TRG0]DATDEB ) )
+            Call ERREURT(mess(264,107,1), 1) From GESECRAN      # "INVALID Date RANGE"
+            mkstat=2
+            End
+        Endif
+    Else
+        If (month([M:TRG0]DATDEB)=01 and month(VALEUR)=12)
+            Call ERREURT(mess(310,107,1), 0) From GESECRAN #if date range is calendar year => warning
+            WARNING2 = 1
+        Elsif (func CHECK_DATE_FISCAL( VALEUR ))
+            Call ERREURT(mess(425,107,1), 0) From GESECRAN #if date range is fiscal year => warning
+            WARNING2 = 1
+        Endif
+
+        If WARNING2 = 0
+          If VALEUR < [M:TRG0]DATDEB or year([M:TRG0]DATDEB) <> year(VALEUR)
+              Call ERREURT(mess(264,107,1), 1) From GESECRAN      # "INVALID Date RANGE"
+              mkstat=2
+              End
+          Endif
+
+          If gdat$(0,month(VALEUR)+1,year(VALEUR)) <> VALEUR or
+&              gdat$(1,month([M:TRG0]DATDEB),year([M:TRG0]DATDEB))<>[M:TRG0]DATDEB
+                Call ERREURT(mess(264,107,1), 1) From GESECRAN      # "INVALID Date RANGE"
+                mkstat=2
+            End
+          Endif
+
+          If !( (month([M:TRG0]DATDEB) = month(VALEUR)) or (month([M:TRG0]DATDEB)=1 and month(VALEUR)=3) or
+&           (month([M:TRG0]DATDEB)=4 and month(VALEUR)=6) or (month([M:TRG0]DATDEB)=7 and month(VALEUR)=9) or
+&           (month([M:TRG0]DATDEB)=10 and month(VALEUR)=12) or (month([M:TRG0]DATDEB)=01 and month(VALEUR)=12))
+              Call ERREURT(mess(264,107,1), 1) From GESECRAN  #error "INVALID Date RANGE"
+              mkstat=2
+              End
+          Endif
+        Endif
+    Endif
+  Endif
+End
+
+
+#** #############################################################################################
+#* Controle field action of the 'date from' field
+#*! #############################################################################################
+Subprog C_DATDEB(VALEUR)
+Variable Date    VALEUR
+
+  #if header screen [m:trg0] is used by "Dauerfristverlängerung"
+  If GFONCTION = "CONSPPG"
+    If (day(VALEUR) <> 1 | month(VALEUR) <> 1)
+      Call ERREURT(mess(264,107,1), 1) From GESECRAN      # "INVALID Date RANGE"
+      mkstat=2
+      End
+    Endif
+  Endif
+End
+
+#** #############################################################################################
+#* Controle field action of the 'Group' field
+#*! #############################################################################################
+Subprog C_GRP(VALEUR)
+Variable Char VALEUR()
+  Local Integer COUNTER : COUNTER = 0
+
+  #No group => do nothing.
+  If VALEUR = "" : End : Endif
+
+  # Check consistency of parameter DCLVATDAT between the company group and
+  # its member companies.
+  Local Char VATDAT(255) : VATDAT = func GETCOMPANYVATDAT( VALEUR )
+
+  For [F:AGC] Where GRP = VALEUR
+      If VATDAT <> func GETCOMPANYVATDAT( [F:AGC]CPY )
+          Call ERREURT( mess(284,107,1) - [F:AGC]CPY + ".", 1 ) From GESECRAN # "INCONSISTENT PARAMETER DCLVATDAT IN COMPANY"
+          mkstat = 2
+          End
+      Endif
+      COUNTER += 1
+  Next
+
+  # Check if the given value is a group of companies.
+  If COUNTER < 1
+      Call ERREURT(  mess(283,107,1), 1 ) From GESECRAN # "THIS IS not A GROUP OF COMPANIES."
+      mkstat = 2
+      End
+  Endif
+
+
+# 2015-08-19 DNE MODIF BEGIN
+  # Do these additional checks only for German VAT declaration.
+  If GFONCTION = "CONSTRG"
+      Call CHECK_REQUIREDCOMPANYDATA(func GERVATCSVLIB.GETLECOMPANY(VALEUR,""))
+  Endif
+# 2015-08-19 DNE MODIF ORIG
+#  #Call CHECK_REQUIREDCOMPANYDATA(VALEUR)
+#  Call CHECK_REQUIREDCOMPANYDATA(func GERVATCSVLIB.GETLECOMPANY(VALEUR,""))
+# 2015-08-19 DNE MODIF END
+End
+
+#** #############################################################################################
+#* Calls the function which checks the required company address data
+#*
+#*  @param COMP     Value Char         company
+#*! #############################################################################################
+Subprog CHECK_REQUIREDCOMPANYDATA(COMP)
+Value Char COMP
+  If func CHECK_CPYADDRESS(COMP) <> 1
+    GMESSAGE = mess(378,107,1) + "\" + mess(379,107,1) + "\" + mess(300,107,1)
+  mkstat = 2
+  Endif
+End
+
+
+
+#** #############################################################################################
+#* After_Change action of the group field
+#*! #############################################################################################
+Subprog AM_GRP(VALEUR)
+Variable Char    VALEUR()
+   Call SETFIELDSFORGROUP(VALEUR)
+End
+
+Subprog SETFIELDSFORGROUP(VALEUR)
+  Variable Char VALEUR()
+  #If group is set then set company and facility disabled
+  If VALEUR <>"" Then
+    [M:TRG0]CPY = ""
+    [M:TRG0]FCY =""
+    Affzo [M:TRG0]
+    Diszo  [M:TRG0]CPY
+    Diszo  [M:TRG0]FCY
+  Else
+   #Else Enable the fields
+   Actzo [M:TRG0]CPY
+   Actzo [M:TRG0]FCY
+  Endif
+  #get the specific company/group data
+  Call GET_CPYDATA([M:TRG0]CPY, [M:TRG0]LEG, VALEUR,[M:TRG0]CRN)
+End
+
+#** #############################################################################################
+#* Controle action of the company field
+#*! #############################################################################################
+Subprog C_CPY(VALEUR)
+  Variable Char    VALEUR()
+  Local Char GRP(20), CRN(20),LEG(10)
+  If VALEUR <>"" Then
+     Call GET_CPYDATA(VALEUR, LEG, GRP,CRN)
+     If CRN = ""
+        Call ERREURT( mess(299,107,1) + "\" + mess(300,107,1), 1 ) From GESECRAN  # "Tax identifier missing. Please check the company's legal data settings."
+        mkstat = 2
+        End
+    Endif
+  Endif
+
+  # Do these additional checks only for German VAT declaration.
+  If GFONCTION = "CONSTRG"
+     Call CHECK_REQUIREDCOMPANYDATA(VALEUR)
+  Endif
+End
+
+
+
+#** #############################################################################################
+#* Controle field action of the taxno field
+#*! #############################################################################################
+Subprog C_CRN(VALEUR)
+Variable Char VALEUR()
+    Local Char COMP(GLONCPY)
+    Local Char TAXNUM(255)
+
+    # If no group and no company is entered then end.
+    If [M:TRG0]CPY = "" & [M:TRG0]GRP = "" Then
+        End
+    Endif
+
+    If [M:TRG0]CPY <> "" Then
+        COMP = [M:TRG0]CPY
+    Elsif  [M:TRG0]GRP <> ""
+        COMP = [M:TRG0]GRP
+    Endif
+    # Called to check taxnumber and show errormessage if invalid
+    TAXNUM = func GETTAXNO( COMP, VALEUR )
+    If VALEUR <> TAXNUM
+        Call ERREURT( mess(285,107,1), 1 ) From GESECRAN  # "Incorrect tax identifier."
+        mkstat = 2
+        End
+    Endif
+End
+
+
+
+#** #############################################################################################
+#* Controle field action of the facility field
+#*! #############################################################################################
+Subprog C_FCY(VALEUR)
+Variable Char VALEUR()
+  If VALEUR <> ""
+    Read [F:FCY]FCY1 = [M:TRG0]CPY; VALEUR
+    If fstat
+      Call ERREURT( ( mess(412,199,1) ), 1 ) From GESECRAN # "THIS IS not A COMPANY SITE"
+      mkstat = 2
+    Endif
+  Endif
+End
+
+
+
+#** #############################################################################################
+#* Controle action of the Legislation field
+#*! #############################################################################################
+Subprog C_LEG(VALEUR)
+Variable Char VALEUR()
+
+  If VALEUR <> ""
+        Read [F:TRP]TRPG0(1) = VALEUR
+        If fstat
+            Call ERREURT( ( mess(261,107,1) - VALEUR ), 1 ) From GESECRAN # "This legislation does not have a recapitulative statement parameterization."
+            mkstat = 2
+            End
+        Endif
+    Endif
+End
+
+
+#** #############################################################################################
+#* Init_Button action for NBLIG in preview grid
+#*! #############################################################################################
+Subprog IB_NBLIG
+  #show filtered lines for the linecode which is ticked in preview grid
+  Call FILTERLINES()
+End
+
+
+#** #############################################################################################
+#* GET_WINLEG: get window and specific program
+#*! #############################################################################################
+Subprog GET_WINLEG(LEG,WWINDOW, WACTPROG, WSPEPROG)
+Value Char LEG()
+Variable Char WWINDOW ()
+Variable Char WACTPROG ()
+Variable Char WSPEPROG ()
+Local Char PROPSCREEN(30)
+
+Call PARAM([M:TRG0]CPY, "VATPROPSCR", PROPSCREEN) From ADOVAL
+If PROPSCREEN = "" : End : Endif
+
+Read [F:AWI]AWI0 = PROPSCREEN #[F:ADI]A1
+If fstat : End   : Endif
+For S=0 To dim([F:AWI]NOMMSK)-1
+  If [F:AWI]NOMMSK(S) <> ""
+     Read [F:AMK]CODMSK = [F:AWI]NOMMSK(S)
+     If !fstat
+        If [F:AMK]TRTSPE <> ""
+           WSPEPROG = [F:AMK]TRTSPE
+           WACTPROG = [F:AMK]TRTSPE
+           WWINDOW  = [F:AWI]WIN
+           Break
+        Endif
+     Endif
+  Endif
+Next
+End
+
+Funprog CHECKDOCTYPELEG(TYP,LEG)
+Variable Char TYP
+Variable Char LEG
+Local Char RESULT(10)
+  If clalev([F:GTE1])=0 : Local File GTYPACCENT    [GTE1] : Endif
+  Read [GTE1]GTE0 = TYP;LEG
+  If !fstat
+    RESULT = LEG
+  Else RESULT = ""
+  Endif
+End RESULT
+

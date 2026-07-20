@@ -1,0 +1,480 @@
+#<AdxTL>@(#)11.0.0.0 $Revision$ Blocage/Déblocage client
+###########################################################################################
+#
+# BLOCAGE des clients
+#    PARAM = "B"
+#    PRC  = "En-cours est supérieur par rapport au plafond"        X%
+#
+###########################################################################################
+#
+# DEBLOCAGE des clients
+#    PARAM = "D"
+#    PRC  = "En-cours est inférieur par rapport au plafond"        X%
+#
+###########################################################################################
+Local Char PARAM(10)(1..10) , VALEUR(10)
+#PARAM(1)="D"
+PARAM(1)="B"
+Call TRAITE_CHAR(VALEUR,PARAM,"","BPCREDIT","DBPCREDIT",3,"") From GTRAITE
+End
+
+
+$ACTION
+Case ACTION
+ When "INIT"        : Gosub INIT
+ When "INIT_DIA"    : Gosub INIT_DIA
+ When "TIT_DIA"     : Gosub TIT_DIA
+ When "EXEC"        : Gosub EXEC
+ When "OUVRE_BATCH" : Gosub OUVRE
+Endcase
+Return
+
+$OUVRE
+If clalev([F:TCU])=0 : Local File TABCUR [TCU] : Endif
+Return
+
+$INIT
+TMP = 1 : TRA = 1
+Return
+
+$INIT_DIA
+
+If clalev([F:TCU])=0 : Local File TABCUR [TCU] : Endif
+Call LEC_TCU(GCURSHR) From CPTLEC
+If [F:TCU]DECNBR=0
+ [M]FMTMNT = "N3:13#"
+Else
+ [M]FMTMNT = "N3:13."+num$([F:TCU]DECNBR)
+Endif
+
+Case PARAM(1)
+ When "B"
+  [M]LIBPRC = mess(235,117,1) # En-cours est > par rapport au plafond
+  TIT       = mess(325,117,1) # Blocage des clients
+
+ When "D"
+  [M]LIBPRC = mess(236,117,1) # En-cours est < par rapport au plafond
+  TIT       = mess(326,117,1) # Déblocage des clients
+Endcase
+[M]FCT = PARAM(1)
+Return
+
+$TIT_DIA
+Case PARAM(1)
+ When "B"
+  TITCRIT = mess(325,117,1) # Blocage des clients
+ When "D"
+  TITCRIT = mess(326,117,1) # Déblocage des clients
+Endcase
+Return
+
+$EXEC
+If !GSERVEUR
+ Case [M]FCT
+  When "B"
+   Call OUVRE_TRACE(mess(325,117,1)) From LECFIC
+   # Blocage des clients
+  When "D"
+   Call OUVRE_TRACE(mess(326,117,1)) From LECFIC
+   # Délocage des clients
+ Endcase
+Endif
+Call CONTCREDIT2([M:DIA]FCT,[M:DIA]ALLBPC,[M:DIA]BPCSTR,[M:DIA]BPCEND,[M:DIA]MNT,[M:DIA]NBR,[M:DIA]PRC,[M:DIA]TYP,[M:DIA]SIM)
+If !GSERVEUR
+ Call FERME_TRACE From LECFIC
+Endif
+Return
+
+##############################################################
+Subprog CONTCREDIT(BLC,ALL,DEB,FIN,MNT,JRS,PRC,IMP,SIM)
+Value Char    BLC()   : # B=blocage et D=déblocage
+Value Integer ALL     : # Tous clients
+Value Char    DEB()   : # Bornes de début client
+Value Char    FIN()   : # Bornes de début client
+Value Decimal MNT     : # Montant retard
+Value Integer JRS     : # Nb Jour retard
+Value Decimal PRC     : # Pourcentage
+Value Integer IMP     : # Impayé - Obsolète #YYFIN_2280
+Value Integer SIM     : # Simulation
+
+##YYFIN_2280_CAL
+Goto CREDIT
+
+##############################################################
+Subprog CONTCREDIT2(BLC,ALL,DEB,FIN,MNT,JRS,PRC,TYP,SIM)
+Value Char    BLC()   : # B=blocage et D=déblocage
+Value Integer ALL     : # Tous clients
+Value Char    DEB()   : # Bornes de début client
+Value Char    FIN()   : # Bornes de début client
+Value Decimal MNT     : # Montant retard
+Value Integer JRS     : # Nb Jour retard
+Value Decimal PRC     : # Pourcentage
+Value Integer TYP     : # 1 : Contrôle d'en cours // 2 :Contrôle du retard de paiement
+Value Integer SIM     : # Simulation
+
+$CREDIT
+Local Decimal RETARD, SOLDE, WMNT, PLAFOND, PLAFOND2
+Local Integer STAT
+Local Char    CLICUR(GLONBPR)
+Local Integer VALEUR
+Local Char    CRITERE(255), CRIT_BPC(255)
+Local Char    WPAR(10)
+Local Integer FLG_ONE_BPC, NBRCUR
+Local Date    DATREF
+DATREF = datesyst
+
+Onerrgo ERREUR From CONTROLE
+
+If !clalev([TCU]) : Local File TABCUR [TCU] : Endif
+Local File BPCUSTOMER [BPC] , GACCDUDATE [DUD] , COMPANY [CPY] ,TABCHANGE [TCH]
+
+If [L]TYP=1
+  Local File BPCUSTOMER [BPC2]
+  Local File BPCUSTOMER [BPC3]
+Else
+   Local File SINVOICE   [SIH]
+&   Where STA = 3
+&   Order By Key FACT = BPRPAY;CPY
+Endif
+
+Onerrgo
+If GERREUR : GERREUR=0 : End : Endif
+
+Case BLC
+ When "B"
+   Call ECR_TRACE(mess(325,117,1),0) From GESECRAN  # Blocage des clients
+ When "D"
+   Call ECR_TRACE(mess(326,117,1),0) From GESECRAN   # Déblocage des clients
+Endcase
+
+If dim([F:BPC]OSTCTL)<=0
+ Call ECR_TRACE(mess(76,117,1),1) From GESECRAN        # Il n'y a pas de contrôle d'en-cours
+ Goto FIN_CREDIT
+Endif
+
+Lock CREDIT With lockwait=0
+If fstat
+ Call ECR_TRACE(mess(30,100,1),1) From GESECRAN        # Opération en cours sur autre poste
+ Goto FIN_CREDIT
+Endif
+
+# ML3679 : Blocage/Déblocage Client
+# 1 = Contrôle d'en-cours
+# 2 = Contrôle du retard de paiement
+If [L]TYP=1
+ Gosub CTL_OST
+Else
+ Gosub CTL_DUD
+Endif
+
+Unlock CREDIT
+
+$FIN_CREDIT
+Call ECR_TRACE(string$(60,"-"),0) From GESECRAN
+If !FLG_ONE_BPC : Call ECR_TRACE(mess(348,117,1),0) From GESECRAN : Endif
+End
+
+
+##############################################################
+# ML3679 : Blocage/Déblocage Client
+# 1 = Contrôle d'en-cours
+##############################################################
+$CTL_OST
+Raz GCUR
+If GFCYDEF(9)<>""
+ Call GETDEV(GFCYDEF(9)) From DEVSUB : GCUR=GLOCALDEV
+Endif
+If GCUR="" : GCUR=GCURSHR : Endif
+Raz GSOCIETE, GCURLEG
+Call PARAM(GSOCIETE,"OSTCTL",WPAR) From ADOVAL # Valeur paramètre par société mais sous GESBPC/BPCREDIT, pas de notion de société.
+GOSTCTL = val(WPAR)
+If GOSTCTL=1 : GCUR=GCURSHR : Endif
+Call LEC_TCU(GCUR) From CPTLEC
+[L]NBRCUR = [F:TCU]CURRND
+
+Case BLC
+ When "B" : CRIT_BPC  = "[F:BPC2]OSTCTL=1"  : # LA234 Contrôle
+ When "D" : CRIT_BPC  = "[F:BPC2]OSTCTL=3"  : # LA234 Bloqué
+Endcase
+
+If ALL=2
+ CRIT_BPC += "& 1=1"
+Elsif DEB=FIN
+ CRIT_BPC += "& [F:BPC2]BPCRSK='"+DEB+"'"
+Else
+ CRIT_BPC += "& [F:BPC2]BPCRSK>='"+DEB+"' & [F:BPC2]BPCRSK<='"+FIN+"'"
+Endif
+
+Link [BPC2] With [BPC3]BPC0~=[BPC2]BPCRSK
+&   As [LNK]
+&   Where evalue(CRIT_BPC)
+&   Order By Key RSK = [F:BPC2]BPCRSK;[F:BPC2]BPCNUM
+Columns [LNK] ([F:BPC3]BPCNUM,[F:BPC3]OSTAUZ)
+
+For [LNK]RSK(1)
+ Gosub TRT_BPCRSK
+Next
+Return
+
+
+$TRT_BPCRSK
+CLICUR    = [F:BPC3]BPCNUM
+Raz PLAFOND
+Call CONVERT2(GSYSCUR,GCUR,GCUR,GCHGTYP,datesyst,[F:BPC3]OSTAUZ,PLAFOND,STAT) From TRTDEV
+If STAT #Error
+ PLAFOND = 0
+Else
+ PLAFOND = arr(PLAFOND,NBRCUR)
+Endif
+
+FLG_ONE_BPC = 1
+Call CALENC(CLICUR, datesyst,RETARD) From TRTBPMVT
+
+If PRC<>0
+ PLAFOND2 = PLAFOND*(1+(PRC/100))
+ If PLAFOND2<0 : PLAFOND2 = 0 : Endif
+Else
+ PLAFOND2 = PLAFOND
+Endif
+
+Case BLC
+ When "B" :
+  If RETARD>PLAFOND2
+   VALEUR = 3 : Gosub MAJCLI  : # LA234 Bloqué
+   Call ECR_TRACE(CLICUR-"->"-mess(VALEUR,234,1)-":"-
+&               mess(600,197,1)-format$([M]FMTMNT,RETARD)-GCUR-
+&              "("+mess(351,117,1)-":"-format$([M]FMTMNT,PLAFOND)-GCUR-"/"-
+&                 +mess(350,117,1)-":"-format$([M]FMTMNT,PLAFOND2)-GCUR+")",0) From GESECRAN
+  Endif
+
+ When "D" :
+   If RETARD<PLAFOND2
+    VALEUR = 1 :  Gosub MAJCLI # LA234 Contrôle
+    Call ECR_TRACE(CLICUR-"->"-mess(VALEUR,234,1)-":"-
+&               mess(600,197,1)-format$([M]FMTMNT,RETARD)-GCUR-
+&              "("+mess(351,117,1)-":"-format$([M]FMTMNT,PLAFOND)-GCUR-"/"-
+&                 +mess(350,117,1)-":"-format$([M]FMTMNT,PLAFOND2)-GCUR+")",0) From GESECRAN
+  Endif
+Endcase
+
+Return
+
+##############################################################
+# ML3679 : Blocage/Déblocage Client
+# 2 = Contrôle du retard de paiement
+##############################################################
+$CTL_DUD
+Case BLC
+ When "B" : Filter [BPC] Where OSTCTL=1   : # LA234 Contrôle
+ When "D" : Filter [BPC] Where OSTCTL=3   : # LA234 Bloqué
+Endcase
+
+If ALL=2
+ For [BPC]
+  Gosub TRT_BPRPAY
+ Next
+Elsif DEB=FIN
+ For [BPC] Where BPCNUM=DEB
+   Gosub TRT_BPRPAY
+  Next
+Else
+ For [BPC] Where BPCNUM>=DEB and BPCNUM<=FIN
+  Gosub TRT_BPRPAY
+ Next
+Endif
+Filter [BPC]
+Return
+
+
+$TRT_BPRPAY
+CLICUR    = [F:BPC]BPCNUM
+Raz RETARD
+CRITERE = ""
+FLG_ONE_BPC = 1
+
+# Point d'entrée
+Raz CRITERE
+GPOINT = "FILTRE" : Gosub ENTREE From EXEFNC
+If CRITERE="" : CRITERE = "1=1" : Endif
+
+Case BLC
+ When "B" :
+  Gosub STAT
+  If RETARD>MNT
+   If CLICUR=[F:BPC]BPCRSK
+    VALEUR = 3  : Gosub MAJCLI
+    Call ECR_TRACE(CLICUR-"->"-mess(VALEUR,234,1)-":"-mess(77,117,1)-format$([M]FMTMNT,RETARD)-GCURSHR,0) From GESECRAN
+   Else
+    Call ECR_TRACE(CLICUR-":"-mess(77,117,1)-format$([M]FMTMNT,RETARD)-GCURSHR-
+&                  func AFNC.MESN(mess(349,117,1),[F:BPC]BPCRSK),-1) From GESECRAN
+   Endif
+  Endif
+ When "D" :
+  Gosub STAT
+  If RETARD<=MNT
+   If CLICUR=[F:BPC]BPCRSK
+    VALEUR = 1 : Gosub MAJCLI
+    Call ECR_TRACE(CLICUR-"->"-mess(VALEUR,234,1)-":"-mess(77,117,1)-format$([M]FMTMNT,RETARD)-GCURSHR,0) From GESECRAN
+   Else
+    Call ECR_TRACE(CLICUR-":"-mess(77,117,1)-format$([M]FMTMNT,RETARD)-GCURSHR-
+&                  func AFNC.MESN(mess(349,117,1),[F:BPC]BPCRSK),-1) From GESECRAN
+   Endif
+  Endif
+ Endcase
+Return
+
+
+$STAT
+Link [SIH] With [DUD]DUD1(1)~=[F:SIH]ACCNUM As [LNK] Where [DUD]BPRPAY=CLICUR & evalue([L]CRITERE)
+Columns [LNK]([SIH]BPRPAY,[SIH]CPY,[DUD]CPY,[DUD]DUDDAT,[DUD]AMTCUR,[DUD]PAYCUR,[DUD]TMPCUR,[DUD]CUR,[SIH]SNS)
+
+For [LNK]FACT(2)
+ Call PARAML([F:DUD]CPY,"OSTTYPCUR",WPAR) From ADOVAL
+ TYPCOURS= val(WPAR)
+ For [LNK]FACT
+  If DATREF-[F:DUD]DUDDAT > JRS
+   SOLDE  = [F:SIH]SNS*([F:DUD]AMTCUR-[F:DUD]PAYCUR-[F:DUD]TMPCUR)
+   Call CONVERT([F:DUD]CUR,GCURSHR,GCURSHR,TYPCOURS,DATREF,SOLDE,WMNT,STAT) From TRTDEV
+   If !STAT
+    RETARD+=WMNT
+   Endif
+  Endif
+ Next
+Next
+Columns [LNK]
+
+# Point d'entrée
+GPOINT = "AFTACCBAL" : Gosub ENTREE From EXEFNC
+Return
+
+############################################################################################################################
+$MAJCLI
+Lock ="BPC"+CLICUR With lockwait=0
+If fstat=0
+ GPE = 0
+ GPOINT = "MAJ" : Gosub ENTREE From EXEFNC
+ If !GPE
+  Call DEBTRANS From GLOCK
+  Gosub TR1
+ Endif
+Else
+ Call ECR_TRACE(CLICUR-mess(30,100,1),1) From GESECRAN
+# Opération en cours sur autre poste
+Endif
+Unlock ="BPC"+CLICUR
+Return
+
+$TR1
+GOK=1
+Trbegin [BPC]
+If TYP=2
+ Update [BPC] Where BPCNUM=CLICUR With OSTCTL=VALEUR
+Else
+ Update [BPC] Where BPCRSK=CLICUR With OSTCTL=VALEUR
+Endif
+If fstat=1
+ GOK=-1 : GLOCK="$BPCUSTOMER"-[F:BPC]BPCNUM : Goto ROLL_TR1
+Elsif fstat
+ GOK=0 : Call FSTA("BPC") From GLOCK : Goto AB_TR1
+Endif
+If SIM<>2 : Commit : Else : Rollback : Endif
+Return
+
+$AB_TR1
+Rollback
+Return
+
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+Return
+
+##############################################################################################
+Subprog AV_INI(VALEUR)
+Variable Char VALEUR()
+
+If [M]TYP=2
+ Gosub LIB_PYR
+Else
+ Gosub LIB_RSK
+Endif
+End
+
+If [M]ALLBPC=2
+ Effzo [M]BPCSTR, BPCEND : Grizo [M]BPCSTR, BPCEND
+Else
+ Actzo [M]BPCSTR, BPCEND
+Endif
+Affzo [M]BPCSTR, BPCEND
+End
+
+$LIB_PYR
+Chgfmt [M]PRC    With "-N:3.2"
+Chgfmt [M]PRCAFF With "-K:15X"
+Chgfmt [M]NBR    With "K:15X"
+Chgfmt [M]MNT    With [M]FMTMNT
+Chgfmt [M]CUR    With "K:15X"
+Chgtzn [M]ALLBPC With mess(345,117,1)
+Chgtzn [M]BPCSTR With mess(346,117,1)
+Chgtzn [M]BPCEND With mess(347,117,1)
+
+If clalev([F:TCU])=0 : Local File TABCUR [TCU] : Endif
+Call LEC_TCU(GCURSHR) From CPTLEC
+If [F:TCU]DECNBR=0
+ [M]FMTMNT = "N3:13#"
+Else
+ [M]FMTMNT = "N3:13."+num$([F:TCU]DECNBR)
+Endif
+Return
+
+$LIB_RSK
+Chgfmt [M]PRC    With  "N:3.2"
+Chgfmt [M]PRCAFF With  "K:15X"
+Chgfmt [M]NBR    With "-K:15X"
+Chgfmt [M]MNT    With "-K:15X"
+Chgfmt [M]CUR    With "-K:15X"
+Chgtzn [M]ALLBPC With mess(342,117,1)
+Chgtzn [M]BPCSTR With mess(343,117,1)
+Chgtzn [M]BPCEND With mess(344,117,1)
+
+If clalev([F:TCU])=0 : Local File TABCUR [TCU] : Endif
+Call LEC_TCU(GCUR) From CPTLEC
+If [F:TCU]DECNBR=0
+ [M]FMTMNT = "N3:13#"
+Else
+ [M]FMTMNT = "N3:13."+num$([F:TCU]DECNBR)
+Endif
+Return
+
+Subprog C_TYP(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+ Gosub LIB_PYR
+Else
+ Gosub LIB_RSK
+Endif
+End
+
+Subprog C_ALLBPC(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+ Effzo BPCSTR, BPCEND : Grizo BPCSTR, BPCEND
+Else
+ Actzo BPCSTR, BPCEND
+Endif
+End
+
+Subprog AS_BPCEND(VALEUR)
+Variable Char    VALEUR()
+If VALEUR="" | VALEUR<[M]BPCSTR : VALEUR=[M]BPCSTR : Endif
+End
+
+Subprog C_BPCEND(VALEUR)
+Variable Char    VALEUR()
+If VALEUR<>"" & VALEUR<[M]BPCSTR
+ GMESSAGE = mess(44,199,1)
+ mkstat = 2 : End
+Endif
+End
+

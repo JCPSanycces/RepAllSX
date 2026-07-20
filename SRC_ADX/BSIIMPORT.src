@@ -1,0 +1,1516 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ Bank statement import
+#<AdxTL>@(#)0.0.0.0 $Revision$ Bank statement import
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# ##########    SUBJECT :    Bank statement import                                              #
+# ##########                 Handle classic bank statement import screen                        #
+# ##########                 Handle classic object BSIIMPP                                      #
+# ##########                                                                                    #
+# ##########    AUTHORS :    UBA/ANGRE                                                          #
+# ##########    DATE    :    2016-05-30                                                         #
+# ##########    UPDATES :    2016-06-01 DNE   - Basic batch server task abilities               #
+# ##########                 2016-07-06 ANGRE - Import of MT940 file from client                #
+# ##########                 2016-07-28 DNE   - x3-2244 Check statement against bank currency   #
+# ##########                 2016-08-10 ANGRE - check of double imports, import of files        #
+# ##########                                    without line feed                               #
+# ##########                 2016-08-15 ANGRE - File name tracing                               #
+# ##########                 2016-09-05 DNE   - X3-1765 Batch server enablement                 #
+# ##########                 2017-03-14 DNE/ANGRE - X3-26255                                    #
+# ##########                 2017-03-14 DNE   - X3-32209  Removal of Openio                     #
+# ##########                 2017-05-16 Bader - CREATE_LINE: init [F:BSIIMPD]FLGCRE with 1      #
+# ##########                 2017-10-26 Bader - HANDLE_SEGMENT: NEXTFIELDSTAT instead of NEXTFLDSTAT
+# ##########                 2017-11-24 jma -X3-66886  Limitation with additional lines of type 88       #
+# ##########                 2017-12-18 Bader - CREATE_HEADER: allow call from formula
+# Issue X3-70348 - 2018-02-08 by RAFAX : Bank Type code assignment when importing BAI file.     #
+#                            2018-09-17: ANGRE - Improvement of error handling    (105985)      #
+# Issue X3-109506 - 2018-10-08 by SEMOL : CFONB new format type
+#                            2018-10-15: FPE   - Improve log messages for CFONB type (X3-112106)#
+# ############################################################################################# #
+
+# < DEBUG> #################################################################################### #
+End
+# </DEBUG> #################################################################################### #
+
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  ACTION
+#*
+#* Purpose:    Standard action dispatcher.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param ACTION      Name of the event (action).
+#*
+#*! #####################################################################################
+
+$ACTION
+    If GSERVEUR
+        # Batch server mode
+        Case ACTION
+           When "INIT"        : Gosub INIT
+           When "INIT_DIA"    : Gosub INIT_DIA
+           When "EXEC"        : Gosub EXEC
+        Endcase
+    Else
+        # Interactive mode and batch task configuration.
+        Case ACTION
+           When "OUVRE_BATCH" : Gosub INIT        # Called from EXEQRT function instead of INIT in interactive mode!
+           When "CONT_BATCH"  : Gosub CONT_BATCH  # Called when entering task data.
+           When "INIT"        : Gosub INIT
+           When "INIT_DIA"    : Gosub INIT_DIA
+           When "EXEC"        : Gosub EXEC
+           When Default
+        Endcase
+    Endif
+Return
+
+###########################################################################
+$INIT
+  If !clalev([F:BSIIP])    Local File BSIIMPPAR    [BSIIP]      Endif #Bank statement import parameter
+  If !clalev([F:CPY])      Local File COMPANY      [CPY]        Endif #Company
+  If !clalev([F:BAN])      Local File BANK         [BAN]        Endif #Bank
+  If !clalev([F:BSIIMP])   Local File BSIIMP       [F:BSIIMP]   Endif #Bank statment import header
+  If !clalev([F:BSIIMPD])  Local File BSIIMPD      [F:BSIIMPD]  Endif #Bank statement import detail
+  If !clalev([F:BSIIMPDS]) Local File BSIIMPDS     [F:BSIIMPDS]  Endif #Bank statement import subdetail (CAMT)
+  If !clalev([F:BSIFFM])   Local File BSIFILFMT    [F:BSIFFM]   Endif #Bank import format header
+  If !clalev([F:BSIFFD])   Local File BSIFILFMTD   [F:BSIFFD]   Endif #Bank import format detail
+  If !clalev([F:BSISCT])   Local File BSISCT       [F:BSISCT]   Endif #Bank import segment header
+  If !clalev([F:BSISCTD])  Local File BSISCTD      [F:BSISCTD]  Endif #Bank import segment detail
+  If !clalev([F:BSIITCD])   Local File BSIITCD       [F:BSIITCD]   Endif #Bank import type codes detail
+  If !clalev([F:BSIIMPTC])  Local File BSIIMPTC      [F:BSIIMPTC]  Endif #Bank import type codes header
+  If !clalev([F:BSISCTD1]) Local File BSISCTD      [F:BSISCTD1] Endif #Bank import segment detail
+  If !clalev([F:BSISCTD2]) Local File BSISCTD      [F:BSISCTD2] Endif #Bank import segment detail
+  If !clalev ([F:RBK])      : Local File RELBANK     [RBK]     : Endif # French bank account statement
+
+  Local Clbfile LINE(9), LINECLEARED(5), WORKLINE(9), W_LINECLEARED(7)
+#  Local Char TMPSTMCOD(10), TMPSTAT(10), TMPCPY(GLONCPY), ERRMSG(255) # Bader 2017-12-18
+  Local Char TMPSTMCOD(10)                                             # Bader 2017-12-18
+  Local Integer CURRLIN, DETAILCURRLIN, STATCOUNTER, TRANSCOUNTER, ALLTRANSCOUNTER, LASTFOUNDEDLINE
+  Local Integer OK: OK = 1
+# Issue X3-66886 - 2018-02-08 by JMA : comment
+  Local Char W_CURRENCY_CODE_SEGMENT_02(3), W_CURRENCY_CODE_SEGMENT_03(3), W_CURRENCY_CODE_BANK(3), W_BANK(5)
+  Local Char W_CURRENT_TMPSTMCOD(10), W_PREVIOUS_TMPSTMCOD(10), W_PREVIOUS_TMPSTMCOD(10), W_TMPSTMCOD_FIRST(10), W_TMPSTMCOD_LAST(10)
+  Local Char W_FIRST_FINAL_MESSAGE(100), W_SECOND_FINAL_MESSAGE(100), W_THIRD_FINAL_MESSAGE(100), W_FOURTH_FINAL_MESSAGE(100), W_FIFTH_FINAL_MESSAGE(100)
+  Local Char W_SPACE(1)           : W_SPACE = ""
+  Local Char W_SLASH(1)           : W_SLASH = "/"
+  Local Char W_COMMA(1)           : W_COMMA = ","
+  Local Char W_COMMA_SLASH(2)     : W_COMMA_SLASH = ",/"
+  Local Char W_NUMBER_ZERO(1)     : W_NUMBER_ZERO = "0"
+  Local Char W_SEGMENT_02(3)      : W_SEGMENT_02 = "02,"
+  Local Char W_SEGMENT_03(3)      : W_SEGMENT_03 = "03,"
+  Local Char W_SEGMENT_16(3)      : W_SEGMENT_16 = "16,"
+  Local Char W_SEGMENT_88(3)      : W_SEGMENT_88 = "88,"
+  Local Integer W_NUMBER_0        : W_NUMBER_0 = 0
+  Local Integer W_NUMBER_31       : W_NUMBER_31 = 31
+  Local Integer W_LINE_FEED       : W_LINE_FEED = 10
+  Local Integer W_CARRIAGE_RETURN : W_CARRIAGE_RETURN = 13
+  Local Integer W_TRANSCOUNTER_FIRST, W_TRANSCOUNTER_LAST
+
+  Local Integer FORCECREATELINE: FORCECREATELINE = 0
+
+# End issue X3-66886
+Return
+
+
+###########################################################################
+$INIT_DIA
+    If [M:BSIIMP]CODIMPPAR <> ""
+        Read [F:BSIIP]BSIIP0 = [M:BSIIMP]CODIMPPAR
+        If !fstat
+            Gosub INIT_FROM_CODIMPPAR
+        Else
+            Raz [F:BSIIP]
+        Endif
+    Endif
+Return
+
+
+###########################################################################
+$CONT_BATCH
+    # Signal error if import type is "Client" and therefore would require interactive file upload handling.
+    If [M:BSIIMP]TYPIMP = 1
+        Call ECR_TRACE( mess(75,7703,1), 1 ) From GESECRAN # 'Upload from client is not supported for batch run.'
+        SAI = 1 # Signal error.
+    Endif
+Return
+
+
+###########################################################################
+$EXEC
+    If GSERVEUR
+        # Compute file's name and open it.
+        Gosub FILE_OPEN_BATCH
+
+        #Import file
+        If STAT = 0 #if upload ok
+            Gosub IMPORT_FILE
+        Endif
+    Else
+        #File selection dialog, upload and opening of the file if ok
+        Gosub FILE_OPEN_INTERACTIVE
+
+        #Import file
+        If STAT = 0 #if upload ok
+            Gosub IMPORT_FILE
+        Endif
+        Call FERME_TRACE From LECFIC
+        Call LEC_TRACE From LECFIC
+    Endif
+Return
+
+#check filename (length and if allready has been imported)
+####################################################################################
+$CHECK_FILENAME
+    Local Tinyint REP : Raz REP
+
+    If len( IMPORTNAME ) > 250
+        Call ECR_TRACE( mess(62,7703,1), 1 ) From GESECRAN # 'The length of the filename is limited to 250 characters. Please shorten the filename.'
+        REP = 2
+        Return
+    Endif
+    Filter [F:BSIIMP] Where [F:BSIIMP]FILNAM = IMPORTNAME
+    If rowcount([F:BSIIMP]) > 0
+        If GSERVEUR
+            If FLGIGNDUPNAM
+                Call ECR_TRACE( mess(74,7703,1), -1 ) From GESECRAN # 'A file with the same filename has already been imported.'
+            Else
+                Call ECR_TRACE( mess(74,7703,1),  1 ) From GESECRAN # 'A file with the same filename has already been imported.'
+                REP = 2
+            Endif
+        Else
+            Wrnbox mess(63,7703,1) Using REP # 'A file with the same filename has already been imported. Press Cancel to abort import.'
+        Endif
+    Endif
+    Filter [F:BSIIMP]
+Return
+
+
+###############################################################################
+# Open a file in batch mode
+$FILE_OPEN_BATCH
+    Local Char    IMPORTNAME(GDIMFIC) : Raz IMPORTNAME
+    Local Integer STAT                : STAT = 0
+    Local Integer FLGIGNDUPNAM        : FLGIGNDUPNAM = 0
+
+    # Stop if import type is "Client" and therefore requires interactive file upload handling.
+    If [M:BSIIMP]TYPIMP = 1
+        Call ECR_TRACE( mess(75,7703,1), 1 ) From GESECRAN # 'Upload from client is not supported for batch run.'
+        STAT = 1 # Signal error.
+        Return
+    Endif
+
+    # Get filename from task.
+    Call SETNAM( [M:BSIIMP]FILNAM, IMPORTNAME ) From ORDSYS
+
+    # Entry point FILNAM
+    #
+    # In case you want to have changing filenames update IMPORTNAME in the entry point.
+    # And you can set FLGIGNDUPNAM = 1 to be able to ignore duplicate import files (in
+    # case you want to use always the same name).
+    #
+    # Notes:
+    # - There is no database transaction is open at the moment.
+    # - Interesting variables: IMPORTNAME (import file name) and FLGIGNDUPNAM (see above).
+    #
+    GPOINT = "FILNAM" : Gosub ENTREE From EXEFNC
+
+    # Import file.
+    Gosub $FILE_OPEN_COMMON
+Return
+
+
+###############################################################################
+# Open a file in interactive mode
+$FILE_OPEN_INTERACTIVE
+    Local Char    IMPORTNAME(GDIMFIC) : Raz IMPORTNAME
+    Local Integer STAT                : STAT = 0
+    Local Integer FLGIGNDUPNAM        : FLGIGNDUPNAM = 0
+
+    If [M:BSIIMP]TYPIMP = 1
+        Call COPSRV( IMPORTNAME, [M:BSIIMP]FILNAM, STAT ) From ORDSYS
+        If STAT >= 1 Then # 1 = canceled / 2 = error
+            Return
+        Endif
+    Else
+        Call SETNAM([M:BSIIMP]FILNAM,IMPORTNAME) From ORDSYS
+    Endif
+
+    # Import file.
+    Gosub $FILE_OPEN_COMMON
+Return
+
+
+###############################################################################
+#select and open file.
+$FILE_OPEN_COMMON
+    Local Integer FILEFOUND           : FILEFOUND = 0
+    Local Char FIELDSEP(10)
+    Local Integer IMPTYP
+    Local Integer TRANSVERSION
+
+    #check filename
+    Gosub CHECK_FILENAME
+    If REP > 1
+        STAT = 1
+        Return
+    Endif
+
+    If !GSERVEUR
+        Call OUVRE_TRACE( func AFNC.MES1( mess(30,7703,1), [M:BSIIMP]FILNAM) ) From LECFIC # 'Import of bank statement file '$1$''
+    Endif
+    Call EXISTE( [M:BSIIMP]FILNAM, FILEFOUND ) From ORDSYS
+# 2017-03-15 DNE MODIF BEGIN (X3-26255)
+    If FILEFOUND <> 1
+        Call ECR_TRACE(func AFNC.MES1( mess(11,7703,1), [M:BSIIMP]FILNAM), 1 )  From GESECRAN #  'File '$1$' could not be found on server.'
+        STAT = 1
+        Return
+    Endif
+
+    Local Char FILNAMTMP(255) : FILNAMTMP = [M:BSIIMP]FILNAM
+    Read [F:BSIFFM]BSIFFM0 = [M:BSIIMP]FILFMT
+    [L]FIELDSEP = [F:BSIFFM]FLDSEP
+    [L]IMPTYP = [F:BSIFFM]FILTYP
+
+    # Handle camt (XML) files
+    If IMPTYP = 3 #no field seperator
+        Clbfile RESHEAD      # Stream that contains the javascript result header
+        Clbfile RESBODY      # Stream that contains the javascript result bodyEnd
+        Clbfile INPXML       # Stream containing the XML file to transform
+        Clbfile INPTRANSF    # Stream containing the JSON transformation description
+        Integer STATUSCODE   # Status code from JS function (200 = GOOD).
+        Char ELEMENTMAP(30)
+
+        Call READCLOB( FILNAMTMP, INPXML ) From BSILIBXMLTRA
+        Filter [F:BSIFFD] Where [F:BSIFFD]CODBFF = [F:BSIFFM]CODBFF
+        Read [F:BSIFFD]BSIFFD0 First
+        Filter [F:BSISCT] Where [F:BSISCT]CODSCT = [F:BSIFFD]SCT
+        Read [F:BSISCT]BSISCT0 First
+        ELEMENTMAP = [F:BSISCT]CODELT
+        Filter [F:BSISCT]
+        Filter [F:BSIFFD]
+        Local Instance QBSIELTMAP Using C_BSIELTMAP
+        QBSIELTMAP = NewInstance C_BSIELTMAP AllocGroup null
+        STATUSCODE = fmet QBSIELTMAP.AREAD( ELEMENTMAP )
+        INPTRANSF = fmet QBSIELTMAP.GETJSONTRANS()
+
+        STATUSCODE = func BSILIBXMLTRA.X3XMLTRANSMULTILINE( RESHEAD, RESBODY, INPXML, INPTRANSF )
+        If STATUSCODE <> 200
+# TODO (DNE): Create a good error message?
+            Call ECR_TRACE( num$( STATUSCODE ) - RESHEAD, 1 )  From GESECRAN
+            STAT = 1
+            Return
+        #angre X3-41079
+        Else
+            TRANSVERSION = func BSILIBXMLTRA.X3XMLTRANSVERSION()
+            If TRANSVERSION > 0
+              Call ECR_TRACE(func AFNC.MES1( mess(226,7703,1), num$(TRANSVERSION)), -1 )  From GESECRAN #Version number of bundle-sage-camt: $1$
+            Else
+              Call ECR_TRACE( mess(225,7703,1), -1 )  From GESECRAN #Version number cannot be retrieved. Please ask your administrator to check JavaScript bundle: bundle-sage-camt.
+            Endif
+        Endif
+
+
+
+        FILNAMTMP += ".csv"
+        Call WRITECLOB( FILNAMTMP, RESBODY ) From BSILIBXMLTRA
+    Endif
+
+    # If the last two characters in the file are not CR + LF... add them
+# 2017-04-10 DNE MODIF BEGIN (X3-32209 Removal of Openio)
+    Tinyint BUFFER(2)
+    Openi FILNAMTMP
+    Seek Last-2
+    Getseq 2, BUFFER
+    Openi
+    If BUFFER(0) <> 13 and BUFFER(1) <> 10
+        Openo FILNAMTMP, -1
+        BUFFER(0) = 13 : BUFFER(1) = 10
+        Putseq 2, BUFFER
+        Openo
+    Endif
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Open file
+    Openi FILNAMTMP Using [REPS]
+    adxifs = ''
+    adxirs = chr$(13) + chr$(10)
+    Iomode adxium GASCII
+Return
+
+################################################################################
+#import selected file
+$IMPORT_FILE
+
+Local Char CHCKCHAR(2), SEGLAST(10), SEGCUR(10)
+Local Integer J, LENGTHOFLINE, FILEFSTAT, HCREATED
+Local Integer L, M
+Local Char C(115)
+Local Char W_ELLIPSIS(3)        : W_ELLIPSIS = "..." # Issue X3-66886 - 2018-02-08 by jma
+Local Char CFONB_RECORD01(125)  : CFONB_RECORD01 = "" # Issue X3-112106 - 2018-10-15 by FPE : Text to be logged
+Local Tinyint CFONB_LINE        : CFONB_LINE = 0      # Issue X3-112106 - 2018-10-15 by FPE : If 0, then it's the first line
+
+
+
+
+
+# link files if import type is mt940 or AR-LOCKBOX
+  If IMPTYP <> 3 : Link [F:BSIFFD] With [F:BSIFFM]BSIFFM0 = [F:BSIFFD]CODBFF As [LNK] Where [F:BSIFFD]CODBFF = [M:BSIIMP]FILFMT Order By [F:BSIFFD]LIN : Endif
+  Trbegin [F:BSIIMP], [F:BSIIMPD], [F:BSIIMPDS], [F:RBK]
+
+# Issue X3-66886 - 2018-02-08 by JMA
+  If IMPTYP = 4 # BAI
+    Repeat
+      Gosub READ_FILE  #Read the file imported.
+
+      C = LINE : Call ECR_TRACE(C, 0) From GESECRAN : C = ""
+
+      Gosub CLEAR_LINE #Clear line from control characters.
+
+# Retrieve the Currency code for segment 02
+
+
+
+      If left$(LINECLEARED,3) = W_SEGMENT_02 : W_CURRENCY_CODE_SEGMENT_02 = func BSILIBBAI.CURRENCY_CODE_SEGMENT_02(LINECLEARED) : Endif
+
+# Retrieve the Currency code for segment 03
+      If left$(LINECLEARED,3) = W_SEGMENT_03
+        W_CURRENCY_CODE_SEGMENT_03 = func BSILIBBAI.CURRENCY_CODE_SEGMENT_03(LINECLEARED)
+          # Assign the Currency code to file
+          If W_CURRENCY_CODE_SEGMENT_03 <> W_SPACE and W_CURRENCY_CODE_SEGMENT_03 <> W_SLASH
+            [F:BSIIMP]CUR = W_CURRENCY_CODE_SEGMENT_03
+          Else
+            If W_CURRENCY_CODE_SEGMENT_02 <> ""
+              [F:BSIIMP]CUR = W_CURRENCY_CODE_SEGMENT_02
+            Else
+              Read [F:BAN]BAN0 = [F:BSIIMP]BAN
+              [F:BSIIMP]CUR = [F:BAN]CUR
+            Endif
+          Endif
+      Endif
+
+
+      #if line not empty
+      If J > 0
+
+        Gosub CHK_SEG_TYP
+        If OK = 0
+          Break
+        Else
+          If SEGTOHANDLE        #If line starts with segment-id
+            If WORKLINE <> ""   #if a former segment found ---> work with it
+              Gosub HANDLE_SEGMENT  # Handle the last founded segment
+              #break in case of errror
+              If OK = 0 : Break : Endif
+            Endif
+            WORKLINE = LINECLEARED #Set the line to work with to cleared line
+          Else
+            Gosub REMOVE_SEGMENT_ID # Remove segment ID + comma
+            WORKLINE = WORKLINE + LINECLEARED # If line not starts with a segment-id then concatenate lines
+C = WORKLINE : Call ECR_TRACE(C, 0) From GESECRAN : C = ""
+          Endif
+        Endif
+      Endif
+      [L]SEGLAST = [L]SEGCUR
+      fstat = [L]FILEFSTAT
+
+    Until fstat <> 0
+  Else
+# End issue X3-66886
+
+   Repeat
+      Gosub READ_FILE  #Read the file imported.
+      Gosub CLEAR_LINE #Clear line from control characters.
+
+     #if line not empty
+     If J > 0
+       If IMPTYP = 1 or IMPTYP = 5 #no field seperator
+         Gosub CHK_SEG_TYP
+         If OK = 0
+           Break
+         Else
+           If SEGTOHANDLE        #If line starts with segment-id
+             If WORKLINE <> ""   #if a former segment found ---> work with it
+               Gosub HANDLE_SEGMENT  # Handle the last founded segment
+               #break in case of errror
+               If OK = 0 : Break : Endif
+              Endif
+              WORKLINE = LINECLEARED #Set the line to work with to cleared line
+            Else
+              WORKLINE = WORKLINE + LINECLEARED # If line not starts with a segment-id then concatenate lines
+            Endif
+          Endif
+
+          [L]SEGLAST = [L]SEGCUR
+
+        Elsif IMPTYP = 2 # AR-LOCKBOX
+          # TODO handle file with field seperator (csv. etc....)
+          WORKLINE = LINECLEARED
+
+          #new angre
+          Local Integer I, C
+          Local Char CURFIELD(255), TABLEF(255)
+          For [LNK]
+            If HCREATED = 0
+              Gosub CREATE_HEADER
+              HCREATED = 1
+            Endif
+            Filter [F:BSISCTD] Where [F:BSISCTD]CODSCT = [F:BSIFFD]SCT Order By [F:BSISCTD]LIN
+            For [F:BSISCTD] #loop through all fields of a segment
+              TABLEF = [F:BSISCTD]FLD
+              If [F:BSISCTD]TYP <> 4 # no constant
+                If WORKLINE <> ""
+                  I = instr(1, WORKLINE, FIELDSEP)
+                  If I>0
+                    CURFIELD = left$(WORKLINE, I-1)
+                    WORKLINE = right$(WORKLINE,I+1)
+                  Elsif I = 0 and WORKLINE <> ""
+                    CURFIELD = WORKLINE
+                    WORKLINE = ""
+                  Endif
+                Endif
+              Else
+                #constant
+                CURFIELD = [F:BSISCTD]FRM
+              Endif
+              If TABLEF <> ""
+                #angre X3-105985 Check if the type of the tablefield is compatible with the field type set in segment definition
+                If !func CHECKDBFIELDTYPE(TABLEF,[F:BSISCTD]FLDTYP)
+                  ERRMESS1 = func AFNC.MES2( mess(254,7703,1), TABLEFIELD, mess([F:BSISCTD]FLDTYP,3683,1))
+                  Gosub EXIT_IMPORT
+                Else
+                  If [F:BSISCTD]FLDTYP =2 Then
+                    Assign TABLEF  With val(CURFIELD)
+                  Else
+                    Assign TABLEF  With CURFIELD
+                  Endif
+                Endif
+              Endif
+            Next
+          Next
+          Gosub CREATE_LINE
+
+        Elsif IMPTYP = 3 # CAMT
+          Local Char CURFIELD(255), TABLEF(255), TMPWORKLINE(255)
+          Local Char ELEMENTLEVEL(10)
+          WORKLINE = LINECLEARED
+          If instr(1, LINE, FIELDSEP) <> 0
+            ELEMENTLEVEL = func GETFIELDFROMLINE(1,WORKLINE,FIELDSEP)
+            TMPWORKLINE = WORKLINE
+
+            Filter [F:BSISCTD] #set back filter of import segment lines
+            Filter [F:BSIFFD]  #set back filter of format definition lines
+            Filter  [F:BSIFFD] Where [F:BSIFFD]CODBFF = [M:BSIIMP]FILFMT and [F:BSIFFD]LEV = val(ELEMENTLEVEL) #Get segment for Elementlevel
+            Read  [F:BSIFFD]BSIFFD0 First
+            Filter [F:BSISCTD] Where [F:BSISCTD]CODSCT = [F:BSIFFD]SCT Order By [F:BSISCTD]LIN
+            For [F:BSISCTD] #loop through all fields of a segment for the elementlevel of the file line
+              TABLEF = [F:BSISCTD]FLD #set field of table
+              If [F:BSISCTD]TYP <> 4 # no constant
+                If WORKLINE <> ""
+                  CURFIELD = func GETFIELDFROMLINE([F:BSISCTD]POS, WORKLINE, FIELDSEP)
+                  WORKLINE = TMPWORKLINE
+                Endif
+                If [F:BSISCTD]FRM<>"" Then
+                  CURFIELD =evalue([F:BSISCTD]FRM)
+                Endif
+              Else #constant
+                CURFIELD = [F:BSISCTD]FRM
+              Endif
+              If TABLEF <> "" and CURFIELD <> ""
+                #angre X3-105985 Check if the type of the tablefield is compatible with the field type set in segment definition
+                If !func CHECKDBFIELDTYPE(TABLEF,[F:BSISCTD]FLDTYP)
+                  ERRMESS1 = func AFNC.MES2( mess(254,7703,1), TABLEFIELD, mess([F:BSISCTD]FLDTYP,3683,1))
+                  Gosub EXIT_IMPORT
+                Else
+                  If [F:BSISCTD]FLDTYP =2 Then # if value type is numeric
+                    Assign TABLEF  With val(CURFIELD)
+                  Else
+                    If [F:BSISCTD]FLDTYP = 3 # If fieldtype = date, we have to remove "-" from datevalue
+                      Local Char TMPDATE(8), FSEP(1)
+                      Tinyint COUNTER
+                      FSEP = "-"
+                      For COUNTER = 0 To 1
+                        TMPDATE += func GETFIELDFROMLINE(1, CURFIELD, FSEP)
+                      Next
+                      CURFIELD = TMPDATE + CURFIELD
+                    Endif
+                    Assign TABLEF  With CURFIELD
+                  Endif
+                Endif
+              Endif
+            Next
+
+           # write data into database
+            If [F:BSIFFD]DBACT = 2 Then #if create
+              If [F:BSIFFD]TABTYP = 2 Then #if header
+                Gosub CREATE_HEADER
+              Elsif [F:BSIFFD]TABTYP = 3 Then #if line
+                Gosub CREATE_LINE ##### write line
+              Elsif [F:BSIFFD]TABTYP = 1 Then #if detail line
+                Gosub CREATE_DETAIL_LINE ##### write detail line
+              Endif
+            Endif
+
+          Endif
+        Endif # IMPTYP=3
+      Endif # J > 0
+      fstat = [L]FILEFSTAT
+    Until fstat <> 0
+  Endif
+
+  Gosub HANDLE_LAST_LINE #  Issue X3-66886 - 2018-02-08 by JMA
+  Openi Using [REPS]
+
+  If GERRTRACE=0  #No error logged --- commit
+      #X3-42442
+     If [M:BSIIMP]FLOTYP = 2
+        Gosub DO_RECONSILATION
+     Endif
+     Commit
+     If IMPTYP <> 4
+      Call ECR_TRACE(func AFNC.MES2(mess(25,7703,1),TMPSTMCOD, num$(TRANSCOUNTER)),0) From GESECRAN
+      Call ECR_TRACE(func AFNC.MES2(mess(26,7703,1),num$(STATCOUNTER), num$(ALLTRANSCOUNTER)),0) From GESECRAN
+     Endif
+     TRA=1
+  Else #Error logged --- rollback
+     STATCOUNTER              =0
+     ALLTRANSCOUNTER          =0
+     W_TMPSTMCOD_FIRST        ="0"
+     W_TRANSCOUNTER_FIRST     =0
+     W_TMPSTMCOD_LAST         ="0"
+     W_TRANSCOUNTER_LAST      =0
+
+     Rollback
+     Call ECR_TRACE(mess(23,7703,1),1) From GESECRAN
+     If GERRTRACE > 1 Then
+      GERRTRACE -= 1 #Avoid the message 'Error while importing file' taken into account as a number of error
+     Endif
+
+     TRA=1
+  Endif
+  Gosub FILE_HANDLING
+Return
+
+# Issue  X3-66886 - 2018-02-08 by JMA
+#########################################
+# Remove the segment ID from the workline
+#########################################
+$REMOVE_SEGMENT_ID
+  If left$(LINECLEARED,3) = W_SEGMENT_88
+    If left$(WORKLINE,3) <> W_SEGMENT_16
+      If right$(WORKLINE, len(WORKLINE)) = W_SLASH
+        WORKLINE = left$(WORKLINE, len(WORKLINE) - 1) + W_COMMA
+      Endif
+    Endif
+    If left$(WORKLINE,3) = W_SEGMENT_16
+      If right$(WORKLINE, len(WORKLINE) - 1) = W_COMMA_SLASH
+        WORKLINE = left$(WORKLINE, len(WORKLINE) - 1)
+      Endif
+      If right$(WORKLINE, len(WORKLINE)) = W_SLASH
+        WORKLINE = left$(WORKLINE, len(WORKLINE) - 1) + W_COMMA
+      Endif
+    Endif
+    LINECLEARED = right$(LINECLEARED,4)
+  Endif
+Return
+
+##################
+# Handle last line
+##################
+$HANDLE_LAST_LINE
+  If IMPTYP <> 4
+    If FIELDSEP =""
+        If WORKLINE<>"" :    Gosub HANDLE_SEGMENT : Endif
+    Endif
+  Else # BAI
+    If FIELDSEP =""
+      If LINECLEARED <> "" : Gosub HANDLE_SEGMENT : Endif
+    Endif
+  Endif
+Return
+
+###################################
+#Clear line from control characters
+###################################
+$CLEAR_LINE
+  Raz LINECLEARED, CHCKCHAR, J
+  While J <= len(LINE)
+    J +=1 : CHCKCHAR = mid$(LINE,J,1)
+    # Sometimes the first character is a carriage return, 13, or line feed, 10. Then we should change this character by 0.
+    If J = 1 and (ascii(CHCKCHAR) = W_LINE_FEED or ascii(CHCKCHAR) = W_CARRIAGE_RETURN)
+      LINECLEARED = W_NUMBER_ZERO
+    Else
+      If ascii(CHCKCHAR) > W_NUMBER_31
+        LINECLEARED = LINECLEARED + CHCKCHAR
+      Endif
+      If ascii(CHCKCHAR) = W_NUMBER_0
+        If J = 1
+          J = 0
+        Endif
+        Break
+      Endif
+    Endif
+  Wend
+Return
+
+##########
+#Read file
+##########
+$READ_FILE
+  Onerrgo ERRSEQFILEREADING
+  Rdseq LINE Using [REPS]
+  Onerrgo
+  FILEFSTAT = fstat
+Return
+
+############################
+#Retrieve bank currency code
+############################
+$RETRIEVE_BANK_CURRENCY_CODE
+  Filter [F:BAN] Where [F:BAN]CUR = 2 and [F:BSISCTD]CODSCT = [F:BSIFFD]SCT # TYP = 2 ==> Code = 2, Segment id (local menu 3667)
+Return
+
+# End issue X3-66886
+
+#####################################################################################################
+#X3-42442
+$DO_RECONSILATION
+  Local Integer PSTA  # status of matching 0 : OK, 1 : already matched, 2 : import/statement not found,
+                       # 3: error creating a new ID in RELBANK, 4 : various
+  Local Clbfile PMSG  # Message corresponding to status
+  Call BSI_RECONCILE(TMPSTMCOD,PSTA,PMSG,0) From BSILIBRCL
+  If PMSG <> ""
+    Call ECR_TRACE(PMSG,-1) From GESECRAN
+  Endif
+Return
+
+#move file if defined in settings
+######################################################################################################
+
+#**
+#* Returns the value from the position of parameter INDEX in the given line and field seperator
+#*
+#* @param INDEX       Position of the value in the line
+#* @param LINE        Line, seperated by field seperator
+#* @param FIELDSEP    Field seperator for LINE
+#*!
+Funprog GETFIELDFROMLINE(INDEX,LINE,FIELDSEP)
+Value Tinyint INDEX
+Variable Char LINE
+Variable Char FIELDSEP
+Local Char RETURNVALUE(255)
+Local Integer C, I
+  For C = 0 To INDEX - 1
+    I = instr(1, LINE, FIELDSEP)
+    If I>0 #if field seperator in line
+      RETURNVALUE = left$(LINE, I-1) #seperate value
+      LINE = right$(LINE,I+1) #cut off value from line
+    Elsif I = 0 and LINE <> "" #last value in line
+      RETURNVALUE = LINE
+      LINE = ""
+    Endif
+  Next
+  If RETURNVALUE <> ""
+    Call REMOVE_APO(RETURNVALUE) #remove apostroph
+  Endif
+End RETURNVALUE
+
+#angre 210317 remove '"' from char
+Subprog REMOVE_APO(SOURCEVAL)
+Variable Char SOURCEVAL
+  If right$(SOURCEVAL,len(SOURCEVAL)) = '"' and left$(SOURCEVAL,1) = '"' Then
+    SOURCEVAL = seg$(SOURCEVAL,2,len(SOURCEVAL)-1)
+  Endif
+End
+
+$FILE_HANDLING
+
+  Local Char LOGPATH(250)
+  Local Char DIRSEP(2)
+  DIRSEP = func GDPDU1.GETDIRSEPARATOR
+  #filepath for tracefile (only when client checked)
+  LOGPATH = IMPORTNAME
+  Read [F:BSIIP]BSIIP0 = [M:BSIIMP]CODIMPPAR
+  If [F:BSIIP]MOVAFTIMP = 2
+    Local Char COPYPATH(255)
+    Local Char FILEPREFIX(3) : If GERRTRACE = 0 : FILEPREFIX = "OK" : Else FILEPREFIX = "NOK" : Endif
+    Local Char MOVEVOLUME(255)
+    Local Char FILNAME(255)
+    #filepath for tracefile when move is checked
+    LOGPATH =  [F:BSIIP]MOVVOL + DIRSEP + IMPORTNAME
+    MOVEVOLUME = filpath(mid$([F:BSIIP]MOVVOL,2, len([F:BSIIP]MOVVOL) - 2),"","","","","")
+    If [F:BSIIP]RENAFTIMP = 2
+      Local Char FTIME(8)
+      FTIME = func AFNC.TIME_FROM_DT(datetime$)
+      FILNAME = FILEPREFIX + "_" + format$( "D:YYYY[-]MM[-]DD", date$ ) + "-" + left$(FTIME,2) + "-"+ mid$(FTIME,4,2)+ "-" + IMPORTNAME #+ ".txt"
+      MOVEVOLUME = MOVEVOLUME + DIRSEP + FILNAME
+      #filepath for tracefile when move and rename are checked.
+      LOGPATH =  [F:BSIIP]MOVVOL + DIRSEP + FILNAME
+    Endif
+    Call MOVE([M:BSIIMP]FILNAM,MOVEVOLUME,STAT) From ORDSYS
+  Endif
+  If IMPTYP <> 4
+    Call ECR_TRACE(mess(67,7703,1) - LOGPATH,0) From GESECRAN
+    #angre X3-105985 display infboxes only for BAI import (IMPTYPE = 4)
+  Else
+# Issue  X3-66886 - 2018-02-08 by JMA
+    W_FIRST_FINAL_MESSAGE = (mess(67,7703,1) - LOGPATH)
+    W_SECOND_FINAL_MESSAGE = (func AFNC.MES2(mess(26,7703,1),num$(STATCOUNTER), num$(ALLTRANSCOUNTER)))
+    If W_TMPSTMCOD_FIRST = W_TMPSTMCOD_LAST
+      W_FIFTH_FINAL_MESSAGE = (func AFNC.MES2(mess(247,7703,1),W_TMPSTMCOD_FIRST, num$(W_TRANSCOUNTER_FIRST)))
+      Infbox W_SECOND_FINAL_MESSAGE, W_FIFTH_FINAL_MESSAGE Titled W_FIRST_FINAL_MESSAGE
+    Else
+      W_THIRD_FINAL_MESSAGE = (func AFNC.MES2(mess(245,7703,1),W_TMPSTMCOD_FIRST, num$(W_TRANSCOUNTER_FIRST)))
+      W_FOURTH_FINAL_MESSAGE = (func AFNC.MES2(mess(246,7703,1),W_TMPSTMCOD_LAST, num$(W_TRANSCOUNTER_LAST)))
+      Infbox W_SECOND_FINAL_MESSAGE, W_THIRD_FINAL_MESSAGE, W_FOURTH_FINAL_MESSAGE Titled W_FIRST_FINAL_MESSAGE
+    Endif
+  Endif
+# End issue  X3-66886
+
+Return
+
+########################################################################
+#check if line starts with segment typ
+$CHK_SEG_TYP
+  Local Integer SEGTOHANDLE, SEGMAXLENGTH
+  Local Char SEGMENT(10)
+
+  Filter [LNK]
+  For [LNK]
+    Filter [F:BSISCTD] Where [F:BSISCTD]TYP = 2 and [F:BSISCTD]CODSCT = [F:BSIFFD]SCT # TYP = 2 ==> Code = 2, Segment id (local menu 3667)
+    For [F:BSISCTD]
+      If mid$(LINECLEARED,[F:BSISCTD]POS, [F:BSISCTD]LNG) = [F:BSISCTD]FLDIDT Then
+         If [F:BSIFFD]LIN = 1
+          LASTFOUNDEDLINE = 0
+        Endif
+
+         [L]SEGTOHANDLE = 1
+         [L]SEGCUR  =     [F:BSISCTD]CODSCT
+         [L]SEGMAXLENGTH  = [F:BSISCT]LNGMAX
+
+         If [F:BSIFFD]LIN - LASTFOUNDEDLINE > 1 Then
+          SEGMENT = func CHECK_MANDATORY_SEG([F:BSIFFD]LIN-1, [F:BSIFFD]CODBFF)
+          If SEGMENT <> ""
+            OK = 0
+            Break
+          Endif
+         Endif
+         LASTFOUNDEDLINE = [F:BSIFFD]LIN
+         Break
+      Endif
+    Next
+    If OK = 0
+      ERRMESS1 = func AFNC.MES1( mess(16,7703,1), SEGMENT)#= "Segment " + SEGMENT + " is mandatory"
+      Gosub EXIT_IMPORT
+    Endif
+    If SEGTOHANDLE = 1
+      Break
+    Endif
+  Next
+  Filter [F:BSISCTD]
+Return
+
+
+#######################################################################
+# check if segment length is valid
+$CHECK_SEGMENTLENGTH
+  If [L]SEGLENGTH > [L]SEGMAXLENGTH Then
+  Endif
+Return
+
+###########################################################################
+#Handle line for a segment
+$HANDLE_SEGMENT
+
+  If OK = 0 : Return : Endif
+  Local Integer SEGPROCESSED   # Flag that indicates that segment is processed
+  Local Integer POSFIELD, LASTDBACTION, LASTTABTYP, NEXTFIELDLINE, NEXTFIELDLENGTH, NEXTFIELDPOS, NEXTFIELDTYP, NEXTFIELDSTAT       # Position of the current field
+  Local Char TABLEFIELD(30),NEXTFIELDID(10)
+  Local Clbfile CURFIELD(9), CURFIELDORIG(9)
+  SEGPROCESSED = 1 : POSFIELD = 1
+
+  Filter [LNK] Where [F:BSIFFD]SCT  = SEGLAST Order By [F:BSIFFD]LIN # loop through all segments of a bank file format
+    For [LNK]
+      Filter [F:BSISCTD] Where [F:BSISCTD]CODSCT = [F:BSIFFD]SCT Order By [F:BSISCTD]LIN
+
+    #if segment is a start segment then empty import table
+    If [F:BSIFFD]SCTSTR = 2
+      Raz [F:BSIIMPD]
+    Endif
+
+    For [F:BSISCTD] #loop through all fields of a segment
+
+      If OK = 0 : Break : Endif
+      Raz [L]CURFIELD
+
+      If SEGPROCESSED
+        [F:BSISCTD2] = [F:BSISCTD]
+      Endif
+
+  Case [F:BSISCTD]FLDOBY #mandatory or optional
+        When 2 #field is mandatory
+
+          If [F:BSISCTD]TYP = 2 or [F:BSISCTD]TYP = 3 Then #If field type is segment-id or field-id
+            CURFIELD = mid$(WORKLINE,POSFIELD,[F:BSISCTD]LNG)
+            POSFIELD = POSFIELD + [F:BSISCTD]LNG
+            SEGPROCESSED = 1
+          Elsif [F:BSISCTD]TYP = 1 # field is a data field
+
+
+            Case [F:BSISCTD]LNGTYP
+              When 1 #fixed field length
+                CURFIELD = mid$(WORKLINE,POSFIELD,[F:BSISCTD]LNG)
+                [L]CURFIELDORIG = CURFIELD
+
+
+                   If [F:BSISCTD]FRM <> "" : Gosub CHECK_CONTROL_TYPE : Endif  # Issue X3-66886 - 2018-02-08 by JMA :  JUST If WE HAVE A FUNCTION IN FRM Field.
+
+
+                [L]SEGPROCESSED = 1
+                POSFIELD = POSFIELD + len([L]CURFIELDORIG) # if length fixed use CURFIELDORIG because CURFIELD may changed in CHECK_CONTROL_TYPE
+
+              When 2 #variable field length
+                 Gosub CHECK_NEXT_FIELD # check the next field
+                 If ![L]NEXTFIELDTYP Then #
+                    CURFIELD = vireblc(mid$(WORKLINE,POSFIELD,[F:BSISCTD]LNG),1)
+                    [L]CURFIELDORIG = CURFIELD
+                    If [F:BSISCTD]FRM <> "" : Gosub CHECK_CONTROL_TYPE : Endif # Issue X3-66886 - 2018-02-08 by JMA :  JUST If WE HAVE A FUNCTION IN FRM Field.
+
+
+                    [L]SEGPROCESSED = 1
+                    POSFIELD = POSFIELD + len([L]CURFIELD)
+
+
+
+
+
+
+                 Elsif [L]NEXTFIELDTYP = 3 Then
+                    If [L]NEXTFIELDID <> "" Then
+                       If instr(POSFIELD, WORKLINE, [L]NEXTFIELDID) =0 Then
+                          # TODO check if we need a field status
+                          If [L]NEXTFIELDSTAT= 1 Then # 2017-10-26 Bader NEXTFIELDSTAT instead of NEXTFLDSTAT
+                             ERRMESS1 = func AFNC.MES2( mess(14,7703,1), [L]NEXTFIELDID, SEGLAST)
+                             Gosub EXIT_IMPORT
+                          Endif
+                      Else
+                        CURFIELD = mid$(WORKLINE,POSFIELD,(instr(POSFIELD, WORKLINE, [L]NEXTFIELDID) - POSFIELD))
+                        POSFIELD = POSFIELD + len(CURFIELD)
+                        [L]SEGPROCESSED = 1
+                      Endif
+                   Else
+                      ERRMESS1 = func AFNC.MES2( mess(15,7703,1), [L]NEXTFIELDID, SEGLAST)
+                      Gosub EXIT_IMPORT
+                   Endif
+
+                 Elsif [L]NEXTFIELDTYP = 1 Then
+                   CURFIELD = vireblc(mid$(WORKLINE,POSFIELD,[F:BSISCTD]LNG),1)
+                   [L]CURFIELDORIG = CURFIELD
+                   Gosub CHECK_FIELD_FORMAT
+                   #formula check according to Control type ]CTL
+                   Gosub CHECK_CONTROL_TYPE
+                   [L]SEGPROCESSED = 1
+                   POSFIELD = POSFIELD + len([L]CURFIELD)
+                 Endif
+
+             Endcase
+        Endif
+
+        When 1 #field is optional##################################################################################################################
+
+          If  [F:BSISCTD]TYP = 3  Then  # Feldkennung
+             If instr(POSFIELD, WORKLINE, [F:BSISCTD]FLDIDT) =0 Then
+                [L]SEGPROCESSED = 0
+             Else
+                CURFIELD = mid$(WORKLINE,POSFIELD,[F:BSISCTD]LNG)
+                POSFIELD = POSFIELD + [F:BSISCTD]LNG
+             Endif
+          Elsif [F:BSISCTD]TYP = 1 Then  #Daten
+          Gosub CHECK_NEXT_FIELD
+            Case [L]NEXTFIELDTYP
+               When 0  # keine Felder mehr im Segment?
+                 CURFIELD = vireblc(mid$(WORKLINE,POSFIELD,[F:BSISCTD]LNG),1)
+                 POSFIELD = POSFIELD + len(CURFIELD)
+                 [L]SEGPROCESSED = 1
+               When 3  # nechstes Feld - Segmentkennung
+                 If instr(POSFIELD, WORKLINE, [L]NEXTFIELDID) <>0 Then
+                    CURFIELD = mid$(WORKLINE,POSFIELD,(instr(POSFIELD, WORKLINE, [L]NEXTFIELDID) - POSFIELD))
+                    POSFIELD = POSFIELD + len(CURFIELD)
+                    [L]SEGPROCESSED = 1
+                Else
+                    [L]SEGPROCESSED = 0
+
+                Endif
+
+               When 1  # nechstes Feld - Daten
+                 CURFIELD = vireblc(mid$(WORKLINE,POSFIELD,[F:BSISCTD]LNG),1)
+
+                 #formula check according to Control type
+                 Gosub CHECK_CONTROL_TYPE
+                 [L]SEGPROCESSED = 1
+                 POSFIELD = POSFIELD + len([L]CURFIELD)
+            Endcase
+         Endif
+      Endcase
+
+      If CURFIELD<>"" Then
+        If left$([F:BSISCTD2]FLD,3) = "[F:" Then
+         TABLEFIELD = [F:BSISCTD2]FLD
+         #angre X3-105985 Check if the type of the tablefield is compatible with the field type set in segment definition
+         If !func CHECKDBFIELDTYPE(TABLEFIELD,[F:BSISCTD2]FLDTYP)
+          ERRMESS1 = func AFNC.MES2( mess(254,7703,1), TABLEFIELD, mess([F:BSISCTD2]FLDTYP,3683,1))
+          Gosub EXIT_IMPORT
+         Elsif [F:BSIFFD]TABTYP = 2 and [F:BSIFFD]DBACT= 3 Then # Header and update
+              Read [F:BSIIMP]BSIIMP0= [L]TMPSTMCOD
+              If fstat
+                 GOK=0 : Call FSTA("BSIIMP") From GLOCK : [L]OK=0
+              Endif
+              Gosub ASSIGN_FIELD
+              Gosub UPDATE_HEADER
+         Else
+
+          Gosub ASSIGN_FIELD
+
+         Endif
+        Endif
+      Endif
+
+    Next
+
+
+      If IMPTYP <> 5 Then
+
+        If [F:BSIFFD]TABTYP = 2 Then #if header
+          If [F:BSIFFD]DBACT = 2 Then #if create
+          Gosub CREATE_HEADER
+          Endif
+        Elsif [F:BSIFFD]TABTYP = 3 Then #if line
+          If [F:BSIFFD]DBACT = 2 Then #if create
+          Gosub CREATE_LINE ##### write line
+          Endif
+        Endif
+
+      Else
+        #X3-109506
+        If [F:BSIFFD]TABTYP = 2 Then #if header
+          If [F:BSIFFD]DBACT = 2 Then #if create
+            Gosub CREATE_HEADER
+          Endif
+        Elsif [F:BSIFFD]TABTYP = 3 Then #if line
+
+          If FORCECREATELINE = 1
+            Gosub CREATE_LINE ##### write line
+            FORCECREATELINE = 0
+          Endif
+
+          If left$(LINECLEARED,2) = "05" Then
+            FORCECREATELINE = 1
+          Else
+            If [F:BSIFFD]DBACT = 2 Then #if create
+              Gosub CREATE_LINE ##### write line
+            Endif
+          Endif
+
+        Endif
+        #X3-109506 END
+      Endif
+
+  Next
+
+Return
+
+
+##################################################################################################################
+$ASSIGN_FIELD
+
+  If [F:BSISCTD2]FLDTYP =2 Then
+    Assign TABLEFIELD  With val(CURFIELD)
+  Else
+    Assign TABLEFIELD  With CURFIELD
+  Endif
+
+Return
+
+
+
+
+
+
+
+##################################################################################################################
+#check bank. Is bank in import screen mandatory
+$CHECK_BANK
+Local Char TBAN(30)
+  If [F:BSIIMP]REFBAN <> ""
+    Filter [F:BAN] Where BSIREFBAN = [F:BSIIMP]REFBAN   ### new field in table [BAN]
+    If rowcount([F:BAN])>1 # if more than one bank with REFBAN
+      Call ECR_TRACE (func AFNC.MES1( mess(31,7703,1), [F:BSIIMP]REFBAN), -1) From GESECRAN #more than one bank
+      If [M:BSIIMP]BAN <> ""
+        For [F:BAN]
+          If [F:BAN]BAN = [M:BSIIMP]BAN
+             [L]TBAN = [F:BAN]BAN
+             Break
+          Endif
+        Next
+      Endif
+    Endif
+    If TBAN = ""
+      Read [F:BAN]First
+      If !fstat
+        [L]TBAN = [F:BAN]BAN
+      Endif
+      Filter [F:BAN]
+    Endif
+  Endif
+
+  If [F:BSIFFM]FILTYP <> 5 Then # Issue X3-112106 - 2018-10-15 by FPE : if file type <> CFONB
+#No bank with reference number --> take bank from screen
+    If  [L]TBAN = ""
+      Call ECR_TRACE (func AFNC.MES1( mess(18,7703,1), [F:BSIIMP]REFBAN)  - mess(24,7703,1), -1) From GESECRAN
+      If [M:BSIIMP]BAN <> ""
+        [L]TBAN = [M:BSIIMP]BAN
+      Else
+        ERRMESS1 =  mess(19,7703,1)#"No Bank for import defined in import screen."
+        Gosub EXIT_IMPORT : Return
+      Endif
+    Else
+      If [M:BSIIMP]BAN <> "" and [L]TBAN <> [M:BSIIMP]BAN Then
+        ERRMESS1 = func AFNC.MES2( mess(20,7703,1), [F:BSIIMP]REFBAN, [M:BSIIMP]BAN)
+        Gosub EXIT_IMPORT : Return
+      Endif
+    Endif
+    Read [F:BAN]BAN0 = [L]TBAN
+    If fstat
+      ERRMESS1 =  mess(21,7703,1) # 'Defined bank is not valid.'
+      Gosub EXIT_IMPORT : Return
+    Elsif [M:BSIIMP]CPY <> "" & [F:BAN]CPY <> [M:BSIIMP]CPY Then
+      ERRMESS1 = func AFNC.MES2( mess(22,7703,1), [F:BAN]BAN, [M:BSIIMP]CPY) # "Bank $1$ is not a bank of company '$2$'."
+      Gosub EXIT_IMPORT : Return
+    Endif
+# Issue X3-112106
+  Else
+    Local Char MYSTART(30), MYEND(30)
+    MYSTART = mid$(WORKLINE,3,5) + mid$(WORKLINE,12,5) + mid$(WORKLINE,22,11) + "  "
+    MYEND   = mid$(WORKLINE,3,5) + mid$(WORKLINE,12,5) + mid$(WORKLINE,22,11) + "ZZ"
+    Filter [BAN] Where BIDNUM >= MYSTART and BIDNUM <= MYEND
+    Read [F:BAN] First
+    If fstat
+      If TMPSTMCOD <> ""
+        Call ECR_TRACE(func AFNC.MES2(mess(25,7703,1),TMPSTMCOD,num$(TRANSCOUNTER)),0) From GESECRAN
+      Endif
+      ERRMESS1 = func AFNC.MES1(mess(257,7703,1), mid$(WORKLINE,3,5) - mid$(WORKLINE,12,5) - mid$(WORKLINE,22,11)) # Bank ID file not consistent with any EM bank
+      Filter [BAN] : Gosub EXIT_IMPORT : Return
+    Elsif [M:BSIIMP]CPY <> "" & [F:BAN]CPY <> [M:BSIIMP]CPY Then
+      If TMPSTMCOD <> ""
+        Call ECR_TRACE(func AFNC.MES2(mess(25,7703,1),TMPSTMCOD,num$(TRANSCOUNTER)),0) From GESECRAN
+      Endif
+      ERRMESS1 = func AFNC.MES2( mess(22,7703,1), [F:BAN]BAN, [M:BSIIMP]CPY) # "Bank $1$ is not a bank of company '$2$'."
+      Filter[BAN] : Gosub EXIT_IMPORT : Return
+    Elsif [M:BSIIMP]BAN <> "" & [M:BSIIMP]BAN <> [F:BAN]BAN Then
+      If TMPSTMCOD <> ""
+        Call ECR_TRACE(func AFNC.MES2(mess(25,7703,1),TMPSTMCOD,num$(TRANSCOUNTER)),0) From GESECRAN
+      Endif
+      ERRMESS1 = func AFNC.MES3(mess(256,7703,1), [M:BSIIMP]BAN, [F:BAN]BAN, mid$(WORKLINE,3,5) - mid$(WORKLINE,12,5) - mid$(WORKLINE,22,11)) # Bank entered not consistent with Bank ID found
+      Filter[BAN] : Gosub EXIT_IMPORT : Return
+    Endif
+    Filter [BAN]
+    [L]TBAN = [F:BAN]BAN
+    CFONB_RECORD01 = func AFNC.MES2(mess(255,7703,1), mid$(WORKLINE,3,5) - mid$(WORKLINE,12,5) - mid$(WORKLINE,22,11), [F:BAN]BAN) # Bank ID found related to Bank
+    If CFONB_LINE = 0 Then
+      Call ECR_TRACE(CFONB_RECORD01,-1) From GESECRAN
+      CFONB_LINE += 1
+    Endif
+# End issue X3-112106
+  Endif
+
+  #angre     X3-36481
+#  If IMPTYP <> 2 # currency check not for AR-Lockbox                # Bader 2017-12-18
+  If [F:BSIFFM]FILTYP <> 2 and [F:BSIFFM]FILTYP <> 5 # currency check not for AR-Lockbox nor CFONB     # Bader 2017-12-18  #CFONB added by RXA 11/18
+    If [F:BSIIMP]CUR <> [F:BAN]CUR
+      If [F:BSIIMP]CUR = ""
+
+        Call ECR_TRACE(func AFNC.MES1( mess(219,7703,1), [F:BAN]CUR),-1) From GESECRAN
+        [F:BSIIMP]CUR = [F:BAN]CUR
+      Else
+        ERRMESS1 = mess(60,7703,1) # 'Bank currency and statement currency do not match. Bank statement cannot be imported'
+        Gosub  EXIT_IMPORT : Return
+      Endif
+
+    Endif
+  Endif
+
+#  [L]TMPCPY        = [F:BAN]CPY
+  [F:BSIIMP]BAN    = [F:BAN]BAN
+  [F:BSIIMP]FCY    = [F:BAN]FCY
+  [F:BSIIMP]CPY    = [F:BAN]CPY
+
+
+Return
+
+
+#########################################################################################
+#check needed fields of next field in segment
+$CHECK_NEXT_FIELD
+Filter [F:BSISCTD1] Where [F:BSISCTD1]CODSCT  = [L]SEGLAST and [F:BSISCTD1]LIN >[F:BSISCTD]LIN Order By [F:BSISCTD1]LIN
+Read [F:BSISCTD1] First
+If !fstat
+   [L]NEXTFIELDLINE       = [F:BSISCTD1]LIN
+   [L]NEXTFIELDLENGTH     = [F:BSISCTD1]LNG
+   [L]NEXTFIELDPOS        = [F:BSISCTD1]POS
+   [L]NEXTFIELDTYP        = [F:BSISCTD1]TYP
+   [L]NEXTFIELDID         = [F:BSISCTD1]FLDIDT
+   [L]NEXTFIELDSTAT       =[F:BSISCTD1]FLDOBY # Mandatory or not
+Else
+   Raz [L]NEXTFIELDLENGTH , [L]NEXTFIELDPOS, [L]NEXTFIELDTYP , [L]NEXTFIELDID, [L]NEXTFIELDSTAT
+Endif
+Filter [F:BSISCTD1]
+Return
+
+##########################################################################################
+# Important!!!!!!!!!!!
+# If local BSIIMPORT variables (such as TMPSTMCOD) are used in here, you have to add them to the parameter
+# list of func BSILIBBAI.HANDLE_SEGMENT_03, as CREATE_HEADER is called from there as a callback function
+# Important!!!!!!!!!!!
+$CREATE_HEADER
+Local Char STANUM(8)
+OK = 1
+Gosub CHECK_BANK
+If OK = 0 : Return  : Endif
+
+#X3-42442
+If [M:BSIIMP]FLOTYP = 2 and [F:BSIIMP]BLCSTRSNS = ""
+  ERRMESS1 = mess(239,7703,1) - mess(240,7703,1)
+  Gosub EXIT_IMPORT
+  Return
+Endif
+
+
+
+If TMPSTMCOD <> ""
+  Call ECR_TRACE(func AFNC.MES2(mess(25,7703,1),TMPSTMCOD,num$(TRANSCOUNTER)),0) From GESECRAN
+  # Issue X3-112106
+  If [F:BSIFFM]FILTYP = 5 and CFONB_RECORD01 <> "" Then
+    Call ECR_TRACE(CFONB_RECORD01, -1) From GESECRAN
+  Endif
+  # End issue X3-112106
+  #X3-42442
+  If [M:BSIIMP]FLOTYP = 2
+    Gosub DO_RECONSILATION
+  Endif
+  TRANSCOUNTER = 0
+Endif
+
+Call NUMERO("BSISQ","",datesyst,"",STANUM,STAT) From SUBANM
+For K = len(STANUM) + 1 To 8
+  STANUM = "0"+STANUM
+Next
+[F:BSIIMP]FILNAM = IMPORTNAME
+[F:BSIIMP]STMCOD = STANUM
+[F:BSIIMP]FILFMT   = [M:BSIIMP]FILFMT
+[F:BSIIMP]CODIMPPAR = [M:BSIIMP]CODIMPPAR
+[F:BSIIMP]FLGMTC = 1
+
+[L]TMPSTMCOD    = [F:BSIIMP]STMCOD
+
+# Issue X3-66886 - 2018-02-08 by JMA
+  If W_TMPSTMCOD_FIRST = "" : [L]W_TMPSTMCOD_FIRST = [F:BSIIMP]STMCOD : Endif
+  [L]W_CURRENT_TMPSTMCOD = [F:BSIIMP]STMCOD
+# End issue number
+
+#Issue 109880
+If IMPTYP = 5
+  If left$(WORKLINE,2) = "01" and left$(LINECLEARED,2) = "07"
+     Call ECR_TRACE(func AFNC.MES1(mess(258,7703,1), mid$(WORKLINE,3,5) - mid$(WORKLINE,12,5) - mid$(WORKLINE,22,11)), 0 )  From GESECRAN
+  Endif
+Endif
+#End Issue 109880
+
+Write [F:BSIIMP]
+If fstat
+  GOK=0 : Call FSTA("BSIIMP") From GLOCK : [L]OK=0
+Else
+  STATCOUNTER += 1
+Endif
+
+[L]CURRLIN = 0
+
+Return
+##########################################################################################
+
+$UPDATE_HEADER
+
+  #X3-42442
+  If [M:BSIIMP]FLOTYP = 2 and [F:BSIIMP]BLCENDSNS = ""
+    ERRMESS1 = mess(239,7703,1) - mess(240,7703,1)
+    Gosub EXIT_IMPORT
+    Return
+  Endif
+
+  Rewrite [F:BSIIMP]
+  If fstat
+     GOK=0 : Call FSTA("BSIIMP") From GLOCK : [L]OK=0
+  Endif
+
+Return
+
+#######################################################################################
+$CREATE_LINE
+
+  If [F:BSIIMPD]AMTCUR = 0
+    Return
+   Endif
+
+   [L]CURRLIN +=1
+
+   [F:BSIIMPD]LIN    = [L]CURRLIN
+   [F:BSIIMPD]BAN    = [F:BSIIMP]BAN
+   [F:BSIIMPD]CPY    = [F:BSIIMP]CPY
+   [F:BSIIMPD]CUR    = [F:BSIIMP]CUR
+   [F:BSIIMPD]STMCOD = [F:BSIIMP]STMCOD
+   [F:BSIIMPD]FILFMT = [F:BSIIMP]FILFMT
+   [F:BSIIMPD]FLGCRE = 1                                    # 2017-05-16 Bader init with "Not validated"
+
+   Write [F:BSIIMPD]
+
+   If fstat
+    GOK=0 : Call FSTA("BSIIMPD") From GLOCK : [L]OK=0
+   Else
+
+# Issue X3-66886 - 2018-02-08 by JMA
+    If W_TMPSTMCOD_FIRST = W_CURRENT_TMPSTMCOD : W_TRANSCOUNTER_FIRST += 1 : Endif
+    If W_CURRENT_TMPSTMCOD <> W_PREVIOUS_TMPSTMCOD
+      W_PREVIOUS_TMPSTMCOD = W_CURRENT_TMPSTMCOD
+      W_TMPSTMCOD_LAST = W_PREVIOUS_TMPSTMCOD
+      Raz W_TRANSCOUNTER_LAST : W_TRANSCOUNTER_LAST += 1
+    Else
+      W_TRANSCOUNTER_LAST += 1
+    Endif
+# End issue X3-66886
+
+    TRANSCOUNTER += 1
+    ALLTRANSCOUNTER += 1
+   Endif
+
+   Raz [F:BSIIMPD]
+   DETAILCURRLIN = 0 # Set Detail line counter back to 0
+
+Return
+
+
+#######################################################################################
+$CREATE_DETAIL_LINE
+
+   If CURRLIN = 0
+    Return
+   Endif
+
+   [L]DETAILCURRLIN +=1
+
+   [F:BSIIMPDS]TRSLIN = [L]CURRLIN
+   [F:BSIIMPDS]DETLIN = [L]DETAILCURRLIN
+   [F:BSIIMPDS]STMCOD  =[F:BSIIMP]STMCOD
+
+
+   Write [F:BSIIMPDS]
+
+   If fstat
+    GOK=0 : Call FSTA("BSIIMPDS") From GLOCK : [L]OK=0
+
+
+
+   Endif
+
+   Raz [F:BSIIMPDS]
+
+Return
+
+
+#######################################################################################
+$CHECK_FIELD_FORMAT
+  If [F:BSISCTD]FLDFMT <> "" Then
+    CURFIELD = vireblc(format$([F:BSISCTD]FLDFMT,CURFIELD), 2)
+  Endif
+Return
+
+#######################################################################################
+$CHECK_CONTROL_TYPE
+
+  If [F:BSISCTD]FRM <> "" : CURFIELD = evalue([F:BSISCTD]FRM) : Endif
+
+    If IMPTYP = 4 # BAI
+        If CURFIELD <> ""
+               ERRMESS1 = CURFIELD  #RRR#
+               Gosub ERROR_IMPORT  : Return
+        Endif
+    Endif
+Return
+
+#angre X3-105985 Check if DB field type corresponds with type in segment definition
+Funprog CHECKDBFIELDTYPE(DBFIELD, VALUETYPE)
+Variable Char DBFIELD
+Value Integer VALUETYPE
+Local Integer DBFIELDTYPE
+Local Integer RESULT : RESULT = 0
+  DBFIELDTYPE = evalue("type(" + DBFIELD +")")
+  If find(DBFIELDTYPE,5,6,7) and VALUETYPE = 2
+    RESULT = 1
+  Elsif (DBFIELDTYPE>10 or DBFIELDTYPE = 3) and (VALUETYPE = 1 or VALUETYPE = 3)
+    RESULT = 1
+  Endif
+End RESULT
+
+
+##########################################################################################
+
+$EXIT_IMPORT
+  [L]OK =0
+
+  If ERRMESS1 <> ""
+    Call ECR_TRACE(ERRMESS1,1) From GESECRAN
+
+  Endif
+  Openi Using [R1]
+Return
+
+$ERROR_IMPORT
+  If ERRMESS1 <> ""
+    Call ECR_TRACE(ERRMESS1,1) From GESECRAN
+
+  Endif
+Return
+
+$ERRSEQFILEREADING
+
+Return
+
+Funprog CHECK_MANDATORY_SEG(LINE, FORMAT)
+Value Integer LINE
+Value Char FORMAT()
+Local Char SEGMENT(10)
+  If !clalev([F:BSIFFD1])   Local File BSIFILFMTD   [F:BSIFFD1] Endif
+  Read [F:BSIFFD1]BSIFFD0 = FORMAT;LINE
+  If !fstat
+    If [F:BSIFFD1]SEGOBY = 2
+      SEGMENT = [F:BSIFFD1]SCT
+    Endif
+  Endif
+
+End SEGMENT
+
+##########################################################################################
+Subprog C_IMPVOL( VALEUR )
+Variable Char VALEUR()
+
+  Gosub ENUM_VOLFIL_TYPE From ASYRSTO
+  mkstat = func ASYRSTO.CTL_VOLFIL( [M]TYPIMP, VALEUR, [M]FILNAM, E_TYPE_FILEREAD, GMESSAGE )
+End
+
+
+###########################################################################
+$INIT_FROM_CODIMPPAR
+  [M:BSIIMP]CPY = [F:BSIIP]CPY
+  [M:BSIIMP]BAN = [F:BSIIP]BAN
+  If [F:BSIIP]BAN <> ""                  # if bank is set in parameters > take it and disable field
+    Diszo [M:BSIIMP]BAN
+  Else                                   # if bank is empty in parameters > enable field
+    Actzo [M:BSIIMP]BAN
+  Endif
+
+  [M:BSIIMP]TYPIMP = [F:BSIIP]TYPIMP     # get (read only) import type from parameters
+  [M:BSIIMP]IMPVOL = [F:BSIIP]IMPVOL
+  If [M:BSIIMP]TYPIMP = 1                # if "Client" > disable file
+    Diszo [M:BSIIMP]IMPVOL
+  Else                                   # if "Server" > enable file
+    Actzo [M:BSIIMP]IMPVOL
+  Endif
+  [M:BSIIMP]FILFMT = [F:BSIIP]FILFMT
+  If [F:BSIIP]FILFMT <> ""               # if file format is set in parameters > take it and disable field
+    Diszo [M:BSIIMP]FILFMT
+  Else                                   # if file format is empty in parameters > enable field
+    Actzo [M:BSIIMP]FILFMT
+  Endif
+  [M:BSIIMP]FLOTYP = [F:BSIIP]FLOTYP
+  Affzo [M:BSIIMP]FLOTYP
+  Affzo [M:BSIIMP]
+
+Return
+
+######################################################################################
+## Section automatically added (screen BSIIMPORT) 05/30/2016 11:38:28 (UBA)
+######################################################################################
+Subprog AM_CODIMPPAR(VALEUR)
+Variable Char    VALEUR()
+
+If VALEUR <> [M:BSIIMP]CODIMPPAR
+  Read [F:BSIIP]BSIIP0 = VALEUR
+  If !fstat
+    Gosub INIT_FROM_CODIMPPAR
+  Endif
+Endif
+End
+
+
+######################################################################################
+## Section automatically added (screen BSIIMPORT) 05/31/2016 09:14:02 (UBA)
+######################################################################################
+Subprog C_BAN(VALEUR)
+Variable Char    VALEUR()
+  Read [F:BAN]BAN0 = VALEUR
+  If !fstat
+    If [F:BAN]CPY <> [M:BSIIMP]CPY   # bank doesn't belong to company > error
+       mkstat = 2
+       GMESSAGE = mess(12,117,1) # Bank account not held by company
+    Endif
+  Endif
+End
+
+
+######################################################################################
+## Section automatically added (screen BSIIMPORT) 06/01/2016 10:32:45 (UBA)
+######################################################################################
+Subprog AV_BAN(VALEUR)
+Variable Char    VALEUR()
+If [M:BSIIMP]BAN <> ""                # if "Bank" entered > enable field
+    Diszo [M:BSIIMP]BAN
+Else                                  # if "Bank" empty > disable field
+    Actzo [M:BSIIMP]BAN
+Endif
+
+If [M:BSIIMP]FILFMT = "CFONB"
+  Grizo   [M:BSIIMP]BAN
+Else
+  Actzo [M:BSIIMP]BAN
+Endif
+
+End
+
+Subprog AV_FILFMT(VALEUR)
+Variable Char    VALEUR()
+If [M:BSIIMP]FILFMT <> ""             # if "File format" entered > enable field
+    Diszo [M:BSIIMP]FILFMT
+Else                                  # if "File format" empty > disable field
+    Actzo [M:BSIIMP]FILFMT
+Endif
+End
+
+Subprog AV_IMPVOL(VALEUR)
+Variable Char    VALEUR()
+  If [M:BSIIMP]TYPIMP = 1                # if "Client" > disable file
+    Diszo [M:BSIIMP]IMPVOL
+  Else                                   # if "Server" > enable file
+    Actzo [M:BSIIMP]IMPVOL
+  Endif
+End
+

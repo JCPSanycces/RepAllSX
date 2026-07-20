@@ -1,0 +1,875 @@
+#<AdxTL>@(#)4.0.0.0 $Revision$
+###########################################################################
+# FUNMDESA  : Désallocations automatiques matières GPAO  LLC - DEC   1998 #
+###########################################################################
+#########################################################################
+# Contient les traitements utilisée pour la modélisation                #
+# Etiquettes                                                            #
+#########################################################################
+#    ACTION MODELISATION E-COMMERCE                                     #
+#                                                                       #
+# GACTION  : TRTDESALLM  : Action désallocation automatique             #
+#                                                                       #
+#########################################################################
+$ACTION
+Case ACTION
+ When "INIT"          : Gosub INIT
+ When "INIT_DIA"      : Gosub INIT_DIA
+ When "CONTROLE"      : Gosub CONTROLE
+ When "EXEC"          : Gosub EXEC
+ When "TERMINE"       : Gosub TERMINE
+ When Default
+Endcase
+Return
+
+########################################################################
+$INIT
+# En batch , il vaut mieux mettre onerrgo
+If GSERVEUR
+    Onerrgo ERRBATCH
+Endif
+
+Call FIND_GFCYDEF(8) From TRTX3   # FQ 54218
+Gosub OUVRE
+Return
+
+########################################################################
+$INIT_DIA
+Local    Char    LFCY : LFCY = PARAM(1)
+Local    Char    LDAT : LDAT = PARAM(2)
+Local    Char    LTYP : LTYP = PARAM(3)
+Local    Char    LVCR : LVCR = PARAM(4)
+Local    Char    LITM : LITM = PARAM(5)
+Local    Integer LRET : LRET = 0
+
+# titre de la boîte
+TIT = mess(118,197,1)
+Raz [M:DIA]
+
+If LFCY <> "" : [M:DIA]MFGFCY    = LFCY : Endif
+If LDAT <> ""
+    If instr(1,LDAT,"/")
+        [M:DIA]STRDAT = "["+LDAT+"]"
+    Else
+        [M:DIA]STRDAT = LDAT
+    Endif
+Endif
+Case LTYP
+    When "1":     [M:DIA]ALLTYP = 1
+    When "3":     [M:DIA]ALLTYP = 2
+Endcase
+If LVCR <> "" : [M:DIA]MFGNUMDEB = LVCR : [M:DIA]MFGNUMFIN = LVCR : Endif
+If LITM <> "" : [M:DIA]ITMREFDEB = LITM : [M:DIA]ITMREFFIN = LITM : Endif
+Return
+
+########################################################################
+$CONTROLE
+TIT=" "
+TMP=1
+Return
+
+
+#########################################################################
+$EXEC
+If !GSERVEUR
+    TRA = 1
+    Call OUVRE_TRACE(TIT) From LECFIC
+    Call ECR_TRACE(" ",0) From GESECRAN
+    Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+    Call PRTSCR("MAUTALL","DIA","",0,1) From ATRTX3
+    Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+    Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+# préparation des critères de filtre
+Gosub SEL_MAT
+
+# traitement des désallocations
+Gosub TRT_MAT
+
+Return
+
+#########################################################################
+$TERMINE
+If !GSERVEUR
+    # fermeture trace
+    Call FERME_TRACE From LECFIC
+    # aucune allocation effectuee ou lecture trace
+    If !NBDES
+        GERR = 2 : GMESSAGE = mess(71,193,1)
+    Endif
+    # lecture trace
+    #    Call LEC_TRACE From LECFIC
+Endif
+Return
+
+###########################################################################
+$OUVRE
+Local Integer  MODE
+Local Integer  OK
+Local Integer  NBDES
+Local Char     TIT(50)
+Local Char     CRITERE(255)
+Local Char     CRITERE2(255)
+# sr 09.01 CUSFLT zone de filtres supplémentaires demande 10405
+Local Char     CUSFLT(255)
+#
+Local Char     FORMULE1(255)
+
+# GH 12/09/12 dm 84212
+Local Char     FORMULE2(255)
+Local Integer  WITF2, WITM2, WMFI
+#
+Local Char     WMESS(85)
+Local Char     WMESS1(85)
+Local Char     WMESS2(85)
+Local Decimal  WALL
+Local Decimal  WSHT
+Local Integer  WRET
+Local Char     WTRTLIG(1)
+Local Char     WTRT(1)
+Local Integer  WALLTYP
+Local Char     WITMREF
+Local Char     WSTOFCY (GLONFCY)
+Local Char     WVCRNUM
+Local Integer  WVCRLIN
+Local Integer  WVCRSEQ
+Local Date     WSTRDAT
+
+
+Gosub CHARG_PARAM
+
+#---------------------------------------#
+# Ouverture des fichiers utilisés       #
+#---------------------------------------#
+If clalev([F:ORD])  = 0 : Local File ORDERS      [ORD]  : Endif
+If clalev([F:ORD1]) = 0 : Local File ORDERS      [ORD1] : Endif
+If clalev([F:MFG])  = 0 : Local File MFGHEAD     [MFG]  : Endif
+If clalev([F:MFM])  = 0 : Local File MFGMAT      [MFM]  : Endif
+If clalev([F:ITM])  = 0 : Local File ITMMASTER   [ITM]  : Endif
+If clalev([F:ITV])  = 0 : Local File ITMMVT      [ITV]  : Endif
+If clalev([F:ITF])  = 0 : Local File ITMFACILIT  [ITF]  : Endif
+If clalev([F:TFO])  = 0 : Local File TABFOR      [TFO]  : Endif
+If GWRHACT=2
+   If !clalev([F:WRH])  Local File WAREHOUSE  [WRH] : Endif
+   If !clalev([F:ITW])  Local File ITMWRH     [ITW] : Endif
+Endif
+
+# --- Déclaration classe ecran pour les encours --- #
+Local Mask ORDK    [ORDK]
+
+# V6 Affectations
+Gosub OPEN_MTO From MTOLINKLIB
+
+Return
+
+########################################################################
+# Préparation du filtre sur la table encours (matières)                #
+########################################################################
+$SEL_MAT
+
+MODE = 0
+# critères liés aux articles lancés
+CRITERE  = 'STOFCY ="'+[M:DIA]MFGFCY+'"'            # site de production
+CRITERE -= '& VCRTYP = 10'                          # ordre de fabrication
+CRITERE -= '& WIPSTA = 1'                           # statut ferme
+
+CRITERE -= '& PIO >=' +num$([M:DIA]MFGPIODEB)           # borne début priorité
+CRITERE -= '& PIO <=' +num$([M:DIA]MFGPIOFIN)           # borne fin   priorité
+
+If [M:DIA]MFGNUMDEB <> ""                               # borne début OF
+   CRITERE -= '& VCRNUM >="'+[M:DIA]MFGNUMDEB+'"'
+Endif
+If [M:DIA]MFGNUMFIN <> ""                               # borne fin   OF
+   CRITERE -= '& VCRNUM <="'+[M:DIA]MFGNUMFIN+'"'
+Endif
+
+# affaire
+If [M:DIA]PJTDEB <> ""
+   CRITERE -= '& PJT >="'+[M:DIA]PJTDEB+'"'             # borne début affaire
+Endif
+If [M:DIA]PJTFIN <> ""
+   CRITERE -= '& PJT <="'+[M:DIA]PJTFIN+'"'             # borne fin   affaire
+Endif
+
+# destinataire
+If [M:DIA]BPCNUMDEB <> ""
+   CRITERE -= '& BPRNUM >="'+[M:DIA]BPCNUMDEB+'"'       # borne début destin.
+Endif
+If [M:DIA]BPCNUMFIN <> ""
+   CRITERE -= '& BPRNUM <="'+[M:DIA]BPCNUMFIN+'"'       # borne fin   destin.
+Endif
+
+# no commande
+If [M:DIA]VCRNUMDEB <> ""
+   CRITERE -= '& VCRNUMORI >="'+[M:DIA]VCRNUMDEB+'"'    # borne début n° commande
+Endif
+If [M:DIA]VCRNUMFIN <> ""
+   CRITERE -= '& VCRNUMORI <="'+[M:DIA]VCRNUMFIN+'"'    # borne fin   n° commande
+Endif
+If [M:DIA]VCRNUMDEB <> "" | [M:DIA]VCRNUMFIN <> ""
+   CRITERE -= '& VCRTYPORI = 2'                         # type pièce =   commande
+Endif
+
+If [M:DIA]ALDEB <> "" | [M:DIA]ALFIN <> ""
+    MODE = 1
+    CRITERE -= '& WIPTYP = 5'                           # type WO
+    If [M:DIA]ALDEB <> ""
+       CRITERE -= '& ITMREF >="'+[M:DIA]ALDEB+'"'       # borne début article lancé
+    Endif
+    If [M:DIA]ALFIN <> ""
+       CRITERE -= '& ITMREF <="'+[M:DIA]ALFIN+'"'       # borne fin   article lancé
+    Endif
+    CRITERE2 = 'WIPTYP = 6'                             # type MW
+    If [M:DIA]ITMREFDEB <> ""
+       CRITERE2 -= '& ITMREF >="'+[M:DIA]ITMREFDEB+'"'   # borne début matière
+    Endif
+    If [M:DIA]ITMREFFIN <> ""
+       CRITERE2 -= '& ITMREF <="'+[M:DIA]ITMREFFIN+'"'   # borne fin   matière
+    Endif
+Else
+    CRITERE -= '& WIPTYP = 6'                           # type MW
+    If [M:DIA]ITMREFDEB <> ""
+       CRITERE -= '& ITMREF >="'+[M:DIA]ITMREFDEB+'"'   # borne début matière
+    Endif
+    If [M:DIA]ITMREFFIN <> ""
+       CRITERE -= '& ITMREF <="'+[M:DIA]ITMREFFIN+'"'   # borne fin   matière
+    Endif
+Endif
+#
+Gosub ANALYSE_FORMULE
+If FORMULE1 = "" : FORMULE1 = "1=1" : Endif
+
+# GH 12/09/12 dm 84212
+FORMULE2 = vireblc(FORMULE1,4)
+WMFI=0 : WITM2=0 : WITF2=0
+If instr(1,FORMULE2,"[ITM2]") | instr(1,FORMULE2,"[F:ITM2]")
+   WITM2=1
+   If !clalev([F:ITM2]) : Local File ITMMASTER [ITM2] : Endif
+Endif
+
+If instr(1,FORMULE2,"[ITF2]") | instr(1,FORMULE2,"[F:ITF2]")
+   WITF2=1
+   If !clalev([F:ITF2]) : Local File ITMFACILIT [ITF2] : Endif
+Endif
+
+If instr(1,FORMULE2,"[MFI]") | instr(1,FORMULE2,"[F:MFI]") | WITM2 | WITF2
+    WMFI=1
+    If !clalev([F:MFI])  : Local File MFGITM    [MFI] : Endif
+Endif
+
+If WMFI | WITF2 | WITM2
+& | instr(1,FORMULE2,"[MFM]") | instr(1,FORMULE2,"[F:MFM]")
+& | instr(1,FORMULE2,"[MFG]") | instr(1,FORMULE2,"[F:MFG]")
+& | instr(1,FORMULE2,"[ITM]") | instr(1,FORMULE2,"[F:ITM]")
+& | instr(1,FORMULE2,"[ITF]") | instr(1,FORMULE2,"[F:ITF]")
+    FORMULE2 = FORMULE1
+    FORMULE1 = "1=1"
+Else
+    FORMULE2=""
+Endif
+
+Return
+
+##################################################
+$ANALYSE_FORMULE
+# analyse présence formule de sélection
+If [M:DIA]FORMULE  = ""
+    If FORMULE1 = "" :  FORMULE1 = "1=1" : Endif
+Else
+    Read [F:TFO]TFO0=10;[M:DIA]FORMULE
+    If fstat
+        If FORMULE1 = "" :  FORMULE1 = "1=1" : Endif
+    Else
+        If FORMULE1 = ""
+            FORMULE1  = [F:TFO]FORFOR
+        Else
+            FORMULE1 += "&"
+            FORMULE1 += [F:TFO]FORFOR
+        Endif
+    Endif
+Endif
+
+Return
+
+
+#---------------------------------------------------------------------#
+# Traitement des matières                                             #
+#---------------------------------------------------------------------#
+$TRT_MAT
+# Point d'entrée pour permettre à l'utilisateur de rajouter des sélections
+# sr 09.01 demande 10405
+Raz CUSFLT
+GPOINT = "CUSSELFLT" : Gosub ENTREE From EXEFNC
+If CUSFLT = "" : CUSFLT = "1=1" : Endif
+#
+# link en tenant compte des critères sur date ou sur code priorité
+Case [M:DIA]SORPAR
+    When 1: Filter [ORD] Where (evalue(CRITERE) & STRDAT <= [M:DIA]STRDAT) &
+&                               evalue(CUSFLT) & evalue(FORMULE1)
+&                        Order By STRDAT Desc; PIO Asc; VCRTYP Asc; VCRNUM Asc
+    When 2: Filter [ORD] Where (evalue(CRITERE) & STRDAT <= [M:DIA]STRDAT) &
+&                               evalue(CUSFLT) & evalue(FORMULE1)
+&                        Order By PIO Asc; STRDAT Desc; VCRTYP Asc; VCRNUM Asc
+Endcase
+
+# boucle de lecture des matières
+For  [ORD] With Nohint                                # 10.02 Performances
+      # FQ 70409 GA 01/2011 limiter le nb de maj de [F:MFG], on maj l'OF précédent
+      If [F:ORD]VCRNUM<>WVCRNUM & WVCRNUM<>""
+         Gosub TRTMFG
+      Endif
+      If MODE = 1
+        Filter [ORD1] Where (evalue(CRITERE2) & STRDAT<=[M:DIA]STRDAT & VCRTYP=[F:ORD]VCRTYP & VCRNUM=[F:ORD]VCRNUM)
+&                     Order By STRDAT Asc; PIO Desc
+        For [ORD1] With Nohint                        # 10.02 Performances
+                WITMREF = [F:ORD1]ITMREF
+                WSTOFCY = [F:ORD1]STOFCY
+                WVCRNUM = [F:ORD1]VCRNUM
+                WVCRLIN = [F:ORD1]VCRLIN
+                WVCRSEQ = [F:ORD1]VCRSEQ
+                WSTRDAT = [F:ORD1]STRDAT
+                Gosub SEL_MATCOMPL
+                If OK = 1 : Goto NXT1 : Endif
+                #
+                WTRTLIG = "A"
+                Gosub TRTALL
+        $NXT1
+        Next
+        Filter [ORD1]
+        Goto NXT2
+      Endif
+      WITMREF = [F:ORD]ITMREF
+      WSTOFCY = [F:ORD]STOFCY
+      WVCRNUM = [F:ORD]VCRNUM
+      WVCRLIN = [F:ORD]VCRLIN
+      WVCRSEQ = [F:ORD]VCRSEQ
+      WSTRDAT = [F:ORD]STRDAT
+      Gosub SEL_MATCOMPL
+      If OK = 1 : Goto NXT2 : Endif
+      #
+      WTRTLIG = "A"
+      Gosub TRTALL
+$NXT2
+Next
+#
+Filter [ORD]
+# FQ 70409 GA 01/2011 limiter le nb de maj de [F:MFG], traiter le dernier OF
+If WVCRNUM<>""
+   Gosub TRTMFG
+Endif
+#
+Return
+
+#-----------------------------------------------------------------------#
+# Sélections complémentaires sur la matière                             #
+#-----------------------------------------------------------------------#
+$SEL_MATCOMPL
+OK=1
+# lecture article
+If [F:ITM]ITMREF <> WITMREF
+    Read [ITM]ITM0=WITMREF
+    If fstat : Raz [F:ITM] : Return : Endif
+Endif
+
+# lecture article/site
+If [F:ITF]ITMREF <> WITMREF | [F:ITF]STOFCY <> WSTOFCY
+    Read [ITF]ITF0=WITMREF;WSTOFCY
+    If fstat : Raz [F:ITF] : Return : Endif
+Endif
+
+# lecture enregistrement entête OF
+If [F:MFG]MFGNUM <> WVCRNUM
+    Read [MFG]MFG0=WVCRNUM
+    If fstat : Raz [F:MFG] : Return : Endif
+Endif
+
+# lecture enregistrement matière
+Read [MFM]MFM0=WVCRNUM;WVCRLIN;WVCRSEQ;WITMREF
+If fstat : Raz [F:MFM] : Return : Endif
+
+#
+If !find([F:MFG]MFGMOD,1,2) : Return : Endif
+# 18546 MM 08.03
+If [M:DIA]ENCOURFLG=1 & [F:MFM]MATSTA = 2 : Return : Endif    # si matière en cours et case non cochée
+If [F:MFM]MATSTA >= 3 : Return : Endif    # si matière soldée ou exclue
+# FIN 18546 MM 08.03
+
+If [F:MFM]ALLSTA  = 1 : Return : Endif    # si matière non allouée
+If [M:DIA]DESMOD = 2   # par type
+    Case [M:DIA]ALLTYP
+        When 1:    If [F:MFM]ALLSTA >= 4 : Return : Endif     # si alloué détail
+        When 2:    If [F:MFM]ALLSTA <  4 : Return : Endif     # si alloué global
+    Endcase
+Endif
+
+# GH 12/09/12 dm 84212
+If FORMULE2<>""
+   If WMFI & ([F:MFI]MFGNUM <> WVCRNUM | [F:MFI]MFGLIN <> WVCRLIN)
+        # lecture enregistrement ligne OF article lancé
+        Read [MFI]MFI0 = WVCRNUM;WVCRLIN
+        If fstat : Raz [F:MFI] : Return : Endif
+   Endif
+   If WITF2 & ([F:ITF2]ITMREF <> [F:MFI]ITMREF | [F:ITF2]STOFCY <> WSTOFCY)
+        # lecture enregistrement article/site lancé
+        Read [ITF2]ITF0 = [F:MFI]ITMREF;WSTOFCY
+        If fstat : Raz [F:ITF2] : Return : Endif
+   Endif
+   If WITM2 & [F:ITM2]ITMREF <> [F:MFI]ITMREF
+        # lecture enregistrement article lancé
+        Read [ITM2]ITM0 = [F:MFI]ITMREF
+        If fstat : Raz [F:ITM2] : Return : Endif
+   Endif
+   If !evalue(FORMULE2) : Return : Endif
+Endif
+
+# 44409 mm 06.08- Si la matière a le statut en cours de pesée, pas de désallocation
+# 85521 mm 10.12 - WGGBOX géré pour la pesée par OF
+If dim([F:MFM]WGGBOX)>0
+    If [M:DIA]DESMOD= 1 |[M:DIA]DESMOD = 2 & [M:DIA]ALLTYP= 2
+        If [F:MFM]ALLSTA >= 4  & [F:MFM]WGGBOX=2
+            WMESS = mess(156,197,1)-[F:MFM]MFGNUM- mess(157,197,1)-[F:MFM]ITMREF-mess(271,193,1)
+            WMESS2 = mess(272,193,1)
+            Call ECR_TRACE(WMESS ,0) From GESECRAN
+            Call ECR_TRACE(WMESS2,0) From GESECRAN
+            Raz WMESS,WMESS2
+            Return
+        Endif
+    Endif
+Endif
+
+OK=2
+#-----------------------------------------------
+GPOINT = "CUSSELCOMP" : Gosub ENTREE From EXEFNC
+
+Return
+
+#-----------------------------------------------------------------------#
+# Traitement d'une allocation                                           #
+#-----------------------------------------------------------------------#
+$TRTALL
+Gosub VERROU
+If !OK : Return : Endif
+Call DEBTRANS From GLOCK
+GOK = 1
+Gosub MAJALL
+Gosub DEVERROU
+Return
+
+#-----------------------------------------------------------------------#
+# Mise à jour des allocations                                           #
+#-----------------------------------------------------------------------#
+$MAJALL
+Local Char    WTRTORD
+Local Decimal WCPLQTY
+Local Integer MEMSTA : MEMSTA = [F:MFM]ALLSTA # mémo statut
+
+#
+WALLTYP = [M:DIA]ALLTYP
+WMESS   = mess(156,197,1)+" "+WVCRNUM+" "+mess(157,197,1)+" "+WITMREF+" "+
+&         mess(158,197,1)+" "+format$("D:"+GFMDAT,WSTRDAT)                  # 56915 mm 08.09
+#
+Trbegin [MFG],[MFM]
+    # traitement matière
+    Readlock [MFM]MFM0 Curr
+    If fstat = 1
+        GOK = -1 : GLOCK="$MFGITM"+WVCRNUM-num$(WVCRLIN)-num$(WVCRSEQ)
+        Goto ROL_TRTALL
+    Elsif fstat
+        GOK = 0  : Call RSTA("MFM",WVCRNUM-num$(WVCRLIN)-num$(WVCRSEQ)) From GLOCK
+        Goto AB_TRTALL
+    Endif
+    #
+    WTRT = "A"
+    WALL = [F:MFM]ALLQTY
+    WSHT = [F:MFM]SHTQTY
+    If DESMOD = 1
+        Case [F:MFM]ALLSTA
+            When 2,3: WALLTYP = 1
+            When 4,5: WALLTYP = 2
+        Endcase
+    Endif
+    # appel à la routine de gestion des allocations
+    Call ALLOCATION(WTRT, WALLTYP, WALL, WSHT, WRET) From MFGALL
+    If WRET <> 0 Goto AB_TRTALL:Endif
+
+    # mise à jour matière
+    [F:MFM]ALLQTY     = 0
+    [F:MFM]SHTQTY     = 0
+    [F:MFM]ALLSTA     = 1
+
+    # mise à jour matière
+    Rewrite [MFM]
+    If fstat : GOK=0 : Call FSTA("MFM") From GLOCK : Goto AB_TRTALL : Endif
+
+    # mise à jour encours
+    Case MODE
+        When 0 : Readlock [ORD] Curr
+                 [F:ORD]ALLQTY = 0
+                 [F:ORD]SHTQTY = 0
+                 Rewrite [ORD]
+        When 1 : Readlock [ORD1] Curr
+                 [F:ORD1]ALLQTY = 0
+                 [F:ORD1]SHTQTY = 0
+                 Rewrite [ORD1]
+    Endcase
+    If fstat : GOK=0 : Call FSTA("ORD") From GLOCK : Goto AB_TRTALL : Endif
+
+    # traces
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+    Raz WMESS, WMESS1, WMESS2
+
+    # FQ 70409 GA 01/2011 Maj déplacée + tard pour performances
+    # mise à jour entête
+    ##### Gosub MAJMFG
+
+    # v6 affectations
+    Gosub MAJ_MTO_MFM From MFGMTOLIB
+
+    NBDES += 1
+Commit
+Return
+
+#####-----------------------------------------------------------------------#
+##### Mise à jour de l'entete OF                                            #
+#####-----------------------------------------------------------------------#
+####$MAJMFG
+####Local Integer XTOT
+####Local Integer I
+#####
+####Readlock [MFG]MFG0 Curr
+####If fstat = 1
+####   GOK = -1 : GLOCK = "$MFGHEAD"+[F:MFG]MFGNUM
+####   Goto ROL_TRTALL
+####Elsif fstat
+####   GOK = 0  : Call RSTA("MFG",   [F:MFG]MFGNUM) From GLOCK
+####   Goto AB_TRTALL
+####Endif
+#####
+####Case [F:MFM]ALLSTA    # évaluation nouveaux totaux en fonction de l'évolution du statut
+####    When 1:  Case MEMSTA
+####                When 2:    [F:MFG]OVRALLNBR -= 1
+####                           [F:MFG]SHTMATNBR -= 1
+####                When 3:    [F:MFG]OVRALLNBR -= 1
+####                When 4:    [F:MFG]DETALLNBR -= 1
+####                           [F:MFG]SHTMATNBR -= 1
+####                When 5:    [F:MFG]DETALLNBR -= 1
+####             Endcase
+####    When 2:  Case MEMSTA
+####                When 1:    [F:MFG]OVRALLNBR += 1
+####                           [F:MFG]SHTMATNBR += 1
+####                When 3:    [F:MFG]SHTMATNBR += 1
+####             Endcase
+####    When 3:  Case MEMSTA
+####                When 1:    [F:MFG]OVRALLNBR += 1
+####                When 2:    [F:MFG]SHTMATNBR -= 1
+####             Endcase
+####    When 4:  Case MEMSTA
+####                When 1:    [F:MFG]DETALLNBR += 1
+####                           [F:MFG]SHTMATNBR += 1
+####                When 2:    [F:MFG]OVRALLNBR -= 1
+####                           [F:MFG]DETALLNBR += 1
+####                When 3:    [F:MFG]OVRALLNBR -= 1
+####                           [F:MFG]DETALLNBR += 1
+####                           [F:MFG]SHTMATNBR += 1
+####                When 5:    [F:MFG]SHTMATNBR += 1
+####             Endcase
+####    When 5:  Case MEMSTA
+####                When 1:    [F:MFG]DETALLNBR += 1
+####                When 2:    [F:MFG]OVRALLNBR -= 1
+####                           [F:MFG]SHTMATNBR -= 1
+####                           [F:MFG]DETALLNBR += 1
+####                When 3:    [F:MFG]OVRALLNBR -= 1
+####                           [F:MFG]DETALLNBR += 1
+####                When 4:    [F:MFG]SHTMATNBR -= 1
+####             Endcase
+####Endcase
+#####
+####Gosub MAJSTATUT
+####If dim(GAVAMFG) <= 0 : Global Decimal GAVAMFG : Endif
+####GAVAMFG = 9999999999
+####Call  MAJ_AVAMFGQTY("MFM") From MFGLIBM       # llc 06.04
+#####
+####Rewrite [MFG]
+####If fstat
+####   GOK = 0 : Call FSTA("MFG") From GLOCK
+####   Goto AB_TRTALL
+####Endif
+#####
+####Return
+####
+####
+#####-----------------------------------------------------------------------#
+##### Recalcul statut allocation                                            #
+#####-----------------------------------------------------------------------#
+####$MAJSTATUT
+####Local Integer XTOT
+##### nouveau statut allocation (non alloué, partiel, complet)
+####XTOT = [F:MFG]OVRALLNBR + [F:MFG]DETALLNBR
+####If (XTOT = 0)
+####    [F:MFG]ALLSTA = 1
+####Else
+####    If (XTOT < [F:MFG]MATLINNBR - [F:MFG]MATCLENBR)          # llc 04.02 14090
+####        [F:MFG]ALLSTA = 2
+####    Else
+####        # sr 07.02 demande 15130  tester >= au lieu de =
+####        If (XTOT >= [F:MFG]MATLINNBR - [F:MFG]MATCLENBR)      # llc 04.02 14090
+####            [F:MFG]ALLSTA = 3
+####        Endif
+####    Endif
+####Endif
+##### si des ruptures existent, statut allocation + 2
+####If [F:MFG]SHTMATNBR <> 0 : [F:MFG]ALLSTA += 2 : Endif
+##### si toutes les matières sont soldées, on force le statut à "complet" ...
+####If [F:MFG]MATCLENBR = [F:MFG]MATLINNBR
+####    [F:MFG]ALLSTA = 3
+####Endif
+####Return
+
+
+#-----------------------------------------------------------------------#
+# Maj globale d'un OF après allocations                                 #
+#-----------------------------------------------------------------------#
+$TRTMFG                                           # FQ 70409 GA 01/2011 #
+Gosub VERROU
+If !OK : Return : Endif
+Call DEBTRANS From GLOCK
+GOK = 1
+Gosub MAJMFG
+Gosub DEVERROU
+Return
+#-----------------------------------------------------------------------#
+# Mise à jour de l'entete OF                                            #
+#-----------------------------------------------------------------------#
+$MAJMFG                                           # FQ 70409 GA 01/2011 #
+Local Integer XTOT
+Local Integer I
+#
+If WVCRNUM="" Return Endif
+
+Trbegin [MFG]
+#
+  Readlock [MFG]MFG0=WVCRNUM
+  If fstat = 1
+     GOK = -1 : GLOCK = "$MFGHEAD"+[F:MFG]MFGNUM
+     Goto ROL_TRTMFG
+  Elsif fstat
+     GOK = 0  : Call RSTA("MFG",   [F:MFG]MFGNUM) From GLOCK
+     Goto AB_TRTMFG
+  Endif
+#
+  Gosub MAJMFGHEAD From MFGLIB
+#
+    # 82781
+  [F:MFG]UPDDAT = date$
+  [F:MFG]UPDUSR = GUSER
+  [F:MFG]EXPNUM = [C]EXPORT
+  Rewrite [MFG]
+  If fstat
+     GOK = 0 : Call FSTA("MFG") From GLOCK
+     Goto AB_TRTMFG
+  Endif
+#
+Commit
+#
+Return
+$ROL_TRTMFG
+Rollback
+Call ROLL From GLOCK
+If GROLL
+     Call ECR_TRACE(mess(17,107,1),1) From GESECRAN
+Endif
+Return
+$AB_TRTMFG
+Rollback
+Call ECR_TRACE(mess(17,107,1),1) From GESECRAN
+Return
+
+#-----------------------------------------------------------------------#
+# Positionnement d'un verrou sur l'entête OF                            #
+#-----------------------------------------------------------------------#
+$VERROU
+SYMBOLE = "MFG"+[F:MFG]MFGNUM
+Lock = SYMBOLE With lockwait = 0
+OK = 1
+If fstat
+    Call ECR_TRACE([F:MFG]MFGNUM - mess(10,100,1),1) From GESECRAN
+    OK = 0
+Endif
+Return
+
+#-----------------------------------------------------------------------#
+# Suppression du verrou sur l'entête OF                                 #
+#-----------------------------------------------------------------------#
+$DEVERROU
+Unlock=SYMBOLE
+Return
+
+$ROL_TRTALL
+Rollback
+Call ROLL From GLOCK
+If GROLL
+     Call ECR_TRACE(mess(17,107,1),1) From GESECRAN
+Else Goto MAJALL :Endif
+Return
+
+$AB_TRTALL
+Rollback
+Call ECR_TRACE(mess(17,107,1),1) From GESECRAN
+Return
+
+########################################################################
+$CHARG_PARAM
+#----- Variables globales stock
+Call GLOBVAR(GFCY)    From WWGLOBSTO
+#----- Variables globales GPAO
+Call GLOBVAR(GFCY)    From WWGLOBGPA
+Return
+
+#######################################################################
+#                     ETIQUETTES                                      #
+#######################################################################
+
+
+########################################
+Subprog AM_MFGPIODEB(VALEUR)
+Variable Integer VALEUR
+[M:DIA]MFGPIOFIN = VALEUR
+End
+
+########################################
+Subprog C_MFGPIOFIN(VALEUR)
+Variable Integer VALEUR
+If VALEUR < [M:DIA]MFGPIODEB : GMESSAGE= mess(44,199,1) : mkstat=2 : Endif
+End
+
+########################################
+Subprog AS_BPCNUMDEB(VALEUR)
+Variable Char    VALEUR()
+GBOUT1=mess(72,198,1)
+GBOUT2=mess(154,198,1)
+End
+
+########################################
+Subprog AS_BPCNUMFIN(VALEUR)
+Variable Char    VALEUR()
+GBOUT1=mess(72,198,1)
+GBOUT2=mess(154,198,1)
+End
+
+########################################
+Subprog AM_MFGNUMDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]MFGNUMFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_PJTDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]PJTFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_BPCNUMDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]BPCNUMFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_ALDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]ALFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_ITMREFDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]ITMREFFIN = VALEUR : Endif
+End
+
+########################################
+Subprog AM_VCRNUMDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M:DIA]VCRNUMFIN = VALEUR : Endif
+End
+
+##########################################################################
+# pour les batchs                                                        #
+##########################################################################
+Subprog PARAM(DOSSIER,USER,P1,P2,OK)
+#-----------------------------#
+# obligatoire pour les batchs #
+#-----------------------------#
+Value    Char    DOSSIER   : # dossier de lancement
+Value    Char    USER      : # utilisateur
+Variable Char    P1()(1..) : # on peut avoir 2 fois 50 chaînes de 15 caractères
+Variable Char    P2()(1..)
+Variable Integer OK
+
+
+Gosub OUVRE
+
+Local Char    WIN (GLONFEN)
+WIN="DDESALLM"
+Call PARAM (DOSSIER,USER,P1,P2,OK,TIT,WIN) From CPTTRT
+
+End
+###########################################################################################
+$ERRBATCH
+Call ECR_TRACE(errmes$(errn)-num$(errl)-errm,1) From GESECRAN
+End
+
+
+########################################
+Subprog AM_MFGFCY(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> GFCY                   # mm 12.02
+    GFCY=VALEUR                     # mm 12.02
+    Gosub CHARG_PARAM
+Endif                               # mm 12.02
+End
+
+##########################################################################
+## Etiquette ajoutée par le superviseur 10/06/2003 17:27:20 (MM)
+##########################################################################
+Subprog B1_BPCNUMDEB(VALEUR)
+Variable Char    VALEUR()
+# 06.03 WEB MM
+If dim (GBPRSEL)>0  : Kill GBPRSEL : Endif
+#
+End
+
+##########################################################################
+Subprog B1_BPCNUMFIN(VALEUR)
+Variable Char    VALEUR()
+# 06.03 WEB MM
+If dim (GBPRSEL)>0  : Kill GBPRSEL : Endif
+#
+End
+
+
+##########################################################################
+
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran MDESALL) 01/02/2006 10:02:03 (LLCX)
+######################################################################################
+Subprog AS_VCRNUMDEB(VALEUR)
+Variable Char    VALEUR()
+[M]ORDFILTER = "1=1"
+If [M]BPCNUMDEB <> "" : [M]ORDFILTER += "&BPRNUM>=[M]BPCNUMDEB" : Endif
+If [M]BPCNUMFIN <> "" : [M]ORDFILTER += "&BPRNUM<=[M]BPCNUMFIN" : Endif
+If [M]PJTDEB    <> "" : [M]ORDFILTER += "&PJT>=[M]PJTDEB"       : Endif
+If [M]PJTFIN    <> "" : [M]ORDFILTER += "&PJT<=[M]PJTFIN"       : Endif
+End
+
+Subprog AS_VCRNUMFIN(VALEUR)
+Variable Char    VALEUR()
+[M]ORDFILTER = "1=1"
+If [M]BPCNUMDEB <> "" : [M]ORDFILTER += "&BPRNUM>=[M]BPCNUMDEB" : Endif
+If [M]BPCNUMFIN <> "" : [M]ORDFILTER += "&BPRNUM<=[M]BPCNUMFIN" : Endif
+If [M]PJTDEB    <> "" : [M]ORDFILTER += "&PJT>=[M]PJTDEB"       : Endif
+If [M]PJTFIN    <> "" : [M]ORDFILTER += "&PJT<=[M]PJTFIN"       : Endif
+End
+
+
+######################################################################################

@@ -1,0 +1,874 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+############################################################################
+# UUMGTRTSAL07   Moulinette de Migration des retours         Module Ventes #
+############################################################################
+# Issue 115758 - 2016190416 by LD : Migration V6->PU9 : error with SQHTYP
+
+
+Local Char DOSSIER(30) : DOSSIER = nomap
+If !GSERVEUR
+  # Issue 106947 - 20150811 by LD : Migration of historic folder
+  #Call SAIDOS(DOSSIER,"") From SAIDOS
+  Call SAIDOSHIS(DOSSIER,"") From SAIDOSHIS
+  # Issue 106947 - 20150811 by LD
+Endif
+If DOSSIER <> ""
+  If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+  # Issue 106947 - 20150811 by LD : Migration of historic folder
+  #Read [ADS] DOSSIER=[L]DOSSIER : If fstat Raz [F:ADS] : Endif
+  If func DOSSUB.FILL_ADS([L]DOSSIER)=0 : End : Endif
+  # Issue 106947 - 20150811 by LD
+
+  #Call ACTIVE From TIMING
+  If !GSERVEUR
+    Call TEMPON("O") From GESECRAN
+    Call OUVRE_TRACE("UUMGTRTSAL07") From LECFIC
+  Endif
+
+  #Call RAZ_UUMGTRTSAL07(DOSSIER)
+  Call MAJ_UUMGTRTSAL07(DOSSIER)
+
+  If !GSERVEUR
+    Call TEMPOFF     From GESECRAN
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+  Endif
+  #Call ARRET From TIMING
+Endif
+End
+
+
+##########################################################################
+Subprog MAJ_UUMGTRTSAL07(DOSSIER)
+Value Char DOSSIER
+
+# Issue 106947 - 20150811 by LD : Migration of historic folder
+#adxftl=10
+#adxwrb=10
+#NEWMOTEUR=1
+# Issue 106947 - 20150811 by LD
+
+Local Integer ERR
+
+#----- Récupération du n° de version
+Local Char    CVERSION
+Local Integer VERSION
+Call MIGGETVERSION (DOSSIER,CVERSION,ERR) From TRTMIG
+If ERR
+  # N° de version incorrecte
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",7,ERR) From TRTMIG : #7=Erreur
+  End
+Else
+ VERSION=val(CVERSION)
+Endif
+
+##1 - verifications
+####################
+
+If [F:ADS]MODULE(4)<>2 : : # N = no module
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+Local Char WNAMSRHM,WNAMSRDM
+Call MIGTABNAME (DOSSIER,"SRETURN", WNAMSRHM,ERR) From TRTMIG
+Call MIGTABNAME (DOSSIER,"SRETURND",WNAMSRDM,ERR) From TRTMIG
+If ERR
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+#----- Présence des fichiers renommées...  -----#
+If filinfo(filpath("FIL",WNAMSRHM, "fde",DOSSIER),0)<0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+If filinfo(filpath("FIL",WNAMSRDM, "fde",DOSSIER),0)<0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+##2 - Traitements en cours
+####################
+
+Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",2,ERR) From TRTMIG : #2=En cours
+Gosub MIG_OUVRE From TRTMIG #Gbn-108768
+
+###################
+
+Local Char WTAB_SRH (30) (adxwrb)
+Local Char WTAB_SRD (90) (adxwrb)
+Local Char WTAB_CAL (120) (adxwrb)
+Local Shortint WCPT_SRH,WCPT_SRD,WCPT_CAL
+
+Call ECR_TIME("UUMGTRTSAL07 Sales Return Process : Update SRETURN-D") From DOSSUB
+Call ECR_TRACE("UUMGTRTSAL07 : Process Start on : "+DOSSIER,0) From GESECRAN
+
+#----- Modification des fichiers où on va inserer -----#
+Call MIGTABINIT (DOSSIER,"SRETURN",ERR) From TRTMIG
+Call MIGTABINIT (DOSSIER,"SRETURND",ERR) From TRTMIG
+
+#----- Ouverture des fichiers -----#
+If clalev([F:SRH])  = 0 : Local File =DOSSIER+".SRETURN"     [SRH]  : Endif   # Fichier X3 "Vide"
+If clalev([F:SRD])  = 0 : Local File =DOSSIER+".SRETURND"    [SRD]  : Endif   # Fichier X3 "Vide"
+If clalev([F:TMD])  = 0 : Local File =DOSSIER+".TABMODELIV"  [TMD]  : Endif
+
+If clalev([F:SRHM]) = 0 : Local File =DOSSIER+"."+WNAMSRHM   [SRHM] : Endif   # Fichier X3 renommé Avant Migration
+If clalev([F:SRDM]) = 0 : Local File =DOSSIER+"."+WNAMSRDM   [SRDM] : Endif   # Fichier X3 renommé Avant Migration
+
+#-----  Déclaration des variables -----#
+# Déclaration des variables pour gérer les ruptures (évite les snapshot too old)
+Local Integer STOP, NB, ISVALID, NBLUS, NBCOMMIT
+Local Char CRITERE(250),CRITERESPE(250), HINTSPE(30)
+Local Integer NBMIGKEY : NBMIGKEY=3
+Local Char TABMIGKEY(30)(1..NBMIGKEY)
+Raz NBLUS, STOP, CRITERE, NBCOMMIT
+
+# Issue 115758
+# SRHTYP value search :
+# Tables are opened in the migrated folder
+If !clalev([F:FGRM]) : Local File =DOSSIER+".FACGROUP"  [FGRM]        : Endif
+If !clalev([F:TREM]) : Local File =DOSSIER+".TABSRHTYP" [TREM]        : Endif
+# Tables are opened in the reference folder (in case we don't find anything in the migrated folder)
+If !clalev([F:FGRR]) : Local File =[F:ADS]DOSREF+".FACGROUP"  [FGRR]  : Endif
+If !clalev([F:TRER]) : Local File =[F:ADS]DOSREF+".TABSRHTYP" [TRER]  : Endif
+Local Char SGCURLEG(GLONADI), SGCURFCY(GLONFCY)
+Local Char WSRHTYP(GLONTRE), WSRHTYPNOR(GLONTRE),  WSRHTYPLND(GLONTRE),  WSRHTYPSCO(GLONTRE)
+Local Integer WSRHCAT
+# End issue 115758
+
+# Déclaration des variables communes de travail
+Local Integer I, J
+
+#déclaration des variables locales de travail
+Local Char     WSITE : Raz WSITE
+Local Integer  WLIG  : Raz WLIG
+
+Gosub OUVRE_SAL From UUMGTRTSAL00
+If GOK<>1
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",7,ERR) From TRTMIG : #7=Erreur
+  Goto FIN
+Endif
+Gosub OUVRE_SAL07
+If GOK<>1
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",7,ERR) From TRTMIG : #7=Erreur
+  Goto FIN
+Endif
+
+#-----  Lecture des clés -----#
+# Read de la table AMIGKEY "index migration" pour alimenter ACLE1/ACLE2/ACLE3/STOP
+Call MIGGETKEY (DOSSIER,"UUMGTRTSAL07",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT,ERR) From TRTMIG
+STOP=val(TABMIGKEY(3))
+
+# Dde 81811 : Optimisation
+#If NBCOMMIT=0
+#  #----- Suppression des incohérences entre tables avant migration -----#
+#  Gosub TRT_SQL
+#  If GOK<1 : Goto FIN : Endif
+#Endif
+# Dde 81811 : Optimisation
+
+
+#-----  Lien des tables entête & lignes -----#
+#----- on ne met pas le numero de ligne dans le tri
+Link [SRDM] With [SRHM]SRH0~=[F:SRDM]SRHNUM
+&    As [LNK]
+&    Order By Key CLE = [F:SRHM]STOFCY;[F:SRHM]SRHNUM
+
+# PE pour ajout clause where
+Local Char FLUX
+Local Integer FILTRELIN
+FLUX="UUMGTRTSAL07" : FILTRELIN=0 : Raz HINTSPE : Raz CRITERESPE : Gosub PE_CRITSEL From TRTMIG
+If CRITERESPE="" : CRITERESPE="1=1" : Endif
+
+Call DEBTRANS From GLOCK
+Gosub SET_FIRST From TRTFIRST
+
+$LOOP_SAL07
+Raz NB
+If STOP=1
+ STOP = 2
+ CRITERE = "[F:SRHM]STOFCY=TABMIGKEY(1) & [F:SRHM]SRHNUM>TABMIGKEY(2)"
+Elsif STOP=2
+ STOP = 0
+ CRITERE = "[F:SRHM]STOFCY>TABMIGKEY(1)"
+Else
+ CRITERE = "1=1"
+Endif
+
+Trbegin [SRH],[SRD]
+GOK = 1
+
+For [LNK]CLE(2) Hint Key=HINTSPE Where evalue(CRITERE) & evalue(CRITERESPE)
+  #rupture par site,retour
+  NBLUS+=1
+
+  # PE pour exclure ligne
+  If FILTRELIN
+    FLUX="UUMGTRTSAL07" : ISVALID=1 : Gosub PE_VERIFSEL From TRTMIG
+    If ISVALID=0 : Goto SUITE_BOUCLE : Endif
+  Endif
+
+  #Raz [F:SRH]
+  Gosub RAZ_SRH
+  [F:SRH] = [F:SRHM]
+
+  If WSITE<>[F:SRDM]STOFCY
+      Call RECUP_GLOBAL_CPT([F:ADS]DOSSIER,[F:SRDM]STOFCY) From TRTX3CPT
+      WSITE=[F:SRDM]STOFCY
+
+      # Issue 115758
+      If VERSION<GMIGX3VER70
+        Gosub RECSRHTYP
+      Endif
+      # End issue 115758
+  Endif
+
+  If dim([F:SRH]DIE)>0 & [F:SRH]DIE(0)=""
+      For I=1 To max(GNBDIE,GOPTCANA)
+          [F:SRH]DIE(I-1)=GDIE(I)
+      Next I
+  Endif
+
+  # Source folder version before V6.0
+  If VERSION<GMIGX3VER60
+    Gosub MAJ60_SRH
+    If GOK<1 : Break : Endif
+  Endif
+
+  # Source folder version before V6.1
+  If VERSION<GMIGX3VER61
+    Gosub MAJ61_SRH
+    If GOK<1 : Break : Endif
+  Endif
+
+  # Version of the origin folder < V7
+  If VERSION<GMIGX3VER70
+    Gosub MAJ70_SRH
+    If GOK<1 : Break : Endif
+  Endif
+
+  Raz WLIG
+  ############################
+  #-- Boucle sur les lignes
+  ############################
+  For [LNK]CLE
+    #rupture par ligne de retour
+    #Raz [F:SRD]
+    Gosub RAZ_SRD
+    [F:SRD] = [F:SRDM]
+
+    # Version of the origin folder < V6
+    If VERSION<GMIGX3VER60
+      Gosub AMAJ60_SRDSRH
+      If GOK<1 : Break : Endif
+    Endif
+
+    # Version of the origin folder < V7
+    If VERSION<GMIGX3VER70
+        Gosub MAJ70_SRDSRH
+        If GOK<1 : Break : Endif
+    Endif
+
+    # 71065 : PJT
+    # Source folder version before V11 (before CHALLENGER)
+    If VERSION<GMIGX3VER110
+        If [F:SRDM]SDHNUM<>""
+          Gosub MAJ110_SRHSRDSDH
+          If GOK<1 : Break : Endif
+        Endif
+    Endif
+    # 71065 : PJT
+
+    # Issue 106947 - 20150811 by LD : Migration of historic folder
+#    If NEWMOTEUR
+#        Gosub SRD_STK : # pour stocker ref
+#        WriteB [SRD]
+#    Else
+#        Write [SRD]
+#    Endif
+#    If fstat
+#        If NEWMOTEUR & adxwrb>1
+#          Call ECR_TRACE("File SRETURND, Error ="-num$(fstat),1) From GESECRAN
+#          Gosub SRD_ERRTRA : # pour afficher les ref
+#        Else
+#          Call ECR_TRACE("File SRETURND(SRHNUM/SRDLIN)"-[F:SRD]SRHNUM-num$([F:SRD]SRDLIN)+", Error ="-num$(fstat),1) From GESECRAN
+#        Endif
+#        GOK=0 : Break
+#    Endif
+    Gosub SRD_STK : # pour stocker ref
+    WriteB [SRD]
+    If fstat
+        Call ECR_TRACE("File SRETURND, Error ="-num$(fstat),1) From GESECRAN
+        Gosub SRD_ERRTRA : # pour afficher les ref
+        GOK=0 : Break
+    Endif
+    # Issue 106947 - 20150811 by LD
+  Next
+  If GOK<1 : Break : Endif
+
+  # Source folder version before V6.0
+  If VERSION<GMIGX3VER60
+    Gosub SUITE_AMAJ60_SRH
+    If GOK<1 : Break : Endif
+  Endif
+
+   # --- alimentation des champs et écriture enreg
+  # Issue 106947 - 20150811 by LD : Migration of historic folder
+#  If NEWMOTEUR
+#      Gosub SRH_STK : # pour stocker ref
+#      WriteB [F:SRH]
+#  Else
+#      Write [F:SRH]
+#  Endif
+#  If fstat
+#    If NEWMOTEUR & adxwrb>1
+#      Call ECR_TRACE("File SRETURN, Error ="-num$(fstat),1) From GESECRAN
+#      Gosub SRH_ERRTRA : # pour afficher les ref
+#    Else
+#      Call ECR_TRACE("File SRETURN(SRHNUM)"-[F:SRH]SRHNUM+", Error ="-num$(fstat),1) From GESECRAN
+#    Endif
+#    GOK=0 : Break
+#  Endif
+  Gosub SRH_STK : # pour stocker ref
+  WriteB [F:SRH]
+  If fstat
+    Call ECR_TRACE("File SRETURN, Error ="-num$(fstat),1) From GESECRAN
+    Gosub SRH_ERRTRA : # pour afficher les ref
+    GOK=0 : Break
+  Endif
+  # Issue 106947 - 20150811 by LD
+
+  NB+=1
+  If NB>GMAXUPDTRS
+    TABMIGKEY(1) = [F:SRHM]STOFCY
+    TABMIGKEY(2) = [F:SRHM]SRHNUM
+    STOP=1
+    Break
+  Endif
+$SUITE_BOUCLE
+Next
+
+$FIN_BOUCLE
+If GOK<1
+  Rollback
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",7,ERR) From TRTMIG : #7=Erreur
+Else
+  #If NEWMOTEUR & adxwrb>1   :   # Issue 106947 - 20150811 by LD : Migration of historic folder
+    Flush [F:SRH]
+    If fstat
+        Call ECR_TRACE("File SRETURN, Error ="-num$(fstat),1) From GESECRAN
+        Gosub SRH_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+    Flush [F:SRD]
+    If fstat
+        Call ECR_TRACE("File SRETURND, Error ="-num$(fstat),1) From GESECRAN
+        Gosub SRD_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+    Flush [F:CAL]
+    If fstat
+        Call ECR_TRACE("File CPTANALIN, Error ="-num$(fstat),1) From GESECRAN
+        Gosub CAL_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+  #Endif                       :   # Issue 106947 - 20150811 by LD : Migration of historic folder
+# Stocker les valeurs de ACLE1/ACLE2/ACLE3/STOP dans la table AMIGKEY.
+  If STOP
+      TABMIGKEY(3)=num$(STOP)
+  Else
+      Raz TABMIGKEY
+  Endif
+  Call MIGSTKKEY (DOSSIER,"UUMGTRTSAL07",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT+NB,ERR) From TRTMIG
+  If ERR
+   GOK=-1 : Goto FIN_BOUCLE
+  Endif
+  Commit
+  NBCOMMIT+=NB
+  Call MIGSTKPROGRESS (DOSSIER,"UUMGTRTSAL07",STOP,ERR) From TRTMIG
+  If STOP
+    Goto LOOP_SAL07
+  Endif
+Endif
+
+Gosub UNSET_FIRST From TRTFIRST
+
+$FIN
+Close Local File [SRD], [SRH], [TMD]
+Close Local File [SRDM], [SRHM]
+
+Call ECR_TIME("UUMGTRTSAL07 : "+num$(NBLUS)+" records read,"-num$(NBCOMMIT)+" records processed.") From DOSSUB
+
+#----- Remise en état des fichiers où on a inseré -----#
+Call MIGTABEND (DOSSIER,"SRETURN",ERR) From TRTMIG
+Call MIGTABEND (DOSSIER,"SRETURND",ERR) From TRTMIG
+
+Call MIGTRTEND (DOSSIER,"UUMGTRTSAL07") From TRTMIG
+End
+##########################################################################
+Subprog RAZ_UUMGTRTSAL07(DOSSIER)
+Value Char DOSSIER
+
+Local Integer ERR
+
+##1 - verifications
+####################
+
+If [F:ADS]MODULE(4)<>2 : # N= no module
+  End
+Endif
+
+#Gbn-101445
+##1.1 - Récupération du n° de version
+#####################################
+Local Char VERSION
+Call MIGGETVERSION (DOSSIER,VERSION,ERR) From TRTMIG
+If ERR
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL07",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+Local Char WNAMSRHM,WNAMSRDM
+Call MIGTABNAME (DOSSIER,"SRETURN", WNAMSRHM,ERR) From TRTMIG
+Call MIGTABNAME (DOSSIER,"SRETURND",WNAMSRDM,ERR) From TRTMIG
+If ERR : End : Endif
+
+If filinfo(filpath("FIL",WNAMSRHM, "fde",DOSSIER),0)<0 : End : Endif   : # XXXXXXM= code table
+If filinfo(filpath("FIL",WNAMSRDM, "fde",DOSSIER),0)<0 : End : Endif   : # XXXXXXM= code table
+
+##2 - On vide les fichiers selon le cas
+#######################################
+Call MIGTABRAZ (DOSSIER,"SRETURN",ERR) From TRTMIG
+Call MIGTABRAZ (DOSSIER,"SRETURND",ERR) From TRTMIG
+
+#Gbn-101445
+If val(VERSION)<GMIGX3VER60
+  Local File =DOSSIER+".CPTANALIN"  [CAL]
+  Trbegin [CAL]
+  Delete [CAL] Where ABRFIC="SRD"
+  Commit
+Endif
+
+Call MIGRAZKEY (DOSSIER,"UUMGTRTSAL07",ERR) From TRTMIG
+
+End
+##############################################################################################
+$OUVRE_SAL07
+If clalev([F:SDH])  = 0 : Local File =DOSSIER+".SDELIVERY"        [SDH]  : Endif
+If clalev([F:SDD])  = 0 : Local File =DOSSIER+".SDELIVERYD"       [SDD]  : Endif
+
+Return
+##############################################################################################
+$SRH_STK
+Call STK (WTAB_SRH,WCPT_SRH,[F:SRH]SRHNUM) From TRTMIG
+Return
+$SRD_STK
+Call STK (WTAB_SRD,WCPT_SRD,[F:SRD]SRHNUM-'/'-num$([F:SRD]SRDLIN)) From TRTMIG
+Return
+$CAL_STK
+Call STK (WTAB_CAL,WCPT_CAL,[F:CAL]ABRFIC-'/'-num$([F:CAL]VCRTYP)-'/'-[F:CAL]VCRNUM-'/'-num$([F:CAL]VCRLIN)-'/'-num$([F:CAL]VCRSEQ)-'/'-[F:CAL]CPLCLE-'/'-num$([F:CAL]ANALIG)) From TRTMIG
+Return
+##############################################################################################
+#################################################
+$SRH_ERRTRA
+Call ERRTRA (WTAB_SRH,WCPT_SRH,"File SRETURN(SRHNUM)=") From TRTMIG
+Return
+$SRD_ERRTRA
+Call ERRTRA (WTAB_SRD,WCPT_SRD,"File SRETURND(SRHNUM/SRDLIN)=") From TRTMIG
+Return
+$CAL_ERRTRA
+Call ERRTRA (WTAB_CAL,WCPT_CAL,"File CPTANALIN(ABRFIC/VCRTYP/VCRNUM/VCRLIN/VCRSEQ/CPLCLE/ANALIG)=") From TRTMIG
+Return
+
+########################################################################
+$RAZ_SRH
+
+Raz [F:SRH]BPDADDLIG : Raz [F:SRH]BPDCRY    : Raz [F:SRH]BPDCRYNAM
+Raz [F:SRH]BPDCTY    : Raz [F:SRH]BPDPOSCOD : Raz [F:SRH]BPDSAT
+Raz [F:SRH]CNDNAM
+If GACTDEB=2 Raz [F:SRH]BPIEECNUM Endif
+If dim([F:SRH]DIE)>0 Raz [F:SRH]DIE : Raz [F:SRH]CCE Endif
+Raz [F:SRH]CPY
+If GACTDEB=2 Raz [F:SRH]EECNUMDEB Endif
+Raz [F:SRH]FFWADD     : Raz [F:SRH]FFWNUM    : Raz [F:SRH]ICTCTY
+Raz [F:SRH]PLISTC
+Raz [F:SRH]SCORTN
+If dim([F:SRH]WRHE)>0 Raz [F:SRH]WRHE Endif
+
+Return
+########################################################################
+$RAZ_SRD
+
+Raz [F:SRD]CPY
+Raz [F:SRD]IMPNUMLIG
+Raz [F:SRD]SCSDAT : Raz [F:SRD]SCSNUM : Raz [F:SRD]SCSLIN
+If dim([F:SRD]WRH)>0 Raz [F:SRD]WRH Endif
+
+Return
+
+########################################################################
+# Migration to v6 - Customer return header
+########################################################################
+$MAJ60_SRH
+
+      [F:SRH]CPY=GSOCIETE
+      If len([F:SRH]EECNAT)>2 & left$([F:SRH]EECNAT,1)="0" : [F:SRH]EECNAT=right$([F:SRH]EECNAT,2) : Endif
+
+      Gosub RECUP_BPD
+
+      Gosub RECUP_BPR
+
+Return
+
+########################################################################
+# Migration to v6.1 - Customer return header
+########################################################################
+$MAJ61_SRH
+
+Return
+########################################################################
+# Migration to v7 - Customer return header
+########################################################################
+$MAJ70_SRH
+    # New field SRHCAT initialization
+    [F:SRH]SRHCAT=1
+    If [F:SRH]LNDRTN=2 & [F:SRH]SCORTN<>2 : [F:SRH]SRHCAT=2 : Endif
+    If [F:SRH]SCORTN=2 & [F:SRH]LNDRTN<>2 : [F:SRH]SRHCAT=3 : Endif
+
+# Issue 115758
+# It is not necessary to search SRHTYP value for each SRETURN
+# It is necessary to do it each time STOFCY has changed
+
+#    # New field SRHTYP initialization
+#    Local Char    SGCURLEG : SGCURLEG=GCURLEG
+#    Local Char    SGCURFCY : SGCURFCY=GCURFCY
+#    Local Integer SGDLVTYP : SGDLVTYP=GDLVTYP
+#    Local Char    WSRHTYP
+#    Local Integer WSRHCAT
+#    GCURLEG=GLEGSOC(find([F:SRH]CPY,GSOC)) : GDLVTYP=[F:SRH]SRHCAT : GCURFCY=[F:SRH]STOFCY
+#    Gosub SRHTYP From SUBSRH
+#    If WSRHTYP<>""
+#     [F:SRH]SRHTYP=WSRHTYP
+#    Else
+#     GOK=0 : Call ECR_TRACE("     1-File SRETURN"-[F:SRH]SRHNUM+", Error : Impossible to défine a customer return type",1) From GESECRAN
+#    Endif
+#    GCURLEG=SGCURLEG : GDLVTYP=SGDLVTYP : GCURFCY=SGCURFCY
+
+Case [F:SRH]SRHCAT
+    When 1       : # Retour normal
+      If WSRHTYPNOR<>""
+        [F:SRH]SRHTYP=WSRHTYPNOR
+      Endif
+    When 2       : # Retour de prêt
+      If WSRHTYPLND<>""
+        [F:SRH]SRHTYP=WSRHTYPLND
+      Endif
+    When 3       : # Retour pour sous-traitance
+      If WSRHTYPSCO<>""
+        [F:SRH]SRHTYP=WSRHTYPSCO
+      Endif
+    When Default : # Au cas où...
+      If WSRHTYPNOR<>""
+        [F:SRH]SRHTYP=WSRHTYPNOR
+      Endif
+Endcase
+
+If [F:SRH]SRHTYP=""
+    GOK=0 : Call ECR_TRACE("     1-File SRETURN"-[F:SRH]SRHNUM+", Error : Impossible to défine a customer return type",1) From GESECRAN
+Endif
+# End issue 115758
+
+Return
+# Issue 115758
+########################################################################
+$RECSRHTYP
+
+Local Integer  CATEG
+
+SGCURLEG=GCURLEG : SGCURFCY=GCURFCY
+GCURLEG=GLEGSOC(find(GSOCIETE,GSOC)) : GCURFCY=[F:SRDM]STOFCY
+
+# Initialisation du type de retour pour les retours normaux           : SRHCAT=1
+Raz WSRHTYP, WSRHTYPNOR, WSRHTYPLND, WSRHTYPSCO
+CATEG=1 : Gosub SRHTYP : WSRHTYPNOR=WSRHTYP
+# Initialisation du type de retour pour les retours de prêt           : SRHCAT=2
+Raz WSRHTYP
+CATEG=2 : Gosub SRHTYP : WSRHTYPLND=WSRHTYP
+# Initialisation du type de retour pour les retours de sous-traitance : SRHCAT=3
+Raz WSRHTYP
+CATEG=3 : Gosub SRHTYP : WSRHTYPSCO=WSRHTYP
+
+GCURLEG=SGCURLEG : GCURFCY=SGCURFCY
+
+Return
+
+########################################################################
+$SRHTYP
+
+# ----------------------------------------------------- #
+# First, we search return type in the migrated folder   #
+# ----------------------------------------------------- #
+Link [TREM] With [FGRM]FGR0=[F:TREM]GFY;GCURFCY As [KTREM]
+
+# First, we search return type for the legislation
+Filter [KTREM] Where SRHCAT=CATEG & ([TREM]GFY="" | [FGRM]FCY=GCURFCY) & [TREM]LEG=GCURLEG
+Read [KTREM]TRE0 First
+If fstat=0
+    WSRHTYP = [F:TREM]SRHTYP
+    WSRHCAT = [F:TREM]SRHCAT
+Endif
+Filter [KTREM]
+
+# No return type found for the legislation, we search return type with no legislation
+If WSRHTYP=""
+    Filter [KTREM] Where SRHCAT=CATEG & ([TREM]GFY="" | [FGRM]FCY=GCURFCY) & [TREM]LEG=""
+    Read [KTREM]TRE0 First
+    If fstat=0
+        WSRHTYP = [F:TREM]SRHTYP
+        WSRHCAT = [F:TREM]SRHCAT
+    Endif
+    Filter [KTREM]
+Endif
+
+# -------------------------------------------------------------------------------- #
+# No return type found in the migrated folder, we search in the reference folder   #
+# -------------------------------------------------------------------------------- #
+# First, we search return type for the legislation
+If WSRHTYP=""
+    Link [TRER] With [FGRR]FGR0=[F:TRER]GFY;GCURFCY As [KTRER]
+    Filter [KTRER] Where SRHCAT=CATEG & ([TRER]GFY="" | [FGRR]FCY=GCURFCY) & [TRER]LEG=GCURLEG
+    Read [KTRER]TRE0 First
+    If fstat=0
+       WSRHTYP = [F:TRER]SRHTYP
+       WSRHCAT = [F:TRER]SRHCAT
+    Endif
+    Filter [KTRER]
+Endif
+
+# No return type found for the legislation, we search return type with no legislation
+If WSRHTYP=""
+    Filter [KTRER] Where SRHCAT=CATEG & ([TRER]GFY="" | [FGRR]FCY=GCURFCY) & [TRER]LEG=""
+    Read [KTRER]TRE0 First
+    If fstat=0
+       WSRHTYP = [F:TRER]SRHTYP
+       WSRHCAT = [F:TRER]SRHCAT
+    Endif
+    Filter [KTRER]
+Endif
+
+Return
+# End issue 115758
+
+# 71065 : PJT
+########################################################################
+# Migration to U11 - Return lines [CHALLENGER]
+########################################################################
+$MAJ110_SRHSRDSDH
+
+If [F:SDH]SDHNUM<>[F:SRDM]SDHNUM
+  Read [F:SDH]SDH0 = [F:SRDM]SDHNUM : If fstat Raz [SDH] Endif
+Endif
+# Code affaire entête retour = Code affaire de la 1ère livraison liée à une ligne retour
+If WLIG=0 [F:SRH]PJT=[F:SDH]PJT : WLIG=1 Endif
+
+# Code affaire ligne retour = Code affaire de la livraison liée
+[F:SRD]PJT = [F:SDH]PJT
+
+Return
+# 71065 : PJT
+
+########################################################################
+# Migration to V6 - Customer return lines
+########################################################################
+$AMAJ60_SRDSRH
+    [F:SRD]CPY=[F:SRH]CPY
+    Gosub UPD_CAL_SRD
+Return
+
+########################################################################
+# Migration to V7 - Customer return lines
+########################################################################
+$MAJ70_SRDSRH
+    # New field SRHCAT initialization
+    [F:SRD]SRHCAT=[F:SRH]SRHCAT
+Return
+
+# -------------------------------------------------- #
+# Création des enregistrements de la table CPTANALIN #
+# -------------------------------------------------- #
+$UPD_CAL_SRD
+
+#Look [CAL] CAL0="SRD";0;[F:SRD]SRHNUM;[F:SRD]SRDLIN;0;"";1
+#If fstat
+    Raz [F:CAL]
+    [F:CAL]ABRFIC="SRD"
+    [F:CAL]VCRNUM=[F:SRD]SRHNUM
+    [F:CAL]VCRLIN=[F:SRD]SRDLIN
+    [F:CAL]ANALIG=1
+    For J=1 To max(GNBCOA,2)
+        [F:CAL]LED(J-1)=GLEDSOC(J)
+        [F:CAL]COA(J-1)=GCOA(J)
+    Next J
+    Gosub EVAL_CAL
+
+    # Issue 106947 - 20150811 by LD : Migration of historic folder
+#    If NEWMOTEUR
+#        Gosub CAL_STK : # pour stocker ref
+#        WriteB [F:CAL]
+#    Else
+#        Write [F:CAL]
+#    Endif
+#    If fstat
+#      Call ECR_TRACE("File CPTANALIN, Error ="-num$(fstat),1) From GESECRAN
+#      Gosub CAL_ERRTRA : # pour afficher les ref
+#      GOK=0 : Return
+#    Endif
+    Gosub CAL_STK : # pour stocker ref
+    WriteB [F:CAL]
+    If fstat
+      Call ECR_TRACE("File CPTANALIN, Error ="-num$(fstat),1) From GESECRAN
+      Gosub CAL_ERRTRA : # pour afficher les ref
+      GOK=0 : Return
+    Endif
+    # Issue 106947 - 20150811 by LD
+#Endif
+
+Return
+
+$EVAL_CAL
+
+  For J=1 To max(GNBDIE,GOPTCANA)
+      [F:CAL]DIE(J-1)=GDIE(J)
+      Case J
+          When 1 : [F:CAL]CCE(J-1)=[F:SRDM]CCE1
+          When 2 : [F:CAL]CCE(J-1)=[F:SRDM]CCE2
+          When 3 : [F:CAL]CCE(J-1)=[F:SRDM]CCE3
+          When 4 : [F:CAL]CCE(J-1)=[F:SRDM]CCE4
+          When 5 : [F:CAL]CCE(J-1)=[F:SRDM]CCE5
+          When 6 : [F:CAL]CCE(J-1)=[F:SRDM]CCE6
+          When 7 : [F:CAL]CCE(J-1)=[F:SRDM]CCE7
+          When 8 : [F:CAL]CCE(J-1)=[F:SRDM]CCE8
+          When 9 : [F:CAL]CCE(J-1)=[F:SRDM]CCE9
+          When Default
+      Endcase
+
+#       If evalue("dim([F:SRDM]CCE"+num$(J)+")")>0
+#           [F:CAL]CCE(J-1)=evalue("[F:SRDM]CCE"+num$(J))
+#       Endif
+
+  Next J
+Return
+
+########################################################################
+# Nouveaux Champs entête à alimenter à partir de la V6
+########################################################################
+$SUITE_AMAJ60_SRH
+
+Return
+
+########################################################################
+$RECUP_BPR
+
+    If GACTDEB=2 & [F:SRH]BPIEECNUM=""
+        # --- Alimentation n° d'identification CEE
+        If [F:BPR]BPRNUM<>[F:SRH]BPCINV & [F:SRH]BPCINV<>""
+           Read [F:BPR]BPR0 = [F:SRH]BPCINV : If fstat Raz [BPR] Endif
+        Endif
+        [F:SRH]BPIEECNUM=[F:BPR]EECNUM
+    Endif
+
+Return
+
+########################################################################
+$RECUP_BPD
+
+      If [F:SRH]EECICT="" | (GACTDEB=2 & ([F:SRH]EECLOC=0 | [F:SRH]EECTRN=0))
+          # --- Alimentation incoterm, lieu de transport CEE et mode de transport CEE
+          If [F:BPD]BPCNUM<>[F:SRH]BPCORD | [F:BPD]BPAADD<>[F:SRH]BPAADD
+             Read [F:BPD]BPD0 = [F:SRH]BPCORD;[F:SRH]BPAADD : If fstat Raz [BPD] Endif
+          Endif
+          If [F:SRH]EECICT="" [F:SRH]EECICT=[F:BPD]EECICT Endif
+          If GACTDEB=2
+             If [F:SRH]EECLOC=0 [F:SRH]EECLOC=[F:BPD]EECLOC Endif
+             If [F:SRH]EECTRN=0 & [F:BPD]MDL<>""
+                If [F:TMD]MDL<>[F:BPD]MDL
+                   Read [TMD]TMD0=[F:BPD]MDL
+                   If fstat Raz [TMD] : Endif
+                Endif
+                [F:SRH]EECTRN=[F:TMD]EECTRN
+             Endif
+          Endif
+      Endif
+
+Return
+########################################################################
+########################################################################
+#----- Suppression des incohérences entre tables avant migration -----#
+########################################################################
+$TRT_SQL
+
+ #-----  Déclaration des variables -----#
+
+ Call DEBTRANS From GLOCK
+ Gosub SET_FIRST From TRTFIRST
+
+ Trbegin [SRDM]
+ GOK = 1
+
+ Gosub TRT_SQL1
+
+ If GOK<1
+  Rollback
+ Else
+  Commit
+ Endif
+
+Gosub UNSET_FIRST From TRTFIRST
+
+Return
+
+########################################################################
+# Mise à jour STOFCY SRETURND à partir de STOFCY SRETURN
+########################################################################
+$TRT_SQL1
+Local Char REQSQL (250) (3)
+
+Onerrgo ERR_SQL
+
+REQSQL(0)="UPDATE"-DOSSIER+"."+WNAMSRDM+" SET STOFCY_0="
+REQSQL(1)="(SELECT SRH.STOFCY_0 FROM"-DOSSIER+"."+WNAMSRHM+" SRH Where SRH.SRHNUM_0="+WNAMSRDM+".SRHNUM_0)"
+REQSQL(2)=" WHERE "+WNAMSRDM+".STOFCY_0<>(SELECT SRH.STOFCY_0 From"-DOSSIER+"."+WNAMSRHM+" SRH Where SRH.SRHNUM_0="+WNAMSRDM+".SRHNUM_0) "
+Execsql From num$(GTYPDBA*2+1) Sql REQSQL
+
+Onerrgo
+Return
+###################################################################################################
+$ERR_SQL
+ GMESSAGE = errp-"("+num$(errl)+")"+"\"+mess(6,123,1)-num$(errn)-":"-errmes$(errn)+"\"+errm
+ Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+ GOK=0
+Resume
+########################################################################
+# Pour exécution automatique  en gestion de patch                      #
+########################################################################
+Subprog PATCH(APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 End : Endif
+If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+# Issue 106947 - 20150811 by LD : Migration of historic folder
+#Read [ADS] DOSSIER=APPLI : If fstat Raz [F:ADS] : Endif
+If func DOSSUB.FILL_ADS(APPLI)=0 : End : Endif
+# Issue 106947 - 20150811 by LD
+Call MAJ_UUMGTRTSAL07(APPLI)
+End
+
+#######################################################################
+# Pour exécution depuis dosmaj (validation dossier)
+########################################################################
+Subprog UTI_MOUL (APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 End : Endif
+Call MAJ_UUMGTRTSAL07(APPLI)
+End
+

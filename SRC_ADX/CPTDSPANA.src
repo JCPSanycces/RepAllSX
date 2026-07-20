@@ -1,0 +1,1633 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+##############################################################################
+# Ce traitement gère la répartition analytique.
+# Il utilise la méthode répartition multi-axes
+# L'ancienne méthode de répartition mono-axe a été supprimée
+##############################################################################
+#
+#  X3- 6062    Suprresion du message intermédiare et du traitement permettant son affichage.
+# Issue X3-58600 - 2017-10-19 by BEFOU : overtaking array [M:VT2]TBCCE / Activity code VTL & VTP
+#
+Local Char PARAM(10)(1..2) , VALEUR(10)
+GERR = 0
+Raz GERREUR, GMESSAGE
+Call TRAITE_CHAR(VALEUR,PARAM,"","CPTDSPANA","CPTDSPANA",4,"") From GTRAITE
+End
+
+#######################################################
+## Traitement des actions
+#######################################################
+$ACTION
+Case ACTION
+ When "INIT"        : Gosub OUVRE
+ When "CONTROLE"    : Gosub CONTROLE
+ When "EXEC"        : Gosub EXEC
+ When "TERMINE"     : Gosub FIN
+ When "OUVRE_BATCH" : Gosub OUVRE
+ When "OK"          : FIN = 1 : GOK = 1
+ When "END"         : FIN = 1 : GOK = 0
+ When "DEBUT"       : Gosub DEBUT
+ When "SEL_TABLE"   : Gosub SEL_TABLE
+Endcase
+Return
+
+##############################################################################
+# optimisation de l'ordre pat
+# remplacement des fonctions pat() par un équivalent optimisé
+##############################################################################
+Funprog PAT2(EXPR, MODELE)
+Value Char EXPR
+Value Char MODELE
+Local Char CRITERE(250)
+Local Integer N
+
+If !find(left$(MODELE,1),'*','?','#','!')
+ #--- Le premier caractère n'est pas un caractère joker
+ #--- Recherche du premier caractère joker et on ajoute un left$ plus performant que le pat
+ For N=1 To len(MODELE)
+  If find(mid$(MODELE,N,1),'*','?','#','!')
+   CRITERE = "left$("+EXPR+","+num$(N-1)+")='"+left$(MODELE,N-1)+"'"
+   Break
+  Endif
+ Next
+ If len(CRITERE)=0
+  CRITERE = EXPR+"='"+MODELE+"'"
+  End CRITERE
+ Endif
+Endif
+
+If len(CRITERE)<>0 : CRITERE -= "& " : Endif
+
+CRITERE  -= "pat("+EXPR+",'"+MODELE+"')<>0"
+
+End CRITERE
+
+##############################################################################
+$OUVRE
+If clalev([F:GAC]) =0  :  Local File GACCOUNT   [GAC] : Endif
+If clalev([F:JST]) =0  :  Local File GAJOUSTA   [JST] : Endif
+If clalev([F:CPY]) =0  :  Local File COMPANY    [CPY] : Endif
+If clalev([F:FCY]) =0  :  Local File FACILITY   [FCY] : Endif
+If clalev([F:TCU]) =0  :  Local File TABCUR     [TCU] : Endif
+If clalev([F:GDE]) =0  :  Local File GDIAENTRY  [GDE] : Endif
+If clalev([F:GTE]) =0  :  Local File GTYPACCENT [GTE] : Endif
+If clalev([F:BLA]) =0  :  Local File BALANA     [BLA] : Endif
+If clalev([F:BLQ]) =0  :  Local File BLAQTY     [BLQ] : Endif
+If clalev([F:HAE]) =0  :  Local File GACCTMP    [HAE] : Endif
+If clalev([F:DAE]) =0  :  Local File GACCTMPD   [DAE] : Endif
+If clalev([F:DAA]) =0  :  Local File GACCTMPA   [DAA] : Endif
+If clalev([F:PER]) =0  :  Local File PERIOD     [PER] : Endif
+If clalev([F:JOU]) =0  :  Local File GJOURNAL   [JOU] : Endif
+If clalev([F:TUN]) =0  :  Local File TABUNIT    [TUN] : Endif
+If clalev([F:GAC2])=0  :  Local File GACCOUNT   [GAC2]: Endif
+If clalev([F:CCE]) =0  :  Local File CACCE      [CCE] : Endif
+If clalev([F:CC2]) =0  :  Local File CACCE      [CC2] : Endif
+If clalev([F:DAD]) =0  :  Local File CDIADSP    [DAD] : Endif
+If clalev([F:HA2]) =0  :  Local File GACCENTRY  [HA2] : Endif
+If clalev([F:CPY2])=0  :  Local File COMPANY    [CPY2]: Endif
+If clalev([F:FCY2])=0  :  Local File FACILITY   [FCY2]: Endif
+If clalev([F:GSP]) =0  :  Local File GRPDSP     [GSP] : Endif
+If clalev([F:GCM]) =0  :  Local File GACM       [GCM] : Endif
+If clalev([F:DANA])=0  :  Local File GACCENTRYA [DANA]: Endif
+If clalev([F:DAE2])=0  :  Local File GACCENTRYD [DAE2]: Endif
+
+# Attention ne pas modifier et utiliser LEDR car si on utilise LED , il y a interférence
+# avec le traitement de validation de pièce qui fait dans certains cas un RAZ de la classe [F:LED]
+# d'ou perte d'infos pour nous.
+If clalev([F:LEDR])=0  :  Local File GLED       [LEDR] : Endif
+
+Local Integer NBSECR                      : # Nombre de sections réceptrices
+Local Integer NBECRT                      : # Nombre d'écritures générées du schéma
+Local Integer NSOC                        : # Nombre de société dans le tableau de saisie
+Local Decimal SOMME                       : # Somme des coefficients
+Local Integer NBPCE                       : # Nombre de pièces générées
+Local Integer NBERR                       : # Nombre d'erreurs (transaction, trop de sections, etc...)
+Local Integer NBVTL                       : # Nombre de ventilations par lignes
+Local Char    MESSA(250)
+Local Char    CRITERE(250), CRITDANA(250)
+Local Char    SITE(GLONFCY), SOC(GLONCPY)  : # Société et site utilisées en locale
+Local Integer OK , I, J, K, L, STAT, AXE, MORT
+Local Decimal MNT, QTE, TOTAL, TOTQT, MNTREP, QTEREP
+Local Decimal MNTREPLED # montant à répartir exprimé en devise référentiel
+Local Decimal EXE, PER, EXEBAL, PERBAL(2), EXECAL, PERCAL(2)
+Local Char    TSYMBOLE(50)(1..GNBSOC)
+Local Integer INDLOCK, NBLOCK
+
+Local Mask SAICURLED [SCL], GACCENTFMT  [HAEF], GACCENTW  [HAEW]
+Local Mask GACCENT0 [HAE0], GACCENT1 [HAE1], GACCENT2   [HAE2], VENTILE    [VTL], VENTILE2 [VT2]
+
+Local Integer  MAXLIG                      : # Nombre max de lignes générale dans une pièce
+Local Integer  MAXVTL                      : # Nombre max de lignes de ventilation dans une pièce
+Local Integer  MAXVTL2                     : # Nombre max de lignes de ventilation sur une ligne
+Local Integer  LIG                         : # Numéro de ligne
+
+MAXLIG  = dim([M:HAE2]SAC1)
+MAXVTL  = dim([M:VT2]TBAMT)
+MAXVTL2 = dim([M:VTL]AMT)
+
+Local Decimal  COEFDEF
+Local Char     TACCDSP(GLONGAC)(20)        : # Tableau des comptes de répartition
+Local Integer  NBACCDSP                    : # Nb d'éléments dans le tableau
+Local Char     CRITACC(250)(0..1)          : # Critère de recherche sur ACCDSP
+Local Char     CRITCCE(250)                : # Critère sur sections
+
+Local Integer COETOTAL, ICRIT
+Local Decimal ARRO
+Local Char LCOA(GLONCOA), LCURLED(GLONCUR),LLED(GLONLED)
+
+# Calcul répartitions a posteriori
+TIT = mess(15,107,1)
+
+Local Mask CPTDSPANA  [DIA]
+Raz [M:DIA]
+
+If [M:DIA]GENDAT=[0/0/0]
+ [M:DIA]GENDAT = date$
+Endif
+
+Call LECMEMO("STD","[M:DIA]","cp7") From GMEMO
+
+Default Mask [HAE0]
+Default Mask [HAE1]
+Default Mask [HAE2]
+Return
+
+$DEBUT
+Raz [M:DIA]INI : Affzo [DIA]
+Setmok [DIA] With 0
+Return
+
+##############################################################################
+$CONTROLE
+If GOK<1
+ FIN = 1 : Return
+Else
+ TMP = 1
+Endif
+
+NBLOCK = 0
+For [L]NSOC=0 To [M:DIA]NBSOC-1
+ NBLOCK+=1
+ TSYMBOLE(NBLOCK) = "CPTDSPANA\"+[M:DIA]CPY(NSOC)
+ Lock =TSYMBOLE(NBLOCK) With lockwait=0
+ If fstat
+  # Opération en cours sur autre poste
+  GERR=2 : GMESSAGE=mess(30,100,1)
+  FIN=1 : Break
+ Endif
+Next
+If FIN=1 : Return : Endif
+If [M:DIA]GENCAT<3 : # Simultation non active
+ Call PRESENCE(MORT) From CPTBATCH
+ If MORT
+  # La tâche comptable doit être démarrée
+  GERR = 1 : GMESSAGE = mess(49,134,1)
+ Endif
+Endif
+Return
+
+###############################################################################################
+# Permet de vérifier que les abréviations HAE, DAE et DAA correspondent respectivement aux tables
+# GACCTMP, GACCTMPD, GACCTMPA. Si ce n'est pas le cas, on ferme les tables HAE, DAE ou DAA, et
+# on ouvre les tables GACCTMP, GACCTMPD, GACCTMPA avec les abréviations respectives HAE, DAE, DAA
+###############################################################################################
+$VERIF_TABLE
+Local Integer N
+#HAE
+If !clalev([F:HAE])
+ Local File GACCTMP [HAE]
+Else
+ N = find("HAE", [S]fileabre)
+ If right$([S]filename(N+1), 1+len([S]filename(N+1))-len("GACCTMP")) <> "GACCTMP"
+  Close Local File [HAE]
+  Local File GACCTMP [HAE]
+ Endif
+Endif
+
+#DAE
+If !clalev([F:DAE])
+ Local File GACCTMPD [DAE]
+Else
+ N = find("DAE", [S]fileabre)
+ If right$([S]filename(N+1), 1+len([S]filename(N+1))-len("GACCTMPD")) <> "GACCTMPD"
+  Close Local File [DAE]
+  Local File GACCTMPD [DAE]
+ Endif
+Endif
+
+#DAA
+If !clalev([F:DAA])
+ Local File GACCTMPA [DAA]
+Else
+ N = find("DAA", [S]fileabre)
+ If right$([S]filename(N+1), 1+len([S]filename(N+1))-len("GACCTMPA")) <> "GACCTMPA"
+  Close Local File [DAA]
+  Local File GACCTMPA [DAA]
+ Endif
+Endif
+Return
+
+##############################################################################
+$EXEC
+Gosub VERIF_TABLE
+
+If GSERVEUR
+ [M:DIA]TRC = 2
+Endif
+
+If !GSERVEUR & [M:DIA]TRC=2
+ Call OUVRE_TRACE(TIT) From LECFIC
+Endif
+
+If [M:DIA]TRC=2
+ Call ECR_TRACE(TIT,0) From GESECRAN
+ Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+
+GOK=1
+Gosub DELSIM
+
+If GOK>0
+ # Issue X3-6062
+ OK = 1
+ Gosub TRTDSP
+ If OK
+  GPOINT = "TRTSIM" : Gosub ENTREE From EXEFNC
+  # Aprés création réel de pièce remettre à jour le champ REFINT pour les pièces réelles
+  If [M:DIA]GENCAT=1 : Gosub UPDREAL : Endif
+ Endif
+Endif
+
+If !NBPCE & !NBERR
+ # Aucune pièce à générer
+ Call ECR_TRACE(mess(45,107,1),0) From GESECRAN
+Endif
+
+If !GSERVEUR & [M:DIA]TRC=2
+ Call FERME_TRACE From LECFIC
+Endif
+
+If dim(TSYMBOLE)>0
+ For INDLOCK=1 To NBLOCK
+  Unlock =TSYMBOLE(INDLOCK)
+ Next
+Endif
+Return
+
+#####################################################################
+$FIN
+If !GSERVEUR & [M:DIA]TRC=2
+ TRA = 1
+Else
+ TRA = 0
+Endif
+Return
+
+#####################################################################
+$TRTDSP
+Raz NBECRT, NBPCE, NBERR
+
+Call LEC_CPY([M:DIA]CPY(0)) From CPTLEC
+Call LEC_GCM([F:CPY]ACM) From CPTLEC
+Read [LEDR]LED0 = [F:GCM]LED([M:DIA]LEDTYP-1)
+
+LLED = [F:GCM]LED([M:DIA]LEDTYP-1)
+
+CRITERE = 'LED="'+[F:GCM]LED([M:DIA]LEDTYP-1)+'"'
+CRITERE -= '& COD="'+[M:DIA]DIA+'"'
+If [M:DIA]ALLUSR<>2
+ CRITERE -= '& (UPDUSR = "'+[M:DIA]USR+'"'
+ CRITERE -= '| (UPDUSR = "" & CREUSR = "'+[M:DIA]USR+'"))'
+Endif
+
+# boucle sur le nombre de société
+For [L]NSOC=0 To [M:DIA]NBSOC-1
+ For [DAD]DAD0 Where evalue(CRITERE)
+&                 & VLYSTR<=[M:DIA]STRDAT & VLYSTR<=[M:DIA]STRDAT2
+&                 & VLYSTR<=GENDAT & ((VLYEND>=[M:DIA]ENDDAT & VLYEND>=GENDAT
+&                 & VLYEND>=[M:DIA]ENDDAT2) | VLYEND=[0/0/0])
+
+  # Issue X3-6062
+  If [M:DIA]TRC=2
+   # Schema
+   # Ligne numero
+   Call ECR_TRACE("******  "+mess(19,103,1)-[F:DAD]COD-mess(17,104,1)-num$([F:DAD]LIN),0) From GESECRAN
+  Endif
+
+# JFL - code inutile et contradictoire avec la présence de $UPDREAL
+#  If [M:DIA]GENCAT<3 : # Si différent de simulation non active
+#   Gosub CONTPCE : # La dernière pièce est-elle passée en compta ?
+#  Endif
+
+  #Boucle sur les sociétés juridiques
+  For [CPY2]CPY0 Where CPYLEGFLG=2 & CPY=[M:DIA]CPY(NSOC)
+   Gosub CONTPER
+   If !OK : Break 3 : Endif
+   # boucle sur les sites financiers
+   SOC = [F:CPY2]CPY
+   #Si un site existe
+   If [M:DIA]SITE<>""
+    [L]SITE = [M:DIA]SITE
+    Gosub DSP1
+    If !OK : Break 3 : Endif
+   Else #site
+    # boucle sur les sites financiers
+    For [FCY2]FCY0 Where LEGCPY=[F:CPY2]CPY & FINFLG=2
+     [L]SITE = [F:FCY2]FCY
+     Gosub DSP1
+     If !OK : Break 4 : Endif
+    Next   : # FCY2
+   Endif   : # [M:DIA]SITE
+  Next     : # CPY
+ Next      : # DAD
+Next       : # NBSOC
+
+If GOK=1
+ Call ESPION("",1,[F:DAD]COD,"") From ESPION
+ If GTRACE<>""
+  Call ECR_TRACE(string$(60,"-"),0) From GESECRAN
+  # Nombre de pièces générées :
+  Call ECR_TRACE(mess(19,107,1)-num$(NBPCE),0) From GESECRAN
+ Endif
+Endif
+Return
+
+$DSP1
+Local Char    TSQL(255)(1..9)
+Local Char    SUMCDT(255), SUMDEB(255), SUMCDTLED(255), SUMDEBLED(255)
+Local Integer OKK
+# boucle sur les sections à répartir : chaque ligne du schéma de répartition.
+For [CC2]CCE0 Where DIE=[F:DAD]DIE & IPT=2 & evalue(func PAT2("CCE", [F:DAD]CCEREF))
+ # Ne prendre que les sections répondant aux critéres définis dans GESDAD (CCEREF)
+ # qui ont été mouvementés sur les comptes définis dans GESDAD (ACCREF) donc lignes présentes dans la balance
+ # avec les périodes à répartir
+ N = find([F:DAD]DIE,[F:LEDR]DIE)
+ If N<>0
+  Call GETSUMSQLFORPREDICATE(SUMCDT,"CDT",PERBAL(0),PERBAL(1))
+  Call GETSUMSQLFORPREDICATE(SUMCDTLED,"CDTLED",PERBAL(0),PERBAL(1))
+  Call GETSUMSQLFORPREDICATE(SUMDEB,"DEB",PERBAL(0),PERBAL(1))
+  Call GETSUMSQLFORPREDICATE(SUMDEBLED,"DEBLED",PERBAL(0),PERBAL(1))
+
+  TSQL(1) = "SELECT LEDTYP_0, FCY_0, FIY_0 FROM BALANA "
+  TSQL(2) = "WHERE LEDTYP_0 = " + num$([M:DIA]LEDTYP) + " "
+  TSQL(3) = "AND FCY_0 = '" + [L]SITE + "' AND CPY_0 = '" + [F:CPY2]CPY + "' AND FIY_0 = " + num$(EXEBAL) + " "
+
+  Case N
+    When 1 : TSQL(4) = "AND CCE1_0 = '" + [F:CC2]CCE + "' "
+    When 2 : TSQL(4) = "AND CCE2_0 = '" + [F:CC2]CCE + "' "
+    When 3 : TSQL(4) = "AND CCE3_0 = '" + [F:CC2]CCE + "' "
+    When 4 : TSQL(4) = "AND CCE4_0 = '" + [F:CC2]CCE + "' "
+    When 5 : TSQL(4) = "AND CCE5_0 = '" + [F:CC2]CCE + "' "
+    When 6 : TSQL(4) = "AND CCE6_0 = '" + [F:CC2]CCE + "' "
+    When 7 : TSQL(4) = "AND CCE7_0 = '" + [F:CC2]CCE + "' "
+    When 8 : TSQL(4) = "AND CCE8_0 = '" + [F:CC2]CCE + "' "
+    When 9 : TSQL(4) = "AND CCE9_0 = '" + [F:CC2]CCE + "' "
+  Endcase
+
+  If [F:DAD]ACCREF<>""
+   TSQL(5) = "AND ACC_0 LIKE '" + ctrans([F:DAD]ACCREF, "*", "%") + "' "
+   TSQL(6) = "GROUP BY LEDTYP_0, FCY_0, FIY_0 HAVING "
+   TSQL(7) = "(SUM(" + SUMCDT + ") - SUM(" + SUMDEB + ")) <> 0 "
+   TSQL(8) = "OR (SUM(" + SUMCDTLED + ") "
+   TSQL(9) = "- SUM(" + SUMDEBLED + ")) <>0"
+  Else
+   TSQL(5) = "GROUP BY LEDTYP_0, FCY_0, FIY_0 HAVING "
+   TSQL(6) = "(SUM(" + SUMCDT + ") - SUM(" + SUMDEB + ")) <> 0 "
+   TSQL(7) = "OR (SUM(" + SUMCDTLED + ") "
+   TSQL(8) = "- SUM(" + SUMDEBLED + ")) <>0"
+   Raz TSQL(9)
+  Endif
+  OKK = 0
+  For (Integer LEDTYP, Char FCY(30), Integer FIY) From num$(GTYPDBA*2+1) Sql TSQL As [ZSQL]
+   OKK = 1 : Break
+  Next
+  If OKK=1
+   Gosub DSP2
+   If !OK : Break : Endif
+  Endif
+ Endif
+Next
+If !OK : Return : Endif
+Return
+
+Subprog GETSUMSQLFORPREDICATE(TSQLFRAGMENT, FIELDNAME, PERBALSTART, PERBALEND)
+Variable Char TSQLFRAGMENT
+Value    Char FIELDNAME
+Value    Decimal PERBALSTART, PERBALEND
+Local Integer I
+Raz TSQLFRAGMENT
+#We are building the interior of the SUM function within the predicate here
+For I = PERBALSTART To PERBALEND
+ TSQLFRAGMENT += FIELDNAME + "_" + num$(I)
+ If I <> PERBALEND
+  TSQLFRAGMENT += " + "
+ Endif
+Next
+End
+
+#######################################################################
+# génération d'une pièce de répartition pour société SOC et site SITE
+#######################################################################
+$DSP2
+ Raz [HAE0], [HAE1], [HAE2]
+
+ Call LECLED(SOC,[M:DIA]LEDTYP, LLED, LCURLED) From CPTDIV
+
+ Gosub CALCOEF : # Calcul des coefficients de répartition
+# on récupère les variables suivantes :
+# SOMME      Somme des coefficients
+# NBSECR     Nombre de sections réceptrices
+# SECTIONR   Sections réceptrices
+# COEF       Coeff  de répartition
+# TACCDSP    Comptes de répartition
+ If !OK : Return : Endif
+
+ If SOMME=0
+  # Section
+  # Répartition impossible, somme coefficients nulle
+  MESSA = mess(17,103,1)-[F:CC2]CCE-mess(18,107,1)
+  Gosub MESMES
+  OK = 0 : Return
+ Endif
+
+ # Recherche les pièces qui sont à répartir :
+ # On ne doit pas prendre les pièces qui viennent d'être créées pour être réparties à leur tour .
+ If [M:DIA]GENCAT>1 : # Simulation
+  Link [DANA] With [HA2]HAE0=[DANA]TYP;[DANA]NUM As [LNK] Where [HA2]REFINT <> "RE"+[M:DIA]DIA+num$(adxpid) and find([HA2]CAT,1,2,4)<>0
+ Else
+  Link [DANA] With [HA2]HAE0=[DANA]TYP;[DANA]NUM As [LNK] Where [HA2]REFINT <> "RL"+[M:DIA]DIA+num$(adxpid) and find([HA2]CAT,1,2,4)<>0
+ Endif
+
+# Filtre sur le link pour l'ordonner en fonction de la section à répartir ; optimiser la lecture.
+ INDDIE = find([F:DAD]DIE, [F:LEDR]DIE)
+ Case INDDIE
+  When 0
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(0) Asc;CCE(1) Asc;CCE(2) Asc;CCE(3) Asc;CCE(4) Asc;CCE(5)  Asc;CCE(6)  Asc;CCE(7)  Asc;CCE(8)  Asc;ACCNUM Asc
+  When 1
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(1) Asc;CCE(0) Asc;CCE(2) Asc;CCE(3) Asc;CCE(4) Asc;CCE(5)  Asc;CCE(6)  Asc;CCE(7)  Asc;CCE(8)  Asc;ACCNUM Asc
+  When 2
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(2) Asc;CCE(0) Asc;CCE(1) Asc;CCE(3) Asc;CCE(4) Asc;CCE(5)  Asc;CCE(6)  Asc;CCE(7)  Asc;CCE(8)  Asc;ACCNUM Asc
+  When 3
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(3) Asc;CCE(0) Asc;CCE(1) Asc;CCE(2) Asc;CCE(4) Asc;CCE(5)  Asc;CCE(6)  Asc;CCE(7)  Asc;CCE(8)  Asc;ACCNUM Asc
+  When 4
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(4) Asc;CCE(0) Asc;CCE(1) Asc;CCE(2) Asc;CCE(3) Asc;CCE(5)  Asc;CCE(6)  Asc;CCE(7)  Asc;CCE(8)  Asc;ACCNUM Asc
+  When 5
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(5) Asc;CCE(0) Asc;CCE(1) Asc;CCE(2) Asc;CCE(3) Asc;CCE(4)  Asc;CCE(6)  Asc;CCE(7)  Asc;CCE(8)  Asc;ACCNUM Asc
+  When 6
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(6) Asc;CCE(0) Asc;CCE(1) Asc;CCE(2) Asc;CCE(3) Asc;CCE(4)  Asc;CCE(5)  Asc;CCE(7)  Asc;CCE(8)  Asc;ACCNUM Asc
+  When 7
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(7) Asc;CCE(0) Asc;CCE(1) Asc;CCE(2) Asc;CCE(3) Asc;CCE(4)  Asc;CCE(5)  Asc;CCE(6)  Asc;CCE(8)  Asc;ACCNUM Asc
+  When 8
+   Filter [LNK] Where LEDTYP=[M:DIA]LEDTYP Order By Key CLE=CUR Asc;ACC Asc;CCE(8) Asc;CCE(0) Asc;CCE(1) Asc;CCE(2) Asc;CCE(3) Asc;CCE(4)  Asc;CCE(5)  Asc;CCE(6)  Asc;CCE(7)  Asc;ACCNUM Asc
+ Endcase
+
+ NBCLES = 12
+
+ CRITDANA="CPY=SOC & FCYLIN=[L]SITE & ACCDAT>=[M:DIA]STRDAT & ACCDAT<=[M:DIA]ENDDAT"
+ If([F:DAD]ACCREF<>"") : CRITDANA -= "&"-func PAT2("ACC",[F:DAD]ACCREF) : Endif
+ CRITDANA -= "&"-func PAT2("CCE("+num$(INDDIE-1)+")", [F:CC2]CCE)
+
+ # rupture par devise UNIQUEMENT
+ For [LNK]CLE(1) Where evalue(CRITDANA)
+
+  Gosub INIMSK2
+
+  For [LNK]CLE(NBCLES-1)
+   MNTREP = 0
+   QTEREP = 0
+   MNTREPLED = 0
+
+   For [LNK]CLE
+    #Montant à répartir
+    Read [DAE2]DAE2=[F:DANA]ACCNUM
+    MNTREP = MNTREP+[F:DANA]AMTCUR*[F:DAE2]SNS
+    QTEREP = QTEREP+[F:DANA]QTY*[F:DAE2]SNS
+
+    MNTREPLED = MNTREPLED+[F:DANA]AMTLED*[F:DAE2]SNS
+   Next
+   MNTREP = MNTREP*[F:DAD]PRC/100
+   QTEREP = QTEREP*[F:DAD]PRC/100
+
+   MNTREPLED = MNTREPLED*[F:DAD]PRC/100
+
+   Read [GAC2]GAC0=[F:DANA]COA;[F:DANA]ACC
+   Gosub SETARO
+
+   Gosub INILIG2
+   If GOK<1 | STAT : OK = 0 : Break 2 : Endif
+  Next
+  Gosub VALPCE2
+ Next   # DANA
+ If !OK : Return : Endif
+Return
+
+###################################################################################################
+# remplissage des masques d'entête de pièce GACCENT0 et GACCENT1 pour création d'une nouvelle pièce
+###################################################################################################
+$INIMSK2
+Raz [M:HAE0], [M:HAE1], [M:HAE2], [M:VTL], [M:VT2]
+Raz LIG, NBVTL
+
+# Remplissage masque GACCENT0
+[M:HAE0]FCY = [L]SITE
+[M:HAE0]CPY = SOC
+[M:HAE0]TYP = [M:DIA]GENTYP
+[M:HAE0]ACCDAT = [M:DIA]GENDAT
+[M:HAE0]JOU = [M:DIA]GENJOU
+[M:HAE0]CAT = [M:DIA]GENCAT
+If [M:DIA]GENCAT>1 : # Simulation
+ [M:HAE1]REFSIM = "RE" + [F:DAD]COD
+ [M:HAE1]REFINT = "RE" + [F:DAD]COD + num$(adxpid)
+Else
+ [M:HAE0]STA = [M:DIA]GENSIM
+ [M:HAE1]REFINT = "RL" + [F:DAD]COD + num$(adxpid)
+Endif
+Call GETPER([M:HAE0]FCY,[M:DIA]LEDTYP,[M:DIA]GENDAT,[M:HAE0]FIY,[M:HAE0]PER) From CPTSUB
+[M:HAE0]DACDIA = [M:DIA]DACDIA
+
+# Remplissage masque GACCENT1
+[M:HAE1]DESVCR =  [M:DIA]GENLIB
+[M:HAE1]ENTDAT =  [M:DIA]GENDAT
+[M:HAE1]DUDDAT =  [M:DIA]GENDAT
+[M:HAE1]VALDAT =  [M:DIA]GENDAT
+[M:HAE1]ORIMOD =  2 # Comptabilité
+[M:HAE1]CUR = [F:DANA]CUR
+[M:HAE1]RVS    =  1
+If dim([M:HAE1]FLGDAS)>0
+ [M:HAE1]FLGDAS = 1
+Endif
+[M:HAE1]FLGFUP =  1
+[M:HAE1]FLGPAZ =  1
+
+# Masque des ventilations
+[M:VT2]PTVENT  = 1
+
+# Initialisation masque de référence [HAEF] et [HAE1]
+Call INIMSKFMT3([M]FCY,1,[M]DACDIA,[M]TYP,[M]ACCDAT,STAT) From SUBGASA
+For I=1 To [M:HAEF]NBRLED
+ Assign "[M:HAE1]COA("+num$(I-1)+")" With [M:HAEF]COA(I-1)
+ Assign "[M:HAE2]COA("+num$(I-1)+")" With [M:HAEF]COA(I-1)
+Next
+Return
+
+###################################################################################################
+# Remplissage des lignes analytiques
+###################################################################################################
+$INILIG2
+If [M:HAE2]NBLIG+2>MAXLIG or [M:VT2]PTVENT+NBSECR+2>MAXVTL
+ Gosub VALPCE2
+ If GOK<1 | STAT : Return : Endif
+ Gosub INIMSK2
+Endif
+
+##################################################################
+# Première ligne de la pièce = annulation du montant à répartir  #
+##################################################################
+
+LIG = [M:HAE2]NBLIG
+[M:HAE2]FCYLIN(LIG) = [F:DANA]FCYLIN
+# Le compte à répartir
+If [F:DAD]ACCORI<>""
+ Assign "[M:HAE2]ACC1("+num$(LIG)+")" With [F:DAD]ACCORI
+ Call LEC_GAC([F:DAD]ACCORI,[M:HAE2]COA) From CPTLEC
+Else
+ Assign "[M:HAE2]ACC1("+num$(LIG)+")" With [F:DANA]ACC
+ Call LEC_GAC([F:DANA]ACC,[M:HAE2]COA) From CPTLEC
+Endif
+# Le montant à répartir
+If MNTREP=0 and MNTREPLED=0 : Return : Endif
+If MNTREP>0
+ [M:HAE2]CDT(LIG) = MNTREP
+Else
+ [M:HAE2]DEB(LIG) = -MNTREP
+Endif
+
+If MNTREP<>0
+ If sgn(MNTREP)=sgn(MNTREPLED)
+  Assign "[M:HAE2]AMTFRC"+num$([M:DIA]LEDTYP)+"("+num$(LIG)+")" With abs(MNTREPLED)
+ Else
+  Assign "[M:HAE2]AMTFRC"+num$([M:DIA]LEDTYP)+"("+num$(LIG)+")" With -MNTREPLED
+ Endif
+Else
+ Assign "[M:HAE2]AMTFRC"+num$([M:DIA]LEDTYP)+"("+num$(LIG)+")" With -MNTREPLED
+Endif
+Assign "[M:HAE2]AMTFLG"+num$([M:DIA]LEDTYP)+"("+num$(LIG)+")" With 1
+
+[M:HAE2]QTY(LIG) = QTEREP
+# Libellé
+[M:HAE2]DES(LIG) = [M:DIA]GENLIB
+# Unité
+[M:HAE2]UOM(LIG) = [F:GAC]UOM
+# Section
+For I=1 To dim([F:DANA]CCE)
+ AXE = find(evalue("[F:DANA]DIE"+"("+num$(I-1)+")"),[M:HAEF]DIE(0..[M:HAEF]NBRAXI-1))
+ If AXE>0
+  Assign "[M:HAE2]CCE"+num$(AXE)+"("+num$(LIG)+")" With [F:DANA]CCE(I-1)
+ Endif
+Next I
+
+[M:HAE2]NBLIG=[M:HAE2]NBLIG+1
+
+##############################################################################################
+# Ligne suivante = répartition du montant à répartir                                         #
+# il est inutile de remplir les sections de [M:HAE2] si l'on remplit les sections de [M:VT2] #
+##############################################################################################
+
+Raz TOTAL, TOTQT, COETOTAL
+
+[M:HAE2]FCYLIN([M:HAE2]NBLIG) = [L]SITE
+[M:HAE2]LEDTYP([M:HAE2]NBLIG) = [M:DIA]LEDTYP
+If [F:DAD]ACCDEN<>""
+ Assign "[M:HAE2]ACC1("+num$([M:HAE2]NBLIG)+")" With [F:DAD]ACCDEN
+Else
+ Assign "[M:HAE2]ACC1("+num$([M:HAE2]NBLIG)+")" With [F:DANA]ACC
+Endif
+
+[M:HAE2]PTV([M:HAE2]NBLIG)    = [M:VT2]PTVENT
+
+If MNTREP>0
+ [M:HAE2]DEB([M:HAE2]NBLIG) = MNTREP
+Else
+ [M:HAE2]CDT([M:HAE2]NBLIG) = -MNTREP
+Endif
+
+If MNTREP<>0
+ If sgn(MNTREP)=sgn(MNTREPLED)
+  Assign "[M:HAE2]AMTFRC"+num$([M:DIA]LEDTYP)+"("+num$([M:HAE2]NBLIG)+")" With abs(MNTREPLED)
+ Else
+  Assign "[M:HAE2]AMTFRC"+num$([M:DIA]LEDTYP)+"("+num$([M:HAE2]NBLIG)+")" With -MNTREPLED
+ Endif
+Else
+ Assign "[M:HAE2]AMTFRC"+num$([M:DIA]LEDTYP)+"("+num$([M:HAE2]NBLIG)+")" With MNTREPLED
+Endif
+Assign "[M:HAE2]AMTFLG"+num$([M:DIA]LEDTYP)+"("+num$([M:HAE2]NBLIG)+")" With 1
+
+[M:HAE2]DES([M:HAE2]NBLIG) = [M:DIA]GENLIB-"("-[F:DAD]COD-")"
+[M:HAE2]QTY([M:HAE2]NBLIG) = QTEREP
+[M:HAE2]UOM([M:HAE2]NBLIG) = [F:GAC2]UOM
+[M:HAE2]DSP([M:HAE2]NBLIG) = "$"
+
+###################################################################################
+# Remplissage du masque [M:VT2] pour la ligne de [M:HAE2] ci-dessus
+# Remplissage de [M:VT2]TBDIE inutile car rempli via Call INIMSKFMT3 From SUBGASA
+# Issue X3-58600 - 2017-10-19 by BEFOU : Control activity code VTP and VTL
+###################################################################################
+#Il y a donc n lignes de répartition selon le schéma de répartition
+For N=0 To NBSECR-1
+ # Issue X3-58600
+  If [M:VT2]PTVENT+1 > ( func AFNC.ACTIV('VTP'))
+    If [M:DIA]TRC=2
+      GOK=-1
+      Call ECR_TRACE(mess(00053,10709,1) -mess(00014,00115,1)- "VTP" -"("+num$(func AFNC.ACTIV('VTP'))+")",1) From GESECRAN
+    Endif
+    Break
+  Endif
+  If [M:VT2]PTVENT > ( func AFNC.ACTIV('VTL'))
+    If [M:DIA]TRC=2
+      GOK=-1
+      Call ECR_TRACE(mess(00053,10709,1) -mess(00014,00115,1)- "VTL" -"("+num$(func AFNC.ACTIV('VTL'))+")",1) From GESECRAN
+    Endif
+    Break
+  Endif
+ # End issue X3-58600
+ If [F:DAD]FRWCCE=2
+  AXE = find([F:DAD]DIE,[M:HAEF]DIE(0..[M:HAEF]NBRAXI-1))
+  If AXE>0
+   Assign "[M:VT2]TBCCE"+num$(AXE)+"("+num$([M:VT2]PTVENT)+")" With SECTIONR(N)
+  Endif
+ Else
+  For I=1 To dim([F:DANA]CCE)
+   If [F:DANA]DIE(I-1)=[F:DAD]DIE
+    AXE = find([F:DAD]DIE,[M:HAEF]DIE(0..[M:HAEF]NBRAXI-1))
+    If AXE>0
+     Assign "[M:VT2]TBCCE"+num$(AXE)+"("+num$([M:VT2]PTVENT)+")" With SECTIONR(N)
+    Endif
+   Else
+    AXE = find([F:DANA]DIE(I-1),[M:HAEF]DIE(0..[M:HAEF]NBRAXI-1))
+    If AXE>0
+     Assign "[M:VT2]TBCCE"+num$(AXE)+"("+num$([M:VT2]PTVENT)+")" With [F:DANA]CCE(I-1)
+    Endif
+   Endif
+  Next
+ Endif
+
+ # Méthode de l'arrondi progressif pour le calcul des montants de répartiton
+ MNT = arr(MNTREP*(COEF(N)+COETOTAL)/SOMME,[F:TCU]CURRND)-arr(COETOTAL*MNTREP/SOMME,[F:TCU]CURRND)
+ QTE = arr(QTEREP*(COEF(N)+COETOTAL)/SOMME,ARRO)-arr(COETOTAL*QTEREP/SOMME,ARRO)
+ TOTAL += MNT
+ TOTQT += QTE
+ COETOTAL += COEF(N)
+
+ If MNTREP>0
+  [M:VT2]TBAMT([M:VT2]PTVENT) += MNT
+ Else
+  [M:VT2]TBAMT([M:VT2]PTVENT) -= MNT
+ Endif
+
+ # Remplir le masque des ventilations
+
+ [M:VT2]TBQTY([M:VT2]PTVENT) = QTE
+ [M:VT2]PTVENT += 1
+ NBVTL+=[M:HAE2]PTF([M:HAE2]NBLIG)-[M:HAE2]PTV([M:HAE2]NBLIG)+1
+
+Next # N (NBSECR)
+[M:HAE2]PTF([M:HAE2]NBLIG)    = [M:VT2]PTVENT-1
+[M:HAE2]NBLIG=[M:HAE2]NBLIG+1
+
+Return
+
+################################################################################
+$ERRMES
+NBERR += 1
+# Schéma x Ligne numéro y Société a Site b
+Call ECR_TRACE(mess(19,103,1)-[F:DAD]COD-mess(17,104,1)-num$([F:DAD]LIN)
+&             -mess(2,45,1)-[F:CPY2]CPY-mess(3,45,1)-[F:FCY2]FCY+"\->"-MESSA,1) From GESECRAN
+Return
+
+################################################################################
+$MESMES
+# Schéma x Ligne numéro y Société a Site b
+Call ECR_TRACE(mess(19,103,1)-[F:DAD]COD-mess(17,104,1)-num$([F:DAD]LIN)
+&             -mess(2,45,1)-[F:CPY2]CPY-mess(3,45,1)-[F:FCY2]FCY+"\->"-MESSA,-1) From GESECRAN
+Return
+
+################################################################################
+$PE_ENTREE
+GPOINT = "INILIG" : Gosub ENTREE From EXEFNC
+Return
+
+################################################################################
+$TR2
+GOK = 1
+
+Local Char  TZONE(10)(1..10) : # Table of the zones to be forced (Ex: ORICOD)   #*X3-39795
+Local Char  TVAL(30)(1..10)  : # Table of values for zones to be forced         #*X3-39795
+ TZONE(5)= "ORIGIN" : TVAL(5)= "2"        :#Automatic loading  #*X3-39795
+ TZONE(6)= "ORICOD" : TVAL(6)= "CPTDSPANA"                    #*X3-39795
+
+ Trbegin [HAE], [DAE], [DAA]
+ #*X3-39795 Call VALPIECE(STAT,MESSA) From CPTBATCH : # Pas de MAJ balances
+ Call VALPIECE2(STAT,MESSA,TZONE,TVAL) From CPTBATCH
+ If STAT
+   Gosub MESSAGE From CPTAUTO
+  If GTRACE<>""
+   Gosub ERRMES
+  Endif
+  If GOK<0 : Goto ROLL_TR2
+  Elsif !GOK : Goto AB_TR2
+  Endif
+ Endif
+Commit
+Return
+
+$AB_TR2
+Rollback
+Return
+
+$ROLL_TR2
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR2 : Endif
+
+######################################################################
+$SETARO
+Local Decimal ARRO
+If [F:GAC2]FLGUOM=2
+ Call LEC_TUN([F:GAC2]UOM) From CPTLEC
+ If fstat : ARRO = 1
+ Elsif [F:TUN]UOMDEC=0 : ARRO = 1
+ Else ARRO = val("0."+string$([F:TUN]UOMDEC-1,"0")+"1")
+ Endif
+Else
+ ARRO = 0
+Endif
+Return
+
+################################################################################
+$DELSIM
+For [HA2]HAE2 Where REFSIM="RE"+[M:DIA]DIA
+ If GTRACE<>""
+  # Annulation de la pièce
+  Call ECR_TRACE(mess(16,107,1)-[F:HA2]TYP-[F:HA2]NUM,0) From GESECRAN
+ Endif
+ Call DELPCE([F:HA2]TYP,[F:HA2]NUM) From CPTBATCH
+ If GOK<1 : Break : Endif
+Next
+Return
+
+################################################################################
+$UPDREAL
+Trbegin [HAE]
+ Update [HAE] Where REFINT="RL" + [M:DIA]DIA + num$(adxpid) With REFINT=""
+ If fstat=1
+  GOK=-1 : Call RSTA("HAE",[F:HAE]NUM) From GLOCK : Rollback : Return
+ Endif
+
+ # on fait la mise à jour de la table GACCENTRY après celle de GACCTMP car :
+ # - la table GACCTMP contient moins d'enregistrements (donc mise à jour plus rapide)
+ # - l'index HAE5 (sur le champ REFINT) de la table GACCENTRY n'existe que si le code activité KIT est actif
+ If adxuprec<>NBPCE
+  Update [HA2] Where REFINT="RL" + [M:DIA]DIA + num$(adxpid) With REFINT=""
+  If fstat=1
+   GOK=-1 : Call RSTA("HA2",[F:HA2]NUM) From GLOCK : Rollback : Return
+  Endif
+ Endif
+Commit
+Return
+
+###################################################################################################
+# Calcul des coefficients
+###################################################################################################
+$CALCOEF
+Raz SOMME      : # Somme des coefficients
+Raz NBSECR     : # Nombre de sections réceptrices
+Raz TACCDSP    : # Natures de répartition
+Raz CRITACC    : # Comptes répartitons
+Raz ICRIT
+
+Filter [CCE] Where DIE=[F:DAD]DIE & IPT=2
+MAXSEC = rowcount([CCE])
+Filter [CCE]
+Local Char     SECTIONR(GLONCCE)(MAXSEC)   : # Sections réceptrices
+Local Decimal  COEF(MAXSEC)                : # Coeff de répartition
+
+#OK = 1
+# Si type de répartitions Saisie
+If [F:DAD]TYP=1
+ # Si groupe récepteur défini (GSP) dans GESDAD , boucle sur les sections de ce groupe
+ If [F:DAD]GSP<>""
+  For [GSP] Where DIE=[F:DAD]DIE and COD=[F:DAD]GSP
+   Call LEC_CCE([F:GSP]CCE,[F:DAD]DIE) From CPTLEC
+   If [F:CCE]IPT=2
+    COEFDEF = [F:GSP]COE
+    # calcul des coefficients
+    Gosub CALCOEF1
+    If !OK : Break : Endif
+   Endif
+  Next
+  If !OK : Return : Endif
+ Else
+  # Sinon boucle sur les Sections réceptrices (CCERCP) définies dans GESDAD
+  For [CCE]CCE0 Where DIE=[F:DAD]DIE & IPT=2 & (CCE<>[F:CC2]CCE | [F:DAD]CCEREF=[F:DAD]CCERCP)
+&                     & evalue(func PAT2("CCE", [F:DAD]CCERCP))
+   COEFDEF = 1
+   # calcul des coefficients
+   Gosub CALCOEF1
+   If !OK : Break : Endif
+  Next
+  If !OK : Return : Endif
+ Endif
+
+# Si type de répartitions montant ou calculée
+Else
+ NBACCDSP = 0
+ I = 1
+ J = 1
+ While J
+  # ne sert plus à rien en V6 car le paramétrage n'autorise plus de saisir une liste de comptes séparés par un espace
+  J = instr(I,[F:DAD]ACCDSP," ")
+  If J
+   TACCDSP(NBACCDSP) = mid$([F:DAD]ACCDSP,I,J-I)
+   NBACCDSP +=1
+   I = J+1
+  Else
+   TACCDSP(NBACCDSP) = right$([F:DAD]ACCDSP,I)
+   NBACCDSP +=1
+  Endif
+ Wend
+
+ # Critéres définissant les comptes sur lesquels répartir (ACCDSP)
+ For K=0 To NBACCDSP-1
+  Call ADDCRIT(CRITACC, ICRIT, "CRITACC", func PAT2("ACC", TACCDSP(K)), " | ") From GOBJSUB
+ Next
+
+ #Si groupe récepteur défini (GSP) dans GESDAD , boucle sur les sections de ce groupe
+ If [F:DAD]GSP<>""
+  For [GSP]GSP0 Where DIE=[F:DAD]DIE and COD=[F:DAD]GSP
+   Call LEC_CCE([F:GSP]CCE,[F:DAD]DIE) From CPTLEC
+   If [F:CCE]IPT=2
+    Gosub CALCOEF2
+    If !OK : Break : Endif
+   Endif
+  Next
+  If !OK : Return : Endif
+ Else
+  # Sinon boucle sur les Sections réceptrices (CCERCP) définies dans GESDAD
+  Filter[CCE] #un filter ouvert ailleurs ? on le ferme ici en attendant de le trouver
+  For [CCE]CCE0 Where DIE=[F:DAD]DIE & IPT=2 & CCE<>[F:CC2]CCE & evalue(func PAT2("CCE", [F:DAD]CCERCP))
+   Gosub CALCOEF2
+   If !OK : Break : Endif
+  Next
+  If !OK : Return : Endif
+ Endif
+Endif
+# On vient juste de calculer les coefficients de répartition
+# le point d'entrée donne la possibilité de les modifier avant d'effectuer les répartitions
+ GPOINT = "MODCOEF" : Gosub ENTREE From EXEFNC
+Return
+
+################################################################################
+$CALCOEF1
+Gosub CONTCCE
+If !mkstat
+ If [F:DAD]UOM="" : # proprata au nb de sections trouvées
+  If NBSECR>=dim(SECTIONR)
+   # Trop de sections
+   MESSA = mess(46,107,1)
+   Gosub ERRMES
+   OK = 0 : Return
+  Endif
+  SOMME += COEFDEF
+  COEF(NBSECR)     = COEFDEF
+  SECTIONR(NBSECR) = [F:CCE]CCE
+  NBSECR += 1
+ Else
+  K = find([F:DAD]UOM,[F:CCE]UOM(0..[F:CCE]UOMNBR-1))
+  If K
+   If NBSECR>=dim(SECTIONR)
+    # Trop de sections
+    MESSA = mess(46,107,1)
+    Gosub ERRMES
+    OK = 0 : Return
+   Endif
+   SOMME += [F:CCE]QTY(K-1)
+   COEF(NBSECR)     = [F:CCE]QTY(K-1)
+   SECTIONR(NBSECR) = [F:CCE]CCE
+   NBSECR += 1
+  Endif
+ Endif
+Endif #mkstat
+Return
+
+################################################################################
+# ajout d'un critère sur BLA et BLQ pour sélectionner uniquement les enregistrements sur le référentiel choisi dans les critères
+# de lancement de la répartition
+$CALCOEF2
+Gosub CONTCCE
+If !mkstat  #1
+
+ # Trouver la 1ère section réceptrice
+ N = find([F:DAD]DIE, [F:LEDR]DIE)
+
+ If [F:DAD]TYP=2
+  # Calculée montant
+  CRITCCE = "[F:BLA]CCE"+num$(N)+"='"+[F:CCE]CCE+"'"
+  Filter [BLA] Where LEDTYP=[M:DIA]LEDTYP & CPY=[L]SOC & FCY=[L]SITE & FIY=EXECAL & evalue(CRITCCE)
+  Link [BLA] With [F:GAC2]GAC0=[F:BLA]COA;[F:BLA]ACC As [LKN]
+&            Where evalue(CRITACC) & [F:GAC2]SAC<>2
+&            Order By Key CLE = ACC;ACCNUM
+  For [LKN]CLE(1)
+   Gosub CONTACC
+   If !mkstat
+    For [LKN]CLE
+     [L]MNT = sum([F:BLA]CDTLED(PERCAL(0)..PERCAL(1)))-sum([F:BLA]DEBLED(PERCAL(0)..PERCAL(1)))
+     COEF(NBSECR) += MNT
+     SOMME        += MNT
+    Next
+   Endif
+  Next
+ Else
+  CRITCCE = "[F:BLQ]CCE"+num$(N)+"='"+[F:CCE]CCE+"'"
+  Filter [BLQ] Where LEDTYP=[M:DIA]LEDTYP & CPY=[L]SOC & FCY=[L]SITE & FIY=EXECAL & evalue(CRITCCE)
+  Link [BLQ] With [F:GAC2]GAC0=[F:BLQ]COA;[F:BLQ]ACC As [LKN]
+&           Where evalue(CRITACC) & [F:GAC2]FLGUOM=2 & [F:GAC2]SAC<>2
+&           Order By Key CLE = ACC;ACCNUM
+  For [LKN]CLE(1)
+   Gosub CONTACC
+   If !mkstat
+    For [LKN]CLE
+     [L]QTE = sum([F:BLQ]QTY(PERCAL(0)..PERCAL(1)))
+     COEF(NBSECR) += QTE
+     SOMME        += QTE
+    Next
+   Endif
+  Next
+ Endif
+
+ If COEF(NBSECR)<>0
+  If NBSECR>=dim(SECTIONR)
+   # Trop de sections
+   MESSA = mess(46,107,1)
+   Gosub ERRMES
+   OK = 0 : Return
+  Endif
+  SECTIONR(NBSECR) = [F:CCE]CCE
+  NBSECR += 1
+ Endif
+
+Endif  #mkstat #1
+Filter[BLA]
+Filter[BLQ]
+Return
+
+################################################################################
+$CONTPER
+#OK = 1
+Call GETPERSOC([F:CPY2]CPY, [M:DIA]LEDTYP, [M:DIA]STRDAT,EXE,PER) From CPTSUB
+EXEBAL(0) = EXE : PERBAL(0) = PER
+Call GETPERSOC([F:CPY2]CPY, [M:DIA]LEDTYP, [M:DIA]ENDDAT,EXE,PER) From CPTSUB
+If EXE<>EXEBAL
+ # Les dates ne sont pas dans le même exercice
+ MESSA = mess(20,107,1)
+ Gosub MESMES
+ OK = 0 : Return
+Endif
+PERBAL(1) = PER
+Call GETPERSOC([F:CPY2]CPY,[M:DIA]LEDTYP,[M:DIA]STRDAT2,EXE,PER) From CPTSUB
+EXECAL(0) = EXE : PERCAL(0) = PER
+Call GETPERSOC([F:CPY2]CPY,[M:DIA]LEDTYP,[M:DIA]ENDDAT2,EXE,PER) From CPTSUB
+If EXE<>EXECAL
+ # Les dates ne sont pas dans le même exercice
+ MESSA = mess(20,107,1)
+ Gosub MESMES
+ OK = 0 : Return
+Endif
+PERCAL(1) = PER
+Call GETPERSOC([F:CPY2]CPY, [M:DIA]LEDTYP, [M:DIA]GENDAT,EXE,PER) From CPTSUB
+If !PER | [F:PER]PERSTA<2
+ # Période non ouverte
+ MESSA = mess(35,101,1)
+ Gosub MESMES
+ OK = 0 : Return
+Endif
+Return
+
+################################################################################
+$CONTCCE
+mkstat = 0
+Call CTLVLYDAT([M:DIA]GENDAT,[F:CCE]VLYSTR,[F:CCE]VLYEND) From CPTSUB
+If mkstat : Return : Endif
+Call VERIF([F:CCE]FCY,SITE,[F:CCE]CCE) From CFYSUB
+If mkstat : Return : Endif
+If [F:CCE]IPT<>2 : mkstat = 1 : Endif
+Return
+
+################################################################################
+$CONTACC
+mkstat = 0
+Call CTLVLYDAT([M:DIA]GENDAT,[F:GAC2]VLYSTR,[F:GAC2]VLYEND) From CPTSUB
+If mkstat : Return : Endif
+Call VERIF([F:GAC2]FCY,[F:FCY2]FCY,[F:GAC2]ACC) From CFYSUB
+If mkstat : Return : Endif
+Return
+
+################################################################################
+#$CONTPCE
+#If [F:HAE]NUM<>""
+# fstat = 5
+# While fstat
+#  Sleep 2
+#  Read [F:HA2]HAE0 = [F:HAE]TYP;[F:HAE]NUM
+# Wend
+#Endif
+#Return
+
+##################################################################
+# validation d'une pièce
+$VALPCE2
+If NBVTL>MAXVTL2
+ # Trop de ventilations analytiques
+ MESSA= mess(79,117,1)
+ Gosub ERRMES
+Endif
+If [M:HAE2]NBLIG=0 : Return : Endif
+If GOK<1 : Return : Endif
+
+# Issue X3-6062
+# Contrôles écran
+Call CONTROLE(STAT,MESSA) From CPTBATCH
+If STAT
+ Gosub MESSAGE From CPTAUTO
+ If GTRACE<>""
+  Gosub ERRMES
+ Endif
+ GOK = 0
+ Return
+Else
+ If GOK<1
+  Return
+ Endif
+Endif
+Call DEBTRANS From GLOCK
+Gosub TR2
+If GOK<1 : Return : Endif
+NBECRT += [M:HAE2]NBLIG
+NBPCE  += 1
+
+If GTRACE<>""
+ # Issue X3-6062
+ If [M:DIA]TRC=2
+  # Société ___ Site ___
+  Call ECR_TRACE("****    "+mess(2,45,1)-SOC-mess(3,45,1)-[L]SITE,0) From GESECRAN
+  # Section
+  Call ECR_TRACE("####    "+mess(17,103,1)-[F:CC2]CCE,0) From GESECRAN
+  # Répartition multi-axes
+  Call ECR_TRACE("####    "+mess(104,103,1),0) From GESECRAN
+  # Pièce validée
+  Call ECR_TRACE(mess(11,107,1)-[F:HAE]TYP-[F:HAE]NUM,0) From GESECRAN
+ Endif
+Endif
+Return
+
+###########################################################################################################################
+#                      Gestion de l'écran CPTDSPANA
+###########################################################################################################################
+Subprog C_NBSOC
+Call C_NBSOC From CPTTRT
+End
+
+################################################################################
+Subprog AS_CPY(VALEUR)
+Variable Char    VALEUR()
+If nolign=1 & VALEUR=""
+ If dim([M]LEDTYP)>0 & [M]LEDTYP<>0
+  If clalev([F:CPY])=0  : Local File COMPANY     [CPY]   : Endif
+  If clalev([F:GCM])=0  : Local File GACM        [GCM]   : Endif
+  Local Char SOCCUR(GLONCPY), REFER(GLONLED)
+  SOCCUR = GDEFSOC
+  If SOCCUR<>""
+   Call LEC_CPY(SOCCUR) From CPTLEC
+   Call LEC_GCM([F:CPY]ACM) From CPTLEC
+   REFER = [F:GCM]LED([M]LEDTYP-1)
+   If REFER<>""
+    VALEUR = GDEFSOC
+   Endif
+  Endif
+ Else
+  VALEUR = GDEFSOC
+ Endif
+Endif
+End
+
+################################################################################
+Subprog C_CPY(VALEUR)
+Variable Char    VALEUR()
+Call UNICITE(VALEUR,[M]CPY) From OBJDIV
+If mkstat : End : Endif
+
+Local Integer OKSOC
+Local Char    SOCIETE(GLONCPY)
+Local Char    REFER(GLONLED)
+If clalev([F:COA])=0  :  Local File GCOA   [COA] : Endif
+
+SOCIETE = VALEUR
+GSOCIETE= VALEUR
+
+If nolign=1 & [M]NBSOC = 1 : [M]NBSOC = 0 : Endif
+Gosub OKSOC
+If nolign=1 & [M]NBSOC = 0 : [M]NBSOC = 1 : Endif
+If !OKSOC
+ # Plan de compte incompatible
+ GMESSAGE = mess(93,102,1)
+ mkstat = 2 : End
+Endif
+Gosub CONTSOC
+If !OKSOC
+  #Tous les sites ne sont pas accessibles
+ GMESSAGE = mess(32,104,1)
+ mkstat = 2 : End
+Endif
+
+If nolign = 1
+ [M]CPY(0) = VALEUR
+ Call LEC_CPY(SOCIETE) From CPTLEC
+ Call LEC_GCM([F:CPY]ACM) From CPTLEC
+ REFER = [F:GCM]LED([M]LEDTYP-1)
+ If REFER=""
+  # Référentiel incorrect
+  GMESSAGE = mess(201,111,1)
+  mkstat = 2 : End
+  Else
+  Call LECTURE("LED",[F:GCM]LED([M]LEDTYP-1),"") From CONTOBJ
+  Call LECTURE("COA",[F:LEDR]COA,"") From CONTOBJ
+  If [F:COA]ANATRK<>2
+   #Le type de référentiel sélectionné n'est pas de type 'analytique'
+   GMESSAGE = mess(107,103,1)
+   mkstat = 2 : End
+  Else
+   [M]LED = [F:GCM]LED([M]LEDTYP-1)
+  Endif
+ Endif
+Endif
+
+If GCURFCY=""
+ I = find(GSOCIETE,GSOCSITE(1..GNBSITE))
+ GCURFCY = GSITE(I)
+Endif
+
+End
+
+################################################################################
+Subprog C_ALLUSR(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2 : [M]USR="" : Affzo USR : Grizo USR : Else : Actzo USR : Endif
+End
+
+################################################################################
+Subprog AS_USR(VALEUR)
+Variable Char     VALEUR
+If [M]ALLUSR = 2 : mkstat = 1 : End : Endif
+If VALEUR=""
+ VALEUR = GUSER
+Endif
+End
+
+################################################################################
+Subprog AS_STRDAT(VALEUR)
+Variable Date     VALEUR
+Local Integer ISITE
+If VALEUR=[0/0/0]
+ If GDATEDEB<>[0/0/0]
+  VALEUR    = GDATEDEB
+  [M]ENDDAT = GDATEFIN
+ Else
+  If [F:CPY]CPYLEGFLG=2
+   Call LEC_CPY([M]CPY) From CPTLEC
+   Call GETSOC([F:CPY]MAIFCY) From DEVSUB
+   Call DEFPER([M]CPY,GTYPGEN,VALEUR,[M]ENDDAT) From CPTSUB
+  Else
+   ISITE = find(GFCYDEF(0),GSITE(1..GNBSITE))
+   If ISITE
+    Call DEFPER(GSOCSITE(ISITE),GTYPGEN,VALEUR,[M]ENDDAT) From CPTSUB
+   Endif
+  Endif
+ Endif
+Endif
+End
+
+################################################################################
+Subprog AS_GENTYP(VALEUR)
+Variable Char     VALEUR
+Local Char WLEG(GLONADI)
+If VALEUR=""
+ Call LEC_CPY([M]CPY(0)) From CPTLEC
+ WLEG = [F:CPY]LEG : Gosub INI_GTE
+ If VALEUR=""
+  WLEG = "" : Gosub INI_GTE
+ Endif
+Endif
+End
+
+$INI_GTE
+For [GTE] Where LEG=[L]WLEG
+ If (([F:GTE]VCRSIM=2 & [M]GENCAT>1) | ([F:GTE]VCRREA=2 & [M]GENCAT=1))
+  VALEUR = [F:GTE]TYP : Break
+ Endif
+Next
+Return
+
+################################################################################
+Subprog C_GENTYP(VALEUR)
+Variable Char     VALEUR
+# Si les sociétés ont des législations différentes (GCURLEG="") => pas de contrôle.
+If GCURLEG<>""
+ # le type de pièce choisi doit autoriser le type de référentiel choisi et interdire tous les autres
+ If [F:GTE]AUZLED([M]LEDTYP-1)=1
+&  or sum([F:GTE]AUZLED(0..[M]LEDTYP-2))>[M]LEDTYP-1
+&  or sum([F:GTE]AUZLED([M]LEDTYP..dim([F:GTE]AUZLED)-1))>dim([F:GTE]AUZLED)-[M]LEDTYP
+  #-> Le type de pièce VALEUR n’est pas mono type de réf
+  GMESSAGE = mess(194,107,1)-VALEUR-mess(193,107,1)-mess([M]LEDTYP,2644,1)
+  mkstat = 1 : End
+ Elsif !(([F:GTE]VCRSIM=2 & [M]GENCAT>1) | ([F:GTE]VCRREA=2 & [M]GENCAT=1))
+  # Type de pièce non permis avec l'état ...
+  GMESSAGE = mess(14,107,1)-mess([M]GENCAT,618,1)
+  mkstat = 1 : End
+ Endif
+ Call CONTEXE([F:GTE]ACS) From CPTSUB
+Endif
+End
+
+################################################################################
+Subprog C_GENDAT(VALEUR)
+Variable Date     VALEUR
+Local Integer N
+# on vérifie que les périodes de tous les sites de toutes les sociétés choisies sont ouvertes
+If [M]NBSOC=1 & [F:CPY]CPYLEGFLG=2
+ If [M]SITE=""
+  For N=0 To [M]NBSOC-1
+   Read [CPY]CPY0=[M]CPY(N)
+   For [FCY] Where LEGCPY=[F:CPY]CPY
+    Call CONTPER(VALEUR,[M]LEDTYP,[F:FCY]FCY) From CPTSUB
+    If mkstat
+     Break 2
+    Endif
+   Next
+  Next
+ Else
+  Call CONTPER(VALEUR,[M]LEDTYP,[M]SITE) From CPTSUB
+ Endif
+Endif
+If mkstat
+ GMESSAGE = [F:FCY]FCY-GMESSAGE
+ End
+Endif
+If GCURLEG<>""
+ Call LEC_GTE_LEG(GCURLEG,[M]GENTYP) From CPTLEC
+ Call CTLVLYDAT(VALEUR,[F:GTE]VLYSTR,[F:GTE]VLYEND) From CPTSUB
+Endif
+End
+
+################################################################################
+Subprog AS_GENJOU(VALEUR)
+Variable Char     VALEUR
+If VALEUR=""
+ VALEUR = [F:GTE]DEFJOU
+Endif
+End
+
+################################################################################
+Subprog C_GENJOU(VALEUR)
+Variable Char     VALEUR
+Local Decimal FIY, PER
+Local Char    SOC (GLONCPY)
+# No control if all the companies have a different legislation(GCURLEG="")
+If GCURLEG<>""
+ Call CONTEXE([F:JOU]ACS) From CPTSUB
+ If mkstat : End : Endif
+ If [F:GTE]AUZJOU([F:JOU]TYP-1)<>2
+  # Journal non autorisé sur ce type de pièce
+  GMESSAGE = mess(8,106,1)
+  mkstat = 2 : End
+ Endif
+  # Le jou et la société / site saisie(s) doivent être compatible.
+ Call VERSOC([F:JOU]FCY,[M]CPY,[M]SITE,[F:JOU]JOU) From CFYSUB
+ If mkstat : End : Endif
+
+ If [M]NBSOC=1 & [F:CPY]CPYLEGFLG=2
+  Read [JST]JST0 = [M]CPY(0);[F:JOU]JOU
+ Elsif [M]FCY<>"" & [CPY]CPYLEGFLG=2
+  Call GETPER([M]FCY,[M]LEDTYP,[M]GENDAT,FIY,PER) From CPTSUB
+  SOC = GSOCSITE(find([M]FCY,GSITE(1..GNBSITE)))
+  Read [JST]JST0 = SOC;[F:JOU]JOU
+ Else
+  End
+ Endif
+ If fstat
+  # Journal inactif
+  GMESSAGE = [F:JOU]JOU-mess(7,106,1)
+ Endif
+Endif
+End
+
+################################################################################
+Subprog AS_STRDAT2(VALEUR)
+Variable Date     VALEUR
+If VALEUR=[0/0/0]
+ VALEUR = [M]STRDAT
+ [M]ENDDAT2 = [M]ENDDAT
+Endif
+End
+
+################################################################################
+Subprog AS_ALLUSR(VALEUR)
+Variable Integer VALEUR
+End
+
+################################################################################
+Subprog C_DIA(VALEUR)
+Variable Char     VALEUR
+Call CONTROLE("DAD", "", VALEUR, [M]LED, mkstat) From CONTOBJ
+End
+
+################################################################################
+Subprog AV_GENSIM(VALEUR)
+Variable Integer VALEUR
+If find([M]GENCAT,2,3) : mkstat = 1 : End : Endif
+End
+
+################################################################################
+Subprog AM_GENCAT(VALEUR)
+Variable Integer VALEUR
+[M:DIA]GENTYP = ""
+[M:DIA]GENJOU = ""
+End
+
+################################################################################
+Subprog C_GENCAT(VALEUR)
+Variable Integer VALEUR
+If VALEUR<>1 : Grizo GENSIM : Else : Actzo GENSIM : Endif
+End
+
+################################################################################
+Subprog D_INI(VALEUR)
+Variable Char    VALEUR()
+Gosub GRISE
+End
+
+################################################################################
+$GRISE
+If dim([M]ALLTYPJOU)>0
+ If [M]ALLTYPJOU=2 : [M]TYPJOU=0 : Affzo TYPJOU : Grizo TYPJOU : Else : Actzo TYPJOU : Endif
+Endif
+If dim([M]ALLJOU)>0
+ If [M]ALLJOU=2 : Grizo JOU : Else : Actzo JOU : Endif
+Endif
+If dim([M]ALLTYP)>0
+ If [M]ALLTYP=2
+  Grizo TYP
+  If dim([M]VCRDEB)>0 : Grizo VCRDEB,VCRFIN : Endif
+ Else
+  Actzo TYP
+  If dim([M]VCRDEB)>0 : Actzo VCRDEB,VCRFIN : Endif
+ Endif
+Endif
+If dim([M]ALLUSR)>0
+ If [M]ALLUSR=2 : [M]USR="" : Affzo USR : Grizo USR : Else : Actzo USR : Endif
+Endif
+If dim([M]ALLVAT)>0
+ If [M]ALLVAT=2 : Grizo VAT : Else : Actzo VAT : Endif
+Endif
+If dim([M]SIMSTA)>0
+ If [M]ACTION1="V" : Actzo SIMSTA : Else : Grizo SIMSTA : Endif
+Endif
+If dim([M]CATLOT)>0
+ If [M]CATLOT<>1 : Grizo STALOT : Else : Actzo STALOT : Endif
+Endif
+If dim([M]GENCAT)>0
+ If [M]GENCAT<>1 : Grizo GENSIM : Else : Actzo GENSIM : Endif
+Endif
+
+Return
+
+################################################################################
+Subprog AS_SITE(VALEUR)
+Variable Char    VALEUR()
+If [M]NBSOC>1 : mkstat = 1 : End : Endif
+End
+
+################################################################################
+Subprog C_SITE(VALEUR)
+Variable Char    VALEUR()
+Local Integer OKSOC
+Local Char    SOCIETE(GLONCPY)
+If VALEUR=""
+ If [M]NBSOC=0
+  # Vous devez saisir une société ou un site
+  GMESSAGE = mess(9,109,1)
+  mkstat = 2
+ Endif
+ End
+Endif
+Call LEC_FCY(VALEUR) From CPTLEC
+SOCIETE = [F:FCY]LEGCPY
+If [M]NBSOC>0 & SOCIETE<>[M]CPY(0)
+ # Ce site est dans la société
+ GMESSAGE = mess(30,106,1)-SOCIETE
+ mkstat = 2 : End
+Endif
+GCURFCY=VALEUR
+Gosub OKSOC
+End
+
+################################################################################
+Subprog C_GRPSOC(VALEUR)
+Variable Char    VALEUR()
+Local Integer OKSOC
+Local Char    SOCIETE(GLONCPY)
+
+#Si modif du grp de soc initialisation de certaines variable à zéro
+If VALEUR<>[M]GRPSOC
+ [M]DIA    = ""
+ [M]DACDIA = ""
+ [M]SITE   = ""
+ [M]GENTYP = ""
+ [M]GENJOU = ""
+ [M]GENLIB = ""
+ [M]GENDAT = [0/0/0]
+ [M]NBSOC  = 0
+ Raz [M]CPY
+ Affzo
+Endif
+If VALEUR<>"" & VALEUR<>[M]GRPSOC
+ If clalev([F:AGC])=0 : Local File AGRPCPY [AGC] : Endif
+ # Contrôle que toutes les sociétés d'un groupe sont accessibles
+ Call CONTALLCPY(VALEUR) From CPTSUB
+ If mkstat : End : Endif
+ [M]NBSOC = 0
+ For [AGC] Where GRP=VALEUR
+  SOCIETE = [F:AGC]CPY
+  Gosub OKSOC
+  If OKSOC
+   Gosub CONTSOC
+   If OKSOC
+    [M]CPY([M]NBSOC) = SOCIETE
+    [M]NBSOC += 1
+   Endif
+  Endif
+ Next
+ Affzo 10
+# Si pas de Grp de Soc alors on initialise par défaut la 1ere société avec la société
+# par défaut du dossier
+Elsif VALEUR="" & dim([M]NBSOC)>0 & [M]NBSOC=0 & dim([M]SITE)>0 & [M]SITE=""
+ Raz [M]CPY
+ [M]NBSOC = 1
+ [M]CPY(0)=GDEFSOC
+ If dim([M]LEDTYP)>0 & [M]LEDTYP<>0
+  Call LEC_CPY([M]CPY(0))  From CPTLEC
+  Call LEC_GCM([F:CPY]ACM) From CPTLEC
+  Read [LEDR]LED0 = [F:GCM]LED([M]LEDTYP-1)
+  [M]COA = [F:LEDR]COA
+ Endif
+ Affzo 10
+Endif
+End
+
+################################################################################
+Subprog AS_FCY(VALEUR)
+Variable Char    VALEUR
+End
+
+######################################################################################
+Subprog AS_LEDTYP(VALEUR)
+Variable Integer VALEUR
+# Sélection des référentiels flagué "non automatique" et analytique
+Call LEC_CPY([M]CPY(0))  From CPTLEC
+Call LEC_GCM([F:CPY]ACM) From CPTLEC
+[M]LED = [F:GCM]LED([M]LEDTYP-1)
+Call LEDTYP_CHOICE([M]CPY(0),8) From CPTDIV
+End
+
+######################################################################################
+Subprog C_LEDTYP(VALEUR)
+Variable Integer VALEUR
+If clalev([F:CPY])=0 : Local File COMPANY  [CPY] : Endif
+If clalev([F:FCY])=0 : Local File FACILITY [FCY] : Endif
+
+#Faire le contrôle du LEDTYP et init LED correctement et tout le temps.
+If ([M]GRPSOC<>"" | [M]NBSOC <> 0)
+ [M]LEDTYP = VALEUR
+ Call LEC_CPY([M]CPY(0))  From CPTLEC
+ Call LEC_GCM([F:CPY]ACM) From CPTLEC
+ [M]LED = [F:GCM]LED([M]LEDTYP-1)
+Endif
+
+End
+
+
+######################################################################################
+Subprog C_DACDIA(VALEUR)
+Variable Char    VALEUR()
+If [F:GDE]TYPENT=3 or find([M]LEDTYP, [F:GDE]LEDTYP)=0
+ # Valeur incorrecte
+ GMESSAGE = mess(6,199,1)
+ mkstat=2 : End
+Endif
+End
+
+
+######################################################################################
+$SEL_TABLE
+Case COUZON
+ When "DACDIA"   : Gosub S_DACDIA
+Endcase
+Return
+
+# on affiche uniquement les transactions qui ne sont pas paramétrées avec Type de saisie = "En onglet" et qui contiennent
+# le référentiel saisi sur l'écran de critères
+$S_DACDIA
+OBJET="GDE"
+CRITERE="TYPENT<>3 & find("+num$([M]LEDTYP)+", LEDTYP)<>0"
+Return
+
+################################################################################
+$OKSOC
+Call LEC_CPY(SOCIETE) From CPTLEC
+Call LEC_GCM([F:CPY]ACM) From CPTLEC
+Read [LEDR]LED0 = [F:GCM]LED([M]LEDTYP-1)
+If [M]NBSOC=0 & [F:LEDR]COA<>""
+ [M]COA = [F:LEDR]COA
+ OKSOC = 1
+Else
+ OKSOC = ([F:LEDR]COA=[M]COA)
+Endif
+Return
+
+################################################################################
+$CONTSOC
+If GUSRFCY(1)<>"\"
+ Local Integer I
+ Call LEC_CPY(SOCIETE) From CPTLEC
+ For I=1 To GNBSITE
+  If SOCIETE=GSOCSITE(I) & !find(GSITE(I),GUSRFCY(1..GNBAUZ))
+   OKSOC = 0 : Break
+  Endif
+ Next I
+Endif
+Return
+
+################################################################################
+$INISOC
+If clalev([F:AGC])=0 : Local File AGRPCPY [AGC] : Endif
+[M]NBSOC = 0
+For [AGC] Where GRP=[M]GRPSOC
+ SOCIETE = [F:AGC]CPY
+ Gosub OKSOC
+ If OKSOC
+  Gosub CONTSOC
+  [M]CPY([M]NBSOC) = SOCIETE
+  [M]NBSOC += 1
+ Endif
+Next
+Affzo 10
+Return
+

@@ -1,0 +1,587 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+######################################################################################################
+##  Calcul de la répartition
+######################################################################################################
+
+#**********************************************************
+#* Modifications :
+#*    FQ81491 - 17/10/13 - prise en compte date d'effet
+#**********************************************************
+#*!
+
+$ACTION
+Case ACTION
+ When "INIT"     : TIT = mess(5,10706,1) : # Calcul de la participation individuelle
+ When "CONTROLE" : TRA = 1
+ When "EXEC"     : Gosub EXEC
+Endcase
+Return
+
+$EXEC
+Call OUVRE_TRACE(TIT) From LECFIC
+# Société xxx Exercice xxxx
+Call ECR_TRACE(mess(42,10702,1)-[M:PAC0]CPY-mess(18,10706,1)-num$([M:PAC0]EXO),0) From GESECRAN
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Call CALPAR (PARAM(1))
+Call FERME_TRACE From LECFIC
+Return
+
+
+Subprog CALPAR (NUM)
+Value Char NUM
+Gosub DECLARE
+Read[F:PAC]PAC0=NUM
+If fstat
+ # Numéro de répartition inexistant
+ Call ECR_TRACE(mess(6,10706,1),1) From GESECRAN
+ End
+Endif
+
+Read [HRREP]REP0=[F:PAC]CODREP
+If fstat
+ # Méthode de répartition inexistante
+ Call ECR_TRACE(mess(7,10706,1),1) From GESECRAN
+ End
+Endif
+
+## Critère de sélection sur les sociétés juridiques
+Read [CPY]CPY0=[F:PAC]CPY
+If [F:CPY]CPYLEGFLG=1 : # Société non juridique
+ I=1
+ For [FGR]FGR0 Where CPY=[F:PAC]CPY
+  Read [FCY]FCY0=[F:FGR]FCY
+  If !fstat & !find([F:FCY]LEGCPY,SOCGRP(1..I))
+   SOCGRP(I) = [F:FCY]LEGCPY
+   I +=1
+  Endif
+ Next
+ If I>1
+  CRITSOC = 'find(CPY,SOCGRP(1..'+num$(I-1)+'))'
+ Else
+  # Aucune société juridique n'est rattachée à la société XXX
+  Call ECR_TRACE(mess(8,10706,1)-[F:PAC]CPY,1) From GESECRAN
+  End
+ Endif
+Else
+ CRITSOC = "CPY=[F:PAC]CPY"
+Endif
+
+## Critère sur EMPLOPAR
+CRITPAR = '[F:PAR]PARDAT<='+num$([F:PAC]ENDDAT)
+If [F:HRREP]TYPREP=1 : # Participation
+ CRITPAR-= '& [F:PAR]FLGPAR=2'
+Else               : # Intéressement
+ CRITPAR-= '& [F:PAR]FLGITS=2'
+Endif
+
+Call LECTURE("TCU",GSYSCUR,"") From CONTOBJ
+Call DEBTRANS From GLOCK
+Gosub TR1
+
+End
+
+
+$DECLARE
+If clalev([F:HRBAI])=0    : Local File BASIND     [HRBAI] : Endif
+If clalev([F:CPY])=0      : Local File COMPANY    [CPY]   : Endif
+If clalev([F:HRCOT])=0    : Local File COTISATION [HRCOT] : Endif
+If clalev([F:PAR])=0      : Local File EMPLOPAR   [PAR]   : Endif
+If clalev([F:HRCTR])=0    : Local File EMPLOCTR   [HRCTR] : Endif
+If clalev([F:FGR])=0      : Local File FACGROUP   [FGR]   : Endif
+If clalev([F:FCY])=0      : Local File FACILITY   [FCY]   : Endif
+If clalev([F:FDS])=0      : Local File FONDS      [FDS]   : Endif
+If clalev([F:PAC])=0      : Local File PARCOL     [PAC]   : Endif
+If clalev([F:PAI])=0      : Local File PARIND     [PAI]   : Endif
+If clalev([F:HRREP])=0      : Local File REPART     [HRREP]   : Endif
+If clalev([F:TCU])=0      : Local File TABCUR     [TCU]   : Endif
+# 34597
+If clalev([F:FDS])=0      : Local File FONDS      [FDS]   : Endif
+
+Local Integer MAXBASE, MAXCOT
+MAXBASE = dim([F:HRREP]CODBAS)
+MAXCOT  = dim([F:PAI]CODCOT)
+Local Integer FLGRESIDU, I, J, NBCOT, PASSE
+Local Char    CRITSOC(250), CRITPAR(250)
+Local Char    SOCGRP(GLONCPY)(1..30)
+Local Char    CODCOT(GLONHRCOT)(0..MAXCOT-1)
+Local Char    FONDS(GLONFDS)
+#72889 : add OLDRESIDU
+Local Decimal RESIDU, TOTPRCBAS, MONTANT, BASE, MONTTOT, OLDRESIDU
+Local Decimal MTREP(1..MAXBASE), CUMBASE(1..MAXBASE), SOMBASE(1..MAXBASE), MONT(1..MAXBASE)
+Local Decimal PRORAT1, PRORAT2 : # Taux de proratisation présence plancher et plafond
+Local Decimal BASCOT(0..MAXCOT-1), AMTCOT(0..MAXCOT-1)
+Local Decimal PRCFDS, CUMPRC   : # Pour gérer l'affectation à des fonds multiples
+Local Integer NBMOIS, NBJOUR   : # Calcul du temps de présence
+Local Integer ER
+Return
+
+## FQ74338 - MABON 17/06/11 - Calcul somme des bases selon effectif réel
+#Funprog FIND_OKREFNUM()
+#Local Integer OKREFNUM, NBMOIS, NBJOUR
+#
+#  OKREFNUM=2
+#  ## Calcul montant à répartir. Montant =0 si ancienneté non remplie ou temps de présence non effectué
+#  If [F:HRREP]ONSMIN<>0 : # Nombre de mois d'ancienneté
+#   Filter [HRCTR] Where REFNUM=[F:HRBAI]REFNUM & CTRNUM=[F:HRBAI]CTRNUM
+#   # Recherche de la date d'ancienneté
+#   Read [HRCTR]CTR1 Last
+#   Filter [HRCTR]
+#   If fstat | [F:HRCTR]DATANC=[0/0/0] | addmonth([F:HRCTR]DATANC,[F:HRREP]ONSMIN)>[F:PAC]ENDDAT
+#    OKREFNUM=1
+#    End OKREFNUM
+#   Endif
+#  Endif
+#
+#  If [F:HRREP]MINPRS<>0 : # Nombre de mois de présence
+#   Raz NBMOIS
+#   For [FGR]FGR0 Where CPY=[F:PAC]CPY
+#    For [HRCTR]CTR0 Where REFNUM=[F:HRBAI]REFNUM & CTRNUM=[F:HRBAI]CTRNUM & ETRFCY=[FGR]FCY
+#&     & CTRDAT<=[F:PAC]ENDDAT & (XITDAT=[0/0/0] | XITDAT>=[F:PAC]STRDAT)
+#    #
+#     Raz NBJOUR
+#     If [F:HRCTR]CTRDAT<>[0/0/0] & [F:HRCTR]CTRDAT<=[F:PAC]ENDDAT
+#      If [F:HRCTR]CTRDAT<[F:PAC]STRDAT
+#       NBJOUR = [F:PAC]ENDDAT-[F:PAC]STRDAT+1
+#      Else
+#       NBJOUR = [F:PAC]ENDDAT-[F:HRCTR]CTRDAT+1
+#      Endif
+#     Endif
+#     If [F:HRCTR]XITDAT<>[0/0/0] & [F:HRCTR]XITDAT<=[F:PAC]ENDDAT
+#      If [F:HRCTR]XITDAT<[F:PAC]STRDAT
+#       NBJOUR = 0
+#      Else
+#       NBJOUR -=[F:PAC]ENDDAT-[F:HRCTR]XITDAT+1
+#      Endif
+#     Endif
+#     NBMOIS += NBJOUR
+#    Next
+#   Next
+#   If (NBMOIS/30)<[F:HRREP]MINPRS
+#    OKREFNUM=1
+#    End OKREFNUM
+#   Endif
+#  Endif
+#End OKREFNUM
+## Fin MABON
+
+$TR1
+Local Integer IB, OKREFNUM
+
+GOK = 1
+Trbegin [PAI],[PAC]
+ ## On verrouille le fichier PARIND
+ Lock [PAI]
+ If fstat
+  GOK = -1 : GLOCK = "$PARIND" : Goto ROLL_TR1
+ Endif
+
+ ## On efface la précédente génération
+ Delete [PAI] Where evalue(CRITSOC) & NUMPAR=[F:PAC]NUMPAR
+ If fstat=1
+  GOK = -1
+  GLOCK = "$PARIND"-num$([F:PAC]NUMPAR)
+  Goto ROLL_TR1
+ Elsif fstat>5
+  GOK = 0
+  Call RSTA("PAI",num$([F:PAC]NUMPAR)) From GLOCK
+  Goto AB_TR1
+ Endif
+
+ PASSE     = 0 : # Nombre de fois où on a réparti
+ FLGRESIDU = 1 : # On répartit au moins une fois le résidu
+ RESIDU    = [F:PAC]AMTTOT
+ #72889 : add OLDRESIDU
+ OLDRESIDU    = 0
+ TOTPRCBAS = sum([F:HRREP]PRCBAS(0..[F:HRREP]NBRBAS-1))
+ While  FLGRESIDU<>0 & RESIDU <>0
+  PASSE += 1
+  # Répartition numéro xx
+  Call ECR_TRACE(mess(16,10706,1)-num$(PASSE),0) From GESECRAN
+  FLGRESIDU = [F:HRREP]DSP-1
+  Raz CUMBASE, MTREP, SOMBASE
+  ## Calcul du résidu à répartir par base
+  Gosub RES_BASE
+  Filter [HRBAI] Where evalue(CRITSOC) & EXO=[F:PAC]EXO
+  ## Calcul de la somme des bases
+  For [HRBAI]BAI0
+   # Si la société de la fiche participation collective est non juridique, on somme les bases individuelles
+   # de toutes les sociétés juridiques qui lui appartiennent. Sinon on somme celles de la société juridique.
+   MONTANT = 0
+   Filter [PAI] Where CPY=[F:HRBAI]CPY & REFNUM=[F:HRBAI]REFNUM & CTRNUM=[F:HRBAI]CTRNUM & NUMPAR=[F:PAC]NUMPAR
+   For [PAI]PAI0
+    MONTANT += [F:PAI]AMTGRO
+   Next
+   Filter [PAI]
+   # FQ74338 - MABON 17/06/11 - Calcul somme des bases selon effectif réel
+#   OKREFNUM=func FIND_OKREFNUM
+#   If [F:HRREP]AMTMAX=0 | MONTANT<arr([F:HRREP]AMTMAX*[F:HRBAI]PPN,[F:TCU]CURRND) & OKREFNUM=2
+#   # Fin MABON
+   If [F:HRREP]AMTMAX=0 | MONTANT<arr([F:HRREP]AMTMAX*[F:HRBAI]PPN,[F:TCU]CURRND)
+    For IB=1 To [F:HRBAI]NBRBAS
+     Gosub SOM_BASE
+     If J>0 & BASE<>0
+      SOMBASE(J) += BASE
+     Endif
+    Next
+   Endif
+  Next
+  ER = 0
+  For IB=1 To [F:HRREP]NBRBAS
+   If MTREP(IB)<>0 & SOMBASE(IB)=0
+    # Somme des bases égale à 0 pour la société xxx
+    Call ECR_TRACE ([F:HRREP]CODBAS(IB-1)-":"-mess(9,10706,1)-[F:HRBAI]CPY,-1) From GESECRAN
+    ER = 1
+   Elsif MTREP(IB)<>0
+    Call ECR_TRACE (format$("K:10X",[F:HRREP]CODBAS(IB-1))+":"+format$("N:9.2",SOMBASE(IB))+space$(3)+
+&   mess(17,10706,1)+":"+format$("N:9.2",MTREP(IB)),0) From GESECRAN
+   Endif
+  Next
+  #72889
+  If RESIDU<>OLDRESIDU
+   OLDRESIDU=RESIDU
+  Else
+   # Arrêt de la répartition
+   Call ECR_TRACE (mess(11,10706,1),-1) From GESECRAN
+   #GOK = 0 : sinon MAJ_PARCOL non exécuté !
+   Break
+  Endif
+  If ER
+   If PASSE=1
+    # Répartition impossible
+    Call ECR_TRACE (mess(10,10706,1),-1) From GESECRAN
+   Else
+    # Arrêt de la répartition
+    Call ECR_TRACE (mess(11,10706,1),-1) From GESECRAN
+   Endif
+   GOK = 0 : Break
+  Endif
+  Call ECR_TRACE(string$(70," "),0) From GESECRAN
+  ## Calcul de la base réelle
+  #72889 Cancel RESIDU
+  Raz CUMBASE, MONTTOT #, RESIDU
+  For [HRBAI]BAI0   : # Pour chaque base individuelle
+   MONTANT = 0
+   EXISTE  = 0
+   If PASSE>1
+    # On peut avoir plusieurs enregistrements avec des fonds différents
+    Filter [PAI] Where CPY=[F:HRBAI]CPY & REFNUM=[F:HRBAI]REFNUM & CTRNUM=[F:HRBAI]CTRNUM & NUMPAR=[F:PAC]NUMPAR
+    For [PAI]
+     EXISTE  = 1
+     MONTANT += [F:PAI]AMTGRO
+    Next
+    Filter [PAI]
+    # Le plafond d'attribution est calculé prorata temporis (temps de présence)
+    If EXISTE=1 & [F:HRREP]AMTMAX<>0 & MONTANT>=arr([F:HRREP]AMTMAX*[F:HRBAI]PPN,[F:TCU]CURRND)
+     EXISTE = 2
+    Endif
+   Endif
+   If EXISTE<>2
+    Raz MONT
+    Gosub REEL_BASE
+    ## Application du plafond d'attribution individuel par société
+    If [F:HRREP]AMTMAX<>0 & MONTANT>arr([F:HRREP]AMTMAX*[F:HRBAI]PPN,[F:TCU]CURRND)
+     #72889
+     #RESIDU += MONTANT-arr([F:HRREP]AMTMAX*[F:HRBAI]PPN,[F:TCU]CURRND)
+     MONTANT = arr([F:HRREP]AMTMAX*[F:HRBAI]PPN,[F:TCU]CURRND)
+    Endif
+    If MONTANT<>0
+     Gosub CAL_COTI
+     ## Recherche du fonds par défaut
+     FONDS  = [F:PAC]DEFFDS : # Fonds par défaut
+     PRCFDS = 100
+     Raz CUMPRC
+     Filter [PAR] Where REFNUM=[F:HRBAI]REFNUM & PARDAT<=[F:PAC]ENDDAT
+     Read [PAR]PAR1 Last
+     Filter [PAR]
+     If !fstat
+      If [F:HRREP]TYPREP=1 : # Participation
+       If [F:PAR]NBRFDSPAR>0
+        For J=0 To [F:PAR]NBRFDSPAR-1
+         FONDS  = [F:PAR]FDSPAR(J)
+         PRCFDS = [F:PAR]FDSPARPRC(J)
+         Gosub MAJ_PARIND
+         If GOK<1 : Break 4 : Endif
+         CUMPRC +=PRCFDS
+        Next
+       Else
+        Gosub MAJ_PARIND
+        If GOK<1 : Break 3 : Endif
+       Endif
+      Else               : # Intéressement
+       If [F:PAR]NBRFDSITS>0
+        For J=0 To [F:PAR]NBRFDSITS-1
+         FONDS  = [F:PAR]FDSITS(J)
+         PRCFDS = [F:PAR]FDSITSPRC(J)
+         Gosub MAJ_PARIND
+         If GOK<1 : Break 4 : Endif
+         CUMPRC +=PRCFDS
+        Next
+       Else
+        Gosub MAJ_PARIND
+        If GOK<1 : Break 3 : Endif
+       Endif
+      Endif
+     Endif
+    Endif
+   Endif
+   # xxx Montant réparti xxx xxx.xx
+   Call ECR_TRACE(format$("K:15X",[F:HRBAI]REFNUM)-"("+mess(156,10702,1)-[F:HRBAI]CTRNUM+")"-mess(13,10706,1)+":"+
+&                 format$("N:9.2",MONTANT),0) From GESECRAN
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+   MONTTOT +=MONTANT
+  Next
+  #72889
+  RESIDU=[F:PAC]AMTTOT-MONTTOT
+  Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+  # xxx Montant total réparti xxx xxx.xx
+  Call ECR_TRACE(format$("K:25X",mess(14,10706,1))+format$("N:9.2",MONTTOT),0) From GESECRAN
+  # xxx Montant du résidu xxx xxx.xx
+  Call ECR_TRACE(format$("K:25X",mess(15,10706,1))+format$("N:9.2",RESIDU),0) From GESECRAN
+  Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+ Wend
+
+ Filter [HRBAI]
+ If GOK=0 : Goto AB_TR1 : Endif
+ Gosub MAJ_PARCOL
+ If GOK=0 : Goto AB_TR1 : Endif
+Commit
+Return
+
+
+## Calcul du résidu à répartir par base avec arrondi progressif
+
+$RES_BASE
+For I=1 To [F:HRREP]NBRBAS
+ If [F:HRREP]PRCBAS(I-1)<>0
+  MTREP(I) = arr((CUMBASE+[F:HRREP]PRCBAS(I-1))*RESIDU/TOTPRCBAS,[F:TCU]CURRND)
+&          - arr(CUMBASE*RESIDU/TOTPRCBAS,[F:TCU]CURRND)
+  CUMBASE +=[F:HRREP]PRCBAS(I-1)
+ Endif
+Next
+Return
+
+
+## Calcul de la somme des bases
+
+$SOM_BASE
+J = 0 : BASE = 0
+## Application plancher/plafond et prorata de présence
+J = find([F:HRBAI]CODBAS(IB-1),[F:HRREP]CODBAS(0..[F:HRREP]NBRBAS-1))
+If J
+ BASE = [F:HRBAI]AMTBAS(IB-1)
+ If [F:HRREP]PPNMIN(J-1)=2 : # Proratisation plancher par rapport au prorata présence
+  PRORAT1 = [F:HRBAI]PPN
+ Else
+  PRORAT1 = 1
+ Endif
+ If [F:HRREP]PPNMAX(J-1)=2 : # Proratisation plafond par rapport au prorata présence
+  PRORAT2 = [F:HRBAI]PPN
+ Else
+  PRORAT2 = 1
+ Endif
+ If [F:HRBAI]AMTBAS(IB-1)<PRORAT1*[F:HRREP]MINBAS(J-1)
+  BASE = PRORAT1*[F:HRREP]MINBAS(J-1)
+ Endif
+ If [F:HRREP]MAXBAS(J-1)<>0 & [F:HRBAI]AMTBAS(IB-1)>PRORAT2*[F:HRREP]MAXBAS(J-1)
+  BASE = PRORAT2*[F:HRREP]MAXBAS(J-1)
+ Endif
+Endif
+Return
+
+
+## Calcul base réelle
+
+$REEL_BASE
+Local Integer IB
+## Calcul montant à répartir. Montant =0 si ancienneté non remplie ou temps de présence non effectué
+If [F:HRREP]ONSMIN<>0 : # Nombre de mois d'ancienneté
+ Filter [HRCTR] Where REFNUM=[F:HRBAI]REFNUM & CTRNUM=[F:HRBAI]CTRNUM
+ # Recherche de la date d'ancienneté
+ Read [HRCTR]CTR1 Last
+ Filter [HRCTR]
+ If fstat | [F:HRCTR]DATANC=[0/0/0] | addmonth([F:HRCTR]DATANC,[F:HRREP]ONSMIN)>[F:PAC]ENDDAT
+  # MATRICULE : Critère d'ancienneté non rempli
+  Call ECR_TRACE(format$("K:15X",[F:HRBAI]REFNUM)-"("+mess(156,10702,1)-[F:HRBAI]CTRNUM+") :"-mess(12,10706,1),1) From GESECRAN
+  Return
+ Endif
+Endif
+
+If [F:HRREP]MINPRS<>0 : # Nombre de mois de présence
+ Raz NBMOIS
+ #65281
+ #Filter [HRCTR] Where REFNUM=[F:HRBAI]REFNUM & CTRNUM=[F:HRBAI]CTRNUM & CTRDAT<=[F:PAC]ENDDAT & (XITDAT=[0/0/0] | XITDAT>=[F:PAC]STRDAT)
+ #Filter [FGR] Where CPY=[F:PAC]CPY
+ #Link [HRCTR] With [FGR]FGR1(0)=ETRFCY As [LENT]
+ #For [LENT]
+ Local Date DATREF
+ For [FGR]FGR0 Where CPY=[F:PAC]CPY
+  # FQ81491 - 15/10/13 - Prise en compte de la date d'effet au lieu de la date du contrat, pour déterminer la présence du salarié
+#  For [HRCTR]CTR0 Where REFNUM=[F:HRBAI]REFNUM & CTRNUM=[F:HRBAI]CTRNUM & ETRFCY=[FGR]FCY
+#& & CTRDAT<=[F:PAC]ENDDAT & (XITDAT=[0/0/0] | XITDAT>=[F:PAC]STRDAT)
+  For [HRCTR]CTR0 Where REFNUM=[F:HRBAI]REFNUM & CTRNUM=[F:HRBAI]CTRNUM & ETRFCY=[FGR]FCY
+& & (CTRDAT<=[F:PAC]ENDDAT | (FLGRET=2 & RETDATEFF<=[F:PAC]ENDDAT)) & (XITDAT=[0/0/0] | XITDAT>=[F:PAC]STRDAT)
+  #
+   Raz NBJOUR
+   # FQ81491 - 15/0/13 - La date d'effet sert de référence, si elle existe
+   DATREF=[F:HRCTR]CTRDAT
+   If [F:HRCTR]FLGRET=2 & [F:HRCTR]RETDATEFF<>[0/0/0] Then DATREF=[F:HRCTR]RETDATEFF : Endif
+#   If [F:HRCTR]CTRDAT<>[0/0/0] & [F:HRCTR]CTRDAT<=[F:PAC]ENDDAT
+#    If [F:HRCTR]CTRDAT<[F:PAC]STRDAT
+#     NBJOUR = [F:PAC]ENDDAT-[F:PAC]STRDAT+1
+#    Else
+#     NBJOUR = [F:PAC]ENDDAT-[F:HRCTR]CTRDAT+1
+#    Endif
+#   Endif
+   If DATREF<>[0/0/0] & DATREF<=[F:PAC]ENDDAT
+    If DATREF<[F:PAC]STRDAT
+     NBJOUR = [F:PAC]ENDDAT-[F:PAC]STRDAT+1
+    Else
+     NBJOUR = [F:PAC]ENDDAT-DATREF+1
+    Endif
+   Endif
+   # Fin FQ81491
+   If [F:HRCTR]XITDAT<>[0/0/0] & [F:HRCTR]XITDAT<=[F:PAC]ENDDAT
+    If [F:HRCTR]XITDAT<[F:PAC]STRDAT
+     NBJOUR = 0
+    Else
+     NBJOUR -=[F:PAC]ENDDAT-[F:HRCTR]XITDAT+1
+    Endif
+   Endif
+   NBMOIS += NBJOUR
+  Next
+ #65281
+ Next
+ #Filter [HRCTR]
+ #Filter [FGR]
+ #
+ If (NBMOIS/30)<[F:HRREP]MINPRS
+  # MATRICULE : Critère de présence non rempli
+  Call ECR_TRACE(format$("K:15X",[F:HRBAI]REFNUM)-"("+mess(156,10702,1)-[F:HRBAI]CTRNUM+") :"-mess(22,10706,1),1) From GESECRAN
+  Return
+ Endif
+Endif
+
+## J est l'indice des bases dans le fichier REPARTITION
+For IB=1 To [F:HRBAI]NBRBAS
+ Gosub SOM_BASE
+ If J>0 & MTREP(J)<>0 & BASE<>0
+  MONT(J) = arr((CUMBASE(J)+BASE)*MTREP(J)/SOMBASE(J),[F:TCU]CURRND)
+&            - arr(CUMBASE(J)*MTREP(J)/SOMBASE(J),[F:TCU]CURRND)
+  CUMBASE(J) += BASE
+  MONTANT    += MONT(J)
+  # MATRICULE BASE Base xxx xxx.xx Montant xxx xxx.xx
+  Call ECR_TRACE(format$("K:15X",[F:HRBAI]REFNUM)-"("+mess(156,10702,1)-[F:HRBAI]CTRNUM+")"-format$("K:10X",[F:HRBAI]CODBAS(IB-1))+space$(1)+
+& mess(59,10703,1)+":"+format$("N:9.2",BASE)+space$(3)+mess(50,104,1)+":"+
+& format$("N:9.2",MONT(J)),0) From GESECRAN
+ Endif
+Next
+Return
+
+
+## Calcul des cotisations
+
+$CAL_COTI
+If [F:HRREP]TYPREP= 1 : # Cotisation sur Participation
+ Filter [HRCOT] Where FLGPAR=2 & STRDAT<=[F:PAC]STRDAT & (ENDDAT=[0/0/0] | ENDDAT>=[F:PAC]ENDDAT)
+Else                : # Cotisation sur Intéressement
+ Filter [HRCOT] Where FLGITS=2 & STRDAT<=[F:PAC]STRDAT & (ENDDAT=[0/0/0] | ENDDAT>=[F:PAC]ENDDAT)
+Endif
+Raz [L]CODCOT, [L]BASCOT, [L]AMTCOT
+NBCOT=0
+For [HRCOT]COT0
+ [L]CODCOT(NBCOT) = [F:HRCOT]COD
+ [L]BASCOT(NBCOT) = arr(MONTANT*[F:HRCOT]BAS/100,[F:TCU]CURRND)
+ [L]AMTCOT(NBCOT) = arr(BASCOT(NBCOT)*[F:HRCOT]RAT/100,[F:TCU]CURRND)
+ NBCOT +=1
+Next
+Filter [HRCOT]
+Return
+
+
+## Création ou MAJ des fiches de participation individuelle
+
+$MAJ_PARIND
+Readlock[F:PAI]PAI0=[F:HRBAI]CPY;[F:HRBAI]REFNUM;[F:HRBAI]CTRNUM;[F:PAC]NUMPAR;FONDS
+If fstat=1
+ GOK = -1 : GLOCK = "$PARIND"-[F:HRBAI]CPY-[F:HRBAI]REFNUM-[F:HRBAI]CTRNUM-[F:PAC]NUMPAR : Return
+Endif
+Raz [F:PAI]
+[F:PAI]CPY    = [F:HRBAI]CPY
+[F:PAI]REFNUM = [F:HRBAI]REFNUM
+[F:PAI]CTRNUM = [F:HRBAI]CTRNUM
+[F:PAI]NUMPAR = [F:PAC]NUMPAR
+[F:PAI]CODFDS = FONDS
+[F:PAI]EXO    = [F:PAC]EXO
+[F:PAI]CODREP = [F:PAC]CODREP
+For I=0 To NBCOT-1
+ [F:PAI]CODCOT(I)    = CODCOT(I)
+ [F:PAI]BASCOTINI(I) = arr((CUMPRC+PRCFDS)*BASCOT(I)/100,[F:TCU]CURRND)-arr(CUMPRC*BASCOT(I)/100,[F:TCU]CURRND)
+ [F:PAI]AMTCOTINI(I) = arr((CUMPRC+PRCFDS)*AMTCOT(I)/100,[F:TCU]CURRND)-arr(CUMPRC*AMTCOT(I)/100,[F:TCU]CURRND)
+Next
+[F:PAI]AMTGRO = arr((CUMPRC+PRCFDS)*MONTANT/100,[F:TCU]CURRND)-arr(CUMPRC*MONTANT/100,[F:TCU]CURRND)
+[F:PAI]AMTNET = [F:PAI]AMTGRO-sigma(0,NBCOT,[F:PAI]AMTCOTINI(indcum))
+[F:PAI]NBRCOT = NBCOT
+# 34597
+Read [FDS]FDS0=FONDS
+If !fstat & [F:FDS]VALFDS>0
+ [F:PAI]NBRTTL = [F:PAI]AMTNET/[F:FDS]VALFDS
+Endif
+If [F:PAC]DAT<>[0/0/0]
+ [F:PAI]DAT   = [F:PAC]DAT    : # Date d'attribution de la participation collective
+Else
+ [F:PAI]DAT   = [F:PAC]ENDDAT : # Date fin de période
+Endif
+If MONTANT<[F:HRREP]TSDAVA      : # Seuil d'indisponibilité
+ [F:PAI]DATAVAINI = [F:PAI]DAT
+Else
+ Read [FDS]FDS0=FONDS
+ If !fstat
+  [F:PAI]DATAVAINI = addmonth([F:PAI]DAT,[F:FDS]NBRMON)
+ Endif
+Endif
+[F:PAI]STA=1
+If EXISTE
+ If dim([F:PAI]UPDDAT)>0 : [F:PAI]UPDDAT = date$ : Endif
+ If dim([F:PAI]UPDUSR)>0 : [F:PAI]UPDUSR = GUSER : Endif
+ If dim([F:PAI]UPDTIM)>0 : [F:PAI]UPDTIM = time  : Endif
+ Rewrite [PAI]
+Else
+ If dim([F:PAI]CREDAT)>0 : [F:PAI]CREDAT = date$ : Endif
+ If dim([F:PAI]CREUSR)>0 : [F:PAI]CREUSR = GUSER : Endif
+ If dim([F:PAI]CRETIM)>0 : [F:PAI]CRETIM = time  : Endif
+ Write [PAI]
+Endif
+If fstat
+ GOK = 0 : Call FSTA("PAI") From GLOCK : Return
+Endif
+Return
+
+$AB_TR1
+Rollback
+Return
+
+
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+Return
+
+
+## MAJ des fiches de participation collective
+
+$MAJ_PARCOL
+[F:PAC]AMTREP = MONTTOT
+[F:PAC]STA    = 2 : # Calculé
+If dim([F:PAC]UPDDAT)>0 : [F:PAC]UPDDAT = date$ : Endif
+If dim([F:PAC]UPDUSR)>0 : [F:PAC]UPDUSR = GUSER : Endif
+If dim([F:PAC]UPDTIM)>0 : [F:PAC]UPDTIM = time  : Endif
+Rewrite [PAC]
+If fstat
+ GOK = 0 : Call FSTA("PAC") From GLOCK : Return
+Endif
+[M:PAC0]AMTREP = MONTTOT
+[M:PAC0]STA    = 2
+Affzo [M:PAC0]AMTREP,STA
+Return
+

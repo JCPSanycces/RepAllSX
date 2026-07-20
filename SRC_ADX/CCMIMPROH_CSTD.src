@@ -1,0 +1,468 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Class CCMIMPROH
+###############################################################################
+# Issue 110210/4/5 - 2015-12-15 by BAKHA : Add versioning for Routing
+# Issue 110210/7 - 2015-12-16 by JUSYN : New labels for supervisor update
+$EVENTS
+  Case [L]CURPTH
+    When ""
+      Case [L]AEVENT
+        When "AINIT"                            : Gosub INITIALISE
+        When "AUPDATE_AFTER"                    : Gosub NOTIFY_ACTIONER
+      Endcase
+  Endcase
+Return
+
+$METHODS
+  Case [L]AMETHOD
+    When "CREATE_ROUTING_LINES"             : Gosub CREATE_ROUTING_LINES
+    When "VALIDATE_IMPLEMENT"               : Gosub VALIDATE_IMPLEMENT
+    When "UPDATE_STATUS"                    : Gosub UPDATE_STATUS
+  Endcase
+Return
+
+$OPERATIONS
+  Case [L]AOPERATION
+    When "CREATE_ROUTING"                   : Gosub CREATE_ROUTING
+    When "CREATE_ROUTING_BATCH"             : Gosub CREATE_ROUTING_BATCH
+  Endcase
+Return
+
+$PROPERTIES
+  Case [L]CURPRO
+  Endcase
+Return
+
+###############################################################################
+# --------------------------------------------------
+# Initialise Sales order plan Header properties.
+$INITIALISE
+
+  Local Integer LINES
+
+  this.HOLD       = 1 # No
+  this.IMPLEMENT  = 1 # No
+  this.NUMROU     = 0
+  this.TOTALLINES = 0
+  this.ROHPLASTA  = 4
+
+  this.IMPACTANAL = 0
+
+Return
+
+# ------------------------------------------------------
+# Operation: CREATE_ROUTING_BATCH
+#
+# Called from Impact Analysis summary links.
+# Instantiate Batch Server process, Task: CCMIMPBATT.
+#
+$CREATE_ROUTING_BATCH
+
+  Local Integer LOCAL_STATUS
+  Local Instance IMPROH Using C_CCMIMPROH
+  IMPROH = NewInstance C_CCMIMPROH AllocGroup null
+
+  Local Char    AFOLDER(30)
+  Local Char    USER(30)
+  Local Char    TASKNAME(30)
+  Local Date    DAT
+  Local Char    TIM(5)
+  Local Char    TBPAR(30)(1..10)
+  Local Char    TBVAL(250)(1..10)
+  Local Integer NBPAR
+  Local Integer TASKID
+  Local Char    TASKMESSAGE(250)
+
+  Local Integer LTIME
+  Local Char    CTIME(4)
+
+  # Read impact header
+
+  LOCAL_STATUS = fmet IMPROH.AREAD(CRID)
+
+  ASTATUS = CST_AOK
+
+  If (IMPROH.IMPACTANAL <> 1)
+
+    LTIME = time : CTIME = format$("N00:2", int(LTIME/3600)) +format$("N00:2", int((LTIME -(int(LTIME/3600) *3600)) /60))
+
+    USER       = IMPROH.ACTX.USER
+    TASKNAME  = "CCMIMPBATT"
+    DAT       = date$
+    TIM       = CTIME
+    NBPAR = 1  : TBPAR(NBPAR) = "CRID"        : TBVAL(NBPAR) = CRID
+    NBPAR += 1 : TBPAR(NBPAR) = "TRANSACTION" : TBVAL(NBPAR) = "9"
+
+    # Impact Analysis 'Created' flag = "No" ...
+    IMPROH.IMPACTANAL = 1
+    LOCAL_STATUS = fmet IMPROH.AUPDATE()
+
+    ASTATUS = func ASYRMNGTREQ.CRERQT(IMPROH.ACTX,
+&                              IMPROH.ACTX.AFOLDER,
+&                              USER,
+&                              TASKNAME,
+&                              DAT,
+&                              TIM,
+&                              TBPAR,
+&                              TBVAL,
+&                              NBPAR,
+&                              TASKID,
+&                              TASKMESSAGE)
+
+  Endif
+
+  FreeGroup IMPROH
+  ARET_VALUE = ASTATUS
+
+Return
+
+$CREATE_ROUTING
+  Local Integer LOCSTATUS
+  Local File CCMIMPROD [CCMROD]
+  Local Instance SELCHGREQ Using C_CCMCHGREQ
+  Local Instance SELIMPROH Using C_CCMIMPROH
+
+  # Begin a Database Transaction ...
+  Local Integer TRANSACTION_PENDING
+  TRANSACTION_PENDING = adxlog
+  If (adxlog = 0)
+    Trbegin [CCMROD]
+  Endif
+
+ # Read CHANGE REQUEST
+  SELCHGREQ = NewInstance C_CCMCHGREQ AllocGroup null
+  LOCSTATUS = fmet SELCHGREQ.AREAD(CRID)
+
+  # Read sales order header
+  SELIMPROH = NewInstance C_CCMIMPROH AllocGroup null
+  LOCSTATUS = fmet SELIMPROH.AREAD(CRID)
+
+  # If request in review, and refresh can be done
+  If (LOCSTATUS = [V]CST_AOK and SELCHGREQ.CRSTATUS = 2 and SELIMPROH.HOLD <> 2)
+
+    # Clear lines ...
+    Delete [CCMROD] Where CRID = SELIMPROH.CRID
+
+    SELIMPROH.HOLD = 1      # No
+    SELIMPROH.IMPLEMENT = 1 # No
+    SELIMPROH.NUMROU = 0
+    SELIMPROH.TOTALLINES  = 0
+
+    LOCSTATUS = fmet SELIMPROH.CREATE_ROUTING_LINES (SELIMPROH.CRID, SELCHGREQ.PRODUCT)
+
+  Endif
+
+    #If lines exist then set the status to pending else No lines
+    If SELIMPROH.NUMROU >= 1
+      SELIMPROH.ROHPLASTA = 1
+    Else
+      SELIMPROH.ROHPLASTA = 4
+      # If Plan Status is 4 (None) then Implement flag is always ticked ...
+      SELIMPROH.IMPLEMENT = 2
+    Endif
+
+  SELIMPROH.IMPACTANAL = 2
+
+  LOCSTATUS= fmet SELIMPROH.AUPDATE()
+
+  # Commit or Rollback the Database Transaction ...
+  If (TRANSACTION_PENDING = 0)
+    If (ASTATUS <= [V]CST_AINFO)
+      Commit
+    Else
+      Rollback
+    Endif
+  Endif
+
+  FreeGroup SELIMPROH
+  FreeGroup SELCHGREQ
+
+  LogicClose File [CCMROD]
+
+Return
+
+#  create new routing lines
+
+$CREATE_ROUTING_LINES
+
+  Local Integer LOCSTATUS
+  #MGG X3-38337_Product_Code_length_GLONITM_function
+  Local Char LAST_ITMREF(GLONITM) : LAST_ITMREF = ""
+  #END MGG X3-38337_Product_Code_length_GLONITM_function
+
+  Local Date    WDATREF             : WDATREF=AVOID.ADATE
+  Local Integer WLSTTYP             : WLSTTYP=3     # 1=first level, 2=last level, 3= multi-level
+  Local Integer WALTTYPSTR          : WALTTYPSTR=1  # 1=Sales (kit), 2=WO (Manufacturing), 3=EO (subcontracting BOM)
+  Local Integer WALTTYPEND          : WALTTYPEND=3  # 1=Sales (kit), 2=WO (Manufacturing), 3=EO (subcontracting BOM)
+  Local Integer WALTSTR             : WALTSTR=0     # From alt number : 0=all alternatives
+  Local Integer WALTEND             : WALTEND=0     # From alt number : 0=all alternatives
+  Local Char    MYCRIT(250)         : MYCRIT="1=1"  # No particular Where criteria
+  Local Char    MYFOR (GLONFOR)     : MYFOR=""      # Reference of a Formula in table TABFOR [F:TFO] with FORTYP=31
+  Local Integer WRET,OK
+
+  Local File ITMMASTER [ITM]
+  Local File ITMCATEG [ITG]
+  Local File RVMVAL [RVV] # Issue 110210/4/5
+  Local Integer LINE_NUMBER     : LINE_NUMBER = 0
+  #CATUA X3-38562.sn Set Product Code length to GLONITM
+  Local Char SUB_LINES_PRODUCT(GLONITM)
+  #CATUA X3-38562.en
+  # Issue 110210/4/5
+  Local Char MAJOR_VERSION(11)
+  Local Char MINOR_VERSION(11)
+  Local Integer VERSION_MANAGED : VERSION_MANAGED = CST_AFALSE
+
+  # Check Routing version managed
+  Read [ITM]ITM0 = PRODUCT
+  If fstat = 0
+      If [F:ITM]ECCROUFLG = 2
+        VERSION_MANAGED = CST_ATRUE
+      Endif
+  Endif
+  # End issue 110210/4/5
+
+  # Create lines for Routing Product ...
+
+  SUB_LINES_PRODUCT = PRODUCT
+  Gosub CREATE_ROUTING_SUB_LINES
+
+  # Read Product and Product Category and check for Semi-finished good
+  Read [ITM]ITM0 = PRODUCT
+  If fstat = 0
+    Read [ITG]ITG1 = [F:ITM]TCLCOD; ""
+    If fstat = 0 and [F:ITG]MFGFLG = 2
+
+      # For CCM: first calculate
+      Local File BOMWUS [BOW]
+
+      Call CALCULATE_WHERE_USED(this.ACTX,PRODUCT,WDATREF,WLSTTYP,WALTTYPSTR,WALTTYPEND,WALTSTR,WALTEND,MYCRIT,MYFOR,WRET) From SUBBOW_SYRA
+
+      # For CCM: retrieve temporary result lines in BOMWUS tables
+      For [BOW] Where CREUSR = this.ACTX.USER & BOWUID = adxuid(1)
+        If ([F:BOW]ITMREF <> LAST_ITMREF)
+          # create stock lines for each product found
+           SUB_LINES_PRODUCT = [F:BOW]ITMREF
+          Gosub CREATE_ROUTING_SUB_LINES
+        Endif
+        LAST_ITMREF = [F:BOW]ITMREF
+      Next
+
+      # For CCM: delete temporary result lines in BOMWUS tables
+      Delete [BOW] Where CREUSR = this.ACTX.USER & BOWUID = adxuid(1)
+
+      Close Local File [BOW]
+
+    Endif
+  Endif
+  # Update summary totals ...
+  this.TOTALLINES = LINE_NUMBER
+  this.NUMROU = LINE_NUMBER
+
+  Close Local File [ITM]
+  Close Local File [ITG]
+  Close Local File [RVV] # Issue 110210/4/5
+
+Return
+
+# For a product, find all sites for this product with a Routing, and write to
+# Impact routing lines table
+#
+
+$CREATE_ROUTING_SUB_LINES
+
+  Local Integer LOCSTATUS
+  Local Char CRITERIA(250)
+  Local Date WDATE : WDATE = date$
+  Local File ROUTING [ROH]
+  Local Instance CCMIMPROD Using C_CCMIMPROD
+  CCMIMPROD = NewInstance C_CCMIMPROD AllocGroup null
+
+  # create new sales order lines
+  For [ROH]ROH0 Where ITMREF = SUB_LINES_PRODUCT
+    # Issue 110210/4/5
+    If (VERSION_MANAGED = CST_ATRUE)
+      # write versions not expired or with valid derogation date
+      For [RVV]RVV1 Where ITMREF = SUB_LINES_PRODUCT and
+&         ([F:RVV]ENDDAT = [00/00/00] or [F:RVV]ENDDAT >= WDATE or ([F:RVV]EXNFLG = 2 and [F:RVV]EXNDAT >= WDATE))
+          MAJOR_VERSION = [F:RVV]ECCVALMAJ
+          MINOR_VERSION = [F:RVV]ECCVALMIN
+          Gosub CREATE_IMPACT_ANALYSIS_LINE
+      Next
+    Else
+      MAJOR_VERSION = ""
+      MINOR_VERSION = ""
+      Gosub CREATE_IMPACT_ANALYSIS_LINE
+    Endif
+    # End issue 110210/4/5
+  Next
+  FreeGroup CCMIMPROD
+  LogicClose File [ROH]
+
+Return
+
+# Issue 110210/4/5
+# --------------------------------------------------
+# FUNCTION NAME:        CREATE_IMPACT_ANALYSIS_LINE
+# FUNCTION DESCRIPTION: INSERTs a line into the Impact Analysis Routing lines table.
+# FUNCTION TYPE:        Subroutine
+# PARAMETERS:           N/A
+# RETURN_VALUE:         N/A
+#
+#
+$CREATE_IMPACT_ANALYSIS_LINE
+    Local Integer LOCSTATUS
+
+    LOCSTATUS = fmet CCMIMPROD.AINIT()
+    LINE_NUMBER += 1
+
+    CCMIMPROD.CRID = CRID
+    CCMIMPROD.LINENO = LINE_NUMBER
+    CCMIMPROD.SORTSEQ = LINE_NUMBER
+    CCMIMPROD.FCY = [F:ROH]FCY
+    CCMIMPROD.ITMREF = SUB_LINES_PRODUCT
+    CCMIMPROD.ECCVALMAJ    = MAJOR_VERSION
+    CCMIMPROD.ECCVALMIN    = MINOR_VERSION
+    CCMIMPROD.ROUALT = [F:ROH]ROUALT
+    CCMIMPROD.ROUSTRDAT = [F:ROH]ROUSTRDAT
+    CCMIMPROD.ROUENDDAT = [F:ROH]ROUENDDAT
+    CCMIMPROD.ROUDESAXX = ""#[F:ROH]ROUDESAXX
+    CCMIMPROD.IDENT1 = [F:ROH]IDENT1
+    CCMIMPROD.BLOCK = 1       # 1 = No
+    CCMIMPROD.TRANTYPE = 9    # 9 = Routing
+    CCMIMPROD.LINESTATUS = 1   # 1 = Pending
+    CCMIMPROD.STARTDATE= AVOID.ADATE
+    CCMIMPROD.ENDDATE= AVOID.ADATE
+    CCMIMPROD.COMPLETEDATE= AVOID.ADATE
+    CCMIMPROD.ACTIONID = ""
+    CCMIMPROD.ACTIONER = ""
+    CCMIMPROD.COMMENT = ""
+    LOCSTATUS = fmet CCMIMPROD.AINSERT()
+    If (LOCSTATUS = CST_AOK)
+      this.NUMROU += 1
+    Endif
+
+Return
+# End issue 110210/4/5
+
+# -------------------------------------------------------------------------------
+# Update Sales Oreder Detail Plan 'header' status.
+#
+# Set status to:
+#
+# 4 'Not applicable'  ... if (No sales order lines) or (No actionable sales order lines and Planning complete),
+# 3 'Complete'        ... if (All actionable sales order lines are complete),
+# 2 'Implement'       ... if (Actionable sales order lines and Planning complete),
+# 1 'Plan'            ... if (Planning is not complete).
+
+$UPDATE_STATUS
+
+  Local Integer ACTIONLINES, LINESCOMP
+
+  # Count number of action lines ...
+  Local File CCMIMPROD [CCMROD]
+  Filter [CCMROD] Where CRID = this.CRID and ACTIONID <> ""
+  ACTIONLINES = rowcount([CCMROD])
+
+  # Count number of action lines completed ...
+  Filter [CCMROD] Where CRID = this.CRID and LINESTATUS = 3
+  LINESCOMP = rowcount([CCMROD])
+
+  Filter [CCMROD]
+  LogicClose File [CCMROD]
+
+   If (this.NUMROU = 0) or
+&    (ACTIONLINES = 0 and this.IMPLEMENT = 2)
+    this.ROHPLASTA = 4
+  Elsif (ACTIONLINES <> 0 and ACTIONLINES = LINESCOMP)
+    this.ROHPLASTA = 3
+  Elsif (this.IMPLEMENT = 2)
+    this.ROHPLASTA = 2
+  Else
+    this.ROHPLASTA = 1
+  Endif
+
+  ARET_VALUE = CST_ATRUE
+
+Return
+
+# -------------------------------------------------------------------------------
+# "Planning complete" flag validation ...
+$VALIDATE_IMPLEMENT
+  Local Integer ACTIONLINES, LOCSTATUS
+
+  # count number of action lines
+  Local File CCMIMPROD [CCMROD]
+  Filter [CCMROD] Where CRID = this.CRID and ACTIONID <> ""
+  ACTIONLINES = rowcount([CCMROD])
+  LogicClose File [CCMROD]
+
+  ASTATUS = CST_AOK
+
+  If (this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+    If (this.TOTALLINES > ACTIONLINES)
+      LOCSTATUS = fmet this.ASETERROR ("IMPLEMENT", mess(62,2038,1), CST_AINFO)
+    Endif
+  Endif
+
+ ARET_VALUE = ASTATUS
+
+Return
+
+#
+# --------------------------------------------------
+# FUNCTION NAME:        NOTIFY_ACTIONER
+# FUNCTION DESCRIPTION: Notify Actioner
+# FUNCTION TYPE:        Subroutine
+# PARAMETERS:           N/A
+# RETURN_VALUE:         N/A
+#
+#
+$NOTIFY_ACTIONER
+
+  Local Instance CHANGE_REQUEST Using C_CCMCHGREQ
+  CHANGE_REQUEST = NewInstance C_CCMCHGREQ AllocGroup null
+  Local File CCMIMPROD [ROD]
+  Local Char LAST_ACTIONER(5)
+  Local Integer STAT
+  Local Integer EMAIL_TYPE : EMAIL_TYPE = 2066  # Actioner
+  Local Char SUBJECT(250)
+  Local Clbfile BODY(0), OTHER_BODY(0)
+  Local Integer AC_EMAIL : AC_EMAIL = CST_AFALSE
+
+  If (fmet this.ACTX.APARAM.AGETVALNUM(CST_ALEVFOLD, this.ACTX.AFOLDER, "CCMEMAILAC") <> 1 and
+&     this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+
+    STAT = fmet CHANGE_REQUEST.AREAD(this.CRID)
+
+    BODY(0) = AVOID.ACLOB
+    OTHER_BODY(0) = AVOID.ACLOB
+    Append OTHER_BODY, mess(9,2039,1) +chr$(10)
+    STAT = fmet CHANGE_REQUEST.BUILD_EMAIL(EMAIL_TYPE, SUBJECT, BODY, OTHER_BODY, "CCMPLAROH")
+
+    Filter [ROD] Where CRID = this.CRID and ACTIONER <> "" Order By ACTIONER
+    For [ROD]
+      If ([F:ROD]ACTIONER <> LAST_ACTIONER and
+&         [F:ROD]ACTIONER <> this.ACTX.USER)
+
+        STAT = fmet CHANGE_REQUEST.SEND_EMAIL(this.ACTX.USER, [F:ROD]ACTIONER, "", SUBJECT, BODY)
+
+        If (STAT = CST_AOK)
+          AC_EMAIL = CST_ATRUE
+        Endif
+
+        LAST_ACTIONER = [F:ROD]ACTIONER
+
+      Endif
+    Next
+
+    If (AC_EMAIL = CST_ATRUE)
+      ASTATUS = fmet this.ASETERROR("", mess(60,2038,1), CST_AINFO)
+    Endif
+
+  Endif
+
+  LogicClose File [ROD]
+  FreeGroup CHANGE_REQUEST
+
+Return
+

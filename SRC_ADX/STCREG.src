@@ -1,0 +1,921 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+#######################################################################
+# Issue 89349 - 2013-12-23 by SR                                      #
+# Issue 110325 - 2016-01-12 by SR :FCC sur expé                       #
+# Trt STCREG : Rapprochement des charges                              #
+# Principe de fonctionnement :                                        #
+# boucle sur COSTSTCR selon cle STCR1                                 #
+#  Si changement de NUMORI : commit                                   #
+#  Si commande soldée et au moins en partie réceptionnée :            #
+#       Boucle sur les réceptions de la commande                      #
+#       Pour chaque réception---> Traitement                          #
+#  Si expédition soldée et au moins en partie réceptionnée :          #
+#       Boucle sur les réceptions de l'expédition                     #
+#       Pour chaque réception---> Traitement                          #
+#   Si Réception----------------> Traitement                          #
+#  Si KO  : Rollback et retour sur boucle                             #
+#  Si OK on flag l'enregistrement COSTSTCR                            #
+# Fin Boucle : si OK, on supprime les enreg COSTSTCR flaggés          #
+#                                                                     #
+# Traitement pour chaque réception :                                  #
+# Mise à jour du flag rapproché de la FCC/Avoir                       #
+# Mise à jour de la charge de la réception                            #
+# Mise à jour des montants charge de la réception                     #
+# Si réception facturée :                                             #
+#   Mise à jour des montants des factures                             #
+#   Si fact validées  Mise à jour du coût achat réalisé de la cde     #
+# Si article géré en stock et charge gérée en stock : Régul stock     #
+#######################################################################
+Local Char PARAM(255)(1..3) , VALEUR(10)
+Call TRAITE_CHAR(VALEUR,PARAM,"","STCREG","",3,"") From GTRAITE
+End
+#######################################################################
+
+$ACTION
+Case ACTION
+When "OUVRE_BATCH"  : Gosub INIT
+ When "INIT"        : Gosub INIT
+ When "EXEC"        : Gosub EXEC
+ When "TERMINE"     : Gosub TERMINE
+ When Default
+Endcase
+Return
+
+#######################################################################
+$INIT
+Local Decimal WMNT            # Montant FCC/avoir en devise société
+Local Decimal WMNTPEC         # Montant à prendre en compte en devise de la charge
+Local Decimal WMNTPECSOC      # Montant à prendre en compte en devise société
+Local Decimal WVARCSTPUR      # Variation Coût achat pour maj CA réalisé
+Local Decimal WOLD_FCSAMTSOC  # Sauvegarde mnt charge de la réception rapprochée
+Local Char    WPOHNUM(GLONVCR)# Commande à mettre à jour
+Local Integer WPOPLIN,WPOQSEQ # Commande à mettre à jour
+Local Integer WNBTRTTM        # Nombre d'enregistrements Rapprochement à traiter
+Local Integer WNBTRT          # Nombre d'enregistrements Rapprochement traités
+Local Integer WTRT            # Traitement lancé
+#
+Local Char     WFCY    (GLONFCY)
+Local Char     WITMREF (GLONITM)
+Local Date     WIPTDAT
+Local Integer  WVCRTYP, WTYPORI
+Local Char     WVCRNUM (GLONVCR), WNUMORI(GLONVCR)
+Local Integer  WVCRLIN
+Local Decimal  WQTY, WPRI
+Local Integer  WRET, STAT, WTYP
+Local Integer  I
+Local Decimal  WINVDTACST
+Local Char     WTRSCOD(GLONADI)
+Local Datetime WDATTIM
+Local Char     WMESS(250)
+Local Decimal  WINVQTY, WQTYPUU
+# Sauvegarde totaux charges stock et achat de la réception
+Local Decimal  WFCSCPR, WFCSCSTPUR,WWOLD_FCSAMT
+
+# Issue X3-81852 - 2018-04-13 by MUARN : devises taux diviseur
+Local Shortint WI
+Local Decimal  WRATCUR
+#---
+#
+If !clalev([F:STCR]) : Local File COSTSTCR  [STCR] : Endif # Rapprochement
+If !clalev([F:STCD]) : Local File COSTSTCD  [STCD] : Endif # Charges document
+If !clalev([F:FCS])  : Local File FRECST    [FCS]  : Endif # Charge
+If !clalev([F:POQ])  : Local File PORDERQ   [POQ]  : Endif # Détail commande
+If !clalev([F:PTH])  : Local File PRECEIPT  [PTH]  : Endif # Entête réception
+If !clalev([F:PTD])  : Local File PRECEIPTD [PTD]  : Endif # Détail réception
+If !clalev([F:PTD2]) : Local File PRECEIPTD [PTD2] : Endif # Détail réception depuis les cdes
+If !clalev([F:PIH])  : Local File PINVOICE  [PIH]  : Endif # Entête FCC/Avoir sur FCC
+If !clalev([F:PID])  : Local File PINVOICED [PID]  : Endif # Détail FCC/Avoir sur FCC
+If !clalev([F:PIV])  : Local File PINVOICEV [PIV]  : Endif # Facure valo
+If !clalev([F:PFI])  : Local File PFOOTINV  [PFI]  : Endif # Eléments de facturation
+If !clalev([F:PIH2]) : Local File PINVOICE  [PIH2] : Endif # Entête Facture sur réception
+If !clalev([F:PID2]) : Local File PINVOICED [PID2] : Endif # Détail facture sur réception
+If !clalev([F:ITM])  : Local File ITMMASTER [ITM]  : Endif # Article
+If !clalev([F:ITF])  : Local File ITMFACILIT[ITF]  : Endif # Article-Site
+# Issue 110325 - 2016-01-12 by SR : FCC sur expé
+If !clalev([F:SHD])  : Local File SHIPMENTD [SHD]  : Endif # Détail expédition
+# Issue X3-25003 - 2017-06-01 by SR : Valorisation des réceptions
+If !clalev([F:POH])  : Local File PORDER     [POH] : Endif # Entête commande
+If !clalev([F:PSV])  : Local File PTDSTKVAL  [PSV] : Endif
+If !clalev([F:PSV2]) : Local File PTDSTKVAL [PSV2] : Endif
+#
+# chargement des globales GLOCALDEV,GCUR...
+GFCYDEF(0)=GFCYDEF(6)
+GFCY = GFCYDEF(6)
+Call GLOBVAR(GFCY)    From WWGLOBACH
+# Issue X3-41304 - 2017-07-11 by SR : Récupérer GLOCALDEV
+Call GETDEV(GFCY) From DEVSUB
+GCUR=GLOCALDEV
+Return
+
+#######################################################################
+$EXEC
+If !GSERVEUR
+    Call OUVRE_TRACE(mess(804,197,1)) From LECFIC: # Rapprochement
+Endif
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+
+WDATTIM = datetime$
+
+Raz [F:PIH]
+Raz WNBTRT, WNBTRTTM
+Raz WTYPORI, WNUMORI
+
+# Boucle sur le fichier des rapprochements
+$STCR
+For [F:STCR]STCR1 Where CREDATTIM<WDATTIM & TYPORI >= WTYPORI & NUMORI > WNUMORI
+   If (WTYPORI = 0 & WNUMORI = "") | (WTYPORI <> [F:STCR]TYPORI | WNUMORI <> [F:STCR]NUMORI)
+      Gosub TRANSACTION
+   Endif
+   Raz WTRT
+   If GSTOTRACE >2
+     WMESS = "--------------------------------------------------------------------------------------"
+     Call ECR_TRACE(WMESS,0) From GESECRAN
+   Endif
+   # Facture/Avoir : $1$ Pièce d'origine : $2$ : Montant : $3$ : Charge: $4$
+   WMESS = func AFNC.MES3(mess(809,197,1),[F:STCR]NUM+"/"+num$([F:STCR]PIDLIN),num$([F:STCR]TYPORI)+"/"+[F:STCR]NUMORI+"/"+num$([F:STCR]LINORI),num$([F:STCR]AMTNOTLIN)-[F:STCR]CUR-":"-[F:STCR]FCSCOD)
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+   # Issue X3-25003 - 2017-07-25 by SR : Code déplacé car sinon fait plusieurs fois dans le cas de
+   # FCC sur commande/Expédition
+   #-------- Lecture de la FCC/Avoir -------------------------------------------#
+   Read [F:PID]PID0 = [F:STCR]NUM;[F:STCR]PIDLIN
+   If fstat : Raz [F:PID] : Endif
+   #-------- Lecture des autres fichiers ---------------------------------------#
+   # Lecture sans lock de l'entête de FCC/avoir
+   If [F:PIH]NUM <> [F:PID]NUM
+     Read [F:PIH]PIH0 = [F:PID]NUM
+     If fstat : Raz [F:PIH] : Endif
+     #Récupération des globales
+     If [F:PIH]FCY <> GFCY
+       GFCY=[F:PIH]FCY : Call GLOBVAR(GFCY)    From WWGLOBACH
+       # Issue X3-41304 - 2017-07-11 by SR : Récupérer GLOCALDEV
+       Call GETDEV(GFCY) From DEVSUB
+       GCUR=GLOCALDEV
+     Endif
+   Endif
+   If [F:PIV]NUM <> [F:PID]NUM
+      Read [PIV]PIV0 = [F:PID]NUM
+      If fstat : Raz [PIV] : Endif
+   Endif
+   If GSTOTRACE > 2
+      WMESS = "[F:STCR]CUR ="-[F:STCR]CUR
+      Call ECR_TRACE(WMESS,0) From GESECRAN
+      WMESS = "GLOCALDEV ="-GLOCALDEV
+      Call ECR_TRACE(WMESS,0) From GESECRAN
+      WMESS = num$(1) - [F:STCR]CUR -"="- num$([F:PIH]RATMLT) - GLOCALDEV
+      Call ECR_TRACE(WMESS,0) From GESECRAN
+   Endif
+   # End issue X3-25003
+   #Raz WVARCSTPUR
+   # Issue 110325 - 2016-01-12 by SR : FCC sur expé TYPORI = 6
+   Case [F:STCR]TYPORI
+     When 1 :Read [F:POQ]POQ0 = [F:STCR]NUMORI;[F:STCR]LINORI;[F:STCR]SEQORI
+              WNBTRTTM+=1
+              # Si la commande est soldée et qté réceptionnée <> 0
+              If !fstat & [F:POQ]RCPQTYSTU <> 0 & [F:POQ]LINCLEFLG = 2
+                 WTRT=1
+                 Gosub POQTRT
+                 If GOK<> 1 : Break : Endif
+                 # Enregistrement traité
+                 WMES = "----------"
+                 WMES+= mess(811,197,1)
+                 Call ECR_TRACE(WMES,0) From GESECRAN
+              Else
+                 # Enregistrement non traité : Commande non soldée/Réceptionnée
+                 WMES = "----------"
+                 WMES+= mess(810,197,1)
+                 Call ECR_TRACE(WMES,0) From GESECRAN
+              Endif
+      When 2 :WNBTRTTM +=1
+              WTRT = 1
+              Gosub PTDTRT
+              If GOK<> 1 : Break : Endif
+             # Enregistrement traité
+              WMES = "----------"
+              WMES+= mess(811,197,1)
+              Call ECR_TRACE(WMES,0) From GESECRAN
+      When 6 :Read [F:SHD]SHD0 = [F:STCR]NUMORI;[F:STCR]LINORI
+              WNBTRTTM+=1
+              # Si l'expédition est soldée et qté réceptionnée <> 0
+              If !fstat & [F:SHD]RCPQTYSTU <> 0 & [F:SHD]CLEFLG = 2
+                 WTRT=1
+                 Gosub SHDTRT
+                 If GOK<> 1 : Break : Endif
+                 # Enregistrement traité
+                 WMES = "----------"
+                 WMES+= mess(811,197,1)
+                 Call ECR_TRACE(WMES,0) From GESECRAN
+              Else
+                 # Enregistrement non traité : Expédition non soldée/Réceptionnée
+                 WMES = "----------"
+                 WMES+= mess(867,197,1)
+                 Call ECR_TRACE(WMES,0) From GESECRAN
+              Endif
+    Endcase
+    If GOK=1 & WTRT = 1
+       # Si tout est OK, on flag l'enregistrement Rapprochement pour pouvoir le supprimer en fin de traitement
+       Readlock [F:STCR]STCR0 Curr
+       If fstat=1
+          GOK=-1 : GLOCK="$COSTSTCR"-[F:STCR]NUM-num$([F:STCR]PIDLIN)
+          Break
+       Elsif fstat
+          GOK=0 : Call RSTA("STCR",[F:STCR]NUM-num$([F:STCR]PIDLIN)) From GLOCK
+          Break
+       Else
+          [F:STCR]STCRFLG = 2
+          Rewrite [F:STCR]
+          If fstat
+             GOK=0 : Call FSTA("STCR") From GLOCK
+             Break
+          Else
+             WNBTRT+=1
+          Endif
+       Endif
+       #-----------------Lecture et mise à jour de la FCC/Avoir------------------------------#
+       Readlock [F:PID]PID0 = [F:STCR]NUM;[F:STCR]PIDLIN
+       If fstat=1
+          GOK=-1 : GLOCK="$PINVOICED"-[F:STCR]NUM-num$([F:STCR]PIDLIN)
+          Break
+       Elsif fstat
+          GOK=0 : Call RSTA("PID",[F:STCR]NUM-num$([F:STCR]PIDLIN)) From GLOCK
+          Break
+       Endif
+       [F:PID]STCRFLG = 2
+       Rewrite [F:PID]
+       If fstat GOK=0 : Call FSTA("PID") From GLOCK :Break : Endif
+     Endif
+ Next
+# si on a un problème en cours de traitement d'une commande ou réception, il faut rollbacker
+# et repartir en lecture de [F:STCR] avec TYPORI >= WTYPORI et NUMORI > WNUMORI
+# Issue 116144 - 2016-04-26 by SR : Positionner TYPORI/NUMORI et boucle: Rollback se fera à ce moment-là
+#If GOK <> 1 : Gosub END_TRS : Goto $STCR : Endif
+If GOK <> 1
+  WTYPORI = [F:STCR]TYPORI
+  WNUMORI = [F:STCR]NUMORI
+  Goto STCR
+Endif
+# End issue 116144
+# Pour la dernière transaction en cours
+If adxlog = 1
+   Gosub END_TRS
+Endif
+GOK = 1
+Trbegin [STCR]
+# suppression des enregistrements traités
+Delete [F:STCR] Where STCRFLG = 2
+If !fstat
+  Commit
+Else
+  Rollback
+  Call ECR_TRACE("COSTSTCR:"-mess(808,197,1),1) From GESECRAN :# Erreur en suppression d'enregistrements
+Endif
+Return
+
+#######################################################################
+$TRANSACTION
+If WTYPORI = 0 & WNUMORI = ""
+   Gosub START_TRS
+Else
+   Gosub END_TRS
+   Gosub START_TRS
+Endif
+Return
+
+#######################################################################
+$START_TRS
+WTYPORI = [F:STCR]TYPORI
+WNUMORI = [F:STCR]NUMORI
+GOK = 1
+Trbegin [STCR]
+Return
+
+#######################################################################
+$END_TRS
+If GOK = 1
+   Commit
+Else
+   Rollback
+Endif
+Return
+
+#######################################################################
+$TERMINE
+Call ECR_TRACE(mess(806,197,1)-num$(WNBTRTTM),0) From GESECRAN :# Nbre d'enregistrements à traiter
+If !WNBTRT
+   Call ECR_TRACE(mess(805,197,1),0) From GESECRAN :# aucune ligne traitée!
+Else
+    Call ECR_TRACE(mess(451,197,1)-num$(WNBTRT),0) From GESECRAN :# Nbre d'enregistrements traités
+Endif
+If !GSERVEUR
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+Endif
+
+Return
+
+#######################################################################
+# Traitement d'un enregistrement portant sur une commande
+# boucle sur les réceptions de cette commande
+$POQTRT
+# Issue X3-25003 - 2017-06-01 by SR : Valorisation des réceptions
+If [F:POH]POHNUM <> [F:POQ]POHNUM
+  Read [F:POH]POH0 = [F:POQ]POHNUM
+  If fstat : Raz [F:POH] : Endif
+Endif
+If GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+  Gosub LOAD_PSV2
+  If GOK<1 : Return : Endif
+Endif
+# End issue X3-25003
+For [F:PTD2]PTD2 Where POHNUM = [F:POQ]POHNUM & POPLIN = [F:POQ]POPLIN & POQSEQ = [F:POQ]POQSEQ
+      Readlock [F:PTD]PTD0 =[F:PTD2]PTHNUM;[F:PTD2]PTDLIN
+      If fstat=1
+          GOK=-1 : GLOCK="$PRECEIPTD"-[F:PTD2]PTHNUM-num$([F:PTD2]PTDLIN)
+          Break
+      Elsif fstat
+          GOK=0 : Call RSTA("PTD",[F:PTD2]PTHNUM-num$([F:PTD2]PTDLIN)) From GLOCK
+          Break
+      Endif
+      Gosub STCREG
+      If GOK <> 1 : Break : Endif
+Next
+Return
+
+#######################################################################
+# Traitement d'un enregistrement portant sur une reception
+$PTDTRT
+Readlock [F:PTD]PTD0 =[F:STCR]NUMORI;[F:STCR]LINORI
+If fstat=1
+    GOK=-1 : GLOCK="$PRECEIPTD"-[F:STCR]NUMORI-num$([F:STCR]LINORI)
+    Return
+Elsif fstat
+    GOK=0 : Call RSTA("PTD",[F:STCR]NUMORI-num$([F:STCR]LINORI)) From GLOCK
+    Return
+Endif
+# Issue X3-25003 - 2017-06-01 by SR : Valorisation des réceptions
+If [F:PTH]PTHNUM <> [F:PTD]PTHNUM
+  Read [F:PTH]PTH0 = [F:PTD]PTHNUM
+Endif
+If fstat : Raz [F:PTH] : Endif
+If [F:PTD]POHNUM <> "" & [F:POH]POHNUM <> [F:PTD]POHNUM
+  Read [F:POH]POH0 = [F:PTD]POHNUM
+  If fstat : Raz [F:POH] : Endif
+Endif
+If GPRIFLG = 2 & (([F:PTD]POHNUM <> "" &  GPSVSTRDAT <= [F:POH]CREDAT)|([F:PTD]POHNUM =  "" &  GPSVSTRDAT <= [F:PTH]CREDAT))
+  Gosub LOAD_PSV2
+  If GOK<1 : Return : Endif
+Endif
+# End issue X3-25003
+Gosub STCREG
+Return
+
+# Issue 110325 - 2016-01-12 by SR : FCC sur expé
+#######################################################################
+# Traitement d'un enregistrement portant sur une commande
+# boucle sur les réceptions de cette commande
+$SHDTRT
+# Issue X3-25003 - 2017-06-01 by SR : Valorisation des réceptions
+If [F:POH]POHNUM <> [F:SHD]POHNUM
+  Read [F:POH]POH0 = [F:SHD]POHNUM
+  If fstat : Raz [F:POH] : Endif
+Endif
+If GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+  Gosub LOAD_PSV2
+  If GOK<1 : Return : Endif
+Endif
+# End issue X3-25003
+For [F:PTD2]PTD2 Where SHIPNUM = [F:SHD]SHIPNUM & SHIPLIN = [F:SHD]SHIPLIN
+      Readlock [F:PTD]PTD0 =[F:PTD2]PTHNUM;[F:PTD2]PTDLIN
+      If fstat=1
+          GOK=-1 : GLOCK="$PRECEIPTD"-[F:PTD2]PTHNUM-num$([F:PTD2]PTDLIN)
+          Break
+      Elsif fstat
+          GOK=0 : Call RSTA("PTD",[F:PTD2]PTHNUM-num$([F:PTD2]PTDLIN)) From GLOCK
+          Break
+      Endif
+      Gosub STCREG
+      If GOK <> 1 : Break : Endif
+Next
+Return
+
+# Issue X3-25003 - 2017-07-25 by SR : Valorisation des réceptions
+################################################################
+$LOAD_PSV2
+# Lecture avec lock de la table des régul CPR PTDSTKVAL
+ Raz [F:PSV2]
+ Readlock [F:PSV]PSV0 = [F:PID]NUM;[F:PID]PIDLIN;"";0
+ If fstat
+    Call RSTA("PSV",[F:PID]NUM) From GLOCK
+    GOK = 0
+    Return
+ Endif
+ # Sauvegarde de l'enregistrement d'origine pour duplication rcp par rcp , puis suppression
+ [F:PSV2] = [F:PSV]
+ Delete [F:PSV]PSV0 Curr
+ If fstat GOK=0 : Call FSTA("PSV") From GLOCK : Return  : Endif
+ # End issue X3-25003
+Return
+
+#######################################################################
+# recalcul des charges,CPR,CSTPUR,etc ... sur la facture liée à la réception
+$MAJPID2
+If [F:PIH2]STA=3
+   WVARCSTPUR -= [F:PID2]LINCSTPUR
+Endif
+WFCSCSTPUR = [F:PID2]FCSCSTPUR
+WFCSCPR    = [F:PID2]FCSCPR
+
+# Décrémentation LINCSTPUR (-FCSCSTPUR) et LINAMTCPR (-FCSCPR)
+[F:PID2]LINCSTPUR   -= [F:PID2]FCSCSTPUR
+# si charge valorisée en stock
+If [F:FCS]STKVLT = 2
+   [F:PID2]LINAMTCPR -= [F:PID2]FCSCPR
+Endif
+# Recalcul FCSCSTPUR et FCSCPR
+If [F:PID2]QTYPUU   >= [F:PTD]QTYPUU
+   [F:PID2]FCSCSTPUR = [F:PTD]FCSCSTPUR
+   # si charge valorisée en stock
+   If [F:FCS]STKVLT = 2
+      [F:PID2]FCSCPR    = [F:PTD]FCSCPR
+   Endif
+Else
+   [F:PID2]FCSCSTPUR = [F:PTD]FCSCSTPUR*[F:PID2]QTYPUU/[F:PTD]QTYPUU
+   # si charge valorisée en stock
+   If [F:FCS]STKVLT = 2
+      [F:PID2]FCSCPR    = [F:PTD]FCSCPR*[F:PID2]QTYPUU/[F:PTD]QTYPUU
+   Endif
+Endif
+# Recalcul cout achat
+[F:PID2]LINCSTPUR += [F:PID2]FCSCSTPUR
+[F:PID2]CSTPUR     = [F:PID2]LINCSTPUR / [F:PID2]QTYSTU
+[F:PID2]CSTPUR     = arr([F:PID2]CSTPUR,10^-GDECPRI)
+[F:PID2]LINCSTPUR  = arr([F:PID2]LINCSTPUR,10^-GDECPRI)
+# Recalcul cout stock si charge valorisée en stock
+If [F:FCS]STKVLT    = 2
+   [F:PID2]LINAMTCPR += [F:PID2]FCSCPR
+   [F:PID2]CPR        = [F:PID2]LINAMTCPR / [F:PID2]QTYSTU
+   [F:PID2]CPR        = arr([F:PID2]CPR,10^-GDECPRI)
+   [F:PID2]LINAMTCPR  = arr([F:PID2]LINAMTCPR,10^-GDECPRI)
+Endif
+
+# Incrémentation quantité traitée sur facture
+WINVQTY+=[F:PID2]QTYPUU
+#---
+
+If [F:PIH2]STA=3
+   WVARCSTPUR += [F:PID2]LINCSTPUR
+Endif
+
+Rewrite [F:PID2]
+If fstat GOK=0 : Call FSTA("PID2") From GLOCK : Return : Endif
+If GSTOTRACE > 2
+   WMESS = "----------------------------PINVOICED"-[F:PID2]NUM+"/"+num$([F:PID2]PIDLIN)
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+   WMESS ="FCSCSTPUR :"-mess(205,197,1)-num$(WFCSCSTPUR)-":"-mess(206,197,1)-num$([F:PID2]FCSCSTPUR) - GLOCALDEV
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+   WMESS ="FCSCPR :"-mess(205,197,1)-num$(WFCSCPR)-":"-mess(206,197,1)-num$([F:PID2]FCSCPR) - GLOCALDEV
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+Endif
+Return
+
+#######################################################################
+# recalcul des charges,CPR,CSTPUR,etc ... sur la facture liée à la commande
+$MAJPID2_POH
+If [F:PIH2]STA=3
+   WVARCSTPUR -= [F:PID2]LINCSTPUR
+Endif
+
+WFCSCSTPUR = [F:PID2]FCSCSTPUR
+WFCSCPR    = [F:PID2]FCSCPR
+
+# Quantité à traiter sur la facture
+WQTYPUU = min([F:PTD]INVQTYPUU-WINVQTY,[F:PID2]QTYPUU)
+
+# Décrémentation LINCSTPUR (-FCSCSTPUR) et LINAMTCPR (-FCSCPR)
+[F:PID2]LINCSTPUR   -= [F:PID2]FCSCSTPUR
+# si charge valorisée en stock
+If [F:FCS]STKVLT = 2
+   [F:PID2]LINAMTCPR -= [F:PID2]FCSCPR
+Endif
+
+#--- Recalcul FCSCSTPUR et FCSCPR
+# Décrémentation avec valeur charge non rapprochée
+[F:PID2]FCSCSTPUR -= WFCSCSTPUR*WQTYPUU/[F:PID2]QTYPUU
+If [F:FCS]STKVLT = 2
+   [F:PID2]FCSCPR -= WFCSCPR*WQTYPUU/[F:PID2]QTYPUU
+Endif
+# Incrémentation avec valeur charge rapprochée
+[F:PID2]FCSCSTPUR += [F:PTD]FCSCSTPUR*WQTYPUU/[F:PID2]QTYPUU
+If [F:FCS]STKVLT = 2
+   [F:PID2]FCSCPR += [F:PTD]FCSCPR*WQTYPUU/[F:PID2]QTYPUU
+Endif
+
+# Recalcul cout achat
+[F:PID2]LINCSTPUR += [F:PID2]FCSCSTPUR
+[F:PID2]CSTPUR     = [F:PID2]LINCSTPUR / [F:PID2]QTYSTU
+[F:PID2]CSTPUR     = arr([F:PID2]CSTPUR,10^-GDECPRI)
+[F:PID2]LINCSTPUR  = arr([F:PID2]LINCSTPUR,10^-GDECPRI)
+# Recalcul cout stock si charge valorisée en stock
+If [F:FCS]STKVLT    = 2
+   [F:PID2]LINAMTCPR += [F:PID2]FCSCPR
+   [F:PID2]CPR        = [F:PID2]LINAMTCPR / [F:PID2]QTYSTU
+   [F:PID2]CPR        = arr([F:PID2]CPR,10^-GDECPRI)
+   [F:PID2]LINAMTCPR  = arr([F:PID2]LINAMTCPR,10^-GDECPRI)
+Endif
+
+# Incrémentation quantité traitée sur facture
+WINVQTY+=WQTYPUU
+
+# Maj variation coût achat réalisé
+If [F:PIH2]STA=3
+   WVARCSTPUR += [F:PID2]LINCSTPUR
+Endif
+
+Rewrite [F:PID2]
+If fstat GOK=0 : Call FSTA("PID2") From GLOCK : Return : Endif
+If GSTOTRACE >2
+   WMESS = "----------------------------PINVOICED"-[F:PID2]NUM+"/"+num$([F:PID2]PIDLIN)
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+   WMESS ="FCSCSTPUR :"-mess(205,197,1)-num$(WFCSCSTPUR)-":"-mess(206,197,1)-num$([F:PID2]FCSCSTPUR) - GLOCALDEV
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+   WMESS ="FCSCPR :"-mess(205,197,1)-num$(WFCSCPR)-":"-mess(206,197,1)-num$([F:PID2]FCSCPR) - GLOCALDEV
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+Endif
+Return
+
+#######################################################################
+$REGPRIX
+If GSTOTRACE > 2
+   WMESS = "----------------------------REGPRIX"
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+Endif
+If [F:PTH]PTHNUM <> [F:PTD]PTHNUM
+  Read [F:PTH]PTH0 = [F:PTD]PTHNUM
+  If fstat : Raz [F:PTH] : Endif
+Endif
+WTRSCOD=[F:PTH]TRSCOD
+#----- Article géré en stock ou sous-traitance -----#
+# Issue 112754 - 2016-11-28 by SR : Services
+#If [F:ITM]STOMGTCOD>1 | [F:ITM]SCSFLG=2
+If [F:ITM]STOMGTCOD>1 | [F:PTD]ITMKND=2
+  WFCY   =[F:PTD]PRHFCY
+  WITMREF=[F:PTD]ITMREF
+  #----- Récupération date en fonction du paramètre ACCDATSTK -----#
+  If func AFNC.PARAM("ACCDATSTK",WFCY)="2"
+    WIPTDAT=[F:PIH]ACCDAT
+  Else
+    WIPTDAT=[F:PTD]RCPDAT
+  Endif
+  #-----
+  WVCRTYP=6
+  WVCRNUM=[F:PTD]PTHNUM
+  WVCRLIN=[F:PTD]PTDLIN
+  WQTY   =0
+
+  # Eléments de facturation non valorisés en stock
+  Raz WINVDTACST
+  For I=1 To 9
+    If [F:PIV]INVDTALIN2(I-1)<>0
+      Read [PFI] PFI0=[F:PIV]INVDTALIN2(I-1) : If fstat Raz [F:PFI] : Endif
+      If [F:PFI]NPRVLT=2
+        WINVDTACST+=evalue("[F:PID]DISCRGAMT"+num$(I))
+      Endif
+    Endif
+  Next I
+  #--------------------------------------------------------------------------------------
+  # Mnt à régulariser :Différence entre montant à prendre en compte et ancien montant de la charge
+  #--------------------------------------------------------------------------------------
+  WPRI=WMNTPECSOC-WOLD_FCSAMTSOC
+  WPRI = arr(WPRI,10^-GDECPRI)
+  # si rien à régulariser
+  If WPRI = 0 : Return : Endif
+
+  # Issue 112754 - 2016-11-28 by SR : Services
+  #If [F:ITM]SCSFLG<>2
+  If [F:PTD]ITMKND<>2
+    WTYP=3
+    Gosub REGUL_PRI From TRTACHFAC1
+  # Article sous-traitance
+  Elsif clalev([M:SBCK]) & find([F:PTD]VCRTYPORI,10,36)
+    [M:SBCK]MAJCOD = "F"
+    [M:SBCK]RCPDAT = WIPTDAT
+    [M:SBCK]ITMREF = [F:ITM]ITMREF
+    [M:SBCK]PTHNUM = WVCRNUM
+    [M:SBCK]PTDLIN = WVCRLIN
+    [M:SBCK]VCRNUM = [F:PTD]POHNUM
+    [M:SBCK]VCRLIN = [F:PTD]POPLIN
+    If dim([M:SBCK]LINTYP)>0 : [M:SBCK]LINTYP=[F:PTD]LINTYP : Endif
+    [M:SBCK]INVQTY = WQTY
+    [M:SBCK]CPLPRI = WPRI
+    [M:SBCK]CPLCRG = 0
+    [M:SBCK]INVDTACST = WINVDTACST
+    [M:SBCK]MSGFLG = 1
+    Raz GMESSAGE
+    Call MAJ_SBC From SBCLIB
+    If [M:SBCK]CODRET<>0
+      If GMESSAGE<>""
+        Call ECR_TRACE([F:PIH]NUM-GMESSAGE,0)       From GESECRAN
+      Else
+        Call ECR_TRACE([F:PIH]NUM-mess(96,193,1),0) From GESECRAN
+      Endif
+    Endif
+  Endif
+Endif
+Return
+
+#######################################################################
+# Rapprochement d'une charge
+$STCREG
+If GSTOTRACE > 2
+  WMESS = "-------------RECEIPTD" -[F:PTD]PTHNUM+"/"+num$([F:PTD]PTDLIN)- "STCREG START"
+  Call ECR_TRACE(WMESS,0) From GESECRAN
+Endif
+Raz WINVQTY
+Raz WVARCSTPUR
+# Issue X3-25003 - 2017-07-25 by SR : Déplacé plus haut
+##-------- Lecture de la FCC/Avoir -------------------------------------------#
+#Read [F:PID]PID0 = [F:STCR]NUM;[F:STCR]PIDLIN
+#If fstat : Raz [F:PID] : Endif
+##-------- Lecture des autres fichiers ---------------------------------------#
+## Lecture sans lock de l'entête de FCC/avoir
+#If [F:PIH]NUM <> [F:PID]NUM
+#  Read [F:PIH]PIH0 = [F:PID]NUM
+#  If fstat : Raz [F:PIH] : Endif
+#  #Récupération des globales
+#  If [F:PIH]FCY <> GFCY
+#     GFCY=[F:PIH]FCY : Call GLOBVAR(GFCY)    From WWGLOBACH
+#    GCUR=GLOCALDEV
+#  Endif
+#Endif
+#If [F:PIV]NUM <> [F:PID]NUM
+#   Read [PIV]PIV0 = [F:PID]NUM
+#   If fstat : Raz [PIV] : Endif
+#Endif
+#If GSTOTRACE > 2
+#   WMESS = "[F:STCR]CUR ="-[F:STCR]CUR
+#   Call ECR_TRACE(WMESS,0) From GESECRAN
+#   WMESS = "GLOCALDEV ="-GLOCALDEV
+#   Call ECR_TRACE(WMESS,0) From GESECRAN
+#   WMESS = num$(1) - [F:STCR]CUR -"="- num$([F:PIH]RATMLT) - GLOCALDEV
+#   Call ECR_TRACE(WMESS,0) From GESECRAN
+#Endif
+# Lecture de la charge de la réception
+Readlock [F:STCD]STCD1=6;[F:PTD]PTHNUM;[F:PTD]PTDLIN;[F:STCR]FCSCOD
+If fstat=1
+    GOK=-1 : GLOCK="$COSTSTCD"-[F:PTD]PTHNUM-num$([F:PTD]PTDLIN) - [F:STCR]FCSCOD
+    Return
+Elsif fstat
+    GOK=0 : Call RSTA("STCD",[F:PTD]PTHNUM-num$([F:PTD]PTDLIN) - [F:STCR]FCSCOD) From GLOCK
+    Return
+Endif
+# Lecture de la charge pour récupération indicateur "valorisée en stock"
+Read [F:FCS]FCS0 = [F:STCD]FCSCOD
+If fstat : Raz [F:FCS] : Endif
+If GSTOTRACE >2 : WWOLD_FCSAMT = [F:STCD]FCSAMT : Endif
+# Sauvegarde totaux charges stock et achat de la réception
+WFCSCPR    = [F:PTD]FCSCPR
+WFCSCSTPUR = [F:PTD]FCSCSTPUR
+
+# Décrémentation de FCSCPR, LINAMTCPR,FCSCSTPUR et LINCSTPUR de la réception
+[F:PTD]LINCSTPUR -= [F:PTD]FCSCSTPUR
+WOLD_FCSAMTSOC=0
+[F:PTD]FCSCSTPUR -= [F:STCD]FCSAMTSOC
+If [F:STCD]STCRFLG<>2 :   WOLD_FCSAMTSOC = [F:STCD]FCSAMTSOC : Endif
+
+# si charge valorisée en stock
+If [F:FCS]STKVLT = 2
+  [F:PTD]LINAMTCPR -= [F:PTD]FCSCPR
+  [F:PTD]FCSCPR    -= [F:STCD]FCSAMTSOC
+Endif
+
+#-------- Mise à jour de la charge ------------------------------------------#
+# Montant du rapprochement convertit en devise de la charge si <>
+If [F:STCR]CUR <> [F:STCD]CUR
+   If [F:STCD]CUR = GLOCALDEV
+      # Issue X3-81852 - 2018-04-13 by MUARN : devise, taux avec diviseur
+      #WMNT = [F:STCR]AMTNOTLIN*[F:PIH]RATMLT
+#      Call ARRDEV(WMNTPEC,[F:STCD]CUR) From TRTDIV
+      WMNT = [F:STCR]AMTNOTLIN
+      WI=find(GLOCALDEV,[F:PIH]CURLED)
+      If WI & [F:PIH]RATDIV(WI-1)<>0
+        WRATCUR=[F:PIH]RATMLT(WI-1)/[F:PIH]RATDIV(WI-1)
+      Else
+        WRATCUR=0
+      Endif
+      If WRATCUR=0
+        Call CONVERT2([F:PIH]CUR,GCUR,GCUR,[F:PIH]CURTYP,[F:PIH]RATDAT,WMNT,WMNT,
+&                   STAT) From TRTDEV
+      Else
+        WMNT=WMNT*WRATCUR
+      Endif
+      # End issue X3-81852
+   Else
+      Call CONVERT2([F:STCR]CUR,[F:STCD]CUR,GCUR,[F:PIH]CURTYP,[F:PIH]RATDAT,[F:STCR]AMTNOTLIN,WMNT,
+&                       STAT) From TRTDEV
+   Endif
+Else
+    WMNT = [F:STCR]AMTNOTLIN
+Endif
+
+# Issue 110325 - 2016-01-15 by SR : FCC sur expé
+# Montant à prendre en compte proratisé selon quantité réceptionnée
+Case [F:STCR]TYPORI
+  When 1       : WMNTPEC = WMNT*[F:PTD]QTYSTU/[F:POQ]RCPQTYSTU
+ #                  Call ARRDEV(WMNTPEC,[F:STCD]CUR) From TRTDIV
+  When 2       : WMNTPEC = WMNT
+  When 6       : WMNTPEC = WMNT*[F:PTD]QTYSTU/[F:SHD]RCPQTYSTU
+  When Default :
+Endcase
+
+If [F:STCD]CUR <> GLOCALDEV
+    WMNTPECSOC = WMNTPEC*[F:STCD]CHGCOE
+    If [F:STCD]CUR = [F:STCR]CUR
+      # Issue X3-81852 - 2018-04-13 by MUARN : devise, taux avec diviseur
+      #WMNTPECSOC = WMNTPEC*[F:PIH]RATMLT
+      WMNTPECSOC = WMNTPEC
+      WI=find(GLOCALDEV,[F:PIH]CURLED)
+      If WI & [F:PIH]RATDIV(WI-1)<>0
+        WRATCUR=[F:PIH]RATMLT(WI-1)/[F:PIH]RATDIV(WI-1)
+      Else
+        WRATCUR=0
+      Endif
+      If WRATCUR=0
+        Call CONVERT2([F:PIH]CUR,GCUR,GCUR,[F:PIH]CURTYP,[F:PIH]RATDAT,WMNTPECSOC,WMNTPECSOC,
+&                   STAT) From TRTDEV
+      Else
+        WMNTPECSOC=WMNTPECSOC*WRATCUR
+      Endif
+      # End issue X3-81852
+    Else
+      Call CONVERT2([F:STCD]CUR,GLOCALDEV,GCUR,[F:PIH]CURTYP,[F:PIH]RATDAT,WMNTPEC,WMNTPECSOC,
+&                       STAT) From TRTDEV
+    Endif
+    Call ARRDEV(WMNTPECSOC,GLOCALDEV) From TRTDIV
+Else
+    WMNTPECSOC = WMNTPEC
+Endif
+
+# Si premier rapprochement et FCC on remplace
+If [F:STCD]STCRFLG <> 2 & [F:PIH]PIHTYP = 2
+   [F:STCD]FCSAMT  = WMNTPEC
+   [F:STCD]STCRFLG = 2
+# sinon on ajoute
+Else
+   [F:STCD]FCSAMT += WMNTPEC
+Endif
+#Call ARRDEV([F:STCD]FCSAMT,[F:STCD]CUR) From TRTDIV
+
+If [F:STCD]CUR <> GLOCALDEV
+#    [F:STCD]FCSAMTSOC =  [F:STCD]FCSAMT*[F:STCD]CHGCOE
+    If [F:STCD]CUR = [F:STCR]CUR
+       # Issue X3-81852 - 2018-04-13 by MUARN : devise, taux avec diviseur
+       #[F:STCD]FCSAMTSOC = [F:STCD]FCSAMT*[F:PIH]RATMLT
+       WMNT = [F:STCD]FCSAMT
+       WI=find(GLOCALDEV,[F:PIH]CURLED)
+       If WI & [F:PIH]RATDIV(WI-1)<>0
+         WRATCUR=[F:PIH]RATMLT(WI-1)/[F:PIH]RATDIV(WI-1)
+       Else
+         WRATCUR=0
+       Endif
+       If WRATCUR=0
+         Call CONVERT2([F:PIH]CUR,GCUR,GCUR,[F:PIH]CURTYP,[F:PIH]RATDAT,WMNT,[F:STCD]FCSAMTSOC,
+&                    STAT) From TRTDEV
+       Else
+         [F:STCD]FCSAMTSOC = [F:STCD]FCSAMT*WRATCUR
+       Endif
+       # End issue X3-81852
+    Else
+      Call CONVERT2([F:STCD]CUR,GLOCALDEV,GCUR,[F:PIH]CURTYP,[F:PIH]RATDAT,[F:STCD]FCSAMT,[F:STCD]FCSAMTSOC,
+&                       STAT) From TRTDEV
+    Endif
+Else
+    [F:STCD]FCSAMTSOC =  [F:STCD]FCSAMT
+Endif
+Call ARRDEV([F:STCD]FCSAMT,[F:STCD]CUR) From TRTDIV
+Call ARRDEV([F:STCD]FCSAMTSOC,GLOCALDEV) From TRTDIV
+# flag rapproché
+[F:STCD]STCRFLG = 2
+Rewrite  [F:STCD]
+If fstat GOK=0 : Call FSTA("STCD") From GLOCK : Return : Endif
+If GSTOTRACE >2
+   WMESS = "----------------------------COSTSTCD"-[F:STCD]FCSCOD
+   Call ECR_TRACE(WMESS,0) From GESECRAN
+   WMESS =  "FCSAMT :"-mess(205,197,1)-num$(WWOLD_FCSAMT)-":"-mess(206,197,1)-num$([F:STCD]FCSAMT) - [F:STCD]CUR
+  Call ECR_TRACE(WMESS,0) From GESECRAN
+Endif
+#-------- Mise à jour de la réception ---------------------------------------#
+# Incrémentation de FCSCSTPUR de la réception et recalcul cout achat
+[F:PTD]FCSCSTPUR += [F:STCD]FCSAMTSOC
+# Recalcul CSTPUR
+[F:PTD]LINCSTPUR += [F:PTD]FCSCSTPUR
+[F:PTD]CSTPUR     = [F:PTD]LINCSTPUR / [F:PTD]QTYSTU
+[F:PTD]CSTPUR     = arr([F:PTD]CSTPUR,10^-GDECPRI)
+[F:PTD]LINCSTPUR  = arr([F:PTD]LINCSTPUR,10^-GDECPRI)
+
+# Incrémentation FCSCPR et recalcul cout stock si charge valorisée en stock
+If [F:FCS]STKVLT    = 2
+  [F:PTD]FCSCPR    += [F:STCD]FCSAMTSOC
+  [F:PTD]LINAMTCPR += [F:PTD]FCSCPR
+  [F:PTD]CPR        = [F:PTD]LINAMTCPR / [F:PTD]QTYSTU
+  [F:PTD]CPR        = arr([F:PTD]CPR,10^-GDECPRI)
+  [F:PTD]CPRCLC     = [F:PTD]LINAMTCPR / [F:PTD]QTYSTU
+  [F:PTD]CPRCLC     = arr([F:PTD]CPRCLC,10^-GDECPRI)
+  [F:PTD]LINAMTCPR  = arr([F:PTD]LINAMTCPR,10^-GDECPRI)
+Endif
+Rewrite  [F:PTD]
+If fstat GOK=0 : Call FSTA("PTD") From GLOCK : Return : Endif
+# Issue X3-25003 - 2017-06-01 by SR : Valorisation des réceptions
+If GPRIFLG = 2
+   If ([F:PTD]POHNUM <> "" &  GPSVSTRDAT <= [F:POH]CREDAT)|([F:PTD]POHNUM =  "" &  GPSVSTRDAT <= [F:PTH]CREDAT)
+       Gosub CRE_PTD_PSV_FCC From TRTACHRCP1
+   Endif
+Endif
+If GOK < 1 : Return : Endif
+If GSTOTRACE >2
+    WMESS = "----------------------------PRECEIPTD"-[F:PTD]PTHNUM+"/"+num$([F:PTD]PTDLIN)
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+    WMESS = "FCSCSTPUR :"-mess(205,197,1)-num$(WFCSCSTPUR)-":"-mess(206,197,1)-num$([F:PTD]FCSCSTPUR) - GLOCALDEV
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+    WMESS = "FCSCPR :"-mess(205,197,1)-num$(WFCSCPR)-":"-mess(206,197,1)-num$([F:PTD]FCSCPR) - GLOCALDEV
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+Endif
+#-------- Mise à jour des factures de la réception --------------------------#
+# recalcul charges et coûts sur la/les factures
+#Raz WVARCSTPUR
+# Issue X3-74367 - 2018-02-08 by SR : Uniquement sur les lignes factures avec quantité
+If [F:PTD]INVQTYSTU <> 0
+   Link [PID2] With [PIH2]PIH0 =[F:PID2]NUM As [PIDX]
+&       Where [PIH2]PIHTYP = 1  & [PID2]TYPORI = 2
+&           & [PID2]NUMORI = [F:PTD]PTHNUM & [PID2]LINORI = [F:PTD]PTDLIN
+&           & [PID2]QTYSTU <> 0
+   For [F:PIDX]
+       Gosub MAJPID2
+       If GOK<1 : Break : Endif
+   Next
+   If GOK <> 1 : Return : Endif
+Endif
+
+#-------- Mise à jour des factures de la commande concernant la réception ---#
+If WINVQTY < [F:PTD]INVQTYPUU & [F:PTD]POHNUM <> ""
+   # Issue X3-74367 - 2018-02-08 by SR : Uniquement sur les lignes factures avec quantité
+   Link [PID2] With [PIH2]PIH0 =[F:PID2]NUM As [PIDX]
+&       Where [PIH2]PIHTYP = 1  & [PID2]TYPORI = 1
+&           & [PID2]NUMORI = [F:PTD]POHNUM & [PID2]LINORI = [F:PTD]POPLIN
+&           & [PID2]SEQORI = [F:PTD]POQSEQ
+&           & [PID2]QTYSTU <> 0
+   For [F:PIDX]
+       If WINVQTY >= [F:PTD]INVQTYPUU : Break : Endif
+       Gosub MAJPID2_POH
+       If GOK<1 : Break : Endif
+   Next
+   If GOK <> 1 : Return : Endif
+Endif
+
+#-------- Mise à jour de la commande ----------------------------------------#
+#  mise à jour du coût d'achat réalisé de la commande :
+Raz WRET
+If [F:PTD]POHNUM <> ""
+   WPOHNUM = [F:PTD]POHNUM
+   WPOPLIN = [F:PTD]POPLIN
+   WPOQSEQ = [F:PTD]POQSEQ
+
+   # Maj du coût d'achat réalisé
+   If WVARCSTPUR<>0
+      Call MAJ_REACSTPUR(WPOHNUM,WPOPLIN,WPOQSEQ,WVARCSTPUR,WRET) From STCCLC
+   Endif
+   If WRET
+     #Problème de mise à jour du coût d'achat réalisé
+     GMESSAGE = mess(795,197,1)
+     Call ECR_TRACE([F:PID]NUM+"/"+num$([F:PID]PIDLIN)-GMESSAGE,1) From GESECRAN
+     Return
+   Endif
+   If GSTOTRACE >2
+      WMESS = "----------------------------PORDERQ"-WPOHNUM+"/"+num$(WPOPLIN)+"/"+num$(WPOQSEQ)
+      Call ECR_TRACE(WMESS,0) From GESECRAN
+      WMESS ="REACSTPUR + "-num$(WVARCSTPUR)
+      Call ECR_TRACE(WMESS,0) From GESECRAN
+   Endif
+Endif
+#----------------------------- Mise à jour de la valo stock-----------------------------#
+# Régularisation des mouvements de stock
+If [F:FCS]STKVLT = 2
+    If [F:ITM]ITMREF <> [F:PTD]ITMREF
+      Read [ITM] ITM0=[F:PTD]ITMREF : If fstat  Raz [F:ITM] : Endif
+      If fstat : Raz [F:ITM] : Endif
+    Endif
+    If [F:ITM]STOMGTCOD < 2 : Return : Endif
+    # L'article-site est-il géré en stock ?
+    If [F:ITF]ITMREF<>[F:PTD]ITMREF | [F:ITF]STOFCY<>[F:PTD]PRHFCY
+      Read [F:ITF]ITF0 = [F:PTD]ITMREF;[F:PTD]PRHFCY
+      If fstat : Raz [F:ITF] : Endif
+    Endif
+    If [F:ITF]STOMGTCOD < 2 : Return : Endif
+    Gosub REGPRIX
+Endif
+If GSTOTRACE > 2
+  WMESS = "-------------RECEIPTD" -[F:PTD]PTHNUM+"/"+num$([F:PTD]PTDLIN)- "STCREG END"
+  Call ECR_TRACE(WMESS,0) From GESECRAN
+Endif
+
+Return
+

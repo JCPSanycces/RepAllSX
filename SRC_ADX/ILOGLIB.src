@@ -1,0 +1,1423 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+##############################################################################                                                  I L O G L I B             #
+# Communication avec les composants développés avec ILOG         GPAO        #
+##############################################################################
+#     X3SCHEDULE          Optimisation X3
+#     X3SCALES            Poste de pesée graphique
+##############################################################################
+#     Principe de codage du paramètre RETOUR:
+#     Format : AAA=1T1L1...TnLnFxxxxxxxxxxxxxxxxxxxxxxxxxxx...
+#
+#        ou:   "AAA"     = code retour de 001 à 999
+#              "=1"      = est une constante
+#              "T1"      = type premier paramètre (X = alpha, n = numérique)
+#              "L1"      = longueur premier paramètre
+#              "Tn"      = type paramètre n
+#              "Ln"      = longueur paramètre n
+#              "F"       = caractère constant de fin de description
+#                          des paramètres attendus
+#              "xxx..."  = chaine de caractère contenant les valeurs paramètres
+#
+#    Exemple:
+#        Gantt: Pour le tunnel vers l'ordre de fabrication FCY01010001,
+#               2 paramètres: le code objet MFG et le numéro d'OF.
+#
+#        RETOUR = 011=1X3X11FMFGFCY01010001
+#               Attention, les valeurs numériques n'apparaissent pas en clair
+#               en fait on reçoit:
+#            RETOUR = 011=|X|X|FMFGFCY01010001
+#
+#    Pour le décodage, on prévoit un tableau de 11 paramètres, longueur 20
+###############################################################################
+
+##############################################################################
+# Appel du Gantt
+# Codes retour gérés:
+#         011 = tunnel
+#         014 = notification de sauvegarde ds résultats
+#         015 = demande de lancement de l'aide en ligne
+#         020 = réactualisation des données techniques
+#         050 = appel PE sur déplacement opération
+#         051 = appel PE pour récupération stock opération
+#         999 = sortie
+##############################################################################
+Subprog X3SCHEDULE(IRESULT)
+Variable Integer IRESULT
+
+Local Char     GANTTNBR(255)
+Local Char     RETOUR(255)
+Local Char     WPARAM(255)
+Local Char     WPAR(20)(11)
+Local Integer  WLON(11)
+Local Integer  WTYP(11)
+Local Char     CODE, C1, C2
+Local Char     IFORMAT : IFORMAT = "F"
+Local Integer  NBPAR, POSITION, I
+
+IRESULT = 0
+
+# 07.05 31503
+If [M:MOP1]OPTION <> 3 : Call RESET_FEEDBACK From OPTLIBB : Endif
+
+#------------------------------------------------------------------------------------------------------------------
+If [M:MOP1]OPTION <> 3 : Call RESET_INVENTORY From OPTLIBB : Endif
+
+Global Char GSCHCUSTOM(200)
+GSCHCUSTOM = func OPTLIB.FILNAM(GOPTFCY,"ilfeat",0)
+
+Call RESET_CUSTOM From OPTLIBB
+
+# point d'entrée CUSTOM_GANTT
+GPOINT = "CUSTOM_GANTT" : Gosub ENTREE From EXEFNC
+
+# transfert features
+Call ILFIL2CSV(GOPTFCY,"ilfeat","v6_x3_features") From OPTLIB
+
+#------------------------------------------------------------------------------------------------------------------
+
+Callilog RETOUR="" With     "IAction=" + chr$(1) + "1",
+&                           "IModule=" + chr$(1) + "Scheduling\v6\x3ilog.dll"
+
+# retour de création
+# on récupère l'identifiant du gantt pour appel ultérieur
+CODE = left$(RETOUR,3)
+Case CODE
+  When "001" : GANTTNBR = mid$(RETOUR, 9, 1)
+  When "990" : Gosub PROCESS_ERR : Goto FINGANTT
+  When "999" : Goto FINGANTT : # GH 22/07/2015 bug 108630
+Endcase
+
+# on active le gantt : on n'a plus la main
+Callilog RETOUR="" With     "INumber=" + chr$(1) + GANTTNBR,
+&                           "IAction=" + chr$(1) + "2"
+CODE = left$(RETOUR,3) : # GH 22/07/2015 bug 108630
+If (CODE = "990") : Gosub PROCESS_ERR : Goto FINGANTT : Endif
+
+# boucle de dialogue avec le gantt
+While (!find(val(CODE),990,999))
+    # appel traitement de décodage du paramètre RETOUR
+    Gosub DECODE
+    Case CODE
+        When "011":     # effet tunnel, 3 paramètres possibles (code OBJ, cle1, cle2)
+                        Gosub ZOOM
+        When "014":     # notification de sauvegarde de résultats
+                        IRESULT = 1
+                        If GBROWS=1 & GFUSION=1 : # GH 24/11/2014 dm 103835
+                           Call CSV2ILFIL(GOPTFCY,"ilres","v6_results") From OPTLIB
+                        Endif
+        When "015":     # appel de l'aide sur la fonction optimisation
+                        Hlpbox WPAR(0)+chr$(7)+"FCT" #
+        When "020":     Gosub UPDATE_TD
+        When "050":     Gosub OPERATION_MOVED
+        When "051":     Gosub OPERATION_INVENTORY
+        When "052":     Gosub STOCK_PROJETE # gbe 22/02/12
+        When "053":     Gosub COMPONENT_AVAILABILITY # gbe 10/05/12
+        When "999","":  Goto ENDGANTT
+    Endcase
+
+    Callilog RETOUR="" With     "INumber=" + chr$(1) + GANTTNBR,
+&                               "IAction=" + chr$(1) + "2"
+
+$ENDGANTT
+Wend
+
+$FINGANTT
+End
+
+###############################################################################
+# Appel du poste de pesée graphique
+###############################################################################
+Subprog X3SCALES
+Local Char     SCALENBR(255)
+Local Char     RETOUR(255)(0..5)
+Local Char     WPARAM(255)
+Local Char     WPAR(20)(11)
+Local Integer  WLON(11)
+Local Integer  WTYP(11)
+Local Char     CODE, C1, C2
+Local Char     IFORMAT : IFORMAT = "F"
+Local Integer  NBPAR, POSITION, I
+
+Local Char    LNUM         (GLONVCR)  # dimensionnement - mm .03.11
+Local Char    LNUM_OLD     (GLONVCR)  # dimensionnement - mm .03.11
+Local Char    NUMISM       (8)
+Local Char    NUMCOMPOSANT (GLONITM)  # dimensionnement - mm .03.11
+Local Integer LLIN
+Local Integer LSEQ
+Local Integer LOPE
+Local Integer VAL1
+Local Integer PESEE_ART
+Local Char    F_CONTENU    (7)
+Local Char    F_FORMAT     (7)
+Local Char    NOMETA       (15)
+Local Integer TYPETA
+Local Decimal QTYBESOIN, WEIBESOIN
+Local Integer LALLSTA        # 44043 mm 04.08
+Local Integer ERR
+
+#CATUA X3-67237.sn
+Global Char GWEIUSER(GLONAUS)
+Raz GWEIUSER
+#CATUA X3-67237.en
+
+# bug 75982 02/09/11 pour la récupération des informations du dossier
+#Local Char    A1VERS , A1REL , A1PAT
+#Local Char WCHEMIN(250)
+#Local Integer FILEEXIST
+
+ERR=0
+#FILEEXIST = 0
+Call CTRLCACHE(ERR)
+If ERR=1
+# Erreur lors de la mise à jour du cache des images
+Endif
+
+# llc test
+Local Char    SAVMESS(255)(0..5)
+Local Char    WBESOIN
+
+# Numéro de version, release et patch du dossier
+#Call VERSX3(nomap,A1VERS,A1REL,A1PAT) From INTRUTILA
+# création du poste de pesée en fonction de la version et du niveau de patch
+
+# client Classic : # dm 103835 GH 02/12/2014
+# ou client lourd à partir de la version AKIRA - mm 12.2014
+#If (GBROWS=1 & GFUSION=1) | ( val(A1VERS) >= 170)
+
+# 109010 mm 06.2015
+  Callilog RETOUR="" With     "IAction=" + chr$(1) + "6",
+&                             "IModule=" + chr$(1) + "Scales\v6\x3scales.dll"
+#Endif
+
+# retour de création
+# on récupère l'identifiant de la fenêtre pour appel ultérieur
+CODE = left$(RETOUR,3)
+
+If (CODE = "006") : SCALENBR = mid$(RETOUR, 9, 1) : Endif       # CMI
+# sr 03.05 pas la peine pour le code 990, la centrale a normalement envoye un message clair du probleme rencontre
+#If (CODE = "990") : End : Endif # SR
+#If (CODE = "990") : Goto ENDSCALE : Endif # GH pour ne plus générer de trace vide
+If find(CODE,"990","999") : Goto FINSCALE : Endif : # GH 22/07/2015 bug 108630
+
+# on active le poste : on n'a plus la main
+Callilog RETOUR="" With     "INumber=" + chr$(1) + SCALENBR,
+&                           "IAction=" + chr$(1) + "7"
+CODE = left$(RETOUR,3) : # GH 22/07/2015 bug 108630
+
+# sr 03.05 pas la peine pour le code 990, la centrale a normalement envoye un message clair du probleme rencontre
+#If (CODE = "990") : Gosub PROCESS_ERR             : End : Endif # CMI + LLC
+#If (CODE = "990") : End : Endif # SR
+
+# boucle de dialogue avec le poste
+While (!find(val(CODE),990,999))
+
+    # appel traitement de décodage du paramètre RETOUR
+    Gosub DECODE1
+    # traitement particulier de sortie de la fonction (LLC)
+    Case CODE
+        When "","990","999": Gosub ENDSCALE # SR
+    Endcase
+
+    Gosub OUV_FICHMASK
+
+    Case CODE
+
+        When "019":       Gosub PESEE_PAR_MATIERE
+        When "020":       Gosub CHANGEMENT_OF
+        When "021":       Gosub CHOIX_COMPOSANT
+        When "022":       Gosub CHGMN_COMPOSANT_SANSPESE
+        When "023":       Gosub CHGMN_COMPOSANT_AVECPESE
+        When "024":       Gosub CHGMN_OF_AVECPESE
+        When "025":       Gosub CHGMN_PHASE_AVECPESE
+        When "026":       Gosub MAJ_ALLOCATION
+        When "027":       Gosub PESE_PARTIELLE
+        When "028":       Gosub FIN_LOT
+        When "029":       Gosub FIN_COMPOSANT
+
+        When "030":       Gosub PESE_PARTIELLE_FINPHASE
+        When "031":       Gosub PESE_PARTIELLE_FINOF
+        When "032":       Gosub MWM_HELP
+        When "033":       Gosub RECONCILIATION
+        When "034":       Gosub MAJ_ALLOCATION
+        When "035":       Gosub SAI_PROCEDURES
+        When "036":       Gosub SOLDE_EMBALLAGE
+        When "037":       Gosub CHGMN_OF_SANSPESE
+        When "038":       Gosub MAJ_ALLOCATION
+        When "039":       Gosub MAJ_EMBALLAGE
+
+        When "040":       Gosub RES_CALIBRAGE_OK
+        When "041":       Gosub RES_CALIBRAGE_KO
+        When "042":       Gosub RES_CALIBRAGE_KO_SUROK
+        When "043":       Gosub SOLDE_MATIERE
+        When "044":       Gosub FINPHASE_BIS
+        When "045":       Gosub FINOF_BIS
+
+        When "046":       Gosub REFRESH
+        When "047":       Gosub RELOAD_ALL
+        When "048":       Gosub STOCK_DETAILLE
+
+        When "049":       Gosub CHANGEMENT_MAT_ART
+        When "050":       Gosub CHANGEMENT_OF_ART
+        When "051":       Gosub FIN_COMPOSANT_ART
+        When "052":       Gosub ABANDON_PESEEMULTI
+
+        When "100":       Gosub LOAD_LOGIN #CATUA X3-67237.n
+
+    Endcase
+    # Transfert fichier trace   (si pas d erreur il est vide)
+    # sr 02.02 mise en commentaire car pose de gros problème et de plus ce fichier trace
+    # n'est pas exploité côté DLL
+#        Call TRF_TRA  From SCALEXCHAN
+     Callilog RETOUR="" With     "INumber=" + chr$(1) + SCALENBR,
+&                                "IAction=" + chr$(1) + "7"        # CMI
+
+$ENDSCALE
+Wend
+
+$FINSCALE
+# on supprime le fichier trace
+# sr 06.05 : NON on ferme la trace
+Call FERME_TRACE From LECFIC
+
+GSERVEUR = 0
+
+End
+
+###########################################################################
+$PESEE_PAR_MATIERE                                                  #   19
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+Trbegin [MFG],[MFM]
+  # Si [F:MFG]WGGFLG valait 8 -> passe à 4
+  Call MAJ_FICHIERS ("MFG", 4, 0, LNUM, "", 0, 0) From SCALEXCHAN
+  # [F:MFM]WGGBOX valait 1 -> passe à 2,
+  # Pour ces valeurs de flags, la matière de cet OF pour cette phase n'est plus sélectionnable.
+  Call MAJ_FICHIERS ("MFM", 0, 2, LNUM,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+  If GOK < 1  Gosub AB_TRT
+  Else Commit
+Endif
+
+Return
+
+###########################################################################
+$CHANGEMENT_OF                                                      #   20
+###########################################################################
+Local Shortint EXPITM       #X3-85848.n - Added for call to XTRACT_NUMOF
+LNUM_OLD = WPAR(0)         # numero de l OF ancien
+LNUM     = WPAR(1)         # numero de l OF nouveau
+LMAT     = WPAR(2)         # numero de matiere nouveau
+
+# sr 05.02 FI n° 17
+If LNUM_OLD <> ""
+   If ( CODE = "020" & LNUM_OLD <> LNUM )
+      Call MAJ_FICHIERS ("MFG",3,0,LNUM_OLD,"",0,0) From SCALEXCHAN         # 47764 mm 07.08 - val2=0
+   Endif
+Endif
+
+#X3-85848 - Replaced with new call format     Call XTRACT_NUMOF (LNUM, LMAT)   From SCALEXCHAN
+Call XTRACT_NUMOF (LNUM, LMAT, EXPITM)   From SCALEXCHAN    #X3-85848.n - New Call format
+Call TRF_PHA  From SCALEXCHAN
+Call TRF_MAT  From SCALEXCHAN
+Call TRF_HSH  From SCALEXCHAN
+Return
+
+##########################################################################
+$CHOIX_COMPOSANT                                                    #   21
+#             allocation de toutes les matiere
+#             generation du STO
+#             transfert du STO
+#             generation du CTN  par rapport a la fiche ISM du COMPOSANT
+#             transfert du CTN
+#             rewrite du mfhhead avec WGGFLG = 4 (en cours de pesee)
+#                                     WGGSTA = 2 (pesee en box)
+#             rewrite du mfhmat  avec WGGSTA = 2 (en cours de pesee)
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+WEIBESOIN    = val(WPAR(2))  # quantite du composant   qtyret
+LLIN         = val(WPAR(3))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(4))  # sequence nomenclature   BOMSEQ
+NUMISM       = (WPAR(5))     # numero fiche ism
+PESEE_ART    = val(WPAR(6))  # si PESEE_ART = 2 -> pesée par article - mm 10.10
+# qtybesoin renseigné dans le cas d un excipient
+
+# llc 03.02
+Read [MFM]MFM0=LNUM;LLIN;LSEQ;NUMCOMPOSANT
+If fstat : Raz [MFM] : Endif
+# 44043 mm 04.08 - Sauvegarde du statut d'allocation initial de la matiere
+If LALLSTA=0  : LALLSTA = [F:MFM]ALLSTA : Endif
+
+If find([F:MFM]PKC,4,5,6,7,10)
+    Call CAL_QUANTITE(NUMCOMPOSANT,QTYBESOIN,WEIBESOIN) From SCALEXCHAN
+Else
+    QTYBESOIN = 0
+Endif
+
+WBESOIN = num$(QTYBESOIN)
+
+Call XTRACT_ALLOCATION (LNUM , NUMCOMPOSANT,QTYBESOIN, LLIN, LSEQ,2, [F:MFM]RETDAT)   From SCALEXCHAN
+
+# sr 02.04 tests 140
+Call TRF_STO  From SCALEXCHAN
+Call XTRACT_CONTAINERS (NUMISM)   From SCALEXCHAN
+Call TRF_CTN  From SCALEXCHAN
+Call DEBTRANS From GLOCK
+Trbegin [MFG]
+# sr 05.02 plus la peine car c'est fait bien avant FI n° 17
+#Call MAJ_FICHIERS ("MFG",4,2,LNUM,"",0,0) From SCALEXCHAN
+
+# 85521 mm 10.12 - Gérer WGGBOX pour la pesée par OF
+If PESEE_ART = 2
+  Call MAJ_FICHIERS ("MFM",2,0,LNUM,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+Else
+  Call MAJ_FICHIERS ("MFM",2,2,LNUM,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+Endif
+If GOK < 1  Gosub AB_TRT
+    Else Commit
+Endif
+
+Return
+
+###########################################################################
+$CHGMN_COMPOSANT_SANSPESE                                           #   22
+#             desallocation du composant
+#             rewrite du MFGMAT  avec WGGSTA = 1 (non pesee)
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+Local    Integer WRET : WRET=0                    # 44043 mm 04.08
+Local    Decimal QTYBESOIN  : QTYBESOIN=0         # 44043 mm 04.08
+
+# 44043 mm 04.08
+If find(LALLSTA,1,2,3)
+    Call DES_ALLOCATION_A (LNUM , NUMCOMPOSANT, LLIN, LSEQ)   From SCALEXCHAN
+    If find (LALLSTA,2,3)
+        Call ALLOC_MAT ("C",1,LNUM,1,1,WRET,NUMCOMPOSANT,LLIN,LSEQ,QTYBESOIN) From MFGALL
+    Endif
+Endif
+Raz LALLSTA
+
+Call DEBTRANS From GLOCK
+Trbegin [MFM]
+
+# 44409 mm 06.08
+# si aucun suivi n'existe pour la matière, on repasse en statut non pesé
+# 85521 mm 10.12 - Gestion WGGBOX pour la pesée par OF : WGGBOX repasse à non
+Filter [MKM] Where MFGNUM=LNUM     &
+&     MFGLIN = LLIN                &
+&     BOMSEQ = LSEQ                &
+&     ITMREF = NUMCOMPOSANT
+    Read [MKM] First
+    If !fstat
+      Call MAJ_FICHIERS ("MFM",0,1,LNUM,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+    Else
+      Call MAJ_FICHIERS ("MFM",1,1,LNUM,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+    Endif
+Filter [MKM]
+#
+If GOK < 1 : Rollback : Return
+Else : Commit
+Endif
+
+Return
+
+###########################################################################
+$CHGMN_COMPOSANT_AVECPESE                                           #   23
+#             desallocation reste à peser du composant
+###########################################################################
+
+# faire un modif dans alloc_mat de mfgall avec peut etre un type autre que a
+# ou c pour caluler le reste à peser
+
+
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+# mm 02.11 - allocation et magasin avancé
+Read [MFM]MFM0 = LNUM;LLIN;LSEQ;NUMCOMPOSANT
+If fstat
+ Raz [MFM]
+Else
+# 86183 mm 10.12 (suite du 85521)
+# changement d'article  : l'article courant n'est plus en cours de pesée box
+Call DEBTRANS From GLOCK
+Trbegin [MFM]
+Call MAJ_FICHIERS ("MFM",0,1,LNUM,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+If GOK < 1 : Rollback : Return
+Else : Commit
+Endif
+# on n'est pas en situation std, on ne veut pas perdre les allocations
+# réalisées depuis l'OF
+ If find([F:MFM]PKC,2,3) & GALLAUT = 1 : Return : Endif
+Endif
+
+# 02.07 Demande 39524
+#Call DES_ALLOCATION_R (LNUM , NUMCOMPOSANT, LLIN, LSEQ)   From SCALEXCHAN
+Call DES_ALLOCATION_A (LNUM , NUMCOMPOSANT, LLIN, LSEQ)   From SCALEXCHAN
+Return
+
+###########################################################################
+$CHGMN_OF_AVECPESE                                                  #   24
+#             rewrite du MFGHEAD avec WGGFLG = 3 (plan de pese)
+#             rewrite de MFGMAT avec  WGGSTA = 1 (non pesée) si aucun suivi existant pour la matière
+#             document fin of partielle
+###########################################################################
+LNUM         = WPAR(0)        # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)        # numero du composant     ITMREF
+LLIN         = val(WPAR(2))   # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))   # sequence nomenclature   BOMSEQ
+PESEE_ART    = val(WPAR(4))   # si PESEE_ART = 2 -> pesée par article, sinon =0 - mm 10.10
+Local Integer W_WGGBOX : W_WGGBOX =1               # mm 01.11
+
+# cas particulier de la pesée par article : on ne change plus la valeur de [F:MFG]WGGFLG si OF totalement pesé
+If PESEE_ART = 2
+  Readlock [F:MFG]MFG0 = LNUM
+  If fstat = 0
+    If [F:MFG]WGGFLG = 5 & [F:MFG]WGGSTA = 8 : Return  : Endif
+  Endif
+Endif
+
+Call DEBTRANS From GLOCK
+Trbegin [MFG],[MFM]
+Read [MFM]MFM0 = LNUM;LLIN;LSEQ;NUMCOMPOSANT
+If fstat : Raz [MFM] : Endif
+Call MAJ_FICHIERS ("MFG",3,0,LNUM,"",0,0) From SCALEXCHAN
+If [MFM]WGGSTA =2
+  # 44409 mm 06.08-  on ne repasse en statut non pesé que si aucun suivi n'existe pour la matière
+  Filter [MKM] Where MFGNUM=LNUM                  &
+&                    MFGLIN = LLIN                &
+&                    BOMSEQ = LSEQ                &
+&                    ITMREF = NUMCOMPOSANT
+       Read [MKM] First
+       If fstat
+          Call MAJ_FICHIERS ("MFM",1,0,LNUM,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+       Endif
+  Filter [MKM]
+Endif
+
+If PESEE_ART = 2
+  # mm 01.11 - vérification qu'il ne reste plus de matière en cours de pesée
+  # avant de remettre l'OF dans le plan de pesée
+  For [MFM] Where MFGNUM= LNUM
+     If [F:MFM]WGGBOX = 2   : W_WGGBOX = 2: Break : Endif
+  Next
+  # si aucune matière en cours de pesée, on remet l'OF dans le plan de pesée
+  If  W_WGGBOX =1
+    Call MAJ_FICHIERS ("MFG",3,0,LNUM,"",0,0) From SCALEXCHAN
+  Endif
+Else
+  Call MAJ_FICHIERS ("MFG",3,0,LNUM,"",0,0) From SCALEXCHAN
+Endif
+#
+If GOK < 1 : Rollback : Return
+Else : Commit
+Endif
+
+# impression fin of partielle  init du buffer WGG pour les parametres
+Raz [F:WGG]
+[F:WGG]WEIFLG    = 2
+[F:WGG]MFGNUM    = LNUM
+NOMETA = GWEIRPTOF
+TYPETA = 4
+
+Gosub PESE_IMPRESSION
+
+Return
+
+###########################################################################
+$CHGMN_PHASE_AVECPESE                                               #   25
+#             Etiquette fin phase partielle
+###########################################################################
+
+# impression fin phase partielle  init du buffer WGG pour les parametres
+Raz [F:WGG]
+[F:WGG]WEIFLG    = 2
+[F:WGG]MFGNUM    = WPAR(0)
+[F:WGG]BOMOPE    = val(WPAR(1))
+NOMETA = GWEIRPTOPE
+TYPETA = 3
+
+Gosub PESE_IMPRESSION
+
+Return
+
+
+###########################################################################
+$MAJ_ALLOCATION                                                     #   26
+#                           + document allocation                   #   34
+#                  uniquement document allocation                   #   38
+###########################################################################
+
+ If CODE = "026" Call MAJ_ALLOCATIONS ("26") From SCALEXCHAN  : Endif
+ If CODE = "034" Call MAJ_ALLOCATIONS ("34") From SCALEXCHAN  : Endif
+ If CODE = "038" Call MAJ_ALLOCATIONS ("38") From SCALEXCHAN  : Endif
+Return
+
+###########################################################################
+$PESE_PARTIELLE                                                     #   27
+###########################################################################
+PESEE_ART    = val(WPAR(0))  # si PESEE_ART = 2 -> pesée par article - mm 10.10
+
+Call MAJ_WEIGHING_SUIVI ("27", PESEE_ART )  From SCALEXCHAN
+
+Return
+
+###########################################################################
+$FIN_LOT                                                            #   28
+###########################################################################
+PESEE_ART    = val(WPAR(0))  # si PESEE_ART = 2 -> pesée par article - mm 10.10
+
+Call MAJ_WEIGHING_SUIVI ("28", PESEE_ART)  From SCALEXCHAN
+
+Return
+
+###########################################################################
+$FIN_COMPOSANT                                                      #   29
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+Call MAJ_WEIGHING_SUIVI ("29", 0)  From SCALEXCHAN
+Return
+
+
+###########################################################################
+$PESE_PARTIELLE_FINPHASE                                            #   30
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+Call MAJ_WEIGHING_SUIVI ("30", 0)  From SCALEXCHAN
+
+Return
+
+###########################################################################
+$PESE_PARTIELLE_FINOF                                               #   31
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+Call MAJ_WEIGHING_SUIVI ("31", 0)  From SCALEXCHAN
+#CALL QUANTITE A 0
+Return
+
+###########################################################################
+$SOLDE_MATIERE                                                      #   43
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+
+Call MAJ_SOLDE_MATIERE ("43")  From SCALEXCHAN
+Return
+
+###########################################################################
+$FINPHASE_BIS                                                  #   44
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+
+Call MAJ_SOLDE_MATIERE ("44")  From SCALEXCHAN
+Return
+###########################################################################
+$FINOF_BIS                                                         #   45
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+
+
+Call MAJ_SOLDE_MATIERE ("45")  From SCALEXCHAN
+Return
+###########################################################################
+$MWM_HELP                                                           #   32
+###########################################################################
+#important:   le fichier FUNSCA.htm se trouve dans les sous repertoires :
+#                  fct :  aide par (maj + f1) nommé : FUNSCA.htm
+#                  obj :  code retour 32      nommé : MWM_FUNSCA.htm
+#             pour la maintenance de ce document seul le FUNSCA.htm à jour
+#             doit etre transmis à l indus , l indus se chargeant par
+#             procedure automatique de le dupliquer
+
+Local Char HELPTXT
+
+HELPTXT = "MWM_FUNSCA"
+Hlpbox  HELPTXT
+
+Return
+
+
+###########################################################################
+$RECONCILIATION                                                     #   33
+###########################################################################
+Local Char PARAM(50)(1..20) , SAVACT(10)
+Local Char VALEUR
+
+PARAM(1) = ""
+SAVACT = GACTION : GACTION = "SAIRCL0"
+# 02.07 Demande 39524
+Call SAISIE_CHAR(VALEUR,PARAM,"FRCL0","TRTRCL0","") From GSAISIE
+Return
+
+###########################################################################
+$SAI_PROCEDURES                                                     #   35
+###########################################################################
+Local Char WEIUSR           #X3-67237
+
+FICTEC       = WPAR(0)       # numero de procedure
+MFGNUM       = WPAR(1)       # numero d of
+LOPE         = val(WPAR(2))  # numero  de phase
+LITM         = WPAR(3)       # article
+LTYP         = val(WPAR(4))  # type de procedure
+                             # 1 = vide de box
+                             # 2 = vide de box fin of
+                             # 3 = vide de box fin phase
+                             # 4 = vide de box fin composant
+LOBY         = val(WPAR(5))  # execution
+                             # 1 = facultative
+                             # 2 = obligatoire
+
+WEIUSR = WPAR(6)            #x3-67237:  Save the "REAL" user id
+
+Local Integer L    : L = 0
+Local Integer WTRT : WTRT  = 1
+
+# mm 03.11
+If MFGNUM = "null" : MFGNUM = "" : Endif
+If LITM   = "null" : LITM   = "" : Endif
+
+Call WIN_PROCEDURE(FICTEC,MFGNUM,LOPE,LITM,LTYP,LOBY,L,WTRT) From SCALEXCHAN
+
+Return
+
+###########################################################################
+$SOLDE_EMBALLAGE                                                   #   36
+#  En emballage interne sur dernière pesée si restant dans l'emballage est < qté initiale * % solde emballage
+#  Création d'un mouvement de sortie de type suivi et désignation
+#  "Fin de contenant" sur un OF bidon mensuel
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLOT         = WPAR(2)       # lot                     LOT
+LSLO         = WPAR(3)       # sous-lot                SLO
+LSEQSTA      = val(WPAR(4))  # sequence alloc          SEQ
+QTE          = val(WPAR(5))  # quantité du mouvement
+LOPT         = val(WPAR(6))  # option de pesée
+LLIN         = val(WPAR(7))  # numero de ligne         MFGLIN
+LSEQNOM      = val(WPAR(8))  # sequence nomenclature   BOMSEQ
+
+# mm 109330 09.2015
+# make optional sub-lot (rounding a prerequisite for Sothys customer)
+# article managed with sub-lot?
+Read [ITM]ITM0=NUMCOMPOSANT
+If !fstat
+  If  [F:ITM]LOTMGTCOD <> 4 &  LSLO="ZZZZZ"
+    LSLO =""
+  Endif
+Endif
+
+Call MAJ_FINCONTENANT (LNUM,NUMCOMPOSANT,LLOT,LSLO,LSEQSTA,QTE,LOPT,LLIN,LSEQNOM)  From SCALEXCHAN
+
+Return
+
+###########################################################################
+$MAJ_EMBALLAGE                                                   #   39
+#  Si la quantité physique est <> de la quantité informatique
+#  Création d'un mouvement d'inventaire
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLOT         = WPAR(2)       # lot                     LOT
+LSLO         = WPAR(3)       # Sous-lot                SLO
+QTE          = val(WPAR(4))  # delta pour nouvelle qté du stock   QTYSTU
+LOPT         = val(WPAR(5))  # option de pesée
+LLIN         = val(WPAR(6))  # numero de ligne         MFGLIN
+LSEQNOM      = val(WPAR(7))  # sequence nomenclature   BOMSEQ
+LSENS        = val(WPAR(8))  # sens de la mise à jour : 1= en +, 2 = en -  etc...
+
+# mm 109330 09.2015
+# make optional sub-lot (rounding a prerequisite for Sothys customer)
+# article managed with sub-lot?
+Read [ITM]ITM0=NUMCOMPOSANT
+If !fstat
+  If  [F:ITM]LOTMGTCOD <> 4 &  LSLO="ZZZZZ"
+    LSLO =""
+  Endif
+Endif
+
+# APCPRD-2753 mm 02.2013
+#QTE = QTE / 1000
+Call MAJ_CONTENANT (LNUM,NUMCOMPOSANT,LLOT,LSLO,QTE,LOPT,LLIN,LSEQNOM,LSENS)  From SCALEXCHAN
+
+Return
+
+
+
+###########################################################################
+$CHGMN_OF_SANSPESE                                                  #   37
+#             desallocation du composant
+#             rewrite du mfhhead  avec WGGflg = 3 (plan pesee)
+###########################################################################
+LNUM_OLD     = WPAR(0)       # numero de l OF ancien   MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(3))  # sequence nomenclature   BOMSEQ
+LNUM         = WPAR(4)       # numero de l OF          MFGNUM
+PESEE_ART    = val(WPAR(5))  # si PESEE_ART = 2 -> pesée par article  - mm 10.10
+
+Local    Integer WRET : WRET=0                    # 44043 mm 04.08
+Local    Decimal QTYBESOIN  : QTYBESOIN=0         # 44043 mm 04.08
+Local    Integer W_WGGBOX   : W_WGGBOX =1               # mm 12.10
+
+Local Shortint  EXPITM    #X3-85848.n - added for call to XTRACT_NUMOF
+
+# 44043 mm 04.08
+If find(LALLSTA,1,2,3)
+    Call DES_ALLOCATION_A (LNUM_OLD, NUMCOMPOSANT, LLIN, LSEQ)   From SCALEXCHAN
+    If find (LALLSTA,2,3)
+        Call ALLOC_MAT ("C",1,LNUM_OLD,1,1,WRET,NUMCOMPOSANT,LLIN,LSEQ,QTYBESOIN) From MFGALL
+    Endif
+Endif
+Raz LALLSTA
+
+Call DEBTRANS From GLOCK
+Trbegin [MFG],[MFM]
+
+# 44409 mm 06.08 -  on ne repasse en statut non pesé que si aucun suivi n'existe pour la matière
+# 85521 mm 10.12 - Gérer WGGBOX pour la pesée par OF
+Filter [MKM] Where MFGNUM=LNUM_OLD &
+&     MFGLIN = LLIN                &
+&     BOMSEQ = LSEQ                &
+&     ITMREF = NUMCOMPOSANT
+    Read [MKM] First
+    If fstat
+       Call MAJ_FICHIERS ("MFM",1,1,LNUM_OLD,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+    Else
+       Call MAJ_FICHIERS ("MFM",0,1,LNUM_OLD,NUMCOMPOSANT,LLIN,LSEQ) From SCALEXCHAN
+    Endif
+Filter [MKM]
+
+If PESEE_ART = 2
+    # mm 12.10 - vérification qu'il ne reste plus de matière en cours de pesée
+    # avant de remettre l'OF dans le plan de pesée
+    For [MFM] Where MFGNUM= LNUM_OLD
+       If [F:MFM]WGGBOX = 2   : W_WGGBOX = 2: Break : Endif
+    Next
+    # si aucune matière en cours de pesée, on remet l'OF dans le plan de pesée
+    If  W_WGGBOX =1
+      Call MAJ_FICHIERS ("MFG",3,0,LNUM_OLD,"",0,0) From SCALEXCHAN
+    Endif
+Else
+   Call MAJ_FICHIERS ("MFG",3,0,LNUM_OLD,"",0,0) From SCALEXCHAN
+Endif
+# mm 01.11
+#Commit
+If GOK < 1 : Rollback : Return
+Else : Commit
+Endif
+
+#X3-85848.o - replaced with new call      If LNUM <> ""  Call XTRACT_NUMOF (LNUM, "null")   From SCALEXCHAN
+If LNUM <> ""  Call XTRACT_NUMOF (LNUM, "null", EXPITM)   From SCALEXCHAN      #X3-85848.n - New call
+               Call TRF_PHA  From SCALEXCHAN
+               Call TRF_MAT  From SCALEXCHAN
+               Call TRF_HSH  From SCALEXCHAN
+Endif
+Return
+
+
+###########################################################################
+$RES_CALIBRAGE_OK                                                   #   40
+###########################################################################
+
+Call MAJ_CALIBRAT ("40")  From SCALEXCHAN
+
+Return
+
+
+###########################################################################
+$RES_CALIBRAGE_KO                                                   #   41
+###########################################################################
+
+Call MAJ_CALIBRAT ("41")  From SCALEXCHAN
+
+Return
+
+###########################################################################
+$RES_CALIBRAGE_KO_SUROK                                                   #   42
+###########################################################################
+
+Call MAJ_CALIBRAT ("42")  From SCALEXCHAN
+
+Return
+
+
+###########################################################################
+$MAJ_BALANCE                                                        #   45
+# val1 correspond au code de mise à jour de la balance
+#                           10 choix pour la pesee
+#                           11 validation de la pesee
+#                           19 fin de pesage
+#                           20 choix pour l etalonnage
+#                           28 fin etalonnage KO
+#                           29 fin etalonnage OK
+# lnum correspond au numero de balance
+###########################################################################
+
+LNUM         = WPAR(0)       # numero de balance
+VAL1         = val(WPAR(1))  # code mise à jour
+#Call DEBTRANS From GLOCK
+#Trbegin [SLE]
+Call MAJ_FICHIERS ("SLE",VAL1,0,LNUM,"",0,0) From SCALEXCHAN
+#commit
+Return
+
+###########################################################################
+$REFRESH                                                                  #   46
+#             rewrite du mfhhead  avec WGGflg = 3 (plan pesee)
+###########################################################################
+Local Char   NUMOF (15)
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+
+If LNUM <> ""
+    Call DEBTRANS From GLOCK
+    Trbegin [MFG]
+    Call MAJ_FICHIERS ("MFG",3,0,LNUM,"",0,0) From SCALEXCHAN
+    Commit
+Endif
+Raz  NUMOF
+# EXTRACTION initiale des données
+Gosub XTRACT_DATA From SCALELIB
+
+# transfert des données sur le client (on ne récupère que les données liées à l'OF)
+Call TRF_MWG  From SCALEXCHAN
+Call TRF_PHA  From SCALEXCHAN
+Call TRF_MAT  From SCALEXCHAN
+Call TRF_HSH  From SCALEXCHAN
+
+Return
+
+##########################################################################
+$RELOAD_ALL                                                     #   47
+#    NON UTILISE POUR LE MOMENT ...
+#             Extraction des nouvelles allocations
+#             Suite à une pesée intermédiaire supérieure au prévu
+#             generation du STO
+#             transfert du STO
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(3))  # numero de ligne         MFGLIN
+LSEQ         = val(WPAR(4))  # sequence nomenclature   BOMSEQ
+
+Read [MFM]MFM0=LNUM;LLIN;LSEQ;NUMCOMPOSANT
+If fstat : Raz [MFM] : Endif
+
+Call DES_ALLOCATION_A (LNUM , NUMCOMPOSANT, LLIN, LSEQ)   From SCALEXCHAN
+
+QTYBESOIN = 0
+
+Call XTRACT_ALLOCATION (LNUM , NUMCOMPOSANT,QTYBESOIN, LLIN, LSEQ,2, [F:MFM]RETDAT)   From SCALEXCHAN
+Call TRF_STO  From SCALEXCHAN
+Return
+
+###########################################################################
+$STOCK_DETAILLE
+# tunnel vers la consultation des stocks détaillés                   # 048
+###########################################################################
+Local Decimal BASPAG
+
+NUMCOMPOSANT = WPAR(0)       # numero du composant     ITMREF
+
+## Action CONSSDE
+ Local Char    PARMSK(250)(1..20)
+ GACTION = "CONSSDE"
+ PARMSK(1) = num$(0)
+ PARMSK(2) = GSCA1MFGFCY
+ PARMSK(3) = NUMCOMPOSANT
+ PARMSK(4) = ""
+ PARMSK(5) = ""
+ PARMSK(6) = ""
+ PARMSK(7) = ""
+ PARMSK(8) = ""
+ Call CONSULT_NUM(BASPAG,"SDE",PARMSK) From GCONSULT
+
+Return
+
+###########################################################################
+$CHANGEMENT_MAT_ART                                               #   49
+###########################################################################
+NUMCOMPOSANT = WPAR(0)       # numero du composant     ITMREF
+
+Call XTRACT_PSEMAT_MAT (NUMCOMPOSANT) From SCALEXCHAN
+Return
+
+###########################################################################
+$CHANGEMENT_OF_ART                                                 #   50
+###########################################################################
+NUMCOMPOSANT = WPAR(0)
+
+Call XTRACT_PSEMAT_OF (NUMCOMPOSANT) From SCALEXCHAN
+Return
+
+###########################################################################
+$FIN_COMPOSANT_ART                                                 #   51
+###########################################################################
+LNUM         = WPAR(0)       # numero de l OF          MFGNUM
+NUMCOMPOSANT = WPAR(1)       # numero du composant     ITMREF
+LLIN         = val(WPAR(2))  # numero de ligne         MFGLIN
+LOPE         = val(WPAR(3))  # numero d'operation      BOMOPE
+
+Call PESEE_COMPLETE_ART (LNUM,NUMCOMPOSANT,LOPE)  From SCALEXCHANA
+Return
+
+###########################################################################
+$ABANDON_PESEEMULTI                                                 #  52
+###########################################################################
+Call MAJ_WGG()  From SCALEXCHANA
+Return
+
+###########################################################################
+$PESE_IMPRESSION
+###########################################################################
+
+Local Char TBPAR(10)(1..50),TBVAL(30)(1..50)
+If NOMETA = "" Return : Endif
+Call IMPRESSION(NOMETA,"",TYPETA) From SCALEXCHAN
+#Call ETAT(NOMETA,"FUNSCA",TBPAR,TBVAL) From ETAT
+
+Return
+
+###########################################################################
+# abandon
+###########################################################################
+
+$AB_TRT
+Rollback
+Return
+
+###########################################################################
+$OUV_FICHMASK
+###########################################################################
+If clalev([F:SLE])  <= 0 : Local File SCALES     [SLE]  : Endif
+If clalev([F:STX])  <= 0 : Local File STATION    [STX]  : Endif
+If clalev([F:SBX])  <= 0 : Local File STATIONBOX [SBX]  : Endif
+If clalev([F:CGD])  <= 0 : Local File CALIGUIDES [CGD]  : Endif
+If clalev([F:HSH])  <= 0 : Local File HANDLING   [HSH]  : Endif
+If clalev([F:HSR])  <= 0 : Local File HANDLINGR  [HSR]  : Endif
+If clalev([F:TKS])  <= 0 : Local File TANKS      [TKS]  : Endif
+If clalev([F:TGT])  <= 0 : Local File TANKSGATES [TGT]  : Endif
+If clalev([F:CTN])  <= 0 : Local File CONTAINERS [CTN]  : Endif
+If clalev([F:WGG])  <= 0 : Local File WEIGHING   [WGG]  : Endif
+
+If clalev([F:CBT])  <= 0 : Local File CALIBRAT   [CBT]  : Endif
+If clalev([F:MWA])  <= 0 : Local File MWMCRDASW  [MWA]  : Endif
+
+If clalev([F:ITM])  <= 0 : Local File ITMMASTER  [ITM]  : Endif
+If clalev([F:ITF])  <= 0 : Local File ITMFACILIT [ITF]  : Endif
+
+If clalev([F:MFG])  <= 0 : Local File MFGHEAD    [MFG]  : Endif
+If clalev([F:MFI])  <= 0 : Local File MFGITM     [MFI]  : Endif
+If clalev([F:MFM])  <= 0 : Local File MFGMAT     [MFM]  : Endif
+If clalev([F:MFO])  <= 0 : Local File MFGOPE     [MFO]  : Endif
+If clalev([F:ORD])  <= 0 : Local File ORDERS     [ORD]  : Endif
+
+If clalev([F:STL])  <= 0 : Local File STOLOT     [STL]  : Endif
+If clalev([F:STO])  <= 0 : Local File STOCK      [STO]  : Endif
+If clalev([F:STA])  <= 0 : Local File STOALL     [STA]  : Endif
+
+If clalev([F:ADI])  <= 0 : Local File ATABDIV    [ADI]  : Endif
+If clalev([F:TST])  <= 0 : Local File TABSTASTO  [TST]  : Endif
+If clalev([F:AUS])  <= 0 : Local File AUTILIS    [AUS]  : Endif
+If clalev([F:ACC])  <= 0 : Local File ACCES      [ACC]  : Endif
+If clalev([F:TCO])  <= 0 : Local File TABCOEFF   [TCO]  : Endif
+
+# 44409 mm 06.08
+If clalev([F:MKM])  <= 0 : Local File MFGMATTRK  [MKM]  : Endif
+#
+If clalev([M:MWAP])  <= 0 : Local Mask MWAP      [MWAP]  : Endif
+
+Return
+
+########################################################################
+# tunnels
+$ZOOM
+Case WPAR(0)
+    When "MWS":     If (len(WPAR(1)) > GLONWST)
+                        WPAR(1) = left$(WPAR(1),GLONWST)
+                        WPAR(1) = vireblc(WPAR(1),1)
+                    Endif
+                    WPAR(2) = GOPTFCY
+                    #------------------------------------------------------------------------------------------------------------------
+                    # point d'entrée ZOOMGANTT (28603)
+                    GPE = 0
+                    GPOINT = "ZOOMGANTT" : Gosub ENTREE From EXEFNC
+                    If GPE : Return : Endif
+                    #------------------------------------------------------------------------------------------------------------------
+                    Call OBJET(WPAR(0), WPAR(2), WPAR(1)) From GOBJET
+    When "TDUVAR":  Local Char VALBOUT(250) , PARBOUT(250)(1..20)
+                    PARBOUT(1) = ""
+                    GACTION = "TRTTDUVAR"
+                    Call TRAITE_CHAR(VALBOUT,PARBOUT,"FTDUVAR","FUNTDUVAR","DTDUVAR",3,"XYFUNTDUVAR") From GTRAITE
+    When Default:   If WPAR(0) = "ITM"
+                       # GH 03/01/2013 bug 95418
+                       #WPAR(1) = vireblc(left$(WPAR(1), len(WPAR(1)) - 3),1)
+                       I=instr(1,WPAR(1)," ")
+                       If I : WPAR(1) = left$(WPAR(1),I-1) : Endif
+                    Endif
+                    #------------------------------------------------------------------------------------------------------------------
+                    # point d'entrée ZOOMGANTT (28603)
+                    GPE = 0
+                    GPOINT = "ZOOMGANTT" : Gosub ENTREE From EXEFNC
+                    If GPE : Return : Endif
+                    #------------------------------------------------------------------------------------------------------------------
+                    Call OBJET(WPAR(0), WPAR(1), WPAR(2)) From GOBJET
+Endcase
+
+Return
+
+##############################################################################
+##############################################################################
+# Décodage du message contenu dans RETOUR
+$PROCESS_ERR
+Call ERREUR(mess(206,193,1)) From GESECRAN            # llc 09.02
+Return
+
+
+
+##############################################################################
+# Décodage du message contenu dans RETOUR
+$DECODE
+# les trois premiers caractères correspondent au code retour
+CODE = left$(RETOUR,3)
+If CODE = "021" : SAVMESS = RETOUR : SAVMESS(1) = RETOUR(1) : Endif
+# test sortie de la fonction
+If CODE = "999" | CODE = "" : Return : Endif
+
+# on a récupéré, le code, on peut ignorer la partie gauche
+WPARAM   = right$(RETOUR,6)
+# analyse de la description des paramètres
+Raz C1, C2, WPAR, WTYP, WLON
+NBPAR     = 0
+POSITION  = 1
+While (C1 <> IFORMAT)
+      # plus de 11 paramètres, on sort
+      If NBPAR >= 11 : Break : Endif            # 09.05 31916
+
+      # analyse description paramètre (type, longueur)
+      C1 = mid$(WPARAM, POSITION, 1)
+
+      If C1 = "" : Break : Endif
+
+      If C1 <> IFORMAT
+          Case C1
+              When "X","x":   WTYP(NBPAR) = 1    # alphanumérique
+              When "N","n":   WTYP(NBPAR) = 2    # numérique
+          Endcase
+          # mémorisation de la longueur
+          POSITION += 1
+          C2 = mid$(WPARAM, POSITION, 1)
+          WLON(NBPAR) = ascii(C2)
+
+          POSITION += 1
+          NBPAR    += 1
+      Endif
+Wend
+
+# analyse des paramètres
+WPARAM = right$(WPARAM, POSITION+1)
+# 09.05 31916
+For I = 0 To NBPAR-1
+    WPAR(I) = left$(WPARAM, WLON(I))
+    # si le paramètre faisait 10 caractères, on a ajouté "///" : Il faut les enlever
+    If WLON(I) = 13 & mid$(WPAR(I),WLON(I)-2,3) = "///"
+        WPAR(I) = left$(WPAR(I),WLON(I)-3)
+    Endif
+    WPARAM  = right$(WPARAM, WLON(I)+1)
+Next I
+Return
+
+
+
+##############################################################################
+# Décodage du message contenu dans RETOUR
+$DECODE1
+
+# les trois premiers caractères correspondent au code retour
+CODE = left$(RETOUR,3)
+
+# test sortie de la fonction
+If CODE = "999" | CODE = "" : Return : Endif
+
+If GUSER="MM"
+ Call ECR_TRACE("code="+num$(CODE),1) From GESECRAN
+Endif
+
+#On a récupéré, le code, on peut ignorer la partie gauche
+WPARAM   = right$(RETOUR,6)
+# analyse de la description des paramètres
+Raz C1, C2, WPAR, WTYP, WLON
+NBPAR     = 0
+POSITION  = 1
+While (C1 <> IFORMAT)
+      # plus de 11 paramètres, on sort
+      If NBPAR >= 11 : Break : Endif                # 09.05 31916
+
+      # analyse description paramètre (type, longueur)
+      C1 = mid$(WPARAM, POSITION, 1)
+
+      If C1 = "" : Break : Endif
+
+      If C1 <> IFORMAT
+          Case C1
+              When "X","x":   WTYP(NBPAR) = 1    # alphanumérique
+              When "N","n":   WTYP(NBPAR) = 2    # numérique
+          Endcase
+          # mémorisation de la longueur
+          POSITION += 1
+          C2 = mid$(WPARAM, POSITION, 1)
+          WLON(NBPAR) = ascii(C2)
+
+          POSITION += 1
+          NBPAR    += 1
+      Endif
+Wend
+
+# analyse des paramètres
+WPARAM = right$(WPARAM, POSITION+1)
+
+For I = 0 To NBPAR-1
+    WPAR(I) = left$(WPARAM, WLON(I))
+    # si le paramètre faisait 10 caractères, on a ajouté "///" : Il faut les enlever
+    If WLON(I) = 13 & mid$(WPAR(I),WLON(I)-2,3) = "///"
+        WPAR(I) = left$(WPAR(I),WLON(I)-3)
+    Endif
+    WPARAM  = right$(WPARAM, WLON(I)+1)
+
+Next I
+Return
+
+##############################################################################
+# Contrôles utilisateur si opération déplacée
+$OPERATION_MOVED
+Case CODE
+    When "050" :     # controle changement de poste opération
+                     Local Char     WMFGNUM(GLONVCR)
+                     Local Integer  WOPENUM, WOPESPLNUM
+                     Local Char     WWST (GLONWST)
+                     Local Char     WSBB
+                     Local Date     WDATE
+                     WMFGNUM     = WPAR(0)
+                     WOPENUM     = val(WPAR(1))
+                     WOPESPLNUM  = val(WPAR(2))
+                     WWST        = WPAR(3)
+                     If WPAR(4) <> " " : WSBB        = WPAR(4) : Endif
+                     If WPAR(5) <> ""  : WDATE       = WPAR(5) : Endif
+                     Gosub OPERATION_MOVED_PE From OPTLIBB
+    When Default:    Return
+Endcase
+Return
+
+##############################################################################
+# Infos disponibilité matières
+$OPERATION_INVENTORY
+Case CODE
+    When "051" :
+                     Local Char     WMFGNUM(GLONVCR)
+                     Local Integer  WOPENUM, WOPESPLNUM
+                     Local Char     WWST (GLONWST)
+                     Local Char     WSBB
+                     Local Date     WDATE
+                     WMFGNUM     = WPAR(0)
+                     WOPENUM     = val(WPAR(1))
+                     WOPESPLNUM  = val(WPAR(2))
+                     WWST        = WPAR(3)
+                     If WPAR(4) <> " " : WSBB        = WPAR(4) : Endif
+                     If WPAR(5) <> ""  : WDATE       = WPAR(5) : Endif
+                     Gosub OPERATION_INVENTORY_PE From OPTLIBB
+    When Default:    Return
+Endcase
+Return
+# gbe 22/02/12 Ajout du stock projeté
+##############################################################################
+# Infos disponibilité matières
+$STOCK_PROJETE
+Case CODE
+    When "052" :
+       ## Action CONSSPR
+       Local Decimal BASPAG_1
+       Local Char    PARMSK_1(250)(1..20) , SAVACT_1(20)
+       SAVACT_1 = GACTION : GACTION = "CONSSPR"
+       PARMSK_1(1) = "0"
+       PARMSK_1(2) = GOPTFCY
+       PARMSK_1(3) = WPAR(0)
+       PARMSK_1(4) = ""
+       Call CONSULT_NUM(BASPAG_1,"SPR",PARMSK_1) From GCONSULT
+       GACTION = SAVACT_1
+    When Default:    Return
+Endcase
+Return
+
+
+# gbe 10/05/12 Ajout du stock disponible à date
+##############################################################################
+# Infos disponibilité matières
+$COMPONENT_AVAILABILITY
+Case CODE
+    When "053" :
+ Local Char    PARMSK_1(250)(1..20) , SAVACT_1(20)
+ Decimal VALEUR_1
+ SAVACT_1 = GACTION : GACTION = "FDISPPLN"
+ PARMSK_1(1) = GOPTFCY
+ PARMSK_1(2) = "5"
+ PARMSK_1(3) = "1"
+ PARMSK_1(4) = WPAR(0)
+ PARMSK_1(5) = WPAR(1)
+ PARMSK_1(6) = WPAR(2)
+ PARMSK_1(7) = WPAR(2)
+ Call SAISIE_NUM(VALEUR_1,PARMSK_1,"IDISPPLN","BENCHLIB","XYZBENCHLIB") From GSAISIE
+ GACTION = SAVACT_1
+
+    When Default:    Return
+Endcase
+Return
+
+
+
+##############################################################################
+# réactualisation des données techniques
+$UPDATE_TD
+Gosub TRT_TEC From FUNMOPT
+Gosub TRF_TEC From FUNMOPT
+Return
+
+##############################################################################
+#fonction de contôle du cache des images ilog
+Subprog CTRLCACHE(ERR)
+Variable Integer ERR
+Local File ILOGIMG [ILI]
+Local Integer NBROW
+Local Integer I
+Local Integer NBBAD
+Local Clbfile RETOUR
+Local Integer POSITION,VERSION
+
+POSITION=0
+VERSION=0
+
+POSITION=instr(0,GRELCLI,'.')
+VERSION=val(right$(GRELCLI,POSITION+1))
+If VERSION < 17
+  End
+Endif
+NBBAD=0
+#comptage des lignes de la table
+NBROW = rowcount([ILI])
+If NBROW = 0
+  Close Local File [ILI]
+  End
+Endif
+#Déclaration des tableaux
+Local Integer TABTIMESTAMP(NBROW)
+Local Char TABFICNAME(250)(NBROW)
+Local Char TABBADFILE(250)(NBROW)
+I=0
+#alimentation des tableaux de nom de fichier et de timestamp
+For [ILI]
+  TABFICNAME(I)=[ILI]NOMFIC
+  TABTIMESTAMP(I)=val([ILI]TIMESTAMP)
+  I+=1
+Next
+#Appel de la fonction du client X3 qui va checker les fichiers du cache
+# ICI appel de la fonction Funciu
+RETOUR = Funciu "SESS_CLI:CHECK_CACHE" With("","SCALE-IMG",TABFICNAME,TABTIMESTAMP,TABBADFILE)
+#Traitement du tableau retourné par la fonction du client X3
+#comptage des fichiers bad
+For I=0 To NBROW-1
+  If TABBADFILE(I)=""
+    Break
+  Endif
+  NBBAD+=1
+Next
+If NBBAD = 0
+  #rien à faire pas de déphasage
+  Close Local File [ILI]
+  End
+Endif
+Kill TABTIMESTAMP
+#Déclaration du tableau de blobs
+Local Blbfile TABBLOB(9)(1)
+Local Integer TABTIMESTAMP(1)
+Local Char TABBADFILEUNIT(250)(1)
+# Pour limiter la consommation de mémoire, on ne passe plus toutes les images
+# dans le tableau, mais uniquement une image dans le tableau
+For I=0 To NBBAD-1
+  Read [ILI]ILO0=TABBADFILE(I)
+  If fstat <>0
+    ERR=1
+    Break
+  Endif
+  TABBLOB(0)=[ILI]IMG
+  TABTIMESTAMP(0)=val([ILI]TIMESTAMP)
+  TABBADFILEUNIT(0)=[ILI]NOMFIC
+  If ERR=0
+#Appel de la fonction du client X3 qui va mettre à jour le cache en fonction du tableau de blobs
+# et du tableau de nom de fichiers déphasés
+# ICI appel de la fonction Funciu
+      RETOUR = Funciu "SESS_CLI:UPDTLOB_CACHE" With("","SCALE-IMG",TABBADFILEUNIT,TABTIMESTAMP,TABBLOB)
+  Endif
+Next
+
+Close Local File [ILI]
+End
+
+Onerrgo
+ERR=1
+Close Local File [ILI]
+End
+
+#CATUA X3-67237.sn
+#Prompt for login and validate
+##############################################################################
+$LOAD_LOGIN
+  Local Char X3USERID(GLONAUS)
+  Local Integer OKLOGIN
+
+  Raz X3USERID, OKLOGIN
+
+  #While X3USERID = "" #Remove while loop to give user the ability to exit and close login prompt
+  If func AFNC.CHECKSYRALOGIN(X3USERID)=[V]CST_AOK
+    # Check permission for weighing
+    # probably something like Call AUTORIS From EXEFNC
+    # may also need to reset GVPROFIL and/or set/reset GFONCTION to FUNWEIGH
+    OKLOGIN = 1
+    GWEIUSER = X3USERID
+  Else
+    OKLOGIN = -1
+    GWEIUSER = "FAIL"
+  Endif
+
+  Call XTRACT_PARAM(OKLOGIN) From SCALEXCHAN
+Return
+#CATUA X3-67237.en
+

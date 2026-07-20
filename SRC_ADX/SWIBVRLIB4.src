@@ -1,0 +1,2046 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ 
+  ######################################################################################################
+# Project       : Swiss Localization
+# File          : SWIBVRLIB4
+# Version       : 1.0
+# Author        : Ulrike Bader
+# Creation Date : 28.12.15
+######################################################################################################
+# Module        : Purchasing / AP/AR Accounting
+# Description   : - ISR handling in purchase invoices (GESBIS / GESPIH)
+######################################################################################################
+ # Updates :
+ # Date       |Author   |Version|Description
+ # 2016-02-17 |Bader    |U10_02 |Bugfixing
+ # 2016-02-19 |DNE      |U10    |Bugfixing (SAM #114567)
+ # 2016-02-22 |Bader    |U10    |SAM #114656: OK_BVR_BIS: Call LEC_TPV_LEG instead of direct reading in [F:TPV]
+ # 2016-03-08 |ANGRE    |U10    |SAM #115076: OK_BVR_BIS: Removed the branch for existing invoices.
+ # 2018-05.28 |Bader    |2018.R5|SET_AMOUNT_BIS: Call AFFCOL only if amount has changed
+######################################################################################################
+
+
+#*****************************************************************************************************
+# CONT_PTE: Control event for changes of payment terms in Supplier BP invoices (GESBIS) and
+#           Invoice control (GESPIH)
+#*****************************************************************************************************
+Subprog CONT_PTE(PTE,MSK)
+
+Variable Char PTE
+Value Integer MSK
+
+Local Char REFLINE(55)
+Local Integer OK
+Local Integer TYPE_DTA
+Local Char TEMPPTE(GLONPTE)
+Local Char CPY(GLONCPY)
+Local Char XSLEG(GLONADI)
+
+If MSK = 1
+    REFLINE = [M:BIS1]BVRREFLINE
+    TEMPPTE= [M:BIS1]PTE
+    CPY = [M:BIS0]CPY
+Else
+    REFLINE = [M:PIH1]BVRREFLINE
+    TEMPPTE = [M:PIH1]PTE
+    If !clalev([F:XFCY]) : Local File FACILITY [XFCY] : Endif
+    Read [F:XFCY]FCY0=[M:PIH0]FCY
+    If fstat = 0  # reading ok
+      CPY = [F:XFCY]LEGCPY
+    Endif
+Endif
+
+# Get ISR DTA type from payment method
+Raz [L]XSLEG
+Call GET_LEG(CPY,[L]XSLEG)
+If !clalev([F:XTPT]) : Local File TABPAYTERM [XTPT] : Endif
+Read [XTPT]TPT0 = PTE;[L]XSLEG;1
+# 2016-02-19 DNE INSERT BEGIN (SAM #114567)
+If fstat
+    # Let's give it a 2nd try for "All legislations".
+    #
+    # Note: For TABPAM table we need "All legislation", too, for a payment term
+    #       with "All legislations" can only contain a payment method for
+    #       "All legislations" (empty value), too.
+    #
+    Raz [L]XSLEG
+    Read [XTPT]TPT0 = PTE;[L]XSLEG;1
+Endif
+# 2016-02-19 DNE INSERT END
+If !clalev([F:XTAM]) : Local File TABPAM [XTAM] : Endif  : # X3-46380
+If fstat = 0
+   Read [XTAM]TAM0 = [XTPT]PAM;[L]XSLEG
+   If fstat = 0
+      TYPE_DTA = [XTAM]TYP
+   Endif
+Endif
+
+# Check correctness of ISR reference line
+If TYPE_DTA = 826 or TYPE_DTA = 28
+    If REFLINE<>""
+        Call VERIF_DTA_826(REFLINE,TYPE_DTA,OK)
+        If mkstat : GERR=2 : GMESSAGE=mess(62,3648,1): Raz mkstat : Endif # The ISR reference line does not match the payment method.
+    Else
+        GERR=1 : GMESSAGE=mess(63,3648,1) # The ISR reference line is required for the types DTA 826 et EZAG 28.
+    Endif
+Elsif TYPE_DTA = 827 or TYPE_DTA = 22
+    If REFLINE="" # empty ISR reference line
+        GERR=2 : GMESSAGE=mess(64,3648,1) # Note: This payment DTA 827 or EZAG 22 may require a reference line (red ISR).
+    Else
+        Call VERIF_DTA_827(REFLINE,TYPE_DTA,OK)
+        If mkstat : GERR=2 : GMESSAGE=mess(62,3648,1): Raz mkstat : Endif # The ISR reference line does not match the payment method.
+    Endif
+Elsif [F:XTAM]SWIPAMBVR = 5 and TYPE_DTA = 1 : # X3-46380
+    If REFLINE<>""
+        Call VERIF_DTA_826(REFLINE,TYPE_DTA,OK)
+        If mkstat : GERR=2 : GMESSAGE=mess(62,3648,1): Raz mkstat : Endif # The ISR reference line does not match the payment method.
+    Else
+        GERR=1 : GMESSAGE=mess(89,3648,1) # The ISR reference line is required for the type ISO 1.
+    Endif
+Elsif [F:XTAM]SWIPAMBVR = 5 and ( TYPE_DTA = 201 or TYPE_DTA = 202) : # X3-46380
+    If REFLINE="" # empty ISR reference line
+        Local Char ISO_TYP(7) : If (TYPE_DTA = 201) Then : ISO_TYP = "ISO 2.1" Else : ISO_TYP = "ISO 2.2" : Endif
+        GERR=2 : GMESSAGE=func AFNC.MES1(mess(90,3648,1),ISO_TYP) # Note: This payment ISO 2.1 may require a reference line (red ISR).
+    Else
+        Call VERIF_DTA_827(REFLINE,TYPE_DTA,OK)
+        If mkstat : GERR=2 : GMESSAGE=mess(62,3648,1): Raz mkstat : Endif # The ISR reference line does not match the payment method.
+    Endif
+Else
+    Local Integer LDSPMES : LDSPMES = 0
+    If REFLINE=""
+        End
+    Else
+        If [F:XTAM]SWIPAMBVR = 5 and find(TYPE_DTA, 1,201,202)<=0 : # X3-46380
+            LDSPMES = 1
+            Call OUINON(mess(91,3648,1),OK) From GESECRAN # The invoice has an ISR reference line, but the  payment method is not ISO 1, ISO 2.1 nor ISO 2.2, would you like to delete it?
+        Elsif find(TYPE_DTA, 826,28,827,22)<=0 : # X3-46380
+            LDSPMES = 1
+            Call OUINON(mess(94,3648,1),OK) From GESECRAN
+        Else
+            LDSPMES = 1
+            Call OUINON(mess(65,3648,1),OK) From GESECRAN # The invoice has an ISR reference line, but the  payment method is not 826 or 827, would you like to delete it?
+        Endif
+    Endif
+    If LDSPMES
+        If OK=1 # No
+            mkstat = 2
+            If TEMPPTE<>""
+                PTE=TEMPPTE
+            Endif
+        Else
+            If MSK=1
+                [M:BIS1]BVRREFLINE=""
+                [M:BIS1]BVRBID=""
+            Else
+                [M:PIH1]BVRREFLINE=""
+                [M:PIH1]BVRBID=""
+            Endif
+        Endif
+    Endif
+Endif
+End
+
+
+#*****************************************************************************************************
+Subprog GET_LEG(CPY,LEG)
+Variable Char CPY
+Variable Char LEG
+
+If CPY <> ""
+   If clalev([F:CPY])  & [F:CPY]CPY = CPY
+      LEG = [F:CPY]LEG
+   Else
+      If !clalev([F:XCPY])  : Local File COMPANY  [XCPY]  : Endif
+      Read [F:XCPY]CPY0 = CPY
+      If !fstat
+          LEG = [F:XCPY]LEG
+      Endif
+   Endif
+Endif
+
+End
+
+######################################################################################################
+#                            Action of screen BPSDUD                                                 #
+######################################################################################################
+
+#*****************************************************************************************************
+#CONT_PAM: Control of payment type
+#*****************************************************************************************************
+Subprog CONT_PAM(PAM)
+Variable Char PAM
+
+Local Integer MASQUE : Raz MASQUE
+Local Char REFLINE(55)  # ISR reference line
+Local Integer TYPE_DTA
+Local Integer OK
+Local Char CPY(GLONCPY)
+Local Char FCY(GLONFCY)
+Local Char XSLEG(GLONADI)
+Raz [L]XSLEG
+
+#---- Check where we come from (GESBIS or GESPIH) ----#
+Call MASQUE(MASQUE)
+
+# Initialisation of ISR reference line
+If MASQUE=1
+    REFLINE = [M:BIS1]BVRREFLINE
+    CPY = [M:BIS0]CPY
+    FCY = [M:BIS0]FCY
+Elsif MASQUE =2
+    REFLINE= [M:PIH1]BVRREFLINE
+    If !clalev([F:XFCY]) : Local File FACILITY [XFCY] : Endif
+    Read [F:XFCY]FCY0=[M:PIH0]FCY
+    If fstat = 0  #lecture ok
+      CPY = [F:XFCY]LEGCPY
+    Endif
+    FCY = [M:PIH0]FCY
+Endif
+
+If int(val(func AFNC.PARAM("SWIPURBVR", FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+    Call GET_LEG(CPY,[L]XSLEG)
+    # Read ISR DTA type from TABPAM
+    If !clalev([F:XTAM]) : Local File TABPAM [XTAM] : Endif
+    Read [XTAM]TAM0 = PAM;[L]XSLEG
+# 2016-02-19 DNE INSERT BEGIN (SAM #114567)
+    If fstat
+        # Let's give a 2nd try for "All legislations".
+        Read [XTAM]TAM0 = PAM;""
+    Endif
+# 2016-02-19 DNE INSERT END
+    If fstat = 0
+        TYPE_DTA = [XTAM]TYP
+    Endif
+
+    # check correctness of ISR reference line
+    If TYPE_DTA = 826 or TYPE_DTA = 28
+        If REFLINE<>""
+            Call VERIF_DTA_826(REFLINE,TYPE_DTA,OK)
+            If mkstat : GERR=2 : GMESSAGE=mess(62,3648,1): Raz mkstat : Endif # The ISR reference line does not match the payment method.
+        Else
+            GERR=1 : GMESSAGE=mess(63,3648,1) # The ISR reference line is required for the types DTA 826, EZAG 28.
+        Endif
+    Elsif TYPE_DTA = 827 or TYPE_DTA = 22
+        If REFLINE="" # empty ISR reference line
+            GERR=2 : GMESSAGE=mess(64,3648,1) # Note: This payment DTA 827 or EZAG 22 may require a reference line (red ISR).
+        Else
+            Call VERIF_DTA_827(REFLINE,TYPE_DTA,OK)
+            If mkstat : GERR=2 : GMESSAGE=mess(62,3648,1): Raz mkstat : Endif # The ISR reference line does not match the payment method.
+        Endif
+    Elsif [F:XTAM]SWIPAMBVR = 5 and TYPE_DTA = 1 : # X3-46380
+        If REFLINE<>""
+            Call VERIF_DTA_826(REFLINE,TYPE_DTA,OK)
+            If mkstat : GERR=2 : GMESSAGE=mess(62,3648,1): Raz mkstat : Endif # The ISR reference line does not match the payment method.
+        Else
+            GERR=1 : GMESSAGE=mess(89,3648,1) # The ISR reference line is required for the type ISO 1.
+        Endif
+    Elsif [F:XTAM]SWIPAMBVR = 5 and ( TYPE_DTA = 201 or TYPE_DTA = 202) : # X3-46380
+        If REFLINE="" # empty ISR reference line
+            Local Char ISO_TYP(7) : If (TYPE_DTA = 201) Then : ISO_TYP = "ISO 2.1" Else : ISO_TYP = "ISO 2.2" : Endif
+            GERR=2 : GMESSAGE=func AFNC.MES1(mess(90,3648,1),ISO_TYP) # Note: This payment ISO 2.1 may require a reference line (red ISR).
+        Else
+            Call VERIF_DTA_827(REFLINE,TYPE_DTA,OK)
+            If mkstat : GERR=2 : GMESSAGE=mess(62,3648,1): Raz mkstat : Endif # The ISR reference line does not match the payment method.
+        Endif
+    Else
+        If REFLINE=""
+            End
+        Else
+            If [F:XTAM]SWIPAMBVR = 5 and find(TYPE_DTA, 1,201,202)<=0 : # X3-46380
+                Call OUINON(mess(91,3648,1),OK) From GESECRAN # The invoice has an ISR reference line, but the  payment method is not ISO 1, ISO 2.1 nor ISO 2.2, would you like to delete it?
+                If OK=2 # Yes
+                    If MASQUE=1
+                       [M:BIS1]BVRREFLINE = ""
+                       [M:BIS1]BVRBID=""
+                    Else
+                       [M:PIH1]BVRREFLINE = ""
+                       [M:PIH1]BVRBID=""
+                    Endif
+                Endif
+            Else
+                Call OUINON(mess(65,3648,1),OK) From GESECRAN # The invoice has an ISR reference line, but the  payment method is not 826 or 827, would you like to delete it?
+                If OK=2 # Yes
+                    If MASQUE=1
+                        [M:BIS1]BVRREFLINE = ""
+                        [M:BIS1]BVRBID=""
+                    Else
+                        [M:PIH1]BVRREFLINE = ""
+                        [M:PIH1]BVRBID=""
+                    Endif
+                Endif
+            Endif
+        Endif
+    Endif
+Endif
+End
+#*****************************************************************************************************
+
+#-----------------------------------------------------------------------------------------------------
+# VERIF_DTA_826: Verification of ISR format 826
+#-----------------------------------------------------------------------------------------------------
+Subprog VERIF_DTA_826(REFLINE,SWIPAMTYP,RET)
+
+Variable Char REFLINE       # ISR reference line
+Variable Integer SWIPAMTYP  # X3-46380
+Variable Integer RET        # return code
+
+Local Char GD(2)            # ISR type
+Local Char TYPAMT(12)       # ISR type + amount (for calculation of check digit)
+Local Char C1(1)            # Check digit 1
+Local Char CD(2)            # Check value (2 chars for 41 length format)
+Local Char REF(33)          # ISR reference number
+Local Char C2(1)            # Check digit 2
+Local Char C3(1)            # Check digit 3
+Local Char BVRNUM_(11)      # ISR customer number
+Local Char MODULO10_(10)    # Check digit
+Local Integer AMT_          # For check in misc. table 8700 if ISR with amount or without
+
+If len(REFLINE) = 53 and mid$(REFLINE,14,1) = ">" and mid$(REFLINE,42,2) = "+ " and right$(REFLINE,53) = ">"
+   Gosub DTA_826_53   # Format {#13>#27+ #9>}
+Elsif len(REFLINE) = 43 and mid$(REFLINE,4,1) = ">" and mid$(REFLINE,32,2) = "+ " and right$(REFLINE,43) = ">"
+   Gosub DTA_826_43   # Format {#3>#27+ #9>}
+Elsif len(REFLINE) = 42 and mid$(REFLINE,14,1) = ">" and mid$(REFLINE,31,2) = "+ " and right$(REFLINE,42) = ">"
+   Gosub DTA_826_42   # Format {#13>#16+ #9>}
+Elsif len(REFLINE) = 41 and mid$(REFLINE,1,1) = "<" and mid$(REFLINE,17,2) = "> " and mid$(REFLINE,34,2) = "+ " and right$(REFLINE,41) = ">"
+   Gosub DTA_826_41   # Format {<#15> #15+ #5>}
+Elsif len(REFLINE) = 32 and mid$(REFLINE,4,1) = ">" and mid$(REFLINE,21,2) = "+ " and right$(REFLINE,32) = ">"
+   Gosub DTA_826_32   # Format {#3>#16+ #9>}
+Elsif len(REFLINE) = 23 and mid$(REFLINE,16,2) = "+ " and right$(REFLINE,23) = ">"
+   Gosub DTA_826_23   # Format {#15+ #5>}
+Else # Format incorrect for DTA 826
+   # X3-46380
+   Local Char ISOTYP(7) : ISOTYP="826"
+   If SWIPAMTYP = 1 : ISOTYP = "ISO 1" : Endif
+    mkstat = 2 : GERR = 1 : GMESSAGE = func AFNC.MES1(mess(66,3648,1),ISOTYP) : End : # The format of the ISR reference line is not correct for type $1$.
+Endif
+End
+#-----------------------------------------------------------------------------------------------------
+
+
+#-----------------------------------------------------------------------------------------------------
+# DTA 826 Format {#3>#27+ #9>}
+#
+# TTC>NNNNNNNNNNNNNNNNNNNNNNNNNNC+ XXXXXXXXC>
+# where
+#   TT - document type
+#   C - check digit (modulo 10)
+#   NNNNNNNNNNNNNNNNNNNNNNNNNN - reference number
+#   XXXXXXXX - bank clearing number
+#
+# Example: 042>000017070000419950102141145+ 010169055>
+#-----------------------------------------------------------------------------------------------------
+$DTA_826_43
+    # Extract values from ISR reference line
+    GD = left$(REFLINE,2)
+    C1 = mid$(REFLINE,3,1)
+    REF= mid$(REFLINE,5,26)
+    C2=mid$(REFLINE,31,1)
+    BVRNUM_=mid$(REFLINE,34,8)
+    C3=mid$(REFLINE,42,1)
+
+    # check if with or without amounts
+    Call SET_AMOUNTFLAG(GD, AMT_)
+    If AMT_<>2 : GERR=1: GMESSAGE=mess(68,3648,1) : mkstat=2 : RET=2 : Return : Endif  : # The ISR type is not correct (04, 14, 31 or 33 for this type)
+
+
+    # Control of the first check digit on ISR type
+    Call MODULOR(GD,MODULO10_) From SWILIB0
+    If (C1)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(70,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR type.
+    Endif
+
+    # Control of the second check digit on ISR reference number
+    Call MODULOR(REF,MODULO10_) From SWILIB0
+    If (C2)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(71,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR reference number.
+    Endif
+
+    # Control of the third check digit on ISR participant number
+    Call MODULOR(BVRNUM_,MODULO10_) From SWILIB0
+    If (C3)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(72,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR participant number.
+    Endif
+
+    RET += 1
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+# DTA 826 Format {#13>#16+ #9>}
+#
+# TTFFFFFFFFRRC>NNNNNNNNNNNNNNNC+ XXXXXXXXC>
+# where
+#   TT - document type
+#   FFFFFFFF - amount in Swiss Franc
+#   RR - amount in Rappen
+#   C - check digit (modulo 10)
+#   NNNNNNNNNNNNNNN - reference number
+#   XXXXXXXX - bank clearing number
+#
+# Example: 0100000549506>3804137405061016+ 010004897>
+#-----------------------------------------------------------------------------------------------------
+$DTA_826_42
+    # Extract values from ISR reference line
+    GD = left$(REFLINE,2)
+    TYPAMT = left$(REFLINE,12)
+    C1 = mid$(REFLINE,13,1)
+    REF= mid$(REFLINE,15,15)
+    C2=mid$(REFLINE,30,1)
+    BVRNUM_=mid$(REFLINE,33,8)
+    C3=mid$(REFLINE,41,1)
+
+   Call SET_AMOUNTFLAG(GD, AMT_)
+   If AMT_<>1 : GERR=1: GMESSAGE=mess(69,3648,1) : mkstat=2 : RET=2 : Return : Endif  : # The ISR type is not correct (01, 03, 11, 21 or 23 for this type)
+    # check if with or without amounts
+
+    # Control of the first check digit on ISR type
+    Call MODULOR(TYPAMT,MODULO10_) From SWILIB0
+    If (C1)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(70,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR type.
+    Endif
+
+    # Control of the second check digit on ISR reference number
+    Call MODULOR(REF,MODULO10_) From SWILIB0
+    If (C2)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(71,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR reference number.
+    Endif
+
+    # Control of the third check digit on ISR participant number
+    Call MODULOR(BVRNUM_,MODULO10_) From SWILIB0
+    If (C3)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(72,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR participant number.
+    Endif
+
+    RET += 1
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+# DTA 826 Format {<#15> #15+ #5>}
+#
+# <PPYYTTFFFFFFFRR> NNNNNNNNNNNNNNN+ XXXXC>
+# where
+#   PP - check digits (modulo 11)
+#   YY - reserved
+#   TT - document type
+#   FFFFFFF - amount in Swiss Franc
+#   RR - amount in Rappen
+#   C - check digit (modulo 10)
+#   NNNNNNNNNNNNNNN - reference number
+#   XXXX - bank clearing number
+#
+# Example: <010001000017720> 000010050025143+ 60219>
+#-----------------------------------------------------------------------------------------------------
+$DTA_826_41
+    # <PPRRAABBBBBBBBB> NNNNNNNNNNNNNNN+ TTTTp>
+    #   PP - Prüfziffer (Modulo 11 rekursiv)
+    #   RR - Reserve
+    #   AA - Belegartcode
+    #   BBBBBBBBB - Betrag
+    #   NNNNNNNNNNNNNNN - Referenznummer
+    #   TTTT - Teilnehmer-Nr.
+    #   p - Prüfziffer (Modulo 10 rekursiv)
+    #
+    # Extract values from ISR reference line
+    CD = mid$(REFLINE,2,2)
+    REF= mid$(REFLINE,4,13)+mid$(REFLINE,19,15)+mid$(REFLINE,36,5)
+    BVRNUM_=mid$(REFLINE,36,4)
+    C3=mid$(REFLINE,40,1)
+
+    # Control of the third check digit on ISR participant number
+    Call MODULOR(BVRNUM_,MODULO10_) From SWILIB0
+    If (C3)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(72,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR participant number.
+    Endif
+
+    # Control of the first check digit on ISR reference number
+    Call MODULOR11(REF,MODULO10_)
+    If (CD)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(71,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR reference number.
+    Endif
+
+    RET += 1
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+# DTA 826 Format {#13>#27+ #9>}
+#
+# TTFFFFFFFFRRC>NNNNNNNNNNNNNNNNNNNNNNNNNNC+ XXXXXXXXC>
+# where
+#   TT - document type
+#   FFFFFFFF - amount in Swiss Franc
+#   RR - amount in Rappen
+#   C - check digit (modulo 10)
+#   NNNNNNNNNNNNNNNNNNNNNNNNNN - reference number
+#   XXXXXXXX - bank clearing number
+#
+# Example: 0100000124004>330115000160773400000027900+ 010033018>
+#-----------------------------------------------------------------------------------------------------
+$DTA_826_53
+    # Extract values from ISR reference line
+    GD = left$(REFLINE,2)
+    TYPAMT = left$(REFLINE,12)
+    C1 = mid$(REFLINE,13,1)
+    REF= mid$(REFLINE,15,26)
+    C2=mid$(REFLINE,41,1)
+    BVRNUM_=mid$(REFLINE,44,8)
+    C3=mid$(REFLINE,52,1)
+
+    # check if with or without amounts
+    Call SET_AMOUNTFLAG(GD, AMT_)
+    If AMT_<>1 : GERR=1: GMESSAGE=mess(69,3648,1) : mkstat=2 : RET=2 : Return : Endif  : # The ISR type is not correct (01, 03, 11, 21 or 23 for this type)
+
+    # Control of the first check digit on ISR type
+    Call MODULOR(TYPAMT,MODULO10_) From SWILIB0
+    If (C1)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(70,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR type.
+    Endif
+
+    # Control of the second check digit on ISR reference number
+    Call MODULOR(REF,MODULO10_) From SWILIB0
+    If (C2)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(71,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR reference number.
+    Endif
+
+    # Control of the third check digit on ISR participant number
+    Call MODULOR(BVRNUM_,MODULO10_) From SWILIB0
+    If (C3)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(72,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR participant number.
+    Endif
+
+    RET += 1
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+# DTA 826 Format {#3>#16+ #9>}
+#
+# TTC>NNNNNNNNNNNNNNNC+ XXXXXXXXC>
+# where
+#   TT - document type
+#   C - check digit (modulo 10)
+#   NNNNNNNNNNNNNNN - reference number
+#   XXXXXXXX - bank clearing number
+#
+# Example: 042>0540519016059511+ 010153331>
+#-----------------------------------------------------------------------------------------------------
+$DTA_826_32
+    # Extract values from ISR reference line
+    GD = left$(REFLINE,2)
+    C1 = mid$(REFLINE,3,1)
+    REF= mid$(REFLINE,5,15)
+    C2=mid$(REFLINE,20,1)
+    BVRNUM_=mid$(REFLINE,23,8)
+    C3=mid$(REFLINE,31,1)
+
+    # check if with or without amounts
+    Call SET_AMOUNTFLAG(GD, AMT_)
+    If AMT_<>2 : GERR=1: GMESSAGE=mess(68,3648,1) : mkstat=2 : RET=2 : Return : Endif  : # The ISR type is not correct (04, 14, 31 or 33 for this type)
+
+    # Control of the first check digit on ISR type
+    Call MODULOR(GD,MODULO10_) From SWILIB0
+    If (C1)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(70,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR type.
+    Endif
+
+    # Control of the second check digit on ISR reference number
+    Call MODULOR(REF,MODULO10_) From SWILIB0
+    If (C2)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(71,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR reference number.
+    Endif
+
+    # Control of the third check digit on ISR participant number
+    Call MODULOR(BVRNUM_,MODULO10_) From SWILIB0
+    If (C3)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(72,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR participant number.
+    Endif
+
+    RET += 1
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+# DTA 826 Format {#15+ #5>}
+#
+# NNNNNNNNNNNNNNN+ XXXXC>
+# where
+#   C - check digit (modulo 10)
+#   NNNNNNNNNNNNNNN - reference number
+#   XXXX - bank clearing number
+#
+# Example: 000130202548577+ 21391>
+#-----------------------------------------------------------------------------------------------------
+$DTA_826_23
+    # Extract values from ISR reference line
+    BVRNUM_=mid$(REFLINE,18,4)
+    C3=mid$(REFLINE,22,1)
+
+    # Control of the third check digit on ISR participant number
+    Call MODULOR(BVRNUM_,MODULO10_) From SWILIB0
+    If (C3)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(72,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR participant number.
+    Endif
+
+    RET += 1
+Return
+
+
+
+#-----------------------------------------------------------------------------------------------------
+# VERIF_DTA_827: Verification of ISR format 827
+#-----------------------------------------------------------------------------------------------------
+Subprog VERIF_DTA_827(REFLINE, SWIPAMTYP, RET)
+Variable Char    REFLINE    # ISR reference line
+Variable Integer SWIPAMTYP  # X3-46380
+Variable Integer RET        # return code
+
+    Local Char REF(33)          # ISR reference number
+    Local Char BVRNUM(11)
+    Local Char NUMCLEAR(5)
+    Local Char C1(1)            # Check digit 1
+    Local Char KBVRNUM(13)      # const + BVRNUM
+    Local Char C2(1)            # Check digit 2
+    Local Char C3(1)            # Check digit 3
+    Local Char MODULO10_(10)    # Check digit
+
+    If len(REFLINE) = 39 and mid$(REFLINE,28,2) = "+ " and right$(REFLINE,39) = ">"  # Format {#27+ #9>}
+        Gosub DTA_827_39
+    Elsif len(REFLINE) = 10 and right$(REFLINE,10) = ">"  # Format {#9>}
+        Gosub DTA_827_10
+    Else
+        # X3-46380
+        If (SWIPAMTYP = 0) Then
+            mkstat = 2 : GERR = 1 : GMESSAGE = mess(93,3648,1) : End : # The format of the ISR reference line is not correct for type $1$.
+        Else
+            Local Char ISOTYP(7) : ISOTYP="827"
+            If SWIPAMTYP = 201 : ISOTYP = "ISO 2.1" Elsif SWIPAMTYP = 202 : ISOTYP = "ISO 2.2" : Endif
+            # Format incorrect for DTA 827
+            mkstat = 2 : GERR = 1 : GMESSAGE = func AFNC.MES1(mess(66,3648,1),ISOTYP) : End : # The format of the ISR reference line is not correct for type $1$.
+        Endif
+    Endif
+End
+
+#-----------------------------------------------------------------------------------------------------
+# DTA 827 Format {#27+ #9>}
+#
+# RRRRRRRRRRNNNNNNNNNNNNNNNNC+ 07XXXXXPC>
+# where
+#   07 - constant "07"
+#   P - check digit for the clearing number (modulo 10)
+#   C - check digit (modulo 10)
+#   RRRRRRRRRR - reference number or null
+#   NNNNNNNNNNNNNNNN - account number
+#   XXXXXXXX - bank clearing number
+#
+# Example: 192532685100000000234512348+ 079230045>
+#-----------------------------------------------------------------------------------------------------
+$DTA_827_39
+    # RRRRRRRRRRXXXXXXXXXXXXXXXXP
+    #   R = Referenznummer des Kunden oder Nullen
+    #   X = Konto-Nr. des Begünstigten bei der Bank
+    #   P = Prüfziffer der ganzen Referenznummer (Modulo 10 rekursiv)
+    # Ex.: 000000000000001234567890128
+    #
+    # VVXXXXXpP>
+    #   VV = Konstante "07"
+    #   XXXXX = Bankenclearing-Nr.
+    #   p = Prüfziffer der Bankenclearing-Nr. (inkl. vorlaufende Nullen) (Modulo 10 rekursiv)
+    #   P = Prüfziffer der ganzen Nummer (Konstante und Bankenclearing-Nr.) (Modulo 10 rekursiv)
+    #   > = Hilfszeichen
+    # Ex.: 070888854>
+    #
+    # Extract values from ISR reference line
+    REF=left$(REFLINE,26)
+    C1=mid$(REFLINE,27,1)
+    KBVRNUM=mid$(REFLINE,30,8)
+    BVRNUM=mid$(REFLINE,32,5)
+    C2=mid$(REFLINE,37,1)
+    C3=mid$(REFLINE,38,1)
+
+    # Control of the first check digit on ISR reference number
+    Call MODULOR(REF,MODULO10_) From SWILIB0
+    If (C1)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(71,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR reference number.
+    Endif
+
+    # Control of the second check digit on ISR participant number
+    Call MODULOR(BVRNUM,MODULO10_) From SWILIB0
+    If (C2)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(72,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR participant number.
+    Endif
+
+    # Control of the third check digit on ISR participant number
+    Call MODULOR(KBVRNUM,MODULO10_) From SWILIB0
+    If (C3)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(72,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR participant number.
+    Endif
+
+    RET += 1
+Return
+
+#-----------------------------------------------------------------------------------------------------
+# DTA 827 Format {#9>}
+#
+# PPXXXXXXC>
+# where
+#   C - check digit (modulo 10)
+#   PP - prefix
+#   XXXXXX - bank clearing number
+#
+# Example:
+#-----------------------------------------------------------------------------------------------------
+$DTA_827_10
+    # VVXXXXXXP>
+    #   VV = Vorziffer
+    #   XXXXXX = Ordnungs-Nr. (inkl. vorlaufende Nullen)
+    #   P = Prüfziffer (Modulo 10 rekursiv)
+    #   > = Hilfszeichen
+    #
+    # Ex.: 250090342>
+    #
+    # Extract values from ISR reference line
+    BVRNUM=left$(REFLINE,8)
+    C1=mid$(REFLINE,9,1)
+
+    # Control of the first check digit on ISR reference number
+    Call MODULOR(BVRNUM,MODULO10_) From SWILIB0
+    If (C1)<>MODULO10_ Then
+        GERR=1: GMESSAGE=mess(71,3648,1) : mkstat=2 : RET=2 : Return : # The check digit does not match the ISR reference number.
+    Endif
+
+    RET += 1
+Return
+
+#** #############################################################################################################
+#* Purpose:    Set an amount flag depending on the ISRTYPE
+#* Parameters:
+#* @param ISRTYPE           Variable Char         ISR-TYPE
+#* @param AMOUNTFLG         Variable Char         Flag that indicates if an ISR comes with or without amount
+#*! #############################################################################################################
+Subprog SET_AMOUNTFLAG(ISRTYPE, AMOUNTFLG)
+Variable Char ISRTYPE
+Variable Integer AMOUNTFLG
+    Raz AMOUNTFLG
+    If find(ISRTYPE,"01","03","11","21","23")
+      AMOUNTFLG = 1
+    Elsif find(ISRTYPE,"04","14","31","33")
+      AMOUNTFLG = 2
+    Endif
+End
+#-----------------------------------------------------------------------------------------------------
+
+######################################################################################################
+#                                Actions of screens SWIBVRBIS and SWIBVRPIH                          #
+######################################################################################################
+
+#*****************************************************************************************************
+# CONT_BVRREFLINE: Control correctness of ISR reference line
+#*****************************************************************************************************
+Subprog CONT_BVRREFLINE(REFLINE)
+Variable Char REFLINE
+Local Integer PM
+Local Integer TYPE_DTA
+Local Integer SWIPAMBVR # X3-46380
+Local Integer OK_ : Raz OK_
+Raz PM
+# Check the character "_" which indicates that the code line wasn't read correctly
+If instr(1,REFLINE,"_")<=0
+    If MASQUE=1
+        If [M:BIS1]PTE<>"" # Field PTE entered
+            PM=1
+        Endif
+    Elsif MASQUE=2
+        If [M:PIH1]PTE<>""
+            PM=1
+        Endif
+    Endif
+
+    If PM=1  # The field PTE was entered
+        Call VERIF_DTA_(TYPE_DTA,SWIPAMBVR,MASQUE) :     # Get ISR DTA type
+
+        # X3-46380
+        If TYPE_DTA = 826 or TYPE_DTA = 28 or TYPE_DTA = 1     # Orange ISR input slip
+            Call VERIF_DTA_826(REFLINE,TYPE_DTA,OK_)    # Check correctness of ISR reference line for 826
+        Elsif TYPE_DTA = 827 or TYPE_DTA = 22 or TYPE_DTA = 201 or TYPE_DTA = 202  # Red ISR input slip
+            Call VERIF_DTA_827(REFLINE,TYPE_DTA,OK_)    # Check correctness of ISR reference line for 827
+        Else
+            mkstat = 2 : GERR = 1
+            If (SWIPAMBVR = 5 and find(TYPE_DTA, 1,201,202)<=0 ) : # X3-46380
+                GMESSAGE = mess(92,3648,1) # The processing of a payment with a type different from ISO 1, ISO 2.1 or ISO 2.2 is not possible.
+            Elsif (find(SWIPAMBVR, 3,4) and find(TYPE_DTA, 826,28,827,22)<=0 ) : # X3-46380
+                GMESSAGE = mess(73,3648,1) # The processing of a payment with a type different from DTA 826, DTA 827, EZAG 22, EZAG 28 or ISO 1 is not possible.
+            Else
+                GMESSAGE = mess(95,3648,1)
+            Endif
+        Endif
+    Else   #  The field PTE wasn't entered (new invoice)
+        Call VERIF_DTA_826(REFLINE,TYPE_DTA,OK_)
+        If OK_=0 # Error in 826 format
+            mkstat=0 : GERR = 0 : Raz GMESSAGE
+            Call VERIF_DTA_827(REFLINE,TYPE_DTA,OK_)
+            If mkstat : End : Endif
+        Elsif OK_>=2 # Error in one of the controls for 826
+            GERR=1 : End
+        Endif
+        # Else OK
+        mkstat=0
+        Raz GMESSAGE
+    Endif
+Else
+    mkstat=2 : GERR = 1 : GMESSAGE = mess(74,3648,1) # The optical reading encountered an error. Please check your reference line.
+Endif
+End
+#*****************************************************************************************************
+
+#-----------------------------------------------------------------------------------------------------
+# Get ISR DTA type (826, 827, 830, 836)
+#-----------------------------------------------------------------------------------------------------
+Subprog VERIF_DTA_(DTA,SWIPAMBVR,MSK)
+Variable Integer DTA
+Variable Integer SWIPAMBVR   : # X3-46380
+Variable Integer MSK : # either BIS or PIH
+
+Local Char XSLEG(GLONADI)
+Local Char NUM(GLONVCR)
+Local Char PTE(GLONPTE)
+Local Char PIVTYP(GLONTPV)
+Raz [L]XSLEG
+
+If !clalev([F:DUD])  : Local File GACCDUDATE [DUD]  : Endif
+If !clalev([F:YPIH]) : Local File PINVOICE [YPIH]  : Endif
+If !clalev([F:XTAM]) : Local File TABPAM [XTAM] : Endif
+If !clalev([F:XTPT]) : Local File TABPAYTERM [XTPT] : Endif
+
+Raz SWIPAMBVR : # X3-46380
+
+If MSK=1 Then               # Check where we come from (GESBIS or GESPIH)
+    Call GET_LEG([M:BIS0]CPY,[L]XSLEG)
+    NUM = [M:BIS0]NUM
+    PTE = [M:BIS1]PTE
+    PIVTYP = [M:BIS0]PIVTYP
+    Gosub GET_DTA_TYPE
+Elsif MSK= 2 Then           # Check where we come from (GESBIS or GESPIH)
+    If !clalev([F:XFCY]) : Local File FACILITY [XFCY] : Endif
+    Read [F:XFCY]FCY0=[M:PIH0]FCY
+    If fstat = 0  # found
+      Call GET_LEG([F:XFCY]LEGCPY,[L]XSLEG)
+    Endif
+
+    NUM = [M:PIH0]NUM
+    PTE = [M:PIH1]PTE
+    PIVTYP = [M:PIH0]PIVTYP
+    Gosub GET_DTA_TYPE
+Endif
+
+End
+#-----------------------------------------------------------------------------------------------------
+
+
+
+#-----------------------------------------------------------------------------------------------------
+# GET_DTA_TYPE: get type from payment method or open item - called by VERIF_DTA_
+#-----------------------------------------------------------------------------------------------------
+$GET_DTA_TYPE
+    Read [YPIH]PIH0 = NUM
+    If fstat = 0 and PTE = [F:YPIH]PTE
+        Read [F:DUD]DUD0 = PIVTYP;NUM;1;1
+        If fstat = 0  # found
+            Read [XTAM]TAM0 = [F:DUD]PAM;[L]XSLEG
+            If fstat = 0
+                DTA = [XTAM]TYP
+                SWIPAMBVR = [F:XTAM]SWIPAMBVR  : # X3-46380
+                Return
+            Endif
+        Endif
+    Endif
+
+    Read [XTPT]TPT0 = PTE;[L]XSLEG;1
+    If fstat
+        # Let's give it a 2nd try for "All legislations".
+        #
+        # Note: For TABPAM table we need "All legislation", too, for a payment term
+        #       with "All legislations" can only contain a payment method for
+        #       "All legislations" (empty value), too.
+        #
+        Raz [L]XSLEG
+        Read [XTPT]TPT0 = PTE;[L]XSLEG;1
+    Endif
+    If fstat = 0
+        Read [XTAM]TAM0 = [XTPT]PAM;[L]XSLEG
+        If fstat = 0
+            DTA = [XTAM]TYP
+            SWIPAMBVR = [F:XTAM]SWIPAMBVR  : # X3-46380
+        Endif
+    Endif
+Return
+
+
+######################################################################################################
+#                    Helping routines                                                                #
+######################################################################################################
+
+#*****************************************************************************************************
+# Modulo 97-10 for IBAN
+#*****************************************************************************************************
+
+#*****************************************************************************************************
+# MODULOR11
+# called when checking the ISR customer number (BVRNUM) of the ISR reference line (BVRREFLINE)
+#*****************************************************************************************************
+Subprog MODULOR11(ENTREE,SORTIE)
+Variable Char ENTREE
+Variable Char SORTIE
+Local Decimal NBCAR
+NBCAR = len(ENTREE)
+Gosub MODULO11
+End
+#*****************************************************************************************************
+
+#*****************************************************************************************************
+# Recursive modulo 11 for ISR
+#*****************************************************************************************************
+$MODULO11
+FACTOR="432765432765432765432765432765432"
+MT=0
+For I=1 To NBCAR
+    MT += val(mid$(ENTREE,I,1))*val(mid$(FACTOR,I,1))
+Next I
+If mod(MT,11)=0
+    SORTIE="00"
+Else
+    SORTIE=format$("N0:2",11-mod(MT,11))
+Endif
+Return
+#*****************************************************************************************************
+
+#*****************************************************************************************************
+# MASQUE: Test if we are in Purchase invoice control (GESPIH) or in Supplier BP invoices (GESBIS)
+#*****************************************************************************************************
+Subprog MASQUE(MASQ)
+Variable Integer MASQ
+
+Libelle I, J, NBMSK : NBMSK = 50
+Char VARMSK (10) (1..NBMSK)
+Raz MASQ
+
+I = 1 : J = 1
+    Repeat
+       If maskabr(I)="BIS0" : # Supplier BP invoices
+          MASQ=1
+          Break
+       Elsif maskabr(I)="PIH0" Then # Invoice control
+          MASQ=2
+          Break
+       Endif
+    I += 1
+    Until I > NBMSK
+End
+#*****************************************************************************************************
+
+#*****************************************************************************************************
+# OK_BVR: OK button pressed after entering the ISR reference line -> reference line is checked and invoice is completed
+#*****************************************************************************************************
+Subprog OK_BVR(REFLINE)
+Variable Char REFLINE
+Local Decimal AMOUNT
+Local Char    BVRNUM_(11)
+Local Integer TYPE_DTA
+Local Char    NUMCLEAR(5)
+Local Char    ACCOUNT(GLONBID)
+Local Char    PAYTO_(GLONBPS)
+Local Char    SUPPLIER_(GLONBPS)
+Local Decimal VAT
+Local Integer NEWINV, KO
+Local Char    INTERM(20)
+Local Char    CUR_(GLONCUR)
+
+If !clalev([F:BID])  : Local File BID [BID]        : Endif
+If !clalev([F:TPV])  : Local File TABPIVTYP [TPV]  : Endif
+If !clalev([F:XFCY]) : Local File FACILITY [XFCY]  : Endif
+If !clalev([F:XBID]) : Local File BID [XBID]       : Endif
+
+Raz AMOUNT : Raz BVRNUM_ : Raz TYPE_DTA : Raz NUMCLEAR : Raz ACCOUNT : Raz PAYTO_
+Raz VAT : Raz NEWINV : Raz KO
+
+If REFLINE<>""
+    If MASQUE=1 Then   # Supplier BP invoice
+       Gosub OK_BVR_BIS
+    Elsif MASQUE=2     # Invoice contol
+       Gosub OK_BVR_PIH
+    Endif
+Else
+    If GREP="M" : mkstat=4 : Endif
+    If MASQUE=1
+        [M:BIS1]BVRREFLINE=[M:SWIBVR]BVRREFLINE
+    Else
+        [M:PIH1]BVRREFLINE=[M:SWIBVR]BVRREFLINE
+    Endif
+Endif  # End REFLINE<>""
+End
+#*****************************************************************************************************
+
+
+
+#*****************************************************************************************************
+# OK_BVR_BIS: called by OK_BVR for supplier BP invoices -> reference line is checked and invoice is completed
+#*****************************************************************************************************
+$OK_BVR_BIS
+Local Char BVRBID_(GLONBID) : Raz BVRBID_
+    # SAM #115076 08.03.2016 angre
+    #removed the branch for existing invoices.
+    NEWINV=2
+    # Extract data from ISR reference line
+    Call EXTRACT_DTA(REFLINE,TYPE_DTA,BVRNUM_,AMOUNT,ACCOUNT,NUMCLEAR,CUR_)
+    Gosub FIND_PAYTO
+    [M:BIS1]BVRBID = BVRBID_
+    Gosub FIND_SUPPLIER  # find supplier belonging to pay-to supplier
+
+    Read [F:XBPS]BPS0=SUPPLIER_
+    If fstat=0
+        [M:BIS0]BPR=SUPPLIER_
+        [M:BIS1]BPRPAY=PAYTO_
+        [M:BIS0]BPRNAM=[F:XBPS]BPSNAM
+        [M:BIS1]PTE=[F:XBPS]PTE
+        [M:BIS1]BVRREFLINE = REFLINE           # Bader 20.03.14
+        Call C_PTE([M:BIS1]PTE) From SUBBIS2   # Bader 20.03.14
+        [M:BIS1]DEP=[F:XBPS]DEP
+        Default Mask [BIS0]                    # Bader 20.03.14
+        Default Mask [BIS1]                    # Bader 20.03.14
+        Call AM_DEP([M:BIS1]DEP) From SUBBIS2  # Bader 20.03.14
+        [M:BIS1]PURPRITYP=[F:XBPS]PURPRITYP
+        Call AM_PURPRITYP([M:BIS1]PURPRITYP) From SUBBIS2  # Bader 20.03.14
+        Affzo [M:BIS0] : Affzo [M:BIS1]PTE : Affzo [M:BIS1]DEP : Affzo [M:BIS1]BPRPAY
+    Endif
+
+    # set accounting date
+    If [M:BIS0]ACCDAT=[0/0/0]
+        [M:BIS0]ACCDAT=datesyst
+    Endif
+
+    Local Char CODCPT(GLONCAC)
+    Call LECTURE("BPS",[M:BIS0]BPR,"") From CONTOBJ
+    Call INIT_COMPTE([M:BIS0]BPR,GSOCIETE,"F",CODCPT) From CPTSUB
+    If [L]CODCPT<>""
+       Call LECTURE("CAC",[L]CODCPT,"3~"+GPLAN(1)) From CONTOBJ
+       INTERM = [F:CAC]ACC(0)
+    Endif
+
+    If INTERM<>""
+       Call LECTURE("GAC",INTERM,GPLAN(1)) From CONTOBJ
+       If !fstat & [F:GAC]SAC=2
+          [M:BIS0]BPRSAC= [F:GAC]ACCSHO
+          [M:BIS0]SACACC = [F:GAC]ACC
+       Else
+          [M:BIS0]BPRSAC = ""
+          Raz [M:BIS0]SACACC                  # 09.01.15 Bader [M:BIS0] instead of [M]
+       Endif
+    Endif
+
+    [M:BIS1]BPRDAT=[M:BIS0]ACCDAT : # date of original document
+
+    Default Mask [M:BIS0]                      # UBA: make sure date for currency rates is set
+    Default Mask [M:BIS1]
+    Call LEC_TPV_LEG(GCURLEG,[M:BIS0]PIVTYP) From CPTLEC  # SAM #114656: Call LEC_TPV_LEG instead of direct reading in [F:TPV]
+    Gosub SET_PIVTYP From SUBBIS
+    Call AM_BPRDAT([M:BIS1]BPRDAT) From SUBBICS
+
+    If CUR_ <> ""
+        [M:BIS1]CUR = CUR_ :       # currency
+    Else
+        Call LECTURE("BPR",[M:BIS0]BPR,"") From CONTOBJ
+        [M:BIS1]CUR = [F:BPR]CUR : # currency
+    Endif
+    [M:BIS1]STA=2 : # invoice
+    [M:BIS1]STRDUDDAT = [M:BIS1]BPRDAT : # Due date basis
+    Call INIT_REGIME([M:BIS0]BPR,[M:BIS0]FCY,"F",[M:BIS1]VAC) From CPTSUB : # tax
+    If dim([F:XBPS]CHGTYP)>0  : # currency type
+        [M:BIS1]CURTYP= [F:XBPS]CHGTYP
+    Else
+        [M:BIS1]CURTYP = 1
+    Endif
+
+    Call INI_COURS("BIS1",[M:BIS0]CPY,[M:BIS1]CUR,[M:BIS1]RATDAT,[M:BIS1]CURTYP) From SUBBICS # UBA
+
+    Affzo [M:BIS0] : Affzo [M:BIS1]
+
+    Local Integer SWIPAMBVR # X3-46380
+    Call VERIF_DTA_(TYPE_DTA,SWIPAMBVR,MASQUE) # get DTA type
+
+    # check consistency between ISR reference line and payment method
+    Local Integer OK_ : Raz OK_
+    # X3-46380
+    If TYPE_DTA = 826 or TYPE_DTA = 28 or TYPE_DTA = 1
+        Call VERIF_DTA_826(REFLINE,TYPE_DTA,OK_)
+    Elsif TYPE_DTA = 827 or TYPE_DTA = 22 or TYPE_DTA = 201 or TYPE_DTA = 202
+        Call VERIF_DTA_827(REFLINE,TYPE_DTA,OK_)
+    Endif
+
+    If AMOUNT>0                # if amount in reference line -> take it into screen
+        Gosub SET_AMOUNT_BIS : # set amounts
+    Endif
+Return
+
+
+# ---------------------------------------------------------------------------------------------------
+# FIND_PAYTO: find the pay-to supplier either by the clearing number or by the ISR participant number
+# ---------------------------------------------------------------------------------------------------
+$FIND_PAYTO
+If ACCOUNT<>"" # the account isn't empty -> maybe 827 format 27#+ 9#>
+    Local Char BIDNUM_(GLONBID)
+    # X3-46380
+    # Local Integer TEMP
+    Local Decimal TEMP
+    Call FIND_PAYTO_BY_ACC(NUMCLEAR, PAYTO_) : # look for the pay-to supplier
+    TEMP=val(ACCOUNT)                  # transform string to number
+    ACCOUNT = format$("N0:12#",TEMP)   # add leading zeros
+    BIDNUM_ = NUMCLEAR+ACCOUNT         # build BIDNUM from clearing #5 + account #12
+    # read BID
+    Filter [F:XBID] Where BPATYP=1 and BPANUM=PAYTO_ and BIDNUM=BIDNUM_
+    Read [F:XBID]BID0 First
+    If fstat=0
+        # account for the supplier found
+        BVRBID_=[F:XBID]BIDNUM
+    Endif
+    Filter [F:XBID]
+Else
+    If BVRNUM_<>"" # there is an ISR participant number
+        Call FIND_PAYTO_BY_BVR(BVRNUM_, PAYTO_)  : # look for the pay-to supplier
+        # read BID
+        Filter [F:XBID] Where [F:XBID]BPANUM=PAYTO_ & [F:XBID]BVRNUM=BVRNUM_ & [F:XBID]BPATYP=1
+        For [F:XBID]
+          # account for the supplier found
+          BVRBID_=[F:XBID]BIDNUM
+
+          # If more than 1 account take the account with default address
+          If [F:XBID]BIDNUMFLG=2
+             Break
+          Endif
+        Next
+    Endif
+Endif
+Return
+
+
+# ----------------------------------------------------------------------------------------------------
+# FIND_SUPPLIER: find the supplier belonging to the chosen pay-to supplier
+#                If more than 1 supplier exists with this pay-to supplier user has to choose from list
+# ----------------------------------------------------------------------------------------------------
+$FIND_SUPPLIER
+Local Integer COUNT1
+Local Integer VALEUR2
+Local Integer REP
+Local Integer NBRIB_
+Local Char TIT(50)
+
+Raz COUNT1
+# X3-46380
+# TEMP = ""
+TIT=mess(77,3648,1) # Please select a supplier.
+
+# check if more than 1 supplier exists with chosen pay-to supplier
+Filter [F:XBPS] Where BPRPAY = PAYTO_ Order By BPSNAM
+NBRIB_ = rowcount([F:XBPS])
+If NBRIB_ > 1
+    # create an array for the selection of a supplier. Length of the array depends on number of found suppliers with BPRPAY = PAYTO_
+    Local Char TBLIB (50) (NBRIB_+5)
+
+    For [F:XBPS]
+       COUNT1 += 1
+       SUPPLIER_ = [F:XBPS]BPSNUM
+       TBLIB(COUNT1)=[F:XBPS]BPSNUM+" "+[F:XBPS]BPSNAM
+    Next
+
+    Call SEL_SUPPLIER(NBRIB_,TBLIB,TIT,SUPPLIER_)
+Else
+    Read [F:XBPS] First
+    If !fstat
+       SUPPLIER_ = [F:XBPS]BPSNUM
+    Endif
+Endif
+If  SUPPLIER_="" : SUPPLIER_ = PAYTO_ : Endif  # if no supplier chosen -> take pay-to supplier
+Filter [F:XBPS]
+Return
+
+
+#*****************************************************************************************************
+# OK_BVR_PIH: called by OK_BVR for invoice control -> reference line is checked and invoice is completed
+#*****************************************************************************************************
+$OK_BVR_PIH
+Local Char BVRBID_(GLONBID) : Raz BVRBID_
+
+If ([M:PIH0]BPR<>"" and [M:PIH1]PTE<>"")  # The supplier and the payment term are entered -> we suppose the invoice already exists
+    NEWINV=1
+    Local Integer SWIPAMBVR # X3-46380
+    Call VERIF_DTA_(TYPE_DTA,SWIPAMBVR,MASQUE) # Get DTA type
+    # X3-29237
+    If (TYPE_DTA = 826) or (TYPE_DTA = 827) or (TYPE_DTA=28) or (TYPE_DTA=22) or (TYPE_DTA = 1)
+        # Extract data from ISR reference line
+        Call EXTRACT_DTA(REFLINE,TYPE_DTA,BVRNUM_,AMOUNT,ACCOUNT,NUMCLEAR,CUR_)
+        Gosub FIND_PAYTO
+        [M:PIH1]BVRBID = BVRBID_
+
+        If PAYTO_<>"" & [M:PIH1]BPRPAY<>PAYTO_   # found pay-to supplier differs from "pay to" supplier in invoice
+            Call OUINON(mess(75,3648,1),KO) From GESECRAN  : # The supplier on the ISR reference line is different from the pay-to supplier. Do you want to update the pay-to supplier?
+            If KO=2  # if yes
+                [M:PIH1]BPRPAY=PAYTO_
+                Affzo [M:PIH1]BPRPAY
+                mkstat=4
+            Endif
+        Endif
+
+        Gosub DO_CUR_AND_ADR
+
+        If left$(REFLINE,3) = "042"  # ISR of type ESR+ (without amount, therefore amount entered in screen)
+            AMOUNT = [M:SWIBVR]TOTAMT
+        Endif
+        # if amount in reference line -> take it into screen
+        If AMOUNT>0
+            Gosub SET_AMOUNT_PIH : # set amounts
+        Endif
+    Endif
+Else  # new invoice to be created
+    NEWINV=2
+    # Extract data from ISR reference line
+    Call EXTRACT_DTA(REFLINE,TYPE_DTA,BVRNUM_,AMOUNT,ACCOUNT,NUMCLEAR,CUR_)
+    Gosub FIND_PAYTO
+    [M:PIH1]BVRBID = BVRBID_
+    Gosub FIND_SUPPLIER  # find supplier belonging to pay-to supplier
+
+    Read [F:XBPS]BPS0=SUPPLIER_
+    If fstat=0
+        [M:PIH0]BPR=SUPPLIER_
+        [M:PIH1]BPRPAY = PAYTO_
+        [M:PIH0]BPRNAM1=[F:XBPS]BPSNAM
+        [M:PIH1]PTE=[F:XBPS]PTE
+        [M:PIH1]BVRREFLINE = REFLINE          # Bader 20.03.14
+        Call C_PTE([F:XBPS]PTE) From SUBPIH   # Bader 20.03.14
+        [M:PIH1]DEP=[F:XBPS]DEP
+        Call AM_DEP([F:XBPS]DEP) From SUBPIH  # Bader 20.03.14
+        Affzo [M:PIH0] : Affzo [M:PIH1]PTE : Affzo [M:PIH1]DEP
+    Endif
+
+    # set accounting date
+    If [M:PIH0]ACCDAT=[0/0/0]
+        [M:PIH0]ACCDAT=datesyst
+    Endif
+
+    Local Char CODCPT(GLONCAC)
+    Call INIT_COMPTE([M:PIH0]BPR,GSOCIETE,"F",CODCPT) From CPTSUB
+    Call LECTURE("CAC",[L]CODCPT,"3~"+GCOA(1)) From CONTOBJ
+    Call LECTURE("GAC",[F:CAC]ACC(0),GCOA(1))  From CONTOBJ
+    If !fstat & [F:GAC]SAC=2 [M:PIH0]BPRSAC=[F:GAC]ACCSHO : Endif
+
+    [M:PIH1]BPRDAT=[M:PIH0]ACCDAT : # date of original document
+    If CUR_ <> ""
+        [M:PIH1]CUR = CUR_ :       # currency
+    Else
+        Call LECTURE("BPR",[M:PIH0]BPR,"") From CONTOBJ
+        [M:PIH1]CUR = [F:BPR]CUR :      # currency
+    Endif
+    [M:PIH0]PAZ=4 :                 # Authorized to pay
+
+    If [M:PIH0]PIVTYP = ""                                    # Bader 09.09.15 don't change PIVTYP if already entered by user
+       Call PARAM([M:PIH0]FCY,"TYPINVSUP",[M:PIH0]PIVTYP) From ADOVAL
+       Call LEC_TPV_LEG(GCURLEG,[M:PIH0]PIVTYP) From CPTLEC   # Bader 21.08.15
+       Call AM_PIVTYP([M:PIH0]PIVTYP) From SUBPIH             # Bader 21.08.15
+    Endif                                                     # Bader 09.09.15
+
+    [M:PIH1]STA=2 : # Status = to validate
+
+    Gosub DO_CUR_AND_ADR
+
+    [M:PIH1]STRDUDDAT = [M:PIH1]BPRDAT      # Due date basis
+    Call INIT_REGIME([M:PIH0]BPR,[M:PIH0]FCY,"F",[M:PIH1]VAC) From CPTSUB  # tax
+    If dim([F:XBPS]CHGTYP)>0                # currency type
+        [M:PIH1]CURTYP= [F:XBPS]CHGTYP
+    Else
+        [M:PIH1]CURTYP = 1
+    Endif
+
+    Call INI_COURS("PIH1",GSOCIETE,[M:PIH1]CUR,[M:PIH1]RATDAT,[M:PIH1]CURTYP) From SUBBICS # UBA
+
+    Default Mask [M:PIH0]
+    Affzo [M:PIH0] : Affzo [M:PIH1]
+
+    Local Integer SWIPAMBVR # X3-46380
+    Call VERIF_DTA_(TYPE_DTA,SWIPAMBVR,MASQUE) # get DTA type
+
+    # check consistency between ISR reference line and payment method
+    Local Integer OK_ : Raz OK_
+    # X3-46380
+    If TYPE_DTA = 826 or TYPE_DTA = 28 or TYPE_DTA = 1
+        Call VERIF_DTA_826(REFLINE,TYPE_DTA,OK_)
+    Elsif TYPE_DTA = 827 or TYPE_DTA = 22 or TYPE_DTA = 201 or TYPE_DTA = 202
+        Call VERIF_DTA_827(REFLINE,TYPE_DTA,OK_)
+    Endif
+
+    If left$(REFLINE,3) = "042"  # ISR of type ESR+ (without amount, therefore amount entered in screen)
+        AMOUNT = [M:SWIBVR]TOTAMT
+    Endif
+    If AMOUNT>0                # if amount in reference line -> take it into screen
+        Gosub SET_AMOUNT_PIH : # set amounts
+    Endif
+Endif
+Return
+
+
+# -----------------------------------------------------------------------------------------------
+# DO_CUR_AND_ADR: set currency and address fields for PIH
+# -----------------------------------------------------------------------------------------------
+$DO_CUR_AND_ADR
+# fill currency fields
+If [F:PIH]RATDAT=[0/0/0]
+  If GPIHCURDAT<>2
+    [F:PIH]RATDAT=[F:PIH]ACCDAT : [M:PIH1]RATDAT=[M:PIH0]ACCDAT
+  Else
+    [F:PIH]RATDAT=[F:PIH]BPRDAT : [M:PIH1]RATDAT=[M:PIH1]BPRDAT
+  Endif
+Endif
+Call CHARG_RATCUR("PIH1","PIH") From TRTX3CPT
+
+If [M:PIH1]STA=3       # posted?
+   Diszo [PIH1]RAT1, RAT2
+Endif
+
+If [F:PIH]CRY<>"" | [F:PIH]CTY<>""
+  [M:AD66]       = [F:PIH]
+  [M:AD66]ADBBPR = [F:PIH]BPR
+  [M:AD66]BPAADD = [F:PIH]BPAINV
+  [M:AD66]ADBFLG = 2
+Else
+  Raz [M:AD66]
+  [M:AD66]BPAADD = [F:PIH]BPAINV
+  [M:AD66]ADBBPR = [F:PIH]BPR
+Endif
+# set fields of screen [M:AD67]: address fields for "pay to" supplier
+If [F:PIH]BPYCRY<>"" | [F:PIH]BPYCTY<>""
+  [M:AD67]BPAADD      = [F:PIH]BPAPAY
+  [M:AD67]BPRNAM(0)   = [F:PIH]BPYNAM(0)
+  [M:AD67]BPRNAM(1)   = [F:PIH]BPYNAM(1)
+  [M:AD67]BPAADDLIG(0)= [F:PIH]BPYADDLIG(0)
+  [M:AD67]BPAADDLIG(1)= [F:PIH]BPYADDLIG(1)
+  [M:AD67]BPAADDLIG(2)= [F:PIH]BPYADDLIG(2)
+  [M:AD67]CRY         = [F:PIH]BPYCRY
+  [M:AD67]CRYNAM      = [F:PIH]BPYCRYNAM
+  [M:AD67]SAT         = [F:PIH]BPYSAT
+  [M:AD67]POSCOD      = [F:PIH]BPYPOSCOD
+  [M:AD67]CTY         = [F:PIH]BPYCTY
+  [M:AD67]ADBBPR      = [F:PIH]BPRPAY
+  [M:AD67]ADBFLG      = 2
+Endif
+
+Gosub CHARG_ADR_BPSINV From SUBPIHB
+Gosub CHARG_ADR_BPRPAY From SUBPIHB
+Return
+
+
+
+#-----------------------------------------------------------------------------------------------------
+# Extraction of the values from the ISR reference line
+#-----------------------------------------------------------------------------------------------------
+Subprog EXTRACT_DTA(REFLINE,TYPE_DTA,BVRNUM_,AMT,ACCOUNT,NUMCLEAR,CUR_)
+
+Variable Char REFLINE     # ISR reference line
+Variable Char BVRNUM_     # ISR participant number
+Variable Decimal AMT      # amount +tax
+Variable Char ACCOUNT     # bank account
+Variable Char NUMCLEAR    # clearing number
+Variable Integer TYPE_DTA # DTA type
+Variable Char CUR_        # currency
+
+# X3-29237
+If TYPE_DTA=826 or TYPE_DTA=28 or TYPE_DTA=1
+    Gosub EXTRACT_826_28
+# X3-46380
+Elsif TYPE_DTA=827 or TYPE_DTA =22 or TYPE_DTA =201 or TYPE_DTA =202
+    Gosub EXTRACT_827_22
+Elsif TYPE_DTA=0          # no DTA type determined so far ->
+    Gosub EXTRACT_826_28  # first check type 826/28
+    Gosub EXTRACT_827_22  # then check type 827/22
+Endif
+End
+#-----------------------------------------------------------------------------------------------------
+
+
+#-----------------------------------------------------------------------------------------------------
+# Extraction of the values from the ISR reference line for formats DTA 826 or EZAG 28
+#-----------------------------------------------------------------------------------------------------
+$EXTRACT_826_28
+    If len(REFLINE)= 23 #format{#15+ #5>}
+        BVRNUM_=mid$(REFLINE,18,5)
+        ACCOUNT="" : NUMCLEAR="" : Raz AMT
+        # no currency coded
+    Elsif len(REFLINE)= 41 #format{<#15>#15+ #5>}
+        BVRNUM_=mid$(REFLINE,36,5)
+        AMT=val(mid$(REFLINE,8,9))/100
+        ACCOUNT="" : NUMCLEAR=""
+        If find(mid$(REFLINE,6,2),"0","1")
+           CUR_ = "CHF"
+        Else
+           CUR_ = "EUR"
+        Endif
+    Elsif len(REFLINE)= 42 #format{#13>#16+ #9>}
+        BVRNUM_=mid$(REFLINE,33,2)+"-"+mid$(REFLINE,35,6)+"-"+mid$(REFLINE,41,1)
+        AMT=val(mid$(REFLINE,3,10))/100
+        ACCOUNT="" : NUMCLEAR=""
+        Gosub SET_CURRENCY
+    Elsif len(REFLINE)= 53 #format{#13>#27+ #9>}
+        BVRNUM_=mid$(REFLINE,44,2)+"-"+mid$(REFLINE,46,6)+"-"+mid$(REFLINE,52,1)
+        AMT=val(mid$(REFLINE,3,10))/100
+        ACCOUNT="" : NUMCLEAR=""
+        Gosub SET_CURRENCY
+    Elsif len(REFLINE)= 43 #format{#3>#27+ #9>}
+        BVRNUM_=mid$(REFLINE,34,2)+"-"+mid$(REFLINE,36,6)+"-"+mid$(REFLINE,42,1)
+        ACCOUNT="" : NUMCLEAR="" : Raz AMT
+        # no currency coded
+    Elsif len(REFLINE)= 32 #format{#3>#16+ #9>}
+        BVRNUM_=mid$(REFLINE,23,2)+"-"+mid$(REFLINE,25,6)+"-"+mid$(REFLINE,31,1)
+        ACCOUNT="" : NUMCLEAR="" : Raz AMT
+        Gosub SET_CURRENCY
+    Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+
+$SET_CURRENCY
+  If find(left$(REFLINE,1),"0","1")
+     CUR_ = "CHF"
+  Else
+     CUR_ = "EUR"
+  Endif
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+# Extraction of the values from the ISR reference line for formats DTA 827 or EZAG 22
+#-----------------------------------------------------------------------------------------------------
+$EXTRACT_827_22
+    If len(REFLINE)= 39 #format{#27+ #9>}
+        BVRNUM_=""
+#        ACCOUNT=mid$(REFLINE,1,27) : NUMCLEAR= mid$(REFLINE,32,5) : Raz AMT  # 15.01.16 Bader extract only account
+        ACCOUNT=mid$(REFLINE,11,16) : NUMCLEAR= mid$(REFLINE,32,5) : Raz AMT
+        # no currency coded
+    Elsif len(REFLINE)= 10 #format{#9>}
+        BVRNUM_=mid$(REFLINE,1,2)+"-"+mid$(REFLINE,3,6)+"-"+mid$(REFLINE,9,1)
+        ACCOUNT="" : NUMCLEAR="" : Raz AMT
+        # no currency coded
+    Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+
+#-----------------------------------------------------------------------------------------------------
+# Search the pay-to supplier by a given bank clearing number
+#-----------------------------------------------------------------------------------------------------
+Subprog FIND_PAYTO_BY_ACC(NUMCLEAR, PAYTO_)
+
+Variable Char NUMCLEAR  # clearing number
+Variable Char PAYTO_  # supplier
+Local Char TBLIB (85) (0..200), TIT(50)  : # for a list of pay-to suppliers to choose
+
+Local Integer COUNT1
+Local Integer COUNT     # Bader 2015-12-11, Lisa 185-18466: max. 25 suppliers may be selected from list
+Local Integer VALEUR2
+Local Char T1(GLONBPS), T2(20)
+Local Integer REP
+Local Integer TEMP
+Local Char TMPSUPP(50)
+
+Raz T1,T2
+TMPSUPP = ""
+TIT=mess(81,3648,1) # Please select a pay-to supplier.
+
+TEMP=val(NUMCLEAR)                 # transform string to number
+NUMCLEAR = format$("N0:5#",TEMP)   # add leading zeros
+Raz COUNT1
+
+# Link BID table with BPSUPPLIER table to be able to sort by supplier name instead of supplier number
+Link [F:BID] With [F:BPS]BPS0=[F:BID]BPANUM As [LBID]
+&            Where [F:BID]BPATYP = 1 and [F:BID]BIDNUM >= NUMCLEAR and [F:BID]BIDNUM < NUMCLEAR+"Z"
+&            Order By Key LBIDK = [F:BPS]BPSNAM Asc
+
+COUNT = rowcount([F:LBID])    # Bader 2015-12-11, Lisa 185-18466: max. 25 suppliers may be selected from list
+If COUNT <= 25              # Bader 2015-12-11, Lisa 185-18466: max. 25 suppliers may be selected from list
+    For [F:LBID]
+        If [F:BID]BPANUM <> TMPSUPP
+            COUNT1 += 1
+            PAYTO_ = [F:BID]BPANUM
+            Call LECTURE("BPS",[F:BID]BPANUM,"") From CONTOBJ
+            TBLIB(COUNT1)=[F:BID]BPANUM+" "+[F:BPS]BPSNAM
+            TMPSUPP = [F:BID]BPANUM
+        Endif
+    Next
+Endif
+
+If COUNT1>1 # more than 1 found
+    Call SEL_SUPPLIER(COUNT1,TBLIB,TIT,PAYTO_)
+    # loop until a supplier has been chosen
+    While PAYTO_=""
+        Call OUINON(mess(76,3648,1),REP) From GESECRAN # You didn't select a supplier. Wasn't he on the list?
+        If REP=1
+            Call SEL_SUPPLIER(COUNT1,TBLIB,TIT,PAYTO_)
+        Else
+            Gosub SEL_SUPPLIER2
+        Endif
+    Wend
+Endif
+
+If COUNT1=0 or COUNT > 25 # Bader 2015-12-11, Lisa 185-18466: nothing or more than 25 suppliers found
+    Gosub SEL_SUPPLIER2
+    While PAYTO_=""
+        GERR=2 : GMESSAGE=mess(77,3648,1) # Please select a supplier.
+        Gosub SEL_SUPPLIER2
+    Wend
+Endif
+End
+#-----------------------------------------------------------------------------------------------------
+
+#.....................................................................................................
+# SEL_SUPPLIER : selection of supplier from a list of suppliers
+#.....................................................................................................
+Subprog SEL_SUPPLIER(COUNT1,TBLIB,TIT,SUPP)
+Value Integer COUNT1
+Value Char TBLIB()(0..)
+Value Char TIT
+Variable Char SUPP
+Local Integer VALEUR2
+    Call SAITEX(COUNT1,TBLIB,VALEUR2,TIT) From GESECRAN
+    If VALEUR2>0
+        SUPP = seg$(TBLIB(VALEUR2),1,instr(1,TBLIB(VALEUR2)," ")-1)
+    Else
+        SUPP=""
+    Endif
+End
+#.....................................................................................................
+
+#.....................................................................................................
+# SEL_SUPPLIER2 : tunnel to supplier management to choose a supplier
+#.....................................................................................................
+$SEL_SUPPLIER2
+    Call OBJET("BPS", T1, T2) From GOBJET
+    PAYTO_=T1
+Return
+#.....................................................................................................
+
+#-----------------------------------------------------------------------------------------------------
+# Search the pay-to supplier by a given ISR participant number (BVRNUM)
+#-----------------------------------------------------------------------------------------------------
+Subprog FIND_PAYTO_BY_BVR(BVRNUM_, PAYTO_)
+
+Variable Char BVRNUM_    # ISR participant number
+Variable Char PAYTO_     # pay-to supplier
+
+Local Integer COUNT1
+Local Integer VALEUR2
+Local Char T1(GLONBPS), T2(20)
+Local Integer REP
+Local Char TEMP(50)
+Local Integer NBRIB_
+Local Char TIT(50)
+
+Raz COUNT1,T1,T2
+TEMP = ""
+TIT=mess(81,3648,1) # Please select a pay-to supplier.
+
+# Link BID table with BPSUPPLIER table to be able to sort by supplier name instead of supplier number
+Link [F:BID] With [F:BPS]BPS0=[F:BID]BPANUM As [LBID]
+&            Where [F:BID]BPATYP = 1 and [F:BID]BVRNUM = BVRNUM_ and [F:BID]BIDNUM<>""
+&            Order By Key LBIDK = [F:BPS]BPSNAM Asc
+
+# create an array for the selection of a supplier. Length of the array depends on number of found accounts with BVRNUM = BVRNUM_
+NBRIB_ = rowcount([F:LBID])
+Local Char TBLIB (50) (NBRIB_+5)
+
+For [F:LBID]
+   If [F:BID]BPANUM <> TEMP
+    COUNT1 += 1
+    PAYTO_ = [F:BID]BPANUM
+    Call LECTURE("BPS",[F:BID]BPANUM,"") From CONTOBJ
+    TBLIB(COUNT1)=[F:BID]BPANUM+" "+[F:BPS]BPSNAM
+    TEMP = [F:BID]BPANUM
+   Endif
+Next
+
+If COUNT1>1 # more than 1 found
+    Call SEL_SUPPLIER(COUNT1,TBLIB,TIT,PAYTO_)
+    # loop until a supplier has been chosen
+    While  PAYTO_=""
+        Call OUINON(mess(76,3648,1),REP) From GESECRAN # You didn't select a supplier. Wasn't he on the list?
+        If REP=1
+            Call SEL_SUPPLIER(COUNT1,TBLIB,TIT,PAYTO_)
+        Else
+            Gosub SEL_SUPPLIER2
+        Endif
+    Wend
+Elsif COUNT1=0 # nothing found -> tunnel to supplier management to choose a supplier
+    Gosub SEL_SUPPLIER2
+    While PAYTO_=""
+        GERR=2 : GMESSAGE=mess(77,3648,1) # Please select a supplier.
+        Gosub SEL_SUPPLIER2
+    Wend
+Endif
+End
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+# Set new values in screens BIS1/BIS3
+#-----------------------------------------------------------------------------------------------------
+$SET_AMOUNT_BIS
+Local Integer OK
+Local Integer TYPVAT : TYPVAT=0
+Local Char CNA(GLONGAC) : CNA=""
+Local Char CRIBLE(GLONGAC)
+
+If AMOUNT <> [M:BIS1]AMTATI  # amounts differ
+    If !GIMPORT
+        Default Mask [M:BIS0] # for the field CPY
+        Default Mask [M:BIS1]
+        Call AFFCOL(2) From SUBBICS
+    Endif
+
+    OK = 2
+    If !GIMPORT
+        If NEWINV<>2
+            Call OUINON(mess(78,3648,1),OK) From GESECRAN # Totals incoherent. Do you want to update it?
+        Endif
+    Endif
+
+    If OK<>2
+        OK = 0 : Return
+    Else
+        Read [F:XBPS]BPS0=[M:BIS0]BPR : # read supplier
+        If fstat=0
+            Read [F:XCAC]CAC0=3;[F:XBPS]ACCCOD;GPLAN(1) : # read accounting code
+            If fstat=0
+                Read [F:XGAC]GAC0=GPLAN(1);[F:XCAC]ACC(16) #(GSWIBVRACC) angre 19.02.16 hard coded accountindex (16) SAM #114638: # read account
+                If fstat=0
+                    Filter [XTRA] Where CPY=[M:BIS0]CPY & VAT=[F:XGAC]VAT(0) & STRDAT<=[M:BIS0]ACCDAT
+                    Read [XTRA]TRA0 Last
+                    If fstat=0
+                        VAT=[F:XTRA]VATRAT
+                    Else
+                        Filter [F:XTRA]
+                        Filter [XTRA] Where CPY="" & VAT=[F:XGAC]VAT(0) & STRDAT<=[M:BIS0]ACCDAT
+                        Read [XTRA]TRA0 Last
+                        If fstat=0
+                            VAT=[F:XTRA]VATRAT
+                        Endif
+                    Endif
+
+                    # set VAT type
+                    If [F:XGAC]VATIPT=4
+                        TYPVAT=2
+                    Else
+                        TYPVAT=1
+                    Endif
+                    Call INIACC(GPLAN(1), [F:XGAC]ACC, GPLAN(2), CNA, CRIBLE) From CPTINI
+                Endif
+            Endif
+        Endif
+
+        # set amount -tax
+        If VAT>0
+            [M:BIS1]AMTNOT= int((AMOUNT/(1+(VAT/100)))*100)/100
+        Else
+            [M:BIS1]AMTNOT= AMOUNT : # no tax found, we assume no tax
+        Endif
+        # set amount +tax
+        [M:BIS1]AMTATI = AMOUNT
+
+        If [M:BIS3]ACC1(0)<>""  # At least 1 line created
+            # set amount -tax
+            If VAT>0
+                [M:BIS3]AMTNOTLIN(0)= int((AMOUNT/(1+(VAT/100)))*100)/100
+            Else
+                [M:BIS3]AMTNOTLIN(0)= AMOUNT : # no tax found, we assume no tax
+            Endif
+            # set amount +tax
+            [M:BIS3]AMTATILIN(0) = AMOUNT
+        Else  # no line created
+            [M:BIS3]NBLIG(0) = 1 : # new line number
+            nolign = 1
+            [M:BIS3]FCYLIN(0)=[M:BIS0]FCY   : # Site
+            [M:BIS3]SAC= [M:BIS0]BPRSAC
+
+            [M:BIS3]ACC1(0)=[F:XCAC]ACC(16) #(GSWIBVRACC) angre 19.02.16 hard coded accountindex (16) SAM #114638 :   # account
+            Default Mask [BIS3]                         # Bader 20.03.14
+            Call C_ACC1([M:BIS3]ACC1(0)) From SUBBIS2   # Bader 20.03.14
+            Call AM_ACC1([M:BIS3]ACC1(0)) From SUBBIS2  # Bader 20.03.14
+
+            If VAT>0
+                [M:BIS3]AMTNOTLIN(0)= int((AMOUNT/(1+(VAT/100)))*100)/100
+                [M:BIS3]AMTVAT(0) = AMOUNT-int((AMOUNT/(1+(VAT/100)))*100)/100 : # VAT amount
+                [M:BIS3]DEDVAT(0) = AMOUNT-int((AMOUNT/(1+(VAT/100)))*100)/100
+            Else
+                [M:BIS3]AMTNOTLIN(0)= AMOUNT : # no tax found, we assume no tax
+            Endif
+            Call AM_AMTNOTLIN([M:BIS3]AMTNOTLIN(0)) From SUBBIS2  # Bader 20.03.14
+
+            Call AS_VAT([M:BIS3]VAT(0)) From SUBBIS2              # Bader 16.04.14
+            [M:BIS3]VAT(0)= [F:XGAC]VAT(0) : # VAT
+            Call AM_VAT([M:BIS3]VAT(0)) From SUBBIS2  # Bader 20.03.14
+
+            # set amount +tax
+            [M:BIS3]AMTATILIN(0) = AMOUNT
+            Call AM_AMTATILIN([M:BIS3]AMTATILIN(0)) From SUBBIS2  # Bader 20.03.14
+            [M:BIS3]PURTYP(0)=TYPVAT
+
+            [M:BIS3]ACC2(0)=CNA
+            [M:BIS3]QTY(0)=1    : # Quantity
+
+            Call CAL_BASDEPLIN([M:BIS1]DEP,[M:BIS3]FLGDEP,1) From INVDEPLIB # Bader 20.03.14
+            [M:BIS3]BASDEP = [M:BIS3]BASDEPLIN(0)                           # Bader 20.03.14
+
+        Endif
+        Default Mask [BIS3]
+        Call APRES_NBLIG From SUBBIS2  : # set totals
+        Default Mask [M:BIS1]
+
+        If !GIMPORT
+            Affzo [BIS1]AMTNOT, AMTATI
+            Default Mask [M:BIS0] : Affzo [BIS3]
+        Endif
+        mkstat=4
+    Endif
+Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+# Set new values in screens PIH1/PIH4
+#-----------------------------------------------------------------------------------------------------
+$SET_AMOUNT_PIH
+Local Integer OK
+
+If AMOUNT <> [M:PIH1]TOTATIAMT1  # amounts differ
+    OK = 2
+    If !GIMPORT
+        If NEWINV<>2
+            Call OUINON(mess(78,3648,1),OK) From GESECRAN # Totals incoherent. Do you want to update it?
+        Endif
+    Endif
+
+    If OK<>2
+        OK = 0 : Return
+    Else
+        [M:PIH1]TOTTAXAMT1 = [M:SWIBVR]TOTVAT          # Issue 112279 - 2015-11-13 by BADER
+        [M:PIH4]TOTTAXAMT = [M:SWIBVR]TOTVAT           # Issue 112279 - 2015-11-13 by BADER
+        [M:PIH1]TOTLINAMT1= AMOUNT-[M:PIH1]TOTTAXAMT1  # Issue 112279 - 2015-11-13 by BADER
+        [M:PIH4]TOTLINAMT= AMOUNT-[M:PIH1]TOTTAXAMT1   # Issue 112279 - 2015-11-13 by BADER
+
+        Default Mask [M:PIH1]
+
+        If !GIMPORT
+            Affzo [M:PIH1]TOTLINAMT1, TOTATIAMT1,TOTTAXAMT1
+            Default Mask [M:PIH0] : Affzo [M:PIH4]
+        Endif
+        mkstat=4
+    Endif
+Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#*****************************************************************************************************
+# CONT_AMT_PIH: Check the correctness of the amount (ISR <-> invoice) in invoice control
+#*****************************************************************************************************
+Subprog CONT_AMT_PIH(DTA)
+Variable Integer DTA   # DTA type
+Local Char REFLINE(55) # reference line
+Local Decimal TOTAL
+
+REFLINE=[M:PIH1]BVRREFLINE
+TOTAL = [M:PIH4]AMTATI
+Gosub CONTROL_AMOUNT
+End
+#*****************************************************************************************************
+
+#*****************************************************************************************************
+# CONT_AMT: Check the correctness of the amount (ISR <-> invoice) in supplier BP invoices
+#*****************************************************************************************************
+Subprog CONT_AMT(DTA)
+Variable Integer DTA   # DTA type
+Local Char REFLINE(55) # reference line
+Local Decimal TOTAL
+
+REFLINE=[M:BIS1]BVRREFLINE
+TOTAL = [M:BIS3]TOTATI
+Gosub CONTROL_AMOUNT
+End
+#*****************************************************************************************************
+
+
+
+#*****************************************************************************************************
+# CONTROL_AMOUNT: Check the correctness of the amount (ISR <-> invoice). Called from CONT_AMT and CONT_AMT_PIH
+#*****************************************************************************************************
+$CONTROL_AMOUNT
+Local Char BVRNUM_(11)
+Local Char NUMCLEAR(5)
+Local Decimal AMOUNT
+Local Char ACCOUNT(GLONBID)
+Local Char CUR_(GLONCUR)
+
+# X3-29237
+If REFLINE<>"" & (DTA=826 or DTA=28 or DTA=1)  # only for 826 and 28 and 1 we have an amount
+    # Extract details from reference line
+    Call EXTRACT_DTA(REFLINE,DTA,BVRNUM_,AMOUNT,ACCOUNT,NUMCLEAR,CUR_)
+    If AMOUNT>0 & TOTAL>0
+        # Test if the amounts are equal
+        If AMOUNT<>TOTAL
+            If !GIMPORT
+                GERR=2 : GMESSAGE=mess(79,3648,1)  # Total inconsistent with the total amount of the ISR reference line on the invoice.
+            Endif
+        Endif
+    Endif
+Endif
+Return
+#*****************************************************************************************************
+
+
+#********************************************************************************************
+# OUVRE_PIH: create local variables for AVANTBOUT, FIN_ACTION -> called from OUVRE in SUBPIHA
+#********************************************************************************************
+$OUVRE_PIH
+Local Decimal TOTAMT, TOTTAX
+Local Char PAYTO(GLONBPS), BVRREFLINE(55)
+Return
+
+
+#*******************************************************************************************
+# OUVRE_BIS: create local variables for AVANTBOUT, FIN_ACTION -> called from OUVRE in SUBBIS
+#*******************************************************************************************
+$OUVRE_BIS
+Local Char PAYTO(GLONBPS), BVRREFLINE(55)
+Return
+
+
+#********************************************************************************************************
+# AVANTBOUT_PIH: remember fields TOTAMT, TOTTAX, PAYTO and BVRREFLINE -> called from AVANTBOUT in SUBPIHA
+#********************************************************************************************************
+$AVANTBOUT_PIH
+If int(val(func AFNC.PARAM("SWIPURBVR", [M:PIH0]FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+    [L]TOTAMT = [M:PIH1]TOTATIAMT1
+    [L]TOTTAX = [M:PIH1]TOTTAXAMT1
+    [L]PAYTO = [M:PIH1]BPRPAY
+    [L]BVRREFLINE = [M:PIH1]BVRREFLINE
+Endif
+Return
+
+
+#*******************************************************************************************************
+# AVANTBOUT_BIS: remember fields PAYTO and BVRREFLINE -> called from AVANTBOUT in SUBBIS
+#*******************************************************************************************************
+$AVANTBOUT_BIS
+If int(val(func AFNC.PARAM("SWIPURBVR", [M:BIS0]FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+    [L]PAYTO = [M:BIS1]BPRPAY
+    [L]BVRREFLINE = [M:BIS1]BVRREFLINE
+Endif
+Return
+
+
+#********************************************************************************************************
+# FIN_ACTION_PIH: check fields TOTAMT, TOTTAX, PAYTO and BVRREFLINE -> called from FIN_ACTION in SUBPIHA
+#********************************************************************************************************
+$FIN_ACTION_PIH
+If int(val(func AFNC.PARAM("SWIPURBVR", [M:PIH0]FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+    # if value changed -> set Save button
+    If [L]BVRREFLINE <> [M:PIH1]BVRREFLINE or  [L]TOTAMT <> [M:PIH1]TOTATIAMT1 or
+&  [L]TOTTAX <> [M:PIH1]TOTTAXAMT1 or  [L]PAYTO <> [M:PIH1]BPRPAY
+    # If already IN "Creation" MODE -> SAVE button needs not to be set
+       If !find(GREP,"C","D")
+          GREP="M" : REP="M"
+          If [M:PIH0]NUM<>"" : Gosub GRISE_CLE From =WINPROG : Endif
+       Endif
+    Endif
+Endif
+Return
+
+
+#**************************************************************************************
+# FIN_ACTION_BIS: check fields PAYTO and BVRREFLINE -> called from FIN_ACTION in SUBBIS
+#**************************************************************************************
+$FIN_ACTION_BIS
+If int(val(func AFNC.PARAM("SWIPURBVR", [M:BIS0]FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+    # if value changed -> set Save button
+    If [L]BVRREFLINE <> [M:BIS1]BVRREFLINE or  [L]PAYTO <> [M:BIS1]BPRPAY
+    # If already IN "Creation" MODE -> SAVE button needs not to be set
+       If !find(GREP,"C","D")
+          GREP="M" : REP="M"
+          If [M:BIS0]NUM<>"" : Gosub GRISE_CLE From =WINPROG : Endif
+       Endif
+    Endif
+Endif
+Return
+
+
+#******************************************************************************************************
+# SETBOUT_PIH: disable button “ISR code line” (5) when SWIPURBVR = No -> called from SETBOUT in SUBPIHA
+#******************************************************************************************************
+$SETBOUT_PIH
+Call VIREBOUT(CHAINE,"5") From GOBJET     # remove ISR code line button from CHAINE -> disabled
+If int(val(func AFNC.PARAM("SWIPURBVR", [M:PIH0]FCY))) = 2 and [M:PIH0]PIHTYP < 3  # parameter "Swiss ISR usage purchasing" = yes and type "Invoice"?
+   CHAINE += "5"                          # Enable ISR code line button
+Endif
+Return
+
+
+#*****************************************************************************************************
+# SETBOUT_BIS: disable button “ISR code line” (5) when SWIPURBVR = No -> called from SETBOUT in SUBBIS
+#*****************************************************************************************************
+$SETBOUT_BIS
+Call VIREBOUT(CHAINE,"3") From GOBJET     # remove ISR code line button from CHAINE -> disabled
+If int(val(func AFNC.PARAM("SWIPURBVR", [M:BIS0]FCY))) = 2 and [M:BIS0]INVTYP = 1  # parameter "Swiss ISR usage purchasing" = yes and type "Invoice"?
+   CHAINE += "3"                          # Enable ISR code line button
+Endif
+Return
+
+
+
+#*********************************************************************************
+# RAZDUP_PIH: clear fields BVRREFLINE and BVRBID in case of duplication of invoice
+#*********************************************************************************
+$RAZDUP_PIH
+If dim([M:PIH1]BVRREFLINE) > 0
+   Raz [M:PIH1]BVRREFLINE              # clear field
+Endif
+If dim([M:PIH1]BVRBID) > 0
+   Raz [M:PIH1]BVRBID                  # clear field
+Endif
+Return
+
+
+#*********************************************************************************
+# RAZDUP_BIS: clear fields BVRREFLINE and BVRBID in case of duplication of invoice
+#*********************************************************************************
+$RAZDUP_BIS
+If dim([M:BIS1]BVRREFLINE) > 0
+   Raz [M:BIS1]BVRREFLINE              # clear field
+Endif
+If dim([M:BIS1]BVRBID) > 0
+   Raz [M:BIS1]BVRBID                  # clear field
+Endif
+Return
+
+
+#**********************************************************************************************************************************
+# APRES_MODIF_PIH: enable/disable button “ISR code line” (5) depending on parameter SWIPURBVR -> called from APRES_MODIF in SUBPIHA
+#**********************************************************************************************************************************
+$APRES_MODIF_PIH
+If COUZON = "FCY"
+    Call VIREBOUT(CHAINE,"5") From GOBJET              # remove ISR code line button from CHAINE -> disabled
+    If int(val(func AFNC.PARAM("SWIPURBVR", CZ))) = 2  # parameter "Swiss ISR usage purchasing" = yes?
+       CHAINE += "5"                                   # Enable ISR code line button
+    Endif
+    Gosub SETBOUT From GOBJSUB
+Elsif COUZON = "PIVTYP"                                # button ISR code line only active for type "Invoice"
+    Call VIREBOUT(CHAINE,"5") From GOBJET              # remove ISR code line button from CHAINE -> disabled
+    If int(val(func AFNC.PARAM("SWIPURBVR", GFCY))) = 2 and [M:PIH0]PIHTYP < 3 # parameter "Swiss ISR usage purchasing" = yes and "Invoice"?
+       CHAINE += "5"                                   # Enable ISR code line button
+    Endif
+    Gosub SETBOUT From GOBJSUB
+Endif
+Return
+
+
+#*********************************************************************************************************************************
+# APRES_MODIF_BIS: enable/disable button “ISR code line” (5) depending on parameter SWIPURBVR -> called from APRES_MODIF in SUBBIS
+#*********************************************************************************************************************************
+$APRES_MODIF_BIS
+If COUZON = "FCY"
+    Call VIREBOUT(CHAINE,"3") From GOBJET              # remove ISR code line button from CHAINE -> disabled
+    If int(val(func AFNC.PARAM("SWIPURBVR", CZ))) = 2  # parameter "Swiss ISR usage purchasing" = yes?
+       CHAINE += "3"                                   # Enable ISR code line button
+    Endif
+    Gosub SETBOUT From GOBJSUB
+Elsif COUZON = "PIVTYP"                                # button ISR code line only active for type "Invoice"
+    Call VIREBOUT(CHAINE,"3") From GOBJET              # remove ISR code line button from CHAINE -> disabled
+    If int(val(func AFNC.PARAM("SWIPURBVR", [M:BIS0]FCY))) = 2 and [M:BIS0]INVTYP = 1 # parameter "Swiss ISR usage purchasing" = yes and "Invoice"?
+       CHAINE += "3"                                   # Enable ISR code line button
+    Endif
+    Gosub SETBOUT From GOBJSUB
+Endif
+Return
+
+
+#****************************************************************************************************************************************
+# C_PTE_PIH: do additional controls for correctness of ISR reference line depending on parameter SWIPURBVR -> called from C_PTE in SUBPIH
+#****************************************************************************************************************************************
+$C_PTE_PIH
+If [M:PIH0]PIHTYP < 3                                          # ISR only for type "Invoice"
+    If int(val(func AFNC.PARAM("SWIPURBVR", [M:PIH0]FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+       Call CONT_PTE(VALEUR,2) From SWIBVRLIB4
+    Endif
+Endif
+Return
+
+
+#****************************************************************************************************************************************
+# C_PTE_BIS: do additional controls for correctness of ISR reference line depending on parameter SWIPURBVR -> called from C_PTE in SUBBIS
+#****************************************************************************************************************************************
+$C_PTE_BIS
+If [M:BIS0]INVTYP = 1                                          # ISR only for type "Invoice"
+    If int(val(func AFNC.PARAM("SWIPURBVR", [M:BIS0]FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+       Call CONT_PTE(VALEUR,1) From SWIBVRLIB4
+    Endif
+Endif
+Return
+
+
+#****************************************************************************************************************************************
+# VERIF_PIH: do additional controls for correctness of ISR reference line depending on parameter SWIPURBVR
+# -> called from VERIF_CRE and VERIF_MOD in SUBPIH
+#****************************************************************************************************************************************
+$VERIF_PIH
+If [M:PIH0]PIHTYP < 3                               # ISR only for type "Invoice"
+    If int(val(func AFNC.PARAM("SWIPURBVR", [M:PIH0]FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+        Local Integer TYPE_DTA, MASQUE
+        Local Integer SWIPAMBVR # X3-46380
+        MASQUE = 2
+        Call VERIF_DTA_(TYPE_DTA,SWIPAMBVR,MASQUE)
+
+        If TYPE_DTA = 826 or TYPE_DTA =28
+            If [M:PIH1]BVRREFLINE= ""
+                GERR= 1: GMESSAGE=mess(63,3648,1) : OK=0: Return
+            Endif
+        Endif
+        # X3-46380
+        If SWIPAMBVR = 5 and TYPE_DTA =1
+            If [M:PIH1]BVRREFLINE= ""
+                GERR= 1: GMESSAGE=mess(89,3648,1) : OK=0: Return
+            Endif
+        Endif
+        # verify consistency of amount
+        Call CONT_AMT_PIH(TYPE_DTA)
+    Endif
+Endif
+Return
+
+
+#****************************************************************************************************************************************
+# VERIF_BIS: do additional controls for correctness of ISR reference line depending on parameter SWIPURBVR
+# -> called from VERIF_CRE and VERIF_MOD in SUBBIS
+#****************************************************************************************************************************************
+$VERIF_BIS
+If [M:BIS0]INVTYP = 1                               # ISR only for type "Invoice"
+    If int(val(func AFNC.PARAM("SWIPURBVR", [M:BIS0]FCY))) = 2 # parameter "Swiss ISR usage purchasing" = yes?
+        Local Integer TYPE_DTA, MASQUE
+        Local Integer SWIPAMBVR # X3-46380
+        MASQUE = 1
+        Call VERIF_DTA_(TYPE_DTA,SWIPAMBVR,MASQUE)
+
+        If TYPE_DTA = 826 or TYPE_DTA =28
+            If [M:BIS1]BVRREFLINE= ""
+                GERR= 1: GMESSAGE=mess(63,3648,1) : OK=0: Return
+            Endif
+        Endif
+        If SWIPAMBVR = 5 and TYPE_DTA = 1
+            If [M:BIS1]BVRREFLINE= ""
+                GERR= 1: GMESSAGE=mess(89,3648,1) : OK=0: Return
+            Endif
+        Endif
+        # verify consistency of amount
+        Call CONT_AMT(TYPE_DTA)
+    Endif
+Endif
+Return
+

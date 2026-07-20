@@ -1,0 +1,1173 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+###########################################################
+#109897/1 ajout LAN
+###########################################################
+
+
+#-------------------------------------------#
+# Balayage du répertoire des fichiers .job
+#-------------------------------------------#
+$TRTJOB
+Local Char    FICHIER(GDIMFIC)
+Local Char    LISJOB(50)(1..2000), JOB(50)
+Local Char    APPLI(80), UTIL(10), PASSE(24), TACHE(10), DATJ(20), HEURE(10), GRP(10), LANJ(10)
+Local Integer NBJOB , NOJOB , ERR
+Local Char    LISTAC(10)(1..500)
+Local Integer T, P, R, OKTAC(500)
+Local Char    APPGRP(10), GROUPE(10), USRGRP(10), DATGRP(10), HEUGRP(10)
+Local Char    SITE(10), PARAM(20), VALPAR(20), HOR(20)
+Local Integer OKVERIF, OK
+Local Char    HH(10), HS(10)
+Local Date    DD
+
+#109897 only on primary server because directory are on primary
+If [F:ABP]JOB=2 & adxmac(0)=""
+ Call LISFIC("job",NBJOB,LISJOB)
+ If NBJOB>0
+  # X3-59890 2017-12-12 JPGA : BatchServer DateTime is now the same in every internal function
+  Call SCHEDULING_DATE_TIME_DB   ( [L]DD, [L]HH, [L]HS) From SERVEUR
+  For NOJOB=1 To NBJOB
+   Call DEBTRANS From GLOCK
+   Gosub TR_JOB
+  Next NOJOB
+ Endif
+Endif
+Return
+
+#-------------------------------------------#
+$TR_JOB
+Trbegin [ABR] , [ABP]
+ JOB = LISJOB(NOJOB)
+ If JOB<>""
+  Call SETFIC(JOB,"kil",FICHIER)
+  If FICHIER<>"" & filinfo(FICHIER,0)>0 : # Tué dans l'oeuf !
+   Call RDJOB(JOB,"kil",MESSA,UTIL)
+   MESSA = mess(51,134,1)-MESSA : # Requête interrompue par # pour le motif
+   I = instr(1,MESSA,"#")
+   If I : MESSA = left$(MESSA,I-1)+UTIL+right$(MESSA,I+1) : Endif
+   Call WRJOB(JOB,"sta",31000,0,"",UTIL,"","",MESSA)
+   Call DELJOB(JOB,"kil")
+   Call MOVEJOB(JOB,"job","old") From SERVJOB
+  Else
+   Call GETJOB(JOB,APPLI,UTIL,PASSE,GRP,TACHE,LANJ,DATJ,HEURE,0,ERR,MESSA)
+   If ERR
+    Call WRJOB(JOB,"sta",26000+ERR,0,APPLI,UTIL,LANJ,TACHE,MESSA)
+    Call MOVEJOB(JOB,"job","old")
+   Else
+    Gosub VERFDAT : # Vérification rapide format Date, Heure, Dossier du fichier job
+    If !OKVERIF
+     Call WRJOB(JOB,"sta",ERR,0,APPLI,UTIL,LANJ,TACHE,MESSA)
+     Call MOVEJOB(JOB,"job","old")
+    #Elsif DATJ<DD
+    # Call WRJOB(JOB,"sta",26120,0,APPLI,UTIL,TACHE,mess(50,134,1)) : # Délai dépassé
+    # Call MOVEJOB(JOB,"job","old")
+    Elsif DATJ<=DD : # C'est le moment d'essayer de créer la/les requêtes
+     DATJ = DD
+     If GRP<>""
+      Gosub VERFGRP : # Vérification de tous les jobs du groupe
+      If OKVERIF
+       Gosub VERFCAL : # Vérification des contraintes horaires
+       If OKVERIF
+        Gosub TRTGRP : # Création des requêtes du groupe
+        If GOK<1
+         Goto AB_JOB
+        Endif
+       Endif
+      Endif
+     Else
+      Gosub VERFJOB : # Vérification des autres paramètres du fichier job
+      If !OKVERIF
+       Call WRJOB(JOB,"sta",ERR,0,APPLI,UTIL,LANJ,TACHE,MESSA)
+       Call MOVEJOB(JOB,"job","old")
+      Else
+       Gosub VERFCAL
+       If OKVERIF
+        Readlock [ABP]SPOOL First With lockwait=5
+        If fstat
+         # Erreur de verrouillage
+         GOK = 0 : Call STRACE(FICTRA,44000,0,mess(58,134,1)-"ABATPAR/JOB") From SERVEUR : Goto AB_JOB
+        Endif
+        FLG = 1
+        GRPNUM = 0
+        [L]GRPSEQ=0     # Issue X3-59123 - 2018-05-29 by CCC : add sequence in group of tasks
+        Gosub SETRQT : # Création de la requête
+        If GOK<1 : Goto AB_JOB : Endif
+        Rewrite [ABP]
+        If fstat
+         # Erreur d'écriture sur le fichier
+         GOK = 0 : Call STRACE(FICTRA,44000,0,mess(13,100,1)-"ABATPAR") From SERVEUR : Goto AB_JOB
+        Endif
+        Call MOVEJOB(JOB,"job","req")
+        Call SETFIC(JOB,"job",FICHIER)
+        If FICHIER<>"" & filinfo(FICHIER,0)>0
+         Call STRACE(FICTRA,45000,0,mess(12,100,1)-JOB+".job") From SERVEUR : # Erreur d'accès sur le fichier
+        Endif
+       Endif
+      Endif
+     Endif
+    Endif
+   Endif
+  Endif
+ Endif
+Commit
+Return
+
+$AB_JOB
+Rollback
+Return
+
+#-------------------------------------------------------------#
+# Vérification date, heure et dossier du fichier job
+#-------------------------------------------------------------#
+$VERFDAT
+
+OKVERIF = 1
+
+# Date
+Call CTLDAT(DATJ,OKVERIF)
+If !OKVERIF
+ ERR = 26200 : MESSA = DATJ-mess(1,104,1) : # Date incorrecte
+ Return
+Endif
+
+# Heure
+I = val(left$(HEURE,2))
+J = val(right$(HEURE,3))
+If I<0 | I>23 | J<0 | J>59
+ OKVERIF = 0 : ERR = 26100 : MESSA = HEURE-mess(69,134,1) : # Heure incorrecte
+ Return
+Endif
+
+# Existence dossier
+If filinfo(filpath("FIL","ADOVAL","fde",APPLI),0)<0 : # Ca évite d'ouvrir la table ADOSSIER
+ OKVERIF = 0 : ERR = 28000 : MESSA = APPLI-mess(7,125,1) : # Dossier inexistant
+ Return
+Endif
+
+Return
+
+#------------------------------#
+Subprog CTLDAT(DATJ,OKVERIF)
+Value    Char    DATJ
+Variable Integer OKVERIF
+Local    Date    DAT
+Onerrgo ERDAT
+DAT = gdat$(DATJ)
+End
+
+$ERDAT
+OKVERIF = 0
+Resume
+
+#-------------------------------------------------------------#
+# Vérification calendrier et contraintes horaires
+#-------------------------------------------------------------#
+$VERFCAL
+
+OKVERIF = 1
+
+If GRP<>""
+ Read [ABG]ABG0=GRP
+ HOR = [F:ABG]HOR
+Elsif TACHE<>""
+ Read [ABT]CODTAC=TACHE
+ HOR = [F:ABT]HOR
+Endif
+If HOR="" : Return : Endif : # Pas de contrôle
+
+#CHECK UNUSED_BEGIN
+Call CTLDAT(HOR,"","",DATJ,OKVERIF) From ARQTSUB
+If !OKVERIF : Return : Endif : # Date interdite
+
+Call CTLHOR(HOR,"","",DATJ,HEURE,OKVERIF) From ARQTSUB
+#CHECK UNUSED_END
+
+Return
+
+#-------------------------------------------------------------#
+# Vérification des autres paramètres du fichier job
+#-------------------------------------------------------------#
+$VERFJOB
+
+OKVERIF = 1
+
+Local File =APPLI+".AUTILIS"   [AUS]
+Local File =APPLI+".AMETUTI"   [AME]
+Local File =APPLI+".ADOVAL"    [ADW]
+
+# Existence utilisateur
+Read [AUS]CODUSR = UTIL
+If fstat
+ OKVERIF = 0 : ERR = 23100
+ MESSA = mess(54,134,1) : # Utilisateur # inconnu
+ I = instr(1,MESSA,"#")
+ If I : MESSA = left$(MESSA,I-1)+UTIL+right$(MESSA,I+1) : Endif
+ Goto FIN_VERFJOB
+Endif
+
+# Mot de passe utilisateur
+If len(PASSE)=24 : # Nouveau cryptage
+ Call VARPSE(PASSE) From GESUSER
+ Call CTLPAS(PASSE,OKVERIF) From GESUSER
+Else
+ OKVERIF = (PASSE=[F:AUS]PASSE)
+Endif
+If !OKVERIF
+ ERR = 23200 : MESSA = mess(55,134,1)-UTIL : # Mot de passe incorrect pour l'utilisateur
+ Goto FIN_VERFJOB
+Endif
+
+# Droit d'exécuter les fichiers batchs
+Read [ADW]ADW0 = "";"";"ADMUSR"
+If !fstat
+ GSUPER = [F:ADW]VALEUR
+Else
+ GSUPER = "ADMIN"
+Endif
+If [F:AUS]PRFFCT<>GSUPER
+ PARAM = "EXTBATCH" : Gosub GET_PARAM
+ If val(VALPAR)<>2
+  OKVERIF = 0 : ERR = 23000 : MESSA = mess(52,134,1) : # Accès aux fichiers batchs interdit
+  Goto FIN_VERFJOB
+ Endif
+Endif
+
+# Existence de la tâche
+Read [ABT]CODTAC = TACHE
+If fstat
+ OKVERIF = 0 : ERR = 22000 : MESSA = TACHE-mess(56,134,1) : # Tache inexistante
+ Goto FIN_VERFJOB
+Elsif [F:ABT]ENAFLG<>2
+ OKVERIF = 0 : ERR = 22100 : MESSA = TACHE-mess(67,134,1) : # Tâche inactive
+ Goto FIN_VERFJOB
+Endif
+
+# Niveau d'accès à la tâche batch
+If [F:ABT]NIVEAU<>0 & [F:AUS]PRFFCT<>GSUPER
+ PARAM = "NIVBATCH" : Gosub GET_PARAM
+ If val(VALPAR)<[F:ABT]NIVEAU
+  OKVERIF = 0 : ERR = 23400
+  MESSA = mess(63,134,1)-[F:AUS]USR : # Niveau d'accès # tâche non autorisé à l'utilisateur
+  I = instr(1,MESSA,"#")
+  If I : MESSA = left$(MESSA,I-1)+VALPAR+right$(MESSA,I+1) : Endif
+  Goto FIN_VERFJOB
+ Endif
+Endif
+
+# Droits sur la fonction
+Local Char WPROFIL(10)
+If [F:ABT]FONCTION<>""
+ OK = 0
+ Local File =APPLI+".AFCTFCT"   [AFT]
+ Local File =APPLI+".AFONCTION" [AFC]
+ Read [AFC]CODINT = [F:ABT]FONCTION
+ If [F:AUS]PRFFCT=""
+  Read [AME]AME0 = [F:AUS]CODMET
+  WPROFIL = [F:AME]PRFFCT
+ Else
+  WPROFIL = [F:AUS]PRFFCT
+ Endif
+ Read [AFT]AFT0 = WPROFIL
+ If [F:AFT]ALLFCT=2
+  OK = 1
+ Elsif [F:AFC]FCYAUZ<>2 : # Fonctions sans sites
+  Local File =APPLI+".AFCTPRF"   [AFP]
+  Read [AFP]AFP0 = WPROFIL ; [F:ABT]FONCTION ; ""
+  If !fstat & [F:AFP]ACS=2
+   OK = 1
+  Endif
+  Close Local File [AFP]
+ Else
+  Local File =APPLI+".AFCTFCY"   [AFF]
+  For [AFF]AFF1 Where PRFCOD=WPROFIL & FNC=[F:ABT]FONCTION
+   OK = 1 : Break
+  Next
+  Close Local File [AFF]
+ Endif
+ Close Local File [AFT], [AFC]
+ If !OK
+  OKVERIF = 0 : ERR = 23500
+  MESSA = [F:ABT]FONCTION-mess(57,134,1)-UTIL : # Fonction non autorisée à l'utilisateur
+  Goto FIN_VERFJOB
+ Endif
+Endif
+
+# Retard
+Local Integer RETARD
+If [F:ABT]RETARD<>0
+ RETARD = [F:ABT]RETARD
+Elsif [F:ABP]RETARD<>0
+ RETARD = [F:ABP]RETARD
+Else
+ RETARD = 0
+Endif
+If RETARD
+ Local Date    DAT, DATR
+ Local Integer TIM, TIMR, TEMPS
+ DAT  = DD
+ DATR = DATJ
+ TIM  = val(left$(HH,2))
+ TIMR = val(left$(HEURE,2))
+ If DAT=DATR
+  TEMPS = TIM-TIMR
+ Else
+  TEMPS = (24-TIMR)+TIM+(((DAT-DATR)-1)*24)
+ Endif
+ If TEMPS>RETARD
+  OKVERIF = 0 : ERR = 21000 : MESSA = mess(50,134,1) : # Délai dépassé
+  Goto FIN_VERFJOB
+ Endif
+Endif
+
+# Géode : site et déposant
+If dim([F]GFCY)>0 & dim([V]GDEP)>0 & [F:ABT]FONCTION<>""
+ Local File =APPLI+".AFONCTION" [AFC]
+ Read [AFC]CODINT = [F:ABT]FONCTION
+ If [F:AFC]FCYENV=2
+  If [V]GFCY=""
+   OKVERIF = 0 : ERR = 29000 : MESSA = mess(94,134,1) : # Site inexistant
+  Else
+   Local File =APPLI+".SITE" [SIT]
+   Read [SIT]SIT0 = [V]GFCY
+   If fstat
+    OKVERIF = 0 : ERR = 29100 : MESSA = [V]GFCY-":"-mess(94,134,1) : # Site inexistant
+   Endif
+  Endif
+  Close Local File [SIT]
+ Endif
+ If OKVERIF & [F:AFC]DEPENV=2
+  If [V]GDEP=""
+   OKVERIF = 0 : ERR = 29200 : MESSA = mess(95,134,1) : # Déposant inexistant
+  Else
+   Local File =APPLI+".DEPOSITOR" [DEP]
+   Read [DEP]DEP0 = [V]GFCY;[V]GDEP
+   If fstat
+    OKVERIF = 0 : ERR = 29300 : MESSA = [V]GDEP-":"-mess(95,134,1) : # Déposant inexistant
+   Endif
+  Endif
+  Close Local File [DEP]
+ Endif
+ Close Local File [AFC]
+ If !OKVERIF
+  Goto FIN_VERFJOB
+ Endif
+Endif
+
+#-----------------#
+$FIN_VERFJOB
+Close Local File [AUS], [ADW] , [AME]
+Return
+
+#-------------------------------------------#
+$GET_PARAM
+VALPAR = ""
+Local File =APPLI+".ADOVALAUS" [ADU]
+Read [ADU]ADU0 = UTIL;PARAM
+If !fstat
+ VALPAR = [F:ADU]VALEUR
+Else
+ Local File =APPLI+".AFCTFCT"   [AFT]
+ If [F:AUS]PRFFCT=""
+  Read [AME]AME0 = [F:AUS]CODMET
+  Read [AFT]AFT0 = [F:AME]PRFFCT
+ Else
+  Read [AFT]AFT0 = [F:AUS]PRFFCT
+ Endif
+ SITE = [F:AFT]FCYDEF(0)
+ Read [ADW] = "";SITE;PARAM
+ If !fstat
+  VALPAR = [F:ADW]VALEUR
+ Else
+  Local File =APPLI+".FACILITY"   [FCY]
+  Read [FCY]FCY0 = SITE
+  Read [ADW] = [F:FCY]LEGCPY;"";PARAM
+  If !fstat
+   VALPAR = [F:ADW]VALEUR
+  Else
+   Read [ADW] = "";"";PARAM
+   If !fstat
+    VALPAR = [F:ADW]VALEUR
+   Endif
+  Endif
+  Close Local File [FCY]
+ Endif
+ Close Local File [AFT]
+Endif
+Close Local File [ADU]
+Return
+
+#-------------------------------------------#
+$SETRQT
+Raz [F:ABR]
+[F:ABR] = [F:ABT]
+[F:ABR]ETAT    = [F:ABT]TRAIT
+[F:ABR]NUMGRP  = GRPNUM
+[F:ABR]SEQGRP  = [L]GRPSEQ     # Issue X3-59123 - 2018-05-29 by CCC : add sequence in group of tasks
+[F:ABR]FLAG    = FLG
+[F:ABR]LAN     = LANJ : #109897
+[F:ABR]DAT     = DATJ
+[F:ABR]NUMREQ  = [F:ABP]NUMREQ
+[F:ABR]HEURE   = HEURE
+[F:ABR]DOSSIER = APPLI
+[F:ABR]JOB     = JOB
+[F:ABR]GRP     = GRP
+[F:ABR]TACHE   = TACHE
+[F:ABR]USER    = UTIL
+If dim([F]GFCY)>0 & dim([V]GDEP)>0
+ [F:ABR]FCY=[V]GFCY
+ [F:ABR]DEP=[V]GDEP
+Endif
+Write [ABR]
+If fstat
+ GOK = 0 : Call FSTA("ABR") From GLOCK : Return
+Endif
+Call GETJOB(JOB,APPLI,UTIL,PASSE,GRP,TACHE,LANJ,DATJ,HEURE,[F:ABR]NUMREQ,ERR,MESSA)
+If ERR
+ Call WRJOB(JOB,"sta",26000+ERR,0,APPLI,UTIL,LANJ,TACHE,MESSA)
+ Call MOVEJOB(JOB,"job","old")
+ GOK =0
+ Return
+Endif
+GPOINT = "SETREQ" : Gosub ENTREE From EXEFNC
+[F:ABP]NUMREQ  += 1
+If GOK<1
+ GCLE = num$([F:ABR]NUMREQ) - "(" + JOB + ")"
+ Call STRACE(FICTRA,42000,0,mess(13,100,1)-"ABATRQT"-GCLE) From SERVEUR
+Endif
+Return
+
+#-----------------------------------------------------------------------#
+# On va essayer de créer une requête pour chaque tâche du groupe
+#-----------------------------------------------------------------------#
+$TRTGRP
+Readlock [ABP]SPOOL First With lockwait=5
+If fstat
+ # Erreur de verrouillage
+ GOK = 0 : Call STRACE(FICTRA,44000,0,mess(58,134,1)-"ABATPAR/JOB") From SERVEUR : Return
+Endif
+
+GRPNUM = [F:ABP]NUMREQ
+Raz OKTAC
+For T=0 To [F:ABG]NBTAC-1
+ Read [ABT]CODTAC = [F:ABG]CODTAC(T)
+ If T=0
+& | [F:ABG]SEQ(T)=[F:ABG]SEQ(0)     # Issue X3-59123 - 2018-05-29 by CCC : add sequence in group of tasks
+  FLG = 1 : # En attente
+ Else
+  FLG = 4 : # Bloquée
+ Endif
+ P = 0
+ For R=1 To NBJOB
+  If [F:ABG]CODTAC(T)=LISTAC(R) & OKTAC(R)=0
+   P = R : Break
+  Endif
+ Next R
+ If P
+  JOB = LISJOB(P)
+  Call GETJOB(JOB,APPLI,UTIL,PASSE,GRP,TACHE,LANJ,DATJ,HEURE,0,ERR,MESSA)
+  Read [ABT]CODTAC = TACHE
+  [L]GRPSEQ=[F:ABG]SEQ(T)     # Issue X3-59123 - 2018-05-29 by CCC : add sequence in group of tasks
+  Gosub SETRQT
+  If GOK<1
+   Break
+  Else
+   OKTAC(P) = 1 : # Même si la requête n'est pas créée (GPE=1)
+  Endif
+ Endif
+Next T
+If GOK<1 : Return : Endif
+
+Rewrite [ABP]
+If fstat
+ # Erreur d'écriture sur le fichier
+ GOK = 0 : Call STRACE(FICTRA,44000,0,mess(13,100,1)-"ABATPAR") From SERVEUR : Return
+Endif
+
+# Tout c'est bien passé, on mouve tous les fichiers job du groupe en req
+For T=1 To NBJOB
+ If OKTAC(T)
+  Call MOVEJOB(LISJOB(T),"job","req")
+  LISJOB(T) = ""
+ Endif
+Next T
+Return
+
+#-------------------------------------------#
+# Vérification groupe de tâches
+#-------------------------------------------#
+$VERFGRP
+
+OKVERIF = 1
+GROUPE = GRP
+APPGRP = APPLI
+USRGRP = UTIL
+DATGRP = DATJ
+HEUGRP = HEURE
+
+# Recherche des jobs appartenant au même groupe/appli/utilisateur/date/heure
+Raz LISTAC
+For T=1 To NBJOB
+ If LISJOB(T)<>""
+  Call GETJOB(LISJOB(T),APPLI,UTIL,PASSE,GROUPE,TACHE,LANJ,DATJ,HEURE,0,ERR,MESSA)
+  If !ERR & GROUPE=GRP & APPLI=APPGRP & UTIL=USRGRP & DATJ=DATGRP & HEURE=HEUGRP
+   LISTAC(T) = TACHE
+  Else
+   LISTAC(T) = ""
+  Endif
+ Endif
+Next T
+
+# Existence groupe
+Read [ABG]ABG0 = GRP
+If fstat
+ OKVERIF = 0 : ERR = 27000 : MESSA = GRP-mess(66,134,1) : # Groupe inexistant
+ Goto FIN_VERFGRP
+Elsif [F:ABG]ENAFLG<>2
+ OKVERIF = 0 : ERR = 27100 : MESSA = GRP-mess(45,134,1) : # Groupe inactif
+ Goto FIN_VERFGRP
+Endif
+
+# Issue X3-59123 - 2018-05-30 by CCC : Check that sequence number of tasks are all initialized
+If [F:ABG]NBTAC>0 & find(0,[F:ABG]SEQ(0..[F:ABG]NBTAC-1))>0
+    Call INISEQ([F:ABG]SEQ, [F:ABG]NBTAC) From SUBABG
+
+    Rewrite [ABG]
+    If fstat
+        OKVERIF=0
+        ERR = 27000
+        MESSA = func GLOCK.GET_FSTAT_MSG(fstat)-"ABATGRP"-[F:ABG]CODGRP
+        Goto FIN_VERFGRP
+    Endif
+Endif
+
+# Niveau d'accès au groupe batch
+Local File =APPLI+".AUTILIS"   [AUS]
+Local File =APPLI+".AMETUTI"   [AME]
+Local File =APPLI+".ADOVAL"    [ADW]
+Read [ADW]ADW0 = "";"";"ADMUSR"
+If !fstat
+ GSUPER = [F:ADW]VALEUR
+Else
+ GSUPER = "ADMIN"
+Endif
+Read [AUS]CODUSR = UTIL
+If !fstat
+ If [F:ABG]NIVEAU<>0 & [F:AUS]PRFFCT<>GSUPER
+  PARAM = "NIVBATCH" : Gosub GET_PARAM
+  If val(VALPAR)<[F:ABG]NIVEAU
+   OKVERIF = 0 : ERR = 23400
+   MESSA = mess(72,134,1)-[F:AUS]USR : # Niveau d'accès # groupe non autorisé à l'utilisateur
+   I = instr(1,MESSA,"#")
+   If I : MESSA = left$(MESSA,I-1)+VALPAR+right$(MESSA,I+1) : Endif
+  Endif
+ Endif
+Endif
+Close Local File [AUS], [ADW] , [AME]
+If !OKVERIF : Goto FIN_VERFGRP : Endif
+
+# Est-ce qu'il manque un job ?
+Raz OKTAC
+For T=0 To [F:ABG]NBTAC-1
+ P = 0
+ For R=1 To NBJOB
+  If [F:ABG]CODTAC(T)=LISTAC(R) & OKTAC(R)=0
+   P = R : Break
+  Endif
+ Next R
+ If P
+  OKTAC(P) = 1
+ Else
+  OKVERIF = 0 : ERR = 27200
+  MESSA = mess(68,134,1)-GRP : # Tâche # non paramétrée dans le groupe
+  I = instr(1,MESSA,"#")
+  If I : MESSA = left$(MESSA,I-1)+[F:ABG]CODTAC(T)+right$(MESSA,I+1) : Endif
+  Break
+ Endif
+Next T
+If !OKVERIF : Goto FIN_VERFGRP : Endif
+
+# Vérification des paramètres de tous les jobs du groupe
+For T=1 To NBJOB
+ If LISTAC(T)<>""
+  JOB = LISJOB(T)
+  Call GETJOB(JOB,APPLI,UTIL,PASSE,GRP,TACHE,LANJ,DATJ,HEURE,0,ERR,MESSA)
+  Gosub VERFJOB
+  If !OKVERIF
+   Call WRJOB(JOB,"sta",ERR,0,APPLI,UTIL,LANJ,TACHE,MESSA)
+   Call MOVEJOB(JOB,"job","old")
+   ERR = 27300 : MESSA = mess(71,134,1)-GRP : # Tâche # en erreur dans le groupe
+   I = instr(1,MESSA,"#")
+   If I : MESSA = left$(MESSA,I-1)+TACHE+right$(MESSA,I+1) : Endif
+   LISJOB(T) = "" : LISTAC(T) = "" : # Pour mettre un autre message d'erreur aux autres jobs du groupe
+   Break
+  Endif
+ Endif
+Next T
+
+# En cas d'erreur, on mouve tous les fichiers job du groupe en .old
+#------------------------------------------------------------------#
+$FIN_VERFGRP
+If !OKVERIF
+ For T=1 To NBJOB
+  If LISTAC(T)<>""
+   JOB = LISJOB(T)
+   Call WRJOB(JOB,"sta",ERR,0,APPGRP,USRGRP,LANJ,LISTAC(T),MESSA)
+   Call MOVEJOB(JOB,"job","old")
+   LISJOB(T) = ""
+  Endif
+ Next T
+Endif
+Return
+
+#---------------------------------------------------------#
+# Création des fichiers (sta, run)
+#---------------------------------------------------------#
+Subprog WRJOB(JOB,TYP,ERR,REQ,APP,USR,LAN,TAC,MES)
+Value Char    JOB, TYP
+Value Integer ERR, REQ
+Value Char    APP, USR, LAN,TAC, MES
+Local Char    FICHIER(GDIMFIC), DATDEB(20), DATFIN(20), SEP(1)
+Local Char    FICTRA(GDIMFIC)
+Local Integer NUMREQ, ERR_OPEN
+Local Char    HH(10), HS(10)
+Local Date    DD
+
+If clalev([F:ABR])>0
+ [L]NUMREQ = [F:ABR]NUMREQ
+Else
+ [L]NUMREQ = 0
+Endif
+
+Call SETFIC(JOB,TYP,FICHIER)
+If FICHIER="" : End : Endif
+
+# X3-59890 2017-12-12 JPGA : BatchServer DateTime is now the same in every internal function
+Call SCHEDULING_DATE_TIME_DB   ( [L]DD, [L]HH, [L]HS) From SERVEUR
+
+SEP = ":"
+
+GPE = 0
+GPOINT = "WRJOB" : Gosub ENTREE From EXEFNC
+If GPE=1 : End : Endif
+
+Onerrgo ERR_OPEN
+Openo FICHIER,0 Using [FCB]
+Onerrgo
+If ERR_OPEN
+ FICTRA = func SERVSYS.GET_FILE_SERVEUR("tra")       # Issue X3-70499 - 2018-03-05 by CCC : whole path => with extension file
+ # Erreur d'écriture sur le fichier
+ Call STRACE(FICTRA,45000,[L]NUMREQ,mess(13,100,1)-FICHIER) From SERVEUR
+ End
+Endif
+
+Iomode adxifs "" Using [FCB]
+Iomode adxirs chr$(10) Using [FCB]
+Iomode adxium GASCII Using [FCB]
+
+If DATDEB="" & DATFIN=""
+ Case TYP
+  When "sta"
+   If [L]NUMREQ=0
+    DATDEB = DD+HS
+   Else
+    If [F:ABR]DAT<>[0/0/0] : DATDEB = [F:ABR]DAT   : Else : DATDEB = DD :  Endif
+    If [F:ABR]HDEB<>""     : DATDEB += [F:ABR]HDEB
+    Elsif [F:ABR]HEURE<>"" : DATDEB += [F:ABR]HEURE+"00"
+    Else                   : DATDEB += HS
+    Endif
+   Endif
+   DATFIN = DD+HS
+  When Default
+   DATDEB = DD+HS
+   DATFIN = ""
+ Endcase
+Endif
+
+Wrseq format$("N0:5#",ERR); Using [FCB]                     : # No erreur
+Wrseq SEP;format$("N0:8#",REQ); Using [FCB]                 : # No requête
+Wrseq SEP;format$("N0:14#",DATDEB); Using [FCB]             : # Date et heure début
+Wrseq SEP;format$("N0:14#",DATFIN); Using [FCB]             : # Date et heure fin
+Wrseq SEP;format$("K:10X",APP); Using [FCB]                 : # Dossier
+Wrseq SEP;format$("K:5X",USR); Using [FCB]                  : # Utilisateur
+#109897
+Wrseq SEP;format$("K:3X",LAN); Using [FCB]                  : # Langue
+Wrseq SEP;format$("K:10X",TAC); Using [FCB]                 : # Tâche
+Wrseq SEP;format$("K:80X",toupper(ctrans(MES))) Using [FCB] : # Message en clair
+
+Openo Using [FCB]
+End
+
+$ERR_OPEN
+ERR_OPEN = errn
+Resume
+
+#----------------------------------------------#
+# Lecture du contenu d'un fichier (kil)
+#----------------------------------------------#
+Subprog RDJOB(JOB,TYP,MES,UTIL)
+Value    Char    JOB, TYP
+Variable Char    MES, UTIL
+Local Char       FICHIER(GDIMFIC) , FICTRA(GDIMFIC)
+Local Schar      CHAINE(250)
+Local Integer    ERR_OPEN
+
+Call SETFIC(JOB,TYP,FICHIER)
+
+Onerrgo ERR_OPEN
+Openi FICHIER Using [FCB]
+Onerrgo
+If ERR_OPEN
+ FICTRA = func SERVSYS.GET_FILE_SERVEUR("tra")     # Issue X3-70499 - 2018-03-05 by CCC : whole path => with extension file
+ # Erreur de lecture sur le fichier
+ Call RTRACE(FICTRA,45000,mess(70,122,1)-FICHIER) From SERVEUR
+ End
+Endif
+Iomode adxifs "" Using [FCB]
+Iomode adxirs chr$(10) Using [FCB]
+Iomode adxium GASCII Using [FCB]
+
+Rdseq CHAINE Using [FCB]
+CHAINE = ctrans(CHAINE,chr$(13),"")
+Case TYP
+ When "kil"
+  Call INFO_USR(filinfo(FICHIER,5),UTIL)
+  MES  = CHAINE  : # Motif interruption
+Endcase
+
+Openi Using [FCB]
+End
+
+#-------------------------------------------#
+Subprog INFO_USR(UID,USR)
+Value    Integer UID
+Variable Char    USR
+Local Schar      WUSR(40), WCAR(40)
+Local Char       FICHIER(GDIMFIC) , FICTRA(GDIMFIC)
+Local Integer    ERR_OPEN
+Local Decimal    WDEC, WNUM
+
+FICHIER = "/etc/passwd"
+If filinfo(FICHIER,0)<=0
+ USR = ""
+ End
+Endif
+
+Onerrgo ERR_OPEN
+Openi FICHIER Using [USR_]
+Onerrgo
+If ERR_OPEN
+ FICTRA = func SERVSYS.GET_FILE_SERVEUR("tra")       # Issue X3-70499 - 2018-03-05 by CCC : whole path => with extension file
+ # Erreur de lecture sur le fichier
+ Call RTRACE(FICTRA,45000,mess(70,122,1)-FICHIER) From SERVEUR
+ End
+Endif
+Iomode adxifs ":" Using [USR_]
+Iomode adxirs chr$(10) Using [USR_]
+Iomode adxium GASCII Using [USR_]
+
+fstat = 0
+Repeat
+ Rdseq WUSR, WCAR, WNUM, WDEC, WCAR, WCAR, WCAR Using [USR_]
+ If WNUM=UID : USR = toupper(WUSR) : Break : Endif
+Until fstat
+
+Openi Using [USR_]
+End
+
+#-------------------------------------------#
+# Suppression des fichiers (run)
+#-------------------------------------------#
+Subprog DELJOB(JOB,TYP)
+Value Char JOB, TYP
+Local Char    FICHIER(GDIMFIC)
+Local Integer STAT
+Call SETFIC(JOB,TYP,FICHIER)
+#Call EFFACE(FICHIER,STAT) From ORDSYS
+Call _EFFACE(FICHIER,STAT) From ASYRSYS
+End
+
+#----------------------------------------------#
+# Move des fichiers (job en req, req en old)
+#----------------------------------------------#
+Subprog MOVEJOB(JOB,TYP1,TYP2)
+Value Char    JOB, TYP1, TYP2
+Local Char    FICHIER1(GDIMFIC), FICHIER2(GDIMFIC)
+Local Integer STAT
+Call SETFIC(JOB,TYP1,FICHIER1)
+If FICHIER1<>"" & filinfo(FICHIER1,0)>0
+ Call SETFIC(JOB,TYP2,FICHIER2)
+ If FICHIER2<>""
+  Call MOVE(FICHIER1,FICHIER2,STAT) From ORDSYS
+ Endif
+Endif
+End
+
+#------------------------------------------------------------------------------#
+# Lecture d'un fichier .job
+#------------------------------------------------------------------------------#
+Subprog GETJOB(JOB,APPLI,UTIL,PASSE,GRP,TACHE,LANJ,DATJ,HEURE,NUMREQ,ERR,MES)
+Value    Char    JOB
+Variable Char    APPLI
+Variable Char    UTIL
+Variable Char    PASSE
+Variable Char    GRP
+Variable Char    TACHE
+Variable Char    LANJ
+Variable Char    DATJ
+Variable Char    HEURE
+Value    Integer NUMREQ
+Variable Integer ERR
+Variable Char    MES
+
+Local    Char    FICHIER(GDIMFIC), VARIA(20), ZONE(20)
+Local    Schar   CHAINE(250)
+Local    Char    VALEUR(250) , FICTRA(GDIMFIC)
+Local    Integer DIM2, TETE , ERR_OPEN
+Local    Integer OK, I, J, K, L
+
+If dim([F]GFCY)>0 & dim([V]GDEP)>0 : Raz [V]GFCY, [V]GDEP : Endif
+
+Call SETFIC(JOB,"job",FICHIER)
+If FICHIER="" | filinfo(FICHIER,0)<0
+ ERR = 10 : MES = mess(101,100,1) : # Fichier inexistant
+ End
+Endif
+
+Onerrgo ERR_OPEN
+Openi FICHIER Using [FCB]
+Onerrgo
+If ERR_OPEN
+ FICTRA = func SERVSYS.GET_FILE_SERVEUR("tra")     # Issue X3-70499 - 2018-03-05 by CCC : whole path => with extension file
+ # Erreur de lecture sur le fichier
+ Call RTRACE(FICTRA,45000,mess(70,122,1)-FICHIER) From SERVEUR
+ End
+Endif
+Iomode adxifs "" Using [FCB]
+Iomode adxirs chr$(10) Using [FCB]
+Iomode adxium GASCII Using [FCB]
+
+Raz [F:ABL]
+Raz ERR, MES
+Raz LANJ : #109897
+J = 0
+If dim([F]GFCY)>0 & dim([V]GDEP)>0
+ TETE = 9
+Else
+ TETE = 7    : # Nb infos obligatoires dans l'entête du fichier
+Endif
+DIM2 = mod(type([F:ABL]VALEUR)-10,256)
+
+Rdseq CHAINE Using [FCB]
+CHAINE = ctrans(CHAINE,chr$(13),"")
+While !fstat
+ If left$(CHAINE,1)<>"#" : # Commentaires
+  If TETE=7 & right$(CHAINE,len(CHAINE))=chr$(13) : # Format cr/lf non reconnu
+   ERR = 8 : Break
+  Endif
+  I = instr(1,CHAINE,"=")
+  If I
+   ZONE = left$(CHAINE,I-1)
+   VALEUR = right$(CHAINE,I+1)
+  Else
+   ZONE = ""
+  Endif
+  If ZONE<>""
+   If TETE
+    Case ZONE
+     When "DOSSIER" : APPLI = VALEUR : TETE -= 1
+     When "LAN"     : LANJ = VALEUR  : # TETE -= 1 : #109897
+     When "UTIL"    : UTIL  = VALEUR : TETE -= 1
+     When "PASSE"   : PASSE = VALEUR : TETE -= 1
+     When "GRP"     : GRP   = VALEUR : TETE -= 1
+     When "TACHE"   : TACHE = VALEUR : TETE -= 1
+     When "DATE"    : DATJ  = VALEUR : TETE -= 1
+     When "HEURE"
+      HEURE = VALEUR
+      K = instr(1,HEURE,":")
+      While K
+       HEURE = left$(HEURE,K-1)+right$(HEURE,K+1)
+       K = instr(1,HEURE,":")
+      Wend
+      HEURE = format$("N0:####",left$(HEURE,4))
+      TETE -= 1
+     When "SITE"     : [V]GFCY = VALEUR : TETE -= 1
+     When "DEPOSANT" : [V]GDEP = VALEUR : TETE -= 1
+     When Default
+      Break
+    Endcase
+   Elsif [L]NUMREQ
+    Repeat
+     J += 1
+     [F:ABL]NUMREQ  = [L]NUMREQ
+     [F:ABL]PARAM   = ZONE
+     [F:ABL]NUM = J
+     [F:ABL]VALEUR  = left$(VALEUR,DIM2)
+     Write [F:ABL]
+     If fstat : ERR = 12 : MES = mess(101,100,1)  : Break 2 : Endif
+     VALEUR = right$(VALEUR,DIM2+1)
+    Until VALEUR=""
+   Endif
+  Endif
+ Endif
+ Rdseq CHAINE Using [FCB]
+ CHAINE = ctrans(CHAINE,chr$(13),"")
+Wend
+
+Openi Using [FCB]
+
+If ERR = 12 : End : Endif
+
+If ERR=0 & TETE<>0
+ ERR = TETE
+Endif
+If ERR<>0
+ MES = mess(53,134,1) : # Structure fichier batch incorrecte
+ Case ERR
+  When 9       : MES -= "("+mess(14,135,1)+")" : # Trop de paramètres
+  When 8       : MES -= "("+mess(74,134,1)+")" : # cr/lf
+  When Default : MES -= "("+num$(ERR)+mess(73,134,1)+")" : # Nombre insuffisant de paramètres
+ Endcase
+Endif
+End
+
+#--------------------------------------------------------------------------------#
+# Création du fichier .mod
+#--------------------------------------------------------------------------------#
+Subprog SETJOB(JOB,APPLI,UTIL,GRP,TACHE,DATDAT,HEURE,ABRMSK,FICHIER,LAN)
+Value Char    JOB
+Value Char    APPLI
+Value Char    UTIL
+Value Char    GRP
+Value Char    TACHE
+Value Date    DATDAT
+Value Char    HEURE
+Value Char    ABRMSK()
+Variable Char FICHIER
+Value Char    LAN
+
+Local Schar   CHAINE(GDIMFIC),CHAINES(GDIMFIC)
+Local Char    VARIA(20), PASCOD(24), DATCAR(20) , VARI(10)  , ABREV(20) , VARIAS(20)
+Local Integer I , J , NBVAR , LNG , TYP , DIME , LMAX , MA
+Local Decimal NOMBRE
+Local Date    DAT
+
+Read [ABP]SPOOL First
+Call SETFIC(JOB,"mod",FICHIER)
+If FICHIER="" : End : Endif
+If clalev([F:AUS])=0 : Local File =APPLI+".AUTILIS" [AUS] : Endif
+Read [AUS]CODUSR = UTIL
+If !fstat & dim([F:AUS]NEWPAS)>0 & [F:AUS]NEWPAS<>""
+ PASCOD = [F:AUS]NEWPAS
+Else
+ PASCOD = [F:AUS]PASSE
+Endif
+DATCAR = DATDAT
+HEURE  = format$("N0:4#",HEURE)
+
+Openo FICHIER,0 Using [FCB]
+Iomode adxifs "" Using [FCB]
+Iomode adxirs chr$(10) Using [FCB]
+Iomode adxium GASCII Using [FCB]
+
+Wrseq 'DOSSIER='+APPLI  Using [FCB]
+Wrseq 'LAN='  +LAN  Using [FCB] : #109897
+Wrseq 'UTIL='   +UTIL   Using [FCB]
+Wrseq 'PASSE='  +PASCOD Using [FCB]
+Wrseq 'GRP='    +GRP    Using [FCB]
+Wrseq 'TACHE='  +TACHE  Using [FCB]
+Wrseq 'DATE='   +DATCAR Using [FCB]
+Wrseq 'HEURE='  +HEURE  Using [FCB]
+If dim([F]GFCY)>0 & dim([V]GDEP)>0
+ Wrseq 'SITE='    +[V]GFCY Using [FCB]
+ Wrseq 'DEPOSANT='+[V]GDEP Using [FCB]
+Endif
+
+LMAX = type(CHAINES)-10
+For MA=0 To dim(ABRMSK)-1
+ If ABRMSK(MA)<>""
+  ABREV = "[M:"+ABRMSK(MA)+"]"
+  If evalue("clalev("+ABREV+")")>0
+   NBVAR = evalue("clanbs("+ABREV+",1)")
+   For I=1 To NBVAR
+    VARI = evalue("clavar("+ABREV+","+num$(I)+")")
+    TYP  = evalue("type("+ABREV+VARI+")")
+    DIME = evalue("dim("+ABREV+VARI+")")
+    For J=1 To DIME
+     If DIME=1
+      VARIA = VARI
+     Else
+      VARIA = VARI+"("+num$(J-1)+")"
+     Endif
+     Case TYP
+      When 1,2,4,5,6,7,8,9
+       NOMBRE = evalue(ABREV+VARIA)
+       If NOMBRE<>0
+        VARIAS = VARIA
+        CHAINES = num$(NOMBRE)
+        Wrseq VARIAS+'='+CHAINES Using [FCB]
+       Endif
+      When 3
+       DAT = evalue(ABREV+VARIA)
+       If DAT<>[0/0/0]
+        VARIAS = VARIA
+        CHAINES = DAT
+        Wrseq VARIAS+'='+CHAINES Using [FCB]
+       Endif
+      When Default
+       LNG = evalue("len("+ABREV+VARIA+")")
+       If LNG<>0
+        CHAINE  = evalue(ABREV+VARIA)
+        CHAINES = ""
+        Repeat
+         VARIAS  = VARIA
+         CHAINES += left$(CHAINE,LMAX)
+         CHAINE = right$(CHAINE,LMAX+1)
+        Until CHAINE=""
+        Wrseq VARIAS+'='+CHAINES Using [FCB]
+       Endif
+     Endcase
+    Next J
+   Next I
+  Endif
+ Endif
+Next MA
+
+Openo Using [FCB]
+End
+
+#-------------------------------------------#
+# Détermine le chemin d'un fichier job
+#-------------------------------------------#
+Subprog SETFIC(JOB,TYP,FICHIER)
+Value    Char JOB, TYP
+Variable Char FICHIER
+Gosub SET_REPERT
+If REPERT<>""
+ FICHIER = filpath(REPERT,JOB,TYP,GDOSX3,"",adxmac(0))
+Else
+ FICHIER = ""
+Endif
+End
+
+#--------------#
+$SET_REPERT
+Gosub DEF_DOSSIER From SERVSYS
+Local    Char REPERT(GDIMFIC)
+Case TYP
+ When "job" : If [F:ABP]REPJOB(0)<>"" : REPERT = [F:ABP]REPJOB(0) : Else : REPERT = GBATCHDIR+"/job" : Endif
+ When "mod" : If [F:ABP]REPJOB(1)<>"" : REPERT = [F:ABP]REPJOB(1) : Else : REPERT = GBATCHDIR+"/job" : Endif
+ When "sta" : If [F:ABP]REPJOB(2)<>"" : REPERT = [F:ABP]REPJOB(2) : Else : REPERT = GBATCHDIR+"/job" : Endif
+ When "run" : If [F:ABP]REPJOB(3)<>"" : REPERT = [F:ABP]REPJOB(3) : Else : REPERT = GBATCHDIR+"/job" : Endif
+ When "req" : If [F:ABP]REPJOB(4)<>"" : REPERT = [F:ABP]REPJOB(4) : Else : REPERT = GBATCHDIR+"/job" : Endif
+ When "kil" : If [F:ABP]REPJOB(5)<>"" : REPERT = [F:ABP]REPJOB(5) : Else : REPERT = GBATCHDIR+"/job" : Endif
+ When "old" : If [F:ABP]REPJOB(6)<>"" : REPERT = [F:ABP]REPJOB(6) : Else : REPERT = GBATCHDIR+"/job" : Endif
+Endcase
+If find(left$(REPERT,len(REPERT)),"/","\")
+ REPERT = left$(REPERT,len(REPERT)-1)
+Endif
+If filinfo(filpath(REPERT,"","",GDOSX3,"",adxmac(0)),0)<=0
+ REPERT = ""
+Endif
+Return
+
+#-------------------------------------------#
+# Liste des fichiers job dans un répertoire
+#-------------------------------------------#
+Subprog LISFIC(TYP,NBJOB,LISJOB)
+Value    Char    TYP
+Variable Integer NBJOB
+Variable Char    LISJOB()(1..)
+Local    Char    REPERT(80)
+Gosub SET_REPERT
+If REPERT<>""
+ # 115581 Plantage serveur batch si + de 1000 fichiers .job
+ #Call SYSTEME2(adxmac(0),'lsadx -a'-GDOSX3-REPERT-TYP,"",NBJOB,LISJOB) From ORDSYS
+ Local File (NAMJOB(250)) From System adxmac(0)+'lsadx -a'-GDOSX3-REPERT-TYP As [JOB_]
+ For [JOB_] Where NAMJOB<>""
+  If NBJOB=dim(LISJOB) : Break : Endif
+  NBJOB+=1
+  LISJOB(NBJOB) = [JOB_]NAMJOB
+ Next
+Else
+ NBJOB = 0
+Endif
+End
+
+#------------------------------------------------------------#
+# Ménage dans les .run .kil au démarrage du serveur
+#------------------------------------------------------------#
+Subprog CTLJOB
+Local Char    FICHIER(GDIMFIC) , FICTRA(GDIMFIC)
+Local Char    LISJOB(50)(1..2000), JOB(50), LISJOB2(50)(1..2000)
+Local Schar   CHAINE(250)
+Local Integer K, NBJOB , NBJOB2, NOJOB, REQ , ERR_OPEN
+Local Char    SEP(1)
+
+If [F:ABP]JOB<>2 : End : Endif
+
+Local File ABATRQT   [ABR]
+
+SEP = ":"
+
+# Fichiers run à virer (requête en cours d'exécution)
+Call LISFIC("run",NBJOB,LISJOB)
+If NBJOB
+ For NOJOB=1 To NBJOB
+  JOB = LISJOB(NOJOB)
+  If JOB<>""
+   Call SETFIC(JOB,"run",FICHIER)
+   If FICHIER<>""
+    ERR_OPEN = 0
+    Onerrgo ERR_OPEN
+    Openi FICHIER Using [FCB]
+    Onerrgo
+    If ERR_OPEN
+     FICTRA = func SERVSYS.GET_FILE_SERVEUR("tra")       # Issue X3-70499 - 2018-03-05 by CCC : whole path => with extension file
+     # Erreur de lecture sur le fichier
+     Call RTRACE(FICTRA,45000,mess(70,122,1)-FICHIER) From SERVEUR
+    Else
+     Iomode adxifs "" Using [FCB]
+     Iomode adxirs chr$(10) Using [FCB]
+     Iomode adxium GASCII Using [FCB]
+     Rdseq CHAINE Using [FCB]
+     CHAINE = ctrans(CHAINE,chr$(13),"")
+     Openi Using [FCB]
+     K = instr(1,CHAINE,SEP)
+     If K
+      REQ = val(right$(CHAINE,K+1))
+      If REQ<>0
+       Read [ABR]NUMREQ = REQ
+       If fstat | [F:ABR]FLAG<>2
+        Call DELJOB(JOB,"run")
+       Endif
+      Endif
+     Endif
+     Openi Using [FCB]
+    Endif
+   Endif
+  Endif
+ Next NOJOB
+Endif
+
+# Fichiers kil à virer (tueur de fichier job, requête en attente ou en cours)
+Call LISFIC("kil",NBJOB,LISJOB)
+If NBJOB
+ Call LISFIC("job",NBJOB2,LISJOB2)
+ For NOJOB=1 To NBJOB
+  JOB = LISJOB(NOJOB)
+  If JOB<>""
+   OK = find(JOB,LISJOB2(1..NBJOB2))
+   If !OK
+    For [ABR] Where JOB=[L]JOB
+     OK = [F:ABR]FLAG : Break
+    Next
+    If OK=0 | OK>2
+     Call DELJOB(JOB,"kil")
+    Endif
+   Endif
+  Endif
+ Next NOJOB
+Endif
+
+End
+

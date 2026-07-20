@@ -1,0 +1,1192 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ 
+#################################################################################################################
+#
+#   Recapitulative Statement Germany
+#
+#   PURPOSE :    Gathers data for monthly, quarterly or yearly recapitulative statements
+#                according to German VAT legislation and creates printable reports,
+#                XML-, CSV- and ELMA5-file-exports.
+#   AUTHORS :    DNE
+#   DATE    :    2012-08-27
+#   UPDATES :    2013-01-11 MAMAY/DNE - Mass data complient update
+#                2013-12-12 ANGRE/DNE - Reduced export impediments (SAM #95245)
+#                2014-03-07 DNE - Improvement on payments (SAM #97179)
+#                2015-01-12 DNE - Correction of SAM #104751
+#                2015-06-22 angre Correction of SAM #108806 (additional check for ledgertype)
+#                2015-10-07 ANGRE DELETELINEITEMS CHANGED SAM #111288
+#                2016-04-28 DNE - SAM #116258
+#################################################################################################################
+
+# < DEBUG> ######################################################################################################
+Local Char XPARAM(10)(1..10)
+Call GCONSULT( "RSG", "", XPARAM ) From GCONSULT
+End
+# </DEBUG> ######################################################################################################
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  CALC_RECAP_STATEMENT
+#*
+#* Purpose:    Calculates the recapitulative statement for the parameterization given in the
+#*             header mask ([M:RSG0]).
+#*
+#*! #############################################################################################################
+
+$CALC_RECAP_STATEMENT
+    Local Integer NOL
+    Local Char COMMENT(255)         : COMMENT = ""
+    Local Integer IS_DOCDATE        : IS_DOCDATE = func IS_DCLVATDAT_DOCDATE()
+    Local Char EECNUM(255), COUNTRY(GLONCRY), ADDRESS(GLONADR), BPRNAME(255), VACBPR(GLONTVB)
+    Local File VDGERRSP [RSP2]
+    Local Integer ERRSTATUS         : ERRSTATUS = 0
+    Local Integer BULLET(0..2)      : BULLET(0) = 128  : BULLET(1) = 129  : BULLET(2) = 127     # Bullet array: 0..2 |-> icon no.
+    Local Integer RBULLET(127..129) : RBULLET(127) = 2 : RBULLET(128) = 0 : RBULLET(129) = 1    # Bullet array: icon no. |-> 0..2
+    Local Integer MAX_OCCURRENCES1 : MAX_OCCURRENCES1 = dim([M:RSG1]FLG)
+    Local Integer MAX_OCCURRENCES2 : MAX_OCCURRENCES2 = dim([M:RSG2]FLG)
+
+    # Remove temporary data.
+    Call DELETEDBLINES
+
+    # Reset number of errors (red bullets) and number of warnings (yellow bullets)
+    NOERR = 0
+    NOWARN = 0
+
+    # Clear masks.
+    Raz [M:RSG1], [M:RSG2]
+
+    # Set the filter criteria for the WHERE clause of the database query
+    # (in the variables WFIL, WFILCRY and WFILVAT).
+    Gosub CALC_RS_FILTER
+
+    # Query the accounting documents as [LNK] (using the WHERE clause in
+    # from above WFIL).
+    Gosub CALC_RS_QUERY
+
+    # Loop through accounting documents.
+    For [LNK]CLE
+
+      # Process only the main legal ledger
+      #SAM #108806
+      If [F:DAE]LED = [F:GCM]LED( [F:GCM]GENLEDTYP - 1 ) and [F:DAE]LEDTYP = func CNSTRGSTD.GETMAINLEDORINDEX([F:DAE]CPY,2) Then
+
+        # Try to get the correspondig turnover type from parameterization.
+        #
+        # Note: We differenciate if the document date (ID_DOCDATE = true)
+        #       or the accounting date (default) has to be used for the
+        #       start date filter.
+        If IS_DOCDATE
+            Filter [RSP2]
+&               Where LEG = [M:RSG0]LEG
+&                   & VAT = [F:DAE]TAX
+&                   & ( ( [F:HAE]BPRDATVCR = [0/0/0] & STRDAT <= [F:HAE]ACCDAT ) | STRDAT <= [F:HAE]BPRDATVCR )
+&               Order By STRDAT Desc
+        Else
+            Filter [RSP2]
+&               Where LEG = [M:RSG0]LEG
+&                   & VAT = [F:DAE]TAX
+&                   & STRDAT <= [F:HAE]ACCDAT
+&               Order By STRDAT Desc
+        Endif
+        Read [RSP2]First
+
+        # If there is a valid corresponding type (fstat = 0) create a line
+        # in the detail grid line.
+        If !fstat
+            # Get EEC VAT ID, tax rule, Country, BP name and BP address.
+            Gosub CALC_RS_GET_EECNUM_ADDRESS_NAME_TAXRULE
+
+            # Write a line in the table for temporary data.
+            Gosub FILL_TMP_TABLE
+        Endif
+        Filter [RSP2]
+      Endif
+    Next
+
+    # We don't need the RS parameterization table ony more. So we can close it.
+    Close Local File [RSP2]
+
+    Gosub GETDBLINES
+
+    # Build total
+    [M:RSG1]AMTTOT = sum( [M:RSG1]AMTTRN(0..[M:RSG1]NBLIG - 1) )
+
+    # Build status information
+    Raz [M:RSG1]STA
+    If ( NOERR > 0 ) and ( NOWARN > 0 )
+        [M:RSG1]STA = num$( NOERR ) - mess(274,107,1) - "/" - num$( NOWARN ) - mess(275,107,1) # "Error(s)", "Warning(s)"
+    Elsif NOERR > 0
+        [M:RSG1]STA = num$( NOERR ) - mess(274,107,1) # "Error(s)"
+    Elsif NOWARN > 0
+        [M:RSG1]STA = num$( NOWARN ) - mess(275,107,1) # "Warning(s)"
+    Else
+        [M:RSG1]STA = mess(64,123,1) # "OK"
+    Endif
+
+    # Update screens.
+    Affzo [M:RSG1]
+    Affzo [M:RSG2]
+
+    # Reset modification flag.
+    FLGSELMODIFIED = 0
+Return
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  CALC_RS_FILTER
+#*
+#* Purpose:    Creates WHERE clause filters for chunk CALC_RECAP_STATEMENT.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param WFIL         Filter for company group/company, site, date range and currency. Will be set
+#*                     for further use.
+#* @param WFILCRY      Filter for excluded countries. Will be set for further use.
+#* @param WFILVAT      Filter for VAT codes. Will be set for further use.
+#*
+#*! #############################################################################################################
+
+$CALC_RS_FILTER
+    WFIL       = "1=1"  # Company group/company, site, date range and currency filter.
+    WFILDATDEB = "1=1"  # Start date filter
+    WFILDATFIN = "1=1"  # End date filter
+    WFILCRY    = "1=1"  # Country exclusion filter
+# 2014-03-10 DNE MODIF BEGIN
+    WFILVAT    = "1=0"  # VAT code filter
+# 2014-03-10 DNE MODIF ORIG
+#    WFILVAT    = "1=1"  # VAT code filter
+# 2014-03-10 DNE MODIF BEGIN
+
+    # Company group/Company filter.
+    If [M:RSG0]GRP <> ""
+        WFIL += " & [F:AGC]GRP = [M:RSG0]GRP"
+    Else
+        If [M:RSG0]CPY <> ""
+            WFIL += " & [F:DAE]CPY = [M:RSG0]CPY"
+        Endif
+        If [M:RSG0]FCYLIN <> ""
+            WFIL += " & [F:DAE]FCYLIN = [M:RSG0]FCYLIN"
+        Endif
+    Endif
+
+    # Start date filter.
+    If [M:RSG0]DATDEB <> [0/0/0]
+        If IS_DOCDATE
+            WFILDATDEB += " & ((([F:HAE]BPRDATVCR = [0/0/0]) & ([F:HAE]ACCDAT >= [M:RSG0]DATDEB)) | (([F:HAE]BPRDATVCR <> [0/0/0]) & ([F:HAE]BPRDATVCR >= [M:RSG0]DATDEB)))"
+        Else
+            WFILDATDEB += " & [F:HAE]ACCDAT >= [M:RSG0]DATDEB"
+        Endif
+    Endif
+
+    # End date filter.
+    If [M:RSG0]DATFIN <> [0/0/0]
+        If IS_DOCDATE
+            WFILDATFIN += " & ((([F:HAE]BPRDATVCR = [0/0/0]) & ([F:HAE]ACCDAT <= [M:RSG0]DATFIN)) | (([F:HAE]BPRDATVCR <> [0/0/0]) & ([F:HAE]BPRDATVCR <= [M:RSG0]DATFIN)))"
+        Else
+            WFILDATFIN += " & [F:HAE]ACCDAT <= [M:RSG0]DATFIN"
+        Endif
+    Endif
+
+    # Country filter (for speeding up the main selection).
+# 2014-03-10 DNE MODIF DELETED
+#    Local Char CRY(GLONCRY) : CRY = ""
+#
+#    Filter [RSP2] Where LEG = [M:RSG0]LEG Order By CRY
+#    For [RSP2]
+#        If CRY <> [RSP2]CRY
+#            CRY = [RSP2]CRY
+#            WFILCRY += " & [F:BPR]CRY <> '" + CRY + "'"
+#        Endif
+#    Next
+#    Filter [RSP2]
+# 2014-03-10 DNE MODIF END
+
+    # VAT code filter (for speeding up the main selection).
+    Local Char VAT(255) : VAT = ""
+
+    Filter [RSP2] Where LEG = [M:RSG0]LEG Order By VAT
+    For [RSP2]
+        If VAT <> [RSP2]VAT
+            VAT = [RSP2]VAT
+# 2014-03-10 DNE MODIF BEGIN
+            WFILVAT += " | [F:DAE]TAX = '" + VAT + "'"
+# 2014-03-10 DNE MODIF ORIG
+#            WFILVAT += " & [F:BPR]CRY <> '" + VAT + "'"
+# 2014-03-10 DNE MODIF END
+
+        Endif
+    Next
+    Filter [RSP2]
+Return
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  CALC_RS_QUERY
+#*
+#* Purpose:    Creates the main query for chunk CALC_RECAP_STATEMENT.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param WFIL         Filter for company group/company, site, date range and currency.
+#* @param WFILCRY      Filter for excluded countries.
+#* @param WFILVAT      Filter for VAT codes.
+#* @param LNK          Main query (link) for RS calculation. Will be set for further use.
+#*
+#*! #############################################################################################################
+
+$CALC_RS_QUERY
+    If [M:RSG0]GRP <> "" Then
+        # Select for a company group:
+        Link [DAE] With
+&           [F:CPY]CPY0 ~= [F:DAE]CPY,
+&           [F:HAE]HAE0 ~= [F:DAE]TYP; [F:DAE]NUM,
+&           [F:BPR]BPR0 ~= [F:DAE]OFFACC,
+&           [F:AGC]AGC1(1) ~= [F:DAE]CPY,
+&           [F:GCM]GCM0 ~= [F:CPY]ACM
+&       As [LNK]
+&       Where evalue(WFIL)
+&           & evalue(WFILDATDEB)
+&           & evalue(WFILDATFIN)
+&           & evalue(WFILCRY)
+&           & evalue(WFILVAT)
+&           & ( [F:HAE]ORIMOD = 3 or [F:HAE]ORIMOD = 5 or [F:HAE]ORIMOD = 2 )
+&       Order By Key CLE = [F:BPR]EECNUM; [F:DAE]TAX; [F:HAE]NUM
+    Else
+        # Select for a single company:
+        Link [DAE] With
+&           [F:CPY]CPY0 ~= [F:DAE]CPY,
+&           [F:HAE]HAE0 ~= [F:DAE]TYP; [F:DAE]NUM,
+&           [F:BPR]BPR0 ~= [F:DAE]OFFACC,
+&           [F:GCM]GCM0 ~= [F:CPY]ACM
+&       As [LNK]
+&       Where evalue(WFIL)
+&           & evalue(WFILDATDEB)
+&           & evalue(WFILDATFIN)
+&           & evalue(WFILCRY)
+&           & evalue(WFILVAT)
+&           & ( [F:HAE]ORIMOD = 3 or [F:HAE]ORIMOD = 5 or [F:HAE] ORIMOD = 2 )
+&       Order By Key CLE = [F:BPR]EECNUM; [F:DAE]TAX; [F:HAE]NUM
+    Endif
+Return
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  CALC_RS_GET_EECNUM_ADDRESS_NAME_TAXRULE
+#*
+#* Purpose:    Get the EU VAT Id, address, name, country and taxrule.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param EECNUM         returns the EU VAT ID
+#* @param COUNTRY        returns the country
+#* @param ADDRESS        returns the BP address
+#* @param BPRNAME        returns the BP name
+#* @param VACBPR         returns the BP's tax rule
+#*
+#*! #############################################################################################################
+
+$CALC_RS_GET_EECNUM_ADDRESS_NAME_TAXRULE
+    Raz EECNUM, COUNTRY, ADDRESS, BPRNAME, VACBPR
+
+    Local Char NUM1(255), NUM2(255)
+# 2015-01-12 DNE INSERT BEGIN
+    Local Char TYP1(255), TYP2(255) # [DNE: SAM #104751]
+# 2015-01-12 DNE INSERT END
+    Local Char EECNUM2(255), EECNUM2NEW(255)
+    Local Char VACBPR2(255), VACBPR2NEW(255)
+    Local Integer ORIMOD
+
+    # On payments: Get the corresponding sales invoice.
+    ORIMOD = [F:HAE]ORIMOD
+    NUM1 = [F:HAE]NUM
+# 2015-01-12 DNE MODIF BEGIN
+    TYP1 = [F:HAE]TYP # [DNE: SAM #104751]
+    Read [F:SIH]SIH2 = TYP1; NUM1
+# 2015-01-12 DNE MODIF ORIG
+#    Read [F:SIH]SIH0 = NUM1
+# 2015-01-12 DNE MODIF END
+    If !fstat
+        # Read tax rule from invoice/document. [DNE: Ticket 300098249]
+        VACBPR = [F:SIH]VAC
+    Else
+        # Otherwise try to get the invoice/document from payment.
+        #
+        # NOTE: We have to make sure that all payment details correspond to invoices with
+        #       the same EEC VAT number and the same tax rule!
+        #
+        If !clalev([F:PYD])  : Local File PAYMENTD [PYD]   : Endif
+        If !clalev([F:HAE2]) : Local File GACCENTRY [HAE2] : Endif
+
+        Link [PYD] With
+&           [F:HAE2]HAE0 ~= [F:PYD]VCRTYP; [F:PYD]VCRNUM,
+&           [F:SIH]SIH0  ~= [F:PYD]VCRNUM,
+&           [F:SIV]SIV0   = [F:PYD]VCRNUM
+&       As [LNK2]
+&       Where left$( [F:HAE]REFINT, 4 ) = "PYH " and [F:PYD]NUM = right$( [F:HAE]REFINT, 5 )
+&       Order By Key CLE = [F:PYD]LIN
+# 2016-04-28 DNE MODIF ORIG (SAM #116258)
+#&       Where [F:PYD]NUM = [F:HAE]BPRVCR
+#&       Order By Key CLE = [F:PYD]LIN
+# 2016-04-28 DNE MODIF END
+
+# 2015-01-12 DNE MODIF BEGIN
+        Raz EECNUM2, VACBPR2, NUM2, TYP2 # [DNE: SAM #104751]
+# 2015-01-12 DNE MODIF ORIG
+#        Raz EECNUM2, VACBPR2, NUM2
+# 2015-01-12 DNE MODIF END
+        For [LNK2]CLE
+            Raz EECNUM2NEW, VACBPR2NEW
+
+            ORIMOD = [F:HAE2]ORIMOD
+            If ORIMOD = 5
+                If dim( [F:SIV]BPIEECNUM ) > 0
+                    EECNUM2NEW = [F:SIV]BPIEECNUM
+                Endif
+            Elsif ORIMOD = 3
+                If dim( [F:SIH]DCLEECNUM ) > 0
+                    EECNUM2NEW = [F:SIH]DCLEECNUM
+                Endif
+            Endif
+
+            Read [F:BPD]BPD0 = [F:SIH]BPR; [F:SIH]BPAINV # Ship-to-customer part of BP
+            If !fstat
+                If EECNUM2NEW = "" : EECNUM2NEW  = [F:BPD]EECNUM : Endif
+                If VACBPR2NEW = "" : VACBPR2NEW  = [F:BPD]VACBPR : Endif  # DNE: Ticket 300098249
+            Endif
+
+# 2015-01-12 DNE MODIF BEGIN
+            If NUM2 = "" or TYP2 = "" # [DNE: SAM #104751]
+# 2015-01-12 DNE MODIF ORIG
+#            If NUM2 = ""
+# 2015-01-12 DNE MODIF END
+                NUM2    = [F:PYD]VCRNUM
+# 2015-01-12 DNE INSERT BEGIN
+                TYP2    = [F:PYD]VCRTYP # [DNE: SAM #104751]
+# 2015-01-12 DNE INSERT END
+                VACBPR2 = VACBPR2NEW
+                EECNUM2 = EECNUM2NEW
+            Else
+                If ( VACBPR2 <> VACBPR2NEW ) or ( EECNUM2 <> EECNUM2NEW )
+                    NUM2 = NUM1  # Revert the IDs for we want to be able to use 'break'.
+# 2015-01-12 DNE INSERT BEGIN
+                    TYP2 = TYP1 # [DNE: SAM #104751]
+# 2015-01-12 DNE INSERT END
+                    VACBPR2 = VACBPR
+                    ORIMOD = [F:HAE]ORIMOD
+                    Break
+                Endif
+            Endif
+        Next
+
+        # For further use remember invoice number and taxrule.
+        NUM1 = NUM2
+# 2015-01-12 DNE INSERT BEGIN
+        TYP1 = TYP2 # [DNE: SAM #104751]
+# 2015-01-12 DNE INSERT END
+        VACBPR = VACBPR2
+    Endif
+
+    # If we are in the sales module we will get the EU VAT ID from SINVOICEx tables
+    # and the tax rule from ship-to information (if available).
+    If ORIMOD = 5 Then                                     # Sales module
+        Read [F:SIV]SIV0 = NUM1
+        If !fstat
+            If ( dim( [F:SIV]BPIEECNUM ) > 0 ) and ( [F:SIV]BPIEECNUM <> "" ) Then
+                EECNUM  = [F:SIV]BPIEECNUM
+                ADDRESS = [F:SIV]BPAADD
+            Endif
+
+            Read [F:BPD]BPD0 = [F:SIV]BPCINV; [F:SIV]BPAADD       # Ship-to-customer part of BP
+            If !fstat
+                If EECNUM = "" Then
+                    EECNUM  = [F:BPD]EECNUM
+                    ADDRESS = [F:BPD]BPAADD
+                    BPRNAME = [F:BPD]BPDNAM(0)
+                Endif
+                If VACBPR = "" # DNE: Ticket 300098249
+                    VACBPR = [F:BPD]VACBPR
+                Endif
+                Read [F:BPA]BPA0 = 1; [F:SIV]BPCINV; ADDRESS
+                If !fstat
+                    COUNTRY = [F:BPA]CRY
+                Endif
+            Endif
+        Endif
+    # If we are in the A/P-A/R module we use the needed return values from ship-to
+    # information (if available).
+    Elsif ORIMOD = 3 Then                                  # A/P-A/R Accounting module
+# 2015-01-12 DNE MODIF BEGIN
+        Read [F:SIH]SIH2 = TYP1; NUM1 # [DNE: SAM #104751]
+# 2015-01-12 DNE MODIF ORIG
+#        Read [F:SIH]SIH0 = NUM1
+# 2015-01-12 DNE MODIF END
+        If !fstat
+            If ( dim( [F:SIH]DCLEECNUM ) > 0 ) and ( [F:SIH]DCLEECNUM <> "" )
+                EECNUM = [F:SIH]DCLEECNUM
+            Endif
+            Read [F:BPD]BPD0 = [F:SIH]BPR; [F:SIH]BPAINV          # Ship-to-customer part of BP
+            If !fstat
+                If EECNUM = ""
+                    EECNUM  = [F:BPD]EECNUM
+                Endif
+                ADDRESS = [F:BPD]BPAADD
+                BPRNAME = [F:BPD]BPDNAM(0)
+                If VACBPR = "" # DNE: Ticket 300098249
+                    VACBPR = [F:BPD]VACBPR
+                Endif
+
+                Read [F:BPA]BPA0 = 1; [F:SIH]BPR; ADDRESS
+                If !fstat
+                    COUNTRY = [F:BPA]CRY
+                Endif
+             Endif
+        Endif
+    Endif
+
+    # Fallback: We get the EU Vat ID from BP (if available).
+    If EECNUM = ""
+       EECNUM = [F:BPR]EECNUM
+    Endif
+
+    # Fallback: Get country from ISO prefix of the EEC tax identifier.
+    If ( EECNUM <> "" ) and ( COUNTRY = "" )
+        COUNTRY = func GET_COUNTRY_BY_ISO( left$( EECNUM, 2) )
+    Endif
+
+    # Fallback: Get country from BP address otherwise from BP.
+    If COUNTRY = ""
+        Read [F:BPA]BPA0 = 1; [F:BPR]BPRNUM; ADDRESS
+        If !fstat
+            COUNTRY = [F:BPA]CRY
+        Else
+            COUNTRY = [F:BPR]CRY
+        Endif
+    Endif
+
+    # Fallback: We search for the BP's tax rule 1) in the company exceptions and 2) afterwards
+    #           in the customer informations (and hope to find them of course).
+    #
+    # Lookup tax rule in 1) BPEXCEPT
+    If VACBPR = ""
+        # Issue 56229 - 2017-11-15 by MWA
+        If func ASYRFNC.ACTIV("MUL") >0
+            Read [BPE]BPE0 = [F:BPR]BPRNUM; [F:DAE]CPY
+            If !fstat
+                VACBPR = [F:BPE]VACBPC
+            Endif
+        Endif
+    Endif
+
+    # Lookup tax rule in 2) BPCUSTOMER
+    If VACBPR = ""
+        Read [BPC]BPC0 = [F:BPR]BPRNUM
+        If !fstat
+            VACBPR = [F:BPC]VACBPR
+        Endif
+    Endif
+Return
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  FILL_TMP_TABLE
+#*
+#*! #############################################################################################################
+
+$FILL_TMP_TABLE
+  Raz [F:RSLG2]
+
+  # EEC VAT ID number
+  [F:RSLG2]GEREECNUM = EECNUM
+
+  # Counterpart account and fallback for tax rule from the counterpart
+  # account.
+  If [DAE]OFFACC <> "" Then
+      [F:RSLG2]OFFACC = [F:DAE]OFFACC
+  Elsif [DAE]BPR <> "" Then
+      [F:RSLG2]OFFACC = [F:DAE]BPR
+
+      # Fallback for the BP's tax rule:
+      #
+      # Lookup tax rule in 1) BPEXCEPT
+      If VACBPR = ""
+          # Issue 56229 - 2017-11-15 by MWA
+          If func ASYRFNC.ACTIV("MUL") >0
+              Read [BPE]BPE0 = [F:DAE]BPR; [M:RSG0]CPY
+              If !fstat
+                  VACBPR = [F:BPE]VACBPC
+              Endif
+          Endif
+      Endif
+
+      # Lookup tax rule in 2) BPCUSTOMER
+      If VACBPR = ""
+          Read [BPC]BPC0 = [F:DAE]BPR
+          If !fstat
+              VACBPR = [F:BPC]VACBPR
+          Endif
+      Endif
+  Endif
+
+  # Most other fields:
+  [F:RSLG2]AMTTRN    = [F:DAE]AMTLED * [F:DAE]SNS * (-1)
+  [F:RSLG2]NUM       = [F:HAE]NUM
+  [F:RSLG2]TYP       = [F:HAE]TYP
+  [F:RSLG2]DESVCR    = [F:HAE]DESVCR
+  [F:RSLG2]TAX       = [F:DAE]TAX
+  [F:RSLG2]VACBPR    = VACBPR
+  [F:RSLG2]VACBPRRSP = [F:RSP2]VACBPR
+
+  # Country
+  [F:RSLG2]CRY       = COUNTRY
+
+  # Turnover type
+  [F:RSLG2]TRNTYP    = [RSP2]TRNTYP
+
+  # Category and status
+  [F:RSLG2]CAT       = [F:HAE]CAT
+  [F:RSLG2]STA       = [F:HAE]STA
+
+  # - Test if the EU VAT ID exists.
+  ERRSTATUS = 0
+  COMMENT = ""
+  If EECNUM = ""
+      COMMENT -= "/" - mess(270,107,1) # "BP has no EU VAT ID."
+      ERRSTATUS = max( ERRSTATUS, 2 )
+  Endif
+
+# 2014-03-10 DNE MODIF INSERT
+    # - Test if country is forbidden
+    If [F:RSP2]CRY = COUNTRY
+        COMMENT -= "/" - mess(340,107,1) # "Invalid country"
+        ERRSTATUS = max( ERRSTATUS, 2 )
+    Endif
+# 2014-03-10 DNE MODIF END
+
+  # - Test if tax rule is correct.
+  If VACBPR = ""
+      COMMENT -= "/" - mess(271,107,1) + " " # "No BP tax rule found."
+      ERRSTATUS = max( ERRSTATUS, 2 )
+  Elsif VACBPR <> [F:RSP2]VACBPR
+      # Check if tax rule corresponds to the tax rule defined in the RS parameterization.
+      COMMENT -= "/" - mess(272,107,1) - VACBPR - "<>" - [F:RSP2]VACBPR + " " # "BP tax rule"
+# 2014-03-10 DNE MODIF BEGIN
+      ERRSTATUS = max( ERRSTATUS, 1 )
+# 2014-03-10 DNE MODIF ORIG
+#      ERRSTATUS = max( ERRSTATUS, 2 )
+# 2014-03-10 DNE MODIF END
+  Endif
+
+  # - Test if accounting document category is not "Actual"
+  If [HAE]CAT <> 1
+      COMMENT -= "/" - mess(273,107,1) - "'" - mess([HAE]CAT, 618, 1) + "' (CAT). " # "Accounting document is '"
+      ERRSTATUS = max( ERRSTATUS, 2 )
+  Endif
+
+  # - Test if accounting document status is "Final".
+  If [HAE]STA <> 2
+      COMMENT -= "/" - mess(273,107,1) - "'" - mess([HAE]STA, 617, 1) + "' (STA). " # "Accounting document is '"
+      ERRSTATUS = max( ERRSTATUS, 1 )
+  Endif
+
+  # Comment (Remove trailing slash.).
+  If COMMENT <> ""
+      [F:RSLG2]COMMENT = right$( COMMENT, 3 )
+  Endif
+
+  # Set mark/flag in first column.
+  [F:RSLG2]FLG = num$( BULLET(ERRSTATUS) )
+
+  [F:RSLG2]USERID = func GETUSERID
+
+  # Increment error/warning counter (if necessary).
+  Case ERRSTATUS
+      When 1 : NOWARN += 1
+      When 2 : NOERR  += 1
+  Endcase
+
+  # SAM #95245 (ANGRE/DNE)
+  If ( [M:RSG0]FLGVALIDONLY <> 2 ) or ( ERRSTATUS <> 2 )
+    Trbegin [F:RSLG2]
+    Write [F:RSLG2]
+    If fstat
+      Rollback
+      Call ROLL From GLOCK
+      GOK = 0 : Call FSTA("RSLG2") From GLOCK : End
+    Endif
+    Commit
+  Endif
+Return
+
+
+#** #############################################################################################
+#* select the just added lines and put it into the mask
+#*! #############################################################################################
+$GETDBLINES
+  Local Integer II : II=0
+  Local Integer LINE : LINE=0
+  Local Char USERID(255) : USERID = func GETUSERID
+
+  Raz [M:RSG2]
+
+  # Get the data from table that includes all documents and iterate over this
+  Filter [F:RSLG2] Where USERID = [L]USERID Order By GEREECNUM; TRNTYP; TAX
+  For [F:RSLG2]
+
+    If II = 0
+
+      [F:RSLG1]FLG       = [F:RSLG2]FLG
+      [F:RSLG1]GEREECNUM = [F:RSLG2]GEREECNUM
+      [F:RSLG1]AMTTRN    = [F:RSLG2]AMTTRN
+      [F:RSLG1]TAX       = [F:RSLG2]TAX
+      [F:RSLG1]TRNTYP    = [F:RSLG2]TRNTYP
+      [F:RSLG1]CRY       = [F:RSLG2]CRY
+      [F:RSLG1]USERID    = [L]USERID
+
+      Trbegin [F:RSLG1]
+          Write [F:RSLG1]
+          If fstat
+              Rollback
+              Call ROLL From GLOCK
+              GOK = 0 : Call FSTA("RSLG1") From GLOCK : End
+          Endif
+      Commit
+
+    Elsif [F:RSLG1]GEREECNUM = [F:RSLG2]GEREECNUM and [F:RSLG1]TRNTYP = [F:RSLG2]TRNTYP
+
+      # compress same data
+      Read [F:RSLG1]RSLG2 = USERID;[F:RSLG2]GEREECNUM;[F:RSLG2]TRNTYP
+
+      # Build the error status
+      [F:RSLG1]FLG = num$( BULLET( max( RBULLET( val( [F:RSLG1]FLG ) ), RBULLET( val( [F:RSLG2]FLG ) ) ) ) )
+
+      # Build sum
+      [F:RSLG1]AMTTRN = [F:RSLG1]AMTTRN + [F:RSLG2]AMTTRN
+
+      If [F:RSLG2]TAX <> [F:RSLG1]TAX Then # if TAX not unique -> show asterisk
+          [F:RSLG1]TAX = "*"
+      Endif
+
+      Trbegin [F:RSLG1]
+      Rewrite [F:RSLG1]
+      If fstat
+        Rollback
+        Call ROLL From GLOCK
+        GOK = 0 : Call FSTA("RSLG1") From GLOCK : End
+      Endif
+      Commit
+    Else
+
+      [F:RSLG1]FLG       = [F:RSLG2]FLG
+      [F:RSLG1]GEREECNUM = [F:RSLG2]GEREECNUM
+      [F:RSLG1]AMTTRN    = [F:RSLG2]AMTTRN
+      [F:RSLG1]TAX       = [F:RSLG2]TAX
+      [F:RSLG1]TRNTYP    = [F:RSLG2]TRNTYP
+      [F:RSLG1]CRY       = [F:RSLG2]CRY
+      [F:RSLG1]USERID    = USERID
+
+      Trbegin [F:RSLG1]
+      Write [F:RSLG1]
+      If fstat
+        Rollback
+        Call ROLL From GLOCK
+        GOK = 0 : Call FSTA("RSLG1") From GLOCK : End
+      Endif
+      Commit
+
+    Endif
+
+    If II <= MAX_OCCURRENCES2
+      [M:RSG2]GEREECNUM(II) = [F:RSLG2]GEREECNUM
+      [M:RSG2]OFFACC(II)    = [F:RSLG2]OFFACC
+      [M:RSG2]AMTTRN(II)    = [F:RSLG2]AMTTRN
+      [M:RSG2]NUM(II)       = [F:RSLG2]NUM
+      [M:RSG2]TYP(II)       = [F:RSLG2]TYP
+      [M:RSG2]DESVCR(II)    = [F:RSLG2]DESVCR
+      [M:RSG2]TAX(II)       = [F:RSLG2]TAX
+      [M:RSG2]VACBPR(II)    = [F:RSLG2]VACBPR
+      [M:RSG2]VACBPRRSP(II) = [F:RSLG2]VACBPRRSP
+      [M:RSG2]CRY(II)       = [F:RSLG2]CRY
+      [M:RSG2]TRNTYP(II)    = [F:RSLG2]TRNTYP
+      [M:RSG2]CAT(II)       = [F:RSLG2]CAT
+      [M:RSG2]STA(II)       = [F:RSLG2]STA
+      [M:RSG2]FLG(II)       = [F:RSLG2]FLG
+      [M:RSG2]COMMENT(II)   = [F:RSLG2]COMMENT
+    Endif
+    II += 1
+
+  Next
+
+  If II > MAX_OCCURRENCES2
+    # Grid is full!
+    Call ECR_TRACE (mess(53,1998,1),0) From GESECRAN
+  Endif
+
+  # Get the data from table that includes the compressed data
+  Filter [F:RSLG1] Where USERID = [L]USERID Order By Key RSLG2
+  For [F:RSLG1]
+
+    [M:RSG1]FLG(LINE)       = [F:RSLG1]FLG
+    [M:RSG1]GEREECNUM(LINE) = [F:RSLG1]GEREECNUM
+    [M:RSG1]AMTTRN(LINE)    = [F:RSLG1]AMTTRN
+    [M:RSG1]TAX(LINE)       = [F:RSLG1]TAX
+    [M:RSG1]TRNTYP(LINE)    = [F:RSLG1]TRNTYP
+    [M:RSG1]CRY(LINE)       = [F:RSLG1]CRY
+
+    LINE += 1
+
+    If LINE > MAX_OCCURRENCES1
+      # Grid is full!
+      Call ECR_TRACE (mess(53,1998,1),0) From GESECRAN
+      Break
+    Endif
+
+  Next
+
+  If LINE <> 0
+      [M:RSG1]NBLIG  = LINE
+      [M:RSG1]POSTOT = LINE
+  Endif
+
+  [M:RSG2]NBLIG = II
+  Affzo [M:RSG2]
+Return
+
+#** #############################################################################################
+#* Returns a unique userid
+#*! #############################################################################################
+Funprog GETUSERID()
+End GUSER+num$(adxuid(2))
+
+#** #############################################################################################
+#* Deletes the user specific lines in the temp table
+#*! #############################################################################################
+Subprog DELETEDBLINES()
+     #angre 2015-10-07 SAM #111288 ("or UPDDATTIM <= gdatetime$(format$("D:YYYY[-]MM[-]DD",date$ - 1))" added)
+    Trbegin [F:RSLG1]
+        Delete [F:RSLG1] Where [F:RSLG1]USERID = func GETUSERID() or [F:RSLG1]UPDDATTIM  <= gdatetime$(format$("D:YYYY[-]MM[-]DD",date$ - 1))
+    Commit
+    Trbegin [F:RSLG2]
+        Delete [F:RSLG2] Where [F:RSLG2]USERID = func GETUSERID() or [F:RSLG2]UPDDATTIM  <= gdatetime$(format$("D:YYYY[-]MM[-]DD",date$ - 1))
+    Commit
+End
+
+#** #############################################################################################################
+#*
+#* Function:  IS_DCLVATDAT_DOCDATE
+#*
+#* Purpose:   Check whether we have to use the document date in date comparisons. Otherwise
+#*            use the accounting date.
+#*
+#* Note:      The values of the local menu 1 are translated into No = 0 / Yes = 1
+#*            so you can use the result directly in If ... Endif clauses as
+#*            true / false .
+#*
+#*! #############################################################################################################
+
+Funprog IS_DCLVATDAT_DOCDATE()
+    Local Char CPY(GLONCPY)
+    Local Char DCLVATDAT(255)
+
+    # Get the company/company group depending of the existance of the company group field.
+    If [M:RSG0]GRP <> ""
+        CPY = [M:RSG0]GRP
+    Else
+        CPY = [M:RSG0]CPY
+    Endif
+
+End func IS_DCLVATDAT_OF_CPY_DOCDATE( CPY )
+
+
+
+#** #############################################################################################################
+#*
+#* Function:  IS_DCLVATDAT_OF_CPY_DOCDATE
+#*
+#* Purpose:   Check if the parameter DCLVATDAT of the given company is set to document date
+#*            instead of accounting date.
+#*
+#* Note:      The values of the local menu 1 are translated into No = 0 / Yes = 1
+#*            so you can use the result directly in If ... Endif clauses as
+#*            true / false .
+#*
+#* Parameters:
+#*
+#* @param CPY          Value Char()   Company (or company group) code
+#*
+#*! #############################################################################################################
+
+Funprog IS_DCLVATDAT_OF_CPY_DOCDATE( CPY )
+Value Char CPY
+    Local Char DCLVATDAT(255)
+
+    # Get the parameter value of DCLVATDAT.
+    Call PARAM( CPY, "DCLVATDAT", DCLVATDAT ) From ADOVAL
+
+    # If the parameter does not exist (DCLVATDAT = "") return FALSE (0).
+    If DCLVATDAT = ""
+        End 0
+    Endif
+
+    # Return the parameter as TRUE (1) and FALSE (0).
+End val( DCLVATDAT ) - 1
+
+
+
+#** #############################################################################################################
+#*
+#* Function:   GET_COUNTRY_BY_ISO
+#*
+#* Purpose:    Search for the country code of a given ISO code.
+#*
+#*
+#* Parameters:
+#*
+#* @param PISO         Value Char()   ISO code for which the country code should be returned.
+#*
+#*! #############################################################################################################
+
+Funprog GET_COUNTRY_BY_ISO( PISO )
+Value Char PISO
+
+    If PISO = ""
+        End ""
+    Endif
+
+    Char RCRY(GLONCRY) : Raz RCRY
+    If clalev([F:CRY]) = 0 : Local File TABCOUNTRY [CRY] : Endif
+
+    Filter [CRY] Where ISO = PISO
+    Read [F:CRY] First
+    If !fstat
+        RCRY = [F:CRY]CRY
+    Endif
+    Filter [CRY]
+End RCRY
+
+
+
+# ###############################################################################################################
+# ##########
+# ########## Utility functions/procedures
+# ##########
+# ########## - Common
+# ##########
+# ###############################################################################################################
+
+#** #############################################################################################################
+#*
+#* Procedure:  OPEN_REPORT
+#*
+#* Purpose:    Starts a given X3 report.
+#*
+#*
+#* Parameters:
+#*
+#* @param PRTCOD      Value Char     Name of the report or print code
+#*
+#*! #############################################################################################################
+
+Subprog OPEN_REPORT( PRTCOD )
+Value Char PRTCOD()
+    Local Char TBPAR(30)(1..50), TBVAL(30)(1..50)
+    Local Char RPT(20)
+
+    Call SAIETAT( PRTCOD, RPT ) From GCONSULT
+    If RPT <> ""
+        Call ETATN( RPT, GFONCTION, TBPAR, TBVAL ) From ETAT
+    Endif
+End
+
+
+
+#** #############################################################################################################
+#*
+#* Procedure:  OPEN_RS_EXPORT_DIALOG
+#*
+#* Purpose:    Opens the RS property/export dialog
+#*
+#*! #############################################################################################################
+
+Subprog OPEN_RS_EXPORT_DIALOG
+    # ...
+    Call OPEN_DIALOG( right$( GFONCTION, 5 ) + "Q" )
+End
+
+
+
+#** #############################################################################################################
+#*
+#* Procedure:  OPEN_DIALOG
+#*
+#* Purpose:    Opens the RS property/export dialog
+#*
+#*
+#* Parameters:
+#*
+#* @param SCREEN      Const Char ()     Screen code (CODMSK)
+#*
+#*! #############################################################################################################
+
+Subprog OPEN_DIALOG( SCREEN )
+Value Char SCREEN()                                 # Screen code.
+    Local Char RESULT(255)      : RESULT = ""       # Result parameter (variable VALEUR) of the child screen
+    Local Char PARAM(10)(1..10)                     # Parameter array for the SAISIE_xxx procedure
+    Local Char PROG(GLONADC)                        # Standard processing  for the child screen
+    Local Char PROGSPE(GLONADC)                     # SPEcific processing for the child screen
+
+    # Get the standard and specific processing names for the local BID screen.
+    Call GETSCREENTRT( SCREEN, PROG, PROGSPE ) From BIDLOC
+
+    # Open the property screen.
+    Call SAISIE_CHAR( RESULT, PARAM, SCREEN, PROG, PROGSPE ) From GSAISIE
+End
+
+
+
+#** #############################################################################################################
+#*
+#* Function:   REPLACE
+#*
+#* Purpose:    Replace a given text in a string by another one.
+#*
+#*
+#* Parameters:
+#*
+#* @param CONTENT            Value Char  Contains the text to convert.
+#* @param SRC                Value Char  Contains the text to replace.
+#* @param DEST               Value Char  Contains the text that should replace the text
+#*                           in SRC.
+#*
+#*! #############################################################################################################
+
+Funprog REPLACE( CONTENT, SRC, DEST )
+Value Char CONTENT()
+Value Char SRC()
+Value Char DEST()
+
+    Local Integer K
+
+     K = instr( 1, CONTENT, SRC )
+     While K
+        CONTENT = left$( CONTENT, K - 1 ) + DEST + right$( CONTENT, K + len( SRC ) )
+        K = instr( K + len( DEST ), CONTENT, SRC )
+     Wend
+End CONTENT
+
+
+
+# ###############################################################################################################
+# ##########
+# ########## Utility functions/procedures
+# ##########
+# ########## - XML file creation
+# ##########
+# ###############################################################################################################
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  XML_INIT
+#*
+#* Purpose:    Initialize the XML tag stack for further use of XML_... chunks and
+#*             functions. Creates a file selector XOUT (... Using [XOUT])
+#*
+#*
+#* Parameters: None
+#*
+#*! #############################################################################################################
+
+$XML_INIT
+    # Initialize an XML tag stack.
+    Local Char    XMLTAGSTACK(255)(50)
+    Local Integer XMLTAGSTACKPOINTER : XMLTAGSTACKPOINT = 0
+    Local Char    XMLTAG(50)         : XMLTAG = ""
+    Local Char    XMLATTR(50)        : XMLATTR = ""
+    Local Char    XMLCONTENT(255)    : XMLCONTENT = ""
+    Local Char    XMLFILENAME(255)   : XMLFILENAME = ""
+    Local Char    XMLDTDNAME(255)    : XMLDTDNAME = ""
+    Local Integer XMLFILEERR         : XMLFILEERR = 0
+Return
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  XML_OPEN
+#*
+#* Purpose:    Opens an XML file.
+#*
+#* Note:       Creates a file selector XOUT (... Using [XOUT]). So you can send data
+#*             directly to the XML file using XOUT.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param XMLFILENAME        local char(255)   XML file name.
+#* @param XMLDTDNAME         local char(255)   Optional DTD file name.
+#*
+#*! #############################################################################################################
+
+$XML_OPEN
+    # Open index XML file for writing.
+    Onerrgo XML_ERROR
+    Openo XMLFILENAME, 0                                                 Using [XOUT]
+    Onerrgo
+    If XMLFILEERR
+        Return
+    Endif
+    Iomode adxirs chr$(13) + chr$(10)                                    Using [XOUT]
+    Iomode adxifs ";"                                                    Using [XOUT]
+
+    # Write XML header
+    Wrseq "<?xml version='1.0' encoding='UTF-8'?>"                       Using [XOUT]
+    If XMLDTDNAME <> ""
+        Wrseq "<!DOCTYPE DataSet SYSTEM '" + XMLDTDNAME + "'>"           Using [XOUT]
+    Endif
+Return
+$XML_ERROR
+    XMLFILEERR = 1
+Resume
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  XML_CLOSE
+#*
+#* Purpose:    ...
+#*
+#*
+#* Parameters: None
+#*
+#*! #############################################################################################################
+
+$XML_CLOSE
+    # Flush: Close open XML tags.
+    While XMLTAGSTACKPOINTER > 0
+        Gosub XML_POP_TAG
+    Wend
+
+    # Close XML file.
+    Openo Using [XOUT]
+Return
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  XML_PUSH_TAG
+#*
+#* Purpose:    XML_PUSH_TAG is part of the XML tag stack. It takes the name of an XML tag
+#*             pushes it on the stack and writes the opening of an XML tag into the output
+#*             file.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param XMLTAG             local char(255)   Name of the XML tag
+#* @param XMLATTR            local char(255)   Optional attribute string.
+#*
+#*! #############################################################################################################
+
+$XML_PUSH_TAG
+    XMLTAGSTACK(XMLTAGSTACKPOINTER) = XMLTAG
+    XMLTAGSTACKPOINTER += 1
+    If XMLATTR = ""
+        Wrseq "<" + XMLTAG + ">" Using [XOUT]
+    Else
+        Wrseq "<" + XMLTAG - XMLATTR + ">" Using [XOUT]
+        Raz XMLATTR
+    Endif
+Return
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  XML_POP_TAG
+#*
+#* Purpose:    XML_POP_TAG is part of the XML tag stack. It pops the name of an XML tag
+#*             and writes the ending of an XML tag to the output file.
+#*
+#*! #############################################################################################################
+
+$XML_POP_TAG
+    XMLTAGSTACKPOINTER -= 1
+    XMLTAG= XMLTAGSTACK(XMLTAGSTACKPOINTER)
+    Wrseq "</" + XMLTAG + ">" Using [XOUT]
+Return
+
+
+
+#** #############################################################################################################
+#*
+#* Sub chunk:  XML_CREATE_TAG
+#*
+#* Purpose:    Create an XML tag with text content.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param XMLTAG             local char(255)   Name of the XML tag
+#* @param XMLATTR            local char(255)   Optional attribute string.
+#* @param XMLCONTENT         local char(255)   Text content of the XML tag
+#*
+#*! #############################################################################################################
+
+$XML_CREATE_TAG
+    If XMLATTR = ""
+        Wrseq "<" + XMLTAG + ">" + func XML_ENCODE_ENTITIES( XMLCONTENT ) + "</" + XMLTAG + ">" Using [XOUT]
+    Else
+        Wrseq "<" + XMLTAG - XMLATTR + ">" + func XML_ENCODE_ENTITIES( XMLCONTENT ) + "</" + XMLTAG + ">" Using [XOUT]
+        Raz XMLATTR
+    Endif
+Return
+
+
+
+#** #############################################################################################################
+#*
+#* Function:   XML_ENCODE_ENTITIES
+#*
+#* Purpose:    Replace forbidden characters by XML entities.
+#*
+#*
+#* Parameters:
+#*
+#* @param XMLCONTENT         Value Char  Contains the text to convert.
+#*
+#*! #############################################################################################################
+
+Funprog XML_ENCODE_ENTITIES( XMLCONTENT )
+Value Char XMLCONTENT()
+
+    Local Integer I, K
+    Local Char CA(1)(1..4)
+    Local Char CX(6)(1..4)
+
+    # Replacement table
+    CA(1) = "<" : CX(1) = "&lt;"
+    CA(2) = ">" : CX(2) = "&gt;"
+    CA(3) = '"' : CX(3) = "&quot;"
+    CA(4) = '&' : CX(4) = "&amp;"
+
+    # Replacement
+    For I = 1 To dim(CA)
+     K = instr( 1, XMLCONTENT, CA(I) )
+     While K
+        XMLCONTENT = left$( XMLCONTENT, K-1) + CX(I) + right$( XMLCONTENT, K + len( CA(I) ) )
+        K = instr( K + len( CX(I) ), XMLCONTENT, CA(I) )
+     Wend
+    Next I
+End XMLCONTENT
+

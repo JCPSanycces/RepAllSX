@@ -1,0 +1,756 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+#** FQ96833
+#* Traitement de synchronisation des suivis
+#*
+#
+#  Utilitaire de mise en cohérence des suivis initial et théorique
+#  ------------------------------------------------
+#
+#  L'objectif de cet utilitaire est double :
+#  D'une part réaligner autant que faire se peut les suivis théorique et initial
+#  par rapport au suivi réel. Signaler d'autre part une situation d'incohérence
+#  dans les suivis qui ne peut pas être corrigée de façon automatique.
+#
+#  D'une manière générale, l'ajustement de valeur se fait uniquement sur la période
+#  courante et le bien est considéré comme étant à recalculer pour tous ses contextes.
+#  Un bien qui n'a ni été réévalué ni déprécié doit avoir ses suivis théorique et
+#  initial equivalents au réel. Un bien qui n'a pas été déprécié doit avoir son suivi
+#  théorique aligné sur le réel Ces différents cas peuvent être corrigés automatiquement.
+#  Un bien ayant été déprécié et non réévalué doit avoir ses suivis initial et théorique
+#  équivalents. Si, dans cette situation, ces suivis sont différents, une autocorrection
+#  est impossible. Néanmoins l'utilitaire signalera cette incohérence par un message
+#  d'erreur dans la trace.
+#
+#  Un plan est considéré comme "réévalué" si sur la période courante RVACRB <> 0 ou
+#  ( BSEVAL <> DPRBAS et BSEVAL <> 0 )
+#  Un plan est considéré comme "déprécié" si il existe au moins un enregistrement DEPREC
+#  antérieur à la période courante tel que IML <> 0.
+
+#  Les champs réalignés sur les valeurs du suivi réel sont
+#  Pour le suivi théorique :
+#  PERREFCLCT, DPMT, EXECLOCUMT, ENDDPET, PERCLOCUMT, DPET, EXCCUMT, EXCDPRT, PERCLOEXCT, PEREXCDPRT, NBVT
+#  Pour le suivi initial :
+#  PERREFCLCI, DPMI, EXECLOCUMI, ENDDPEI, PERCLOCUMI, DPEI, EXCCUMI, EXCDPRI, PERCLOEXCI, PEREXCDPRI, NBVI
+#
+
+Subprog UMAJSUIV(PCPY, PCNX, PFLGSIM, PTPLANS_SELEC)
+Value Char PCPY
+Value Integer PCNX, PFLGSIM, PTPLANS_SELEC()
+
+Local Char WFILTRE(250), TERRBIEN(250)(200)
+
+Local Integer I, J, TPLANS_SOC(G301MAX), NBPLANS_SOC, WNBERR_PLAN, WCRET, I_PLAN
+Local Integer WNBTOT_PLANMAJ, WNBTOT_PLANERR, WBSOCERR, WSVTOT_PLANMAJ, WSVTOT_PLANERR, TPLNSTD(G301MAX), B_TRACE
+Local Integer WRES, WNBTOT_BIENMAJ, WNBTOT_BIENERR
+Local Date    WCNXDAT(1..5), WCURFIY, WCURPER
+
+Local Integer B_PLAN_A_MAJ        # plan à mettre à jour
+Local Integer B_BIEN_A_MAJ        # bien à mettre à jour
+Local Integer B_BIEN_ERR          # bien en erreur non corrigeable
+Local Integer B_RVA               # bien réévalué
+Local Integer B_IML               # bien déprécié
+
+B_TRACE = 0
+# ****** Option de trace technique supplémentaire ************************
+
+Local Integer WTRACEMAJCNX
+
+# 0 pas de trace technique
+# 1 trace de base
+# 2 delete tables avec nb sup
+# 3 détail sur trt de maj cnx
+
+WTRACEMAJCNX = 0
+
+# ****** Option de sélection supplémentaire (sur la société) *************
+
+Local Char WSEL(200)
+
+WSEL = ""
+If GUSER = "CBO"
+    If PCPY = ""
+#        WSEL = " and [F:CPY]CPY < 'N'"
+    Endif
+Endif
+
+# ************************************************************************
+
+    Raz WNBTOT_PLANMAJ, WSVTOT_PLANMAJ, WNBTOT_PLANERR, WSVTOT_PLANERR, WNBTOT_BIENMAJ, WNBTOT_BIENERR
+
+
+    Call TEMPON(mess(71, 7784, 1)) From GESECRAN
+    Call DEB_TRACE(PCPY, PCNX, PFLGSIM, PTPLANS_SELEC, WSEL)
+
+    If !clalev([F:CNX])
+        Local File CONTEXT  [CNX]
+    Endif
+
+    If !clalev([F:CPY])
+        Local File COMPANY  [CPY]
+    Endif
+
+    If !clalev([F:FAS])
+        Local File FXDASSETS  [FAS]
+    Endif
+
+    If !clalev([F:DEP])
+        Local File DEPREC  [DEP]
+    Endif
+
+    If !clalev([F:WDEP])
+        Local File DEPREC  [WDEP]
+    Endif
+
+
+    If PCPY = ""
+        WFILTRE = "CPY <> ''"
+    Else
+        WFILTRE = "CPY = PCPY"
+    Endif
+    If WSEL <> ""
+        WFILTRE -= WSEL
+    Endif
+
+    For [CPY] Where evalue(WFILTRE)
+
+        WBSOCERR = 0
+
+        Read[CNX]CNX0 = [F:CPY]CPY; PCNX
+        If fstat = 0
+
+            #  1 Date de début d'exercice
+            #  2 Date de fin d'exercice
+            #  3 Date de début de période courante
+            #  4 Date de fin de période courante
+            #  5 Date de dernière cloture (Dernier jour de l'exercice ou de la période précédente)
+
+            Call GET_CNX_DAT([F:CPY]CPY, [F:CNX]CNX, WCNXDAT, WCRET) From GLOBIENS
+
+            WCURFIY = WCNXDAT(2)
+            WCURPER = WCNXDAT(4)
+
+            # tableau des plans à traiter pour cette société :
+
+            Raz TPLANS_SOC, NBPLANS_SOC
+
+            I = 0
+            While I < G301MAX - 1
+                If PTPLANS_SELEC(I) = 0
+                    Break
+                Endif
+
+                If PCPY = ""
+
+                    J = find(PTPLANS_SELEC(I), [F:CNX]PLNCAA)
+                    If J
+                        TPLANS_SOC(NBPLANS_SOC) = PTPLANS_SELEC(I) # plans à traiter pour cette soc
+
+                        TPLNSTD(NBPLANS_SOC) = [F:CNX]PLNSTD(J - 1)
+                        NBPLANS_SOC += 1
+                    Endif
+
+                Else
+                    J = find(PTPLANS_SELEC(I), [F:CNX]PLNCAA)
+                    If J
+                        TPLNSTD(I) = [F:CNX]PLNSTD(J - 1)
+                    Endif
+
+                    TPLANS_SOC(I) = PTPLANS_SELEC(I) # plans à traiter pour la soc PCPY
+                    NBPLANS_SOC = I + 1
+                Endif
+
+                I += 1
+            Wend
+
+
+            If NBPLANS_SOC
+
+                Call TEMPON(mess(6, 47, 1) - ":" - [F:CPY]CPY) From GESECRAN
+                Trbegin [CNX]
+                WSVTOT_PLANMAJ = WNBTOT_PLANMAJ
+                WSVTOT_PLANERR = WNBTOT_PLANERR
+
+
+                Gosub TRAITE_PAR_BIEN
+
+
+                If WSVTOT_PLANMAJ = WNBTOT_PLANMAJ and
+&                  WSVTOT_PLANERR = WNBTOT_PLANERR
+&                 and GUSER <> "CBO"
+                    Call ECR_TRACE(mess(6, 47, 1) - ":" - [F:CPY]CPY - ": Aucune erreur", 0) From GESECRAN
+                Endif
+
+                # validation de tout le CNX (ou non)
+
+                If PFLGSIM = G_OUI or
+&                 (WSVTOT_PLANMAJ = WNBTOT_PLANMAJ and
+&                  WSVTOT_PLANERR = WNBTOT_PLANERR)
+                    Rollback
+                Else
+                    Commit
+                Endif
+
+            Endif
+
+        Endif
+    Next
+    Call TEMPOFF From GESECRAN
+    Call FIN_TRACE(WNBTOT_PLANMAJ, WNBTOT_PLANERR, WNBTOT_BIENMAJ, WNBTOT_BIENERR)
+
+End
+
+
+$TRAITE_PAR_BIEN
+
+    For [FAS]FAS1 Where CPY = [F:CPY]CPY
+        Raz WNBERR_PLAN, TERRBIEN, B_BIEN_A_MAJ, B_BIEN_ERR
+
+        Gosub CTRL_MAJ_PLN
+
+
+        If B_BIEN_A_MAJ
+            [F:FAS]FLGCLC = G_OUI
+            [F:FAS]FLGCNXCLC(PCNX - 1) = G_OUI
+            WNBTOT_BIENMAJ += 1
+            Rewrite [FAS]
+            If (fstat) Then
+
+                TERRBIEN(WNBERR_PLAN) = "XX" + "06 FXDASSETS : fstat =" - num$(fstat)
+                WNBERR_PLAN += 1
+
+            Endif
+        Endif
+
+        If B_BIEN_A_MAJ or B_BIEN_ERR
+            If B_BIEN_A_MAJ = 0 and B_BIEN_ERR
+                WNBTOT_BIENERR += 1
+            Endif
+#Infbox num$(fstat)
+            If WBSOCERR = 0
+                WBSOCERR = 1
+                Call ECR_TRACE(mess(6, 47, 1) - ":" - [F:CPY]CPY, 0) From GESECRAN
+            Endif
+
+            Call ECR_TRACE("__ bien" - [F:FAS]AASREF +
+& "     (" - mess(11, 198, 1) - ":" - mess([F:FAS]FLGSPL, 1, 1) + ") (" - mess(128, 124, 1) - ":" - mess([F:FAS]CREORI, GML_CREORI, 1) + ")"
+&            , 0) From GESECRAN
+
+            For I = 0 To WNBERR_PLAN - 1
+                If left$(TERRBIEN(I), 2) = "XX"
+                    Call ECR_TRACE("__" - right$(TERRBIEN(I),3), 1) From GESECRAN
+                Else
+                    Call ECR_TRACE("__" - TERRBIEN(I), -1) From GESECRAN
+                Endif
+            Next I
+        Endif
+
+    Next
+
+Return
+
+
+$CTRL_MAJ_PLN
+
+    For I_PLAN = 0 To NBPLANS_SOC - 1
+
+        Read [DEP]DEP0 = [F:FAS]AASREF; TPLANS_SOC(I_PLAN); WCURFIY; WCURPER
+        If fstat = 0
+
+
+            Raz B_PLAN_A_MAJ
+
+            # Le plan a t'il été réévalué ?
+            B_RVA = func REVALUED_ASSET_PLN()
+
+            # Le plan a t'il été déprécié ?
+            B_IML = func IMPAIRED_ASSET_PLN()
+
+
+            If (B_IML and B_TRACE) Then
+                Call ECR_TRACE([F:DEP]AASREF - mess([F:DEP]DPRPLN, GML_NPLAN, 1) - "[D] Déprécié", 0) From GESECRAN
+            Endif
+            If (B_RVA and B_TRACE) Then
+                Call ECR_TRACE([F:DEP]AASREF - mess([F:DEP]DPRPLN, GML_NPLAN, 1) - "[R] Réévalué", 0) From GESECRAN
+            Endif
+
+
+            Gosub CORRIGE_PLAN
+
+
+            If (B_PLAN_A_MAJ) Then
+                # Mise à jour du plan pérode courante
+                [F:DEP]DEPSTA = 1  # PLan calculé à non
+                Rewrite [DEP]
+                WNBTOT_PLANMAJ += 1
+                If (fstat) Then
+
+                    TERRBIEN(WNBERR_PLAN) = "XX" + func PREPA(TPLANS_SOC(I_PLAN),
+&                   "05 DEPREC : fstat =" - num$(fstat) - ":" -
+&                   format$("D:DD[/]MM[/]YYYY", [F:DEP]PERSTRDAT) - "->" - format$("D:DD[/]MM[/]YYYY", [F:DEP]PERENDDAT))
+                    WNBERR_PLAN += 1
+
+                Endif
+            Endif
+            If B_BIEN_ERR = 1
+                B_BIEN_ERR += 1 # ne pas recompter sur son plan suivant
+                WNBTOT_PLANERR += 1
+            Endif
+
+        Endif
+    Next I_PLAN
+
+Return
+
+
+$CORRIGE_PLAN
+
+# Recherche les incohérences entre les modes d'AMT
+
+# Les données réelles    :  avec DEPREC et REEVAL
+# Les données théoriques :  hors DEPREC
+# Les données initiales  :  hors DEPREC/REEVAL
+
+# Si modes incohérents :
+#   Si DPMT incohérent
+#    Si non déprécié
+#      func : Théo <-- Réel
+
+#   Si DPMI incohérent
+#    Si non réévalué
+#      func : init <-- Théo
+
+
+    If [F:DEP]DPM = ""
+
+        TERRBIEN(WNBERR_PLAN) = "XX" - func PREPA(TPLANS_SOC(I_PLAN),
+&                 "05 DPM = '' :" - mess(155, 115, 1) - "(DPMT = '" + [F:DEP]DPMT + "', DPMI = '" + [F:DEP]DPMI + "')")
+        WNBERR_PLAN += 1
+
+        B_BIEN_ERR = 1
+        Return
+    Endif
+
+    If [F:DEP]DPM <> "SA"
+        If [F:DEP]DPMT = "SA" or [F:DEP]DPMT = ""
+
+            # non déprécié
+            If B_IML = 0
+                TERRBIEN(WNBERR_PLAN) = func PREPA(TPLANS_SOC(I_PLAN),
+&                 func AFNC.MES5(mess(77, 7784, 1), [F:DEP]DPMT, [F:DEP]DPM, "", "", ""))
+#&                 "01 DPMT = '" + [F:DEP]DPMT + "' Actualisation du suivi théorique par suivi réel (DPM = '" + [F:DEP]DPM + "')")
+                WNBERR_PLAN += 1
+
+                B_BIEN_A_MAJ = 1      # Bien à recalculer
+                B_PLAN_A_MAJ = 1      # Plan à mettre à jour
+
+                WRES = func MAJ_THEO_PAR_REEL()
+            Else
+
+                TERRBIEN(WNBERR_PLAN) = "XX" - func PREPA(TPLANS_SOC(I_PLAN),
+&                 func AFNC.MES5(mess(78, 7784, 1), [F:DEP]DPMT, [F:DEP]DPM, "", "", ""))
+#&                 "02 DPMT = '" + [F:DEP]DPMT + "' Suivi théorique ne peut être actualisé car bien déprécié (DPM = '" + [F:DEP]DPM + "')")
+                WNBERR_PLAN += 1
+
+                B_BIEN_ERR = 1
+            Endif
+        Endif
+
+        If [F:DEP]DPMI = "SA" or [F:DEP]DPMI = ""
+
+            # non réévalué
+             # + test sur DPMT : On ne peut corriger par la même bétise
+            If B_RVA = 0 and
+&             ([F:DEP]DPMT <> "SA" and [F:DEP]DPMT <> "")
+
+                TERRBIEN(WNBERR_PLAN) = func PREPA(TPLANS_SOC(I_PLAN),
+&                 func AFNC.MES5(mess(79, 7784, 1), [F:DEP]DPMI, [F:DEP]DPMT, "", "", ""))
+#&                 "03 DPMI = '" + [F:DEP]DPMI + "' Actualisation du suivi initial par suivi théorique (DPMT = '" + [F:DEP]DPMT + "')")
+                WNBERR_PLAN += 1
+
+                B_BIEN_A_MAJ = 1      # Bien à recalculer
+                B_PLAN_A_MAJ = 1      # Plan à mettre à jour
+
+                WRES = func MAJ_INIT_PAR_THEO()
+            Else
+
+                If B_RVA
+                    TERRBIEN(WNBERR_PLAN) = "XX" - func PREPA(TPLANS_SOC(I_PLAN),
+&                 func AFNC.MES5(mess(80, 7784, 1), [F:DEP]DPMI, [F:DEP]DPMT, "", "", ""))
+#&                 "04 DPMI = '" + [F:DEP]DPMI + "' Suivi initial ne peut être actualisé car bien réévalué (DPMT = '" + [F:DEP]DPMT + "')")
+                Endif
+                If [F:DEP]DPMT = "SA" or [F:DEP]DPMT = ""
+                    TERRBIEN(WNBERR_PLAN) = "XX" - func PREPA(TPLANS_SOC(I_PLAN),
+&                 func AFNC.MES5(mess(81, 7784, 1), [F:DEP]DPMI, [F:DEP]DPMT, "", "", ""))
+#&                 "05 DPMI = '" + [F:DEP]DPMI + "' Suivi initial ne peut être actualisé car mode théorique incorrect (DPM = '" + [F:DEP]DPM + "', DPMT = '" + [F:DEP]DPMT + "')")
+                Endif
+                WNBERR_PLAN += 1
+
+                B_BIEN_ERR = 1
+            Endif
+        Endif
+    Endif
+
+Return
+
+
+
+$CORRIGE_PLAN_MWA # A VOIR POUR PLUS TARD
+
+# Les données réelles    :  avec DEPREC et REEVAL
+# Les données théoriques :  hors DEPREC
+# Les données initiales  :  hors DEPREC/REEVAL
+
+# Pas de DEPREC                   : si écart : théorique <-- réel
+# Pas de DEPREC et pas de REEVAL  : si écart : initial   <-- réel
+# DEPREC                          / pas de correction systèmatique possible
+
+
+
+    If B_IML = 0 and B_RVA = 0
+        If ([F:DEP]DPMT = "SA" or [F:DEP]DPMT = "" or [F:DEP]DPMI = "SA" or [F:DEP]DPMI = "") and [F:DEP]DPM <> "SA"
+            TERRBIEN(WNBERR_PLAN) = "XX" - func PREPA(TPLANS_SOC(I_PLAN),
+&             "11 DPM = '" + [F:DEP]DPM + "' avec DPMT = '" + [F:DEP]DPMT + "', DPMI = '" - [F:DEP]DPMI) + "'"
+            WNBERR_PLAN += 1
+        Endif
+    Endif
+
+
+
+    # Bien non déprécié ( le théorique est équivalent au réel )
+    If (not B_IML) Then
+
+        If ( [F:DEP]PERREFCLCT <> [F:DEP]PERREFCLC or
+&                [F:DEP]DPMT       <> [F:DEP]DPM       or
+&                [F:DEP]EXECLOCUMT <> [F:DEP]DPRCUM    or
+&                [F:DEP]ENDDPET    <> [F:DEP]ENDDPE    or
+&                [F:DEP]PERCLOCUMT <> [F:DEP]PERCLOCUM or
+&                [F:DEP]DPET       <> [F:DEP]PERENDDPE or
+&                [F:DEP]EXCCUMT    <> [F:DEP]EXCCUM    or
+&                [F:DEP]EXCDPRT    <> [F:DEP]EXCDPR    or
+&                [F:DEP]PERCLOEXCT <> [F:DEP]PERCLOEXC or
+&                [F:DEP]PEREXCDPRT <> [F:DEP]PEREXCDPR or
+&                [F:DEP]NBVT       <> [F:DEP]NBV           ) Then
+
+            B_BIEN_A_MAJ = 1      # Bien à recalculer
+            B_PLAN_A_MAJ = 1      # Plan à mettre à jour
+
+            # Le théorique hérite du réel
+            [F:DEP]PERREFCLCT = [F:DEP]PERREFCLC
+            [F:DEP]DPMT       = [F:DEP]DPM
+            [F:DEP]EXECLOCUMT = [F:DEP]DPRCUM
+            [F:DEP]ENDDPET    = [F:DEP]ENDDPE
+            [F:DEP]PERCLOCUMT = [F:DEP]PERCLOCUM
+            [F:DEP]DPET       = [F:DEP]PERENDDPE
+            [F:DEP]EXCCUMT    = [F:DEP]EXCCUM
+            [F:DEP]EXCDPRT    = [F:DEP]EXCDPR
+            [F:DEP]PERCLOEXCT = [F:DEP]PERCLOEXC
+            [F:DEP]PEREXCDPRT = [F:DEP]PEREXCDPR
+            [F:DEP]NBVT       = [F:DEP]NBV
+
+            TERRBIEN(WNBERR_PLAN) = func PREPA(TPLANS_SOC(I_PLAN), "01 Théorique mis à jour par le réel")
+            WNBERR_PLAN += 1
+
+        Endif
+
+        If (not B_RVA) Then
+              # Bien non déprécié et non réévalué ( l'initial et équivalent au réel)
+            If ( [F:DEP]PERREFCLCT <> [F:DEP]PERREFCLCI or
+&                  [F:DEP]DPMT       <> [F:DEP]DPMI       or
+&                  [F:DEP]EXECLOCUMT <> [F:DEP]EXECLOCUMI or
+&                  [F:DEP]ENDDPET    <> [F:DEP]ENDDPEI    or
+&                  [F:DEP]PERCLOCUMT <> [F:DEP]PERCLOCUMI or
+&                  [F:DEP]DPET       <> [F:DEP]DPEI       or
+&                  [F:DEP]EXCCUMT    <> [F:DEP]EXCCUMI    or
+&                  [F:DEP]EXCDPRT    <> [F:DEP]EXCDPRI    or
+&                  [F:DEP]PERCLOEXCT <> [F:DEP]PERCLOEXCI or
+&                  [F:DEP]PEREXCDPRT <> [F:DEP]PEREXCDPRI or
+&                  [F:DEP]NBVT       <> [F:DEP]NBVI           ) Then
+
+                B_BIEN_A_MAJ = 1    # Bien à recalculer
+                B_PLAN_A_MAJ = 1    # Plan à mettre à jour
+
+                # L'initial hérite du réel
+                [F:DEP]PERREFCLCI = [F:DEP]PERREFCLC
+                [F:DEP]DPMI       = [F:DEP]DPM
+                [F:DEP]EXECLOCUMI = [F:DEP]DPRCUM
+                [F:DEP]ENDDPEI    = [F:DEP]ENDDPE
+                [F:DEP]PERCLOCUMI = [F:DEP]PERCLOCUM
+                [F:DEP]DPEI       = [F:DEP]PERENDDPE
+                [F:DEP]EXCCUMI    = [F:DEP]EXCCUM
+                [F:DEP]EXCDPRI    = [F:DEP]EXCDPR
+                [F:DEP]PERCLOEXCI = [F:DEP]PERCLOEXC
+                [F:DEP]PEREXCDPRI = [F:DEP]PEREXCDPR
+                [F:DEP]NBVI       = [F:DEP]NBV
+
+                TERRBIEN(WNBERR_PLAN) = func PREPA(TPLANS_SOC(I_PLAN), "02 Initial mis à jour par le réel")
+                WNBERR_PLAN += 1
+
+            Endif
+        Endif
+
+    Else
+
+        # Bien déprécié
+        If (not B_RVA) Then
+
+            # CFF 2013.01.08 12:02 : Mise à jour de certaines rubriques du suivi Théorique avec le suivi Réel si plan normé CRC2002-10
+            If (TPLNSTD(I_PLAN) = 2 and
+&                       ([F:DEP]EXECLOCUMT <> [F:DEP]DPRCUM or
+&                       [F:DEP]PERCLOCUMT <> [F:DEP]PERCLOCUM + [F:DEP]PERCLOEXC)) Then
+
+                # Alignement du suivi Théorique
+                [F:DEP]EXECLOCUMT = [F:DEP]DPRCUM
+                # Le bien étant déprécié, le cumul périodique réel (PERCLUCUM)
+                # + la REPRISE de dépréciation (virée en amt except.) (PERCLOEXC)
+                # doit être égal au cumul périodique théorique (PERCLOCUMT)
+                [F:DEP]PERCLOCUMT = ([F:DEP]PERCLOCUM + [F:DEP]PERCLOEXC)
+                # Alignement du suivi Initial
+                [F:DEP]EXECLOCUMI = [F:DEP]EXECLOCUMT
+                [F:DEP]PERCLOCUMI = [F:DEP]PERCLOCUMT
+
+                B_BIEN_A_MAJ = 1 :  # Bien à recalculer
+                B_PLAN_A_MAJ = 1 :  # Plan à mettre à jour
+
+                TERRBIEN(WNBERR_PLAN) = func PREPA(TPLANS_SOC(I_PLAN), "03 Initial/théorique (EXECLOCUMT/I-PERCLOCUMT/I) mis à jour par le réel")
+                WNBERR_PLAN += 1
+            Endif
+            # fin CFF
+
+            # On ne sait qui a raison de l'initial ou du théorique
+            If ( [F:DEP]PERREFCLCT <> [F:DEP]PERREFCLCI or
+&                  [F:DEP]DPMT       <> [F:DEP]DPMI       or
+&                  [F:DEP]EXECLOCUMT <> [F:DEP]EXECLOCUMI or
+&                  [F:DEP]ENDDPET    <> [F:DEP]ENDDPEI    or
+&                  [F:DEP]PERCLOCUMT <> [F:DEP]PERCLOCUMI or
+&                  [F:DEP]DPET       <> [F:DEP]DPEI       or
+&                  [F:DEP]EXCCUMT    <> [F:DEP]EXCCUMI    or
+&                  [F:DEP]EXCDPRT    <> [F:DEP]EXCDPRI    or
+&                  [F:DEP]PERCLOEXCT <> [F:DEP]PERCLOEXCI or
+&                  [F:DEP]PEREXCDPRT <> [F:DEP]PEREXCDPRI or
+&                  [F:DEP]NBVT       <> [F:DEP]NBVI           ) Then
+
+                # n'implique pas la mise à jour ni du plan ni du bien
+
+                TERRBIEN(WNBERR_PLAN) = "XX" + func PREPA(TPLANS_SOC(I_PLAN), "04 Incohérence entre Initial et théorique")
+                WNBERR_PLAN += 1
+#                Call ECR_TRACE([F:DEP]CPY-[F:DEP]AASREF-mess([F:DEP]DPRPLN,GML_NPLAN,1)-"[D & !R] Incohérence Théorique/Initial",1) From GESECRAN
+            Endif
+        Endif
+    Endif
+
+Return
+
+Funprog MAJ_THEO_PAR_REEL()
+
+    # Le théorique hérite du réel
+    [F:DEP]PERREFCLCT = [F:DEP]PERREFCLC
+    [F:DEP]DPMT       = [F:DEP]DPM
+    [F:DEP]EXECLOCUMT = [F:DEP]DPRCUM
+    [F:DEP]ENDDPET    = [F:DEP]ENDDPE
+    [F:DEP]PERCLOCUMT = [F:DEP]PERCLOCUM
+    [F:DEP]DPET       = [F:DEP]PERENDDPE
+    [F:DEP]EXCCUMT    = [F:DEP]EXCCUM
+    [F:DEP]EXCDPRT    = [F:DEP]EXCDPR
+    [F:DEP]PERCLOEXCT = [F:DEP]PERCLOEXC
+    [F:DEP]PEREXCDPRT = [F:DEP]PEREXCDPR
+    [F:DEP]NBVT       = [F:DEP]NBV
+
+End 1
+
+
+Funprog MAJ_INIT_PAR_THEO()
+
+    # L'initial hérite du théorique
+    [F:DEP]PERREFCLCI = [F:DEP]PERREFCLCT
+    [F:DEP]DPMI       = [F:DEP]DPMT
+    [F:DEP]EXECLOCUMI = [F:DEP]EXECLOCUMT
+    [F:DEP]ENDDPEI    = [F:DEP]ENDDPET
+    [F:DEP]PERCLOCUMI = [F:DEP]PERCLOCUMT
+    [F:DEP]DPEI       = [F:DEP]DPET
+    [F:DEP]EXCCUMI    = [F:DEP]EXCCUMT
+    [F:DEP]EXCDPRI    = [F:DEP]EXCDPRT
+    [F:DEP]PERCLOEXCI = [F:DEP]PERCLOEXCT
+    [F:DEP]PEREXCDPRI = [F:DEP]PEREXCDPRT
+    [F:DEP]NBVI       = [F:DEP]NBVT
+
+End 1
+
+Funprog PREPA(PPLAN, PTXT)
+Value Integer PPLAN
+Value Char PTXT()
+
+Local Char TXT(250)
+
+    TXT = mess(PPLAN, 3101, 1) - ":" - PTXT
+
+#    TXT -= func PREPA2(40, num$(P1DPRCUM) - "+" - num$(P1ENDDPE) - "+" - num$(P1EXCDPR))
+
+End TXT
+
+#Funprog PREPA2(PLG, PTXT)
+#Value Integer PLG
+#Value Char PTXT()
+#
+#    Local Integer LG2
+#
+#    If PLG = 0
+#        End PTXT
+#    Endif
+#
+#    LG2 = len(PTXT)
+#    If LG2 > PLG
+#        LG2 = PLG
+#    Endif
+#
+#End string$(PLG - LG2, " ") + left$(PTXT, LG2)
+
+
+Subprog DEB_TRACE(PCPY, PCNX, PFLGSIM, PTPLANS_SELEC, PSEL)
+Value Char PCPY
+Value Integer PCNX, PFLGSIM, PTPLANS_SELEC()
+Value Char PSEL
+
+Local Integer I
+
+    Local Char WLIB(250)
+#    Call OUVRE_TRACE(mess(71, 7784, 1)) From LECFIC
+    Call OUVRE_TRACE("Synchronisation des suivis") From LECFIC
+
+    Call ECR_SOUL(mess(71, 7784, 1), "_")
+    Call ECR_TRACE("", 0) From GESECRAN
+
+    Call ECR_SOUL(mess(4, 26, 1) - ":", "=")
+    Call ECR_TRACE("", 0) From GESECRAN
+
+    Call ECR_TRACE(mess(2, 72, 1) - ":" - GUSER, 0) From GESECRAN
+    Call ECR_TRACE("Date :" - format$("D:DD[/]MM[/]YYYY", date$) - "-" - time$, 0) From GESECRAN
+    Call ECR_TRACE(mess(815, 9913, 1), 0) From GESECRAN
+    Call ECR_TRACE("", 0) From GESECRAN
+
+    If PCPY = ""
+    Call ECR_TRACE(mess(444, 7773, 1) - ":" - mess(G_OUI, 1, 1), 0) From GESECRAN
+    Else
+    Call ECR_TRACE(mess(6, 47, 1)    - ":" - PCPY, 0) From GESECRAN
+    Endif
+    Call ECR_TRACE(mess(31, 15, 1)   - ":" - mess(PFLGSIM, 1, 1), 0) From GESECRAN
+    Call ECR_TRACE(mess(28, 75, 1)   - mess(PCNX, 3100, 1), 0) From GESECRAN
+
+#    If PSEL <> ""
+#    Call ECR_TRACE("Selection +:" - PSEL, 0) From GESECRAN
+#    Endif
+
+    Call ECR_TRACE("", 0) From GESECRAN
+    Call ECR_TRACE(mess(72, 7784, 1) - ":", 0) From GESECRAN
+
+    I = 0
+    While I < G301MAX - 1
+        If PTPLANS_SELEC(I) = 0
+            Break
+        Endif
+        Call ECR_TRACE(mess(PTPLANS_SELEC(I), 3101, 1), 0) From GESECRAN
+        I += 1
+    Wend
+
+    Call ECR_TRACE("", 0) From GESECRAN
+#    Call ECR_TRACE("********************************************************", 0) From GESECRAN
+
+    Call ECR_SOUL(mess(29, 7778, 1) - ":", "=")
+    Call ECR_TRACE("", 0) From GESECRAN
+
+End
+
+Subprog FIN_TRACE(PNBTOT_PLANMAJ, PNBTOT_PLANERR, PNBTOT_BIENMAJ, PNBTOT_BIENERR)
+Value Integer PNBTOT_PLANMAJ, PNBTOT_PLANERR, PNBTOT_BIENMAJ, PNBTOT_BIENERR
+
+    Call ECR_TRACE("", 0) From GESECRAN
+    Call ECR_TRACE("", 0) From GESECRAN
+    Call ECR_TRACE(num$(PNBTOT_BIENMAJ) - mess(73, 7784, 1), 0) From GESECRAN
+    Call ECR_TRACE(num$(PNBTOT_BIENERR) - mess(74, 7784, 1), 0) From GESECRAN
+    Call ECR_TRACE(num$(PNBTOT_PLANMAJ) - mess(75, 7784, 1), 0) From GESECRAN
+    Call ECR_TRACE(num$(PNBTOT_PLANERR) - mess(76, 7784, 1), 0) From GESECRAN
+    Call ECR_TRACE("", 0) From GESECRAN
+Call ECR_SOUL(mess(18, 2, 1) - ":" - format$("D:DD[/]MM[/]YYYY", date$) - "-" - time$, "=")
+
+    Call FERME_TRACE() From LECFIC
+
+    If GSERVEUR = 0
+        Call LEC_TRACE From LECFIC
+    Endif
+
+End
+
+Subprog ECR_SOUL(PTXT, PSOUL)
+Value Char PTXT, PSOUL
+
+    Call ECR_TRACE(PTXT, 0) From GESECRAN
+    Call ECR_TRACE(string$(len(PTXT), PSOUL), 0) From GESECRAN
+End
+
+
+#**
+#* donne le libellé d'1 champ de masque
+#*
+#* @param PLANGUE
+#* @param PMASQUE
+#* @param PCHAMP
+#* @param RLIBELLE
+#*!
+Subprog LIBCHPATZ(PLANGUE, PMASQUE, PCHAMP, RLIBELLE)
+Value Char PLANGUE, PMASQUE, PCHAMP
+Variable Char RLIBELLE
+
+    If !clalev ([F:AMZ])
+        Local File = "AMSKZON" [AMZ]
+    Endif
+    If !clalev ([F:ATX])
+        Local File = "ATEXTE" [ATX]
+    Endif
+
+
+    Read [AMZ]CODE = PMASQUE ; PCHAMP
+    If fstat
+        RLIBELLE = ""
+    Else
+        Read [ATX]NUMERO =PLANGUE ; [F:AMZ]INTIT
+        RLIBELLE = [F:ATX]TEXTE
+    Endif
+End
+
+# fonctions recopiées de TRTFAS pour rendre le trt indépendant des patchs
+
+Funprog IMPAIRED_ASSET_PLN()
+
+# Objet : Retourne si le plan du bien a été déprécié au moins une fois
+# PREREQUIS :  La classe [F:DEPC] doit être ouverte et alimentée en conséquence
+# -> période courante
+  # test de la moulinette MWA :
+#          Filter [WDEP] Where AASREF=[F:FAS]AASREF & DPRPLN= TPLN(I_C,I_P) & FIYENDDAT<= TCURFIY(I_C) & PERENDDAT< TCURPER(I_C) & IML <> 0
+#          Look [WDEP] First
+#          If (fstat < 4) Then : B_IML = 1 : Endif
+
+  If [F:DEP]EXEIMLCUM = 0 and
+&    [F:DEP]EXERVECUM = 0 and
+&    [F:DEP]PERIMLCUM = 0 and
+&    [F:DEP]PERRVECUM = 0 and
+&    [F:DEP]IMLBLC = 0
+
+      End 0
+  Endif
+End 1
+
+########################################################
+Funprog REVALUED_ASSET_PLN()
+
+# Objet : Retourne si le plan du bien a été réévalué au moins une fois
+# PREREQUIS :  La classe [F:DEP] doit être ouverte et alimentée en conséquence
+# -> période courante
+
+  # test de la moulinette MWA :If ( ([F:DEP]RVACRB <> 0) or ([F:DEP]BSEVAL <> [F:DEP]DPRBAS) ) Then : B_RVA = 1  : Endif
+
+  If [F:DEP]BSEVAL = [F:DEP]DPRBAS and
+&    [F:DEP]EXERVADEV = 0 and
+&    [F:DEP]PERRVADEV = 0
+
+      End 0
+  Endif
+End 1

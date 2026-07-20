@@ -1,0 +1,1378 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#############################################################################################################
+#Recherche du taux horaire du formateur interne
+#Si j'ai la paie, je prend la valeur de la rubrique
+#Sinon, je prend le taux défini dans la catégorie 2483
+#############################################################################################################
+Subprog TAUX_HORAIRE (MATRI,CONTRAT,DATMAT,TAUX,TYPTX,TYPCOUT,COLONNE)
+Value    Char    MATRI ()
+Value    Date    DATMAT
+Value    Char    CONTRAT
+Variable Decimal TAUX
+Value    Decimal TYPTX      :#1=Sal & 2=Pat
+Value    Integer TYPCOUT    :#1=Prév  & 2=Réel
+Value    Integer COLONNE    :#1=Total & 2= Imputable
+
+If clalev([F:ADI3])=0 : Local File ATABDIV    [ADI3] : Endif
+
+TAUX=0
+
+If GPAYE & TYPCOUT=2
+ Gosub TXPAYE
+Else
+ Gosub TXCAT
+Endif
+End
+
+#Recherche du taux horaire dans l'historique de paye
+###################################
+$TXPAYE
+If clalev([F:HSP])=0 : Local File HISTOPAYE    [HSP] : Endif
+Local Char CODRUB (GLONRUB)
+If TYPTX=2
+ If COLONNE= 1
+  Call PARAM(GCURLEG,"TXHRPAT2",CODRUB)From ADOVAL
+ Else
+  Call PARAM(GCURLEG,"TXHRPAT",CODRUB)From ADOVAL
+ Endif
+Else
+ If COLONNE= 1
+  Call PARAM(GCURLEG,"TXHRSAL2",CODRUB)From ADOVAL
+ Else
+  Call PARAM(GCURLEG,"TXHRSAL",CODRUB)From ADOVAL
+ Endif
+Endif
+If CODRUB<>""
+ If DATMAT=[0/0/0] : DATMAT=date$ : Endif
+ # 50833
+ #Filter [F:HSP] Where EMP=MATRI & DAT<=DATMAT & RUB=CODRUB & (TYP=TYPTX | TYP=TYPTX+6)
+ Filter [F:HSP] Where EMP=MATRI & CTRNUM=CONTRAT & DAT<=DATMAT & RUB=CODRUB
+ Read[F:HSP]HSP1 Last
+ Filter [F:HSP]
+ If !fstat :  TAUX=[F:HSP]AMT :  Endif
+ #LIPET - 2017-06-22 - X3-34431 - START
+ #104656-
+ # Si pas de bulletin avant la fin de sesion - cas d'une arrivée dans le mois.
+ # chercher 1er bulletin après fin de session
+ If fstat
+  Filter [F:HSP] Where EMP=MATRI & CTRNUM=CONTRAT & DAT>DATMAT & RUB=CODRUB
+  Read[F:HSP]HSP1 First
+  Filter [F:HSP]
+  If !fstat :  TAUX=[F:HSP]AMT :  Endif
+ Endif
+ #LIPET - 2017-06-22 - X3-34431 - END
+#46232
+Else
+ Gosub TXCAT
+Endif
+Return
+
+#Recherche du taux horaire dans la catégorie 2483
+###################################
+$TXCAT
+Local Char CATFRT(3)
+Call CAT2483(MATRI,CONTRAT,CATFRT)From SUBDEM
+If CATFRT<>""
+ Read[F:ADI3]CODE=10453;CATFRT
+ If !fstat
+  If TYPTX=2 :#patronal
+   If COLONNE= 1
+    TAUX=val([F:ADI3]A2)
+   Else
+    TAUX=[F:ADI3]N2
+   Endif
+  Else     :#salarial
+   If COLONNE= 1
+    TAUX=val([F:ADI3]A1)
+   Else
+    TAUX=[F:ADI3]N1
+   Endif
+  Endif
+ Endif
+Endif
+Return
+
+#############################################################################################################
+#############################################################################################################
+
+##############################
+#Type de frais
+#On interdit la saisie des coûts de type "Participant"
+Subprog C_TYPCRG(VALEUR)
+Variable Char    VALEUR()
+Local Integer K
+If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+Read[F:ADI]CODE=10451;VALEUR
+If !fstat & [F:ADI]N1<3 & [F:ADI]N2=1
+ If GFONCTION="GESHRSES" :  K=34 : Else :  K=33 : Endif
+ GMESSAGE=VALEUR-":"-mess(35,10717,1)-mess(K,10717,1) :#Type de coût non autorisé au niveau stage / session
+ mkstat=2 : End
+Endif
+End
+##############################
+#Cout total collectif
+#Si c'est un coût calculable, pas de saisie collective
+#Si un coût total individuel a été saisi, on ne saisit pas le coût total collectif
+Subprog AS_CSTTOTCLL(VALEUR)
+Variable Decimal VALEUR
+If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+Read[F:ADI]CODE=10451;[M]TYPCRG(nolign-1)
+If !fstat & [F:ADI]N1<3
+ mkstat=2 : End
+Endif
+
+#LIPET - 2017-06-22 - X3-34431 - START
+Gosub SET_VALINI
+Gosub IS_DISTRIB
+Gosub GET_CUMUL_CSTTOTCLL
+Gosub GET_CUMUL_CSTTOTIDV
+
+#If VALEUR=0 & [M]CSTTOTIDV(nolign-1)<>0 : mkstat=2 : End : Endif
+If VALCUMULCLL=0 & VALCUMULIDV<>0 : mkstat=2 : End : Endif
+
+VALEUR=VALCUMULCLL
+#LIPET - 2017-06-22 - X3-34431 - END
+End
+
+##############################
+#Cout total collectif
+#Calcul du coût total individuel en fonction du coût total collectif saisi
+Subprog AM_CSTTOTCLL(VALEUR)
+Variable Decimal VALEUR
+#LIPET - 2017-05-10 - X3-34431 - START
+Gosub IS_DISTRIB
+
+If IS_DISTRIB & ![M]WVALCTL
+  IS_COL=1
+  Gosub CALC_DISTRIB
+  If !(VAL1=VAL2 and VAL1=0)
+    # on update l'indi
+    [M]CSTTOTIDV(LIN)=VAL1
+    [M]CSTTOTIDV(LIN+1)=VAL2
+    Affzo [M]CSTTOTIDV(LIN+1)
+    Affzo [M]CSTTOTIDV(LIN)
+  Endif
+  [M]CSTTOTCLL(LIN+1)=(VAL2*NB_COL)
+  Affzo [M]CSTTOTCLL(LIN+1)
+  VALEUR=(VAL1*NB_COL)
+  # on update A
+#LIPET - 2017-05-10 - X3-34431 - END
+Else
+  If VALEUR<>0
+    [M]CSTTOTIDV(nolign-1)=arr((VALEUR/[M]NBRPRTSTD),0.01)
+    Affzo [M]CSTTOTIDV(nolign-1)
+  Endif
+Endif
+End
+##############################
+#Cout total individuel
+#Si un coût total collectif a été saisi, on ne saisit pas le coût total individuel
+#Si un formateur interne a été saisi, on valorise ses charges salariales et patronales
+#en fonction de sa catégorie 2483
+#LIPET - 2017-06-22 - X3-34431 - START
+#Subprog AS_CSTTOTIDV(VALEUR, FORMATEUR, CONTRAT,DATREF)
+#Variable Decimal VALEUR
+#Value Char FORMATEUR ()
+#Value Char CONTRAT
+#Value Date DATREF
+#If [M]CSTTOTCLL(nolign-1)<>0 : mkstat=2 : End : Endif
+#If FORMATEUR<>"" & VALEUR=0
+# Local Decimal TAUX
+# If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+# Read[F:ADI]CODE=10451;[M]TYPCRG(nolign-1)
+# If !fstat & [F:ADI]N1<3 & [F:ADI]N2=2     :#cout calculable pour formateur interne
+#  Call TAUX_HORAIRE (FORMATEUR,CONTRAT,DATREF,TAUX,[F:ADI]N1,2,1) From TRTCOUT
+#  If !TAUX
+#   #Taux horaire total non défini
+#   Call ERREUR (FORMATEUR-":"-mess(78,10717,1))From GESECRAN
+#  Else
+#   VALEUR=arr(TAUX*[M]NBRHOUIPT,0.01) :# Nb d'heures imputables
+#  Endif
+# Endif
+#Endif
+#End
+
+Subprog AS_CSTTOTIDV(VALEUR)
+Variable Decimal VALEUR
+
+Gosub SET_VALINI
+Gosub IS_DISTRIB
+Gosub GET_CUMUL_CSTTOTCLL
+If VALCUMULCLL<>0 : mkstat=2 : End : Endif
+
+Gosub GET_CUMUL_CSTTOTIDV
+
+If W_FORMATEUR<>"" & VALCUMULIDV=0
+ Local Decimal TAUX
+ If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+ Read[F:ADI]CODE=10451;[M]TYPCRG(nolign-1)
+ If !fstat & [F:ADI]N1<3 & [F:ADI]N2=2     :#cout calculable pour formateur interne
+  Call TAUX_HORAIRE (W_FORMATEUR,W_CONTRAT,W_DATREF,TAUX,[F:ADI]N1,2,1) From TRTCOUT
+  If !TAUX
+   #Taux horaire total non défini
+   Call ERREUR (W_FORMATEUR-":"-mess(78,10717,1))From GESECRAN
+  Else
+   VALEUR=arr(TAUX*W_NBRHOUR,0.01) :# Nb d'heures imputables
+  Endif
+ Endif
+Else
+  VALEUR=VALCUMULIDV
+Endif
+End
+#LIPET - 2017-06-22 - X3-34431 - END
+
+##############################
+#LIPET - 2017-06-22 - X3-34431 - START
+#Cout imputable collectif
+#Si c'est un coût calculable, pas de saisie collective
+#Si un coût imputable individuel a été saisi, on ne saisit pas le coût imputable collectif
+#Subprog AS_CSTIPTCLL(VALEUR)
+#Variable Decimal VALEUR
+#If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+#Read[F:ADI]CODE=10451;[M]TYPCRG(nolign-1)
+#If !fstat & [F:ADI]N1<3
+# mkstat=2 : End
+#Endif
+#If VALEUR=0  & [M]CSTIPTIDV(nolign-1)<>0 : mkstat=2 : End : Endif
+## MABON 25/08/10 - Initialisation de CSTIPTCLL avec CSTTOTCLL si celui-ci est renseigné
+#If VALEUR=0  & [M]CSTTOTCLL(nolign-1)<>0 : VALEUR=[M]CSTTOTCLL(nolign-1) : Endif
+#End
+
+Subprog AS_CSTIPTCLL(VALEUR)
+Variable Decimal VALEUR
+If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+Read[F:ADI]CODE=10451;[M]TYPCRG(nolign-1)
+If !fstat & [F:ADI]N1<3
+ mkstat=2 : End
+Endif
+Gosub SET_VALINI
+Gosub IS_DISTRIB
+Gosub GET_CUMUL_CSTIPTCLL
+Gosub GET_CUMUL_CSTIPTIDV
+If VALCUMULCLL=0 & VALCUMULIDV<>0 : mkstat=2 : End : Endif
+If VALCUMULCLL=0
+  Gosub GET_CUMUL_CSTTOTCLL
+Endif
+VALEUR=VALCUMULCLL
+End
+#LIPET - 2017-06-22 - X3-34431 - END
+##############################
+#Cout imputable collectif
+#On contrôle que le coût imputable collectif n'est pas > que le coût total collectif
+#LIPET - 2017-06-22 - X3-34431 - START
+#Subprog C_CSTIPTCLL(VALEUR)
+#Variable Decimal VALEUR
+## FQ71546 - MABON 14/02/11 - Le coût total peut être négatif
+#If [M]CSTTOTCLL(nolign-1)>0 Then
+#  If VALEUR>[M]CSTTOTCLL(nolign-1) Then
+#    GMESSAGE=mess(7,10717,1) :#Coût imputable supérieur au coût total
+#    mkstat=2 : End
+#  Endif
+#  # FQ71546 - MABON 14/02/11 - Si le coût total est positif, le coût imputable doit l'être aussi
+#  If VALEUR<0 Then
+#    GMESSAGE=mess(231,10717,1) :# Le coût imputable doit être positif
+#    mkstat=2 : End
+#  Endif
+#Endif
+#If [M]CSTTOTCLL(nolign-1)<0 Then
+#  If VALEUR<=0 Then
+#    If abs(VALEUR)>abs([M]CSTTOTCLL(nolign-1)) Then
+#      GMESSAGE=mess(7,10717,1) : #Coût imputable supérieur au coût total
+#      mkstat=2 : End
+#    Endif
+#  Else
+#    GMESSAGE=mess(228,10717,1) : # Le coût imputable ne peut pas être supérieur à 0
+#    mkstat=2 : End
+#  Endif
+#Endif
+## Fin MABON
+#End
+
+Subprog C_CSTIPTCLL(VALEUR)
+Variable Decimal VALEUR
+
+# SEGAY X3PEOP-112635 230117
+If dim([M]TCRCOD)<>-1 and dim([M]LNKREP)<>-1 and [M]TCRCOD<>"" and [M]LNKREP(nolign-1)=""
+   [M]CSTIPTCLL(nolign-1)=VALEUR
+   Gosub ADD_REP_COST From TRTCOUT
+Endif
+
+Gosub IS_DISTRIB
+Gosub GET_CUMUL_CSTTOTCLL
+
+If VALCUMULCLL>0 Then
+  If VALEUR>VALCUMULCLL Then
+    GMESSAGE=mess(7,10717,1) :#Coût imputable supérieur au coût total
+    Gosub ERROR_RETORE_CSTIPTCLL
+    mkstat=2 : End
+  Endif
+  # FQ71546 - MABON 14/02/11 - Si le coût total est positif, le coût imputable doit l'être aussi
+  If VALEUR<0 Then
+    GMESSAGE=mess(231,10717,1) :# Le coût imputable doit être positif
+    Gosub ERROR_RETORE_CSTIPTCLL
+    mkstat=2 : End
+  Endif
+Endif
+If VALCUMULCLL<0 Then
+  If VALEUR<=0 Then
+    If abs(VALEUR)>abs(VALCUMULCLL) Then
+      GMESSAGE=mess(7,10717,1) : #Coût imputable supérieur au coût total
+      Gosub ERROR_RETORE_CSTIPTCLL
+      mkstat=2 : End
+    Endif
+  Else
+    GMESSAGE=mess(228,10717,1) : # Le coût imputable ne peut pas être supérieur à 0
+    Gosub ERROR_RETORE_CSTIPTCLL
+    mkstat=2 : End
+  Endif
+Endif
+# Force recalculation
+If IS_DISTRIB
+  If func FORCE_AM(VALEUR)
+    Call AM_CSTIPTCLL(VALEUR)
+    Gosub SET_VALCTL
+  Endif
+Endif
+
+End
+
+#LIPET - 2017-06-22 - X3-34431 - END
+
+#LIPET - 2017-06-22 - X3-34431 - START
+$ERROR_RETORE_CSTIPTCLL
+If IS_DISTRIB
+  VALEUR=VALEUR-[M]CSTIPTCLL(LIN+1)
+Endif
+Return
+#LIPET - 2017-06-22 - X3-34431 - END
+
+##############################
+#Cout imputable collectif
+#Calcul du coût imputable individuel en fonction du coût individuel collectif saisi
+Subprog AM_CSTIPTCLL(VALEUR)
+Variable Decimal VALEUR
+
+Gosub IS_DISTRIB
+
+If IS_DISTRIB & ![M]WVALCTL
+  IS_COL=1
+  Gosub CALC_DISTRIB
+  If !(VAL1=VAL2 and VAL1=0)
+    # on update l'indi
+    [M]CSTIPTIDV (LIN)=VAL1
+    [M]CSTIPTIDV (LIN+1)=VAL2
+    Affzo [M]CSTIPTIDV (LIN+1)
+    Affzo [M]CSTIPTIDV (LIN)
+  Endif
+  [M]CSTIPTCLL(LIN+1)=(VAL2*NB_COL)
+  Affzo [M]CSTIPTCLL(LIN+1)
+  VALEUR=(VAL1*NB_COL)
+  # on update A
+Else
+  If VALEUR<>0
+    [M]CSTIPTIDV(nolign-1)=arr((VALEUR/[M]NBRPRTSTD),0.01)
+    Affzo [M]CSTTOTIDV(nolign-1)
+  Endif
+Endif
+End
+
+##############################
+#Cout imputable total
+#Si un coût imputable collectif a été saisi, on ne saisit pas le coût imputable individuel
+#Si un formateur interne a été saisi, on valorise ses charges salariales et patronales
+#en fonction de l'historique de paye ou de sa catégorie 2483
+#Si un coût d'hebergement a été saisi, on valorise son coût en fonction du Minimum garanti
+#Frais d'hebergement imputable individuel = 5*MG*Nb jours
+#LIPET - 2017-06-22 - X3-34431 - START
+#Subprog AS_CSTIPTIDV(VALEUR, FORMATEUR,CONTRAT, DATREF)
+#Variable Decimal VALEUR
+#Value Char FORMATEUR ()
+#Value Char CONTRAT
+#Value Date DATREF
+#If [M]CSTIPTCLL(nolign-1)<>0 : mkstat=2 : End : Endif
+#If FORMATEUR<>"" & VALEUR=0
+# Local Decimal TAUX
+# If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+# Read[F:ADI]CODE=10451;[M]TYPCRG(nolign-1)
+# If !fstat & [F:ADI]N1<3 & [F:ADI]N2=2
+#  Call TAUX_HORAIRE (FORMATEUR,CONTRAT,DATREF,TAUX,[F:ADI]N1,2,2) From TRTCOUT
+#  If !TAUX
+#   #Taux horaire imputable non défini
+#   Call ERREUR (FORMATEUR-":"-mess(79,10717,1))From GESECRAN
+#  Else
+#   VALEUR=arr(TAUX*[M]NBRHOUIPT,0.01)
+#  Endif
+# Endif
+#Endif
+#If [M]TYPCRG(nolign-1)="HEB" & VALEUR=0
+# Local Decimal VALMG
+# Call RECUP_MG("", "", "",DATREF,VALMG)
+# If [M]CSTTOTIDV(nolign-1)<arr(5*VALMG*[M]NBRDAY,0.01)
+#  VALEUR=[M]CSTTOTIDV(nolign-1)
+# Else
+#  VALEUR=arr(5*VALMG*[M]NBRDAY,0.01)
+# Endif
+#Endif
+## MABON 25/08/10 - Initialisation de CSTIPTIDV avec CSTTOTIDV si celui-ci est renseigné
+#If VALEUR=0  & [M]CSTTOTIDV(nolign-1)<>0 : VALEUR=[M]CSTTOTIDV(nolign-1) : Endif
+#End
+
+Subprog AS_CSTIPTIDV(VALEUR)
+Variable Decimal VALEUR
+
+Gosub SET_VALINI
+
+Gosub IS_DISTRIB
+Gosub GET_CUMUL_CSTIPTCLL
+Gosub GET_CUMUL_CSTIPTIDV
+
+If VALCUMULCLL<>0 : mkstat=2 : End : Endif
+If W_FORMATEUR<>"" & VALCUMULIDV=0
+ Local Decimal TAUX
+ If clalev([F:ADI])=0 : Local File ATABDIV     [ADI] : Endif
+ Read[F:ADI]CODE=10451;[M]TYPCRG(LIN)
+ If !fstat & [F:ADI]N1<3 & [F:ADI]N2=2
+  Call TAUX_HORAIRE (W_FORMATEUR,W_CONTRAT,W_DATREF,TAUX,[F:ADI]N1,2,2) From TRTCOUT
+  If !TAUX
+   #Taux horaire imputable non défini
+   Call ERREUR (W_FORMATEUR-":"-mess(79,10717,1))From GESECRAN
+  Else
+   VALEUR=arr(TAUX*[L]W_NBRHOUR,0.01)
+  Endif
+ Endif
+Endif
+
+# warning line could be split
+
+
+VALCUMUL=VALCUMULIDV
+# /!\  VALCUMULIDV is now CSTTOTIDV : VALCUMUL=CSTIPTIDV
+Gosub GET_CUMUL_CSTTOTIDV
+
+If [M]TYPCRG(LIN)="HEB" & VALCUMUL=0
+ Local Decimal VALMG
+ Call RECUP_MG("", "", "",W_DATREF,VALMG) From TRTCOUT
+ If VALCUMULIDV<arr(5*VALMG*[L]W_NBRDAY,0.01)
+  VALEUR=VALCUMULIDV
+ Else
+  VALEUR=arr(5*VALMG*[L]W_NBRDAY,0.01)
+ Endif
+Endif
+# SBA change  MABON 25/08/10 - Initialisation de CSTIPTIDV avec CSTTOTIDV si celui-ci est renseigné
+#If VALEUR=0  & [M]CSTTOTIDV(nolign-1)<>0 : VALEUR=[M]CSTTOTIDV(nolign-1) : Endif
+
+If VALEUR=0 & VALCUMUL=0  & VALCUMULIDV<>0
+  VALEUR=VALCUMULIDV
+Else
+  VALEUR=VALCUMUL
+Endif
+
+End
+#LIPET - 2017-06-22 - X3-34431 - END
+##############################
+#Cout imputable individuel
+#On contrôle que le coût imputable individuel n'est pas > que le coût total individuel
+#On contrôle que le coût imputable individuel n'est pas > au minimum garanti en cas de frais d'hebergement
+#LIPET - 2017-06-22 - X3-34431 - START
+#Subprog C_CSTIPTIDV(VALEUR, FORMATEUR, DATREF)
+#Variable Decimal VALEUR
+#Value Char FORMATEUR ()
+#Value Date DATREF
+## FQ71546 - MABON 14/02/11 - Le coût total peut être négatif
+#If [M]CSTTOTIDV(nolign-1)>0 Then
+#  If VALEUR>[M]CSTTOTIDV(nolign-1) Then
+#    GMESSAGE=mess(7,10717,1) :#Coût imputable supérieur au coût total
+#    mkstat=2 : End
+#  Endif
+#  # FQ71546 - MABON 14/02/11 - Si le coût total est positif, le coût imputable doit l'être aussi
+#  If VALEUR<0 Then
+#    GMESSAGE=mess(231,10717,1) :# Le coût imputable doit être positif
+#    mkstat=2 : End
+#  Endif
+#Endif
+#If [M]CSTTOTIDV(nolign-1)<0 Then
+#  If VALEUR<=0 Then
+#    If abs(VALEUR)>abs([M]CSTTOTIDV(nolign-1)) Then
+#      #Coût imputable supérieur au coût total
+#      GMESSAGE=mess(7,10717,1)
+#      mkstat=2 : End
+#    Endif
+#  Else
+#    GMESSAGE=mess(228,10717,1) : # Le coût imputable ne peut pas être supérieur à 0
+#    mkstat=2 : End
+#  Endif
+#Endif
+## Fin MABON
+#If [M]TYPCRG(nolign-1)="HEB"
+# Local Decimal VALMG
+# Call RECUP_MG("", "", "",DATREF,VALMG)
+# If VALEUR>arr(5*VALMG*[M]NBRDAY,0.01)
+#   # FQ97638 - 21/03/14 - Mettre un message plus complet
+##  GMESSAGE=mess(51,10717,1) :#Coût imputable supérieur au minimum garanti
+#  #Incohérence de données : / - Coût imputable supérieur au minimum garanti / - Le nombre de jours n'est pas renseigné
+#  GMESSAGE=mess(305,10717,1)-":"+chr$(10)+"- "+mess(51,10717,1)+chr$(10)+"- "+mess(306,10717,1)
+#  # Fin FQ97638
+#  mkstat=2 : End
+# Endif
+#Endif
+#End
+
+Subprog C_CSTIPTIDV(VALEUR)
+Variable Decimal VALEUR
+
+# SEGAY X3PEOP-112635 230117
+If dim([M]TCRCOD)<>-1 and dim([M]LNKREP)<>-1 and [M]TCRCOD<>"" and [M]LNKREP(nolign-1)=""
+   [M]CSTIPTIDV(nolign-1)=VALEUR
+   Gosub ADD_REP_COST From TRTCOUT
+Endif
+
+Gosub IS_DISTRIB
+Gosub GET_CUMUL_CSTTOTIDV
+
+# FQ71546 - MABON 14/02/11 - Le coût total peut être négatif
+If VALCUMULIDV>0 Then
+  If VALEUR>VALCUMULIDV Then
+    GMESSAGE=mess(7,10717,1) :#Coût imputable supérieur au coût total
+    Gosub ERROR_RETORE_CSTIPTIDV
+    mkstat=2 : End
+  Endif
+  # FQ71546 - MABON 14/02/11 - Si le coût total est positif, le coût imputable doit l'être aussi
+  If VALEUR<0 Then
+    GMESSAGE=mess(231,10717,1) :# Le coût imputable doit être positif
+    Gosub ERROR_RETORE_CSTIPTIDV
+    mkstat=2 : End
+  Endif
+Endif
+If VALCUMULIDV<0 Then
+  If VALEUR<=0 Then
+    If abs(VALEUR)>abs(VALCUMULIDV) Then
+      #Coût imputable supérieur au coût total
+      GMESSAGE=mess(7,10717,1)
+      Gosub ERROR_RETORE_CSTIPTIDV
+      mkstat=2 : End
+    Endif
+  Else
+    GMESSAGE=mess(228,10717,1) : # Le coût imputable ne peut pas être supérieur à 0
+    Gosub ERROR_RETORE_CSTIPTIDV
+    mkstat=2 : End
+  Endif
+Endif
+# Fin MABON
+If [M]TYPCRG(nolign-1)="HEB"
+ Local Decimal VALMG
+ Call RECUP_MG("", "", "",W_DATREF,VALMG) From TRTCOUT
+ If VALEUR>arr(5*VALMG*W_NBRDAY,0.01)
+   # FQ97638 - 21/03/14 - Mettre un message plus complet
+#  GMESSAGE=mess(51,717,1) :#Coût imputable supérieur au minimum garanti
+  #Incohérence de données : / - Coût imputable supérieur au minimum garanti / - Le nombre de jours n'est pas renseigné
+  GMESSAGE=mess(305,10717,1)-":"+chr$(10)+"- "+mess(51,10717,1)+chr$(10)+"- "+mess(306,10717,1)
+  Gosub ERROR_RETORE_CSTIPTIDV
+  # Fin FQ97638
+  mkstat=2 : End
+ Endif
+Endif
+If IS_DISTRIB
+  If func FORCE_AM(VALEUR)
+    Call AM_CSTIPTIDV(VALEUR)
+    Gosub SET_VALCTL
+  Endif
+Endif
+
+End
+#LIPET - 2017-06-22 - X3-34431 - END
+
+#LIPET - 2017-06-22 - X3-34431 - START
+$ERROR_RETORE_CSTIPTIDV
+If IS_DISTRIB
+  VALEUR=VALEUR-[M]CSTIPTIDV(LIN+1)
+Endif
+Return
+#LIPET - 2017-06-22 - X3-34431 - END
+##############################
+#Calcul de la synthèse des coûts
+Subprog CSTMOY (VALEUR)
+Value Integer VALEUR
+Local Integer I
+Raz[M]CSTMOYTOT
+Raz[M]CSTMOYIPT
+# 97021 Nbr ligne -1
+For I=0 To VALEUR-1
+ [M]CSTMOYTOT+=[M]CSTTOTIDV(I)
+ [M]CSTMOYIPT+=[M]CSTIPTIDV(I)
+Next
+Affzo[M]CSTMOYTOT,CSTMOYIPT
+
+If dim([M]CSTMOYTOT2)>=0
+ Raz[M]CSTMOYTOT2
+ Raz[M]CSTMOYIPT2
+ # FQ70982 - MABON 24/01/11 - Gestion des arrondis
+# 97021 Nbr ligne -1
+ For I=0 To VALEUR-1
+  [M]CSTMOYTOT2+=[M]CSTTOTCLL(I)
+  If [M]CSTTOTCLL(I)=0 Then
+    [M]CSTMOYTOT2+=arr([M]CSTTOTIDV(I)*[M]NBRPRTSTD,0.01)
+  Endif
+  [M]CSTMOYIPT2+=[M]CSTIPTCLL(I)
+  If [M]CSTIPTCLL(I)=0 Then
+    [M]CSTMOYIPT2+=arr([M]CSTIPTIDV(I)*[M]NBRPRTSTD,0.01)
+  Endif
+ Next
+# [M]CSTMOYTOT2=arr([M]CSTMOYTOT*[M]NBRPRTSTD,0.01)
+# [M]CSTMOYIPT2=arr([M]CSTMOYIPT*[M]NBRPRTSTD,0.01)
+ # Fin MABON
+ Affzo[M]CSTMOYTOT2,CSTMOYIPT2
+Endif
+End
+
+##############################
+#Récup du minimum garanti dans les valeurs de variables de paie
+Subprog RECUP_MG(SOCIETE, SITE, MATRI,DATMAT,VALEUR)
+Value Char SOCIETE()
+Value Char SITE()
+Value Char MATRI()
+Value Date DATMAT ()
+Variable Decimal VALEUR
+
+VALEUR=0
+If DATMAT=[0/0/0] : DATMAT=date$ : Endif
+
+If GPAYE Then
+  If clalev([F:VLA])=0  : Local File VALEUR     [VLA] : Endif
+  If clalev([F:VFD])=0  : Local File VALFDR     [VFD] : Endif
+  If clalev([F:VCP])=0  : Local File VALCPY     [VCP] : Endif
+  If clalev([F:VFC])=0  : Local File VALFCY     [VFC] : Endif
+  If clalev([F:VEP])=0  : Local File VALEMP     [VEP] : Endif
+  If clalev([F:FCY])=0  : Local File FACILITY   [FCY] : Endif
+
+  Local Char CODMG (GLONVRA), CTR(GLONHRCTR)
+
+  VALEUR=0
+  If DATMAT=[0/0/0] : DATMAT=date$ : Endif
+
+  Call PARAM(GCURLEG,"CODMG",CODMG) From ADOVAL
+  If CODMG="" :  End : Endif
+
+  ## Valeurs salarié
+  If MATRI<>""
+   Filter [VEP] Where EMP=MATRI & PYRDAT<=DATMAT
+   Read [VEP]VEP0 Last
+   Filter [VEP]
+   If !fstat
+    Read[VLA]VLA0=4;"";"";"";[F:VEP]EMP;[F:VEP]PYRDAT;CODMG
+    If !fstat : VALEUR=[VLA]VARVAL : Endif
+   Endif
+   If VALEUR<>0 : End : Endif
+   # Recup du site en fonction du matricule...
+   Gosub OUVRE From WPDEFTABLE
+   CTR = [F:VEP]CTRNUM
+   Gosub LECEMP From WPDEFTABLE
+   SITE =[F:HRCTR]ETRFCY
+  Endif
+
+   ## Valeurs site
+  If SITE<>""
+   Filter [VFC] Where FCY=SITE & DAT<=DATMAT
+   Read [VFC]VFC0 Last
+   Filter [VFC]
+   If !fstat
+    Read[VLA]VLA0=3;"";"";[F:VFC]FCY;"";[F:VFC]DAT;CODMG
+    If !fstat : VALEUR=[VLA]VARVAL : Endif
+   Endif
+   If VALEUR<>0 : End : Endif
+   # Recup du société en fonction du site...
+   Call LECTURE("FCY",SITE,"") From CONTOBJ
+   SOCIETE =[F:FCY]LEGCPY
+  Endif
+
+  If SOCIETE<>""
+   ## Valeurs société
+   Filter [VCP] Where CPY=SOCIETE & DAT<=DATMAT
+   Read [VCP]VCP0 Last
+   Filter [VCP]
+   If !fstat
+    Read[VLA]VLA0=2;"";[F:VCP]CPY;"";"";[F:VCP]DAT;CODMG
+    If !fstat : VALEUR=[VLA]VARVAL : Endif
+   Endif
+   If VALEUR<>0 : End : Endif
+  Endif
+
+  ## Valeurs dossier
+  Filter [VFD] Where DAT<=DATMAT
+  Read [VFD]VFD0 Last
+  Filter [VFD]
+  If !fstat
+   Read[VLA]VLA0=1;[F:VFD]LEG;"";"";"";[F:VFD]DAT;CODMG
+   If !fstat : VALEUR=[VLA]VARVAL : Endif
+  Endif
+Endif
+End
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+####################################
+# X3PEOP-3477
+Subprog C_ORGFIN(VALEUR)
+Variable Char    VALEUR()
+
+# On teste l'unicité de la ligne sur les zones : TYPCRG/TYPFIN/ORGFIN
+# X3PEOP-3477
+# Idem SUBSTG
+
+Gosub DECLARE_PROCESS_LINE
+Local Integer I, OK
+OK = 1
+For I=0 To nolign-2
+ If [M]TYPCRG(I)=[M]TYPCRG(nolign-1) & [M]TYPFIN(I)=[M]TYPFIN(nolign-1) & [M]ORGFIN(I)=VALEUR
+  OK = 0 : Break
+ Endif
+Next
+If OK=1
+ For I=nolign To VAL_NBLIG-1
+  If [M]TYPCRG(I)=[M]TYPCRG(nolign-1) & [M]TYPFIN(I)=[M]TYPFIN(nolign-1) & [M]ORGFIN(I)=VALEUR
+   OK = 0 : Break
+  Endif
+ Next
+Endif
+If OK=0
+ # Ligne de coût déjà existante en ligne xx
+ GMESSAGE = mess(84,10717,1)-num$(I+1)
+ mkstat = 2 : End
+Endif
+
+# SBA X3PEOP-3476
+If [M]TCRCOD<>"" and (VALEUR<>[M]ORGFIN(nolign-1) or [M]FLGCHG(nolign-1)=1 )# test to see if ok or adpat
+  Read [F:HRTCR]HRTCR1=[M]TCRCOD;[M]TYPCRG(nolign-1);[M]TYPFIN(nolign-1);VALEUR
+  If !fstat
+    For I=0 To VAL_NBLIG-1
+      If !(I= nolign-1 or [M]LNKREP(nolign-1)+"D"=[M]LNKREP(I))
+        If [M]TYPCRG(I)=[M]TYPCRG(nolign-1) & [M]TYPFIN(I)=[M]TYPFIN(nolign-1) & [M]ORGFIN(I)=[F:HRTCR]ORGFIN2
+          OK = 0 : Break
+        Endif
+      Endif
+    Next
+   Endif
+Endif
+
+If !OK
+  GMESSAGE = [F:HRTCR]ORGFIN2-":"- mess(84,10717,1)-num$(I+1)
+  mkstat = 2 : End
+Elsif (VALEUR=[M]ORGFIN(nolign-1) and [M]FLGCHG(nolign-1)=1)
+  # forced creation
+  Call AM_ORGFIN(VALEUR)
+  [M]FLGCHG(nolign-1)=0
+Endif
+End
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+#$TCR_ORGFIN
+# X3PEOP-3477
+# TODO Idem SUBSTG
+# = Subprog AM_ORGFIN(VALEUR)
+Subprog AM_ORGFIN(VALEUR)
+Variable Char    VALEUR()
+Local Char W_ACT(1)
+Gosub DECLARE_PROCESS_LINE
+If [M]LNKREP(LIN)<>""
+  LINREF=LIN+1
+  Gosub DELETE_LINEREP
+   W_ACT="D"
+   [M]LNKREP(LIN)=""
+Endif
+
+If [M]TCRCOD<>""
+  Read [F:HRTCR]HRTCR1=[M]TCRCOD;[M]TYPCRG(LIN);[M]TYPFIN(LIN);VALEUR
+  If!fstat
+    W_ACT="C"
+    LINREF=LIN+1
+    Gosub CREATE_LINEREP
+    Raz  [M]CSTIPTIDV(LIN),[M]CSTIPTCLL(LIN),[M]CSTTOTCLL(LIN),[M]CSTTOTIDV(LIN)
+  Endif
+Endif
+
+[M]WLNKTYPACT=W_ACT
+[M]ORGFIN(LIN)=VALEUR
+# local car sur le masque
+Gosub STYLE
+Gosub AFFZO_BLOCCOUT From =W_NOMPRG
+End
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# X3PEOP-3477
+Subprog AM_CSTIPTIDV(VALEUR)
+Variable Decimal VALEUR
+
+Gosub IS_DISTRIB
+
+If IS_DISTRIB & ![M]WVALCTL
+  Gosub CALC_DISTRIB
+  [M]CSTIPTIDV(LIN+1)=VAL2
+  Affzo [M]CSTIPTIDV(LIN+1)
+  VALEUR=VAL1
+Endif
+End
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+# Declaration variable
+# W_NOMPRG = non du traitement appelant
+$DECLARE_PROCESS_LINE
+Local Char W_ACTLINE(10)
+Local Char W_STYLE(10)
+Local Integer LINREF
+Local Char W_CIBLE(30)
+Local Char W_NOMPRG(200)
+Gosub GET_NOLIGN
+###
+### [M]WTRTCOU
+###
+If dim([M]WTRTCOU)<>-1
+  W_NOMPRG=[M]WTRTCOU
+  Gosub GET_NAMBAS From =W_NOMPRG
+  Gosub GET_VALNBLIGN
+  W_CIBLE=WMANBAS+"(LINREF)"
+Endif
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$GET_VALNBLIGN
+Local Integer VAL_NBLIG
+VAL_NBLIG=evalue(WMANBAS)
+
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$GET_NOLIGN
+Local Integer LIN
+LIN=nolign-1
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$GRISE_LINE
+W_ACTLINE="GRIZO"
+Gosub CHANGE_STYLE_LINE
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$PROCESS_LINE
+For WNAME="TYPCRG","TYPFIN","ORGFIN","CSTTOTCLL","CSTTOTIDV","CSTIPTCLL","CSTIPTIDV","LNKREP"
+  Case W_ACTLINE
+    When "GRIZO"    : Diszo="[M]"+WNAME+'('+num$(LINREF)+')'
+    When "ACTZO"    : Actzo="[M]"+WNAME+'('+num$(LINREF)+')'
+    When "SAVE"     : Assign "[M]W"+WNAME With evalue("[M]"+WNAME+"("+num$(LINREF)+")")
+    When "REST"     : Assign "[M]"+WNAME+"("+num$(LINREF)+")" With evalue("[M]W"+WNAME)
+  Endcase
+Next
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+####################################
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$CHANGE_STYLE_LINE
+ W_STYLE=""
+If W_ACTLINE="GRIZO" : W_STYLE="PLAGE" : Endif
+Gosub PROCESS_LINE
+
+Chgstl =W_CIBLE With W_STYLE
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+#######################################
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+# Call when enter in a line
+$SAVE_LINE
+W_ACTLINE="SAVE"
+Gosub PROCESS_LINE
+
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+#######################################
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$DELETE_LINEREP
+  W_ACTLINE="ACTZO"
+  Gosub CHANGE_STYLE_LINE
+  Gosub DELETE_LINE
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+$ACTIVE_LINE
+  W_ACTLINE="ACTZO"
+  Gosub CHANGE_STYLE_LINE
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+$DELETE_LINE
+ Gosub DELETE_LINE From =W_NOMPRG
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+#######################################
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$CREATE_LINEREP
+  Gosub ADD_NEWLINE  From =W_NOMPRG
+  Gosub SET_REPART_BASE
+  Gosub GRISE_LINE
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+#######################################
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$RESTORE_LINEREP
+Gosub ADD_NEWLINE From =W_NOMPRG
+LINREF+=1
+Gosub RESTORE_LINE
+Gosub GRISE_LINE
+
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#######################################
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+# Call with echapp
+$RESTORE_LINE
+W_ACTLINE="REST"
+Gosub PROCESS_LINE
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+#######################################
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$SET_REPART_BASE
+Local Char TIMESTP(20)
+TIMESTP=timestamp$
+[M]TYPCRG (LINREF)=[F:HRTCR]TYPCRG
+[M]TYPFIN  (LINREF)=[F:HRTCR]TYPFIN
+[M]ORGFIN(LINREF)=[F:HRTCR]ORGFIN2
+[M]LNKREP(LINREF)=TIMESTP+"D"
+[M]LNKREP(LINREF-1)=TIMESTP
+
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$IS_DISTRIB
+
+Local Integer IS_DISTRIB
+Local Integer IS_COL
+Local Integer NB_COL,W_NBRDAY,W_NBRNIGHT
+Local Decimal W_NBRHOUR
+Local Decimal RESULT(0..1)
+Local Decimal CSTDISTUNIT, VALCUMUL
+Local Decimal VALCUMULCLL, VALCUMULIDV
+Local Decimal VALINI,VAL1,VAL2
+Local Char W_TCHEMP(GLONTRN)
+Local Char W_CTRNUM(GLONCTR)
+Local Date W_ENDDAT
+
+Gosub DECLARE_PROCESS_LINE
+If GFONCTION <>"GESPLF"
+  Gosub SET_PARAMSCALCUL From =W_NOMPRG
+  VALINI=VALEUR
+  IS_DISTRIB= dim([M]TCRCOD)<>-1 and [M]TCRCOD<>"" and dim([M]LNKREP)<>-1 and [M]LNKREP(LIN)<>""
+Endif
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$CALC_DISTRIB
+VALIINI=VALEUR
+CSTDISTUNIT=VALEUR
+If IS_COL
+# non generic .
+  CSTDISTUNIT=VALEUR/NB_COL
+Endif
+Call  CALCULATE([M]TCRCOD,[M]TYPCRG(LIN),[M]TYPFIN(LIN),[M]ORGFIN(LIN),[L]W_NBRHOUR,[L]W_NBRNIGHT,CSTDISTUNIT,RESULT) From SUBHRTCR
+VAL1=arr(RESULT(0),0.01)
+VAL2=arr(RESULT(1),0.01)
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$GET_CUMUL_CSTTOTCLL
+VALCUMULCLL=[M]CSTTOTCLL(LIN)
+If IS_DISTRIB : VALCUMULCLL+=[M]CSTTOTCLL(LIN+1) : Endif
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$GET_CUMUL_CSTTOTIDV
+VALCUMULIDV=[M]CSTTOTIDV(LIN)
+If IS_DISTRIB : VALCUMULIDV+=[M]CSTTOTIDV(LIN+1) : Endif
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$GET_CUMUL_CSTIPTCLL
+VALCUMULCLL=[M]CSTIPTCLL(LIN)
+If IS_DISTRIB : VALCUMULCLL+=[M]CSTIPTCLL(LIN+1) : Endif
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$GET_CUMUL_CSTIPTIDV
+VALCUMULIDV=[M]CSTIPTIDV(LIN)
+If IS_DISTRIB : VALCUMULIDV+=[M]CSTIPTIDV(LIN+1) : Endif
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# X3PEOP-3477
+$STYLE
+Gosub DECLARE_PROCESS_LINE
+Chgstl  =WMANBAS With ""
+Actzo =WMANBAS
+If dim([M]LNKREP)<>-1
+#  Local Integer LINREF
+  For LINREF=1 To VAL_NBLIG-1
+    If [M]LNKREP(LINREF)<>"" and right$([M]LNKREP(LINREF),len([M]LNKREP(LINREF)))="D"
+      W_CIBLE=WMANBAS+"(LINREF)"
+      Gosub GRISE_LINE
+    Else
+      Gosub ACTIVE_LINE
+    Endif
+  Next
+Endif
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+Funprog FORCE_AM(VALEUR)
+Value Decimal VALEUR
+Local Integer RES
+RES=(VALEUR<>0 and VALEUR=[M]WVALINI)
+End RES
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+$COUTS_IND
+#  X3PEOP-3477
+#  idem SUBSTG
+Gosub DECLARE_PROCESS_LINE
+Local Decimal VALTEMP
+FLGMOD=0
+For nolign=1 To VAL_NBLIG
+  If right$([M]LNKREP(nolign-1),len([M]LNKREP(nolign-1)))<>"D"
+    VALTEMP=[M]CSTTOTCLL(nolign-1)
+    If [M]LNKREP(nolign-1)<>""
+      VALTEMP+=[M]CSTTOTCLL(nolign)
+    Endif
+    If VALTEMP<>0
+      Call AM_CSTTOTCLL(VALTEMP)
+      [M]CSTTOTCLL(nolign-1)=VALTEMP
+      FLGMOD=1
+    Endif
+
+   VALTEMP=[M]CSTIPTCLL(nolign-1)
+    If [M]LNKREP(nolign-1)<>""
+      VALTEMP+=[M]CSTIPTCLL(nolign)
+    Endif
+    If VALTEMP<>0
+      Call AM_CSTIPTCLL(VALTEMP)
+      [M]CSTIPTCLL(nolign-1)=VALTEMP
+      FLGMOD=1
+    Endif
+  Endif
+Next
+
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+# chg nb night. could be an impact on repartition.
+$COUTS_DISTRIB
+Gosub DECLARE_PROCESS_LINE
+Local Decimal VALTEMP
+FLGMOD=0
+For nolign=1 To VAL_NBLIG
+  If [M]LNKREP(nolign-1)<>"" and right$([M]LNKREP(nolign-1),len([M]LNKREP(nolign-1)))<>"D"
+    VALTEMP=[M]CSTTOTCLL(nolign-1)+[M]CSTTOTCLL(nolign)
+    If VALTEMP<>0
+      Call AM_CSTTOTCLL(VALTEMP)
+      [M]CSTTOTCLL(nolign-1)=VALTEMP
+      FLGMOD=1
+    Else
+      VALTEMP=[M]CSTTOTIDV(nolign-1)+[M]CSTTOTIDV(nolign)
+      If VALTEMP<>0
+        Call AM_CSTTOTIDV(VALTEMP)
+#        Call AFTER_CSTTOTIDV(VALEUR,W_NBRDAY,W_NBRHOU)
+        [M]CSTTOTIDV(nolign-1)=VALTEMP
+      Endif
+    Endif
+
+   VALTEMP=[M]CSTIPTCLL(nolign-1)+[M]CSTIPTCLL(nolign)
+    If VALTEMP<>0
+      Call AM_CSTIPTCLL(VALTEMP)
+      [M]CSTIPTCLL(nolign-1)=VALTEMP
+      FLGMOD=1
+    Else
+      VALTEMP=[M]CSTIPTIDV(nolign-1)+[M]CSTIPTIDV(nolign)
+      If VALTEMP<>0
+#        Call AFTER_CSTIPTIDV(VALEUR,W_NBRDAY,W_NBRHOU)
+        Call AM_CSTIPTIDV(VALTEMP)
+        [M]CSTIPTIDV(nolign-1)=VALTEMP
+        FLGMOD=1
+      Endif
+    Endif
+  Endif
+Next
+
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+Subprog AVANT_LIGNETABLE()
+Gosub DECLARE_PROCESS_LINE
+Gosub EFFZO_BLOCTECH From =W_NOMPRG
+[M]WLNKTYPACT=""
+If([M]LNKREP(LIN))<>"" and [M]LNKREP(LIN)+"D"=[M]LNKREP(LIN+1)
+  LINREF=LIN+1
+  Gosub SAVE_LINE
+  [M]WLNKTYPACT="C"
+Endif
+[M]FLGCHG(LIN)=0
+Gosub AFFZO_BLOCTECH From =W_NOMPRG
+End
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+Subprog APRES_LIGNETABLE()
+Gosub DECLARE_PROCESS_LINE
+If status=6
+  If [M]WLNKTYPACT="C"
+    LINREF=LIN+1
+    Gosub DELETE_LINEREP
+    # case add at the last line => [M]+2
+    If VAL_NBLIG-1=LINREF
+      Gosub DELETE_LINEREP
+    Endif
+  Endif
+  If[M]WTYPCRG(0)<>""
+    LINREF=LIN
+    Gosub RESTORE_LINEREP
+  Endif
+  # Bonne place????
+  Gosub EFFZO_BLOCTECH From =W_NOMPRG
+  [M]WLNKTYPACT=""
+  Gosub STYLE
+  Gosub AFFZO_BLOCCOUT From =W_NOMPRG
+Endif
+
+# delete call CSTMOY. put in local file
+End
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+Subprog AM_TYPCRG(VALEUR)
+Variable Char    VALEUR()
+Gosub FLG_MODIF
+End
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+Subprog AM_TYPFIN(VALEUR)
+Variable Char    VALEUR()
+Gosub FLG_MODIF
+End
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34429 - START
+# SBA X3PEOP-3476
+$FLG_MODIF
+Gosub DECLARE_PROCESS_LINE
+[M]FLGCHG(LIN)=1
+Return
+#LIPET - 2017-06-22 - X3-34429 - END
+
+#LIPET - 2017-06-22 - X3-34431 - START
+Subprog AM_TCRCOD(VALEUR)
+Variable Char    VALEUR()
+#Only if code exist and change
+If [M]TCRCOD<>""
+  Local Integer OK
+  Call OUINON(mess(318,10717,1),OK) From GESECRAN  :# "Les lignes liées à la répartition seront supprimées. Souhaitez-vous continuer?"
+  If OK=2
+    Gosub DECLARE_PROCESS_LINE
+    For LINREF=VAL_NBLIG-1 To 0 Step -1
+      If dim([M]LNKREP)<>-1 and [M]LNKREP(LINREF)<>""
+        Gosub DELETE_LINEREP
+      Endif
+    Next
+   Gosub AFFZO_BLOCCOUT From =W_NOMPRG
+  Else
+      VALEUR=[M]TCRCOD
+  Endif
+Endif
+End
+#LIPET - 2017-06-22 - X3-34431 - END
+
+#LIPET - 2017-06-22 - X3-34431 - START
+$SET_VALINI
+If dim([M]WVALINI)<>-1
+  [M]WVALINI=VALEUR
+  [M]WVALCTL=0
+Endif
+Return
+#LIPET - 2017-06-22 - X3-34431 - END
+
+#LIPET - 2017-06-22 - X3-34431 - START
+# SBA X3PEOP-3476
+Subprog C_CSTTOTCLL(VALEUR)
+Variable Decimal VALEUR
+
+# SEGAY X3PEOP-112635 230117
+If dim([M]TCRCOD)<>-1 and dim([M]LNKREP)<>-1 and [M]TCRCOD<>"" and [M]LNKREP(nolign-1)=""
+   [M]CSTTOTCLL(nolign-1)=VALEUR
+   Gosub ADD_REP_COST From TRTCOUT
+Endif
+
+Gosub IS_DISTRIB
+If IS_DISTRIB
+  If func FORCE_AM(VALEUR)
+    Call AM_CSTTOTCLL(VALEUR)
+    Gosub SET_VALCTL
+  Endif
+Endif
+End
+#LIPET - 2017-06-22 - X3-34431 - END
+
+#LIPET - 2017-06-22 - X3-34431 - START
+# SBA X3PEOP-3476
+Subprog C_CSTTOTIDV(VALEUR)
+Variable Decimal VALEUR
+
+# SEGAY X3PEOP-112635 230117
+If dim([M]TCRCOD)<>-1 and dim([M]LNKREP)<>-1 and [M]TCRCOD<>"" and [M]LNKREP(nolign-1)=""
+   [M]CSTTOTIDV(nolign-1)=VALEUR
+   Gosub ADD_REP_COST From TRTCOUT
+Endif
+
+Gosub IS_DISTRIB
+If IS_DISTRIB
+  If func FORCE_AM(VALEUR)
+    Call AM_CSTTOTIDV(VALEUR)
+    Gosub SET_VALCTL
+  Endif
+Endif
+End
+#LIPET - 2017-06-22- X3-34431 - END
+
+#LIPET - 2017-06-22- X3-34431 - START
+# SBA X3PEOP-3476
+Subprog AM_CSTTOTIDV(VALEUR)
+Variable Decimal VALEUR
+
+Gosub IS_DISTRIB
+
+If IS_DISTRIB & ![M]WVALCTL
+  Gosub CALC_DISTRIB
+  [M]CSTTOTIDV(LIN+1)=VAL2
+  Affzo [M]CSTTOTIDV(LIN+1)
+  VALEUR=VAL1
+Endif
+End
+#LIPET - 2017-06-22- X3-34431 - END
+
+#LIPET - 2017-06-22- X3-34431 - START
+# SBA X3PEOP-3476
+$SET_VALCTL
+  [M]WVALCTL=1
+Return
+#LIPET - 2017-06-22- X3-34431 - END
+
+#LIPET - 2017-06-22- X3-34431 - START
+Subprog C_NBLIG()
+Gosub DECLARE_PROCESS_LINE
+If status=73 and right$([M]LNKREP(LIN),len([M]LNKREP(LIN)))="D"
+  GMESSAGE=mess(321,10717,1)
+  mkstat=2
+Endif
+If status=71
+  Gosub STYLE         : # mandotory to rigth display
+  Gosub AFFZO_BLOCCOUT From =W_NOMPRG
+Endif
+
+End
+#LIPET - 2017-06-22- X3-34431 - END
+
+#LIPET - 2017-06-22- X3-34431 - START
+Subprog DELETE_MANUAL()
+  Gosub DECLARE_PROCESS_LINE
+  LINREF=LIN
+  If([M]LNKREP(LIN))<>""
+    If right$([M]LNKREP(LIN),len([M]LNKREP(LIN)))="D"
+    # delete manual
+    LINREF=LIN-1
+    Endif
+    Gosub DELETE_LINE
+  Endif
+  Gosub DELETE_LINE
+  Gosub STYLE         : # mandotory to rigth display
+  Gosub AFFZO_BLOCCOUT From =W_NOMPRG
+
+End
+#LIPET - 2017-06-22- X3-34431 - END
+
+#LIPET - 2017-06-22- X3-34431 - START
+$GET_RECORD_REP
+If dim(IS_REP)<0 : Local Integer IS_REP : Endif
+Raz [L]IS_REP
+If clalev([F:HRTCR])=0 : Local File HRTRACSTREP     [HRTCR] : Endif
+Read [F:HRTCR]HRTCR1(2)=[L]W_TCRCOD;[L]W_TYPCRG
+If !fstat
+  [L]IS_REP=1
+Else
+  Raz [F:HRTCR]
+Endif
+
+Return
+#LIPET - 2017-06-22- X3-34431 - END
+
+#LIPET - 2017-06-22- X3-34431 - START
+# SEGAY X3PEOP-112635 230117
+$ADD_REP_COST
+Local Char W_ACT(1)
+Gosub DECLARE_PROCESS_LINE From TRTCOUT
+If [M]LNKREP(LIN)=""
+  If [M]TCRCOD<>""
+    Read [F:HRTCR]HRTCR1=[M]TCRCOD;[M]TYPCRG(LIN);[M]TYPFIN(LIN);[M]ORGFIN(LIN)
+    If!fstat
+      W_ACT="C"
+      LINREF=LIN+1
+      Gosub CREATE_LINEREP From TRTCOUT
+      Raz  [M]CSTIPTIDV(LIN),[M]CSTIPTCLL(LIN),[M]CSTTOTCLL(LIN),[M]CSTTOTIDV(LIN)
+    Endif
+  Endif
+
+  [M]WLNKTYPACT=W_ACT
+#  [M]ORGFIN(LIN)=[M]ORGFIN(LIN)
+  # local car sur le masque
+  Gosub STYLE From TRTCOUT
+  Gosub AFFZO_BLOCCOUT From =W_NOMPRG
+ Endif
+Return
+#LIPET - 2017-06-22- X3-34431 - END
+

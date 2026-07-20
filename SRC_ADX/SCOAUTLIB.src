@@ -1,0 +1,2507 @@
+#<AdxTL>@(#)10.0.0.0 $Revision$
+# Librairie de sous-programme de mises à jour automatiques (selon MFGAUTLIB) #
+##############################################################################
+# Les paramètres sont passés par le masque SCOK
+# [M:SCOK]CODMAJ     :  "C" = création     EOP/EOF
+#                       "M" = modification EOP/EOF
+#                       "A" = annulation   EOS/EOP/EOF
+#                       "R" = transformation EOS en EOP/EOF
+#                       "P" = création avec pec SOF/TWF/EOS sur article sous-traité
+#                       "S" = pec SOX sur article sous-traité
+#         CODTRS     :  mode transactionnel (0 = non, 1 = oui)
+#         SCONUM     :  numéro ordre
+#         SCILIN     :  numéro ligne
+#         STOFCY     :  site de production
+#         SCOSTA     :  statut ordre
+#         ITMREF     :  article lancé
+#         PRVQTY     :  quantité précédente
+#         EXTQTY     :  quantité prévue
+#         STRDAT     :  date début
+#         ENDDAT     :  date fin
+#         BOMALT     :  alternative de nomenclature
+#         VCRTYPORI  :  type  pièce origine
+#         VCRNUMORI  :  no    pièce origine
+#         VCRLINORI  :  ligne pièce origine
+#         VCRSEQORI  :  seq   pièce origine
+#         LOT        :  lot
+#         CODRET     :  code retour (0 = OK, 1 = Pb)
+##############################################################################
+# Différences avec les ordres relatifs aux OF dans MFGAUTLIB - GA pour mémo
+#  VCRTYP = 10           devient    VCRTYP = 36
+#  WIPTYP = 6 pour MW    devient    WIPTYP = 3  pour MS
+#  WIPTYP = 5 pour WO    devient    WIPTYP = 13 pour EO
+#  suppression de tout ce qui concerne: jalonnement, MTS (transaction OF)
+#  suppression de MFGMOD=Mode de lancement OF (complet, matières seules, opérations seules)
+#  suppression de ce qui concerne VISUGHOST (visu composants fantomes)
+#  [F:MFG]EXTQTY = somme ([F:MFI]EXTQTY) => WTOTEXTQTY = [F:SCI]EXTQTY
+#  suppression des appels à COVER From TRTWIP
+#
+#  CRE_SCM: réalise l'insertion directement dans [F:SCM], remplace CREMAT, puis GEN_MAT, FILL_MAT
+#  CRE_SCS: réalise l'insertion directement dans [F:SCS], remplace CREOPE, FILL_OPE
+##############################################################################
+#  CPTANALIN: les mises à jour ne sont faites qu'en création, valeurs par défaut pour les CCE
+##############################################################################
+# Subprog MAJ_SCO
+# Subprog SUPPRIME_SCO
+# Subprog CREATION_SCO
+# Subprog MODIFICATION_SCO
+# Subprog CONSO_SOX (PRISE_SOX + transaction)
+# Subprog PRISE_SOX
+# Subprog PRISE_EOX
+############################################################################
+# Subprog UPD_POHFCY(LVCRNUM, LVCRLIN, LPOHFCY, LRET)  Issue 85528 10/2012
+# Subprog RAZFMISCO(LVCRNUM, LVCRLIN, LRET)
+############################################################################
+
+############################################################################
+# 02/2007 dans SCOSRV CPNITMREF devient SRVITMREF                          #
+############################################################################
+
+
+#######################################################################
+# Sous programme de mise à jour d'un Ordre de sous-traitance
+#######################################################################
+Subprog MAJ_SCO
+#Global Integer  GSCOLIN
+Local  Integer  WOK
+
+# masque
+If clalev([M:ORDK])  = 0 : Local Mask ORDK       [ORDK]  : Endif
+If clalev([M:ORCK])  = 0 : Local Mask ORCK       [ORCK]  : Endif
+
+# Ouverture des tables si nécessaire
+# GA 10/2006 ajout des Local File
+# sinon pb resynchro des encours dans FUNSYNCW (ligne 1195)
+# après le commit, "ORA- Fetch out of sequence" quand on fait next
+# FQ 54554 GA 07/2009 cela pose pb pour la maj en génération de commande
+# FQ 59529 GA 11/2009 régression "ORA- Fetch out of sequence" quand on fait next FUNSYNCW(1239)
+If GPILNAV>1 & find(GNAVIG(GPILNAV-1),"FUNSYNCW")
+    Local File ORDERS   [ORD]
+    Local File SCOHEAD  [SCO]
+    Local File SCOITM   [SCI]
+    Local File SCOSRV   [SCS]
+    Local File SCOMAT   [SCM]
+Endif
+Gosub OPEN_FILES_SCO From SCOLIB
+Gosub OPEN_MTO       From MTOLINKLIB # V6 Affectations
+
+If clalev([F:ITV]) = 0 : Local File ITMMVT     [ITV] : Endif
+If clalev([F:ITP]) = 0 : Local File ITMBPS     [ITP] : Endif # FQ 69962 GA 12/2010
+If clalev([F:TBO]) = 0 : Local File TABBOMALT  [TBO] : Endif # Issue 86439 GA 12/2012
+If clalev([F:BOH]) = 0 : Local File BOM        [BOH] : Endif
+If clalev([F:BOD]) = 0 : Local File BOMD       [BOD] : Endif
+If clalev([F:FCY]) = 0 : Local File FACILITY   [FCY] : Endif
+If clalev([F:SRU]) = 0 : Local File TABSTORUL  [SRU] : Endif
+If clalev([F:ORD]) = 0 : Local File ORDERS     [ORD] : Endif
+If clalev([F:ORD1])= 0 : Local File ORDERS     [ORD1]: Endif # pour les affectations MTOLINK
+
+# récupération compteur PSC (ordre sous-traitance)
+If clalev ([F:TCA])<=0 Local File TABCOUAFF [TCA] : Endif
+Call LECTCA(6,WOK) From SUBTCA
+If WOK=0 : Call ERREUR(mess(58,105,1)-mess(6,14,1)-":"-mess(250,199,1)) From GESECRAN : End : Endif
+# Issue 83183 GA 06/2012 don't replace GCODNUM used by GESPOH
+Local Integer SAVMANCOU : SAVMANCOU=GMANCOU
+Local Char    SAVCODNUM(GLONANM) : SAVCODNUM=GCODNUM
+GMANCOU=[F:TCA]MANCOU(14) : GCODNUM=[F:TCA]CODNUM(14)  # compteur PEO (ordre sous-traitance) position 15 ou indice 14
+
+[M:SCOK]CODRET = 0
+Case [M:SCOK]CODMAJ
+    When "C","P": Call CREATION_SCO          # création
+    When "M":     Call MODIFICATION_SCO      # modification
+    When "A":     Call SUPPRIME_SCO          # suppression
+    When "R":     Call LANCEMENT_SUG         # confirmation suggestion remplacé par CODMAJ="P"
+    When "D":     Call LANCEMENT_SUG         # diminution suggestion   remplacé par CODMAJ="P"
+    When "S":     Call CONSO_SOX             # pec commande vente
+Endcase
+# Issue 83183 GA 06/2012
+GMANCOU=SAVMANCOU
+GCODNUM=SAVCODNUM
+End
+
+#######################################################################
+# Sous programme de suppression d'un Ordre de sous-traitance
+#######################################################################
+Subprog SUPPRIME_SCO
+Local Integer  STA : STA=0
+Local Integer  WRET : WRET=0
+
+$SUP1
+GOK  = 1
+Local Integer WSCOTRBEGIN
+Raz WSCOTRBEGIN
+# Si pas de transaction en cours
+If adxlog<>1
+   GOK=1
+   Call DEBTRANS From GLOCK
+   Trbegin [SCO],[SCI],[SCM],[SCS]
+   WSCOTRBEGIN=1
+Endif
+$TR_SUP_SCO
+#
+Case [M:SCOK]SCOSTA
+    When 1,2:    Gosub SUP_SCO_FP
+    When 3:      Gosub SUP_SCO_S
+Endcase
+#
+Goto END_SUP
+#
+
+#########################################################################
+# suppression des ordres de sous-traitance fermes et planifiés
+#########################################################################
+$SUP_SCO_FP
+# lecture entête Ordre de sous-traitance
+Readlock [SCO]SCO0=[M:SCOK]SCONUM
+If fstat : GOK=0 : Call RSTA("SCO","SCO0") From GLOCK : Goto AB_SUP : Endif
+
+If left$([F:SCO]SCOTEX,3)="SCO"
+   Call SUP_CLOB([F:SCO]SCOTEX,WRET) From TRTX3TEX
+Endif
+
+# boucle de suppression des matières
+For [F:SCM]SCM0 Where SCONUM=[M:SCOK]SCONUM
+    Readlock [SCM] Curr
+    If fstat=1 & !GSERVEUR : Goto ROLL_SUP : Endif
+    If fstat : GOK=0 : Call RSTA("SCM","SCM0") From GLOCK : Goto AB_SUP : Endif
+
+    If left$([F:SCM]SCMTEX,3)="SCM"           # FQ 65646 avant [F:SCO]SCOTEX
+       Call SUP_CLOB([F:SCM]SCMTEX,WRET) From TRTX3TEX
+    Endif
+
+    # suppression affectations
+    Gosub SUP_MTO_SCM From SCOMTOLIB
+
+    # suppression encours MSx et des ALLocations
+    Call UPDATE_MSX("A",1) From SCOLIB
+
+    #----- Suppression des comptes et sections de la ligne de document -----# Ajout Issue 87818 GA 04/2013
+    Call UPDATE_SCM_CPTANALIN ("A",0) From SCOCPTLIB
+
+    # suppression matière
+    Delete [SCM]SCM0=[F:SCM]SCONUM;[F:SCM]SCILIN;[F:SCM]SCMLIN
+Next
+
+# boucle de suppression des opérations
+# NB: il n'y en a qu'une dans un premier temps ....
+For [F:SCS]SCS0 Where SCONUM=[M:SCOK]SCONUM
+    Readlock [SCS] Curr
+    If fstat=1 & !GSERVEUR : Goto ROLL_SUP : Endif
+    If fstat : GOK=0 : Call RSTA("SCS","SCS0") From GLOCK : Goto AB_SUP : Endif
+
+    If left$([F:SCS]SCSTEX,3)="SCS"
+       Call SUP_CLOB([F:SCS]SCSTEX,WRET) From TRTX3TEX
+    Endif
+
+    # suppression encours sous-traitance
+    Call UPDATE_SCX("A") From SCOLIB
+
+    #----- Suppression des comptes et sections de la ligne de document -----# Ajout Issue 87818 GA 04/2013
+    Call UPDATE_SCS_CPTANALIN ("A") From SCOCPTLIB
+
+    # suppression opération de sous-traitance
+    Delete [SCS]SCS0=[F:SCS]SCONUM;[F:SCS]SCILIN;[F:SCS]SCSLIN
+Next
+
+# boucle de suppression des articles lancés
+# NB: il n'y en a qu'un dans un premier temps ....
+For [SCI]SCI0 Where SCONUM=[M:SCOK]SCONUM
+    Readlock [SCI] Curr
+    If fstat=1 & !GSERVEUR : Goto ROLL_SUP : Endif
+    If fstat : GOK=0 : Call RSTA("SCI","SCI0") From GLOCK : Goto AB_SUP : Endif
+
+    # suppression affectations
+    Gosub SUP_MTO_SCI From SCOMTOLIB
+
+    # suppression encours EOx
+    Call UPDATE_EOX("A") From SCOLIB
+
+    #----- Suppression des comptes et sections de la ligne de document -----# Ajout Issue 87818 GA 04/2013
+    Call UPDATE_SCS_CPTANALIN ("A") From SCOCPTLIB
+
+    # suppression article lancé
+    Delete [SCI]SCI0=[F:SCI]SCONUM;[F:SCI]SCILIN
+Next
+
+# annulation entête
+Delete [SCO]SCO0=[M:SCOK]SCONUM
+
+Return
+#
+
+#########################################################################
+# suppression des besoins de sous-traitance suggérés EOS (VCRTYP = 11)
+#########################################################################
+$SUP_SCO_S
+# Issue 79916 GA 02/2012 - code review - MFGAUTLIB
+Local Char WCRIT(255)
+
+If find([M:SCOK]WIPTYP,7,8)
+     WCRIT = "VCRTYP = 11 & VCRNUM=[M:SCOK]SCONUM & WIPSTA = 3"
+Else
+   # Issue 86867 GA 12/2012 avant [M:SCOK]POHFCY, non renseigné par FUNDBENCH
+     WCRIT = "STOFCY=[M:SCOK]STOFCY & VCRTYP = 11 & VCRNUM=[M:SCOK]SCONUM & WIPSTA = 3"
+Endif
+For [ORD]ORD3 Where evalue (WCRIT)
+    Readlock [ORD]  Curr
+    If fstat=1 & !GSERVEUR : Goto ROLL_SUP : Endif
+    If fstat : GOK=0 : Call RSTA("ORD","ORD0") From GLOCK : Goto AB_SUP : Endif
+    If [F:ORD]WIPTYP = 13
+        WFCY = [F:ORD]STOFCY
+    Endif
+    If GTRACE<>""
+       Call ECR_TRACE("Deleting ORD"-[F:ORD]WIPNUM-mess([F:ORD]WIPTYP,341,1)+mess([F:ORD]WIPSTA,342,1),0) From GESECRAN
+    Endif
+    Delete [ORD]
+Next
+
+Return
+#
+
+#########################################################################
+$END_SUP
+# Si on a ouvert une transaction
+If WSCOTRBEGIN=1
+   Commit
+   Raz WSCOTRBEGIN
+Endif
+End
+
+#########################################################################
+$AB_SUP
+[M:SCOK]CODRET=1
+# Si on a ouvert une transaction
+If WSCOTRBEGIN=1
+   Rollback   : # pour fermer la transaction
+   Raz WSCOTRBEGIN
+Endif
+Gosub AB_TRANSACTION_MSG
+End
+
+#########################################################################
+$ROLL_SUP
+# Si on a ouvert une transaction
+If WSCOTRBEGIN=1
+   Rollback
+   Raz WSCOTRBEGIN
+Endif
+End
+
+#######################################################################
+# Sous programme de modification d'un Ordre de sous-traitance
+#######################################################################
+Subprog MODIFICATION_SCO
+Local    Integer  STA : STA=0
+Local    Integer  MEMSTA
+Local    Integer  WMSG
+Local    Integer  WRET : WRET=0
+Local    Integer  WOK  : WOK=2
+Local    Char     WMSGA(80)
+Local    Char     WMSGB(80)
+Local    Integer  WOLDSTA
+Local    Char     WOLDBPR(GLONBPR)     # FQ 75630 GA 09/2011
+Local    Char     WBPRNUM(GLONBPR): WBPRNUM=[M:SCOK]BPRNUM # Issue 88337
+Local    Char     WITMREF(GLONITM)                         # Issue 88337
+# Issue 113887 - 2016-02-12 by SR
+Local   Char      WOLD_POHFCY(GLONFCY), WOLD_PRHFCY(GLONFCY)
+
+$MOD1
+WLOAD = 0
+GOK  = 1
+# si on passe en modif uniquement pour resynchroniser l'encours
+If [M:SCOK]SYNCHRO <> 2
+    If GSCOPTRNUM = "" : GOK = 0 : Goto AB_MOD : Endif
+    If [F:PTR]PTRTYP <> 9 | [F:PTR]TRSAUTO <> 2
+        Read [PTR]PTR0=9;GSCOPTRNUM
+        If fstat <> 0 : GOK=0 : Call FSTA("PTR") From GLOCK : Goto AB_MOD : Endif
+    Endif
+Endif
+# Issue 86437 GA 12/2012
+Gosub CTRL_FCY
+If WOK<>2 : GOK = -1 : End : Endif
+
+# Si pas de transaction en cours
+Local Integer WSCOTRBEGIN
+Raz WSCOTRBEGIN
+If adxlog<>1 & [M:SCOK]CODTRS <> 0
+   GOK=1
+   Call DEBTRANS From GLOCK
+   #Trbegin [SCO],[SCI],[SCM],[SCS]
+   Trbegin ADOVAL
+   WSCOTRBEGIN=1
+Endif
+$TR_MOD_SCO
+#
+Case [M:SCOK]SCOSTA
+    When 1,2:    Goto MOD_SCO_FP
+    When 3:      Goto MOD_SCO_S
+Endcase
+End
+# Issue 92063 GA 09/2013 si on arrive depuis "Plan de travail" avec un EOS
+#########################################################################
+# modification des suggestions de sous-traitance
+#########################################################################
+$MOD_SCO_S
+GOK  = 1
+
+Raz [M:ORDK]
+
+Read [ORD]ORD0 = [M:SCOK]WIPTYP;[M:SCOK]WIPNUM;[M:SCOK]ITMREF
+If fstat
+    GOK = 0
+    WCLE = num$([M:SCOK]WIPTYP)-[M:SCOK]WIPNUM-[M:SCOK]ITMREF
+    Call RSTA ("ORD", WCLE)From GLOCK
+    Goto AB_MOD
+Endif
+
+[M:ORDK]MAJCOD     = "M"
+[M:ORDK]           = [F:ORD]
+
+[M:ORDK]EXTQTY     = [M:SCOK]EXTQTY
+[M:ORDK]STRDAT     = [M:SCOK]STRDAT
+[M:ORDK]ENDDAT     = [M:SCOK]ENDDAT
+Call WIP From TRTWIP
+If GOK<>1 Goto AB_MOD Endif
+
+If [F:BTS]TRACE=2
+    Call OUVRE_TRACE(mess(229,197,1)) From LECFIC
+    MESS1 = mess(641,197,1)- mess([M:SCOK]WIPSTA,317,1)-[M:SCOK]SCONUM-mess(232,197,1)
+    Call ECR_TRACE(MESS1,0) From GESECRAN
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+Endif
+Raz [M:SCOK]
+
+Goto END_MOD
+
+
+$MOD_SCO_FP
+#########################################################################
+# modification des ordres de sous-traitance fermes et planifiés
+#########################################################################
+# Issue 107513/US10 by GA 08/2015 + case different version
+Local Shortint WECCSAIFLG : WECCSAIFLG=0
+
+# lecture entête Ordre de sous-traitance
+Readlock [SCO]SCO0=[M:SCOK]SCONUM
+If fstat : GOK=0 : Call RSTA("SCO","SCO0") From GLOCK : Goto AB_MOD : Endif
+
+WOLDSTA = [F:SCO]SCOSTA
+WOLDBPR = [F:SCO]BPRNUM   : # changt fournisseur
+# Issue 113887 - 2016-02-12 by SR
+WOLD_POHFCY = [F:SCO]POHFCY
+
+If [M:SCOK]BPRNUM<>"" & WOLDBPR<>[M:SCOK]BPRNUM  # Issue 93771 GA 11/2013
+    Local Char MESS1(250) # Changement de fournisseur impossible pour cet ordre de sous-traitance.
+    MESS1 = WOLDBPR-":"-mess(461,194,1)-[M:SCOK]SCONUM
+    Call ECR_TRACE(MESS1,1) From GESECRAN
+    GOK=-1 : Goto AB_MOD
+Endif
+
+# GA à faire en 1er sinon il manque des données pour les UPDATE_ssX des encours
+Call UPD_SCO_FROM_SCOK
+
+# lock article lancé
+Readlock [SCI]SCI0=[M:SCOK]SCONUM;[M:SCOK]SCILIN
+If fstat : GOK=0 : Call RSTA("SCI","SCI0") From GLOCK : Goto AB_MOD : Endif
+
+# Issue 113887 - 2016-02-12 by SR
+WOLD_PRHFCY = [F:SCI]PRHFCY
+
+# Issue 96725 GA 02/2014 contrôle trop contraignant: changement PRHADD autorisé
+# Issue 94215 & 88046 GA 12/2013
+# Changement de site/adresse de réception impossible pour cet ordre de sous-traitance.
+If  ([M:SCOK]PRHFCY<>"" & [F:SCI]PRHFCY<>[M:SCOK]PRHFCY)
+#& | ([M:SCOK]PRHADD<>"" & [F:SCI]PRHADD<>[M:SCOK]PRHADD)
+    Local Char MESS1(250)
+    MESS1 = mess(468,194,1)-[M:SCOK]SCONUM
+    Call ECR_TRACE(MESS1,1) From GESECRAN
+    GOK=-1 : Goto AB_MOD
+Endif
+
+# Ecart sur la quantité article lancé
+If [M:SCOK]PRVQTY = 0 [M:SCOK]PRVQTY=[F:SCI]EXTQTY Endif
+WSCOQTY = [M:SCOK]EXTQTY - [F:SCI]EXTQTY
+
+# Issue 107513/US10 by GA 08/2015 + case different version WECCSAIFLG
+# Issue X3-62806 15/11/2017 by GEBIL : ECCVALMAJ: Variable Non-existent
+# If dim([M:SCOK]ECCVALMAJ)
+If dim([M:SCOK]ECCVALMAJ) > 0
+& & ([M:SCOK]ECCVALMAJ <> [F:SCI]ECCVALMAJ & [M:SCOK]ECCVALMAJ <> ""
+&  | [M:SCOK]ECCVALMIN <> [F:SCI]ECCVALMIN & [M:SCOK]ECCVALMIN <> "")
+  If [F:SCI]SCITRKFLG>3
+   # Version is fixed by origin document $1$
+    Local Char MESS1(250)
+    MESS1 = func AFNC.MES1 (mess(643,199,1),[M:SCOK]SCONUM-mess([F:SCI]SCITRKFLG,2238,1))
+    Call ECR_TRACE(MESS1,1) From GESECRAN
+    GOK=-1 : Goto AB_MOD
+  Else
+    WECCSAIFLG = 1
+  Endif
+Endif
+
+# FQ 54554 si changt de fournisseur: à faire immédiatement
+Call UPD_SCI_FROM_SCOK
+If GOK<0 : Goto AB_MOD : Endif
+
+# rechargement de nomenclature
+# Issue 107513/US10 by GA 08/2015 + case different version WECCSAIFLG
+#If [F:SCI]BOMALT <> [M:SCOK]BOMALT : Goto RPL_SCS : Endif
+If WOLDSTA = 2 & [M:SCOK]SCOSTA = 1 & find(GEOMUPD,2,4) | WECCSAIFLG : Goto RPL_SCS : Endif
+
+# si passage de planifié à ferme et mise à niveau auto
+# GEOMUPD meme fonctionnement que GRELUPD sur les OF
+#If [F:SCO]SCOSTA = 2 & [M:SCOK]SCOSTA = 1 & find(GEOMUPD,3,4) : Goto RPL_SCS : Endif
+
+# FQ 77115 GA 12/2011 avant les SCM pour que [F:SCS]OPESTR soit correcte
+$MAJ_SCS
+# si passage de planifié à ferme et mise à niveau auto
+# GEOMUPD meme fonctionnement que GRELUPD sur les OF
+# Issue 87818 GA 04/2013 tester WOLDSTA car [F:SCO]SCOSTA a déjà été maj
+If WOLDSTA = 2 & [M:SCOK]SCOSTA = 1 & find(GEOMUPD,2,4) : Goto RPL_SCS : Endif
+
+# Issue 88261 GA 03/2013 utiliser For sinon le Next ou Break fait perdre les maj du buffer [F:SCS]
+#For [SCS]SCS0 Where SCONUM=[M:SCOK]SCONUM
+#    Readlock [SCS]  Curr
+#    If fstat=1 & !GSERVEUR : Goto ROLL_MOD : Endif
+#    If fstat : GOK=0 : Call RSTA("SCS","SCS0") From GLOCK : Goto AB_MOD : Endif
+Readlock [SCS]SCS0(2)=[M:SCOK]SCONUM;[M:SCOK]SCILIN
+If fstat : GOK=0 : Call RSTA("SCS","SCS0") From GLOCK : Goto AB_MOD : Endif
+
+# Maj des Qtés et dates
+Call UPD_SCS_FROM_SCOK
+
+# encours SCx - déplacé dans REWRITE_SCS
+# Call UPDATE_SCX("M") From SCOLIB
+
+Gosub REWRITE_SCS
+
+#Next
+# Issue 113887 - 2016-02-12 by SR : si aucun site modifié, aucune raison de modifier le site des matières
+If [F:SCO]POHFCY = WOLD_POHFCY & [F:SCI]PRHFCY = WOLD_PRHFCY
+   Raz [M:SCOK]STOFCY
+Endif
+Goto MAJ_SCM
+
+
+$RPL_SCS
+# boucle de suppression des opérations
+# NB: il n'y en a qu'une dans un premier temps ....
+# Issue 88261 GA 03/2013 Readlock direct
+#For [SCS]SCS0 Where SCONUM=[M:SCOK]SCONUM
+#    Readlock [SCS]  Curr
+#    If fstat=1 & !GSERVEUR : Goto ROLL_MOD : Endif
+#    If fstat : GOK=0 : Call RSTA("SCS","SCS0") From GLOCK : Goto AB_MOD : Endif
+Readlock [SCS]SCS0(2)=[M:SCOK]SCONUM;[M:SCOK]SCILIN
+If fstat : GOK=0 : Call RSTA("SCS","SCS0") From GLOCK : Goto AB_MOD : Endif
+
+    If left$([F:SCS]SCSTEX,3)="SCS"
+       Call SUP_CLOB([F:SCS]SCSTEX,WRET) From TRTX3TEX
+    Endif
+
+    # suppression encours sous-traitance
+    Call UPDATE_SCX("A") From SCOLIB
+
+    #----- Suppression des comptes et sections de la ligne de document -----# Ajout Issue 87818 GA 04/2013
+    Call UPDATE_SCS_CPTANALIN ("A") From SCOCPTLIB
+
+    #Delete [SCS]SCS0=[F:SCS]SCONUM;[F:SCS]SCILIN;[F:SCS]SCSLIN
+    Delete [SCS] Curr
+#Next
+
+# Issue 105251 GA 04/2015 EP to use end date instead of [M:SCOK]STRDAT to check availability of component
+# Check validity date of the link
+Local Integer WBOMDATCTL : WBOMDATCTL=2
+Local Date    WBOMDAT
+
+# Issue 110935 - 2016-04-20 by BEEBE : Deactivate EP PE_BOMDATCTL for product managed by version
+If dim(WITMREF)   <=0 : Local    Char     WITMREF   (GLONITM) : Endif
+WITMREF = [M:SCOK]ITMREF
+#----- Read [F:ITM] with WITMREF when not loaded
+If clalev([F:ITM])=0 | [F:ITM]ITMREF <> WITMREF
+    Gosub READ_ITM From ITMLIB
+Endif
+
+If dim([F:ITM]ECCFLG)<=0 | [F:ITM]ECCFLG<>2
+    Gosub PE_BOMDATCTL From SCOAUTLIB
+Endif
+# End issue 110935
+Case WBOMDATCTL
+  When 1       : WBOMDAT=[M:SCOK]ENDDAT
+  When Default : WBOMDAT=[M:SCOK]STRDAT  # standard mode
+Endcase
+If WBOMDAT=[0/0/0] WBOMDAT=date$ Endif
+
+# Issue 107513/US10 by GA 08/2015: change reference date to reload correctly the BOM
+If dim([M:SCOK]ECCVALMAJ)>0 & [M:SCOK]ECCVALMAJ<>""
+   Local Date WWDAT : WWDAT=WBOMDAT
+   # Issue 117019 - 2016-06-08 by MUARN : erreur SCOK non SCO1
+   #Call INIECCDAT([M:SCOK]ITMREF,[M:SCO1]PRHFCY,[M:SCOK]ECCVALMAJ,[M:SCOK]ECCVALMIN,3,WBOMDAT) From SCOECCLIB
+   Call INIECCDAT([M:SCOK]ITMREF,[M:SCOK]PRHFCY,[M:SCOK]ECCVALMAJ,[M:SCOK]ECCVALMIN,3,WBOMDAT) From SCOECCLIB
+   If WBOMDAT>WWDAT
+      Call CALENDDAT([F:SCI]LTI,[M:SCOK]STRDAT,[M:SCOK]ENDDAT) From SCOLIB
+   Endif
+Endif
+
+# Issue 105251 GA 04/2015 [M:SCOK]STRDAT replaced by WBOMDAT to call CRE_SCM/CRE_SCS
+# Issue 80045 GA 02/2012 + [M:SCOK]BPRNUM
+# Issue 86437 GA 12/2012 before [M:SCOK]STOFCY
+Call CRE_SCS(WBOMDAT, [M:SCOK]ITMREF,[M:SCOK]BOMALT, [M:SCOK]BPRNUM, [M:SCOK]PRHFCY,WSCOQTY, WMSG)
+If GOK=0 : Goto AB_MOD : Endif
+
+# Issue 87818 GA 03/2013 selon GEOMUPD
+# Goto RPL_SCM
+
+$MAJ_SCM
+# Issue 87818 GA 03/2013
+# si passage de planifié à ferme et mise à niveau auto
+# GEOMUPD meme fonctionnement que GRELUPD sur les OF
+# Issue 87818 GA 04/2013 tester WOLDSTA car [F:SCO]SCOSTA a déjà été maj
+# Issue 107513/US10 by GA 08/2015 + case different version WECCSAIFLG
+If WOLDSTA = 2 & [M:SCOK]SCOSTA = 1 & find(GEOMUPD,3,4) | WECCSAIFLG : Goto RPL_SCM : Endif
+
+# mise à jour des matières qui ne sont ni soldées, ni exclues
+# Issue 88261 GA 03/2013 utiliser Filter sinon le Next fait perdre les maj
+#For [SCM]SCM0 Where SCONUM = [M:SCOK]SCONUM & SCILIN = [M:SCOK]SCILIN & MATSTA<3
+#    Readlock [SCM] Curr
+Filter [F:SCM] Where SCONUM = [M:SCOK]SCONUM & SCILIN = [M:SCOK]SCILIN & MATSTA<3
+For [F:SCM] # With Lock
+#    If fstat=1 & !GSERVEUR : Goto ROLL_MOD : Endif
+#    If fstat : GOK=0 : Call RSTA("SCM","SCM0") From GLOCK : Goto AB_MOD : Endif
+
+   # Maj des Qtés et dates
+    Call UPD_SCM_FROM_SCOK
+    If GOK<1 : Break : Endif # Issue 88814 GA 05/2013
+
+    # maj encours MSx et des ALLocations - déplacé dans REWRITE_SCM
+    #Call UPDATE_MSX("M",1) From SCOLIB
+
+    Gosub REWRITE_SCM
+
+    # V6 Affectations
+    If [F:SCM]WIPSTA = 1 : Gosub MAJ_MTO_SCM From SCOMTOLIB : Endif
+Next
+Filter [F:SCM]
+If GOK=0 : Goto AB_MOD : Endif # Issue 88814 GA 05/2013
+
+Goto MAJ_SCI
+
+$RPL_SCM
+# boucle de suppression des matières
+# Issue 88261 GA 03/2013 utiliser Filter sinon le Next fait perdre les maj
+#For [SCM]SCM0 Where SCONUM = [M:SCOK]SCONUM
+#    Readlock [SCM] Curr
+Filter [F:SCM] Where SCONUM=[M:SCOK]SCONUM
+For [F:SCM] # With Lock
+#    If fstat=1 & !GSERVEUR : Goto ROLL_MOD : Endif
+#    If fstat : GOK=0 : Call RSTA("SCM","SCM0") From GLOCK : Goto AB_MOD : Endif
+
+    If left$([F:SCM]SCMTEX,3)="SCM"
+       Call SUP_CLOB([F:SCM]SCMTEX,WRET) From TRTX3TEX # FQ 65646 avant SCOTEX
+    Endif
+
+    # suppression affectations
+    Gosub SUP_MTO_SCM From SCOMTOLIB
+
+    # suppression encours MSx et des ALLocations
+    Call UPDATE_MSX("A",1) From SCOLIB
+
+    #----- Suppression des comptes et sections de la ligne de document -----# Ajout Issue 87818 GA 04/2013
+    Call UPDATE_SCM_CPTANALIN ("A",0) From SCOCPTLIB
+
+    # suppression matière
+    #Delete [SCM]SCM0=[F:SCM]SCONUM;[F:SCM]SCILIN;[F:SCM]SCMLIN
+    Delete [SCM] Curr
+Next
+Filter [F:SCM]
+
+# Issue 105251 GA 04/2015 EP to use end date instead of [M:SCOK]STRDAT to check availability of component
+# Check validity date of the link
+Local Integer WBOMDATCTL : WBOMDATCTL=2
+Local Date    WBOMDAT
+
+# Issue 110935 - 2016-04-20 by BEEBE : Deactivate EP PE_BOMDATCTL for product managed by version
+If dim(WITMREF)   <=0 : Local    Char     WITMREF   (GLONITM) : Endif
+WITMREF = [M:SCOK]ITMREF
+#----- Read [F:ITM] with WITMREF when not loaded
+If clalev([F:ITM])=0 | [F:ITM]ITMREF <> WITMREF
+    Gosub READ_ITM From ITMLIB
+Endif
+
+If dim([F:ITM]ECCFLG)<=0 | [F:ITM]ECCFLG<>2
+    Gosub PE_BOMDATCTL From SCOAUTLIB
+Endif
+# End issue 110935
+Case WBOMDATCTL
+  When 1       : WBOMDAT=[M:SCOK]ENDDAT
+  When Default : WBOMDAT=[M:SCOK]STRDAT  # standard mode
+Endcase
+If WBOMDAT=[0/0/0] WBOMDAT=date$ Endif
+
+# Issue 107513/US10 by GA 08/2015: change reference date to reload correctly the BOM
+If dim([M:SCOK]ECCVALMAJ)>0 & [M:SCOK]ECCVALMAJ<>""
+   Local Date WWDAT : WWDAT=WBOMDAT
+   # Issue 117019 - 2016-06-08 by MUARN : erreur SCOK non SCO1
+   #Call INIECCDAT([M:SCOK]ITMREF,[M:SCO1]PRHFCY,[M:SCOK]ECCVALMAJ,[M:SCOK]ECCVALMIN,3,WBOMDAT) From SCOECCLIB
+   Call INIECCDAT([M:SCOK]ITMREF,[M:SCOK]PRHFCY,[M:SCOK]ECCVALMAJ,[M:SCOK]ECCVALMIN,3,WBOMDAT) From SCOECCLIB
+   If WBOMDAT>WWDAT
+      Call CALENDDAT([F:SCI]LTI,[M:SCOK]STRDAT,[M:SCOK]ENDDAT) From SCOLIB
+   Endif
+Endif
+
+# Issue 105251 GA 04/2015 [M:SCOK]STRDAT replaced by WBOMDAT to call CRE_SCM/CRE_SCS
+# création des matières
+Call CRE_SCM([M:SCOK]STOFCY,[M:SCOK]ITMREF,[M:SCOK]BOMALT, WBOMDAT,[M:SCOK]EXTQTY,
+&            [M:SCOK]LOT, 1, WRET)
+If GOK=0 : Goto AB_MOD : Endif
+
+$MAJ_SCI
+#
+# maj encours EOx - déplacé dans REWRITE_SCI
+# Call UPDATE_EOX("M") From SCOLIB
+
+# avant MAJSCOHEAD car relecture de [F:SCI] !!!
+Gosub REWRITE_SCI
+
+# V6 Affectations
+If [F:SCI]WIPSTA=1 : Gosub MAJ_MTO_SCI From SCOMTOLIB : Endif
+
+#
+# Compléments maj de [F:SCO], [F:SCI]
+#[F:SCO]MATLINNBR,SHTMATNBR,OVRALLNBR,DETALLNBR,ALLSTA
+#[F:SCI]AVASCOQTY
+Gosub MAJSCOHEAD From SCOLIB
+#
+# point d'entrée pour récup infos avant ré-écriture de l'entête,
+# en modification d'Ordre de sous-traitance - 20142 12.03 MM
+GPOINT = "SCOLIBMAJ" : Gosub ENTREE From EXEFNC
+#
+Gosub REWRITE_SCO From SCOLIB
+#
+Goto END_MOD
+#
+
+#########################################################################
+$END_MOD
+
+# FQ 74489 GA 06/2011 déclencher alloc auto si nécessaire
+Local Shortint WOK
+# 79595 désactivation si synchro en-cours
+If [M:SCOK]SCOSTA = 1 & [M:SCOK]CODMAJ <> "A" & [M:SCOK]SYNCHRO <> 2: WOK=func SCOLIB.CTRL_ALLMGT() : Endif
+GOK=1
+
+#--------------------------------------------------#
+# v 150 Calcul automatique des coûts prévisionnels # (CPT et CPL)
+#--------------------------------------------------#
+# FQ 73195 GA 05/2011 déplacé avant la fin de transaction + changement des conditions
+#If GCLCEOCAUT = 3 & [M:SCOK]CODTRS <> 0 & [M:SCOK]SCOSTA = 1 & [M:SCOK]CODMAJ <> "A"
+If GCLCEOCAUT = 3 & [M:SCOK]SCOSTA = 1 & [M:SCOK]CODMAJ <> "A" & [M:SCOK]SYNCHRO <> 2
+    # appel direct possible car aucune saisie (compatible Web ?)
+    # charger les paramètres (! déjà déclarés)
+    If dim([L]PARAM_CLC)>1   # FQ 47987 avant PARAM, VALEUR
+      Raz PARAM_CLC,VAL_CLC
+    Else
+      Local Char PARAM_CLC(15)(1..14) , VAL_CLC(10)
+    Endif
+    # Issue 84784 - 2012-09-26 by CCC
+    #PARAM_CLC(1) = [F:SCO]POHFCY
+    If [F:SCI]SCONUM<>[F:SCO]SCONUM
+        Read [SCI]SCI0(1)=[F:SCO]SCONUM
+        [G:SCI]currlen=0
+    Endif
+    PARAM_CLC(1) = [F:SCI]PRHFCY
+    PARAM_CLC(2) = [F:SCO]SCONUM
+    PARAM_CLC(4) = "1"
+    PARAM_CLC(5) = "4"
+    PARAM_CLC(13) = "2"   # Issue 89622 - 2013-06-05 by CCC
+    Case [F:PTR]MCCIMPMOD
+         When 0, 1  : PARAM_CLC(12) = "2"
+                      PARAM_CLC(13) = "1"   # Issue 89622 - 2013-06-05 by CCC
+         When 2     : PARAM_CLC(13) = "1"   # Issue 89622 - 2013-06-05 by CCC
+         When 3     : PARAM_CLC(12) = "2"
+    Endcase
+    # positionner PARAM_CLC(12) à "2" SI ON NE VEUT PAS l'édition du calcul
+    # positionner PARAM_CLC(13) & "2" si on ne veut pas la trace
+    # si traitement multiple alors rien
+     If [F:PTR]TRSAUTO = 2
+         PARAM_CLC(12) = "2"
+         PARAM_CLC(13) = "3"   # Issue 89622 - 2013-06-05 by CCC
+     Endif
+    PARAM_CLC(14) = "36"   : # VCRTYP 36 pour EO
+    Call TRAITE_CHAR(VAL_CLC,PARAM_CLC,"","SUBSCC","",3,"") From GTRAITE
+Endif
+
+# Si on a ouvert une transaction
+If WSCOTRBEGIN=1
+   Commit
+   Raz WSCOTRBEGIN
+Endif
+
+End
+
+#########################################################################
+$AB_MOD
+[M:SCOK]CODRET=1
+# Si on a ouvert une transaction
+If dim(WSCOTRBEGIN)>0 & WSCOTRBEGIN=1
+   Rollback   : # pour fermer la transaction
+   Raz WSCOTRBEGIN
+Endif
+Gosub AB_TRANSACTION_MSG
+End
+
+#########################################################################
+$ROLL_MOD
+# Si on a ouvert une transaction
+If WSCOTRBEGIN=1
+   Rollback
+   Raz WSCOTRBEGIN
+Endif
+End
+
+#######################################################################
+# Sous programme de modification d'un Ordre de sous-traitance
+#######################################################################
+Subprog CREATION_SCO
+Local    Integer  STA : STA=0
+Local    Integer  MEMSTA
+Local    Integer  WRET, WMSG
+
+#
+$CRE1
+GOK  = 1
+Local Integer WSCOTRBEGIN
+Raz WSCOTRBEGIN
+# Si pas de transaction en cours
+If adxlog<>1
+   GOK=1
+   Call DEBTRANS From GLOCK
+   #Trbegin [SCO],[SCI],[SCM],[SCS]
+   Trbegin ADOVAL
+   WSCOTRBEGIN=1
+Endif
+$TR_CRE_SCO_FP
+#
+Case [M:SCOK]SCOSTA
+    When 1,2:    Goto CRE_SCO_FP
+    When 3:      Goto CRE_SCO_S
+Endcase
+End
+# Issue 92063 GA 09/2013 si on arrive depuis "Plan de travail" avec un EOS
+#########################################################################
+# modification des suggestions de sous-traitance
+#########################################################################
+$CRE_SCO_S
+GOK  = 1
+
+Raz [M:ORDK]
+
+Read [ORD]ORD0 = [M:SCOK]WIPTYP;[M:SCOK]WIPNUM;[M:SCOK]ITMREF
+If fstat
+    GOK = 0
+    WCLE = num$([M:SCOK]WIPTYP)-[M:SCOK]WIPNUM-[M:SCOK]ITMREF
+    Call RSTA ("ORD", WCLE)From GLOCK
+    Goto AB_CRE
+Endif
+
+[M:ORDK]MAJCOD     = "M"
+[M:ORDK]           = [F:ORD]
+
+[M:ORDK]EXTQTY     = [M:SCOK]EXTQTY
+[M:ORDK]STRDAT     = [M:SCOK]STRDAT
+[M:ORDK]ENDDAT     = [M:SCOK]ENDDAT
+Call WIP From TRTWIP
+If GOK<>1 Goto AB_CRE Endif
+
+If [F:BTS]TRACE=2
+    Call OUVRE_TRACE(mess(229,197,1)) From LECFIC
+    MESS1 = mess(641,197,1)- mess([M:SCOK]WIPSTA,317,1)-[M:SCOK]SCONUM-mess(232,197,1)
+    Call ECR_TRACE(MESS1,0) From GESECRAN
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+Endif
+Raz [M:SCOK]
+
+Goto END_CRE
+
+#########################################################################
+# création des ordres de sous-traitance fermes et planifiés
+#########################################################################
+$CRE_SCO_FP
+# préparation entête Ordre de sous-traitance
+Call CRE_SCO
+If GOK = -1 : Goto ROLL_CRE : Endif
+If GOK = 0  : Goto AB_CRE   : Endif
+
+# si contremarque, lecture SORDERP pour sections analytiques
+If [M:SCOK]CODMAJ = "P" & [M:SCOK]FMI = 5
+    If clalev([F:SOP])   = 0 : Local File SORDERP [SOP]   : Endif
+    Read [SOP]SOP0=[M:SCOK]VCRNUMORI;[M:SCOK]VCRLINORI;[M:SCOK]VCRSEQORI
+    If fstat : Raz [F:SOP] : Endif
+Endif
+# préparation article lancé
+Call CRE_SCI([M:SCOK]ITMREF,[M:SCOK]BOMALT)
+If GOK = 0 : Goto AB_CRE : Endif
+
+# Issue 105251 GA 04/2015 EP to use end date instead of [M:SCOK]STRDAT to check availability of component
+# Check validity date of the link
+Local Integer WBOMDATCTL : WBOMDATCTL=2
+Local Date    WBOMDAT
+# Issue 110935 - 2016-04-20 by BEEBE : Deactivate EP PE_BOMDATCTL for product managed by version
+If dim(WITMREF)   <=0 : Local    Char     WITMREF   (GLONITM) : Endif
+WITMREF = [M:SCOK]ITMREF
+#----- Read [F:ITM] with WITMREF when not loaded
+If clalev([F:ITM])=0 | [F:ITM]ITMREF <> WITMREF
+    Gosub READ_ITM From ITMLIB
+Endif
+
+If dim([F:ITM]ECCFLG)<=0 | [F:ITM]ECCFLG<>2
+    Gosub PE_BOMDATCTL From SCOAUTLIB
+Endif
+# End issue 110935
+Case WBOMDATCTL
+  When 1       : WBOMDAT=[M:SCOK]ENDDAT
+  When Default : WBOMDAT=[M:SCOK]STRDAT  # standard mode
+Endcase
+If WBOMDAT=[0/0/0] WBOMDAT=date$ Endif
+
+# Issue 105251 GA 04/2015 [F:SCO]ORDDAT replaced by WBOMDAT to call CRE_SCM/CRE_SCS
+# FQ 77115 GA 12/2011 avant les SCM pour que [F:SCS]OPESTR soit correcte
+# création des nouvelles opérations
+# Issue 80045 GA 02/2012 + [M:SCOK]BPRNUM
+# Issue 86437 GA 12/2012 before [M:SCOK]POHFCY
+Call CRE_SCS(WBOMDAT, [M:SCOK]ITMREF,[F:SCI]BOMALT,[M:SCOK]BPRNUM,[M:SCOK]PRHFCY,[F:SCI]EXTQTY, WMSG)
+If GOK=0 : Goto AB_CRE : Endif
+
+# Issue 105251 GA 04/2015 [F:SCO]ORDDAT replaced by WBOMDAT to call CRE_SCM/CRE_SCS
+# création des nouvelles matières
+# Issue 86437 GA 12/2012 before [M:SCOK]POHFCY
+Call CRE_SCM([M:SCOK]STOFCY,[M:SCOK]ITMREF,[F:SCI]BOMALT, WBOMDAT,[F:SCI]EXTQTY,
+&            [F:SCI]LOT, 1, WRET)
+If GOK=0 : Goto AB_CRE : Endif
+
+# avant MAJSCOHEAD car relecture de [F:SCI] !!!
+Gosub WRITE_SCI
+If GOK = 0 : Goto AB_CRE : Endif
+
+# V6 Affectations
+If [F:SCI]WIPSTA=1 Gosub MAJ_MTO_SCI From SCOMTOLIB Endif
+
+# Compléments maj de [F:SCO], [F:SCI]
+#[F:SCO]MATLINNBR,SHTMATNBR,OVRALLNBR,DETALLNBR,ALLSTA
+#[F:SCI]AVASCOQTY
+Gosub MAJSCOHEAD From SCOLIB
+
+#
+Gosub WRITE_SCO
+If GOK = 0 : Goto AB_CRE : Endif
+#
+[M:SCOK]SCONUM = [F:SCI]SCONUM
+[M:SCOK]SCILIN = 1000
+# si on est en mode "prise en compte besoin initial" SOx ou TRx ou EOS ???
+# Issue 84277 GA 10/2012 If [M:SCOK]CODMAJ = "P" & !find([M:SCOK]WIPTYP,2,3,6)
+If [M:SCOK]CODMAJ = "P" & !find([M:SCOK]WIPTYP,3,6)
+
+    # relecture éventuelle de Article et Article_site
+    Local Integer WOK
+    WOK = func ITMLIB.IS_ITF_OK([M:SCOK]ITMREF,[M:SCOK]PRHFCY)
+    If WOK<2 : Goto AB_CRE : Endif
+
+    Case [M:SCOK]WIPTYP
+       When 13 , 4 :     # Cas d'un EOS ou SCS
+       Call PRISE_EOX
+
+       When 2 :        # Cas d'une POS # Issue 84277 GA 10/2012
+       Call PRISE_POX
+
+       When 1,7,8 :    # Cas SOx ou TRx
+       Call PRISE_SOX
+
+       When Default :  # Autre (exemple WOS) # Issue 86491 GA 01/2013
+       Call PRISE_POX
+
+    Endcase
+
+Endif
+#
+Goto END_CRE
+
+#########################################################################
+$END_CRE
+
+# FQ 74489 GA 06/2011 déclencher alloc auto si nécessaire
+Local Shortint WOK
+If [M:SCOK]SCOSTA = 1 : WOK=func SCOLIB.CTRL_ALLMGT() : Endif
+
+#--------------------------------------------------#
+# v 150 Calcul automatique des coûts prévisionnels # (CPT et CPL)
+#--------------------------------------------------#
+# FQ 76166 GA 09/2011 changement des conditions (idem END_MOD pour FQ 73195)
+#If GCLCEOCAUT > 1 & [M:SCOK]CODTRS <> 0 & [M:SCOK]SCOSTA = 1
+If GCLCEOCAUT > 1 & [M:SCOK]SCOSTA = 1 & [M:SCOK]CODMAJ <> "A" & [M:SCOK]SYNCHRO <> 2
+    # appel direct possible car aucune saisie (compatible Web ?)
+    # charger les paramètres (! déjà déclarés)
+    If dim([L]PARAM_CLC)>1   # FQ 47987 avant PARAM, VALEUR
+     Raz PARAM_CLC,VAL_CLC
+    Else
+      Local Char PARAM_CLC(15)(1..14) , VAL_CLC(10)
+    Endif
+    # Issue 84784 - 2012-09-26 by CCC
+    #PARAM_CLC(1) = [F:SCO]POHFCY
+    If [F:SCI]SCONUM<>[F:SCO]SCONUM
+        Read [SCI]SCI0(1)=[F:SCO]SCONUM
+        [G:SCI]currlen=0
+    Endif
+    PARAM_CLC(1) = [F:SCI]PRHFCY
+    PARAM_CLC(2) = [F:SCO]SCONUM
+    PARAM_CLC(4) = "1"
+    PARAM_CLC(5) = "4"
+    PARAM_CLC(13) = "2"   # Issue 89622 - 2013-06-05 by CCC
+    Case [F:PTR]MCCIMPMOD
+         When 0, 1  : PARAM_CLC(12) = "2"
+                      PARAM_CLC(13) = "1"   # Issue 89622 - 2013-06-05 by CCC
+         When 2     : PARAM_CLC(13) = "1"   # Issue 89622 - 2013-06-05 by CCC
+         When 3     : PARAM_CLC(12) = "2"
+    Endcase
+    # positionner PARAM_CLC(12) à "2" SI ON NE VEUT PAS l'édition du calcul
+    # positionner PARAM_CLC(13) & "2" si on ne veut pas la trace
+    # si traitement multiple alors rien
+     If [F:PTR]TRSAUTO = 2
+         PARAM_CLC(12) = "2"
+         PARAM_CLC(13) = "3"   # Issue 89622 - 2013-06-05 by CCC : trace des erreurs
+     Endif
+    PARAM_CLC(14) = "36"
+    Call TRAITE_CHAR(VAL_CLC,PARAM_CLC,"","SUBSCC","",3,"") From GTRAITE
+Endif
+
+# Si on a ouvert une transaction
+If WSCOTRBEGIN=1
+   Commit
+   Raz WSCOTRBEGIN
+Endif
+End
+
+#########################################################################
+$AB_CRE
+[M:SCOK]CODRET=1
+# Si on a ouvert une transaction
+If WSCOTRBEGIN=1
+   Rollback   : # pour fermer la transaction
+   Raz WSCOTRBEGIN
+Endif
+Gosub AB_TRANSACTION_MSG
+End
+
+#########################################################################
+$ROLL_CRE
+[M:SCOK]CODRET=1
+# Si on a ouvert une transaction
+If WSCOTRBEGIN=1
+   Rollback
+   Raz WSCOTRBEGIN
+Endif
+End
+
+#######################################################################
+# Sous programme lancement suggestion EOS      GA 03/2011    FQ 72413 #
+#######################################################################
+Subprog LANCEMENT_SUG
+   [M:SCOK]CODMAJ = "P"
+   If [M:SCOK]STRDAT < date$ # Issue 89038 GA 03/2013 date suggestion dépassée
+      [M:SCOK]STRDAT = date$
+      Raz [M:SCOK]ENDDAT
+   Endif
+   Call CREATION_SCO
+End
+
+#######################################################################
+# Sous programme de pec commande vente
+#######################################################################
+Subprog CONSO_SOX
+Local    Integer  WRET : WRET=0
+#
+GOK  = 1
+Local Integer WSOXTRBEGIN
+Raz WSOXTRBEGIN
+# Si pas de transaction en cours
+If adxlog<>1
+   GOK=1
+   Call DEBTRANS From GLOCK
+   Trbegin [SCO],[SCI],[SCM],[SCS]
+   WSOXTRBEGIN=1
+Endif
+$TR_PEC_SOX
+#
+# pec commande vente
+$PEC_SOX
+
+If [M:SCOK]FMI = 5 : # code à préciser par les Ventes (5=Fabrication)
+    Call MAJFMISOQ([M:SCOK]VCRNUMORI, [M:SCOK]VCRLINORI, [M:SCOK]VCRSEQORI,
+&                  [M:SCOK]SCONUM, [M:SCOK]SCILIN, 0, 1, WRET) From TRTVENMAJ
+
+Endif
+
+# V6 Affectations
+Gosub CRE_MTO_SO_EO  From SCOMTOLIB
+
+#
+Goto END_PEC_SOX
+#
+
+#########################################################################
+$END_PEC_SOX
+# Si on a ouvert une transaction
+If WSOXTRBEGIN=1
+   Commit
+   Raz WSOXTRBEGIN
+Endif
+End
+
+#########################################################################
+$AB_PEC_SOX
+[M:SCOK]CODRET=1
+# Si on a ouvert une transaction
+If WSOXTRBEGIN=1
+   Rollback   : # pour fermer la transaction
+   Raz WSOXTRBEGIN
+Endif
+Gosub AB_TRANSACTION_MSG
+End
+
+#########################################################################
+$ROLL_PEC_SOX
+# Si on a ouvert une transaction
+If WSOXTRBEGIN=1
+   Rollback
+   Raz WSOXTRBEGIN
+Endif
+End
+#######################################################################
+# Sous programme de pec commande vente
+#######################################################################
+Subprog PRISE_SOX
+Local    Integer  WRET : WRET=0
+#
+If [M:SCOK]FMI = 5 : # code à préciser par les Ventes (5=Fabrication)
+    Call MAJFMISOQ([M:SCOK]VCRNUMORI, [M:SCOK]VCRLINORI, [M:SCOK]VCRSEQORI,
+&                  [M:SCOK]SCONUM, [M:SCOK]SCILIN, 0, 1, WRET) From TRTVENMAJ
+
+Endif
+# V6 Affectations
+Gosub CRE_MTO_SO_EO  From SCOMTOLIB
+#
+$PRISE_SOX_FIN
+End
+#######################################################################
+# Sous programme de pec suggestion achat
+#######################################################################
+Subprog PRISE_POX
+Local    Integer  WRET : WRET=0
+#
+If [M:SCOK]EXTQTY < [M:SCOK]PRVQTY : Goto MOD_POX : Endif
+$DEL_POX
+# purge suggestion POS
+For [ORD]ORD0 Where WIPTYP=[M:SCOK]WIPTYP & WIPNUM=[M:SCOK]WIPNUM & ITMREF=[M:SCOK]ITMREF
+&   & WIPSTA = 3 With Nohint
+    Readlock [ORD]  Curr
+    If fstat=1 & !GSERVEUR : Goto ROLL_CRE : Endif
+    If fstat : GOK=0 : Call RSTA("ORD","ORD0") From GLOCK : Goto PRISE_POX_FIN : Endif
+    Delete [ORD] Curr
+Next
+Goto PRISE_POX_FIN
+
+# modification suggestion d'achat
+$MOD_POX
+# mise à jour Ordre POS
+Readlock [ORD]ORD0=[M:SCOK]WIPTYP;[M:SCOK]WIPNUM;[M:SCOK]ITMREF
+If fstat : GOK=0 : Call RSTA("ORD","ORD0") From GLOCK : Goto PRISE_POX_FIN : Endif
+#
+Case [M:SCOK]CODMAJ
+    When "R" : WLCT = [M:SCOK]PRVQTY - [M:SCOK]EXTQTY
+    When "D","P" : WLCT = [F:ORD]EXTQTY- [M:SCOK]EXTQTY  # FQ 72191 GA 04/2011 qté restante
+Endcase
+If WLCT<0 WLCT=0 Endif
+
+[F:ORD]EXTQTY     = WLCT
+[F:ORD]RMNEXTQTY  = WLCT
+
+[F:ORD]UPDDAT = date$
+[F:ORD]UPDUSR = GUSER
+[F:ORD]EXPNUM = [C]EXPORT
+Rewrite [ORD]
+If fstat : GOK=0 : Call RSTA("ORD","ORD0") From GLOCK : Goto PRISE_EOX_FIN : Endif
+#
+$PRISE_POX_FIN
+End
+
+#######################################################################
+# Sous programme de pec besoin sous-traitance
+#######################################################################
+Subprog PRISE_EOX
+Local    Integer  WRET : WRET=0
+#
+If clalev([F:ORDW])= 0 : Local File ORDERS     [ORDW]: Endif
+
+If [M:SCOK]EXTQTY < [M:SCOK]PRVQTY : Goto MOD_EOX : Endif
+$DEL_EOX
+# purge suggestion EOS ou SCS
+For [ORDW]ORD0 Where WIPTYP=[M:SCOK]WIPTYP & WIPNUM=[M:SCOK]WIPNUM & ITMREF=[M:SCOK]ITMREF
+&   & WIPSTA = 3 With Nohint
+    Readlock [ORDW]  Curr
+    If fstat=1 & !GSERVEUR : Goto ROLL_CRE : Endif
+    If fstat : GOK=0 : Call RSTA("ORDW","ORD0") From GLOCK : Goto PRISE_EOX_FIN : Endif
+    Delete [ORDW] Curr
+Next
+# + toutes les suggestions portant en n° origine le N° de suggestion traité (selon MFGAUTLIB)
+For [ORDW]ORD3 Where STOFCY=[M:SCOK]STOFCY & VCRTYP = 11 & VCRNUM=[M:SCOK]WIPNUM & WIPSTA = 3 With Nohint
+    Readlock [ORDW]  Curr
+    If fstat=1 & !GSERVEUR : Goto ROLL_CRE : Endif
+    If fstat : GOK=0 : Call RSTA("ORDW","ORD0") From GLOCK : Goto PRISE_EOX_FIN : Endif
+    Delete [ORDW] Curr
+Next
+Goto PRISE_EOX_FIN
+
+# modification suggestion de sous-traitance
+$MOD_EOX
+# mise à jour Ordre EOS
+Readlock [ORDW]ORD0=[M:SCOK]WIPTYP;[M:SCOK]WIPNUM;[M:SCOK]ITMREF
+If fstat : GOK=0 : Call RSTA("ORDW","ORD0") From GLOCK : Goto PRISE_EOX_FIN : Endif
+#
+Case [M:SCOK]CODMAJ
+    When "R" : WLCT = [M:SCOK]PRVQTY - [M:SCOK]EXTQTY
+    When "D","P" : WLCT = [F:ORDW]EXTQTY- [M:SCOK]EXTQTY  # FQ 72191 GA 04/2011 qté restante
+Endcase
+If WLCT<0 WLCT=0 Endif
+
+[F:ORDW]EXTQTY     = WLCT
+[F:ORDW]RMNEXTQTY  = WLCT
+
+[F:ORDW]UPDDAT = date$
+[F:ORDW]UPDUSR = GUSER
+[F:ORDW]EXPNUM = [C]EXPORT
+Rewrite [ORDW]
+If fstat : GOK=0 : Call RSTA("ORDW","ORD0") From GLOCK : Goto PRISE_EOX_FIN : Endif
+
+# FQ 74507 GA 06/2011 il manquait la mise à jour de la SCS
+# mise à jour MSS - GA 3 pour ordre MS, avant 6 pour MW
+#For [ORDW]ORD3 Where STOFCY=[M:SCOK]STOFCY & VCRTYP = 11 & VCRNUM = [M:SCOK]WIPNUM & WIPTYP = 3
+For [ORDW]ORD3 Where STOFCY=[M:SCOK]STOFCY & VCRTYP = 11 & VCRNUM = [M:SCOK]WIPNUM & find(WIPTYP,3,4)
+    Readlock [ORDW]  Curr
+    If [M:SCOK]PRVQTY = 0 : [M:SCOK]PRVQTY = 1 : Endif
+    WRATIO = [F:ORDW]EXTQTY / [M:SCOK]PRVQTY
+    WWRK   = WLCT * WRATIO
+    [F:ORDW]EXTQTY = WWRK
+    [F:ORDW]RMNEXTQTY = WWRK
+    [F:ORDW]UPDDAT = date$
+    [F:ORDW]UPDUSR = GUSER
+    [F:ORDW]EXPNUM = [C]EXPORT
+    Rewrite [ORDW]
+    If fstat : GOK=0 : Call RSTA("ORDW","ORD0") From GLOCK : Goto PRISE_EOX_FIN : Endif
+Next
+#
+$PRISE_EOX_FIN
+End
+
+############################################################
+Subprog CRE_SCM(LFCY,LITM,LALT,LDAT,LQTY,LLOT, LLIK, LRET)
+Value    Char     LFCY
+Value    Char     LITM
+Value    Integer  LALT
+Value    Date     LDAT
+Value    Decimal  LQTY
+Value    Char     LLOT
+Value    Decimal  LLIK
+Variable Integer  LRET           : LRET = 0
+
+Local Integer  WOK : WOK=0
+Local Integer  WSCMLIN : WSCMLIN=0
+Local Integer  NOL : NOL =0
+#
+# point d'entrée génération liste composant 12264
+GPOINT = "BOMDET" : Gosub ENTREE From EXEFNC
+If LRET = 9 : LRET = 0 : End : Endif
+
+# lecture entete nomenclature
+Read [BOH]BOH0=LITM;LALT;3
+If fstat : End : Endif
+
+# relecture éventuelle de Article et Article_site
+WOK = func ITMLIB.IS_ITF_OK(LITM,LFCY)
+If WOK<2 : GOK=0 : LRET=1 : End : Endif
+
+# lecture liens (sauf composants de type Valorisation)
+Local File BOMD [BOD] Where ITMREF = LITM  & BOMALT = LALT & BOMALTTYP = 3 & CPNTYP<6 &
+&              (BOMSTRDAT = [0/0/0] | (BOMSTRDAT <> [0/0/0] & BOMSTRDAT <= LDAT)) &
+&              (BOMENDDAT = [0/0/0] | (BOMENDDAT <> [0/0/0] & BOMENDDAT >= LDAT))
+
+# lecture premier enregistrement
+Read [BOD]BOD0 First
+
+# tant qu'y en a !
+While !fstat
+  # contrôle lot valide
+    If LLOT <> ""
+        If ([F:BOD]BOMSTRLOT <> "" & LLOT < [F:BOD]BOMSTRLOT)
+&        | ([F:BOD]BOMENDLOT <> "" & LLOT > [F:BOD]BOMENDLOT)
+        Goto NEXT_BOD
+        Endif
+    Endif
+    WOK=2
+  # lecture composant
+    WOK = func ITMLIB.IS_ITF_OK([F:BOD]CPNITMREF,LFCY)
+    If WOK<2 : GOK=0 : LRET=1 : End : Endif
+
+    Raz mkstat
+  # si composant normal, mis à dispo du sous-traitant: ctrl de validité
+    If [F:BOD]SCOFLG = 2 & [F:BOD]CPNTYP=1
+       # Issue 114967 - 2016-03-15 by MUARN : toujours CONTMATITM
+       # Issue 107513/US10 by GA
+       #If func AFNC.ACTIV("ECC")
+       #   Call CONTMATITMECC([F:BOD]CPNITMREF, LFCY, [F:BOD]SCOFLG, "SCM",  GERR, GMESSAGE) From SCOLIB
+       #Else
+       #  # Issue 82823 GA 06/2012
+       #  #Call CONTMATITM(LFCY,1) From MFGLIB
+       #   Call CONTMATITM([F:BOD]CPNITMREF,LFCY,[F:BOD]SCOFLG, 1) From SCOLIB
+       #Endif
+       Call CONTMATITM([F:BOD]CPNITMREF, LFCY, [F:BOD]SCOFLG, "SCM",  GERR, GMESSAGE) From SCOLIB
+       # Issue 114967 - 2016-03-15 by MUARN : gestion erreur
+       If GERR =4 : GOK=0 : LRET=1 : End : Endif
+
+     # lecture cumuls stocks
+       Call LECITV2(LFCY,[F:BOD]CPNITMREF,WOK) From MFGLIB
+       # Issue 72149 - 2011-03-08 by CCC : test du code retour de LECITV2
+       If WOK : GOK=0 : Goto NEXT_BOD : Endif
+    # Issue 115863 - 2016-04-12 by MUARN : contrôle pour matière fournie
+    Elsif [F:BOD]SCOFLG = 3
+      # Issue 117019 - 2016-06-08 by MUARN : erreur nombre paramètre
+      Call CONTMATITM([F:BOD]CPNITMREF,LFCY,[F:BOD]SCOFLG,  "SCM",  GERR, GMESSAGE) From SCOLIB
+      If mkstat=1 : End : Endif
+    Endif
+    WSCMLIN += GBOMSTE
+    Raz [F:SCM]
+    [F:SCM]SCONUM      = [F:SCI]SCONUM
+    [F:SCM]SCILIN      = [F:SCI]SCILIN
+    [F:SCM]SCMLIN      = WSCMLIN
+    [F:SCM]SCSLIN      = [F:SCS]SCSLIN     : # 03/2007 matières rattachées au service
+    [F:SCM]CPY         = [F:SCI]CPY
+    [F:SCM]CPNITMREF   = [F:BOD]CPNITMREF
+    [F:SCM]ITMREF      = [F:BOD]ITMREF
+    [F:SCM]BOMALT      = [F:BOD]BOMALT
+    [F:SCM]BOMSEQ      = [F:BOD]BOMSEQ
+ ###[F:SCM]PJT         = [F:SCI]PJT
+    [F:SCM]PIO         = [F:SCI]PIO
+  #
+    # FQ 74137 GA 06/2011 pb si nomenclature avec [F:BOH]BASQTY>1
+    # Issue 101293 GA 09/2014 0<[F:BOH]BASQTY<1
+    If [F:BOH]BASQTY<>1
+       [F:SCM]BASQTY   = [F:BOH]BASQTY
+       #[F:SCM]QTYCOD   = [F:BOH]QTYCOD
+    Endif
+    [F:SCM]LIKQTYCOD   = [F:BOD]LIKQTYCOD
+    [F:SCM]QTYRND      = [F:BOD]QTYRND
+    [F:SCM]LIKQTY      = [F:BOD]LIKQTY * LLIK
+    [F:SCM]SCA         = [F:BOD]SCA
+    [F:SCM]RELSCATIA   = 1           : # Menu 1: Oui/Non => Pas de perte au lancement par défaut
+    [F:SCM]STU         = [F:ITM]STU
+    # FQ 73060 GA 04/2011 BOMSTUCOE et BOMQTY non renseignés si génération automatique de l'EO
+    #If [F:SCM]BOMUOM="" : [F:SCM]BOMUOM=[F:ITM]STU : Endif
+    If dim([F:SCM]BOMUOM)>0
+      [F:SCM]BOMUOM    = [F:BOD]BOMUOM
+      [F:SCM]BOMSTUCOE = [F:BOD]BOMSTUCOE
+      [F:SCM]BOMQTY    = [F:BOD]BOMQTY
+      If [F:SCM]BOMUOM = ""
+         [F:SCM]BOMUOM   = [F:SCM]STU
+         [F:SCM]BOMSTUCOE= 1
+         [F:SCM]BOMQTY   = [F:SCM]LIKQTY
+      Endif
+    Endif
+
+    # Issue 107513/US10 GA 06/2015 : ECC
+    If func AFNC.ACTIV("ECC")
+      If [F:ITM]ECCFLG=2  # Only one available BOMALT
+         [F:SCM]ECCVALMAJ = [F:BOD]ECCVALMAJ
+         [F:SCM]ECCVALMIN = [F:BOD]ECCVALMIN
+      Endif
+    Endif
+
+   # Issue 78122 GA 08/2012 toujours tenir compte du SCA indiqué sur la nomenclature de sous-traitance
+   # FQ 51330 si % perte et PEC activé sur l'article-site
+   #If [M:SCO2]SCA(NOL) <> 0  & [F:ITF]RELSCATIA<>0
+   If [F:SCM]SCA <> 0
+     [F:SCM]RELSCATIA = 2 # before [F:ITF]RELSCATIA
+   Else
+     [F:SCM]RELSCATIA = 1
+   Endif
+
+  #
+  # ------------------------------------------------
+  # Délai composant
+  # ------------------------------------------------
+    If [F:BOD]BOMOFS<>0  # FQ 77115 GA 12/2011 avant >0 uniquement
+       [F:SCM]BOMOFS = [F:BOD]BOMOFS
+    ### FQ 77115 GA 12/2011 pas de délai si rien sur la nomenclature
+    ###Else
+    ###   Local Integer WOFS : WOFS=[F:SCM]BOMOFS
+    ###   Call FIND_LTI([F:SCM]CPNITMREF,[F:SCO]BPRNUM,[F:SCO]POHFCY,WOFS) From SCOLIB
+    ###   [F:SCM]BOMOFS = WOFS
+    Endif
+  #
+    If dim([F:SCM]PKC) > 0 :     [F:SCM]PKC = [F:BOD]PKC  : Endif
+    [F:SCM]SCMTRKFLG = 1
+    [F:SCM]SCOFLG    = [F:BOD]SCOFLG
+    [F:SCM]CPNTYP    = [F:BOD]CPNTYP
+    # FQ 72413 GA 03/2011 [F:SCM]MATSTA    = 1
+    Gosub SCM_MATSTA_DEF From SCOLIB
+    # Issue 97153 GA 02/2014
+    [F:SCM]ALLSTA=1
+
+   # Issue 81641 maj site des composants
+   # If [F:SCM]SCOFLG < 3 & [F:SCM]CPNTYP=1
+   #    [F:SCM]LOC    = [F:SCI]LOC     # emplacement sous-traitance
+   #    [F:SCM]STOFCY = [M:SCOK]STOFCY
+   #    [F:SCM]MFGFCY = [F:SCO]MFGFCY
+   #    [F:SCM]STOMGTCOD = func ITMLIB.GET_STOMGTCOD([F:BOD]CPNITMREF,[F:SCM]STOFCY)
+   #    If [F:SCM]STOMGTCOD<2 [F:SCM]SCOFLG=1 Endif # Issue 82823 GA 06/2012 Matière interne
+   # Elsif [F:SCM]SCOFLG = 3
+   #  # pas de site de stockage, pas d'adresse sous-traitant
+   #    Raz [F:SCM]MFGFCY : Raz [F:SCM]STOFCY
+   #    [F:SCM]STOMGTCOD = 1
+   # Endif
+   Call UPD_MAT_FCY([M:SCOK]STOFCY,-1) From SCOLIB
+
+  # composant <Texte> => matière exclue
+    If [F:SCM]CPNTYP = 5 : [F:SCM]MATSTA=4 : [F:SCM]SCOFLG = 1 : Endif
+
+    [F:SCM]SCMTEX = [F:BOD]BOMTEXNUM
+
+  # Maj des Qtés et dates
+    Call UPD_SCM_FROM_SCOK
+
+    NOL+=1
+    Gosub WRITE_SCM
+    If GOK <> 1 : GOK=0 : LRET=1 : End : Endif
+
+    # V6 Affectations
+    If [F:SCM]WIPSTA=1 Gosub MAJ_MTO_SCM From SCOMTOLIB Endif
+
+$NEXT_BOD
+    Read [BOD]BOD0 Next
+Wend
+
+End
+
+
+############################################################
+# Recherche du service associé à la nomenclature
+############################################################
+# Issue 80045 GA 02/2012 + LBPRNUM
+Subprog CRE_SCS(LDAT,LITM, LALT, LBPRNUM, LFCY, LQTY, LMSG)
+Value    Date     LDAT   :  # date référence
+Value    Char     LITM   :  # article lancé
+Value    Integer  LALT   :  # alternative gamme
+Value    Char     LBPRNUM:  # fournisseur
+Value    Char     LFCY   :  # Site
+Value    Decimal  LQTY   :  # quantité
+Value    Integer  LMSG   :  # message
+#
+Local Integer  WOK : WOK=0
+Local Integer  WSCSLIN : WSCSLIN=0
+Local Char     WITMREF(GLONITM)
+Local Char     WBPRNUM(GLONBPR): WBPRNUM=LBPRNUM
+
+# Issue X3-55891 - 2018-08-22 by MUARN : exploitation table article/fournisseur/site
+Local Integer WITMBPS : WITMBPS = 0
+
+# lecture entete nomenclature
+Read [BOH]BOH0=LITM;LALT;3
+If fstat : End : Endif
+
+# Lecture article
+If dim(WITMREF)   <=0 : Local    Char     WITMREF   (GLONITM) : Endif
+If [M:SCOK]WIPTYP=4
+   WITMREF = [M:SCOK]ITMREF
+   [F:SCS]WIPTYP     = [M:SCOK]WIPTYP
+   [F:SCS]WIPNUM     = [M:SCOK]WIPNUM  : # on garde le même n° encours SCS car stocké dans [F:PWO] SUBPOHB
+Else
+   Raz WITMREF
+Endif
+
+If WITMREF<>""
+ # on connait déjà le service commandé
+   Local File BOMD [BOD] Where ITMREF = LITM  & CPNITMREF = WITMREF
+&             & BOMALT = LALT & BOMALTTYP=3 & CPNTYP=7
+&             &  (BOMSTRDAT = [0/0/0] | (BOMSTRDAT <> [0/0/0] & BOMSTRDAT <= LDAT))
+&             &  (BOMENDDAT = [0/0/0] | (BOMENDDAT <> [0/0/0] & BOMENDDAT >= LDAT))
+Else
+ # 1er service valide
+   Local File BOMD [BOD] Where ITMREF = LITM
+&             & BOMALT = LALT & BOMALTTYP=3 & CPNTYP=7
+&             &  (BOMSTRDAT = [0/0/0] | (BOMSTRDAT <> [0/0/0] & BOMSTRDAT <= LDAT))
+&             &  (BOMENDDAT = [0/0/0] | (BOMENDDAT <> [0/0/0] & BOMENDDAT >= LDAT))
+Endif
+
+# lecture premier enregistrement
+Read [BOD]BOD0 First
+If fstat
+    GOK = 0 : End
+Else
+
+# on ne lit que le 1er service valide
+    WITMREF = [F:BOD]CPNITMREF
+
+  # lecture service
+    WOK = func ITMLIB.IS_ITF_OK([F:BOD]CPNITMREF,LFCY)
+  # FQ 59223 Article-Site facultatif sur le Service, ne pas renvoyer d'erreur
+  # If WOK<2 : GOK=0 : End : Endif
+    If WOK<2 : Raz GMESSAGE : GERR=0 : Endif
+
+    #----- Lecture [F:ITM] selon WITMREF
+    Gosub READ_ITM From ITMLIB
+    #If [F:ITM]ITMREF<>WITMREF : GOK=0 : End : Endif
+
+    # Issue X3-55891 - 2018-08-22 by MUARN : exploitation table article/fournisseur/site
+    ##----- Lecture [F:ITP] selon WITMREF et WBPRNUM
+    #Gosub READ_ITP From ITMLIB
+    Call FIND_ITMBPSFCY_ITMBPS(WITMREF,WBPRNUM,LFCY,WITMBPS) From TRTACHDEF1
+    # End issue X3-55891
+
+    # Issue 112754 - 2017-01-04 by MUARN : service doit être réceptionnable
+    If [F:ITM]RCPFLG <> 2 : GMESSAGE=WITMREF-mess(99,194,1)  : GERR=1 : WOK=1 : GOK=0 : End : Endif
+
+    WSCSLIN = 5 # FQ 54710 GA 23/04/2009 avant += GBOMSTE
+    Raz [F:SCS]
+    [F:SCS]SCONUM      = [F:SCI]SCONUM
+    [F:SCS]SCILIN      = [F:SCI]SCILIN
+    [F:SCS]SCSLIN      = WSCSLIN
+    [F:SCS]CPY         = [F:SCI]CPY
+    [F:SCS]SRVITMREF   = [F:BOD]CPNITMREF
+    [F:SCS]ITMREF      = [F:BOD]ITMREF
+    [F:SCS]BOMALT      = [F:BOD]BOMALT
+    [F:SCS]BOMSEQ      = [F:BOD]BOMSEQ
+ ###[F:SCS]PJT         = [F:SCI]PJT
+    [F:SCS]PIO         = [F:SCI]PIO
+  #
+  #  FQ 72413 GA 03/2011 [F:SCS]OPESTA      = 1
+     Gosub SCS_OPESTA_INI From SCOLIB
+
+    [F:SCS]SCSTEX      = [F:BOD]BOMTEXNUM
+    [F:SCS]STRQTYCOD   = [F:BOD]LIKQTYCOD
+  #
+  # Issue 80045 & 69609 GA 02/2012
+    Call UPD_SRV_UOM(-1) From SCOLIB
+
+  # ------------------------------------------------
+  # Délai opération et réajustement délai global
+  # ------------------------------------------------
+    If [F:BOD]BOMOFS > 0
+       [F:SCS]SCOLTI = [F:BOD]BOMOFS
+    Else
+       Local Integer WLTI : WLTI=[F:SCS]SCOLTI
+       Call FIND_LTI([F:SCS]SRVITMREF,[F:SCO]BPRNUM,[F:SCO]POHFCY,WLTI) From SCOLIB
+       [F:SCS]SCOLTI=WLTI
+    Endif
+
+    If [F:SCS]SCOLTI > [F:SCI]LTI : [F:SCI]LTI = [F:SCS]SCOLTI : Endif
+
+  # Maj des Qtés et dates
+    Call UPD_SCS_FROM_SCOK
+
+    # Issue 111449 - 2015-10-29 by MUARN : REFPRI est alimenté par GROPRI en création
+    If [F:SCO]CUR=GLOCALDEV
+      [F:SCS]REFPRI=[F:SCS]GROPRI
+    Else
+      Local Integer  WRET
+      Call COURMNT([F:SCO]CUR,GLOCALDEV,GLOCALDEV,[F:SCO]CHGTYP,[F:SCS]OPESTR,1,
+&                    [F:SCS]GROPRI,[F:SCS]REFPRI,[F:SCO]CHGCOE,WRET) From TRTDEV
+    Endif
+
+    Gosub WRITE_SCS
+
+Endif
+$NEXT_BOS
+
+End
+
+
+####################################################################################
+# alimentation de l'enregistrement SCO
+Subprog CRE_SCO
+Local Integer STAT
+Local Integer WOK : WOK=2
+# contrôle préalable ITMREF et BPRNUM doivent obligatoirement être renseignés
+If [M:SCOK]ITMREF="" : GOK=-1 : GMESSAGE=mess(437,182,1) : End : Endif
+
+Local Integer WOK : WOK=2
+
+# Issue 80196 GA 03/2012: ctrl remonté car on utilise ensuite [M:SCOK]POHFCY
+# [M:SCOK]STOFCY est obligatoirement renseignée
+# ensuite, les autres FCY peuvent être renseignés par défaut
+Gosub CTRL_FCY
+If WOK<>2 : GOK = -1 : End : Endif
+
+# Issue 86437 GA 12/2012 before [M:SCOK]POHFCY
+WOK = func ITMLIB.IS_ITF_OK([M:SCOK]ITMREF,[M:SCOK]PRHFCY)
+If WOK<2 : GOK=-1 : End : Endif
+# Issue 112879 - 2015-12-11 by SR : Receipt Product only
+If [F:ITM]RCPFLG <> 2
+   Call ECR_TRACE([M:SCOK]ITMREF -":"-mess(472,194,1),1) From GESECRAN
+   GOK = -1 : End
+Endif
+# End issue 112879
+
+If [M:SCOK]BPRNUM=""
+   # GMESSAGE=mess(69,197,1) : # GH 14/08/13 bug 91792
+   Call ECR_TRACE(mess(69,197,1),1) From GESECRAN
+   GOK=-1 : End
+Endif
+
+If [M:SCOK]RSCONUM = ""
+   # récupération compteur, sauf si on est en création ordre de sous-traitance
+   Call NUMERO(GCODNUM,[M:SCOK]POHFCY,[M:SCOK]STRDAT,"",[M:SCOK]SCONUM,STAT) From SUBANM
+   #--CPO  68322/59141
+   #If STAT <> 0 : Call ERREUR(GCODNUM-mess(60,199,1)) From GESECRAN : GOK=0 : End : Endif
+   If GOK<1 | STAT<>0
+     Local Char MESSA(80)
+     Gosub MESSAGE From SUBANM
+     Call ERREUR(mess(60,199,1)-"("+GCODNUM+") :"-MESSA) From GESECRAN : GOK=-1 : End
+   Endif
+   #--/CPO 68322/59141
+Else
+   [M:SCOK]SCONUM = [M:SCOK]RSCONUM
+Endif
+
+Raz [F:SCO]
+[F:SCO]SCONUM     = [M:SCOK]SCONUM
+[F:SCO]POHFCY     = [M:SCOK]POHFCY
+If [M:SCOK]POHFCY<>GFCY
+   Call GETDEV([M:SCOK]POHFCY) From DEVSUB
+Endif
+[F:SCO]CPY        = GSOCIETE
+Call UPD_SCO_FROM_SCOK
+#
+[F:SCO]ALLSTA     = 1
+[F:SCO]SCOTRKFLG  = 1
+#
+End
+
+
+####################################################################################
+# alimentation de l'enregistrement SCI
+Subprog CRE_SCI(LITM, LALT)
+Value    Char     LITM   :  # article lancé
+Value    Integer  LALT   :  # alternative nomenclature
+Local Integer WOK : WOK=0
+Local Integer I,J
+Local Integer STA : STA=0
+Local Integer  WSCILIN : WSCILIN=1000
+#
+# lecture entete nomenclature
+Read [BOH]BOH0=LITM;LALT;3
+If fstat : End : Endif
+
+# Issue 86437 GA 12/2012 before [M:SCOK]STOFCY
+# Lecture tables article
+WOK = func ITMLIB.IS_ITF_OK([M:SCOK]ITMREF,[M:SCOK]PRHFCY)
+If WOK<2 : GOK=0 : End : Endif
+# Issue X3-55891 - 2018-09-12 by MUARN : exploitation table article/fournisseur/site
+#WOK = func ITMLIB.IS_ITP_OK([M:SCOK]ITMREF,[M:SCOK]BPRNUM)
+If [F:SCO]BETFCY=2 & [F:SCO]BETCPY=1
+  WOK = func ITMLIB.IS_ITP_OK([M:SCOK]ITMREF,[M:SCOK]BPRNUM,[M:SCOK]PRHFCY,2)
+Else
+  WOK = func ITMLIB.IS_ITP_OK([M:SCOK]ITMREF,[M:SCOK]BPRNUM,[M:SCOK]PRHFCY,1)
+Endif
+If WOK<2 : GOK=0 : End : Endif
+
+Raz [F:SCI]
+[F:SCI]SCONUM     = [F:SCO]SCONUM
+[F:SCI]SCILIN     = WSCILIN
+[F:SCI]CPY        = [F:SCO]CPY
+# FQ 61094 GA 12/2009 ne pas garder le WIPNUM si conso partielle car l'encours EOS est alors perdu/écrasé
+If [M:SCOK]WIPTYP=13 & [M:SCOK]EXTQTY >= [M:SCOK]PRVQTY
+#  conso d'un encours EOS: on garde le même n° encours EOS car stocké dans [F:PWO] SUBPOHB
+   [F:SCI]ITMREF     = [M:SCOK]ITMREF
+   [F:SCI]WIPTYP     = [M:SCOK]WIPTYP
+   [F:SCI]WIPNUM     = [M:SCOK]WIPNUM
+Elsif [M:SCOK]WIPTYP=4   : # cas peu probable car cela pose pb sur les qtés
+#  conso d'un encours SCS
+   [F:SCI]ITMREF     = [M:SCOK]ITMREFORI
+Else
+#  plan de travail: on n'est pas sur un encours ...
+   [F:SCI]ITMREF     = [M:SCOK]ITMREF
+Endif
+
+# Issue 88337 GA 03/2013
+Call UPD_ITM_UOM(-1) From SCOLIB
+
+Call UPD_SCI_FROM_SCOK
+If GOK<0 : End : Endif
+
+[F:SCI]PRHFCY     = [M:SCOK]PRHFCY
+[F:SCI]BOMALT     = [M:SCOK]BOMALT
+
+[F:SCI]BASQTY     = [F:BOH]BASQTY
+[F:SCI]QTYCOD     = [F:BOH]QTYCOD
+
+# FQ 74168 GA 06/2011 avant [M:SCOK]EXTQTY utilisé systématiquement
+If [M:SCOK]QTYPUU <> 0
+   [F:SCI]QTYPUU     = [M:SCOK]QTYPUU
+Elsif [F:SCI]PUUSTUCOE<>0
+   [F:SCI]QTYPUU     = [M:SCOK]EXTQTY/[F:SCI]PUUSTUCOE
+Else
+   [F:SCI]QTYPUU     = [M:SCOK]EXTQTY
+   [F:SCI]PUU        = [F:ITM]STU
+Endif
+[F:SCI]EXTQTY     = [M:SCOK]EXTQTY
+[F:SCI]RMNEXTQTY  = [M:SCOK]EXTQTY
+
+# si on est en mode "prise en compte besoin initial" SOx ou TRx ou EOS ???
+If [M:SCOK]CODMAJ = "P" & !find([M:SCOK]WIPTYP,2,3,6)
+    # lecture encours
+    Read [ORD]ORD0=[M:SCOK]WIPTYP;[M:SCOK]WIPNUM;[M:SCOK]ITMREF
+    If fstat : GOK=0 : End : Endif
+
+    If [F:ORD]VCRTYP=2 & [F:PTR]UOMSAIFLG1 = 2 : # [F:MTS]UOMSAI Accès à la Commande de Vente
+      # recherche de l'unité PUU: lecture détail commande client
+      If clalev([F:SOP])   = 0 : Local File SORDERP        [SOP]   : Endif
+
+      Read [SOP]SOP0=[F:ORD]VCRNUM;[F:ORD]VCRLIN;[F:ORD]VCRSEQ
+      If !fstat
+        #For J = 1 To GOPTCANA
+        #  Assign "[F:SCI]CCE"+num$(J) With evalue("[F:SOP]CCE"+num$(J))
+        #Next
+        For I = 0 To dim([F:ITM]PCU) - 1
+            If [F:ITM]PCU(I) = [F:SOP]SAU
+               [F:SCI]PUU          = [F:SOP]SAU
+               [F:SCI]PUUSTUCOE    = [F:ITM]PCUSTUCOE(I)
+               If [F:SCS]OPESTRCOE = 0 : [F:SCS]OPESTRCOE = 1 : Endif # FQ 65646 avant [F:SCS]OPESTUCOE
+               [F:SCI]QTYPUU       = [F:SCI]EXTQTY / [F:SCI]PUUSTUCOE # FQ 74478 Ctrl des sources avant QTYSTU
+               Call QTEARR([F:SCI]QTYPUU,[F:SCI]PUU) From TRTDIV
+               Break
+            Endif
+        Next I
+      Endif : # fsi !fstat
+    Endif : # fsi [F:ORD]VCRTYP=2
+Endif
+
+[F:SCI]PJT        = [M:SCOK]PJT
+[F:SCI]PIO        = [M:SCOK]PIO
+[F:SCI]VCRTYPORI  = [M:SCOK]VCRTYPORI
+[F:SCI]VCRNUMORI  = [M:SCOK]VCRNUMORI
+[F:SCI]VCRLINORI  = [M:SCOK]VCRLINORI
+[F:SCI]VCRSEQORI  = [M:SCOK]VCRSEQORI
+[F:SCI]SCITRKFLG  = 1
+#
+[F:SCI]ITMSTA     = 1
+#
+#
+End
+
+
+
+#########################################################################
+Subprog UPD_SCO_FROM_SCOK
+#########################################################################
+
+Local    Date     WOLDDAT   # FQ 75630 GA 09/2011
+WOLDDAT = [F:SCO]ORDDAT     # FQ 75630 GA 09/2011 changt de date de commande
+
+If [M:SCOK]MFGFCY<>""
+   [F:SCO]MFGFCY  = [M:SCOK]MFGFCY
+Endif
+
+# FQ 54554 changt de fournisseur à génération de la commande
+If [M:SCOK]BPRNUM<>"" & [M:SCOK]BPRNUM<>[F:SCO]BPRNUM
+   [F:SCO]BPRNUM  = [M:SCOK]BPRNUM
+   Call CTRL_INTERSITE ([F:SCO]POHFCY,[F:SCO]BPRNUM)
+   If [M:SCOK]BPAADD="" # Recherche de l'adresse par défaut
+       # FQ 54554 Adresse du client livré (avant FIND_BPAADD)
+       Call FIND_BPDADD ([M:SCOK]BPRNUM,[M:SCOK]BPAADD) From BPRLIB
+   Endif
+Endif
+
+# FQ 78033 GA 11/2011
+If [M:SCOK]BPRNUM="" [M:SCOK]BPRNUM=[F:SCO]BPRNUM Endif
+
+# FQ 72413 GA 03/2011 appel Tarif achat : CUR nécessaire
+#----- Lecture BPARTNER si nécessaire pour chargement CUR, LAN -----#
+Local    Integer WOK
+Local    Char    WSTOFCY (GLONFCY)
+Local    Char    WRCPFCY (GLONFCY)
+Local    Char    WBPRNUM (GLONBPR)
+WBPRNUM = [M:SCOK]BPRNUM
+Gosub READ_BPR From BPRLIB
+
+WOK = func BPRLIB.IS_BPS_ACTIVE(WBPRNUM)
+If WOK = 1 : mkstat=1 : Endif
+
+WOK = func BPRLIB.CTL_BPS_DOUFLG(WBPRNUM)
+If WOK = 1 : Endif : # mkstat déjà positionné si nécessaire
+#
+If [F:BPR]BPRNUM=WBPRNUM & [F:BPR]CUR<>GLOCALDEV
+   GCUR          = [F:BPR]CUR
+   [F:SCO]CUR    = [F:BPR]CUR
+   #[F:SCO]LAN    = [F:BPR]LAN
+Else
+   GCUR          = GLOCALDEV
+   [F:SCO]CUR    = GLOCALDEV
+   #[F:SCO]LAN    = GLANGUE
+Endif
+# Fin - FQ 72413 GA 03/2011 appel Tarif achat : CUR nécessaire
+
+[F:SCO]SCOSTA = [M:SCOK]SCOSTA
+# Issue X3-68900 - 2018-01-24 by MUARN : modification dates sur EO ajout UPDSCO
+If [M:SCOK]UPDSCO = 2
+  [F:SCO]ORDDAT = [M:SCOK]STRDAT
+Endif
+
+# FQ 77488 GA 10/2011 taux de conversion à la date LOPESTR: => fait dans UPD_SRV_DAT
+### # FQ 75630 GA 09/2011 si maj de ORDDAT => relecture du cours de change
+### # FQ 74682 GA 07/2011 devise Fournisseur versus devise locale
+### If dim([F:SCO]CHGTYP)>0 & [F:SCO]ORDDAT <> WOLDDAT
+###    Local Shortint  WCHGTYP : WCHGTYP=0   # forcer la relecture du type et cours de change
+###    Call FIND_CUR(WBPRNUM,[F:SCO]ORDDAT,[F:SCO]CUR,WCHGTYP,[F:SCO]CHGCOE) From SCOLIB
+###    [F:SCO]CHGTYP =WCHGTYP
+### Endif
+
+If varinit([M:SCOK]SCODES)
+ [F:SCO]SCODES = [M:SCOK]SCODES : # GH 09/01/2012 bug 78926
+Endif
+If dim([M:SCOK]MTOREF)>0 & [M:SCOK]MTOREF<>""
+  [F:SCO]MTOREF     = [M:SCOK]MTOREF   : # V6 Réseau MTO FQ 46650 GA 04/2008
+Endif
+
+# Issue X3-68900 - 2018-03-12 by MUARN : si pas de commande mise à jour, sinon si date plus éloignée
+If [F:SCI]POHNUM = "" | ( [F:SCI]POHNUM<>"" & [M:SCOK]ENDDAT > [F:SCO]RETDAT)
+  If [M:SCOK]ENDDAT <> [0/0/0]
+     [F:SCO]RETDAT  = [M:SCOK]ENDDAT
+  Elsif [M:SCOK]OBJDAT <> [0/0/0]
+     [F:SCO]RETDAT  = [M:SCOK]OBJDAT
+  Endif
+Endif
+# Issue 102679 GA 09/2014 don't change all dates, only ENDDAT if ORDDAT doesn't change
+# FQ 75630 GA 09/2011 si maj de ORDDAT => recalcul des dates SCI,SCS,SCM
+#If [F:SCO]ORDDAT <> WOLDDAT | ([F:SCO]RETDAT<>[M:SCOK]ENDDAT & [F:SCO]RETDAT<>[M:SCOK]OBJDAT)
+If [F:SCO]ORDDAT <> WOLDDAT & ([F:SCO]RETDAT<>[M:SCOK]ENDDAT & [F:SCO]RETDAT<>[M:SCOK]OBJDAT)
+   Call UPD_ITM_DAT([F:SCI]LTI,[F:SCO]POHFCY,[F:SCO]ORDDAT,[F:SCO]RETDAT) From SCOLIB
+# Issue X3-68900 - 2018-03-12 by MUARN : que si nouvelle date dans le futur
+#Elsif   [F:SCO]RETDAT<>[M:SCOK]ENDDAT
+Elsif   [F:SCO]RETDAT<[M:SCOK]ENDDAT
+   [F:SCO]RETDAT=[M:SCOK]ENDDAT   # Issue 102679 GA 09/2014
+Endif
+
+End
+
+
+#########################################################################
+Subprog UPD_SCI_FROM_SCOK
+#########################################################################
+#Local Char     WGESLOT(1)
+Local Char     WLOTCOU(GLONANM)
+Local Integer  WIND
+# Issue 115453 - 2016-03-22 by SR : to manage PRHFCY modification
+Local Integer  WFCY_CHANGED
+WFCY_CHANGED = 1
+
+# Issue 86437 GA 12/2012 détermination du client-livré selon PRHFCY
+# FQ 54554 changt de fournisseur/adresse client livré
+#If [M:SCOK]BPRNUM<>"" & dim([F:SCI]BPRNUM)>0
+If [M:SCOK]BPRNUM<>"" & dim([F:SCI]BPRNUM)>0 & [M:SCOK]BPRNUM<>[F:SCI]BPRNUM
+   [F:SCI]BPRNUM  = [M:SCOK]BPRNUM
+###   If [M:SCOK]BPAADD="" # Recherche de l'adresse par défaut
+###       # FQ 54554 Adresse du client livré (avant FIND_BPAADD)
+###       Call FIND_BPDADD ([M:SCOK]BPRNUM,[M:SCOK]BPAADD) From BPRLIB
+###   Endif
+
+  # Issue 88337 GA 03/2013
+   Call UPD_ITM_UOM(-1) From SCOLIB
+#
+Endif
+# Issue 88018 GA 02/2013
+#Call FIND_SCOLOC ([M:SCOK]BPRNUM,[M:SCOK]BPAADD,[F:SCI]LOC,[M:SCOK]MFGFCY,[M:SCOK]PRHFCY) From BPRLIB
+
+If [M:SCOK]BPAADD<>"" & [M:SCOK]MFGFCY<>""
+    # Issue 83847 GA 08/2012 ctl BPAADD
+    #----- Lecture de l'adresse si nécessaire -----#
+    If !clalev([F:BPA])  Local File BPADDRESS [BPA] : Endif
+    If [F:BPA]BPATYP<>1 | [F:BPA]BPANUM<>[M:SCOK]MFGFCY | [F:BPA]BPAADD<>[M:SCOK]BPAADD
+      Read [BPA] BPA0=3;[M:SCOK]MFGFCY;[M:SCOK]BPAADD
+      If fstat : Raz [F:BPA] : Raz [M:SCOK]BPAADD : Endif
+    Endif
+Elsif [M:SCOK]BPAADD<>"" & [M:SCOK]BPRNUM<>""
+    # Issue 83847 GA 08/2012 ctl BPAADD
+    #----- Lecture de l'adresse si nécessaire -----#
+    If !clalev([F:BPA])  Local File BPADDRESS [BPA] : Endif
+    If [F:BPA]BPATYP<>1 | [F:BPA]BPANUM<>[M:SCOK]BPRNUM | [F:BPA]BPAADD<>[M:SCOK]BPAADD
+      Read [BPA] BPA0=1;[M:SCOK]BPRNUM;[M:SCOK]BPAADD
+      If fstat : Raz [F:BPA] : Raz [M:SCOK]BPAADD : Endif
+    Endif
+Endif
+
+# Site de réception
+# -----------------------------
+If [M:SCOK]PRHFCY<>"" & [M:SCOK]PRHFCY<>[F:SCI]PRHFCY
+   [F:SCI]PRHFCY  = [M:SCOK]PRHFCY
+   # Issue 115453 - 2016-03-22 by SR : PRHFCY modified
+   WFCY_CHANGED = 2
+Endif
+If dim([M:SCOK]PRHADD)>0 & [M:SCOK]PRHADD<>""  # Issue 88018 GA 02/2013
+   [F:SCI]PRHADD  = [M:SCOK]PRHADD
+Endif
+#----------------------------------------------------
+# Recherche adresse du site de réception
+#----------------------------------------------------
+If [F:SCI]PRHADD = "" & [F:SCI]PRHFCY<>""
+  # Issue 84534 GA 11/2012
+  # Read [F:FCY]FCY0=[F:SCI]PRHFCY
+  # If !fstat [F:SCI]PRHADD=[F:FCY]BPAADD Endif
+  Call FIND_FCYADD([F:SCI]PRHFCY,[F:SCI]PRHADD) From BPRLIB
+Endif
+If [M:SCOK]BPAADD<>"" & [F:SCI]BPAADD<>[M:SCOK]BPAADD
+    #----------------------------------------------------
+    # Recherche adresse + emplacement de sous-traitance ?
+    #----------------------------------------------------
+    [F:SCI]BPAADD     = [M:SCOK]BPAADD
+    Raz [F:SCI]LOC                            # Issue 88018 GA 02/2013 rechercher l'emplacement associé à cette adresse
+    If [F:SCI]BPAADD = "" & [F:SCO]MFGFCY<>""
+       Read [F:FCY]FCY0=[F:SCO]MFGFCY
+       If !fstat [F:SCI]BPAADD=[F:FCY]BPAADD Endif
+    Endif
+    # Issue 88018 GA 02/2013
+    #Call FIND_SCOLOC ([M:SCOK]BPRNUM,[F:SCI]BPAADD,[F:SCI]LOC,[F:SCO]MFGFCY,[M:SCOK]PRHFCY) From BPRLIB
+    Call FIND_SCOLOC ([F:SCI]BPRNUM,[F:SCI]BPAADD,[F:SCI]LOC,[F:SCO]MFGFCY,[F:SCI]PRHFCY) From BPRLIB
+    # ------------------------------------------------
+    # Délai article sous-traité
+    # ------------------------------------------------
+    # Issue 100424 GA 07/2014 special for workbench
+    #Local Integer WLTI : WLTI=[F:SCI]LTI
+    #Call FIND_LTI ([M:SCOK]ITMREF,[M:SCOK]BPRNUM,[M:SCOK]PRHFCY,WLTI) From SCOLIB
+    #[F:SCI]LTI=WLTI
+# Issue 115453 - 2016-03-22 by SR : Only if PRHFCY modified
+Elsif [F:SCI]LOC="" & [F:SCI]BPAADD<>"" & WFCY_CHANGED = 2
+    # Issue 88018 GA 02/2013
+    #Call FIND_SCOLOC ([M:SCOK]BPRNUM,[F:SCI]BPAADD,[F:SCI]LOC,[F:SCO]MFGFCY,[M:SCOK]PRHFCY) From BPRLIB
+    Call FIND_SCOLOC ([F:SCI]BPRNUM,[F:SCI]BPAADD,[F:SCI]LOC,[F:SCO]MFGFCY,[F:SCI]PRHFCY) From BPRLIB
+Endif
+
+# Lecture article lancé
+# -----------------------------
+Local Integer  WOK
+WOK = func ITMLIB.IS_ITF_OK([F:SCI]ITMREF,[F:SCI]PRHFCY)
+If WOK<2 : GOK=0 : End : Endif
+
+# ------------------------------------------------
+# Délai article sous-traité
+# ------------------------------------------------
+If [F:SCI]LTI=0  # Issue 100424 GA 07/2014 special for workbench
+  Local Decimal WLTI : WLTI=[F:SCI]LTI
+  Local Char           WSRVITMREF(GLONITM)
+  Call FIND_SCI_LTI([M:SCOK]ITMREF,[M:SCOK]BPRNUM,[M:SCOK]PRHFCY,[M:SCOK]BOMALT,WSRVITMREF,WLTI) From SCOLIB
+  [F:SCI]LTI=WLTI
+Endif
+
+# Qtés Ordre de sous-traitance
+# -----------------------------
+# mise à jour qté US article lancé
+If [M:SCOK]EXTQTY <> 0
+   [F:SCI]EXTQTY    = [M:SCOK]EXTQTY
+   [F:SCI]RMNEXTQTY = [F:SCI]EXTQTY - [F:SCI]CPLQTY
+   If [F:SCI]RMNEXTQTY < 0 : [F:SCI]RMNEXTQTY = 0 : Endif
+Endif
+
+# mise à jour qté UA article lancé
+# si changt fournisseur, l'UA peut être modifiée
+If [M:SCOK]QTYPUU <> 0
+   [F:SCI]QTYPUU  = [M:SCOK]QTYPUU
+   [F:SCI]PUU     = [M:SCOK]PUU
+   # Coef de conversion entre "UA" et "US"
+   Call RECH_COEFF([F:SCI]ITMREF,[F:SCO]BPRNUM,[F:SCI]PUU, [F:SCI]STU, GBIDD1) From SCOLIB
+   [F:SCI]PUUSTUCOE = GBIDD1
+Else
+ # recalcul QTYPUU selon EXTQTY
+   Call UPD_ITM_QTY(1,[F:SCI]STU,[F:SCI]EXTQTY,[F:SCI]PUU,[F:SCI]QTYPUU,GBIDD1,-1) From SCOLIB
+Endif
+
+# Issue 107513/US2 GA 04/2015 : ECC for EO - start
+If func AFNC.ACTIV("ECC") & dim([M:SCOK]ECCVALMAJ)>0
+  If [F:ITM]ECCFLG=2  # Only one available BOMALT
+     If [M:SCOK]ECCVALMAJ=""
+       For [BOH] Where ITMREF=[F:SCI]ITMREF & USESTA=2
+           [M:SCOK]BOMALT    = [F:BOH]BOMALT
+           Call BOMFINDECC([F:SCI]ITMREF,[M:SCOK]ECCVALMAJ,[M:SCOK]ECCVALMIN,[M:SCOK]LOT,[M:SCOK]BOMALT,3,[M:SCOK]STRDAT) From TRTBOM
+           Break
+       Next
+     Else
+       Raz GMESSAGE
+       Call BOMCTRECC([M:SCOK]ITMREF,[M:SCOK]ECCVALMAJ,[M:SCOK]ECCVALMIN,"",0,[M:SCOK]BOMALT,3,[M:SCOK]STRDAT) From TRTBOM
+       If GMESSAGE<>""   # Version is not valid at this date ?
+          Raz GMESSAGE : Raz mkstat
+          Call BOMFINDECC([M:SCOK]ITMREF,[M:SCOK]ECCVALMAJ,[M:SCOK]ECCVALMIN,[M:SCOK]LOT,[M:SCOK]BOMALT,3,[M:SCOK]STRDAT) From TRTBOM
+          If GMESSAGE<>"" : GOK=0 : End : Endif
+       Endif
+     Endif
+     [F:SCI]ECCVALMAJ = [M:SCOK]ECCVALMAJ
+     [F:SCI]ECCVALMIN = [M:SCOK]ECCVALMIN
+  Endif
+Endif
+# Issue 107513/US2 GA 04/2015 : ECC for EO - end
+
+If [F:SCI]BOMALT <> [M:SCOK]BOMALT & [M:SCOK]BOMALT<>0
+   [F:SCI]BOMALT = [M:SCOK]BOMALT
+Endif
+
+# Lot de fabrication (?)
+# -----------------------------
+If [M:SCOK]LOT = "" & [F:ITM]LOTMGTCOD > 1
+   # à revoir ? le code [F:SCI]LOT est calculé à l'entrée en stock ?
+Else
+   [F:SCI]LOT = [M:SCOK]LOT
+Endif
+
+# mise à jour priorité
+# -----------------------------
+If [F:SCI]PIO <> [M:SCOK]PIO & [M:SCOK]PIO<>0
+   [F:SCI]PIO  = [M:SCOK]PIO
+Endif
+If [F:SCI]PIO = 0 : [F:SCI]PIO = 1 : Endif : # donnée Obligatoire pour [F:ORD]
+
+# changt de statut de l'ordre de sous-traitance
+[F:SCI]WIPSTA  = [M:SCOK]SCOSTA
+
+If varinit([M:SCOK]PJT)
+ [F:SCI]PJT = [M:SCOK]PJT  : # GH 09/01/2012 bug 78926
+Endif
+
+End
+
+#########################################################################
+Subprog UPD_SCS_FROM_SCOK
+#########################################################################
+Local Decimal WCOEFF
+
+# Site Ordre de sous-traitance
+# -----------------------------
+If [M:SCOK]PRHFCY<>""
+   [F:SCS]PRHFCY  = [M:SCOK]PRHFCY
+Else
+   [F:SCS]PRHFCY  = [F:SCI]PRHFCY
+Endif
+
+# Issue 88337 Changement de fournisseur ?
+If [M:SCOK]BPRNUM<>"" & dim([F:SCS]BPRNUM)>0 & [M:SCOK]BPRNUM<>[F:SCS]BPRNUM
+   [F:SCS]BPRNUM  = [M:SCOK]BPRNUM
+#
+   Raz [F:SCS]SCOPUU : Raz [F:SCS]OPESTRCOE : Raz [F:SCS]OPESTUCOE
+   Call UPD_SRV_UOM(-1) From SCOLIB
+Endif
+
+# Lecture Service
+# -----------------------------
+Local Integer  WOK
+WOK = func ITMLIB.IS_ITF_OK([F:SCS]SRVITMREF,[F:SCS]PRHFCY)
+# FQ 59223 Article-Site facultatif sur le Service, ne pas renvoyer d'erreur
+#If WOK<2 : GOK=0 : End : Endif
+If WOK<2 : Raz GMESSAGE : GERR=0 : Endif
+
+# Issue 94619 GA 11/2013 à faire avant UPD_SRV_DAT
+Gosub INIT_TARIF
+
+# Qtés Ordre de sous-traitance
+# -----------------------------
+# Issue 89037 GA 03/2013 rectification des lignes SCS sans qté | [F:SCS]EXTSTRQTY=0
+# FQ 68321 GA 10/2010 planning global qtés SCS et SCM restent nulles
+#If ([M:SCOK]EXTQTY <> [M:SCOK]PRVQTY )
+If ([M:SCOK]EXTQTY <> [M:SCOK]PRVQTY | [M:SCOK]CODMAJ<>"M" | [F:SCS]EXTSTRQTY=0 )
+    Call UPD_SRV_QTY([M:SCOK]EXTQTY,[F:SCS]OPESTU,[F:SCS]SCOPUU,-1) From SCOLIB
+Endif
+
+# Dates Ordre de sous-traitance
+# -----------------------------
+# Issue X3-68900 - 2018-03-12 by MUARN : si pas de commande mise à jour, sinon si date plus éloignée
+If [F:SCI]POHNUM = "" | ( [F:SCI]POHNUM<>"" & [M:SCOK]ENDDAT > [F:SCS]OPEEND )
+  If [M:SCOK]ENDDAT<>[0/0/0] & [M:SCOK]ENDDAT <> [F:SCS]OPEEND
+     [F:SCS]OPEEND = [M:SCOK]ENDDAT
+  #   [F:SCS]OPESTR = [0/0/0] # Issue 102679 GA 09/2014
+  Endif
+Endif
+# Issue X3-68900 - 2018-01-24 by MUARN : modification dates sur EO ajout UPDSCO
+If [M:SCOK]STRDAT<>[0/0/0] & [M:SCOK]STRDAT<>[F:SCS]OPESTR & [M:SCOK]UPDSCO = 2
+   [F:SCS]OPESTR = [M:SCOK]STRDAT
+   If [M:SCOK]CODMAJ<>"M" [F:SCS]OPEEND = [0/0/0] Endif # Issue 102679 GA 09/2014
+Endif
+If [F:SCS]OPEEND = [0/0/0] | [M:SCOK]CODMAJ<>"M"        # Issue 102679 GA 09/2014
+  If [F:SCS]SCOLTI=0 & [F:SCI]LTI>0 [F:SCS]SCOLTI=[F:SCI]LTI Endif  # Issue 100424 GA 07/2014
+  Local Integer WOFS : WOFS=[F:SCS]SCOLTI
+  Call UPD_SRV_DAT(WOFS,[F:SCS]OPESTR,[F:SCS]OPEEND,-1) From SCOLIB
+Endif
+
+If [F:SCS]NETPRI=0
+# ------------------------------------------------
+# Recherche tarif - Ajouté FQ 72413 GA 03/2011
+# ------------------------------------------------
+    # Issue 94619 GA 11/2013 à faire avant UPD_SRV_DAT cf + haut
+    # Gosub INIT_TARIF
+    Call UPD_SRV_PRI(-1) From SCOLIB
+Else
+
+# FQ 76403 GA 09/2011 toujours recalculer les montants convertis
+    Gosub CALC_LINAMT_SCS  From SCOLIB
+Endif
+
+# mise à jour priorité
+# -----------------------------
+If [F:SCS]PIO <> [M:SCOK]PIO & [M:SCOK]PIO<>0
+   [F:SCS]PIO  = [M:SCOK]PIO
+Endif
+
+# changt de statut de l'ordre de sous-traitance
+[F:SCS]WIPSTA  = [M:SCOK]SCOSTA
+
+
+End
+
+#########################################################################
+Subprog UPD_SCM_FROM_SCOK
+#########################################################################
+Local    Decimal  WQTY, WDIS, WQTYN, WQTYNA, WQTYB, WQTYBA, WLIEN, WMFGQTY
+Local    Char     WSTU(GLONUOM)
+# si composant texte ou matière exclue, on ressort
+If ([F:SCM]CPNTYP=5 | [F:SCM]MATSTA=4 ) : End : Endif
+
+# Sites Ordre de sous-traitance
+# -----------------------------
+If [M:SCOK]STOFCY<>"" & [F:SCM]SCOFLG<3
+   [F:SCM]STOFCY  = [M:SCOK]STOFCY
+Endif
+If [M:SCOK]MFGFCY<>"" & [F:SCM]SCOFLG=3
+   [F:SCM]STOFCY  = [M:SCOK]MFGFCY
+Endif
+
+# Issue 88814 GA 05/2013 Pouvoir rendre STOFCY et LOC obligatoire
+If dim(GEOMLOC)>0 & GEOMLOC=1 & [F:SCM]SCOFLG=2 & ([F:SCM]STOFCY="" | [F:SCM]LOC="")
+   # Livraison pour sous-traitance : L'emplacement doit être renseigné !
+   GMESSAGE=mess(1,762,1) - "(LOC)\"+mess(237,192,1)
+   GOK=0 : End
+Endif
+
+# Lecture composant matière
+# -----------------------------
+Local Integer WOK
+#WOK = func ITMLIB.IS_ITF_OK([F:SCM]ITMREF,[F:SCM]STOFCY)  # Issue 81641 recontrole site
+WOK = func ITMLIB.IS_ITF_OK([F:SCM]CPNITMREF,[F:SCM]STOFCY)
+If WOK<2 : mkstat=2 : End : Endif
+
+
+# Qtés Ordre de sous-traitance
+# -----------------------------
+# Issue 89037 GA 03/2013 rectification des lignes SCM sans qté | [F:SCM]RETQTY=0
+# FQ 68321 GA 10/2010 planning global qtés SCS et SCM restent nulles
+#If ([M:SCOK]EXTQTY <> [M:SCOK]PRVQTY )
+If ([M:SCOK]EXTQTY <> [M:SCOK]PRVQTY | [M:SCOK]CODMAJ<>"M" | [F:SCM]RETQTY=0 )
+   Call UPD_MAT_QTY([M:SCOK]EXTQTY,-1) From SCOLIB
+Endif
+
+If [F:SCM]NETPRI=0 & [F:SCM]SCOFLG=3
+# ------------------------------------------------
+# Recherche tarif - Ajouté FQ 72413 GA 03/2011
+# ------------------------------------------------
+    Gosub INIT_TARIF
+    Call UPD_MAT_PRI(-1) From SCOLIB
+Else
+  # FQ 76403 GA 09/2011 toujours recalculer les montants convertis
+    Gosub CALC_LINAMT_SCM  From SCOLIB
+Endif
+
+# Dates Ordre de sous-traitance
+# -----------------------------
+# expédition des matières
+If [M:SCOK]ENDDAT <> [0/0/0] & [F:SCM]SCOFLG=2
+   Local Integer WOFS : WOFS=[F:SCM]BOMOFS
+   Local Date    WSTRDAT,WENDDAT,WDLVDAT
+   If [F:SCS]OPESTR<>[0/0/0] WSTRDAT=[F:SCS]OPESTR Else WSTRDAT=[M:SCOK]STRDAT Endif
+   If [F:SCS]OPEEND<>[0/0/0] WENDDAT=[F:SCS]OPEEND Else WENDDAT=[M:SCOK]ENDDAT Endif
+   Call UPD_MAT_DAT(WSTRDAT, WENDDAT,[F:SCM]STOFCY,WOFS,WDLVDAT) From SCOLIB
+   # Issue 102679 GA 09/2014 updated only if [F:SCS]OPESTR or [F:SCM]BOMOFS was changed
+   If [M:SCOK]CODMAJ<>"M" | WDLVDAT<>[F:SCM]DLVDAT
+      [F:SCM]DLVDAT=WDLVDAT
+   Endif
+Endif
+
+# mise à jour priorité
+# -----------------------------
+If [F:SCM]PIO <> [M:SCOK]PIO & [M:SCOK]PIO<>0
+   [F:SCM]PIO  = [M:SCOK]PIO
+Endif
+If [F:SCM]PIO = 0 : [F:SCM]PIO = 1 : Endif : # donnée Obligatoire pour [F:ORD]
+
+# changt de statut de l'ordre de sous-traitance
+[F:SCM]WIPSTA  = [M:SCOK]SCOSTA
+
+End
+
+# Issue 85528 10/2012 cas particulier changt site de commande
+#---------------------------------------------------------------------#
+# Changement de site d'achat d'un EO à la génération d'une commande   #
+#---------------------------------------------------------------------#
+# Entrée  LVCRNUM     : N° de pièce                                   #
+#         LVCRLIN     : N° ligne                                      #
+# Sortie  LRET        : 0 Ok ; 1 Pb                                   #
+#---------------------------------------------------------------------#
+Subprog UPD_POHFCY(LVCRNUM, LVCRLIN, LPOHFCY, LRET)
+Value    Char    LVCRNUM
+Value    Integer LVCRLIN
+Value    Char    LPOHFCY
+Variable Integer LRET    : LRET=0
+
+   Gosub OPEN_FILES_SCO From SCOLIB
+   Readlock [SCO]SCO0=LVCRNUM
+   If !fstat
+      If [F:SCO]POHFCY<>LPOHFCY
+         Read [SCI]SCI0=LVCRNUM;LVCRLIN
+         If !fstat & [F:SCI]ORDQTY>0
+          # Traitement impossible :\cette ligne est passée en commande
+          # Le site de commande est différent !
+            GMESSAGE=mess(38,192,1)+"\"+mess(288,194,1)-[F:SCO]POHFCY-"=>"-LPOHFCY
+            Unlock [F:SCO]
+            LRET=1
+            End
+         Else
+            #Call ECR_TRACE("MAJ_EOF2POF: change POHFCY from"-[F:SCO]POHFCY-"to"-LPOHFCY,0) From GESECRAN
+            [F:SCO]POHFCY=LPOHFCY
+            Gosub REWRITE_SCO From SCOLIB
+
+           # A RAJOUTER: ctrl relatifs à la gestion des devises ? tarifs ?
+         Endif
+      Endif
+      Unlock [F:SCO]
+   Endif
+ End
+#---------------------------------------------------------------------#
+# Raz information contremarque sous-traitance (suppression cde vente) #
+#---------------------------------------------------------------------#
+# Entrée  LVCRNUM     : N° de pièce                                   #
+#         LVCRLIN     : N° ligne                                      #
+# Sortie  LRET        : 0 Ok ; 1 Pb                                   #
+#---------------------------------------------------------------------#
+Subprog RAZFMISCO(LVCRNUM, LVCRLIN, LRET)
+Value    Char    LVCRNUM
+Value    Integer LVCRLIN
+Variable Integer LRET    : LRET=0
+
+If clalev ([F:SCI]) = 0  : Local File SCOITM [SCI]   : Endif
+If clalev ([F:ORD]) = 0  : Local File ORDERS [ORD]   : Endif
+#If clalev([M:ORCK])  = 0 : Local Mask ORCK   [ORCK]  : Endif
+
+Readlock [SCI]SCI0 = LVCRNUM;LVCRLIN
+If fstat
+   # GH 06/07/2012 bug 83344 avant d'afficher une erreur dans la trace, voir s'il ne s'agirait pas d'un OF plutôt
+   # LRET=1 : Call RSTA("SCI", LVCRNUM-num$(LVCRLIN)) From GLOCK : End
+   LRET=-1 : End
+Endif
+
+If [F:SCI]WIPNUM<>"" & [F:SCI]WIPTYP=13
+   # mise à jour encours EOx
+   Readlock [ORD]ORD0 = [F:SCI]WIPTYP;[F:SCI]WIPNUM;[F:SCI]ITMREF
+   If fstat : LRET = 1 : Call FSTA("ORD") From GLOCK : End : Endif
+
+   [F:ORD]FMI = 1
+   #If [F:SCO]MFGFCY<>""
+   #   [F:ORD]BPRNUM = [F:SCO]MFGFCY  : # site de production (???)
+   #Else
+   #   [F:ORD]BPRNUM = [F:SCO]BPRNUM  : # fournisseur
+   #Endif
+   Raz [F:ORD]VCRTYPORI, [F:ORD]VCRNUMORI, [F:ORD]VCRLINORI, [F:ORD]VCRSEQORI
+
+   Rewrite [F:ORD]
+   If fstat : LRET=1 : Call FSTA("ORD") From GLOCK : Endif
+Endif
+
+# raz données contremarque
+#[F:SCI]FMI = 1             # FQ 65646 champ inexistant
+#[F:SCI]BPCTYPDEN = 1
+#[F:SCI]BPCNUM    = [F:SCO]MFGFCY
+Raz [F:SCI]VCRTYPORI, [F:SCI]VCRNUMORI, [F:SCI]VCRLINORI, [F:SCI]VCRSEQORI
+
+Gosub REWRITE_SCI
+
+# V6 Affectations
+If [F:SCI]WIPSTA=1 Gosub MAJ_MTO_SCI From SCOMTOLIB Endif
+
+End
+
+
+
+#########################################################################
+$WRITE_SCO
+#
+# cas particulier du picking des besoins EOS
+# lorsqu'on est en création dans la fenêtre OSCO,
+# => pas d'insertion mais affichage
+If clalev([M:SCO0])<>0 : #### & GREP="C"
+   [M:SCO0] = [F:SCO]
+   [M:SCO1] = [F:SCO]
+Else
+   Gosub WRITE_SCO From SCOLIB
+Endif
+Return
+
+#########################################################################
+$WRITE_SCI
+#
+# cas particulier du picking des besoins EOS
+# lorsqu'on est en création dans la fenêtre OSCO,
+# => pas d'insertion mais affichage
+If clalev([M:SCO0])<>0 : #### & GREP="C"
+   [M:SCO0] = [F:SCI]
+   [M:SCO1] = [F:SCI]
+Else
+  # création encours EOx
+   Call UPDATE_EOX("C") From SCOLIB
+
+   #----- Ecriture des comptes et sections de la ligne de document -----#
+   #Call UPDATE_SCI_CPTANALIN ("C") From SCOCPTLIB
+   # Issue 90716 GA 06/2013
+   Gosub CRESCI_CPTANALIN From SCOCPTLIB
+
+   Gosub WRITE_SCI From SCOLIB
+Endif
+Return
+
+#########################################################################
+$WRITE_SCM
+#
+# cas particulier du picking des besoins EOS
+# lorsqu'on est en création dans la fenêtre OSCO,
+# => pas d'insertion mais affichage
+If clalev([M:SCO0])<>0 : #### & GREP="C"
+   nolign=NOL
+   [M:SCO2] = [F:SCM]
+   If NOL > [M:SCO2]NBLIG : [M:SCO2]NBLIG=NOL : Endif
+Else
+  # création encours MSx et des ALLocations
+   Call UPDATE_MSX("C",1) From SCOLIB
+
+   #----- Ecriture des comptes et sections de la ligne de document -----#
+   #Call UPDATE_SCM_CPTANALIN ("C",0) From SCOCPTLIB
+   # Issue 90716 GA 06/2013
+   Gosub CRESCM_CPTANALIN From SCOCPTLIB
+
+   Gosub WRITE_SCM From SCOLIB
+Endif
+Return
+
+#########################################################################
+$WRITE_SCS
+#
+# cas particulier du picking des besoins EOS
+# lorsqu'on est en création dans la fenêtre OSCO,
+# => pas d'insertion mais affichage
+If clalev([M:SCO0])<>0 : #### & GREP="C"
+   [M:SCO3] = [F:SCS]
+Else
+  # encours SCx
+   Call UPDATE_SCX("C") From SCOLIB
+
+   #----- Ecriture des comptes et sections de la ligne de document -----#
+   #Call UPDATE_SCS_CPTANALIN ("C") From SCOCPTLIB
+   # Issue 90716 GA 06/2013
+   Gosub CRESCS_CPTANALIN From SCOCPTLIB
+
+   Gosub WRITE_SCS From SCOLIB
+Endif
+Return
+
+#########################################################################
+$REWRITE_SCI                               # suite Issue 87818 GA 04/2013
+#
+  # maj encours EOx
+   Call UPDATE_EOX("M") From SCOLIB
+
+   #----- Ecriture des comptes et sections de la ligne de document -----#
+   #Call UPDATE_SCI_CPTANALIN ("M") From SCOCPTLIB
+   # Issue 90716 GA 06/2013
+   Gosub MAJSCI_CPTANALIN From SCOCPTLIB
+
+   Gosub REWRITE_SCI From SCOLIB
+
+Return
+
+#########################################################################
+$REWRITE_SCM                               # suite Issue 87818 GA 04/2013
+#
+  # maj encours MSx et des ALLocations
+   Call UPDATE_MSX("M",1) From SCOLIB
+
+   #----- Ecriture des comptes et sections de la ligne de document -----#
+   #Call UPDATE_SCM_CPTANALIN ("M",0) From SCOCPTLIB
+   # Issue 90716 GA 06/2013
+   Gosub MAJSCM_CPTANALIN From SCOCPTLIB
+
+   Gosub REWRITE_SCM From SCOLIB
+
+Return
+
+#########################################################################
+$REWRITE_SCS                               # suite Issue 87818 GA 04/2013
+#
+  # maj encours SCx
+   Call UPDATE_SCX("M") From SCOLIB
+
+   #----- Ecriture des comptes et sections de la ligne de document -----#
+   #Call UPDATE_SCS_CPTANALIN ("M") From SCOCPTLIB
+   # Issue 90716 GA 06/2013
+   Gosub MAJSCS_CPTANALIN From SCOCPTLIB
+
+   Gosub REWRITE_SCS From SCOLIB
+
+Return
+#########################################################################
+$CTRL_FCY   : # init par défaut des différents codes FCY en création/maj
+If [M:SCOK]POHFCY="" & [M:SCOK]STOFCY<>""
+   [M:SCOK]POHFCY=[M:SCOK]STOFCY
+Endif
+# Issue 86439 GA 12/2012
+# lecture alternative nomenclature: ctrl du site de réception
+If [M:SCOK]BOMALT<>0
+  Read [TBO]TBO0=3;[M:SCOK]BOMALT
+  If fstat : End : Endif
+  If [F:TBO]FCY<>""
+     If [M:SCOK]PRHFCY=""
+        [M:SCOK]PRHFCY=[F:TBO]FCY
+     Elsif [M:SCOK]PRHFCY<>[F:TBO]FCY
+        Call ECR_TRACE([M:SCOK]PRHFCY-mess(48,193,1)-num$([M:SCOK]BOMALT),1) From GESECRAN
+        WOK=0 : Return
+     Endif
+  Endif
+Endif
+If [M:SCOK]PRHFCY="" & [M:SCOK]POHFCY<>""
+   [M:SCOK]PRHFCY=[M:SCOK]POHFCY
+Endif
+# Issue 86437 GA 12/2012 before [M:SCOK]POHFCY
+# Issue 80579 Import PEO: STOFCY is empty
+If [M:SCOK]STOFCY="" & [M:SCOK]PRHFCY<>""
+   [M:SCOK]STOFCY=[M:SCOK]PRHFCY
+Endif
+# [M:SCOK]MFGFCY renseigné uniquement en inter-site = site associé au fournisseur
+#If [M:SCOK]MFGFCY="" & [M:SCOK]POHFCY<>""
+#   [M:SCOK]MFGFCY=[M:SCOK]POHFCY
+#Endif
+
+# Issue 86437 GA 12/2012
+#If [M:SCOK]POHFCY<>[M:SCOK]PRHFCY
+  If clalev([F:FCY1]) = 0 : Local File FACILITY   [FCY1] : Endif
+  If clalev([F:FCY2]) = 0 : Local File FACILITY   [FCY2] : Endif
+  Read [FCY1]FCY0=[M:SCOK]POHFCY : If fstat : Raz [F:FCY1] : Endif
+  Read [FCY2]FCY0=[M:SCOK]PRHFCY : If fstat : Raz [F:FCY2] : Endif
+  If [F:FCY1]PURFLG<>2
+     # Le site n'est pas un site d'achat
+     Call ECR_TRACE([F:FCY1]FCY-mess(145,194,1),1) From GESECRAN
+     WOK=0 : Return
+  Endif
+  If [F:FCY2]WRHFLG<>2
+     # Le site n'est pas un site de stock
+     Call ECR_TRACE([F:FCY2]FCY-mess(61,187,1),1) From GESECRAN
+     WOK=0 : Return
+  Endif
+  If [F:FCY1]LEGCPY<>[F:FCY2]LEGCPY
+     # Le site n'est pas sur la même société juridique
+     Call ECR_TRACE([F:FCY1]FCY-"/"-[F:FCY2]FCY-mess(2,194,1)-[F:FCY1]LEGCPY-"/"-[F:FCY2]LEGCPY,1) From GESECRAN
+     WOK=0 : Return
+  Endif
+#Endif
+Return
+##################################################################
+#-----------------------------------------------------#
+# Contrôle et chargement des zones pour l'inter-sites #
+# --------------------------------------------------- #
+# LPOHFCY : Site de commande                          #
+# LBPRNUM : Fournisseur de la commande                #
+#-----------------------------------------------------#
+Subprog CTRL_INTERSITE (LPOHFCY,LBPRNUM)
+Variable Char    LPOHFCY
+Variable Char    LBPRNUM
+
+If LBPRNUM="" : End : Endif
+Local Char    WBPCORD(GLONBPR),WBPCINV(GLONBPR)
+Local Char    WSALFCY(GLONFCY)
+Local Integer WDME,WBETFCY,WBETCPY
+
+Raz [F:SCO]MFGFCY
+Call CTRL_INTERSITE(LPOHFCY,LBPRNUM,2,WBETFCY,WBETCPY,WSALFCY,
+&                   [F:SCO]MFGFCY,WBPCORD,[F:SCO]INVFCY,WBPCINV,
+&                   WDME) From TRTACHCTL1
+[F:SCO]BETFCY = WBETFCY
+[F:SCO]BETCPY = WBETCPY
+End
+
+$INIT_TARIF
+# FQ 72413 GA 03/2011 appel Tarif achat
+If clalev([F:BPC]) = 0 : Local File BPCUSTOMER [BPC] : Endif
+If clalev([F:BPD]) = 0 : Local File BPDLVCUST  [BPD] : Endif
+If clalev([F:BPS]) = 0 : Local File BPSUPPLIER [BPS] : Endif  # FQ 73060 GA 04/2011 pour UTIACH28
+If clalev([F:BPR]) = 0 : Local File BPARTNER   [BPR] : Endif  # FQ 73060 GA 04/2011 pour UTIACH28
+If clalev([F:MVS]) = 0 : Local File BPSUPPMVT  [MVS] : Endif
+If clalev([F:TCY]) = 0 : Local File TABCOUNTRY [TCY] : Endif
+If clalev([F:FCY]) = 0 : Local File FACILITY   [FCY] : Endif
+If clalev([F:POS]) = 0 : Local File POSCOD     [POS] : Endif
+If clalev([F:PPK]) = 0 : Local File PPRICLINK  [PPK] : Endif
+If clalev([F:TCU]) = 0 : Local File TABCUR     [TCU] : Endif
+#----- Ouverture fichiers pour inter-sites / inter-sociétés -----#
+If GMODU(5)=2 : # Si module Ventes présent
+  If !clalev([F:ITS]) : Local File ITMSALES   [ITS] : Endif
+  If !clalev([F:MVC]) : Local File BPCUSTMVT  [MVC] : Endif
+  If !clalev([F:SOH]) : Local File SORDER     [SOH] : Endif
+Endif
+
+#-----------------------------------------------------#
+# Contrôle existence de la structure tarif par défaut #
+# et chargement des libellés colonnes par défaut      #
+#-----------------------------------------------------#
+#####Raz GRCPFCY, GPLISTC, GPUU, GREVFLG, GAPPFLG, GPLIFLG, GVACFLG, GDATFLG,
+#####&   GCOEUOM, GPURTRACE
+Local Libelle  WMODULE : WMODULE=6
+Local Integer  I, WRET
+#Local Char     CODE(3)
+#Local Shortint OUVFICFLG
+#Local Integer  I, WRET, WCOD, MAJCDE
+#Local Libelle  WPE_POHCLEFLG, WCLEFLG, WTRAIT
+Call CTLSTRUCT(2,WRET) From TRTPRICE
+If WRET<>0 OK=0 : Return : Endif
+
+#----- Chargement libellés et formats colonnes tarif -----#
+# FQ 72413 GA 05/2011 1er passage, on devrait avoir GPLISTC="none" => ajout | GPLISTC=""
+If GPLISTC<>[F:BPS]PLISTC | GPLISTC=""
+  GPLISTC=[F:BPS]PLISTC
+  Call COLREM("C",2,[F:BPS]PLISTC) From TRTPRICE
+  Call TYPREM(2,[F:BPS]PLISTC)     From TRTPRICE
+  Call TARIFCHGT(6)                From TRTPRICE
+Endif
+
+
+Return
+
+##################################################################
+#---------------------------------------------#
+# Messages en cas d'abandon de la transaction #
+#---------------------------------------------#
+$AB_TRANSACTION_MSG
+  If GMESSAGE<>""   # FQ 68321 GA 10/2010 afficher d'abord le message d'erreur ;-)
+     Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+  Endif
+  GMESSAGE=mess(157,199,1)  : # Transaction abandonnée
+  Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+  Raz GMESSAGE
+Return
+
+# ---------------------------------------------------------------------------
+# Issue 105251 GA 04/2015
+# New entry point: how to select components validity date in a BOM
+# ---------------------------------------------------------------------------
+# Variable must be declared: Local Integer WBOMDATCTL
+# - WBOMDATCTL=2 start date is used (standard behavior)
+# - WBOMDATCTL=1 end   date is used
+# ---------------------------------------------------------------------------
+$PE_BOMDATCTL
+If dim(WBOMDATCTL)<0 Return Endif
+GPE=0 : GPOINT = "BOMDATCTL" : Gosub ENTREE From EXEFNC
+If GPE : WBOMDATCTL=GPE : Endif
+Return
+

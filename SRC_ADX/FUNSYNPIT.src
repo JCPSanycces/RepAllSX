@@ -1,0 +1,886 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#########################################################################
+#    ACTION MODELISATION E-COMMERCE                                     #
+#                                                                       #
+# GACTION  : TRTSYNCW   : Action resynchronisation encours              #
+#                                                                       #
+#########################################################################
+$ACTION
+  Case ACTION
+    When "INIT"         : Gosub INIT
+    When "INIT_DIA"     : Gosub INIT_DIA
+    When "EXEC"         : Gosub EXEC
+    When "SEL_TABLE"    : Gosub SEL_TABLE
+  Endcase
+Return
+
+$INIT
+
+  Local File ITMFACILIT   [ITF]
+  Local File ITMMASTER    [ITM]
+  Local File FISCALYEAR   [FIY]
+  Local File PERIOD       [PER]
+  Local File TABCOSTMET   [TCM]
+  Local File STOJOU       [STJ]
+  Local File ITMCOSTPIT   [ITCP]
+  Local File ITMMVTPIT    [ITVP]
+  Local File STOLOTFCYPIT [SLFP]
+  Local File STOCOSTPIT   [STPP]
+  Local File ITCPITTMP    [ITCT]
+  Local File ITVPITTMP    [ITVT]
+  Local File SLFPITTMP    [SLFT]
+  Local File STPPITTMP    [STPT]
+
+  Local Char WMESS(85)
+
+Return
+
+$INIT_DIA
+  # Default to the default company
+  [M:DIA]CPY = GDEFSOC
+  [M:DIA]SIM = [V]CST_AYES
+Return
+
+$EXEC
+
+  # Open the log file
+  Call TITAWI(BCRIT,TIT) From OBJDIV    # Use the window title for the log file title
+  Call OUVRE_TRACE(TIT) From LECFIC
+  Call ECR_TRACE(" ",0) From GESECRAN
+  Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+  Call PRTSCR("SYNPIT","DIA","",0,1) From ATRTX3
+  Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+  Call ECR_TRACE(" ",0) From GESECRAN
+  TRA=1   # Display the log file at the end
+
+  # Verify that the temp tables are clean before starting
+  Call CLEARTEMPTABLES
+
+  # Call the resync
+  If [M:DIA]TOUSITE = [V]CST_AYES
+    Call REYNC_ALL_SITES
+  Else
+    Call RESYNC_PIT([M:DIA]STOFCY)
+  Endif
+
+  # Clean up any records created when done
+  Call CLEARTEMPTABLES
+
+  Call FERME_TRACE From LECFIC
+
+Return
+
+$SEL_TABLE
+  Case COUZON
+    When "PERNUM" : Gosub S_PER
+  Endcase
+Return
+
+$S_PER
+
+  CRITERE="[F:PER]CPY='"+[M:DIA]CPY+"' AND [F:PER]LEDTYP=1 AND [F:PER]FIYNUM="+num$([M:DIA]FIYNUM)
+  TIT(0)=mess(18,100,1) # window title
+
+  NBCOL  = 0
+  NBCOL += 1 : COL(NBCOL)="PERNUM" : Call TITZON("PERIOD","PERNUM",TIT(NBCOL)) From CONTOBJ
+  NBCOL += 1 : COL(NBCOL)="PERSTR" : Call TITZON("PERIOD","PERSTR",TIT(NBCOL)) From CONTOBJ
+  NBCOL += 1 : COL(NBCOL)="PEREND" : Call TITZON("PERIOD","PEREND",TIT(NBCOL)) From CONTOBJ
+
+  Default File [PER]
+
+Return
+
+######################################################################################
+Subprog REYNC_ALL_SITES
+
+Local File FACILITY [FCY]
+
+  Filter [FCY] Where LEGCPY=[M:DIA]CPY and WRHFLG=2
+  For [FCY]
+    Call RESYNC_PIT([F:FCY]FCY)
+  Next
+  Filter [FCY]
+
+End
+
+######################################################################################
+Subprog RESYNC_PIT(SITE)
+Value Char SITE
+
+  Local Char CRITITF(255), CRITSTJ(255), CRITSTJ2(255)
+  Local Char LTCM(3)
+  Local Integer LRET, LERR, I
+  Local Integer PROD_COUNT, DESYNC_COUNT
+  Local Date LSTRDAT, HISTDATE
+  Local Integer NUMYEAR, NUMMONTH, NUMDAY
+  Local Char DATESTRING(20)
+  Local Integer LFIY, LPER, LHIST
+
+
+  CRITITF = "STOFCY='"+SITE+"'"
+  If ITMREFSTR <> ""
+    CRITITF += " and ITMREF >= '"+[M:DIA]ITMREFSTR+"'"
+    CRITITF += " and ITMREF <= '"+[M:DIA]ITMREFEND+"'"
+  Endif
+
+  Raz PROD_COUNT, DESYNC_COUNT
+
+  Filter [ITF] Where evalue(CRITITF)
+  For [ITF]
+    Raz LERR
+    PROD_COUNT += 1
+
+    Trbegin [ITCP], [ITVP], [STPP], [SLFP], [STJ]
+
+    # Set the start date for clearing the history
+    LSTRDAT = [M:DIA]PERSTR
+
+    # Look for any history records newer than the start date
+    For I = dim([F:ITF]VLTCODDAT)-1 To 0 Step -1
+      # Convert the DATETIME from history to Date so we can compare to PIT table
+      If [F:ITF]VLTCODDAT(I) <> AVOID.ADATTIM
+        DATESTRING  = num$([F:ITF]VLTCODDAT(I))
+        NUMYEAR     = val(left$(DATESTRING, 4))
+        NUMMONTH    = val(mid$(DATESTRING, 6, 2))
+        NUMDAY      = val(mid$(DATESTRING, 9, 2))
+
+        # Save the date portion as a date type so we can add to it if needed.
+        HISTDATE    = evalue("["+num$(NUMDAY)+"/"+num$(NUMMONTH)+"/"+num$(NUMYEAR)+"]")
+
+        # If this history date is greater than our start date, we have to clear it out
+        If HISTDATE >= LSTRDAT
+          Read [TCM]TCM0=[F:ITF]VLTCODHIS(I)
+
+          Call CLEAR_PIT_HISTORY(LSTRDAT, LERR)
+
+          # Set the start date to this history date so next round get cleared starting here.
+          Call GETPERIOD([F:ITF]STOFCY, 1, HISTDATE, LFIY, LPER) From CPTSUB
+          LSTRDAT = [F:PER]PERSTR
+        Endif
+      Endif
+    Next
+
+    # Read the current valuation method
+    Call GETTCM([F:ITF]ITMREF,[F:ITF]STOFCY,LTCM,LRET) From STKVAL
+    If LRET | LTCM= ""
+      Goto NEXT_PROD
+    Endif
+
+    # Clear the history for the current valuation method
+    Call CLEAR_PIT_HISTORY(LSTRDAT, LERR)
+    If LERR : Goto NEXT_PROD : Endif
+
+    # Loop through STOJOU records for Product/Site
+    # Set PITVALFLGs to 0 and re-run PIT update
+    CRITSTJ  = "ITMREF='"+[F:ITF]ITMREF+"'"
+    CRITSTJ += " & STOFCY='"+[F:ITF]STOFCY+"'"
+    CRITSTJ += " & UPDCOD=2"
+
+    # Use ACCDAT if there is one, IPTDAT if not
+    CRITSTJ -= ' & ((ACCDAT<>[0/0/0] & ACCDAT >= [M:DIA]PERSTR)'
+    CRITSTJ -= '| (ACCDAT=[0/0/0] & IPTDAT >= [M:DIA]PERSTR))'
+#    CRITSTJ += " & IPTDAT >= [M:DIA]PERSTR"
+
+    CRITSTJ2 = " find(TRSTYP,7,8,9,10,15,16,17,18,20,21,25,26,27,28,30,31,32,33,34)=0"
+    # Don't recalc anything that hasn't been calced already
+    If GACTVLT2
+      CRITSTJ2 += " & (PITVALFLG = 2 | PITVALFLG2 = 2)"
+    Else
+      CRITSTJ2 += " & PITVALFLG = 2"
+    Endif
+
+    Filter [STJ] Where evalue(CRITSTJ) and evalue(CRITSTJ2) Order By STOFCY;IPTDAT;ITMREF;MVTSEQ;MVTIND
+    For [STJ]
+      [F:STJ]PITVALFLG = 0
+      If GACTVLT2 : [F:STJ]PITVALFLG2 = 0 : Endif
+
+      Call PITUPDATE From STKPITLIB
+
+    Next
+    Filter [STJ]
+
+    # Set the start date for verifications
+    LSTRDAT = [M:DIA]PERSTR
+
+    # Verify any records for historical records
+    For I = dim([F:ITF]VLTCODDAT)-1 To 0 Step -1
+      # Convert the DATETIME from history to Date so we can compare to PIT table
+      If [F:ITF]VLTCODDAT(I) <> AVOID.ADATTIM
+        DATESTRING  = num$([F:ITF]VLTCODDAT(I))
+        NUMYEAR     = val(left$(DATESTRING, 4))
+        NUMMONTH    = val(mid$(DATESTRING, 6, 2))
+        NUMDAY      = val(mid$(DATESTRING, 9, 2))
+
+        # Save the date portion as a date type so we can add to it if needed.
+        HISTDATE    = evalue("["+num$(NUMDAY)+"/"+num$(NUMMONTH)+"/"+num$(NUMYEAR)+"]")
+
+        # If this history date is greater than our start date, we have to clear it out
+        If HISTDATE >= LSTRDAT
+          Read [TCM]TCM0=[F:ITF]VLTCODHIS(I)
+
+          Call VERIF_NEW_VALUES(LSTRDAT, DESYNC_COUNT)
+
+          # Set the start date to this history date so next round get cleared starting here.
+          Call GETPERIOD([F:ITF]STOFCY, 1, HISTDATE, LFIY, LPER) From CPTSUB
+          LSTRDAT = [F:PER]PERSTR
+        Endif
+      Endif
+    Next
+
+    # Read the current valuation method
+    Call GETTCM([F:ITF]ITMREF,[F:ITF]STOFCY,LTCM,LRET) From STKVAL
+    If LRET | LTCM= ""
+      Goto NEXT_PROD
+    Endif
+
+    # Verify the current valuatoin method
+    Call VERIF_NEW_VALUES(LSTRDAT, DESYNC_COUNT)
+    If LERR : Goto NEXT_PROD : Endif
+
+    $NEXT_PROD
+    If LERR
+      WMESS = mess(17,107,1)+":"-[F:ITF]ITMREF-";"-[F:ITF]STOFCY
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      Rollback
+    Elsif [M:DIA]SIM = [V]CST_AYES
+      Rollback
+    Else
+      Commit
+    Endif
+  Next
+  Filter [ITF]
+
+  If [M:DIA]TOUSITE = [V]CST_AYES
+    WMESS = mess(498,197,1)-SITE-mess(95,103,1)
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+  Endif
+
+  If PROD_COUNT
+    WMESS = func AFNC.MES1(mess(670,199,1),num$(PROD_COUNT))
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+  Endif
+
+  If DESYNC_COUNT
+    If [M:DIA]SIM = [V]CST_ANO
+      #WMESS = num$(DESYNC_COUNT)-mess(266,197,1)
+      WMESS = func AFNC.MES1(mess(674,199,1),num$(DESYNC_COUNT))
+    Else
+      WMESS = func AFNC.MES1(mess(673,199,1),num$(DESYNC_COUNT))
+    Endif
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+  Else
+    WMESS = mess(671,199,1)
+    Call ECR_TRACE(WMESS,0) From GESECRAN
+  Endif
+
+  Call ECR_TRACE(" ",0) From GESECRAN
+
+End
+
+######################################################################################
+#  Save off to local variables and clear PIT tables
+######################################################################################
+Subprog CLEAR_PIT_HISTORY(PSTRDAT, PERR)
+Value Date PSTRDAT
+Variable Integer PERR
+
+Local Integer LVLTNUM
+
+  # Assumes TABCOSTMET has the correct valuation method read into it
+  LVLTNUM = 1
+  Case [F:TCM]ISSVLTCOD(0)
+    When 1 # Standard
+      Call CLEAR_STD(PSTRDAT, 1, LVLTNUM, PERR)
+    When 2 # Revised Standard
+      Call CLEAR_STD(PSTRDAT, 2, LVLTNUM, PERR)
+    When 4 # Average Cost
+      Call CLEAR_AVC(PSTRDAT, LVLTNUM, PERR)
+    When 5 # FIFO
+      Call CLEAR_FIF(PSTRDAT, LVLTNUM, PERR)
+    When 6 # Average Lot Cost
+      Call CLEAR_ALC(PSTRDAT, LVLTNUM, PERR)
+    When 8 # LIFO
+      Call CLEAR_FIF(PSTRDAT, LVLTNUM, PERR)
+  Endcase
+  If PERR : End : Endif
+
+  LVLTNUM = 2
+  If GACTVLT2 & [F:TCM]ISSVLTCOD(1)>0 & [F:TCM]ISSVLTCOD(1)<>[F:TCM]ISSVLTCOD(0) & !(find([F:TCM]ISSVLTCOD(0),5,8) & find([F:TCM]ISSVLTCOD(1),5,8))
+    Case [F:TCM]ISSVLTCOD(1)
+      When 1 # Standard
+        Call CLEAR_STD(PSTRDAT, 1, LVLTNUM, PERR)
+      When 2 # Revised Standard
+        Call CLEAR_STD(PSTRDAT, 2, LVLTNUM, PERR)
+      When 4 # Average Cost
+        Call CLEAR_AVC(PSTRDAT, LVLTNUM, PERR)
+      When 5 # FIFO
+        Call CLEAR_FIF(PSTRDAT, LVLTNUM, PERR)
+      When 6 # Average Lot Cost
+        Call CLEAR_ALC(PSTRDAT, LVLTNUM, PERR)
+      When 8 # LIFO
+        Call CLEAR_FIF(PSTRDAT, LVLTNUM, PERR)
+    Endcase
+  Endif
+  If PERR : End : Endif
+
+End
+
+Subprog CLEAR_ALC(PSTRDAT, PVLTNUM, PERR)
+Value Date       PSTRDAT
+Value Integer    PVLTNUM
+Variable Integer PERR
+
+  Filter [SLFP] Where ITMREF=[F:ITF]ITMREF and STOFCY=[F:ITF]STOFCY and PERSTR>=PSTRDAT and VLTNUM = PVLTNUM
+  For [SLFP]SLFP0
+    # Store the original values into a temp table
+    [F:SLFT] = [F:SLFP]
+    [F:SLFT]SYNNUM = adxuid(1)
+    Write [F:SLFT]
+
+    # If first one, only reset period balances - retain start/end
+    If [F:SLFP]PERSTR = PSTRDAT
+      Raz [F:SLFP]PERRCPQTY, [F:SLFP]PERRCPAMT
+      Raz [F:SLFP]PERISSQTY, [F:SLFP]PERISSAMT
+      Raz [F:SLFP]PERVALCHG, [F:SLFP]PERAMTDEV
+      Raz [F:SLFP]PERCUMQTY, [F:SLFP]PERCUMAMT, [F:SLFP]PERCUMAVC
+      [F:SLFP]ENDBASQTY = [F:SLFP]BEGBASQTY
+      [F:SLFP]ENDBASAMT = [F:SLFP]BEGBASAMT
+      [F:SLFP]ENDAVC    = [F:SLFP]BEGAVC
+
+      Rewrite [SLFP]
+    Else
+      Delete [SLFP] Curr
+    Endif
+    If fstat
+      PERR = 1
+      WMESS = mess(815,196,1)-"STOLOTFCYPIT"
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      WMESS = [F:SLFP]ITMREF+";"+[F:SLFP]LOT+";"+[F:SLFP]SLO+";"+[F:SLFP]STOFCY+";"+[F:SLFP]PERSTR+";"
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      Break
+    Endif
+  Next
+  Filter [SLFP]
+End
+
+Subprog CLEAR_AVC(PSTRDAT, PVLTNUM, PERR)
+Value Date       PSTRDAT
+Value Integer    PVLTNUM
+Variable Integer PERR
+
+  Filter [ITVP] Where ITMREF=[F:ITF]ITMREF and STOFCY=[F:ITF]STOFCY and PERSTR>=PSTRDAT and VLTNUM = PVLTNUM
+  For [ITVP]ITVP0
+    # Store the original values into a temp table
+    [F:ITVT] = [F:ITVP]
+    [F:ITVT]SYNNUM = adxuid(1)
+    Write [F:ITVT]
+
+    # If first one, only reset period balances - retain start/end
+    If [F:ITVP]PERSTR = PSTRDAT
+      Raz [F:ITVP]PERRCPQTY, [F:ITVP]PERRCPAMT
+      Raz [F:ITVP]PERISSQTY, [F:ITVP]PERISSAMT
+      Raz [F:ITVP]PERVALCHG, [F:ITVP]PERAMTDEV
+      Raz [F:ITVP]PERCUMQTY, [F:ITVP]PERCUMAMT, [F:ITVP]PERCUMAVC
+      [F:ITVP]ENDBASQTY = [F:ITVP]BEGBASQTY
+      [F:ITVP]ENDBASAMT = [F:ITVP]BEGBASAMT
+      [F:ITVP]ENDAVC    = [F:ITVP]BEGAVC
+
+      Rewrite [ITVP]
+    Else
+      Delete [ITVP] Curr
+    Endif
+    If fstat
+      PERR = 1
+      WMESS = mess(815,196,1)-"ITMMVTPIT"
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      WMESS = [F:ITVP]ITMREF+";"+[F:ITVP]STOFCY+";"+[F:ITVP]PERSTR+";"
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      Break
+    Endif
+  Next
+  Filter [ITVP]
+End
+
+Subprog CLEAR_FIF(PSTRDAT, PVLTNUM, PERR)
+Value Date       PSTRDAT
+Value Integer    PVLTNUM
+Variable Integer PERR
+
+  Filter [STPP] Where ITMREF=[F:ITF]ITMREF and STOFCY=[F:ITF]STOFCY and PERSTR>=PSTRDAT and VLTNUM = PVLTNUM
+  For [STPP]STPP0
+    # Store the original values into a temp table
+    [F:STPT] = [F:STPP]
+    [F:STPT]SYNNUM = adxuid(1)
+    Write [F:STPT]
+
+    # If first one, only reset period balances - retain start/end
+    If [F:STPP]PERSTR = PSTRDAT
+      Raz [F:STPP]PERRCPQTY, [F:STPP]PERRCPCST
+      Raz [F:STPP]PERISSQTY, [F:STPP]PERISSCST
+      Raz [F:STPP]PERVALCHG, [F:STPP]PERVALCHGQTY, [F:STPP]PERAMTDEV
+      Raz [F:STPP]PERCUMQTY, [F:STPP]PERCUMCST
+      [F:STPP]PERENDQTY = [F:STPP]PERBEGQTY
+      [F:STPP]PERENDCST = [F:STPP]PERBEGCST
+
+      Rewrite [STPP]
+    Else
+      Delete [STPP] Curr
+    Endif
+    If fstat
+      PERR = 1
+      WMESS = mess(815,196,1)-"STOCOSTPIT"
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      WMESS = [F:STPP]ITMREF+";"+[F:STPP]STOFCY+";"+[F:STPP]CSTDAT+";"+[F:STPP]CSTTIM+";"+[F:STPP]CSTCOU+";"+[F:STPP]PERSTR+";"
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      Break
+    Endif
+  Next
+  Filter [STPP]
+End
+
+Subprog CLEAR_STD(PSTRDAT,PTYP, PVLTNUM, PERR)
+Value Date       PSTRDAT
+Value Integer    PTYP
+Value Integer    PVLTNUM
+Variable Integer PERR
+
+  Filter [ITCP] Where ITMREF=[F:ITF]ITMREF and STOFCY=[F:ITF]STOFCY and PERSTR>=PSTRDAT and CSTTYP = PTYP and VLTNUM = PVLTNUM
+  For [ITCP]ITCP0
+
+    # Store the original values into a temp table
+    [F:ITCT] = [F:ITCP]
+    [F:ITCT]SYNNUM = adxuid(1)
+    Write [F:ITCT]
+
+    # If first one, only reset period balances - retain start/end
+    If [F:ITCP]PERSTR = PSTRDAT
+      Raz [F:ITCP]PERRCPQTY, [F:ITCP]PERRCPCST
+      Raz [F:ITCP]PERISSQTY, [F:ITCP]PERISSCST
+      Raz [F:ITCP]PERVALCHG, [F:ITCP]PERAMTDEV
+      Raz [F:ITCP]PERCUMQTY, [F:ITCP]PERCUMCST
+      [F:ITCP]PERENDQTY = [F:ITCP]PERBEGQTY
+      [F:ITCP]PERENDCST = [F:ITCP]PERBEGCST
+
+      Rewrite [ITCP]
+    Else
+      Delete [ITCP] Curr
+    Endif
+    If fstat
+      PERR = 1
+      WMESS = mess(815,196,1)-"ITMCOSTPIT"
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      WMESS = [F:ITCP]ITMREF+";"+[F:ITCP]STOFCY+";"+[F:ITCP]PERSTR+";"+num$([F:ITCP]CSTTYP)
+      Call ECR_TRACE(WMESS,1) From GESECRAN
+      Break
+    Endif
+  Next
+  Filter [ITCP]
+End
+
+######################################################################################
+#  Verify the new values and log any changes
+######################################################################################
+Subprog VERIF_NEW_VALUES(PSTRDAT, PCOUNT)
+Value Date PSTRDAT
+Variable Integer PCOUNT
+
+Local Integer LVLTNUM
+
+  # Assumes TABCOSTMET has the correct valuation method read into it
+
+  LVLTNUM = 1
+  Case [F:TCM]ISSVLTCOD(0)
+    When 1 #Standard
+      Call VERIF_STD(PSTRDAT, 1, LVLTNUM, PCOUNT)
+    When 2 #Revised Standard
+      Call VERIF_STD(PSTRDAT, 2, LVLTNUM, PCOUNT)
+    When 4 # Average Cost
+      Call VERIF_AVC(PSTRDAT, LVLTNUM, PCOUNT)
+    When 5 #FIFO
+      Call VERIF_FIF(PSTRDAT, LVLTNUM, PCOUNT)
+    When 6 # Average Lot Cost
+      Call VERIF_ALC(PSTRDAT, LVLTNUM, PCOUNT)
+    When 8 #LIFO
+      Call VERIF_FIF(PSTRDAT, LVLTNUM, PCOUNT)
+  Endcase
+
+  LVLTNUM = 2
+  If GACTVLT2 & [F:TCM]ISSVLTCOD(1)>0 & [F:TCM]ISSVLTCOD(1)<>[F:TCM]ISSVLTCOD(0) & !(find([F:TCM]ISSVLTCOD(0),5,8) & find([F:TCM]ISSVLTCOD(1),5,8))
+    Case [F:TCM]ISSVLTCOD(1)
+      When 1 #Standard
+        Call VERIF_STD(PSTRDAT, 1, LVLTNUM, PCOUNT)
+      When 2 #Revised Standard
+        Call VERIF_STD(PSTRDAT, 2, LVLTNUM, PCOUNT)
+      When 4    # Average Cost
+        Call VERIF_AVC(PSTRDAT, LVLTNUM, PCOUNT)
+      When 5    # FIFO
+        Call VERIF_FIF(PSTRDAT, LVLTNUM, PCOUNT)
+      When 6    # Average Lot Cost
+        Call VERIF_ALC(PSTRDAT, LVLTNUM, PCOUNT)
+      When 8    # LIFO
+        Call VERIF_FIF(PSTRDAT, LVLTNUM, PCOUNT)
+    Endcase
+  Endif
+
+End
+
+Subprog VERIF_ALC(PSTRDAT, PVLTNUM, PCOUNT)
+Value Date       PSTRDAT
+Value Integer    PVLTNUM
+Variable Integer PCOUNT
+
+Local Integer LDESYNC
+Local Char LMESS(85)
+
+  Filter [SLFP] Where ITMREF=[F:ITF]ITMREF and STOFCY=[F:ITF]STOFCY and PERSTR>=PSTRDAT and VLTNUM = PVLTNUM
+  For [SLFP]SLFP0
+    Read [SLFT]SLFT0=adxuid(1);[F:SLFP]ITMREF;[F:SLFP]LOT;[F:SLFP]SLO;[F:SLFP]STOFCY;[F:SLFP]PERSTR;[F:SLFP]VLTNUM
+    If fstat
+      LMESS = [F:ITF]ITMREF-[F:ITF]STOFCY-"STOLOTFCYPIT"-mess(81,75,1)
+      Call ECR_TRACE(LMESS,1) From GESECRAN
+      LMESS = [F:SLFP]ITMREF+";"+[F:SLFP]LOT+";"+[F:SLFP]SLO+";"+[F:SLFP]STOFCY+";"+[F:SLFP]PERSTR+";"+num$([F:SLFP]VLTNUM)+";"
+      Call ECR_TRACE(LMESS,1) From GESECRAN
+      Raz [F:SLFT]
+    Endif
+    Raz LDESYNC
+    Call VERIF_FIELD("BEGBASQTY",[F:SLFT]BEGBASQTY,[F:SLFP]BEGBASQTY,6,LDESYNC)
+    Call VERIF_FIELD("BEGBASAMT",[F:SLFT]BEGBASAMT,[F:SLFP]BEGBASAMT,6,LDESYNC)
+    Call VERIF_FIELD("PERRCPQTY",[F:SLFT]PERRCPQTY,[F:SLFP]PERRCPQTY,6,LDESYNC)
+    Call VERIF_FIELD("PERRCPAMT",[F:SLFT]PERRCPAMT,[F:SLFP]PERRCPAMT,6,LDESYNC)
+    Call VERIF_FIELD("PERISSQTY",[F:SLFT]PERISSQTY,[F:SLFP]PERISSQTY,6,LDESYNC)
+    Call VERIF_FIELD("PERISSAMT",[F:SLFT]PERISSAMT,[F:SLFP]PERISSAMT,6,LDESYNC)
+    Call VERIF_FIELD("PERVALCHG",[F:SLFT]PERVALCHG,[F:SLFP]PERVALCHG,6,LDESYNC)
+    Call VERIF_FIELD("PERCUMQTY",[F:SLFT]PERCUMQTY,[F:SLFP]PERCUMQTY,6,LDESYNC)
+    Call VERIF_FIELD("PERCUMAMT",[F:SLFT]PERCUMAMT,[F:SLFP]PERCUMAMT,6,LDESYNC)
+    Call VERIF_FIELD("ENDBASQTY",[F:SLFT]ENDBASQTY,[F:SLFP]ENDBASQTY,6,LDESYNC)
+    Call VERIF_FIELD("ENDBASAMT",[F:SLFT]ENDBASAMT,[F:SLFP]ENDBASAMT,6,LDESYNC)
+    Call VERIF_FIELD("PERAMTDEV",[F:SLFT]PERAMTDEV,[F:SLFP]PERAMTDEV,6,LDESYNC)
+    If LDESYNC
+      If [M:DIA]SIM = [V]CST_ANO
+        Readlock [F:SLFP] Curr
+        [F:SLFP]RECALCUSR = GUSER
+        [F:SLFP]RECALCDT  = datetime$
+        Rewrite [F:SLFP]
+      Endif
+      PCOUNT += 1
+    Endif
+  Next
+  Filter [SLFP]
+End
+
+Subprog VERIF_AVC(PSTRDAT, PVLTNUM, PCOUNT)
+Value Date       PSTRDAT
+Value Integer    PVLTNUM
+Variable Integer PCOUNT
+
+Local Integer LDESYNC
+Local Char LMESS(85)
+
+  Filter [ITVP] Where ITMREF=[F:ITF]ITMREF and STOFCY=[F:ITF]STOFCY and PERSTR>=PSTRDAT and VLTNUM = PVLTNUM
+  For [ITVP]ITVP0
+    Read [ITVT]ITVT0=adxuid(1);[F:ITVP]ITMREF;[F:ITVP]STOFCY;[F:ITVP]PERSTR;[F:ITVP]VLTNUM
+    If fstat
+      LMESS = [F:ITF]ITMREF-[F:ITF]STOFCY-"ITMMVTPIT"-mess(81,75,1)
+      Call ECR_TRACE(LMESS,1) From GESECRAN
+      LMESS = [F:ITVP]ITMREF+";"+[F:ITVP]STOFCY+";"+[F:ITVP]PERSTR+";"+num$([F:ITVP]VLTNUM)+";"
+      Call ECR_TRACE(LMESS,1) From GESECRAN
+      Raz [F:ITVT]
+    Endif
+    Raz LDESYNC
+    Call VERIF_FIELD("BEGBASQTY",[F:ITVT]BEGBASQTY,[F:ITVP]BEGBASQTY,4,LDESYNC)
+    Call VERIF_FIELD("BEGBASAMT",[F:ITVT]BEGBASAMT,[F:ITVP]BEGBASAMT,4,LDESYNC)
+    Call VERIF_FIELD("PERRCPQTY",[F:ITVT]PERRCPQTY,[F:ITVP]PERRCPQTY,4,LDESYNC)
+    Call VERIF_FIELD("PERRCPAMT",[F:ITVT]PERRCPAMT,[F:ITVP]PERRCPAMT,4,LDESYNC)
+    Call VERIF_FIELD("PERISSQTY",[F:ITVT]PERISSQTY,[F:ITVP]PERISSQTY,4,LDESYNC)
+    Call VERIF_FIELD("PERISSAMT",[F:ITVT]PERISSAMT,[F:ITVP]PERISSAMT,4,LDESYNC)
+    Call VERIF_FIELD("PERVALCHG",[F:ITVT]PERVALCHG,[F:ITVP]PERVALCHG,4,LDESYNC)
+    Call VERIF_FIELD("PERCUMQTY",[F:ITVT]PERCUMQTY,[F:ITVP]PERCUMQTY,4,LDESYNC)
+    Call VERIF_FIELD("PERCUMAMT",[F:ITVT]PERCUMAMT,[F:ITVP]PERCUMAMT,4,LDESYNC)
+    Call VERIF_FIELD("ENDBASQTY",[F:ITVT]ENDBASQTY,[F:ITVP]ENDBASQTY,4,LDESYNC)
+    Call VERIF_FIELD("ENDBASAMT",[F:ITVT]ENDBASAMT,[F:ITVP]ENDBASAMT,4,LDESYNC)
+    Call VERIF_FIELD("PERAMTDEV",[F:ITVT]PERAMTDEV,[F:ITVP]PERAMTDEV,4,LDESYNC)
+    If LDESYNC
+      If [M:DIA]SIM = [V]CST_ANO
+        Readlock [F:ITVP] Curr
+        [F:ITVP]RECALCUSR = GUSER
+        [F:ITVP]RECALCDT  = datetime$
+        Rewrite [F:ITVP]
+      Endif
+      PCOUNT += 1
+    Endif
+  Next
+  Filter [ITVP]
+End
+
+Subprog VERIF_FIF(PSTRDAT, PVLTNUM, PCOUNT)
+Value Date       PSTRDAT
+Value Integer    PVLTNUM
+Variable Integer PCOUNT
+
+Local Integer LDESYNC
+Local Char LMESS(85)
+
+  Filter [STPP] Where ITMREF=[F:ITF]ITMREF and STOFCY=[F:ITF]STOFCY and PERSTR>=PSTRDAT and VLTNUM = PVLTNUM
+  For [STPP]STPP0
+    Read [STPT]STPT0=adxuid(1);[F:STPP]ITMREF;[F:STPP]STOFCY;[F:STPP]CSTDAT;[F:STPP]CSTTIM;[F:STPP]CSTCOU;[F:STPP]PERSTR;[F:STPP]VLTNUM
+    If fstat
+      LMESS = [F:ITF]ITMREF-[F:ITF]STOFCY-"STOCOSTPIT"-mess(81,75,1)
+      Call ECR_TRACE(LMESS,1) From GESECRAN
+      LMESS = [F:STPP]ITMREF+";"+[F:STPP]STOFCY+";"+[F:STPP]CSTDAT+";"+[F:STPP]CSTTIM+";"+num$([F:STPP]CSTCOU)+";"+[F:STPP]PERSTR+";"+num$([F:STPP]VLTNUM)+";"
+      Call ECR_TRACE(LMESS,1) From GESECRAN
+      Raz [F:STPT]
+    Endif
+    Raz LDESYNC
+    Call VERIF_FIELD("PERBEGQTY",[F:STPT]PERBEGQTY,[F:STPP]PERBEGQTY,5,LDESYNC)
+    Call VERIF_FIELD("PERBEGCST",[F:STPT]PERBEGCST,[F:STPP]PERBEGCST,5,LDESYNC)
+    Call VERIF_FIELD("PERRCPQTY",[F:STPT]PERRCPQTY,[F:STPP]PERRCPQTY,5,LDESYNC)
+    Call VERIF_FIELD("PERRCPCST",[F:STPT]PERRCPCST,[F:STPP]PERRCPCST,5,LDESYNC)
+    Call VERIF_FIELD("PERISSQTY",[F:STPT]PERISSQTY,[F:STPP]PERISSQTY,5,LDESYNC)
+    Call VERIF_FIELD("PERISSCST",[F:STPT]PERISSCST,[F:STPP]PERISSCST,5,LDESYNC)
+    Call VERIF_FIELD("PERVALCHG",[F:STPT]PERVALCHG,[F:STPP]PERVALCHG,5,LDESYNC)
+    Call VERIF_FIELD("PERVALCHGQTY",[F:STPT]PERVALCHGQTY,[F:STPP]PERVALCHGQTY,5,LDESYNC)
+    Call VERIF_FIELD("PERCUMQTY",[F:STPT]PERCUMQTY,[F:STPP]PERCUMQTY,5,LDESYNC)
+    Call VERIF_FIELD("PERCUMCST",[F:STPT]PERCUMCST,[F:STPP]PERCUMCST,5,LDESYNC)
+    Call VERIF_FIELD("PERENDQTY",[F:STPT]PERENDQTY,[F:STPP]PERENDQTY,5,LDESYNC)
+    Call VERIF_FIELD("PERENDCST",[F:STPT]PERENDCST,[F:STPP]PERENDCST,5,LDESYNC)
+    Call VERIF_FIELD("PERAMTDEV",[F:STPT]PERAMTDEV,[F:STPP]PERAMTDEV,5,LDESYNC)
+    If LDESYNC
+      If [M:DIA]SIM = [V]CST_ANO
+        Readlock [F:STPP] Curr
+        [F:STPP]RECALCUSR = GUSER
+        [F:STPP]RECALCDT  = datetime$
+        Rewrite [F:STPP]
+      Endif
+      PCOUNT += 1
+    Endif
+  Next
+  Filter [STPP]
+End
+
+Subprog VERIF_STD(PSTRDAT, PTYP, PVLTNUM, PCOUNT)
+Value Date       PSTRDAT
+Value Integer    PTYP
+Value Integer    PVLTNUM
+Variable Integer PCOUNT
+
+Local Integer LDESYNC
+Local Char LMESS(85)
+
+  Filter [ITCP] Where ITMREF=[F:ITF]ITMREF and STOFCY=[F:ITF]STOFCY and PERSTR>=PSTRDAT and CSTTYP = PTYP and VLTNUM = PVLTNUM
+  For [ITCP]ITCP0
+    Read [ITCT]ITCT0=adxuid(1);[F:ITCP]ITMREF;[F:ITCP]STOFCY;[F:ITCP]ECCVALMAJ;[F:ITCP]ECCVALMIN;[F:ITCP]PERSTR;[F:ITCP]CSTTYP;[F:ITCP]VLTNUM
+    If fstat
+      LMESS = [F:ITF]ITMREF-[F:ITF]STOFCY-"ITMCOSTPIT"-mess(81,75,1)
+      Call ECR_TRACE(LMESS,1) From GESECRAN
+      LMESS = [F:ITCP]ITMREF+";"+[F:ITCP]STOFCY+";"+[F:ITCP]ECCVALMAJ+";"+[F:ITCP]ECCVALMIN+";"+[F:ITCP]PERSTR+";"+num$([F:ITCP]CSTTYP)+";"+num$([F:ITCP]VLTNUM)+";"
+      Call ECR_TRACE(LMESS,1) From GESECRAN
+      Raz [F:ITCT]
+    Endif
+    Raz LDESYNC
+    Call VERIF_FIELD("PERBEGQTY",[F:ITCT]PERBEGQTY,[F:ITCP]PERBEGQTY,1,LDESYNC)
+    Call VERIF_FIELD("PERBEGCST",[F:ITCT]PERBEGCST,[F:ITCP]PERBEGCST,1,LDESYNC)
+    Call VERIF_FIELD("PERRCPQTY",[F:ITCT]PERRCPQTY,[F:ITCP]PERRCPQTY,1,LDESYNC)
+    Call VERIF_FIELD("PERRCPCST",[F:ITCT]PERRCPCST,[F:ITCP]PERRCPCST,1,LDESYNC)
+    Call VERIF_FIELD("PERISSQTY",[F:ITCT]PERISSQTY,[F:ITCP]PERISSQTY,1,LDESYNC)
+    Call VERIF_FIELD("PERISSCST",[F:ITCT]PERISSCST,[F:ITCP]PERISSCST,1,LDESYNC)
+    Call VERIF_FIELD("PERVALCHG",[F:ITCT]PERVALCHG,[F:ITCP]PERVALCHG,1,LDESYNC)
+    Call VERIF_FIELD("PERCUMQTY",[F:ITCT]PERCUMQTY,[F:ITCP]PERCUMQTY,1,LDESYNC)
+    Call VERIF_FIELD("PERCUMCST",[F:ITCT]PERCUMCST,[F:ITCP]PERCUMCST,1,LDESYNC)
+    Call VERIF_FIELD("PERENDQTY",[F:ITCT]PERENDQTY,[F:ITCP]PERENDQTY,1,LDESYNC)
+    Call VERIF_FIELD("PERENDCST",[F:ITCT]PERENDCST,[F:ITCP]PERENDCST,1,LDESYNC)
+    Call VERIF_FIELD("PERAMTDEV",[F:ITCT]PERAMTDEV,[F:ITCP]PERAMTDEV,1,LDESYNC)
+    If LDESYNC
+      If [M:DIA]SIM = [V]CST_ANO
+        Readlock [F:ITCP] Curr
+        [F:ITCP]RECALCUSR = GUSER
+        [F:ITCP]RECALCDT  = datetime$
+        Rewrite [F:ITCP]
+      Endif
+      PCOUNT += 1
+    Endif
+  Next
+  Filter [ITCP]
+End
+
+######################################################################################
+Subprog CLEARTEMPTABLES
+
+  Delete [F:ITCT] Where SYNNUM=adxuid(1)
+  Delete [F:ITVT] Where SYNNUM=adxuid(1)
+  Delete [F:SLFT] Where SYNNUM=adxuid(1)
+  Delete [F:STPT] Where SYNNUM=adxuid(1)
+
+End
+
+Subprog VERIF_FIELD(PFLD,POLD,PNEW,PTYP,PCOUNT)
+Value Char PFLD
+Value Decimal POLD
+Value Decimal PNEW
+Value Integer PTYP
+Variable Integer PCOUNT
+
+Local Char LMESS(85)
+Local Char LMESS2(85)
+
+  If arr(POLD,10^-GDECPRI) <> arr(PNEW,10^-GDECPRI)
+    # Build the correct key field
+    Case PTYP
+      When 1    #Standard
+        LMESS   = func AFNC.MES2(mess(672,199,1),"ITMCOSTPIT",PFLD)
+        LMESS2  = mess(55,123,1)+": "
+        LMESS2 += [F:ITCP]ITMREF+";"
+        LMESS2 += [F:ITCP]STOFCY+";"
+        LMESS2 += [F:ITCP]ECCVALMAJ+";"
+        LMESS2 += [F:ITCP]ECCVALMIN+";"
+        LMESS2 += format$("DD2",[F:ITCP]PERSTR)+";"
+        LMESS2 += num$([F:ITCP]CSTTYP)+";"
+      When 4    # Average Cost
+        LMESS   = func AFNC.MES2(mess(672,199,1),"ITMMVTPIT",PFLD)
+        LMESS2  = mess(55,123,1)+": "
+        LMESS2 += [F:ITVP]ITMREF+";"
+        LMESS2 += [F:ITVP]STOFCY+";"
+        LMESS2 += format$("DD2",[F:ITVP]PERSTR)+";"
+      When 5    # FIFO/LIFO
+        LMESS   = func AFNC.MES2(mess(672,199,1),"STOCOSTPIT",PFLD)
+        LMESS2  = mess(55,123,1)+": "
+        LMESS2 += [F:STPP]ITMREF+";"
+        LMESS2 += [F:STPP]STOFCY+";"
+        LMESS2 += format$("DD2",[F:STPP]CSTDAT)+";"
+        LMESS2 += [F:STPP]CSTTIM+";"
+        LMESS2 += num$([F:STPP]CSTCOU)+";"
+        LMESS2 += format$("DD2",[F:STPP]PERSTR)+";"
+      When 6    # Average Lot Cost
+        LMESS   = func AFNC.MES2(mess(672,199,1),"STOLOTFCYPIT",PFLD)
+        LMESS2  = mess(55,123,1)+": "
+        LMESS2 += [F:SLFP]ITMREF+";"
+        LMESS2 += [F:SLFP]LOT+";"
+        LMESS2 += [F:SLFP]SLO+";"
+        LMESS2 += [F:SLFP]STOFCY+";"
+        LMESS2 += format$("DD2",[F:SLFP]PERSTR)+";"
+    Endcase
+    Call ECR_TRACE(LMESS,0) From GESECRAN
+    Call ECR_TRACE(LMESS2,0) From GESECRAN
+
+    LMESS = mess(153,139,1)+":"-num$(POLD)-mess(215,154,1)+":"-num$(PNEW)
+    Call ECR_TRACE(LMESS,0) From GESECRAN
+
+    Call ECR_TRACE(" ",0) From GESECRAN
+    PCOUNT += 1
+  Endif
+
+End
+
+######################################################################################
+Subprog AM_CPY(VALEUR)
+Variable Char    VALEUR()
+  # If company changed, clear site
+  If [M:DIA]TOUSITE = [V]CST_ANO
+    Effzo [M:DIA]STOFCY
+  Endif
+End
+
+Subprog AM_TOUSITE(VALEUR)
+Variable Integer VALEUR
+  If VALEUR = [V]CST_AYES
+    Effzo [M:DIA]STOFCY
+    Grizo [M:DIA]STOFCY
+  Else
+    Actzo [M:DIA]STOFCY
+  Endif
+End
+
+Subprog C_STOFCY(VALEUR)
+Variable Char    VALEUR()
+
+  If VALEUR <> "" & ITMREFSTR <> ""
+    If [F:ITF]ITMREF <> [M:DIA]ITMREFSTR | [F:ITF]STOFCY <> VALEUR
+      Read [ITF]ITF0=[M:DIA]ITMREFSTR;VALEUR
+      If fstat
+        GMESSAGE = mess(25,192,1)
+        mkstat = 2
+        End
+      Endif
+    Endif
+  Endif
+
+  GFCY = VALEUR
+
+End
+
+Subprog AM_ITMREFSTR(VALEUR)
+Variable Char    VALEUR()
+
+  If VALEUR = "" | [M:DIA]ITMREFEND=[M:DIA]ITMREFSTR | [M:DIA]ITMREFEND<VALEUR
+    [M:DIA]ITMREFEND = VALEUR
+    Affzo [M:DIA]ITMREFEND
+  Endif
+
+  If VALEUR = "" | [M:DIA]TOUSITE = [V]CST_AYES : End : Endif
+
+  If [F:ITF]ITMREF <> VALEUR | [F:ITF]STOFCY <> [M:DIA]STOFCY
+    Read [ITF]ITF0=VALEUR;[M:DIA]STOFCY
+    If fstat
+      GMESSAGE = mess(25,192,1)
+      mkstat = 2
+      End
+    Endif
+  Endif
+
+End
+
+Subprog C_FIYNUM(VALEUR)
+Variable Decimal VALEUR
+
+  Read [FIY]FIY0 = [M:DIA]CPY;1;VALEUR
+  If fstat
+    GMESSAGE = mess(52,116,1) : mkstat = 2 : End    # Fiscal year incorrect
+  Endif
+  If [F:FIY]FIYSTA<>2
+    GMESSAGE = mess(34,113,1) : mkstat = 2 : End     # Fiscal year not open
+  Endif
+
+  [M:DIA]FIYSTR = [F:FIY]FIYSTR
+
+End
+
+Subprog C_PERNUM(VALEUR)
+Variable Decimal VALEUR
+
+  Read [PER]PER0=[M:DIA]CPY;1;[M:DIA]FIYNUM;VALEUR
+  If !fstat
+    PERSTR = [F:PER]PERSTR
+  Else
+    GMESSAGE = mess(178,107,1) : mkstat=2 : End     # Incorrect period
+  Endif
+
+  If [F:PER]PERSTA<>2
+    GMESSAGE = mess(208,104,1) : mkstat = 2 : End    # Period not open
+  Endif
+
+End
+
+Subprog C_ITMREFSTR(VALEUR)
+Variable Char    VALEUR()
+
+  # Starting product required if all sites is checked
+  If VALEUR="" & [M:DIA]TOUSITE = [V]CST_AYES
+    GMESSAGE = mess(10,123,1) : mkstat = 2 : End
+  Endif
+
+End
+
+Subprog C_ITMREFEND(VALEUR)
+Variable Char    VALEUR()
+
+  # Ending product required if all sites is checked
+  # Or starting product is entered
+  # Starting product required if all sites is checked
+  If VALEUR="" & ([M:DIA]TOUSITE = [V]CST_AYES | [M:DIA]ITMREFSTR<>"")
+    GMESSAGE = mess(10,123,1) : mkstat = 2 : End
+  Endif
+
+  If VALEUR<>"" & [M:DIA]ITMREFSTR=""
+    GMESSAGE = mess(44,199,1) : mkstat = 2 : End
+  Endif
+End
+

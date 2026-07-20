@@ -1,0 +1,1281 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$
+############################################################################
+# UUMGTRTSAL01   Sales quotes migration script               Sales module  #
+############################################################################
+# Issue 117758 - 2016/07/25 by LD : QA ICV11 => Error : Impossible to define a sales quote type
+
+Local Char DOSSIER(30) : DOSSIER = nomap
+If !GSERVEUR
+  # Issue 106947 - 20150811 by LD : Migration of historic folder
+  #Call SAIDOS(DOSSIER,"") From SAIDOS
+  Call SAIDOSHIS(DOSSIER,"") From SAIDOSHIS
+  # Issue 106947 - 20150811 by LD
+Endif
+If DOSSIER <> ""
+  If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+  # Issue 106947 - 20150811 by LD : Migration of historic folder
+  #Read [ADS] DOSSIER=[L]DOSSIER : If fstat Raz [F:ADS] : Endif
+  If func DOSSUB.FILL_ADS([L]DOSSIER)=0 : End : Endif
+  # Issue 106947 - 20150811 by LD
+
+  #Call ACTIVE From TIMING
+  If !GSERVEUR
+    Call TEMPON("O") From GESECRAN
+    Call OUVRE_TRACE("UUMGTRTSAL01") From LECFIC
+  Endif
+
+  #Call RAZ_UUMGTRTSAL01(DOSSIER)
+  Call MAJ_UUMGTRTSAL01(DOSSIER)
+
+  If !GSERVEUR
+    Call TEMPOFF     From GESECRAN
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+  Endif
+  #Call ARRET From TIMING
+Endif
+End
+##########################################################################
+Subprog MAJ_UUMGTRTSAL01(DOSSIER)
+Value Char DOSSIER
+
+# Issue 106947 - 20150811 by LD : Migration of historic folder
+#adxftl=10
+#adxwrb=10
+#NEWMOTEUR=1
+# Issue 106947 - 20150811 by LD
+
+Local Integer ERR
+##1 - verifications
+####################
+
+If [F:ADS]MODULE(4)<>2 : : # N= no module
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+#----- Récupération du n° de version
+Local Char    CVERSION(3)
+Local Integer VERSION
+Call MIGGETVERSION (DOSSIER,CVERSION,ERR) From TRTMIG
+If ERR
+  # N° de version incorrecte
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",7,ERR) From TRTMIG : #7=Erreur
+  End
+Else
+ VERSION=val(CVERSION)
+Endif
+
+Local Char WNAMSQHM,WNAMSQDM
+Call MIGTABNAME (DOSSIER,"SQUOTE", WNAMSQHM,ERR) From TRTMIG
+Call MIGTABNAME (DOSSIER,"SQUOTED",WNAMSQDM,ERR) From TRTMIG
+If ERR
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+#----- Présence des fichiers renommées...  -----#
+If filinfo(filpath("FIL",WNAMSQHM, "fde",DOSSIER),0)<0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+If filinfo(filpath("FIL",WNAMSQDM, "fde",DOSSIER),0)<0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+##2 - Traitements en cours
+####################
+
+Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",2,ERR) From TRTMIG : #2=En cours
+Gosub MIG_OUVRE From TRTMIG #Gbn-108768
+
+###################
+
+Local Char WTAB_SQH (30) (adxwrb)
+Local Char WTAB_SQD (90) (adxwrb)
+Local Char WTAB_SVF (90) (adxwrb)
+Local Char WTAB_CAL (120) (adxwrb)
+Local Shortint WCPT_SQH,WCPT_SQD,WCPT_SVF,WCPT_CAL
+
+Call ECR_TIME("UUMGTRTSAL01 Sales Quote Process : Update SQUOTE-D") From DOSSUB
+Call ECR_TRACE("UUMGTRTSAL01 : Process Start on : "+DOSSIER,0) From GESECRAN
+
+#----- Modification des fichiers où on va inserer -----#
+Call MIGTABINIT (DOSSIER,"SQUOTE",ERR) From TRTMIG
+Call MIGTABINIT (DOSSIER,"SQUOTED",ERR) From TRTMIG
+
+Call ECR_TIME("UUMGTRTSAL01 Sales Quote Process : Update SQUOTE-D...") From DOSSUB
+
+#----- Ouverture des fichiers -----#
+If clalev([F:SQH])  = 0 : Local File =DOSSIER+".SQUOTE"    [SQH]  : Endif   # Fichier X3 "Vide"
+If clalev([F:SQD])  = 0 : Local File =DOSSIER+".SQUOTED"   [SQD]  : Endif   # Fichier X3 "Vide"
+
+If clalev([F:SQHM]) = 0 : Local File =DOSSIER+"."+WNAMSQHM   [SQHM] : Endif   # Fichier X3 renommé Avant Migration
+If clalev([F:SQDM]) = 0 : Local File =DOSSIER+"."+WNAMSQDM   [SQDM] : Endif   # Fichier X3 renommé Avant Migration
+
+#-----  Déclaration des variables -----#
+# Déclaration des variables pour gérer les ruptures (évite les snapshot too old)
+Local Integer STOP, NB, ISVALID, NBLUS, NBCOMMIT
+Local Char CRITERE(250),CRITERESPE(250), HINTSPE(30)
+Local Integer NBMIGKEY : NBMIGKEY=3
+Local Char TABMIGKEY(30)(1..NBMIGKEY)
+Raz NBLUS, STOP, CRITERE, NBCOMMIT
+
+# Issue 117758
+# SQHTYP value search :
+# Tables are opened in the migrated folder
+If !clalev([F:FGRM]) : Local File =DOSSIER+".FACGROUP"  [FGRM]        : Endif
+If !clalev([F:TSQM]) : Local File =DOSSIER+".TABSQHTYP" [TSQM]        : Endif
+# Tables are opened in the reference folder (in case we don't find anything in the migrated folder)
+If !clalev([F:FGRR]) : Local File =[F:ADS]DOSREF+".FACGROUP"  [FGRR]  : Endif
+If !clalev([F:TSQR]) : Local File =[F:ADS]DOSREF+".TABSQHTYP" [TSQR]  : Endif
+Local Char SQHTYPPAR(GLONTSQ)
+Local Char SGCURLEG(GLONADI), SGCURFCY(GLONFCY)
+Local Char WSQHTYP(GLONTSQ), WSOHTYP(GLONTSO)
+# End issue 117758
+
+# 100121
+Local Char WPARAM(GLONADP)
+
+# Déclaration des variables communes de travail
+Local Integer I, J
+
+#déclaration des variables locales de travail
+Local Char     WSITE : Raz WSITE
+
+Gosub OUVRE_SAL From UUMGTRTSAL00
+If GOK<>1
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",7,ERR) From TRTMIG : #7=Erreur
+  Goto FIN
+Endif
+
+# Issue 106947 - 20150811 by LD : Migration of historic folder
+# Source folder version before V6.0
+If VERSION<GMIGX3VER60
+    #Local Mask =DOSSIER+".SQH0"    [SQH0]
+    #Local Mask =DOSSIER+".SQH1"    [SQH1]
+    #Local Mask =DOSSIER+".SQH2"    [SQH2]
+    #Local Mask =DOSSIER+".SQH3"    [SQH3]
+    Local Mask =WHISTFOLD+".SQH0"   [SQH0]
+    Local Mask =WHISTFOLD+".SQH1"   [SQH1]
+    Local Mask =WHISTFOLD+".SQH2"   [SQH2]
+    Local Mask =WHISTFOLD+".SQH3"   [SQH3]
+Endif
+# Issue 106947 - 20150811 by LD
+
+#-----  Lecture des clés -----#
+Call MIGGETKEY (DOSSIER,"UUMGTRTSAL01",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT,ERR) From TRTMIG
+STOP=val(TABMIGKEY(3))
+
+#-----  Lien des tables entête & lignes -----#
+#----- on ne met pas le numero de ligne dans le tri
+Link [SQDM] With [SQHM]SQH0~=[F:SQDM]SQHNUM, [ITM]ITM0=[F:SQDM]ITMREF
+&    As [LNK]
+&    Order By Key CLE = [F:SQDM]SALFCY;[F:SQDM]SQHNUM;[F:SQDM]SQDLIN
+
+# PE pour ajout clause where
+Local Char FLUX
+Local Integer FILTRELIN
+Local Integer VALORISATION : VALORISATION=1            : # Pour déclencher ou pas la valorisation
+FLUX="UUMGTRTSAL01" : FILTRELIN=0 : Raz HINTSPE : Raz CRITERESPE : Gosub PE_CRITSEL From TRTMIG
+If CRITERESPE="" : CRITERESPE="1=1" : Endif
+
+Call DEBTRANS From GLOCK
+Gosub SET_FIRST From TRTFIRST
+
+$LOOP_SAL01
+Raz NB
+If STOP=1
+ STOP = 2
+ CRITERE = "[F:SQDM]SALFCY=TABMIGKEY(1) & [F:SQDM]SQHNUM>TABMIGKEY(2)"
+Elsif STOP=2
+ STOP = 0
+ CRITERE = "[F:SQDM]SALFCY>TABMIGKEY(1)"
+Else
+ CRITERE = "1=1"
+Endif
+
+Trbegin [SQH],[SQD]
+GOK = 1
+
+# Stockage dans AMIGKEY de la valeur du flag VALORISATION
+# Pour savoir si dans UUMGPOSSAL01 la valorisation doit être déclenchée ou pas
+Call MIGSTKTOTNBR (DOSSIER,"UUMGTRTSAL01/VALORISATION",VALORISATION,ERR) From TRTMIG
+
+For [LNK]CLE(2) Hint Key=HINTSPE Where evalue(CRITERE) & evalue(CRITERESPE)
+  #rupture par site,devis
+  NBLUS+=1
+
+  # PE pour exclure ligne
+  If FILTRELIN
+    FLUX="UUMGTRTSAL01" : ISVALID=1 : Gosub PE_VERIFSEL From TRTMIG
+    If ISVALID=0 : Goto SUITE_BOUCLE : Endif
+  Endif
+
+  #Raz [F:SQH]
+  Gosub RAZ_SQH
+  [F:SQH] = [F:SQHM]
+
+  If WSITE<>[F:SQDM]SALFCY
+      Call RECUP_GLOBAL_CPT([F:ADS]DOSSIER,[F:SQDM]SALFCY) From TRTX3CPT
+      Call GLOBVAR([F:SQDM]SALFCY) From WWGLOBVEN
+      WSITE=[F:SQDM]SALFCY
+      #108649.so
+      #If GACTKUS
+      #    Call PARAM([F:SQDM]SALFCY,"USATAX",WPARAM) From ADOVAL
+      #    GLOCUSATAX=val(WPARAM)
+      #    If GLOCUSATAX>0  GLOCUSATAX-=1 : Endif
+      #Else
+      #    Raz GLOCUSATAX
+      #Endif
+      #108649.eo
+
+      # Issue 117758
+      If VERSION<GMIGX3VER90
+        Gosub RECSQHTYP
+      Endif
+      # End issue 117758
+
+  Endif
+
+  If dim([F:SQH]DIE)>0 & [F:SQH]DIE(0)=""
+      For I=1 To max(GNBDIE,GOPTCANA)
+          [F:SQH]DIE(I-1)=GDIE(I)
+      Next I
+  Endif
+
+  # Source folder version before V6.0
+  If VERSION<GMIGX3VER60
+    Gosub MAJ60_SQH
+    If GOK<1 : Break : Endif
+  Endif
+
+  # Source folder version before V6.1
+  If VERSION<GMIGX3VER61
+    Gosub MAJ61_SQH
+    If GOK<1 : Break : Endif
+  Endif
+
+  #101380 SST Line Level Override .sn
+  # Source folder version before V8 [AKIRA]
+  If VERSION>=GMIGX3VER70 & VERSION<GMIGX3VER80
+    Gosub MAJ80_SQH
+    If GOK<1 : Break : Endif
+  Endif
+  #101380 SST Line Level Override .en
+
+  #104383 - New field SQHTYP initialization
+  If VERSION<GMIGX3VER90
+    Gosub MAJ90_SQH
+    If GOK<1 : Break : Endif
+  Endif
+
+  ############################
+  #-- Boucle sur les lignes
+  ############################
+  For [LNK]CLE
+    #rupture par ligne de devis
+    Gosub RAZ_SQD
+    [F:SQD] = [F:SQDM]
+
+    # Source folder version before V6.0
+    If VERSION<GMIGX3VER60
+      Gosub MAJ60_SQDSQH
+      If nolign>=dim([M:SQH2]UPDFLG)
+          Call ECR_TRACE("File SQUOTE"-[F:SQH]SQHNUM-":"-mess (26,100,1)-mess(224,139,1)-":"-"SQH",1) From GESECRAN
+      Endif
+      If GOK<1 : Break : Endif
+    Endif
+
+    #101380 SST Line Level Override .sn
+    # Source folder version before V8 [AKIRA]
+    If VERSION>=GMIGX3VER70 & VERSION<GMIGX3VER80
+      Gosub MAJ80_SQDSQH
+      If GOK<1 : Break : Endif
+    Endif
+    #101380 SST Line Level Override .en
+
+    # 71065 : PJT
+    # Source folder version before V11 (before CHALLENGER)
+    If VERSION<GMIGX3VER110
+      Gosub MAJ110_SQDSQH
+      If GOK<1 : Break : Endif
+    Endif
+    # 71065 : PJT
+
+    # Issue 106947 - 20150811 by LD : Migration of historic folder
+#    If NEWMOTEUR
+#        Gosub SQD_STK : # pour stocker ref
+#        WriteB [SQD]
+#    Else
+#        Write [SQD]
+#    Endif
+#    If fstat
+#        If NEWMOTEUR & adxwrb>1
+#          Call ECR_TRACE("File SQUOTED, Error ="-num$(fstat),1) From GESECRAN
+#          Gosub SQD_ERRTRA : # pour afficher les ref
+#        Else
+#          Call ECR_TRACE("File SQUOTED(SQHNUM/SQDLIN)"-[F:SQD]SQHNUM-num$([F:SQD]SQDLIN)+", Error ="-num$(fstat),1) From GESECRAN
+#        Endif
+#        GOK=0 : Break
+#    Endif
+    Gosub SQD_STK : # pour stocker ref
+    WriteB [SQD]
+    If fstat
+        Call ECR_TRACE("File SQUOTED, Error ="-num$(fstat),1) From GESECRAN
+        Gosub SQD_ERRTRA : # pour afficher les ref
+        GOK=0 : Break
+    Endif
+    # Issue 106947 - 20150811 by LD
+  Next
+  If GOK<1 : Break : Endif
+
+  # Source folder version before V6.0
+  If VERSION<GMIGX3VER60
+    Gosub SUITE_MAJ60_SQH
+    If GOK<1 : Break : Endif
+  Endif
+
+  # --- alimentation des champs et écriture enreg
+  # Issue 106947 - 20150811 by LD : Migration of historic folder
+#  If NEWMOTEUR
+#      Gosub SQH_STK : # pour stocker ref
+#      WriteB [F:SQH]
+#  Else
+#      Write [F:SQH]
+#  Endif
+#  If fstat
+#    If NEWMOTEUR & adxwrb>1
+#      Call ECR_TRACE("File SQUOTE, Error ="-num$(fstat),1) From GESECRAN
+#      Gosub SQH_ERRTRA : # pour afficher les ref
+#    Else
+#      Call ECR_TRACE("File SQUOTE(SQHNUM)"-[F:SQH]SQHNUM+", Error ="-num$(fstat),1) From GESECRAN
+#    Endif
+#    GOK=0 : Break
+#  Endif
+  Gosub SQH_STK : # pour stocker ref
+  WriteB [F:SQH]
+  If fstat
+      Call ECR_TRACE("File SQUOTE, Error ="-num$(fstat),1) From GESECRAN
+      Gosub SQH_ERRTRA : # pour afficher les ref
+      GOK=0 : Break
+  Endif
+  # Issue 106947 - 20150811 by LD
+
+  NB+=1
+  If NB>GMAXUPDTRS
+    TABMIGKEY(1) = [F:SQDM]SALFCY
+    TABMIGKEY(2) = [F:SQDM]SQHNUM
+    STOP=1
+    Break
+  Endif
+$SUITE_BOUCLE
+Next
+
+$FIN_BOUCLE
+If GOK<1
+  Rollback
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",7,ERR) From TRTMIG : #7=Erreur
+Else
+  #If NEWMOTEUR & adxwrb>1          : # Issue 106947 - 20150811 by LD : Migration of historic folder
+    Flush [F:SQH]
+    If fstat
+        Call ECR_TRACE("File SQUOTE, Error ="-num$(fstat),1) From GESECRAN
+        Gosub SQH_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+    Flush [F:SQD]
+    If fstat
+        Call ECR_TRACE("File SQUOTED, Error ="-num$(fstat),1) From GESECRAN
+        Gosub SQD_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+    Flush [F:SVF]
+    If fstat
+        Call ECR_TRACE("File SVCRFOOT, Error ="-num$(fstat),1) From GESECRAN
+        Gosub SVF_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+  #Endif                            : # Issue 106947 - 20150811 by LD : Migration of historic folder
+  # Stocker les valeurs de ACLE1/ACLE2/ACLE3/STOP dans la table AMIGKEY.
+  If STOP
+      TABMIGKEY(3)=num$(STOP)
+  Else
+      Raz TABMIGKEY
+  Endif
+  Call MIGSTKKEY (DOSSIER,"UUMGTRTSAL01",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT+NB,ERR) From TRTMIG
+  If ERR
+   GOK=-1 : Goto FIN_BOUCLE
+  Endif
+  Commit
+  NBCOMMIT+=NB
+  Call MIGSTKPROGRESS (DOSSIER,"UUMGTRTSAL01",STOP,ERR) From TRTMIG
+  If STOP
+    Goto LOOP_SAL01
+  Endif
+Endif
+
+Gosub UNSET_FIRST From TRTFIRST
+
+$FIN
+Close Local File [SQD], [SQH]
+Close Local File [SQDM], [SQHM]
+
+Call ECR_TIME("UUMGTRTSAL01 : "+num$(NBLUS)+" records read,"-num$(NBCOMMIT)+" records processed.") From DOSSUB
+
+#----- Remise en état des fichiers où on a inseré -----#
+Call MIGTABEND (DOSSIER,"SQUOTE",ERR) From TRTMIG
+Call MIGTABEND (DOSSIER,"SQUOTED",ERR) From TRTMIG
+
+Call MIGTRTEND (DOSSIER,"UUMGTRTSAL01") From TRTMIG
+End
+
+##########################################################################
+Subprog RAZ_UUMGTRTSAL01(DOSSIER)
+Value Char DOSSIER
+
+Local Integer ERR
+
+##1 - verifications
+####################
+
+If [F:ADS]MODULE(4)<>2 : # N= no module
+  End
+Endif
+
+#Gbn-101445
+##1.1 - Récupération du n° de version
+#####################################
+Local Char VERSION
+Call MIGGETVERSION (DOSSIER,VERSION,ERR) From TRTMIG
+If ERR
+  # N° de version incorrecte
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSAL01",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+Local Char WNAMSQHM,WNAMSQDM
+Call MIGTABNAME (DOSSIER,"SQUOTE", WNAMSQHM,ERR) From TRTMIG
+Call MIGTABNAME (DOSSIER,"SQUOTED",WNAMSQDM,ERR) From TRTMIG
+If ERR : End : Endif
+
+#----- Présence des fichiers renommées...  -----#
+If filinfo(filpath("FIL",WNAMSQHM, "fde",DOSSIER),0)<0 : End : Endif   : # XXXXXXM= code table
+If filinfo(filpath("FIL",WNAMSQDM, "fde",DOSSIER),0)<0 : End : Endif   : # XXXXXXM= code table
+
+##2 - On vide les fichiers selon le cas
+#######################################
+Call MIGTABRAZ (DOSSIER,"SQUOTE",ERR) From TRTMIG
+Call MIGTABRAZ (DOSSIER,"SQUOTED",ERR) From TRTMIG
+
+#Gbn-101445
+If val(VERSION)<GMIGX3VER60
+  Local File =DOSSIER+".SVCRVAT"    [SVV]
+  Trbegin [SVV]
+  Delete [SVV] Where VCRTYP=1
+  Commit
+
+  Local File =DOSSIER+".SVCRFOOT"   [SVF]
+  Trbegin [SVF]
+  Delete [SVF] Where VCRTYP=1
+  Commit
+Endif
+
+##3 - On vide AMIGKEY pour le flux
+####################
+Call MIGRAZKEY (DOSSIER,"UUMGTRTSAL01",ERR) From TRTMIG
+Call MIGRAZKEY (DOSSIER,"UUMGTRTSAL01/VALORISATION",ERR) From TRTMIG
+
+End
+##############################################################################################
+$SQH_STK
+Call STK (WTAB_SQH,WCPT_SQH,[F:SQH]SQHNUM) From TRTMIG
+Return
+$SQD_STK
+Call STK (WTAB_SQD,WCPT_SQD,[F:SQD]SQHNUM-'/'-num$([F:SQD]SQDLIN)) From TRTMIG
+Return
+$SVF_STK
+Call STK (WTAB_SVF,WCPT_SVF,[F:SVF]VCRNUM-'/'-num$([F:SVF]VCRTYP)-'/'-num$([F:SVF]DTA)) From TRTMIG
+Return
+$CAL_STK
+Call STK (WTAB_CAL,WCPT_CAL,[F:CAL]ABRFIC-'/'-num$([F:CAL]VCRTYP)-'/'-[F:CAL]VCRNUM-'/'-num$([F:CAL]VCRLIN)-'/'-num$([F:CAL]VCRSEQ)-'/'-[F:CAL]CPLCLE-'/'-num$([F:CAL]ANALIG)) From TRTMIG
+Return
+##############################################################################################
+#################################################
+$SQH_ERRTRA
+Call ERRTRA (WTAB_SQH,WCPT_SQH,"File SQUOTE(SQHNUM)=") From TRTMIG
+Return
+$SQD_ERRTRA
+Call ERRTRA (WTAB_SQD,WCPT_SQD,"File SQUOTED(SQHNUM/SQDLIN)=") From TRTMIG
+Return
+$SVF_ERRTRA
+Call ERRTRA (WTAB_SVF,WCPT_SVF,"File SVCRFOOT(VCRNUM/VCRTYP/DTA)=") From TRTMIG
+Return
+
+########################################################################
+$RAZ_SQH
+
+Raz [F:SQH]APPFLG
+Raz [F:SQH]BPAORD
+If GACTDEB=2 Raz [F:SQH]BPIEECNUM Endif
+If dim([F:SQH]DIE)>0 Raz [F:SQH]DIE : Raz [F:SQH]CCE Endif
+Raz [F:SQH]CPY
+Raz [F:SQH]DSPTOTQTY  : Raz [F:SQH]DSPTOTVOL : Raz [F:SQH]DSPTOTWEI
+Raz [F:SQH]DSPVOU     : Raz [F:SQH]DSPWEU
+Raz [F:SQH]EECICT
+If GACTDEB=2 Raz [F:SQH]EECLOC Endif
+Raz [F:SQH]FFWADD     : Raz [F:SQH]FFWNUM    : Raz [F:SQH]ICTCTY
+If dim([F:SQH]INVDTADSP)>0 Raz [F:SQH]INVDTADSP  : Raz [F:SQH]INVDTATYP : Raz [F:SQH]SFISSTCOD : Endif #gbn-101380
+Raz [F:SQH]PLISTC
+Raz [F:SQH]QUONOTL    : Raz [F:SQH]QUOATIL
+Raz [F:SQH]QUOINVNOTL : Raz [F:SQH]QUOINVATIL
+
+
+Return
+########################################################################
+$RAZ_SQD
+
+Raz [F:SQD]CPY
+If dim([F:SQD]DDTANOT)>0 Raz [F:SQD]DDTANOT : Raz [F:SQD]DDTANUM  Endif
+Raz [F:SQD]DSPLINFLG
+Raz [F:SQD]DSPLINVOL : Raz [F:SQD]DSPLINWEI
+Raz [F:SQD]DSPVOU    : Raz [F:SQD]DSPWEU
+Raz [F:SQD]IMPNUMLIG
+
+Return
+
+########################################################################
+# Initialization of the new fields for V6.0
+########################################################################
+$MAJ60_SQH
+
+      [F:SQH]CPY=GSOCIETE
+      If dim([F:SQH]APPFLG)>0 & [F:SQH]APPFLG=0 [F:SQH]APPFLG=4 Endif : # Init du flag signée à 4 : Pas de signature
+
+      # --- Alimentation incoterm, lieu de transport CEE
+      Gosub RECUP_BPD
+
+      # Initialisation ds le tableau des éléments de facturation
+      # INVDTATYP : Type de valeur : Si élément taux INVDTATYP=3 (%) Sinon INVDTATYP=1 (HT)
+      For WI=0 To dim([F:SQH]INVDTA)-1
+          If [F:SQH]INVDTA(WI)<>0
+              [F:SQH]INVDTATYP(WI)=1
+              WJ=find([F:SQH]INVDTA(WI),WSFINUM(0..WNBSFI))
+              If WJ>0 & WSFIAMTCOD(WJ-1)=1 [F:SQH]INVDTATYP(WI)=3 Endif
+          Endif
+      Next
+
+      # Renseignement des unités de répartition
+      [F:SQH]DSPWEU=GSALDSPWEU
+      [F:SQH]DSPVOU=GSALDSPVOU
+      Raz [F:SQH]DSPTOTQTY, [F:SQH]DSPTOTWEI, [F:SQH]DSPTOTVOL
+
+      # Pour les devis validés et partellement ou non commandés :
+      # Valorisation pour alimentation des tables SVCRFOOT et SVCRVAT
+      If ([F:SQH]VLYDAT=[0/0/0] | [F:SQH]VLYDAT >= date$) & [F:SQH]QUOSTA<3 & VALORISATION=1
+          # Valorisation
+          #--- entete
+          Raz [M:SQH0], [M:SQH1], [M:SQH2], [M:SQH3]
+          [M:SQH0]=[F:SQH]
+          [M:SQH1]=[F:SQH]
+          # Pour l'alim du tableau des éléments voir s'il faut appeler SAISFOOT
+          [M:SQH2]=[F:SQH]
+          [M:SQH3]=[F:SQH]
+          nolign=0
+      Endif
+Return
+
+########################################################################
+# Initialization of the new fields for V6.1
+########################################################################
+$MAJ61_SQH
+      If dim([F:SQH]APPFLG)>0 & [F:SQH]APPFLG=0 [F:SQH]APPFLG=4 Endif : # Init du flag signée à 4 : Pas de signature
+Return
+
+########################################################################
+# Initialization of the new fields (Quotes Lines) for V6.0
+########################################################################
+$MAJ60_SQDSQH
+
+      # Pour les devis validés et partellement ou non commandés :
+      # Valorisation pour alimentation des tables SVCRFOOT et SVCRVAT
+      If ([F:SQH]VLYDAT=[0/0/0] | [F:SQH]VLYDAT >= date$) & [F:SQH]QUOSTA<3 & VALORISATION=1
+             If nolign>=dim([M:SQH2]UPDFLG) GOK=0 : Return Endif        : # Bug 69648
+             nolign += 1
+             [M:SQH2]=[F:SQD]
+             [M:SQH2]VAT1(nolign-1)    = [F:SQD]VAT(0)
+             [M:SQH2]VAT2(nolign-1)    = [F:SQD]VAT(1)
+             [M:SQH2]VAT3(nolign-1)    = [F:SQD]VAT(2)
+             [M:SQH2]VACITM1(nolign-1) = [F:SQD]VACITM(0)
+             [M:SQH2]VACITM2(nolign-1) = [F:SQD]VACITM(1)
+             [M:SQH2]VACITM3(nolign-1) = [F:SQD]VACITM(2)
+             [M:SQH2]NBLIG+=1
+             WFICD="SQD" : WFICD1="SQD" : WFICE="SQH" : Gosub ALIM_FICD
+      Else
+             WFICD="SQD" : WFICD1="SQD" : WFICE="SQH" : Gosub ALIM_FICD
+      Endif
+
+Return
+
+########################################################################
+$SUITE_MAJ60_SQH
+
+     # Pour les devis validés et partellement ou non commandés :
+     # Valorisation pour alimentation des tables SVCRFOOT et SVCRVAT
+     If ([F:SQH]VLYDAT=[0/0/0] | [F:SQH]VLYDAT >= date$) & [F:SQH]QUOSTA<3 & VALORISATION=1
+         # Valorisation
+         #--- entete
+         # Bug 69648
+         If nolign>=dim([M:SQH2]UPDFLG)
+             Call ECR_TRACE("File SQUOTE"-[F:SQH]SQHNUM-":"-mess (26,100,1)-mess(224,139,1)-":"-"SQH",1) From GESECRAN
+         Else
+         # Bug 69648
+             [M:SIH0]ORICLC="GESSQH"
+             #Call CHARG_SIHX From TRTVENFACC : # Bug 70931
+             Gosub CHARG_TABLEAUX  From TRTVENFACC
+             If [M:SIH4]NBLIG>0
+                 Gosub CAL_FACTURE     From TRTVENFACC
+             Endif
+             #-- création des enr dans les tables SVCRVAT et SVCRFOOT à partir de l'écran [M:SIHV]
+             WVCRTYP=1 : WVCRNUM=[F:SQH]SQHNUM
+#             # Faut-il systématiquement supprimer
+#            Delete [SVF] Where VCRTYP=WVCRTYP & VCRNUM=WVCRNUM
+#                 If fstat=1
+#                     GOK=-1 : GLOCK="$SVCRFOOT"-WVCRTYP-WVCRNUM : Goto ROL_UPDVAL
+#                 Endif
+#             Delete [SVV] Where VCRTYP=WVCRTYP & VCRNUM=WVCRNUM
+#                 If fstat=1
+#                     GOK=-1 : GLOCK="$SVCRVAT"-WVCRTYP-WVCRNUM : Goto ROL_UPDVAL
+#                 Endif
+             Gosub UPD_SVF_SIHV : Gosub UPD_SVV_SIHV
+             [F:SQH]QUOINVNOT =[M:SIHV]INVNOT
+             [F:SQH]QUOINVATI =[M:SIHV]INVATI
+             [F:SQH]QUOINVNOTL=[M:SIHV]INVNOTRPT
+             [F:SQH]QUOINVATIL=[M:SIHV]INVATIRPT
+#             Call ECR_TRACE("SQUOTE : "-[F:SQH]SQHNUM,1) From GESECRAN
+         Endif :  # Bug 69648
+     Endif
+     # Alimentation des montants en devise société
+     If [F:SQH]QUONOT<>0
+        Call COURMNT([F:SQH]CUR,GLOCALDEV,GLOCALDEV,[F:SQH]CHGTYP,[F:SQH]QUODAT,1,
+&                     [F:SQH]QUONOT,[F:SQH]QUONOTL,[F:SQH]CHGRAT,WRET) From TRTDEV
+        If WRET <> 0 Then
+          # FGR 12/01/2010 : X3SUIVI61184
+          Call ECR_TRACE("     1-File SQUOTE"-[F:SQH]SQHNUM+", Error ="-num$(WRET),-1) From GESECRAN
+        Endif
+     Endif
+     If [F:SQH]QUOATI<>0
+         Call COURMNT([F:SQH]CUR,GLOCALDEV,GLOCALDEV,[F:SQH]CHGTYP,[F:SQH]QUODAT,1,
+&                     [F:SQH]QUOATI,[F:SQH]QUOATIL,[F:SQH]CHGRAT,WRET) From TRTDEV
+        If WRET <> 0 Then
+          # FGR 12/01/2010 : X3SUIVI61184
+          Call ECR_TRACE("     2-File SQUOTE"-[F:SQH]SQHNUM+", Error ="-num$(WRET),-1) From GESECRAN
+        Endif
+     Endif
+
+     # ACA Gestion des adresses BPAPYR+BPY*
+     # --- Alimentation n° d'identification CEE
+     Gosub RECUP_BPR
+
+Return
+
+########################################################################
+# Initialization of the new fields for V8 [AKIRA]
+########################################################################
+$MAJ80_SQH
+  #SST Line Level Override
+  #If GACTLTA & GLOCUSATAX #108649.o
+  If GSSTTAX(find([F:SQH]CPY,GSOC))  #108649.n
+      For I=0 To dim([F:SQH]INVDTA)-1
+          If [F:SQH]INVDTA(I)<>0
+              Local Integer WJ
+              WJ=find([F:SQH]INVDTA(I),WSFINUM(0..WNBSFI))
+              If WJ>0 : [F:SQH]SFISSTCOD(I)=WSFISSTCOD(WJ-1) : Endif
+          Endif
+      Next
+  Endif
+Return
+
+########################################################################
+# Initialization of the new fields for U9 [AMBASSADOR]
+########################################################################
+$MAJ90_SQH
+
+# Issue 117758
+# It is not necessary to search SQHTYP value for each SQUOTE
+# It is necessary to do it each time SALFCY has changed
+
+#  # 104383 - New field SQHTYP initialization
+#  Local Char    SGCURLEG(GLONADI) : SGCURLEG=GCURLEG
+#  Local Char    SGCURFCY(GLONFCY) : SGCURFCY=GCURFCY
+#  Local Char    WSQHTYP(GLONTSQ)
+#  Local Char    WSOHTYP(GLONTSO)
+#  GCURLEG=GLEGSOC(find([F:SQH]CPY,GSOC)) : GCURFCY=[F:SQH]SALFCY
+#  Gosub SQHTYP From UUMGTRTSAL01
+# End issue 117758
+
+  If WSQHTYP<>""
+   [F:SQH]SQHTYP=WSQHTYP
+   [F:SQH]SOHTYP=WSOHTYP
+  Else
+   GOK=0 : Call ECR_TRACE("     1-File SQUOTE"-[F:SQH]SQHNUM+", Error : Impossible to define a sales quote type",1) From GESECRAN
+  Endif
+#  GCURLEG=SGCURLEG : GCURFCY=SGCURFCY        : # Issue 117758
+
+Return
+
+########################################################################
+# Initialization of the new fields for V8 (Quotes lines) [AKIRA]
+########################################################################
+$MAJ80_SQDSQH
+   #SST Line Level Override
+   #If GACTLTA & GLOCUSATAX #108649.o
+   If GSSTTAX(find([F:SQH]CPY,GSOC))  #108649.n
+       If [F:SQD]ITMREF<>""
+           Gosub READ_ITM
+           If [F:ITM]SSTCOD<>""
+               [F:SQD]SSTCOD = [F:ITM]SSTCOD
+           Endif
+       Endif
+   Endif
+Return
+
+# 71065 : PJT
+########################################################################
+# Initialization of the new fields for V11 (Quotes lines) [CHALLENGER]
+########################################################################
+$MAJ110_SQDSQH
+
+[F:SQD]PJT = [F:SQH]PJT
+
+Return
+# 71065 : PJT
+
+########################################################################
+$RECUP_BPR
+
+    If [F:SQH]BPAORD="" | (GACTDEB=2 & [F:SQH]BPIEECNUM="")
+      # ACA Gestion des adresses +BPAINV
+      # --- Alimentation n° d'identification CEE
+      If [F:BPC]BPCNUM<>[F:SQH]BPCORD
+          Read [F:BPC]BPC0 = [F:SQH]BPCORD : If fstat Raz [F:BPC] Endif
+      Endif
+    Endif
+
+    If [F:SQH]BPAORD=""
+      [F:SQH]BPAORD=[F:BPC]BPAADD
+    Endif
+
+    If GACTDEB=2 & [F:SQH]BPIEECNUM=""
+      If [F:BPR]BPRNUM<>[F:BPC]BPCINV
+          Read [F:BPR]BPR0 = [F:BPC]BPCINV : If fstat Raz [BPR] Endif
+      Endif
+      [F:SQH]BPIEECNUM=[F:BPR]EECNUM
+    Endif
+
+Return
+
+########################################################################
+$RECUP_BPD
+
+      If [F:SQH]EECICT="" | (GACTDEB=2 & [F:SQH]EECLOC=0)
+         # --- Alimentation incoterm, lieu de transport CEE
+         If [F:BPD]BPCNUM<>[F:SQH]BPCORD | [F:BPD]BPAADD<>[F:SQH]BPAADD
+             Read [F:BPD]BPD0 = [F:SQH]BPCORD;[F:SQH]BPAADD : If fstat Raz [BPD] Endif
+         Endif
+         If [F:SQH]EECICT="" [F:SQH]EECICT=[F:BPD]EECICT Endif
+         If GACTDEB=2 & [F:SQH]EECLOC=0 [F:SQH]EECLOC=[F:BPD]EECLOC Endif
+      Endif
+
+Return
+########################################################################
+
+# ---------------------------------------------------- #
+# Creation dans la table SVCRFOOT à partir de [M:SIHV] #
+# ---------------------------------------------------- #
+$UPD_SVF_SIHV
+# On boucle sur la table des élements de pied
+For JL=0 To dim([M:SIHV]XFNUM)-1
+#  If [M:SIHV]XFNUM(JL)<>0                              : # Issue 74556 - Optimisation
+  If [M:SIHV]XFNUM(JL)<>0 & [M:SIHV]XFNOT(JL)<>0        : # Issue 74556 - Optimisation
+
+##     Look [SVF] SVF0=WVCRNUM;WVCRTYP;[M:SIHV]XFNUM(JL)
+##     If fstat
+         Raz [F:SVF]
+         [F:SVF]VCRTYP=WVCRTYP : [F:SVF]VCRNUM=WVCRNUM
+
+         [F:SVF]CPY=GSOCIETE
+         [F:SVF]CUR=[M:SIHV]VCUR
+
+#         If evalue("dim([F:SVF]CREDAT)")>0
+#              Assign "[F:SVF]CREDAT" With date$
+#         Endif
+#         If evalue("dim([F:SVF]CREUSR)")>0
+#              Assign "[F:SVF]CREUSR" With GUSER
+#         Endif
+
+         [F:SVF]CREDAT = date$
+         [F:SVF]CREUSR = GUSER
+
+         [F:SVF]DTA        = [M:SIHV]XFNUM(JL)
+         [F:SVF]DTAAMT     = [M:SIHV]XFDTAAMT(JL)
+         [F:SVF]DTATYP     = [M:SIHV]CLCBAS(JL)
+         [F:SVF]DTANOT     = [M:SIHV]XFNOT(JL)
+
+         For I=0 To dim([F:SVF]DTANET)-1
+             [F:SVF]DTAVATNOT(I) = evalue ("[M:SIHV]DTANOT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+             [F:SVF]DTANET(I)    = evalue ("[M:SIHV]DTANET"+format$("N0:2",I+1)+"("+num$(JL)+")")
+             [F:SVF]DTAVAT(I)    = evalue ("[M:SIHV]DTAVAT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+             [F:SVF]DTAVATRAT(I) = evalue ("[M:SIHV]DTAVATRT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+             [F:SVF]DTAVATAMT(I) = evalue ("[M:SIHV]DTAVATMT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+         Next
+
+         [F:SVF]CLCORD     = [M:SIHV]CLCORD(JL)
+         [F:SVF]AMTCOD     = [M:SIHV]AMTCOD(JL)
+         [F:SVF]DTADSP     = [M:SIHV]DSP(JL)
+
+          # Issue 106947 - 20150811 by LD : Migration of historic folder
+#          If NEWMOTEUR
+#              Gosub SVF_STK : # pour stocker ref
+#              WriteB [F:SVF]
+#          Else
+#              Write [F:SVF]
+#          Endif
+#          If fstat
+#            If NEWMOTEUR & adxwrb>1
+#              Call ECR_TRACE("File SVCRFOOT, Error ="-num$(fstat),1) From GESECRAN
+#              Gosub SVF_ERRTRA : # pour afficher les ref
+#            Else
+#              Call ECR_TRACE("File SVCRFOOT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XFNUM(JL))+", Error ="-num$(fstat),1) From GESECRAN
+#            Endif
+#            GOK=0 : Break
+#          Endif
+          Gosub SVF_STK : # pour stocker ref
+          WriteB [F:SVF]
+          If fstat
+              Call ECR_TRACE("File SVCRFOOT, Error ="-num$(fstat),1) From GESECRAN
+              Gosub SVF_ERRTRA : # pour afficher les ref
+              GOK=0 : Break
+          Endif
+          # Issue 106947 - 20150811 by LD
+
+     Endif
+##  Endif
+Next JL
+
+Return
+
+# --------------------------------------------------- #
+# Creation dans la table SVCRVAT à partir de [M:SIHV] #
+# --------------------------------------------------- #
+$UPD_SVV_SIHV
+Local Integer I
+Local Char    WVAT (GLONVAT)
+
+# On boucle sur la table des taxes liées aux produits
+Raz [F:SVV]        : # Dde 81811 : Optimisation
+For JL=0 To dim ([M:SIHV]XVTAX)-1
+  If [M:SIHV]XVTAX(JL)<>""
+##     Look [SVV] SVV0=WVCRTYP;WVCRNUM;[M:SIHV]XVTAX(JL)
+##     If fstat
+         #Raz [F:SVV]        : # Dde 81811 : Optimisation
+         [F:SVV]VCRTYP=WVCRTYP : [F:SVV]VCRNUM=WVCRNUM
+
+         [F:SVV]CPY=GSOCIETE
+         [F:SVV]CUR=[M:SIHV]VCUR
+
+#         If evalue("dim([F:SVV]CREDAT)")>0
+#             Assign "[F:SVV]CREDAT" With date$
+#         Endif
+#         If evalue("dim([F:SVV]CREUSR)")>0
+#             Assign "[F:SVV]CREUSR" With GUSER
+#         Endif
+
+         [F:SVV]CREDAT = date$
+         [F:SVV]CREUSR = GUSER
+
+         [F:SVV]VAT       = [M:SIHV]XVTAX(JL)
+         [F:SVV]VATTYP    = [M:SIHV]XVTYP(JL)
+         [F:SVV]VATRAT    = [M:SIHV]XVRAT(JL)
+
+         [F:SVV]VATGRO    = [M:SIHV]XVNOT(JL)
+         [F:SVV]VATNET    = [M:SIHV]XVSMI(JL)
+         [F:SVV]VATAMT    = [M:SIHV]XVAMT(JL)
+         [F:SVV]VATSUPAMT = [M:SIHV]XVSUP(JL)
+
+         [F:SVV]BASTAX    = [M:SIHV]XVSMI(JL)
+         [F:SVV]AMTTAX    = [M:SIHV]XVAMT(JL)
+
+         Write [F:SVV]
+         If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+     Endif
+##  Endif
+Next JL
+
+# On boucle sur la table des éléments de pied
+For JL=0 To dim([M:SIHV]XFTAX)-1
+  If [M:SIHV]XFTAX(JL)<>""
+     Read [SVV]SVV0=WVCRTYP;WVCRNUM;[M:SIHV]XFTAX(JL)
+     If fstat
+         Raz [F:SVV]
+         [F:SVV]VCRTYP=WVCRTYP : [F:SVV]VCRNUM=WVCRNUM
+
+         [F:SVV]CPY=GSOCIETE
+         [F:SVV]CUR=[M:SIHV]VCUR
+
+#         If evalue("dim([F:SVV]CREDAT)")>0
+#             Assign "[F:SVV]CREDAT" With date$
+#         Endif
+#         If evalue("dim([F:SVV]CREUSR)")>0
+#             Assign "[F:SVV]CREUSR" With GUSER
+#         Endif
+
+         [F:SVV]CREDAT = date$
+         [F:SVV]CREUSR = GUSER
+
+         [F:SVV]VAT    = [M:SIHV]XFTAX(JL)
+         [F:SVV]VATTYP = 1
+         [F:SVV]VATRAT = [M:SIHV]XFRAT(JL)
+
+         [F:SVV]BASTAX = [M:SIHV]XFSMI(JL)
+         [F:SVV]AMTTAX = [M:SIHV]XFVATAMT(JL)
+
+         Write [F:SVV]
+         If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+     Else
+         [F:SVV]BASTAX += [M:SIHV]XFSMI(JL)
+         [F:SVV]AMTTAX += [M:SIHV]XFVATAMT(JL)
+
+         Rewrite [F:SVV]
+         If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+     Endif
+  Elsif [M:SIHV]XFVATAMT(JL)<>0
+     For I=0 To dim([M:SIHV]XVTAX)-1
+         If evalue ("dim([M:SIHV]DTAVAT"+format$("N0:2",I+1)+")")>0
+             If evalue ("[M:SIHV]DTAVAT"+format$("N0:2",I+1)+"("+num$(JL)+")") <> ""
+                 WVAT=evalue ("[M:SIHV]DTAVAT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+###################Gbn-82996-Deb
+#                 #82906 If VCRTYP<>WVCRTYP | VCRNUM<>WVCRNUM | VAT<>WVAT        : # Dde 81811 : Optimisation
+#                 If [F:SVV]VCRTYP<>WVCRTYP | [F:SVV]VCRNUM<>WVCRNUM | [F:SVV]VAT<>WVAT        : # Dde 81811 : Optimisation
+#                     Read [SVV]SVV0=WVCRTYP;WVCRNUM;WVAT
+#                 Endif                                                   : # Dde 81811 : Optimisation
+#                 If fstat
+#                     Raz [F:SVV]
+#                     [F:SVV]VCRTYP=WVCRTYP : [F:SVV]VCRNUM=WVCRNUM
+#
+#                     [F:SVV]CPY=GSOCIETE
+#                     [F:SVV]CUR=[M:SIHV]VCUR
+#
+##                     If evalue("dim([F:SVV]CREDAT)")>0
+##                         Assign "[F:SVV]CREDAT" With date$
+##                     Endif
+##                     If evalue("dim([F:SVV]CREUSR)")>0
+##                         Assign "[F:SVV]CREUSR" With GUSER
+##                     Endif
+#
+#                     [F:SVV]CREDAT = date$
+#                     [F:SVV]CREUSR = GUSER
+#
+#                     [F:SVV]VAT    = WVAT
+#                     [F:SVV]VATTYP = 1
+#                     [F:SVV]VATRAT = evalue ("[M:SIHV]DTAVATRT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+#
+#                     [F:SVV]BASTAX = evalue ("[M:SIHV]DTANET"+format$("N0:2",I+1)+"("+num$(JL)+")")
+#                     [F:SVV]AMTTAX = evalue ("[M:SIHV]DTAVATMT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+#
+#                     Write [F:SVV]
+#                     If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+#                 Else
+#                     [F:SVV]BASTAX += evalue ("[M:SIHV]DTANET"+format$("N0:2",I+1)+"("+num$(JL)+")")
+#                     [F:SVV]AMTTAX += evalue ("[M:SIHV]DTAVATMT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+#
+#                     Rewrite [F:SVV]
+#                     If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+#                 Endif
+                 If [F:SVV]VCRTYP<>WVCRTYP | [F:SVV]VCRNUM<>WVCRNUM | [F:SVV]VAT<>WVAT        : # Dde 81811 : Optimisation
+                     Read [SVV]SVV0=WVCRTYP;WVCRNUM;WVAT
+                     If fstat=5
+                         Raz [F:SVV]
+                         [F:SVV]VCRTYP=WVCRTYP : [F:SVV]VCRNUM=WVCRNUM
+
+                         [F:SVV]CPY=GSOCIETE
+                         [F:SVV]CUR=[M:SIHV]VCUR
+                         [F:SVV]CREDAT = date$
+                         [F:SVV]CREUSR = GUSER
+
+                         [F:SVV]VAT    = WVAT
+                         [F:SVV]VATTYP = 1
+                         [F:SVV]VATRAT = evalue ("[M:SIHV]DTAVATRT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+
+                         [F:SVV]BASTAX = evalue ("[M:SIHV]DTANET"+format$("N0:2",I+1)+"("+num$(JL)+")")
+                         [F:SVV]AMTTAX = evalue ("[M:SIHV]DTAVATMT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+
+                         Write [F:SVV]
+                         If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+                     Elsif fstat
+                         If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+                     Else
+                         [F:SVV]BASTAX += evalue ("[M:SIHV]DTANET"+format$("N0:2",I+1)+"("+num$(JL)+")")
+                         [F:SVV]AMTTAX += evalue ("[M:SIHV]DTAVATMT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+
+                         Rewrite [F:SVV]
+                         If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+                     Endif
+                 Else
+                     [F:SVV]BASTAX += evalue ("[M:SIHV]DTANET"+format$("N0:2",I+1)+"("+num$(JL)+")")
+                     [F:SVV]AMTTAX += evalue ("[M:SIHV]DTAVATMT"+format$("N0:2",I+1)+"("+num$(JL)+")")
+
+                     Rewrite [F:SVV]
+                     If fstat Call ECR_TRACE("File SVCRVAT"-WVCRNUM-num$(WVCRTYP)-num$([M:SIHV]XVTAX(JL))+", Error ="-num$(fstat),1) From GESECRAN Endif
+                 Endif
+             Endif
+             #Gbn-82996-Fin
+         Endif
+     Next
+  Endif
+Next JL
+
+Return
+
+$READ_ITM
+WITMREF = [F:SQD]ITMREF
+If [F:ITM]ITMREF<>WITMREF
+    Read [F:ITM]ITM0 = WITMREF : If fstat Raz [ITM] Endif
+Endif
+Return
+
+$ALIM_FICD
+
+[F:SQD]CPY= [F:SQH]CPY
+
+[F:SQD]DSPLINFLG= 2
+
+Gosub READ_ITM
+
+WMNTCALC = [F:ITM]ITMWEI * [F:SQD]QTY * [F:SQD]SAUSTUCOE
+WUOM1=[F:ITM]WEU
+WUOM2=GSALDSPWEU
+WQTY=WMNTCALC
+#Call CONVERT_QTY ([F:ITM]WEU,GSALDSPWEU,WMNTCALC)
+Gosub CONVERT_QTY From UUMGTRTSAL00
+WMNTCALC=WQTY
+[F:SQD]DSPLINWEI= WMNTCALC
+
+WMNTCALC = [F:ITM]ITMVOU * [F:SQD]QTY * [F:SQD]SAUSTUCOE
+WUOM1=[F:ITM]VOU
+WUOM2=GSALDSPVOU
+WQTY=WMNTCALC
+#Call CONVERT_QTY ([F:ITM]VOU,GSALDSPVOU,WMNTCALC)
+Gosub CONVERT_QTY From UUMGTRTSAL00
+WMNTCALC=WQTY
+[F:SQD]DSPLINVOL= WMNTCALC
+
+[F:SQD]DSPWEU= [F:SQH]DSPWEU
+[F:SQD]DSPVOU= [F:SQH]DSPVOU
+
+WMONT  = [F:SQH]DSPTOTQTY
+WMONT += [F:SQD]QTY
+
+[F:SQH]DSPTOTQTY= WMONT
+
+WMONT  = [F:SQH]DSPTOTWEI
+WMONT += [F:SQD]DSPLINWEI
+[F:SQH]DSPTOTWEI= WMONT
+
+WMONT  = [F:SQH]DSPTOTVOL
+WMONT += [F:SQD]DSPLINVOL
+[F:SQH]DSPTOTVOL= WMONT
+
+Return
+
+# Issue 117758
+## --------------------------------------------------- #
+## Quote type determination                            #
+## The setup used is the setup of the migrated folder  #
+## --------------------------------------------------- #
+#$SQHTYP
+#
+#  If !clalev([F:FGR]) : Local File =DOSSIER+".FACGROUP"  [FGR] : Endif
+#  If !clalev([F:TSQ]) : Local File =DOSSIER+".TABSQHTYP" [TSQ] : Endif
+#  Local Char SQHTYPPAR(GLONTSQ)
+#
+#  Link [TSQ] With [FGR]FGR0=[F:TSQ]GFY;GCURFCY As [KTSQ]
+#  Call PARAM([F:SQH]SALFCY,"SQHTYP",SQHTYPPAR) From ADOVAL
+#
+#  #> Parameter value found - Check if this quote type exists and if it is consistent with the legislation and company / site restrictions
+#
+#  If SQHTYPPAR<>""
+#    Filter [KTSQ] Where [TSQ]SQHTYP=SQHTYPPAR & ([TSQ]GFY="" | [FGR]FCY=GCURFCY) & ([TSQ]LEG=GCURLEG | [TSQ]LEG="" )
+#    Read [KTSQ]TSQ0 First
+#    If fstat=0
+#       WSQHTYP = [F:TSQ]SQHTYP
+#       WSOHTYP = [F:TSQ]SOHTYP
+#    Endif
+#    Filter [KTSQ]
+#  Endif
+#
+#  #> If no parameter value or if the quote type can't be used try to find a compatible quote type
+#
+#  Filter [KTSQ] Where ([TSQ]GFY="" | [FGR]FCY=GCURFCY) & ([TSQ]LEG=GCURLEG | [TSQ]LEG="" )
+#  Read [KTSQ]TSQ0 First
+#  If fstat=0
+#     WSQHTYP = [F:TSQ]SQHTYP
+#     WSOHTYP = [F:TSQ]SOHTYP
+#  Endif
+#  Filter [KTSQ]
+#
+#Return
+# -------------------------------------------------------------------------------------- #
+# Quote type determination                                                               #
+# The setup used is the setup of the migrated folder                                     #
+# and if we don't find in the migrated folder the setup is setup of the reference folder #
+# -------------------------------------------------------------------------------------- #
+$RECSQHTYP
+
+Raz WSQHTYP, WSOHTYP
+SGCURLEG=GCURLEG : SGCURFCY=GCURFCY
+GCURLEG=GLEGSOC(find(GSOCIETE,GSOC)) : GCURFCY=[F:SQDM]SALFCY
+
+# ----------------------------------------------------- #
+# First, we search quote type in the migrated folder    #
+# ----------------------------------------------------- #
+
+Link [TSQM] With [FGRM]FGR0=[F:TSQM]GFY;GCURFCY As [KTSQM]
+
+Call PARAM([F:SQDM]SALFCY,"SQHTYP",SQHTYPPAR) From ADOVAL
+If SQHTYPPAR<>""
+  # The parameter value SQHTYP is fed :
+  # --> Check if this quote type exists and if it is consistent with the legislation and company / site restrictions
+  Filter [KTSQM] Where [TSQM]SQHTYP=SQHTYPPAR & ([TSQM]GFY="" | [FGRM]FCY=GCURFCY) & ([TSQM]LEG=GCURLEG | [TSQM]LEG="" )
+  Read [KTSQM]TSQ0 First
+  If fstat=0
+     WSQHTYP = [F:TSQM]SQHTYP
+     WSOHTYP = [F:TSQM]SOHTYP
+  Endif
+  Filter [KTSQM]
+Endif
+
+# If no parameter value found or the quote type given by the parameter can't be used
+# --> We try to find a compatible quote type
+
+# First, we search quote type for the legislation
+If WSQHTYP=""
+    Filter [KTSQM] Where ([TSQM]GFY="" | [FGRM]FCY=GCURFCY) & [TSQM]LEG=GCURLEG
+    Read [KTSQM]TSQ0 First
+    If fstat=0
+       WSQHTYP = [F:TSQM]SQHTYP
+       WSOHTYP = [F:TSQM]SOHTYP
+    Endif
+    Filter [KTSQM]
+Endif
+
+# No quote type found for the legislation, we search quote type with no legislation
+If WSQHTYP=""
+    Filter [KTSQM] Where ([TSQM]GFY="" | [FGRM]FCY=GCURFCY) & [TSQM]LEG=""
+    Read [KTSQM]TSQ0 First
+    If fstat=0
+       WSQHTYP = [F:TSQM]SQHTYP
+       WSOHTYP = [F:TSQM]SOHTYP
+    Endif
+    Filter [KTSQM]
+Endif
+
+# -------------------------------------------------------------------------------- #
+# No quote type found in the migrated folder, we search in the reference folder    #
+# -------------------------------------------------------------------------------- #
+# First, we search quote type for the legislation
+If WSQHTYP=""
+    Link [TSQR] With [FGRR]FGR0=[F:TSQR]GFY;GCURFCY As [KTSQR]
+    Filter [KTSQR] Where ([TSQR]GFY="" | [FGRR]FCY=GCURFCY) & [TSQR]LEG=GCURLEG
+    Read [KTSQR]TSQ0 First
+    If fstat=0
+       WSQHTYP = [F:TSQR]SQHTYP
+       WSOHTYP = [F:TSQR]SOHTYP
+    Endif
+    Filter [KTSQR]
+Endif
+
+# No quote type found for the legislation, we search quote type with no legislation
+If WSQHTYP=""
+    Filter [KTSQR] Where ([TSQR]GFY="" | [FGRR]FCY=GCURFCY) & [TSQR]LEG=""
+    Read [KTSQR]TSQ0 First
+    If fstat=0
+       WSQHTYP = [F:TSQR]SQHTYP
+       WSOHTYP = [F:TSQR]SOHTYP
+    Endif
+    Filter [KTSQR]
+Endif
+
+GCURLEG=SGCURLEG : GCURFCY=SGCURFCY
+
+Return
+# End issue 117758
+
+########################################################################
+$TRT_SQL
+
+#2- alimenter la nouvelle colonne si vide
+#-----  Déclaration des variables -----#
+
+Call DEBTRANS From GLOCK
+Gosub SET_FIRST From TRTFIRST
+
+Trbegin [SQDM]
+GOK = 1
+
+Gosub TRT_SQL1
+
+If GOK<1
+  Rollback
+Else
+  Commit
+Endif
+
+Gosub UNSET_FIRST From TRTFIRST
+
+Return
+
+########################################################################
+$TRT_SQL1
+Local Char REQSQL (250) (3)
+
+Onerrgo ERR_SQL
+REQSQL(0)="UPDATE"-DOSSIER+"."+WNAMSQDM+" SET SALFCY_0="
+REQSQL(1)="(SELECT SQH.SALFCY_0 FROM"-DOSSIER+"."+WNAMSQHM+" SQH Where SQH.SQHNUM_0="+WNAMSQDM+".SQHNUM_0)"
+REQSQL(2)=" WHERE "+WNAMSQDM+".SALFCY_0<>(SELECT SQH.SALFCY_0 From"-DOSSIER+"."+WNAMSQHM+" SQH Where SQH.SQHNUM_0="+WNAMSQDM+".SQHNUM_0) "
+
+Execsql From num$(GTYPDBA*2+1) Sql REQSQL
+Onerrgo
+Return
+
+###################################################################################################
+$ERR_SQL
+GMESSAGE = errp-"("+num$(errl)+")"+"\"+mess(6,123,1)-num$(errn)-":"-errmes$(errn)+"\"+errm
+Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+GOK=0
+Resume
+
+########################################################################
+# Pour exécution automatique  en gestion de patch                      #
+########################################################################
+Subprog PATCH(APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 End : Endif
+If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+# Issue 106947 - 20150811 by LD : Migration of historic folder
+#Read [ADS] DOSSIER=APPLI : If fstat Raz [F:ADS] : Endif
+If func DOSSUB.FILL_ADS(APPLI)=0 : End : Endif
+# Issue 106947 - 20150811 by LD
+Call MAJ_UUMGTRTSAL01(APPLI)
+End
+
+#######################################################################
+# Pour exécution depuis dosmaj (validation dossier)
+########################################################################
+Subprog UTI_MOUL (APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 End : Endif
+Call MAJ_UUMGTRTSAL01(APPLI)
+End
+

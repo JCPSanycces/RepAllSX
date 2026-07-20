@@ -1,0 +1,691 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#########################################################################
+#                                       Module Ventes - Septembre 2000  #
+#     VALIDATION DES FACTURES                                           #
+#                                                                       #
+#     - Traitement        : FUNCFMINV                                   #
+#     - Action e_commerce : TRTCFMINV  (Traitement standard)            #
+#                                                                       #
+#########################################################################
+# Issue 115988 - 20170722 by LD : FUNCFMINV skipps invoices when posting large amount of inv
+
+#------------------------------------------------------------------------
+# si on positionne le GTEST = 1 on peut voir la piece equilibree ou non
+#------------------------------------------------------------------------
+
+#########################################################################
+# Etiquettes ACTION                                                     #
+#########################################################################
+$ACTION
+#--- Actions liées au traitement standard
+
+Case ACTION
+ When "OUVRE_BATCH" :  Gosub INIT_TRTCFMINV
+ When "INIT"        :  Gosub INIT_TRTCFMINV
+ When "DEBUT"       :  Affzo [DIA]1-99
+ When "OK"          :  GOK=1
+ When "END"         :  GOK=0 : FIN=1
+ When "CONTROLE"    :  Gosub CONTROLE_TRTCFMINV
+ When "EXEC"        :  Gosub EXEC_TRTCFMINV
+ When "TERMINE"     :  Gosub TERMINE_TRTCFMINV
+ When Default
+Endcase
+Return
+#########################################################################
+# Détail des actions liées au traitement standard                       #
+#########################################################################
+
+#########################################################################
+$INIT_TRTCFMINV
+Local Char    STRNUM(GLONVCR), ENDNUM(GLONVCR)   : # Factures début et fin
+
+# En batch , il vaut mieux mettre onerrgo
+If GSERVEUR
+    Onerrgo ERRBATCH
+Endif
+
+Gosub OUVRE
+
+Local Mask SCI1 [DIA]
+
+# --------------------------------------------------- #
+# Chargement de l'écran en fonction des habilitations #
+# --------------------------------------------------- #
+Raz [M:DIA]
+
+[M:DIA]ALLCPY=2
+If GUSRFCY(1)<>"\" & GNBAUZ<>GNBSITE : [M:DIA]ALLCPY = 1 : Endif
+If [M:DIA]ALLCPY = 1
+    Call INICPY([M:DIA]CPY) From CPTSUB
+Endif
+[M:DIA]ALLFCY=2
+If [M:DIA]ALLCPY=1
+    Call INIALLFCY([M:DIA]ALLFCY,[M:DIA]CPY) From CPTTRT
+Endif
+If [M:DIA]ALLFCY = 1
+    Call INIFCY([M:DIA]FCY,[M:DIA]CPY) From CPTSUB
+Endif
+
+Call LECMEMO ("STD","[M:DIA]","vf8") From GMEMO
+
+[M:DIA]USR=GUSER
+[M:DIA]ALLTYP=2
+
+Return
+
+#########################################################################
+$CONTROLE_TRTCFMINV
+If GOK < 1  FIN=1 Else TMP=1  Endif
+
+Return
+
+#########################################################################
+$EXEC_TRTCFMINV
+Local Char WCPY(GLONCPY), WFCY(GLONFCY)   : # 96470 : Section analytique non alimentées ds STOJOU
+Raz WCPY, WFCY                            : # 96470
+
+If !GSERVEUR
+# --> ouverture de la trace
+    Call OUVRE_TRACE(TIT) From LECFIC
+    Call ECR_TRACE(" ",0) From GESECRAN
+    Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+    Call PRTSCR("SCI1","DIA","",0,1) From ATRTX3
+    Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+    Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+
+# Bornage de la date de prise en compte des factures si la requête est abonnée
+# Si dates début et fin non renseignées, on force la date du jour
+If val(getenv$("RQT_ENTREP"))<>0
+    # Si on a un n° de requête c'est que l'on est batch
+    # ==> Si la requête est abonnée (CODABT<>""), on initialise les dates
+    Read [ABR]NUMREQ = val(getenv$("RQT_ENTREP"))
+    If fstat=0 & [F:ABR]CODABT<>"" & [M]STRDAT=[0/0/0] & [M]ENDDAT=[0/0/0]
+        [M]STRDAT = date$ : [M]ENDDAT = date$
+    Endif
+Endif
+
+# V6.2 : Certification
+# Lecture valeur du paramètre SIVCFM si la validation se fait sur un seul site
+If [M]FCY<>""
+  #Call PARAM([M:DIA]FCY,"SIVCFM",WPARAM) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637
+  Call PARAML([M:DIA]FCY,"SIVCFM",WPARAM) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637
+  GSIVCFM = val(WPARAM)
+  # 96470 : Section analytique non alimentées ds STOJOU
+  # --- Chargement des globales référenciels, comptes et sections de la société
+  Raz GSOC_ACTIVE
+  Call GETCPY([M:DIA]FCY,"",0,"") From TRTX3CPT
+  Call GLOBVAR([M:DIA]FCY) From WWGLOBVEN
+  WCPY=GSOCIETE : WFCY=[M:DIA]FCY
+  # --- Utilisation systeme de taxe
+  Call LEC_CPY(GSOCIETE) From CPTLEC   # 106867.n
+#  If func AFNC.ACTIV("KUS")  # 106867.so
+#      #Call PARAM([M:DIA]FCY,"USATAX",WPARAM) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637
+#      Call PARAML([M:DIA]FCY,"USATAX",WPARAM) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637
+#      GLOCUSATAX=val(WPARAM)
+#      If GLOCUSATAX>0  GLOCUSATAX-=1 : Endif
+#  Else
+#      Raz GLOCUSATAX
+#  Endif  # 106867.eo
+  # 96470
+Endif
+
+# 87923 : Gestion des prélèvements SDD
+# Si validation pour une seule société, lecture du paramètre SDDMGT pour la société
+If [M]CPY<>""
+    If func AFNC.ACTIV("SDD")
+        Call PARAML([M:DIA]FCY,"SDDMGT",WPARAM) From ADOVAL
+        GSDDMGT=val(WPARAM)
+    Endif
+Endif
+# 87923
+
+#--- Sam 75115 : Validation facture par société ---#
+# --> Boucle de traitement
+Gosub TRAITEMENT_TTES_FACTURES
+
+Return
+
+#########################################################################
+$TERMINE_TRTCFMINV
+
+If !GSERVEUR
+    If !NBPCE
+      Call ECR_TRACE(mess(68,192,1),0) From GESECRAN
+    Endif
+# --> fermeture trace
+    Call FERME_TRACE From LECFIC
+# --> aucune facture traitée
+    If !NBPCE
+      GERR=2 : GMESSAGE=mess(68,192,1)
+    Endif
+    TRA=1
+Endif
+
+# Si présence module Support Client, impression
+If GMODU(12)=2
+   Call PRINTFLYER(2,STRNUM,ENDNUM,WRET) From TRTMACRULE
+   If WRET GERR=2 : GMESSAGE=mess(WRET,182,1) Endif
+Endif
+
+# GREP est positionnée à "C" dans l'interface comptable CPTAUTO
+# --> la navigation était totalement bloquée en sortie de cette fonction
+Raz GREP
+
+If func AFNC.ACTIV("SEPP")
+  If dim(GSEPAYLOT)> 0 : Kill GSEPAYLOT : Endif   # 78411 Sage Exchange
+  If dim(GSENBRPAY)> 0 : Kill GSENBRPAY : Endif   # 111836.n
+Endif
+
+Return
+
+
+#-----------------------------------------------------------------------#
+#    Ouverture
+#-----------------------------------------------------------------------#
+$OUVRE
+Local Integer  OK, NBPCE, WRET
+
+#MGG X3-38293 Problem with FUNCFMINV and lengh of criteria
+Local Char     CRITERE(250), SYMBOLE(50),CRITERE_2(250)
+#END MGG X3-38293 Problem with FUNCFMINV and lengh of criteria
+
+If clalev([F:SIH])=0 : Local File SINVOICE    [SIH] : Endif
+If clalev([F:SIV])=0 : Local File SINVOICEV   [SIV] : Endif
+If clalev([F:SID])=0 : Local File SINVOICED   [SID] : Endif
+If clalev([F:SVF])=0 : Local File SVCRFOOT    [SVF] : Endif
+If clalev([F:SVV])=0 : Local File SVCRVAT     [SVV] : Endif
+If clalev([F:FCY])=0 : Local File FACILITY    [FCY] : Endif
+If clalev([F:CPY])=0 : Local File COMPANY     [CPY] : Endif
+If clalev([F:BPR])=0 : Local File BPARTNER    [BPR] : Endif
+If clalev([F:BPC])=0 : Local File BPCUSTOMER  [BPC] : Endif
+If clalev([F:GAC])=0 : Local File GACCOUNT    [GAC] : Endif
+If clalev([F:CAC])=0 : Local File GACCCODE    [CAC] : Endif
+If clalev([F:DSP])=0 : Local File CADSP       [DSP] : Endif
+If clalev([F:CCE])=0 : Local File CACCE       [CCE] : Endif
+If clalev([F:AUZ])=0 : Local File CAAUZ       [AUZ] : Endif
+If clalev([F:TCU])=0 : Local File TABCUR      [TCU] : Endif
+If clalev([F:TCH])=0 : Local File TABCHANGE   [TCH] : Endif
+If clalev([F:TUN])=0 : Local File TABUNIT     [TUN] : Endif
+If clalev([F:GTE])=0 : Local File GTYPACCENT  [GTE] : Endif
+If clalev([F:FIY])=0 : Local File FISCALYEAR  [FIY] : Endif
+If clalev([F:PER])=0 : Local File PERIOD      [PER] : Endif
+If clalev([F:DUD])=0 : Local File GACCDUDATE  [DUD] : Endif
+If clalev([F:GAU])=0 : Local File GAUTACE     [GAU] : Endif
+If GMODU(2)=2                :  # 105566 : Ajout test présence module compta
+    If clalev([F:JOU])=0 Local File GJOURNAL  [JOU] : Endif
+Endif                        :  # 105566
+If clalev([F:ITM])=0 : Local File ITMMASTER   [ITM] : Endif
+If clalev([F:SDH])=0 : Local File SDELIVERY   [SDH] : Endif
+If clalev([F:STJ])=0 : Local File STOJOU      [STJ] : Endif
+If clalev([F:ABR])=0 : Local File ABATRQT     [ABR] : Endif  : # Utile pour savoir si tache abonnée
+If func AFNC.ACTIV("SDD")
+    If clalev([F:MDT])=0 : Local File MANDATE [MDT] : Endif  : # 87923 : Gestion des prélèvements SDD
+Endif
+If clalev([F:TAM])=0 : Local File TABPAM      [TAM] : Endif  : # 87923 : Gestion des prélèvements SDD
+
+If GMODU(2)=2 : # Test module compta
+    If clalev([F:JST])=0 : Local File GAJOUSTA    [JST] : Endif
+Endif
+
+# --> ouvertures
+Local File SINVOICE [SI2]
+
+# --- Déclaration classe ecran pour les encours --- #
+Local Mask ORDK   [ORDK] : Raz [M:ORDK]
+# Local Mask SCI1   [DIA]  : Raz [M:DIA]
+If clalev([M:SIH0])=0 : Local Mask SIH0 [SIH0] : Raz [SIH0] : Endif
+If clalev([M:SIH1])=0 : Local Mask SIH1 [SIH1] : Raz [SIH1] : Endif
+If clalev([M:SIH2])=0 : Local Mask SIH2 [SIH2] : Raz [SIH2] : Endif
+If clalev([M:SIH4])=0 : Local Mask SIH4 [SIH4] : Raz [SIH4] : Endif
+If clalev([M:SIHV])=0 : Local Mask SIHV [SIHV] : Raz [SIHV] : Endif
+# ajouter tous les masques nécessaires
+
+TIT = mess(44,119,1)  : # Validation factures clients
+
+# Raz [M:DIA]
+Filter [SI2]
+
+Local Integer  WCDTUNL
+#------------------------------------------------------------#
+# Chargement flag déblocage crédit autorisé                  #
+#------------------------------------------------------------#
+Local Char WPARAM(GLONADP)
+
+Call PARAMUTIL("SCDTUNL",WPARAM,"","") From SUBAUS
+WCDTUNL=val(WPARAM)
+If WCDTUNL=0 WCDTUNL=1 Endif
+
+# 78411 Sage Exchange
+If func AFNC.ACTIV("SEPP")
+  Global Char     GSEPAYLOT
+  Global Integer  GSENBRPAY # 111836.n
+Endif
+
+Return
+
+
+#--- Sam 75115 : Validation facture par société ---#
+##################################################################
+# $TRAITEMENT_TTES_FACTURES : Lecture et traitement des factures #
+##################################################################
+$TRAITEMENT_TTES_FACTURES
+
+#--- Sam 75115 : Validation facture par société ---#
+Local Integer WEXIT_VALID_FAC : #-- 0=Non / 1=Arret boucle facture pour la société / 2=Arret complet boucle facture --#
+Local Char     WTRS(3), WPARAM2(GLONADP)
+
+NBPCE = 0
+#--> constitution du filtre des entêtes factures
+
+#    facture et avoir (pas proforma) statut imprimé et module vente =
+#CRITERE = "INVTYP<3 & (STA=2 | (STA=1 & GSIVCFM=1)) & ORIMOD=5"
+#CRITERE = "INVTYP<3 & STA<3 & ORIMOD=5"
+
+# Facture et avoir non validée origine module vente
+#MGG X3-38293 Problem with FUNCFMINV and lengh of criteria
+CRITERE_2 = ""
+#END MGG X3-38293 Problem with FUNCFMINV and lengh of criteria
+CRITERE = "INVTYP<3 & STA<>3 & ORIMOD=5"
+# V6.2 : Certification : Facture imprimée ou non imprimée ssi on est pas en Impression facture obligatoire
+# Si le traitement est fait sur un site, on peut positionner le critère içi
+If [M:DIA]FCY<>""
+#    CRITERE -= "& (STARPT=2 | (STARPT<>1 & GSIVCFM<>2)) "  : # Bug 68331
+    CRITERE -= "& (STARPT=2 | GSIVCFM<>2) "                 : # Bug 68331
+Endif
+
+If [M:DIA]ALLCPY<>2 : CRITERE -= '& CPY = "'+[M:DIA]CPY+'"' : Endif
+If [M:DIA]ALLFCY<>2 : CRITERE -= '& FCY = "'+[M:DIA]FCY+'"' : Endif
+If [M:DIA]ALLUSR<>2
+ CRITERE -= '& (UPDUSR = "'+[M:DIA]USR+'"'
+ CRITERE -= '| (UPDUSR = "" & CREUSR = "'+[M:DIA]USR+'"))'
+Endif
+#MGG X3-38293 Problem with FUNCFMINV and lengh of criteria
+If [M:DIA]STRDAT<>[0/0/0] : CRITERE_2 -= "& ACCDAT>=["+format$(GFMD,[M:DIA]STRDAT)+"]" : Endif
+If [M:DIA]ENDDAT<>[0/0/0] : CRITERE_2 -= "& ACCDAT<=["+format$(GFMD,[M:DIA]ENDDAT)+"]" : Endif
+If [M:DIA]VCRDEB<>"" : CRITERE_2 -= '& NUM>="'+[M:DIA]VCRDEB+'"' : Endif
+If [M:DIA]VCRFIN<>"" : CRITERE_2 -= '& NUM<="'+[M:DIA]VCRFIN+'"' : Endif
+If [M:DIA]ALLTYP<>2  : CRITERE_2 -= '& INVTYP='+num$([M:DIA]INVTYP) : Endif
+#END MGG X3-38293 Problem with FUNCFMINV and lengh of criteria
+#---------------------------------------------------------------------#
+# Point d'entree ajout filtres supplémentaires                        #
+#---------------------------------------------------------------------#
+Local Char    FILSUP (250)
+Local Char    L_NUM (GLONVCR), SNAP_CRIT(150)
+Local Integer SNAP_N, SNAP_STOP, L_STA, L_ORIMOD, L_INVTYP
+Local Char    L_CPY (GLONCPY)   : # Issue 115988
+
+FILSUP="1=1"
+GPOINT="CFMINVFIL" : Gosub ENTREE From EXEFNC
+
+Raz L_STA, L_ORIMOD, L_INVTYP, L_NUM, SNAP_CRIT
+Raz L_CPY                       : # Issue 115988
+
+$SNAP_BOUCLE
+# Issue 115988
+#If SNAP_STOP=1
+#   SNAP_CRIT="STA=L_STA & ORIMOD=L_ORIMOD & INVTYP=L_INVTYP & NUM>L_NUM"
+#   SNAP_STOP=2
+#Elsif SNAP_STOP=2
+#   SNAP_CRIT="STA=L_STA & ORIMOD=L_ORIMOD & INVTYP>L_INVTYP"
+#   SNAP_STOP=3
+#Elsif SNAP_STOP=3
+#   SNAP_CRIT="STA=L_STA & ORIMOD>L_ORIMOD"
+#   SNAP_STOP=4
+#Elsif SNAP_STOP=4
+#   SNAP_CRIT="STA>L_STA"
+#   SNAP_STOP=0
+#Else
+#   SNAP_CRIT="1=1"
+#Endif
+If SNAP_STOP=1
+   SNAP_CRIT="CPY=L_CPY & STA=L_STA & ORIMOD=L_ORIMOD & INVTYP=L_INVTYP & NUM>L_NUM"
+   SNAP_STOP=2
+Elsif SNAP_STOP=2
+   SNAP_CRIT="CPY=L_CPY & STA=L_STA & ORIMOD=L_ORIMOD & INVTYP>L_INVTYP"
+   SNAP_STOP=3
+Elsif SNAP_STOP=3
+   SNAP_CRIT="CPY=L_CPY & STA=L_STA & ORIMOD>L_ORIMOD"
+   SNAP_STOP=4
+Elsif SNAP_STOP=4
+   SNAP_CRIT="CPY=L_CPY & STA>L_STA"
+   SNAP_STOP=5
+Elsif SNAP_STOP=5
+   SNAP_CRIT="CPY>L_CPY"
+   SNAP_STOP=0
+Else
+   SNAP_CRIT="1=1"
+Endif
+# End issue 115988
+
+#SNAP_N=0 : SNAP_STOP=0
+SNAP_N=0
+
+#--> lecture des factures et traitement
+
+#--- Sam 75115 : Validation facture par société ---#
+
+#For  [SI2]SIH6 Where (evalue(CRITERE) & evalue (FILSUP)) & evalue(SNAP_CRIT)
+Filter  [SI2] Where (evalue(CRITERE + CRITERE_2) & evalue (FILSUP)) & evalue(SNAP_CRIT)
+&                     Order By Key CLE=[F:SI2]CPY; [F:SI2]STA; [F:SI2]ORIMOD; [F:SI2]INVTYP; [F:SI2]NUM
+
+For  [SI2]CLE(1)
+
+  #Call PARAM([F:SI2]FCY,"PORDKS",WPARAM2) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637 : #-- Lecture param PORDKS pour un site --> ramène val pour société  ---#
+  Call PARAML([F:SI2]FCY,"PORDKS",WPARAM2) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637 : #-- Lecture param PORDKS pour un site --> ramène val pour société  ---#
+
+  # 87923 : Gestion des prélèvements SDD
+  # Si validation pour ttes les sociétés, lecture du paramètre SDDMGT à chaque rupture société
+  If [M]CPY=""
+      If func AFNC.ACTIV("SDD")
+          Call PARAML([F:SI2]FCY,"SDDMGT",WPARAM) From ADOVAL
+          GSDDMGT=val(WPARAM)
+      Endif
+  Endif
+  # 87923
+
+  If GTRACE<>""
+    Call ECR_TRACE( '  '  ,0) From GESECRAN
+    Call ECR_TRACE(mess(6,47,1) + ' : ' + [F:SI2]CPY  ,0) From GESECRAN
+  Endif
+
+  For  [SI2]CLE
+   Gosub TRAITEMENT_UNE_FACTURE
+
+   If WEXIT_VALID_FAC=2    : #-- Arrêt complet de la boucle ---------#
+         Break 2
+   Elsif WEXIT_VALID_FAC=1 : #-- Arrêt de la boucle pour la société  --#
+         Break
+   Endif
+  Next
+
+Next
+
+Filter  [SI2]
+
+
+If SNAP_STOP : Goto SNAP_BOUCLE : Endif
+
+Return
+
+#--- Sam 75115 : Validation facture par société ---#
+#####################################################
+# $TRAITEMENT_UNE_FACTURE : Traitement une facture  #
+#####################################################
+$TRAITEMENT_UNE_FACTURE
+
+  #--- Sam 75115 : Validation facture par société ---#
+  WEXIT_VALID_FAC=0
+
+  OK =2
+  Call CONTFCY([F:SI2]FCY) From CPTSUB
+  If mkstat : OK = 1 : Endif
+
+  # 87923 : Gestion des prélèvements SDD
+  If dim(GSDDMGT)>0 & GSDDMGT=2
+      # Si la société gère les SDD
+      For [DUD]DUD0 Where TYP=[F:SI2]GTE & NUM=[F:SI2]NUM
+       # On vérifie le n°mandat sur chaque échéance dt le mode règlement est SDD
+       Call LEC_TAM(GCURLEG,[F:DUD]PAM) From CPTLEC
+       If !fstat & [F:TAM]SDDFLG=2 & [F:DUD]UMRNUM=""
+            # Le n°mandat doit être renseigné
+            OK=1 : If GTRACE<>"" Call ECR_TRACE([F:SI2]NUM-":"-mess(389,192,1),1) From GESECRAN : Endif
+       Elsif !fstat & [F:TAM]SDDFLG=2
+            # Si le n°mandat est renseigné mais qu'il n'est validé, on le précise dans la trace
+            If [F:MDT]UMRNUM<>[F:DUD]UMRNUM | [F:MDT]CPY<>[F:SI2]CPY
+              Read [MDT]MDT0 = [F:SI2]CPY;[F:DUD]UMRNUM
+            Endif
+            If [F:MDT]STA<>2
+                If GTRACE<>"" Call ECR_TRACE([F:SI2]NUM-":"-[F:DUD]UMRNUM-":"-mess(382,192,1)-"("-mess([F:MDT]STA,3631,1)-")",0) From GESECRAN : Endif
+            Endif
+        Endif
+      Next
+      Default File [SIV]
+      If GERR=1 : Return : Endif
+  Endif
+  # 87923
+
+  #---- Pour vérifier si la facture est validable
+  GPOINT="CFMINVSEL" : Gosub ENTREE From EXEFNC
+
+  #---- V6.2 : Certification : Si Impression facture obligatoire, la facture doit être imprimée
+  If [M]FCY=""
+      # Si le traitement est fait sur plusieurs sites, on positionne le critère içi
+      #Call PARAM([F:SI2]FCY,"SIVCFM",WPARAM) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637
+      Call PARAML([F:SI2]FCY,"SIVCFM",WPARAM) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637
+      GSIVCFM = val(WPARAM)
+      If GSIVCFM=2 & [F:SI2]STARPT<>2 OK=1 Endif : # Bug 68331
+  Endif
+
+  If OK=2
+    #----   Si facture directe issue du module vente
+    #----    Récupération de la transaction de stock
+    #----    Si facture avec mouvement de stock, contrôle du client
+    # 96470 : Section analytique non alimentées ds STOJOU
+#    Call GETDEV([F:SI2]FCY)  From DEVSUB    : # Bug 61533
+    If WFCY<>[F:SI2]FCY
+      # --- Chargement des globales référenciels, comptes et sections de la société
+      Call GETCPY([F:SI2]FCY,"",0,"") From TRTX3CPT
+      Call GLOBVAR([F:SI2]FCY) From WWGLOBVEN : # Bug 61533
+      WCPY=GSOCIETE : WFCY=[F:SI2]FCY
+      # --- Utilisation systeme de taxe
+      Call LEC_CPY(GSOCIETE) From CPTLEC   # 106867.n
+#      If func AFNC.ACTIV("KUS")  # 106867.so
+#          #Call PARAM([M:DIA]FCY,"USATAX",WPARAM) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637
+#          Call PARAML([M:DIA]FCY,"USATAX",WPARAM) From ADOVAL      # FGR 17/04/2015  X3SUIVI107637
+#          GLOCUSATAX=val(WPARAM)
+#          If GLOCUSATAX>0  GLOCUSATAX-=1 : Endif
+#      Else
+#          Raz GLOCUSATAX
+#      Endif  # 106867.eo
+    Endif
+    # 96470
+
+    If [F:SI2]INVTYP = 1 & [F:SI2]ORIMOD = 5
+        Read [SIV]SIV0=[F:SI2]NUM
+        If fstat : OK=1 : Endif
+        If OK=2
+            If [F:SIV]SIHORI=1 & [F:SIV]STOMVTFLG=2 Gosub VERIF_BPC : Endif
+        Endif
+    Endif
+    If OK=2
+        NBPCE +=1
+        #-----        SYMBOLE = "SIH"+[F:SI2]NUM     : # bug 18393
+        SYMBOLE = "SIV"+[F:SI2]NUM      : # bug 18393
+        Lock =SYMBOLE With lockwait=0
+        If   fstat=1
+          #----  modification en cours sur un autre poste
+          If GTRACE<>"" : Call ECR_TRACE([F:SI2]NUM-mess(10,100,1),1) From GESECRAN : Endif
+        Else
+          #---- 2 = traitement de validation appelé par validation de masse
+          Call VALIDATION(2,[F:SI2]NUM) From TRTVENFACV
+          If GOK = 1
+            GPOINT="CFMINVAFT" : Gosub ENTREE From EXEFNC
+          Endif
+          Unlock =SYMBOLE
+
+          #-------------------------------------------------------------------#
+          # Si présence module Support Client, gestion du parc client
+          #    si facture directe avec m.a.j. stock
+          #    si facture de commande
+          #    si facture de livraison (lignes ajoutées et livraisons de prêt)
+          #-------------------------------------------------------------------#
+          If GMODU(12)=2
+             If [F:SIV]INVTYP=1 & ([F:SIV]SIHORI=1 & [F:SIV]STOMVTFLG=2) |
+&               [F:SIV]SIHORI=2 | [F:SIV]SIHORI=3
+                # Alimentation des bornes min et max des livraisons traitées
+                If STRNUM=""
+                   STRNUM=[F:SI2]NUM
+                Elsif STRNUM>[F:SI2]NUM
+                   STRNUM=[F:SI2]NUM
+                Endif
+                If ENDNUM=""
+                   ENDNUM=[F:SI2]NUM
+                Elsif ENDNUM<[F:SI2]NUM
+                   ENDNUM=[F:SI2]NUM
+                Endif
+              Endif
+           Endif
+        Endif
+    Endif
+  Endif
+
+  SNAP_N +=1
+If GUSER="LD"
+     Call ECR_TRACE('SNAP_N=' + num$(SNAP_N)+'L_NUM=' + num$(L_NUM),0) From GESECRAN
+Endif
+#----  If SNAP_N>1000 : SNAP_CLE=[F:SI2]NUM : SNAP_STOP=1 : Break : Endif
+  #If SNAP_N>1000                      # FGR 17/04/2015 : X3SUIVI107637
+  If SNAP_N> GMAXUPDTRS Then           # FGR 17/04/2015 : X3SUIVI107637
+      L_CPY=[F:SI2]CPY          : # 115988
+      L_STA=[F:SI2]STA
+      L_ORIMOD=[F:SI2]ORIMOD
+      L_INVTYP=[F:SI2]INVTYP
+      L_NUM=[F:SI2]NUM
+      SNAP_STOP=1
+      #Break
+      WEXIT_VALID_FAC=2
+If GUSER="LD"
+     Call ECR_TRACE('L_STA=' + num$(L_STA)+'L_ORIMOD=' + num$(L_ORIMOD)+'L_INVTYP=' + num$(L_INVTYP),0) From GESECRAN
+     Call ECR_TRACE('L_STA=' + num$(L_STA)+'L_NUM=' + num$(L_NUM)+ ' ---###' ,0) From GESECRAN
+Endif
+      Return
+  Endif
+
+  #--- Sam 75115 : Validation facture par société ---#
+  If GOK<1  & val(WPARAM2)=2
+    If GTRACE<>""
+     Call ECR_TRACE('    ###--- ' + mess(4,26,1)  + '('+mess(6,47,1)+')' - 'PORDKS='+mess(val(WPARAM2),1,1) + ' -> ' + mess(255,191,1) + ' ---###' ,0) From GESECRAN
+    Endif
+    WEXIT_VALID_FAC=1 : #-- Arrêt du traitement de la société  --#
+  Endif
+
+Return
+
+#------------------------------------------------------------------------- #
+# Si facture directe avec mouvement de stock                               #
+# on vérifie que client non bloqué et pas de dépassement d'en-cours        #
+#------------------------------------------------------------------------- #
+$VERIF_BPC
+Local Integer CDTSTA
+
+Local Decimal WCOURS : WCOURS=0
+
+#--- Alimentation cours pour conversion en-cours de dev.soc vers dev.facture (Utilisé si ctrl en-cours au niveau soc)
+# FGR 21/07/2014 : X3SUIVI100904 (début)
+#If [F:SI2]RATDIV(GTYPGEN-1)<>0 WCOURS=arr([F:SI2]RATDIV(GTYPGEN-1)/[F:SI2]RATMLT(GTYPGEN-1), 10^-GDECRCU) : Endif
+If [F:SI2]RATMLT(GTYPGEN-1)<>0 WCOURS=arr([F:SI2]RATDIV(GTYPGEN-1)/[F:SI2]RATMLT(GTYPGEN-1), 10^-GDECRCU) : Endif
+# FGR 21/07/2014 : X3SUIVI100904 (fin)
+
+Call SDCDTSTA ("",[F:SIV]BPCORD,[F:SI2]CURTYP,WCOURS,"",[F:SI2]ACCDAT,0,1,CDTSTA,GBIDD1,GBIDD1) From TRTVENCDT
+Case CDTSTA
+ When 2 : # Client bloqué
+      OK=1 : If GTRACE<>"" Call ECR_TRACE([F:SI2]NUM-mess(151,199,1),1) From GESECRAN : Endif
+ When 3 : # Dépassement d'en cours
+          # Si déblocage crédit non autorisé on bloque
+          If WCDTUNL=1
+              OK=1 : If GTRACE<>"" Call ECR_TRACE([F:SI2]NUM-mess(29,192,1),1) From GESECRAN : Endif
+          Endif
+ When Default
+Endcase
+Return
+
+#########################################################################
+#                            ACTIONS CHAMPS
+#########################################################################
+
+Subprog AS_ALLCPY(VALEUR)
+Variable Integer  VALEUR
+#If GUSRACC(2)=0 VALEUR = 1 : mkstat=2 : Endif
+If GUSRFCY(1)<>"\" & GNBAUZ<>GNBSITE : mkstat = 1 : End : Endif
+End
+
+########################################
+Subprog AS_CPY(VALEUR)
+Variable Char     VALEUR
+Local Integer ISITE
+If [M:DIA]ALLCPY = 2 : mkstat = 1 : End : Endif
+# Initialsation de la société avec l'action INICPY
+#If VALEUR=""
+# ISITE = find(GFCYDEF(0),GSITE(1..GNBSITE))
+# If ISITE
+#  VALEUR = GSOCSITE(ISITE)
+# Endif
+#Endif
+#If GUSRACC(2)=0 : mkstat = 2 : Endif
+End
+########################################
+Subprog AS_ALLFCY(VALEUR)
+Variable Integer  VALEUR
+If [M]ALLCPY=2 : VALEUR = 2 : End : Endif
+Call INIALLFCY(VALEUR,[M]CPY) From CPTTRT
+#If GUSRACC(2)=0
+# VALEUR = 1 : mkstat = 2
+#Elsif [M:DIA]ALLCPY=2
+# VALEUR = 2 : mkstat = 2
+#Endif
+End
+
+########################################
+Subprog AS_FCY(VALEUR)
+Variable Char VALEUR
+If [M:DIA]ALLFCY = 2 : mkstat = 1 : End : Endif
+# Initialsation du site avec l'action INIFCY
+#If VALEUR=""
+# VALEUR = GFCYDEF
+#Endif
+#If GUSRACC(2)=0 : mkstat = 2 : Endif
+End
+
+Subprog C_FCY(VALEUR)
+Variable Char     VALEUR
+If [M:DIA]ALLCPY=1 & [F:FCY]LEGCPY<>[M:DIA]CPY
+ GMESSAGE = mess(30,106,1)-[F:FCY]LEGCPY : # Ce site est dans la société
+ mkstat = 2
+Endif
+End
+
+########################################
+# Action supprimée
+Subprog AV_USR(VALEUR)
+Variable Char    VALEUR()
+If [M:DIA]ALLUSR <> 2 and VALEUR = ""
+  VALEUR = GUSER
+Endif
+End
+Subprog AS_USR(VALEUR)
+Variable Char     VALEUR
+If [M:DIA]ALLUSR = 2 : mkstat = 1 : End : Endif
+If VALEUR=""
+ VALEUR = GUSER
+Endif
+End
+
+########################################
+Subprog AS_INVTYP(VALEUR)
+Variable Integer VALEUR
+If [M:DIA]ALLTYP=2 : mkstat = 1 : End : Endif
+End
+
+########################################
+Subprog AM_STRDAT(VALEUR)
+Variable Date    VALEUR
+If VALEUR <> [0/0/0] : [M]ENDDAT = VALEUR : Endif
+End
+
+########################################
+Subprog AM_VCRDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M]VCRFIN = VALEUR : Endif
+End
+
+#########################################################################
+#                            ERREUR BATCH
+#########################################################################
+$ERRBATCH
+Call ECR_TRACE(errmes$(errn)-num$(errl)-ERR,1) From GESECRAN
+End
+
+########################################################################
+

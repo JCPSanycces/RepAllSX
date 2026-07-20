@@ -1,0 +1,788 @@
+#<AdxTL>@(#)4.0.0.0 $Revision$
+#########################################################################
+# TRTVENFACG
+#########################################################################
+#
+# Composant de calcul d'une facture de vente :
+# -> Call GENSIH(LCOD, LMAJ, LECH, LTEST, LTRT, LORINUM, LSIVNUM, LERR)
+#   - LCOD     1= création complète de la facture
+#              2= garnissage des classes [M] entête et lignes (ex : picking)
+#              3= garnissage de  classe  [M] ligne (ex : picking) (ajout d'une ligne)
+#   - LMAJ     C=Création / M=Modification / S=Suppression
+#   - LECH     Création des echeances (1=Non / 2=Oui)
+#   - LTEST    Simulation et Ecriture ds fichier trace pour tests
+#              (1=Non sans simul/2=Oui sans simul/3=Non avec simul/4=Oui avec simul)
+#   - LTRT     Traitement appelé pour le chargement de [M]
+#   - LORINUM  No document origine
+#   - LSIVNUM  No de la facture créée
+#   - LERR     Code erreur
+#              1=sur action OBJET / 2= dans chargement [M]entete
+#              3=dans chargement [M]detail / 4=en lecture de table
+#              8=dans point entrée / 9=autres
+#              (complement info sur erreur dans GBIDC3)
+#              90=en simulation, valeur affectee lors du rollback
+#
+#########################################################################
+
+#########################################################################
+#           ATTENTION POUR AVANCER DANS LES TESTS
+#
+# Ecran SIH4 :
+#   Champ NBLIG  : Apres_zone      STD       (mis interactive) pour US ?
+#                                            et ouverture fermeture trace ?
+#   Champ NBSLO  : Controle        STD       (mis interactive)
+#   Champ LOCTYP : Avant_saisie    STKSUGTLO (mis interactive)
+#                  Controle        STKCTRTLO (mis interactive)
+#                  Apres_modif     RAZLOC    (mis interactive)
+#   Champ LOC    : Avant_saisie    STKSUGEMP (mis interactive)
+#
+#########################################################################
+
+Local Integer LCOD   : LCOD=1
+Local Char    LMAJ   : LMAJ="C"
+Local Integer LECH   : LECH=2
+Local Integer LTEST  : LTEST=2
+Local Char    LTRT   : LTRT="ZTRTJLFACG"
+Local Char    LORINUM
+Local Char    LSIVNUM
+Local Integer LERR   : LERR=0
+
+Raz GTRACE
+
+Call GENSIH(LCOD, LMAJ, LECH, LTEST, LTRT, LORINUM, LSIVNUM, LERR)
+End
+
+
+
+#########################################################################
+# Subprog GENSIH(LCOD, LMAJ, LECH, LTEST, LTRT, LORINUM, LSIVNUM, LERR)
+#    S/P de calcul automatique d'une facture de vente
+#########################################################################
+
+Subprog GENSIH(LCOD, LMAJ, LECH, LTEST, LTRT, LORINUM, LSIVNUM, LERR)
+Value    Integer LCOD
+Value    Char    LMAJ
+Value    Integer LECH
+Value    Integer LTEST
+Value    Char    LTRT
+Value    Char    LORINUM
+Variable Char    LSIVNUM
+Variable Integer LERR         : # test des erreurs par remplissage de GMESSAGE
+
+#--X3-23080
+If !find(GFONCTION,"FUNAUTINVSCH","FUNAUTINVC","FUNAUTINVS","FUNAUTINVT")
+  Gosub CHECK_INV_MSK
+  If LERR = 1 Then
+    Call ERREUR(GMESSAGE) From GESECRAN
+    End
+  Endif
+Endif
+#-- End X3-23080
+
+#-- pour passage des valeurs
+Global   Char    GWLTRT (15) : GWLTRT=LTRT
+Global   Integer GWLECH      : GWLECH=LECH
+Global   Integer GWLTEST     : GWLTEST=LTEST
+Global   Char    GWLIB_TD (50)            : # libelle de l'action pour trace test
+Global   Integer GWCREINV : GWCREINV=2    : # pour effectuer traitements même si GIMPORT=1
+Global   Char    GWIMPZON                 : # champ de classe [M] en cours chargement
+Global   Char    GWACTION_GS (20)
+Global   Integer GWIMPMOD
+
+#--
+Local    Integer SAVGIMPORT : SAVGIMPORT=GIMPORT
+Raz LERR
+Local    Integer WINVTYP
+
+#-- Pour Setmode
+Local Integer  INBAFF                  : # Pile/Indice
+Local Integer  IAFFCOD(0..1)           : # Code instruction
+Local Char     IAFFMASK(GLONABR)(0..1) : # Abréviation écran
+Local Char     IAFFCHP(50)(0..1)       : # Zone écran
+Local Integer  IAFFIND(0..1)           : # Indice de la zone
+Local Char     IAFFTXT(250)(0..1)      : # Texte
+Local Integer  IAFFRANG(0..1)          : # Rang
+Local Integer  IAFFOPT1(0..1)          : # Option1 Ex: Status, premier rang affzo 10-20
+Local Integer  IAFFOPT2(0..1)          : # Option2 Ex: Raccourci clavier, dernier rang affzo 10-20
+#---------
+
+
+
+Case LCOD
+     When 1   : Gosub GS_1
+     When 2   : Gosub GS_2
+     When 3   : Gosub GS_2_DET
+Endcase
+
+Setmode
+
+If find(GWLTEST,2,4) : Call LEC_TRACE From LECFIC : Endif
+
+Kill GWLTRT, GWLECH, GWLTEST, GWLIB_TD, GWCREINV, GWIMPZON, GWACTION_GS, GWIMPMOD
+GIMPORT=SAVGIMPORT
+
+End
+
+#########################################################################
+#########################################################################
+$GS_1
+Case LMAJ
+     When "C"   : Gosub GS_1C
+     When "M"   : Gosub GS_1M
+     When "S"   : Gosub GS_1S
+Endcase
+Return
+
+#------------------------------------------------------------------------
+$GS_1C
+#--- variables
+Local  Integer OK
+Local  Char    ACTION(20), ABREV(5)
+
+#--- declaration et chargement des variables objet
+ABREV="SIH" : GABREV="SIH"
+Gosub DEFVAR From GOBJET
+GIMPORT=1
+
+Raz GMESSAGE
+GOK=1 : OK=1
+
+ACTION="AVANT_OUVRE" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE : Gosub ACTION From GOBJSUB
+
+#--- ouverture des maques de objet SIH
+If clalev([M:SIH0])=0 : Local Mask SIH0 [SIH0] : Endif
+If clalev([M:SIH1])=0 : Local Mask SIH1 [SIH1] : Endif
+If clalev([M:SIH2])=0 : Local Mask SIH2 [SIH2] : Endif
+If clalev([M:SIH4])=0 : Local Mask SIH4 [SIH4] : Endif
+If clalev([M:SIHV])=0 : Local Mask SIHV [SIHV] : Endif
+If clalev([M:SIHI])=0 : Local Mask WSIH4INV [SIHI] : Endif
+If clalev([M:SIHC])=0 : Local Mask WSIH4CNO [SIHC] : Endif
+If clalev([M:ACL])=0  : Local Mask ACLOB [ACL] : Endif
+Raz [M:SIH0], [M:SIH1], [M:SIH2], [M:SIH4], [M:SIHV]
+
+#--- ouverture des tables necessaires
+If clalev([F:SIV])=0 : Local File SINVOICEV   [SIV] : Endif
+
+Gosub DEF_MSK_OBJ : Gosub OUVRE From WOSIH
+
+ACTION="OUVRE" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE : Gosub DEF_MSK_OBJ
+Gosub AVANT_ACTION
+Gosub ACTION From GOBJSUB
+Gosub APRES_ACTION
+If !OK : LERR=1 : Gosub TRT_ERR : Goto GS_1C_FIN : Endif
+Call ISWINDOWOK (nomap,"OSIH") From INTRUTILB
+WINPROG="WGOSIH"
+
+Setmode INBAFF,IAFFCOD,IAFFMASK,IAFFCHP,IAFFIND,IAFFTXT,IAFFRANG,IAFFOPT1,IAFFOPT2
+
+GREP="C"
+ACTION="RAZCRE" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE : Gosub DEF_MSK_OBJ
+Gosub AVANT_ACTION
+Gosub ACTION From GOBJSUB
+Gosub APRES_ACTION
+If GERR=1 : LERR=1 : Gosub TRT_ERR : Goto GS_1C_FIN : Endif
+
+#--- chargement des masques de objet
+GWLIB_TD="MSK_ENTETE" : Gosub TRACE_DETAILLEE
+Gosub AVANT_ACTION
+Gosub MSK_ENTETE : # chargement masques enregistrement entête
+Gosub APRES_ACTION
+If mkstat : LERR=2 : Gosub TRT_ERR : Goto GS_1C_FIN : Endif
+
+GWLIB_TD="MSK_DETAIL" : Gosub TRACE_DETAILLEE
+Gosub AVANT_ACTION
+Gosub MSK_DETAIL : # chargement des lignes
+Gosub APRES_ACTION
+If mkstat : LERR=3 : Gosub TRT_ERR : Goto GS_1C_FIN : Endif
+
+GPOINT="ALIMSKSIH" : Gosub ENTREE From EXEFNC
+If mkstat : LERR=8 : Gosub TRT_ERR : Goto GS_1C_FIN : Endif
+
+#--- chargement masque de valorisation sans calcul
+GWACTION_GS="MSK_VALORISATION" : Raz GPE : Gosub ACTION_GS From=GWLTRT
+If GPE : [M:SIH0]INVCLCFLG=1 : Raz GPE : Goto GS_1C_AC : Endif
+
+# 107888 : Scheduled invoices - X3-26242 (LD:27/02/17) : Performance improvement on automatic process
+# The invoice calcul is done in $VERIF_CRE so it is not necessary to do it here
+##--- calcul de la facture
+#GWLIB_TD="CHARG_TABLEAUX" : Gosub TRACE_DETAILLEE
+#Gosub CHARG_TABLEAUX From TRTVENFACC
+#
+#GWLIB_TD="CAL_FACTURE" : Gosub TRACE_DETAILLEE
+#Gosub CAL_FACTURE    From TRTVENFACC
+# 107888 : Scheduled invoices - X3-26242 (LD:27/02/17) : Performance improvement on automatic process
+
+#---
+$GS_1C_AC
+OK=1
+ACTION="VERIF_CRE" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE : Gosub DEF_MSK_OBJ
+Gosub AVANT_ACTION
+Gosub ACTION From GOBJSUB
+Gosub APRES_ACTION
+If !OK : LERR=1 : Gosub TRT_ERR : Goto GS_1C_FIN : Endif
+
+GWACTION_GS="AP_VERIF_CRE" : Gosub ACTION_GS From=GWLTRT
+
+Call DEBTRANS From GLOCK
+
+#--- debut transaction creation
+$GS_1C_TR
+GOK=1
+
+# ----------------------------------------------
+# Issue X3-7938/120447 - 2016-12-16 by FGR : BEGIN
+#Trbegin [SIH], [SIV], [SID]
+Local Integer IBDEBTRANSFLG
+
+  IBDEBTRANSFLG = (adxlog=1)
+  If IBDEBTRANSFLG = [V]CST_AFALSE Then
+    Trbegin [SIH], [SIV], [SID]
+  Endif
+# Issue X3-7938/120447 - 2016-12-16 by FGR : END
+# ----------------------------------------------
+  Raz [F:SIH], [F:SIV], [F:SID]
+   nolign=1
+  [F:SIH]=[M:SIH0] : [F:SIH]=[M:SIH1] :[F:SIH]=[M:SIH2] :[F:SIH]=[M:SIH4]
+  [F:SIV]=[M:SIH0] : [F:SIV]=[M:SIH1] :[F:SIV]=[M:SIH2] :[F:SIV]=[M:SIH4]
+  Default File [F:SIH]
+
+  GWLIB_TD="INICRE de GOBJSUB" : Gosub TRACE_DETAILLEE
+  Gosub INICRE From GOBJSUB
+
+  ACTION="INICRE" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE
+  Gosub AVANT_ACTION
+  Gosub ACTION From GOBJSUB
+  Gosub APRES_ACTION
+  If GOK<0  Goto GS_1C_ROLL  Elsif  !GOK Goto GS_1C_AB  Endif
+
+  GWACTION_GS="INICRE" : Gosub ACTION_GS From=GWLTRT
+
+  GWLIB_TD="Write SINVOICE" : Gosub TRACE_DETAILLEE
+  Write [F:SIV]
+  If fstat : GOK=0 : Call FSTA("SIV") From GLOCK : LERR=9 : Goto GS_1C_AB : Endif
+
+  ACTION="CREATION" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE
+  Gosub AVANT_ACTION
+  Gosub ACTION From GOBJSUB
+  Gosub APRES_ACTION
+  If GOK<0  Goto GS_1C_ROLL  Elsif  !GOK Goto GS_1C_AB  Endif
+
+  GWACTION_GS="CREATION" : Gosub ACTION_GS From=GWLTRT
+  If GOK<0  Goto GS_1C_ROLL  Elsif  !GOK Goto GS_1C_AB  Endif
+
+If find(GWLTEST, 1,2)
+    # ----------------------------------------------
+    # Issue X3-7938/120447 - 2016-12-16 by FGR : BEGIN
+    #Commit
+    If IBDEBTRANSFLG = [V]CST_AFALSE Then
+      Commit
+    Endif
+    # Issue X3-7938/120447 - 2016-12-16 by FGR : END
+    # ----------------------------------------------
+Else
+    LERR=90 : Goto GS_1C_AB    : # simulation ne pas ecrire
+Endif
+
+ACTION="APRES_CRE" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE
+Gosub AVANT_ACTION
+Gosub ACTION From GOBJSUB
+Gosub APRES_ACTION
+
+If GOK=1 : LSIVNUM=[M:SIH0]NUM : WINVTYP=[M:SIH0]INVTYP : Endif
+
+Goto GS_1C_FIN
+
+#---
+$GS_1C_ROLL
+# ----------------------------------------------
+# Issue X3-7938/120447 - 2016-12-16 by FGR : BEGIN
+#Rollback
+#Call ROLL From GLOCK
+#If GROLL
+#   ACTION="AB_CREATION" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE
+#   Gosub AVANT_ACTION
+#   Gosub ACTION From GOBJSUB
+#   Gosub APRES_ACTION
+#   LERR=1 : Goto GS_1C_FIN
+#Else
+#   Goto GS_1C_TR
+#Endif
+If IBDEBTRANSFLG = [V]CST_AFALSE Then
+  Rollback
+  Call ROLL From GLOCK
+  If GROLL
+     ACTION="AB_CREATION" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE
+     Gosub AVANT_ACTION
+     Gosub ACTION From GOBJSUB
+     Gosub APRES_ACTION
+     LERR=1 : Goto GS_1C_FIN
+  Else
+     Goto GS_1C_TR
+  Endif
+Else
+  # Impossible to manage "Call ROLL From GLOCK" in this case
+   ACTION="AB_CREATION" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE
+   Gosub AVANT_ACTION
+   Gosub ACTION From GOBJSUB
+   Gosub APRES_ACTION
+   LERR=1 : Goto GS_1C_FIN
+Endif
+# Issue X3-7938/120447 - 2016-12-16 by FGR : END
+# ----------------------------------------------
+
+#---
+$GS_1C_AB
+# ----------------------------------------------
+# Issue X3-7938/120447 - 2016-12-16 by FGR : BEGIN
+#Rollback
+If IBDEBTRANSFLG = [V]CST_AFALSE Then
+  Rollback
+Endif
+# Issue X3-7938/120447 - 2016-12-16 by FGR : END
+# ----------------------------------------------
+ACTION="AB_CREATION" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE
+Gosub AVANT_ACTION
+Gosub ACTION From GOBJSUB
+Gosub APRES_ACTION
+
+# FGR 14/10/2008 X3SUIVI49551 : le test ne fonctionnait pas
+#If !LERR = 90 Then
+If LERR <> 90 Then
+  LERR=1
+Endif
+
+Goto GS_1C_FIN
+
+#---
+$GS_1C_FIN
+
+ACTION="FERME" : GWLIB_TD=ACTION : Gosub TRACE_DETAILLEE
+Gosub AVANT_ACTION
+Gosub ACTION From GOBJSUB
+Gosub APRES_ACTION
+
+If GTRACE<>""
+   If LERR=0
+      Case WINVTYP
+          When 1 :
+              Call ECR_TRACE("**********"+mess(122,197,1)-LSIVNUM,0) From GESECRAN : # Facture générée
+          When 2 :
+              Call ECR_TRACE("**********"+mess(757,197,1)-LSIVNUM,0) From GESECRAN : # Avoir généré
+          When 5 :
+              Call ECR_TRACE("**********"+mess(758,197,1)-LSIVNUM,0) From GESECRAN : # Proforma généré
+      Endcase
+   Elsif LERR=90
+      Call ECR_TRACE("**********"+mess(942,196,1),0) From GESECRAN  : # Simulation de création OK
+      LERR=0
+   Else
+      Case WINVTYP
+          When 1 :
+              Call ECR_TRACE("**********"+mess(218,192,1),1) From GESECRAN        : # Facture non créée
+          When 2 :
+              Call ECR_TRACE("**********"+mess(730,197,1),1) From GESECRAN        : # Avoir non créé
+          When 5 :
+              Call ECR_TRACE("**********"+mess(756,197,1),1) From GESECRAN        : # Proforma non créée
+      Endcase
+   Endif
+Endif
+
+Return
+
+#------------------------------------------------------------------------
+$GS_1M
+Return
+#------------------------------------------------------------------------
+$GS_1S
+Return
+
+
+#########################################################################
+#########################################################################
+$GS_2
+#GIMPORT=1
+
+#--- chargement des masques de objet
+
+GWLIB_TD="MSK_ENTETE" : Gosub TRACE_DETAILLEE
+Gosub AVANT_ACTION
+Gosub MSK_ENTETE : # chargement masques enregistrement entête
+Gosub APRES_ACTION
+If mkstat : LERR=2 : Gosub TRT_ERR : Goto GS_2_FIN : Endif
+
+$GS_2_DET
+GWLIB_TD="MSK_DETAIL" : Gosub TRACE_DETAILLEE
+Gosub AVANT_ACTION
+Gosub MSK_DETAIL : # chargement des lignes
+Gosub APRES_ACTION
+If mkstat : LERR=3 : Gosub TRT_ERR : Goto GS_2_FIN : Endif
+
+GPOINT="ALIMSKSIH" : Gosub ENTREE From EXEFNC
+If mkstat : LERR=8 : Gosub TRT_ERR : Goto GS_2_FIN : Endif
+
+$GS_2_FIN
+If LERR : Call ERREUR (GBIDC3) From GESECRAN : Endif
+Return
+
+#########################################################################
+#########################################################################
+$GS_3
+Return
+
+#########################################################################
+#########################################################################
+$GS_9
+Return
+
+#########################################################################
+#########################################################################
+
+#------------------------------------------------------------------------
+$TRT_ERR
+If LERR & GOK=1 : GOK=0 : Endif
+Case LERR
+     When 1        GBIDC3="ACTION="+GWLIB_TD
+     When 2        Raz GBIDC3
+     When 3        Raz GBIDC3
+     When 4        Raz GBIDC3
+     When 8        GBIDC3=GWLIB_TD-GBIDC3
+     When 9        GBIDC3=GWLIB_TD-GBIDC3
+     When Default  Raz GBIDC3
+Endcase
+GWACTION_GS="ERREUR" : Gosub ACTION_GS From=GWLTRT
+If GBIDC3<>""
+   Call ERREUR (GBIDC3) From GESECRAN
+   Raz GBIDC3
+Endif
+Return
+
+#------------------------------------------------------------------------
+$TRACE_DETAILLEE
+If !find(GWLTEST,2,4) : Return : Endif
+If GTRACE=""
+   Call OUVRE_TRACE (mess(1,13,1)+" TRTVENFACG : "+mess(747,197,1)) From LECFIC
+   #                 Traitement TRTVENFACG : Génération facture de vente
+Endif
+Call ECR_TRACE(GWLIB_TD,0) From GESECRAN
+Return
+
+#------------------------------------------------------------------------
+$ACTION
+GWIMPZON=IMPZON
+Raz GCLE
+Case ACTION
+     When "IMP_ZONE" : GWACTION_GS="MSK_ENTETE" : Gosub ACTION_GS From=GWLTRT
+     When "IMP_TAB"  : GWACTION_GS="MSK_DETAIL" : Gosub ACTION_GS From=GWLTRT
+Endcase
+GWIMPMOD=IMPMOD
+Return
+
+
+#------------------------------------------------------------------------
+# chargement masques enregistrement entête facture
+$MSK_ENTETE
+Default Mask [SIH0]
+Call SAIMSK("SIH","IMP_ZONE","TRTVENFACG") From W0SIH0
+If mkstat : Return : Endif
+
+Default Mask [SIH1]
+Call SAIMSK("SIH","IMP_ZONE","TRTVENFACG") From W0SIH1
+If mkstat : Return : Endif
+
+Default Mask [SIH2]
+Call SAIMSK("SIH","IMP_ZONE","TRTVENFACG") From W0SIH2
+
+#Fq73266-gbn-Pas de modèle/facturation auto contrat et demandes de service/destination : on prend le nbre de copies de la destination
+If [F:BPC]BPCNUM=[M:SIH0]BPCINV & [F:BPC]TPMCOD="" & (GFONCTION="FUNAUTINVC" | GFONCTION="FUNAUTINVS" | GFONCTION="FUNAUTINVT")
+  If dim([M:DIA]PRNDEN)>0 & [M:DIA]PRNDEN<>"" : [M:SIH0]COPNBR=[M:DIA]PRTCOP : Endif
+Endif
+
+Return
+
+#------------------------------------------------------------------------
+# chargement tableau des lignes facture
+$MSK_DETAIL
+Local Integer LEC_DETAIL   : # 0=lire 1er enr. / 1= suivant / 2=fin / 3=erreur / 4=suivant
+Local Char    LIG_DETAIL   : # (C)create / (U)pdate / (D)elete
+Default Mask [SIH4]
+
+If LCOD<>3 [M]NBLIG=0 : nolign=0 Endif
+
+While LEC_DETAIL <2
+   If [M]NBLIG>=dim([M]ITMREF)
+      OK=0 : GERR=1 : GMESSAGE=mess(26,100,1)-num$([M]NBLIG)
+      Call ERREUR (GMESSAGE) From GESECRAN
+      mkstat=1 : Break
+   Endif
+   GWACTION_GS="READ_DETAIL" : Gosub ACTION_GS From=GWLTRT
+   If LEC_DETAIL =1
+      If nolign=0 & LIG_DETAIL="C"
+         [M]NBLIG +=1 : nolign=[M]NBLIG : status=73
+      Endif
+      If nolign>0 & LIG_DETAIL="U"
+         status=75
+      Endif
+      If nolign>0 & LIG_DETAIL="D"
+         Dela nolign-1,1,[M]NBLIG-1 NBLIG
+         [M]NBLIG -=1
+      Endif
+      indice=nolign-1 : mkstat=0
+      If find([M:SIH0]INVTYP,1,5)    : # facture / proforma
+         Call SAI_NBLIG("SID","IMP_TAB","TRTVENFACG") From W0WSIH4INV
+      Endif
+      If [M:SIH0]INVTYP=2            : # avoir
+         Call SAI_NBLIG("SID","IMP_TAB","TRTVENFACG") From W0WSIH4CNO
+      Endif
+      If mkstat : Break : Endif
+      GWACTION_GS="AP_READ_DETAIL" : Gosub ACTION_GS From=GWLTRT
+   Endif
+   If LEC_DETAIL =3
+      OK=0 : GERR=1 : GMESSAGE=mess(1,13,1)-GWLTRT+" : "+mess(49,125,1)-GBIDC3
+      Raz GBIDC3
+      Call ERREUR (GMESSAGE) From GESECRAN
+      mkstat=1 : LERR=4 : Break
+   Endif
+   If LEC_DETAIL =4
+      # Lecture ok mais la ligne n'est pas à charger : Lecture ligne suivante
+      If GBIDC3<>""
+          Call MESSAGE (GBIDC3) From GESECRAN
+          Raz GBIDC3
+      Endif
+      LEC_DETAIL=1 : # Pour lire la ligne suivante
+   Endif
+Wend
+
+Return
+
+#------------------------------------------------------------------------
+# Masques factures dans pile des masques par defaut
+$DEF_MSK_OBJ
+Default Mask [SIH0]
+Default Mask [SIH1]
+Default Mask [SIH2]
+Default Mask [SIH4]
+Default Mask [SIHV]
+Return
+
+#------------------------------------------------------------------------
+$AVANT_ACTION
+Case GWLIB_TD
+  When "MSK_DETAIL"
+       Local Integer SAUV_GPRIMOD, SAUV_GSPRIMOD
+       SAUV_GPRIMOD=GPRIMOD : GPRIMOD=2 : SAUV_GSPRIMOD=GSPRIMOD : GSPRIMOD=2
+       If SAUV_GPRIMOD=1
+          Actzo [M:SIH4]GROPRI
+          If dim([M:SIH4]DISCRGVAL1) > 0 Actzo [M:SIH4]DISCRGVAL1 Endif
+          If dim([M:SIH4]DISCRGVAL2) > 0 Actzo [M:SIH4]DISCRGVAL2 Endif
+          If dim([M:SIH4]DISCRGVAL3) > 0 Actzo [M:SIH4]DISCRGVAL3 Endif
+          If dim([M:SIH4]DISCRGVAL4) > 0 Actzo [M:SIH4]DISCRGVAL4 Endif
+          If dim([M:SIH4]DISCRGVAL5) > 0 Actzo [M:SIH4]DISCRGVAL5 Endif
+          If dim([M:SIH4]DISCRGVAL6) > 0 Actzo [M:SIH4]DISCRGVAL6 Endif
+          If dim([M:SIH4]DISCRGVAL7) > 0 Actzo [M:SIH4]DISCRGVAL7 Endif
+          If dim([M:SIH4]DISCRGVAL8) > 0 Actzo [M:SIH4]DISCRGVAL8 Endif
+          If dim([M:SIH4]DISCRGVAL9) > 0 Actzo [M:SIH4]DISCRGVAL9 Endif
+       Endif
+Endcase
+Return
+
+#------------------------------------------------------------------------
+$APRES_ACTION
+Case GWLIB_TD
+  When "MSK_DETAIL"
+       If dim(SAUV_GPRIMOD)>0  :
+          If SAUV_GPRIMOD=1
+             Diszo [M:SIH4]GROPRI
+             If dim([M:SIH4]DISCRGVAL1) > 0 Diszo [M:SIH4]DISCRGVAL1 Endif
+             If dim([M:SIH4]DISCRGVAL2) > 0 Diszo [M:SIH4]DISCRGVAL2 Endif
+             If dim([M:SIH4]DISCRGVAL3) > 0 Diszo [M:SIH4]DISCRGVAL3 Endif
+             If dim([M:SIH4]DISCRGVAL4) > 0 Diszo [M:SIH4]DISCRGVAL4 Endif
+             If dim([M:SIH4]DISCRGVAL5) > 0 Diszo [M:SIH4]DISCRGVAL5 Endif
+             If dim([M:SIH4]DISCRGVAL6) > 0 Diszo [M:SIH4]DISCRGVAL6 Endif
+             If dim([M:SIH4]DISCRGVAL7) > 0 Diszo [M:SIH4]DISCRGVAL7 Endif
+             If dim([M:SIH4]DISCRGVAL8) > 0 Diszo [M:SIH4]DISCRGVAL8 Endif
+             If dim([M:SIH4]DISCRGVAL9) > 0 Diszo [M:SIH4]DISCRGVAL9 Endif
+          Endif
+          GPRIMOD=SAUV_GPRIMOD
+
+       Endif
+
+       If dim(SAUV_GSPRIMOD)>0 : GSPRIMOD=SAUV_GSPRIMOD : Endif
+Endcase
+Return
+
+
+
+
+#------------------------------------------------------------------------
+# Exemple de MSK_ENTETE a developper dans le traitement LTRT
+#------------------------------------------------------------------------
+#$MSK_ENTETE
+#Case IMPZON
+#     When "NUM"        :  IMPMOD=1 : [M]NUM=               #--- masque SIH0
+#     When "SIVTYP"     :  IMPMOD=1 : [M]SIVTYP=
+#     When "SALFCY"     :  IMPMOD=1 : [M]SALFCY=
+#     When "INVREF"     :  IMPMOD=1 : [M]INVREF=
+#     When "INVDAT"     :  IMPMOD=1 : [M]INVDAT=    defaut (datesys)
+#     When "BPCINV"     :  IMPMOD=1 : [M]BPCINV=    OBLIGATOIRE
+#                          --- gestion textes entete sur le 1er champ obligatoire
+#                              attention - stockage du lien dans un champ de manoeuvre
+#                                        - recuperation du lien dans la 1ere ligne detail
+#                              - ouvrir masque ACLOB [ACL] et table TEXCLOB [TXC] en debut
+#                              - garnir [M:ACL]CLOB avec le texte
+#                              - mettre abréviation de la table dans le champ de manoeuvre
+#                          Local Integer T_OK
+#                          raz [M]I_SIHTEX1, [M]I_SIHTEX2
+#                          If [M]I_SIHTEX1(nolign-1)="SIV"
+#                             Call CRE_CLOB_ACL ("[M]I_SIHTEX1",T_OK) From TRTX3TEX
+#                          Endif
+#                          If [M]I_SIHTEX2(nolign-1)="SIV"
+#                             Call CRE_CLOB_ACL ("[M]I_SIHTEX2",T_OK) From TRTX3TEX
+#                          Endif
+#
+#
+#     When "BPCORD"     :  IMPMOD=1 : [M]BPCORD=            #--- masque SIH1
+#     When "BPRPAY"     :  IMPMOD=1 : [M]BPRPAY=
+#     When "BPCGRU"     :  IMPMOD=1 : [M]BPCGRU=
+#     When "BPAADD"     :  IMPMOD=1 : [M]BPAADD=
+#     When "PJT"        :  IMPMOD=1 : [M]PJT=
+#     When "REP"        :  IMPMOD=1 : [M]REP(0)=
+#          Case indice
+#               When 0  :  IMPMOD=1 : [M]REP(0)=
+#               When 1  :  IMPMOD=1 : [M]REP(1)=
+#          Endcase
+#     When "SIHORI"     :  IMPMOD=1 : [M]SIHORI=
+#     When "SIHORINUM"  :  IMPMOD=1 : [M]SIHORINUM=
+#     When "CNOREN"     :  IMPMOD=1 : [M]CNOREN=
+#     When "PRITYP"     :  IMPMOD=1 : [M]PRITYP=
+#     When "STOMVTFLG"  :  IMPMOD=1 : [M]STOMVTFLG=
+#     When "STOFCY"     :  IMPMOD=1 : [M]STOFCY=
+#     When "SRGLOCDEF"  :  IMPMOD=1 : [M]SRGLOCDEF=
+#     When "TRSFAM"     :  IMPMOD=1 : [M]TRSFAM=
+#     When "INVSTA"     :  IMPMOD=1 : [M]INVSTA=
+#
+#     When "CUR"        :  IMPMOD=1 : [M]CUR=               #--- masque SIH2
+#     When "CURTYP"     :  IMPMOD=1 : [M]CURTYP=
+#     When "RATCUR"     :  IMPMOD=1 : [M]RATCUR=
+#     When "RATRPT"     :  IMPMOD=1 : [M]RATRPT=
+#     When "BPRFCT"     :  IMPMOD=1 : [M]BPRFCT=
+#     When "BPRSAC"     :  IMPMOD=1 : [M]BPRSAC=
+#     When "STRDUDDAT"  :  IMPMOD=1 : [M]STRDUDDAT=
+#     When "PTE"        :  IMPMOD=1 : [M]PTE=
+#     When "STRDATSVC"  :  IMPMOD=1 : [M]STRDATSCV=
+#     When "ENDDATSVC"  :  IMPMOD=1 : [M]ENDDATSVC=
+#     When "DES"
+#          Case indice
+#               When x  :  IMPMOD=1 : [M]DES(x)=            x = 0 à 2
+#          Endcase
+#     When "NBAXE"      :  IMPMOD=1 : [M]NBAXE=
+#     When "CCE"
+#          Case indice
+#               When x  :  IMPMOD=1 : [M]CCE(x)=            x = 0 à 8
+#          Endcase
+#     When "NBFAC"      :  IMPMOD=1 : [M]NBFAC=
+#     When "INVDTAAMT"
+#          Case indice
+#               When x  :  IMPMOD=1 : [M]INVDTAAMT(x)=      x = 0 à 9
+#          Endcase
+#Endcase
+#Return
+
+#------------------------------------------------------------------------
+# Exemple de MSK_DETAIL a developper dans le traitement LTRT
+#------------------------------------------------------------------------
+#$MSK_DETAIL
+#Case IMPZON
+#     When "NBLIG"      :  IMPMOD=1 : [M]NBLIG(nolign-1)=   : #--- masque SIH4
+#     When "ITMREF"     :  IMPMOD=1 : [M]ITMREF(nolign-1)=
+#                          --- recuperation des liens des textes entete
+#                          If nolign=1
+#                             If [M]I_SIHTEX1<>"" : [M]SIHTEX1=[M]I_SIHTEX1 : Raz [M]I_SIHTEX1 : Endif
+#                             If [M]I_SIHTEX2<>"" : [M]SIHTEX2=[M]I_SIHTEX2 : Raz [M]I_SIHTEX2 : Endif
+#                          Endif
+#     When "ITMDES"     :  IMPMOD=1 : [M]ITMDES(nolign-1)=
+#     When "ITMDES1"    :  IMPMOD=1 : [M]ITMDES1(nolign-1)=
+#     When "SAU"        :  IMPMOD=1 : [M]SAU(nolign-1)=
+#     When "QTY"        :  IMPMOD=1 : [M]QTY(nolign-1)=
+#                          --- gestion textes lignes sur 1er champ obligatoire
+#                              autre que ITMREF qui garni les textes par defaut
+#                              - ouvrir masque ACLOB [ACL] et table TEXCLOB [TXC] en debut
+#                              - garnir [M:ACL]CLOB avec le texte
+#                              - mettre abréviation de la table dans le champ lien
+#                          Local Integer T_OK
+#                          If [M]SIDTEX(nolign-1)="SID"
+#                             Call CRE_CLOB_ACL ("[M]SIDTEX(nolign-1)",T_OK) From TRTX3TEX
+#                          Endif
+#
+#     When "SAUSTUCOE"  :  IMPMOD=1 : [M]SAUSTUCOE(nolign-1)=
+#     When "GROPRI"     :  IMPMOD=1 : [M]GROPRI(nolign-1)=
+#     When "DISCRGVAL1" :  IMPMOD=1 : [M]DISCRGVAL1(nolign-1)=
+#     When "DISCRGVAL2" :  IMPMOD=1 : [M]DISCRGVAL2(nolign-1)=
+#     When "DISCRGVAL3" :  IMPMOD=1 : [M]DISCRGVAL3(nolign-1)=
+#     When "DISCRGVAL4" :  IMPMOD=1 : [M]DISCRGVAL4(nolign-1)=
+#     When "DISCRGVAL5" :  IMPMOD=1 : [M]DISCRGVAL5(nolign-1)=
+#     When "DISCRGVAL6" :  IMPMOD=1 : [M]DISCRGVAL6(nolign-1)=
+#     When "DISCRGVAL7" :  IMPMOD=1 : [M]DISCRGVAL7(nolign-1)=
+#     When "DISCRGVAL8" :  IMPMOD=1 : [M]DISCRGVAL8(nolign-1)=
+#     When "DISCRGVAL9" :  IMPMOD=1 : [M]DISCRGVAL9(nolign-1)=
+#     When "CPRPRI"     :  IMPMOD=1 : [M]ITMREF(nolign-1)=
+#     When "VACITM1"    :  IMPMOD=1 : [M]VACITM1(nolign-1)=
+#     When "VACITM2"    :  IMPMOD=1 : [M]VACITM2(nolign-1)=
+#     When "VACITM3"    :  IMPMOD=1 : [M]VACITM3(nolign-1)=
+#     When "BPSLOT"     :  IMPMOD=1 : [M]BPSLOT(nolign-1)=
+#     When "LOT"        :  IMPMOD=1 : [M]LOT(nolign-1)=
+#     When "NBSLO"      :  IMPMOD=1 : [M]NBSLO(nolign-1)=
+#     When "SLO"        :  IMPMOD=1 : [M]SLO(nolign-1)=
+#     When "STA"        :  IMPMOD=1 : [M]STA(nolign-1)=
+#     When "LOCTYP"     :  IMPMOD=1 : [M]LOCTYP(nolign-1)=
+#     When "LOC"        :  IMPMOD=1 : [M]LOC(nolign-1)=
+#     When "SERNUM"     :  IMPMOD=1 : [M]SERNUM(nolign-1)=
+#     When "PRIORD"     :  IMPMOD=1 : [M]PRIORD(nolign-1)=
+#     When "MVTDES"     :  IMPMOD=1 : [M]MVTDES(nolign-1)=
+#     When "REP1"       :  IMPMOD=1 : [M]REP1(nolign-1)=
+#     When "REPRAT1"    :  IMPMOD=1 : [M]REPRAT1(nolign-1)=
+#     When "REP2"       :  IMPMOD=1 : [M]REP2(nolign-1)=
+#     When "REPRAT2"    :  IMPMOD=1 : [M]REPRAT2(nolign-1)=
+#     When "REPCOE"     :  IMPMOD=1 : [M]REPCOE(nolign-1)=
+#     When "CCE1"       :  IMPMOD=1 : [M]CCE1(nolign-1)=
+#     When "CCE2"       :  IMPMOD=1 : [M]CCE2(nolign-1)=
+#     When "CCE3"       :  IMPMOD=1 : [M]CCE3(nolign-1)=
+#     When "CCE4"       :  IMPMOD=1 : [M]CCE4(nolign-1)=
+#     When "CCE5"       :  IMPMOD=1 : [M]CCE5(nolign-1)=
+#     When "CCE6"       :  IMPMOD=1 : [M]CCE6(nolign-1)=
+#     When "CCE7"       :  IMPMOD=1 : [M]CCE7(nolign-1)=
+#     When "CCE8"       :  IMPMOD=1 : [M]CCE8(nolign-1)=
+#     When "CCE9"       :  IMPMOD=1 : [M]CCE9(nolign-1)=
+#Endcase
+#Return
+#------------------------------------------------------------------------
+
+
+#########################################################################
+## X3-23080
+$CHECK_INV_MSK
+Local Integer OKTRT
+
+  If filinfo(filpath("ECR","WSIH4INV","msk",0),0) < 0 Then
+    GMESSAGE=mess(262,191,1) - ":" - mess(263,191,1) - mess(264,191,1)
+    LERR=1
+  Else
+     Call EXISTE_ADX("", "","W0WSIH4INV", OKTRT) From ORDSYS
+    If OKTRT > 0 Then
+      # Il existe, c'est bon
+    Else
+      # Si l'écran existe on peut tenter de le valider : ça génèrera automatiquement le script
+      If clalev([F:ADS])=0 : Local File ADOSSIER [ADS] : Endif
+      If [F:ADS]DOSSIER <> nomap Then
+        Read [F:ADS]DOSSIER=nomap
+      Endif
+      Call VALID("WSIH4INV", nomap, [F:ADS]NBRLAN, [F:ADS]LAN, 1, OKTRT) From VALMSK
+      Call EXISTE_ADX("", "","W0WSIH4INV", OKTRT) From ORDSYS
+      If OKTRT > 0 Then
+        # Il existe, c'est bon
+      Else
+        GMESSAGE = mess(262,191,1) - ":" - mess(263,191,1) - mess(265,191,1)
+        LERR=1
+      Endif
+     Endif
+    Endif
+Return
+

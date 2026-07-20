@@ -1,0 +1,2886 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#<gen>
+# DEFPRISVW : ?
+# SPLIT_SVW : La ligne indicée PIND a été splittée dans STW
+#             il faut donc faire de même dans SVW
+# BEFWRISTJ : Juste avant l'appel à l'écriture de STJ
+#        Chargement des montants dans STJ
+# AFTWRISTJ : Juste après l'appel à l'écriture de STJ si elle s'est bien passée
+#        Ecriture d'un enregistrement SJV
+# UPDSTJDEV : Répartit le non absorbé sur tous les mouvements qui viennent d'être créés
+# CALOVELIN : Calcule les FG de la ligne de document en cours de traitement
+# AFTUPDLIN : Sous-programme appelé après la mise à jour des stocks d'une ligne de document
+# VALAUZ : Renvoie 1 si la ligne de [M:STW] doit être valorisée
+#</gen>
+
+##########################################################################
+# Renvoie un tableau de valeurs permettant de savoir
+# si un type de mouvement est comptabilisé ou non
+# Attention, c'est différent de "valorisé" :
+# 5,6 et 19 sont valorisés mais pas forcément comptabilisé par l'interface stock
+##########################################################################
+Funprog TRSTYPACC(PLEG, PSOC, PFCY, LTABTRS)
+Value Char PLEG
+Value Char PSOC
+Value Char PFCY
+Variable Integer LTABTRS(1..)
+
+Raz LTABTRS
+
+If clalev([F:ADW])=0 : Local File ADOVAL   [ADW] : Endif
+If clalev([F:FCY])=0 : Local File FACILITY [FCY] : Endif
+If clalev([F:CPY])=0 : Local File COMPANY  [CPY] : Endif
+
+Local Char LOPEIFA
+
+If PFCY<>""
+    Call PARAM(PFCY,"OPEIFA",LOPEIFA) From ADOVAL
+Else
+    LOPEIFA="2" # Cas où il n'y aurait pas de site pour la législation donnée
+    # Boucler sur les sites de la société ou de la législation
+    # S'il n'y a, ne serait-ce qu'un seul site qui ne comptabilise pas les WIPCOST,
+    # il faut paramétrer les mvts de GPAO pour la législation ou la société donnée.
+    Link [FCY] With [CPY]CPY0~=[F:FCY]LEGCPY
+&              As [LNK]
+&              Where ([CPY]CPY=PSOC | PSOC="")
+&                  & ([CPY]LEG=PLEG | PLEG="")
+&                  & [F:FCY]FINFLG = 2
+    For [LNK]
+        # Issue 82114 - 2012-07-02 by CCC
+        #Call PARAM(PFCY,"OPEIFA",LOPEIFA) From ADOVAL
+        Call PARAM([F:FCY]FCY,"OPEIFA",LOPEIFA) From ADOVAL
+        If LOPEIFA="1"
+            Break
+        Endif
+    Next
+Endif
+
+If val(LOPEIFA) > 1
+    LTABTRS(5) = 1 # entrée OF
+    LTABTRS(6) = 1 # sortie OF : interfacés via les Wipcost
+    LTABTRS(19)= 1 # réintégration matière
+Endif
+
+LTABTRS(7) = 1 # changement d'emplacement
+LTABTRS(8) = 1 # controle qualité
+LTABTRS(9) = 1 # changement de statut
+
+LTABTRS(10) = 1 # inactif
+LTABTRS(15) = 1 # inactif
+LTABTRS(16) = 1 # inactif
+
+LTABTRS(17) = 1 # Livraison prêt
+LTABTRS(18) = 1 # Retour prêt
+LTABTRS(20) = 1 # Livraison sous-traitance
+LTABTRS(21) = 1 # refractionnement
+LTABTRS(22) = 1 # plan de rangement
+LTABTRS(25) = 1 # réappro zone dde picking
+LTABTRS(26) = 1 # Changement stock
+LTABTRS(27) = 1 # Sortie transfert interne
+LTABTRS(28) = 1 # Entrée transfert interne
+LTABTRS(30) = 1 # Réception prêt (inactif)
+LTABTRS(31) = 1 # Retour réception prêt (inactif)
+LTABTRS(32) = 1 # Retour réception sous-traitance
+LTABTRS(33) = 1 # Retour livraison sous-traitance
+LTABTRS(34) = 1 # Demande analyse
+
+# Issue X3-70385 - 2018-01-10 by ERMIL : inactive for now
+LTABTRS(36) = 1 # Container identifier change
+
+# Issue 84400 - 2012-09-11 by CCC
+#LTABTRS(35) = 1 # Régularisation valeur stock   # Issue 71240 & 78854 - 2012-06-13 by CCC
+
+#!!!!!!!!!!!!!!!!!!!!!!
+#!!! chaque nouveau type de mouvement doit faire l'objet
+#!!! d'un paramétrage dans les dossiers de référence => avertir GL
+#!!!!!!!!!!!!!!!!!!!!!!
+
+GPOINT="TRSTYPACC"
+Gosub ENTREE From EXEFNC
+
+End LTABTRS
+
+###########################################
+# ALIVALWORK : Alimente le masque STOVALWORK à partir
+#              de STOVALW et STOWORK
+###########################################
+# LLIG : n° WSTOSEQ donné par ALISTOWORK (STKINT) (peut être égal à 0 dans le cas des suivis auto)
+#
+# LRET = ERRVAL + x (si =0 -> OK)
+#    x = 1 : WSTOSEQ introuvable dans VALW
+#        2 : Somme des quantités = 0
+#        3 : Mouvement non trouvé
+#        4 : Article-site non trouvé
+#        5 : Quantité du mouvement nulle
+###########################################
+$ALIVALWORK
+If !clalev([F:SJV]) : Local File STOJOUVAL  [SJV] : Endif
+If !clalev([F:SJO]) : Local File STOJOUOVE  [SJO] : Endif
+If !clalev([F:TCM]) : Local File TABCOSTMET [TCM] : Endif
+If !clalev([F:ITM]) : Local File ITMMASTER  [ITM]: Endif
+
+If [F:ITM]ITMREF<>[M:STW]ITMREF
+    Read [ITM]ITM0=[M:STW]ITMREF
+Endif
+
+Local Integer ERRVAL : ERRVAL=100
+# Indique où aller chercher le prix d'ordre pour chaque type de mouvement
+#     M: dans STOVALW
+#     V: dans PRIVAL
+#     J: dans le mouvement d'origine
+#    AJ: dans le mouvement d'origine en faisant une moyenne
+#     I: dans le fichier d'inventaire
+Local Char    FINDPRIORD
+If dim(GRNDVAL)<=0 : Global Decimal GRNDVAL : Endif
+Call INIRNDVAL("STOJOU","AMTORD") From STKVALECR  # Issue 80993 - 2012-05-10 by CCC
+Local Char    LSTJCRIT(250)(3)    # Utiliser la variable I comme indice dans STW
+Local Char    LSTJCRIT2(250)(3)   # Utiliser la variable I comme indice dans STW
+Local Char    LSTJCRIT3(250)(3)   # Utiliser la variable I comme indice dans STW
+Local Char    LSTJCRITC(250)(2)   # Utiliser la variable I comme indice dans STW
+Local Integer LSJVORDVAL    # Indique si les valeurs d'ordre(modulo 1) et valeurs de valo(modulo 2) doivent
+                            # être récupérées de STOJOUVAL
+                            # modulo 4 => valeurs d'ordre mise dans valeurs de valo
+Local Char    WFIC(10), WCLE(60)    # --> pour erreur 60 (accès à enreg)
+Local Decimal LACTQTY, LACTQTYSTJ
+Local Char    LVALFCY(GLONFCY)
+
+# Issue 66182 - 2010-09-09 by CCC : La variable a pu être créée dans le PE BEFORE_STW de STKINT
+If dim(WNOTNUL)<=0
+    Local Integer WNOTNUL : WNOTNUL=1
+Endif
+
+Local Integer LTABTRS(1..len(mess(0,704,1)))
+Local Integer LADDVALWFLG : LADDVALWFLG=0   # 1: indique que les valeurs de VALW doivent être récupérées
+Local Integer I,J,K,F
+Local Integer LLIGW, LLIGO
+LLIGW = -1
+LLIGO = -1
+
+If sigma(0,[M:STW]NBLIG-1,func VALAUZ(indcum))=0
+    Return
+Endif
+
+If sum([M:STW]QTYSTUACT)=0    # QTYSTU peut-être nul dans le cas des mouvements en attente
+    GMESSAGE = mess(9,184,1)
+    LRET = ERRVAL+2
+    Return
+Endif
+
+# Issue 80993 - 2012-05-10 by CCC
+#GRNDVAL = 10^-6
+Raz FINDPRIORD
+Raz LSTJCRIT
+LSTJCRIT2="1=1"
+LSTJCRIT3="1=1"
+
+# Issue 69134 - 2010-11-16 by CCC : Dans le cas des inventaires, le masque SVW est déjà renseigné
+If [M:STW]TRSTYP<>13
+    Raz [M:SVW]
+Endif
+
+[M:SVW]FILUPD = 1+2+4+8    # STOCOST - ITMMVT - STOLOT - ITMMVTHIS
+
+Case [M:STW]TRSTYP
+    When 1 : # Entrée div
+             FINDPRIORD = "M"
+             If [M:STW]VCRTYP=32 & [M:STW]VCRLINORI<>0    # Désassemblage d'un assemblage
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","STOFCY=[M:STW]STOFCY","&") From GOBJSUB
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","VCRTYP=[M:STW]VCRTYPORI & VCRNUM=[M:STW]VCRNUMORI & VCRLIN=[M:STW]VCRLINORI","&") From GOBJSUB
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2 & UPDCOD=2","&") From GOBJSUB
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT2,GBIDI1,"","LOT=[M:STW]LOT(I) & SLO=[M:STW]SLO(I)","&") From GOBJSUB # en cas de valo
+                 FINDPRIORD = "J"
+                 LSJVORDVAL = 1+2
+             Else
+                If [M:STW]VCRTYP=35
+                    [M:SVW]FILUPD = 4    # Only update STOLOT
+                    # Issue 88366 - 2013-03-05 by CCC
+                    #If GFONCTION="GESSMX"
+                    If find(GFONCTION,"GESSMX","FUNSMXUPD")
+                        FINDPRIORD=""
+                        # Issue 114528 & 112666 09.2016 CCC : update active quantity in ITMMVT & STOCOST tables when potency changes
+                        # [M:SVW]FILUPD = 2    # On ne met à jour que la table ITMMVT (recalcul du PMP)
+                        If dim([M:SMX1]POT)<0 | dim([M:SMX1]POT)>0 & [M:SMX1]POT <> [M:SMX1]POTOLD
+                            [M:SVW]FILUPD += 1+2    # Fifo is updated only at entry time
+                        Endif
+                    Endif
+                Endif
+            Endif
+    When 2 : # Sortie div
+             FINDPRIORD = "V"
+             If [M:STW]VCRTYP=32 & [M:STW]VCRLINORI<>0    # Désassemblage d'un assemblage
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","STOFCY=[M:STW]STOFCY","&") From GOBJSUB
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","VCRTYP=[M:STW]VCRTYPORI & VCRNUM=[M:STW]VCRNUMORI & VCRLIN=[M:STW]VCRLINORI","&") From GOBJSUB
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2 & UPDCOD=2","&") From GOBJSUB
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT2,GBIDI1,"","LOT=[M:STW]LOT(I) & SLO=[M:STW]SLO(I)","&") From GOBJSUB # en cas de valo
+                 FINDPRIORD = "J"
+                 LSJVORDVAL = 1+2
+             Elsif [M:STW]VCRTYP=35
+                 FINDPRIORD="L"
+                 [M:SVW]FILUPD = 4    # Only update STOLOT
+                 # Issue 88366 - 2013-03-05 by CCC
+                 #If GFONCTION="GESSMX"
+                 If find(GFONCTION,"GESSMX","FUNSMXUPD")
+                     FINDPRIORD=""
+                     # Issue 114528 & 112666 09.2016 CCC : update active quantity in ITMMVT & STOCOST tables when potency changes
+                     # [M:SVW]FILUPD = 2    # On ne met à jour que la table ITMMVT (recalcul du PMP)
+                     If dim([M:SMX1]POT)<0 | dim([M:SMX1]POT)>0 & [M:SMX1]POT <> [M:SMX1]POTOLD
+                         [M:SVW]FILUPD += 2    # Update only AUC if potency changes (or could have been changed)
+                     Endif
+                 Endif
+             Endif
+    When 3 : # Réception
+             # inter-site sub-contracting receipt musn't and can't get value from delivery
+             If [M:STW]VCRTYPORI<>0 & [M:STW]VCRTYPORI<>36 & [M:STW]VCRNUMORI<>"" & [M:STW]VCRLINORI<>0
+&             & [M:STW]TRFFCY<>"" &  [M:STW]BETCPY<>2
+                 FINDPRIORD = "J" # inter-sites
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","STOFCY=[M:STW]TRFFCY & ITMREF=[M:STW]ITMREF","&") From GOBJSUB
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","VCRTYP=[M:STW]VCRTYPORI & VCRNUM=[M:STW]VCRNUMORI & VCRLIN=[M:STW]VCRLINORI","&") From GOBJSUB
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2 & UPDCOD=2","&") From GOBJSUB
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT2,GBIDI1,"","LOT=[M:STW]LOT(I) & SLO=[M:STW]SLO(I)","&") From GOBJSUB
+                 # Issue 95566 - 2014-01-10 by CCC : si valo prix d'ordre => récup de la valeur d'ordre ligne par ligne
+                 Call LOATCM([M:STW]ITMREF,[M:STW]STOFCY,[M:STW]TRSTYP,[M:STW]TRSCOD,LRET) From STKVAL
+                 If [F:TCM]RCPVLTCOD=7    # Valorisation au prix de l'ordre
+                     LSJVORDVAL = 1+4
+                 Else
+                     LSJVORDVAL = 1
+                 Endif
+                 LADDVALWFLG = 1
+             Else
+                 FINDPRIORD = "M"
+             Endif
+    When 4 : # Livraison
+             FINDPRIORD = "V"
+    When 5 : # Entrée OF
+             FINDPRIORD = "M"
+    When 6 : # Sortie OF (identique à trstyp=29 sauf si pas proprio)
+             FINDPRIORD = "V"
+    When 7 : # Changement emplacement
+             Call GETTCM([M:STW]ITMREF,[M:STW]STOFCY,GBIDC1,LRET) From STKVAL
+             If [F:TCM]VLTINT=2    # Valorisation des mouvements internes
+                 FINDPRIORD = "C"
+             Endif
+    When 8 : # Contrôle qualité
+             Call GETTCM([M:STW]ITMREF,[M:STW]STOFCY,GBIDC1,LRET) From STKVAL
+             If [F:TCM]VLTINT=2    # Valorisation des mouvements internes
+                 FINDPRIORD = "C"
+             Endif
+             # Issue 112666 - 2016-07-07 by CCC : update FIFO & Lot quantity if potency changes during QC
+             [M:SVW]FILUPD =0
+             Raz [F:STL]
+             Read [STL]STL0=[M:STW]ITMREF;[M:STW]LOT(0);[M:STW]SLO(0)
+             If fstat
+                 Call RSTA([STL],[M:STW]ITMREF+";"+[M:STW]LOT(0)+";"+[M:STW]SLO(0)) From GLOCK
+                 GOK=0
+                 Return
+             Endif
+             If [F:STL]POT<>[M:STW]POT(0)
+                 # AUC and Lot AUC are systematicaly updated thanks to STKVALMAJ2.UPDQTYACT called by STKMAJC.MAJ_STOCK_LOT
+                 # => update of FIFO only
+                 [M:SVW]FILUPD += 1
+             Endif
+    When 9 : # Changement statut
+             Call GETTCM([M:STW]ITMREF,[M:STW]STOFCY,GBIDC1,LRET) From STKVAL
+             If [F:TCM]VLTINT=2    # Valorisation des mouvements internes
+                 FINDPRIORD = "C"
+             Endif
+    When 10: # Inactif
+    When 11: # Retour réception
+             If [M:STW]VCRTYPORI<>0 & [M:STW]VCRNUMORI<>"" & [M:STW]VCRLINORI<>0
+                 FINDPRIORD = "J"
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","ITMREF=[M:STW]ITMREF","&") From GOBJSUB   # Issue 83150 - 2012-08-06 by CCC
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","VCRTYP=[M:STW]VCRTYPORI & VCRNUM=[M:STW]VCRNUMORI & VCRLIN=[M:STW]VCRLINORI","&") From GOBJSUB
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2 & UPDCOD=2","&") From GOBJSUB
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT2,GBIDI1,"","LOT=[M:STW]LOT(I) & SLO=[M:STW]SLO(I)","&") From GOBJSUB
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT3,GBIDI1,"","STOFCY=[M:STW]STOFCY","&") From GOBJSUB
+                 LSJVORDVAL = 1+2
+             Else
+                 FINDPRIORD = "V"
+             Endif
+    When 12: # Retour livraison
+             If [M:STW]VCRTYPORI<>0 & [M:STW]VCRNUMORI<>"" & [M:STW]VCRLINORI<>0
+                 FINDPRIORD = "J"
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","ITMREF=[M:STW]ITMREF","&") From GOBJSUB   # Issue 83150 - 2012-08-06 by CCC
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","VCRTYP=[M:STW]VCRTYPORI & VCRNUM=[M:STW]VCRNUMORI & VCRLIN=[M:STW]VCRLINORI","&") From GOBJSUB
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2 & UPDCOD=2","&") From GOBJSUB
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT2,GBIDI1,"","LOT=[M:STW]LOT(I) & SLO=[M:STW]SLO(I)","&") From GOBJSUB
+                 Raz GBIDI1
+                 Call ADDCRIT(LSTJCRIT3,GBIDI1,"","STOFCY=[M:STW]ORIFCY","&") From GOBJSUB
+                 LSJVORDVAL = 1+2
+             Else
+                 FINDPRIORD = "M"
+             Endif
+    When 13: # Inventaire
+             FINDPRIORD = "I"
+    When 14: # Transfert inter-sites
+             FINDPRIORD = "C"    # Inter-sites : prix ordre = prix valo pour la sortie, l'entrée est gérée dans la partie exception (plus bas)
+    When 15: # Transfert sous-traitance
+             # inactif
+    When 16: # Réception sous-traitance
+             # Pas de valo
+    When 17: # Livraison prêt
+             FINDPRIORD = "C"    # prix ordre = prix valo pour la sortie et le prix entrée=prix sortie
+    When 18: # Retour prêt
+             FINDPRIORD = "C"    # prix ordre = prix valo pour la sortie et le prix entrée=prix sortie
+    When 19: # Réintégration stock
+             FINDPRIORD = "AJ"    # On va récupérer un prix moyen de mouvements, pas LE prix d'un mouvement
+             Raz GBIDI1
+
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","STOFCY=[M:STW]STOFCY&ITMREF=[M:STW]ITMREF","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","VCRTYPORI=[M:STW]VCRTYPORI & VCRNUMORI=[M:STW]VCRNUMORI & VCRLINORI=[M:STW]VCRLINORI","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","UPDCOD=2","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2","&") From GOBJSUB  # Issue 96694 - 2014-03-31 by CCC
+             Raz GBIDI1
+             Call ADDCRIT(LSTJCRIT2,GBIDI1,"","LOT=[M:STW]LOT(I) & SLO=[M:STW]SLO(I)","&") From GOBJSUB
+             LSJVORDVAL = 1
+    When 20: # Livraison sous-traitance
+             # Issue X3-54040 - 2017-10-12 by ERMIL : Value Subcontract delivery if value internal is yes
+             Call GETTCM([M:STW]ITMREF,[M:STW]STOFCY,GBIDC1,LRET) From STKVAL
+             If [F:TCM]VLTINT=2    # Valorisation des mouvements internes
+                 FINDPRIORD = "C"
+             Endif
+    When 21: # Refractionnement (lors d'un déconditionnement seul par ex)
+    When 22: # Plan de rangement
+             FINDPRIORD = "J"
+             Raz GBIDI1
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","STOFCY=[M:STW]STOFCY&ITMREF=[M:STW]ITMREF","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","VCRTYP=[M:STW]VCRTYP & VCRNUM=[M:STW]VCRNUM & VCRLIN=[M:STW]VCRLIN","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","LOT=[F:STO]LOT & SLO=[F:STO]SLO","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","BPSLOT=[F:STO]BPSLOT","&") From GOBJSUB
+             # Issue 110327 - 2016-04-01 by CCC : For SERMGTCOD=4 => no filter on SERNUM
+             If find([F:ITM]SERMGTCOD,2,3)
+                 Call ADDCRIT(LSTJCRIT,GBIDI1,"","SERNUM=[F:STO]SERNUM","&") From GOBJSUB
+             Endif
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","STA=[F:STO]STA & LOC=[F:STO]LOC","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","PCU=[F:STO]PCU & PCUSTUCOE=[F:STO]PCUSTUCOE","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","PALNUM=[F:STO]PALNUM & CTRNUM=[F:STO]CTRNUM","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","STOFLD1=[F:STO]STOFLD1 & STOFLD2=[F:STO]STOFLD2","&") From GOBJSUB
+             Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2 & QTYSTU>0","&") From GOBJSUB
+
+             # Issue 100163 - 2014-11-27 by CCC : if original document had not been valued, keep [M:SVW] void for STKVALMAJ.SRGVAL
+             For [STJ] Where TRSTYP<>22
+&                          & STOFCY=[M:STW]STOFCY & ITMREF=[M:STW]ITMREF
+&                          & VCRTYP=[M:STW]VCRTYP & VCRNUM=[M:STW]VCRNUM & VCRLIN=[M:STW]VCRLIN
+                 If find([F:STJ]TRSTYP,7,8,9)<>0
+                     Call GETTCM([M:STW]ITMREF,[M:STW]STOFCY,GBIDC1,LRET) From STKVAL
+                     If [F:TCM]VLTINT<>2    # Valorisation des mouvements internes
+                        Raz FINDPRIORD
+                     Endif
+                 Endif
+                 Break
+             Next
+             LSJVORDVAL = 1+2
+    When 23: # Changement de valeur
+    When 24: # Demande de service
+             FINDPRIORD = "V"
+    When 25: # Réappro zones conso
+    When 26: # Changement stock          (utilisé uniquement pour les règles de gestion)
+    When 27: # Sortie transfert interne  (utilisé uniquement pour les règles de gestion)
+    When 28: # Entrée transfert interne  (utilisé uniquement pour les règles de gestion)
+    When 29: # Sortie sous-traitance  (identique à trstyp=6)
+             FINDPRIORD = "V"
+    When 30: # Réception prêt (inactif)
+    When 31: # Retour réception prêt (inactif)
+    When 32: # Retour réception sous-traitance
+             # Pas de valo
+    When 33: # Retour livraison sous-traitance
+             # Pas de valo
+    When 36: # Container change
+             Call GETTCM([M:STW]ITMREF,[M:STW]STOFCY,GBIDC1,LRET) From STKVAL
+             If [F:TCM]VLTINT=2    # Value internal movements
+                 FINDPRIORD = "C"
+             Endif
+Endcase
+
+# Issue 106617 - 2012-10-24 by CCC
+GPOINT="BEFLOADSVW"         #CHECK IGNORE_LINE
+Gosub ENTREE From EXEFNC
+
+If FINDPRIORD=""
+    Return
+Endif
+
+If !find([M:STW]MAJCODH,"M","A")
+    Case FINDPRIORD
+        When "C" : Gosub LOAD_CHG
+        When "M" : If [M:STW]PRIORDH=0 & WNOTNUL=1
+                       # Si le prix d'ordre est nul, on lui affecte le prix de valo
+                       Gosub LOAD_FROM_VALO
+                   Else
+                       LVALFCY = [M:STW]STOFCY
+                       Gosub LOAD_FROM_MASK
+                   Endif
+        When "V" : Gosub LOAD_FROM_VALO
+        When "J", "AJ" : Gosub LOAD_FROM_STJ
+        When "I" : Gosub LOAD_FROM_CUD
+        When "L" : Gosub LOAD_FROM_LOT
+    Endcase
+Else #---- Modification -----#
+    Gosub LOAD_MODIF
+Endif
+
+If LRET
+    Case LRET-ERRVAL
+        When  1 : GMESSAGE = mess(238,184,1)    # Erreur dans le masque STOVALWORK
+        When  6 : GMESSAGE = mess(34,196,1)     # Tables Stocks et prix FIFO désynchronisées
+        When 30 : Local Char WITMREF(GLONITM) : WITMREF=[M:STW]ITMREF
+    Endcase
+    If [M:STW]ERRCOD>0
+        # Issue 92377 - 2013-09-06 by CCC
+        Local Char WITMREF(GLONITM) : WITMREF=[M:STW]ITMREF
+        Local Char WFCY(GLONFCY)    : WFCY=[M:STW]STOFCY
+
+        Gosub TRT_ERR From STKMAJ    # Affiche ou écrit le message correspondant à [M:STW]ERRCOD
+    Else
+        Gosub TRT_ERR From STKINT    # Ecriture dans la trace ou affichage de GMESSAGE
+    Endif
+    Return
+Endif
+
+[M:SVW]NBLIG = [M:STW]NBLIG
+For I=0 To [M:SVW]NBLIG-1
+    [M:SVW]QTYSTUACT(I) = [M:STW]QTYSTUACT(I)
+Next
+
+#-------------------------------------#
+#    Gestion des cas particuliers     #
+#-------------------------------------#
+
+# Cas particulier de l'assemblage: somme SVW sorties --> SDPA --> VALW --> montant entrée assemblage
+#                                  somme SVW entrées --> SDPA --> régul entrée assemblage
+# ... et de la rénumérotation/mélange de lot
+If find([M:STW]VCRTYP,31,35)
+    Call SUMSVW2SDP("SDPA", 1) From SUBSDPCOM
+Endif
+
+Return
+
+##############################################################
+# Load [M:SVW] for a modification/cancelatinon
+##############################################################
+$LOAD_MODIF
+
+Local Decimal LPRI(2)
+Local Integer LPRINAT(2)
+Local Integer LVALMVTFLG(2) # to indicate if valuation method is for the line (=0) or for the movement (=1)
+
+    If clalev([M:SDPA])
+        Raz [M:SDPA]    # Masque de cumul des montants
+    Endif
+
+    Filter [STJ] Where STOFCY=[M:STW]STOFCY
+&                    & VCRTYP=[M:STW]VCRTYP
+&                    & VCRNUM=[M:STW]VCRNUM
+&                    & VCRLIN=[M:STW]VCRLIN
+&                    & ITMREF=[M:STW]ITMREF
+&                    & UPDCOD=2
+    Look [STJ] First Hint Key STJ1
+    Filter [STJ]
+    # S'il n'existe que des mouvements en attente, il faut déclencher la valorisation
+    If fstat
+        Gosub LOAD_FROM_VALO
+    Else
+        If !clalev([M:SDP]) : Local Mask SAIDECPRI [SDP] : Endif
+        If !clalev([M:SDP2]) : Local Mask SAIDECPRI [SDP2] : Endif
+        # Sinon on récupère la valeur d'origine
+        # Issue 91323 - 2013-08-13 by CCC
+        For F=([M:STW]TRSTYP=14) To 0 Step -1
+
+            Raz LSTJCRIT, LSTJCRIT2, LSTJCRITC
+            Raz GBIDI1
+
+            If F
+                LFCY = [M:STW]TRFFCY
+            Else
+                LFCY = [M:STW]STOFCY
+            Endif
+
+            # get quantity of document line
+            Call ADDCRIT(LSTJCRIT,GBIDI1,"","SELECT sum(ACTQTY_0) From STOJOU"," ") From GOBJSUB
+            Call ADDCRIT(LSTJCRIT,GBIDI1,"","Where VCRTYP_0="+num$([M:STW]VCRTYP)+" and VCRNUM_0='"+[M:STW]VCRNUM+"' and VCRLIN_0="+num$([M:STW]VCRLIN)," ") From GOBJSUB
+            Call ADDCRIT(LSTJCRIT,GBIDI1,"",  "and ITMREF_0='"+[M:STW]ITMREF+"'"," ") From GOBJSUB
+            Call ADDCRIT(LSTJCRIT,GBIDI1,"",  "and STOFCY_0='"+LFCY+"'"," ") From GOBJSUB
+
+            For (Decimal ACTQTY) From num$(GTYPDBA*2+1) Sql LSTJCRIT As [SQLX]
+                LACTQTY = [SQLX]ACTQTY
+            Next
+
+            # CCC : Optimization of overheads management
+            # Get all overheads for the document line
+            # Issue 109924 - 2015-09-22 by CCC
+            # If the type of movement usually needs valuation calculation
+            # and the valuation method is average lot cost or standard cost for item managed by version
+            # => look for existing valuation concerning the lot or standard cost by version
+            Call GETTCM([M:STW]ITMREF,[M:STW]STOFCY,GBIDC1,LRET) From STKVAL
+            Raz GBIDI1, LSTJCRITC, LVALMVTFLG
+            For LNUMVLT=0 To GACTVLT2
+                Raz GBIDC1
+                If FINDPRIORD = "V" & [F:TCM]ISSVLTCOD(LNUMVLT)=6
+                    Call ADDCRIT(GBIDC1,GBIDI1,"","LOT=[M:STW]LOT(I) & SLO=[M:STW]SLO(I)","&") From GOBJSUB
+                    LSTJCRITC(LNUMVLT) = GBIDC1
+                    LVALMVTFLG(LNUMVLT) = 1
+                Elsif FINDPRIORD = "V" & find([F:TCM]ISSVLTCOD(LNUMVLT),1,2) & func ECCLIB.NBRCPNCST([M:STW]ITMREF)>0
+                    Call ADDCRIT(GBIDC1,GBIDI1,"","ECCVALMAJ=[M:STW]ECCVALMAJ(I) & ECCVALMIN=[M:STW]ECCVALMIN(I)","&") From GOBJSUB
+                    LSTJCRITC(LNUMVLT) = GBIDC1
+                    LVALMVTFLG(LNUMVLT) = 1
+                Else
+                    LSTJCRITC(LNUMVLT)="1=1"
+                Endif
+            Next
+
+            # Issue 108742 - 2015-09-30 by CCC : For performance, read all SJO once, agregated in first row of SVW.
+            #                                    Afterwards, each overhead category is spread considering quantity on each line
+            # Issue 109924 : If valuation is by movement then we get overheads later line by line
+            If !F & LVALMVTFLG(0)=0   # overheads are not managed on inter-sites transfers
+                Link [SJO] With [STJ]STJ0~=[F:SJO]STOFCY;[F:SJO]UPDCOD;[F:SJO]ITMREF;[F:SJO]IPTDAT;[F:SJO]MVTSEQ;[F:SJO]MVTIND
+&                                          As [LNK]
+&                                          Where [F:STJ]STOFCY=LFCY
+&                                              & [F:STJ]UPDCOD=2
+&                                              & [F:STJ]ITMREF=[M:STW]ITMREF
+&                                              & [F:STJ]VCRTYP=[M:STW]VCRTYP
+&                                              & [F:STJ]VCRNUM=[M:STW]VCRNUM
+&                                              & [F:STJ]VCRLIN=[M:STW]VCRLIN
+                Raz [M:SVW]OVENAT,[M:SVW]ONATYP,[M:SVW]NBONA,[M:SVW]OLNK,[M:SVW]ONAAMT,[M:SVW]LNK
+                [M:SVW]LNK(0) = 1
+                For [LNK]
+                    Call SJO2SVW2(0,1) From STKVALECR
+                Next
+            Endif
+
+            Raz LSTJCRIT, LSTJCRIT2
+            Raz GBIDI1
+            Call ADDCRIT(LSTJCRIT,GBIDI1,"","VCRTYP=[M:STW]VCRTYP & VCRNUM=[M:STW]VCRNUM & VCRLIN=[M:STW]VCRLIN","&") From GOBJSUB
+# Issue 109924 - 2015-09-23 by CCC : Test on REGFLG is only needed by Cancelation (MAJCOD="A") but absolutely not by Creation
+#                Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2","&") From GOBJSUB
+            Call ADDCRIT(LSTJCRIT,GBIDI1,"","UPDCOD=2 & PRINAT<>0 & TRSTYP<>35","&") From GOBJSUB
+            If F=1
+                Call ADDCRIT(LSTJCRIT,GBIDI1,"","STOFCY=[M:STW]TRFFCY&ITMREF=[M:STW]ITMREF","&") From GOBJSUB
+                Raz GBIDI1
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","LOT=[F:STO]LOT & SLO=[F:STO]SLO","&") From GOBJSUB
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","BPSLOT=[F:STO]BPSLOT","&") From GOBJSUB
+                # Issue 110327 - 2016-04-01 by CCC : For SERMGTCOD=4 => no filter on SERNUM
+                If find([F:ITM]SERMGTCOD,2,3)
+                    Call ADDCRIT(LSTJCRIT2,GBIDI1,"","SERNUM=[F:STO]SERNUM","&") From GOBJSUB
+                Endif
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","STA=[F:STO]STA & LOC=[F:STO]LOC","&") From GOBJSUB
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","PCU=[F:STO]PCU & PCUSTUCOE=[F:STO]PCUSTUCOE","&") From GOBJSUB
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","PALNUM=[F:STO]PALNUM & CTRNUM=[F:STO]CTRNUM","&") From GOBJSUB
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","STOFLD1=[F:STO]STOFLD1 & STOFLD2=[F:STO]STOFLD2","&") From GOBJSUB
+            Else
+                Call ADDCRIT(LSTJCRIT,GBIDI1,"","STOFCY=[M:STW]STOFCY&ITMREF=[M:STW]ITMREF","&") From GOBJSUB
+                Raz GBIDI1
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","LOT=[M:STW]LOT(I) & SLO=[M:STW]SLO(I)","&") From GOBJSUB
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","BPSLOT=[M:STW]BPSLOT(I)","&") From GOBJSUB
+                # Issue 110327 - 2016-04-01 by CCC : For SERMGTCOD=4 => no filter on SERNUM
+                If find([F:ITM]SERMGTCOD,2,3)
+                    Call ADDCRIT(LSTJCRIT2,GBIDI1,"","SERNUM=[M:STW]SERNUM(I)","&") From GOBJSUB
+                Endif
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","STA=[M:STW]STA(I) & LOC=[M:STW]LOC(I)","&") From GOBJSUB
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","PCU=[M:STW]PCU(I) & PCUSTUCOE=[M:STW]PCUSTUCOE(I)","&") From GOBJSUB
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","PALNUM=[M:STW]PALNUM(I) & CTRNUM=[M:STW]CTRNUM(I)","&") From GOBJSUB
+                Call ADDCRIT(LSTJCRIT2,GBIDI1,"","STOFLD1=[M:STW]STOFLD1(I) & STOFLD2=[M:STW]STOFLD2(I)","&") From GOBJSUB
+            Endif
+            # Loop inverted to keep the first line with total value of overheads
+            For I=[M:STW]NBLIG-1 To 0 Step -1
+                If F=1
+                    # if F=1 then [F:STO] is used in filter LSTJCRIT2
+                    Raz [F:STO]
+                    Read [STO]STO0=[M:STW]TRFFCY;[M:STW]STOCOU(I)
+                Endif
+                Case [M:STW]MAJCOD(I)
+                    When "A" :
+                        #Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2","&") From GOBJSUB
+                        Raz [F:STJ]
+                        For [STJ] Hint Key STJ1
+&                                 Where evalue(LSTJCRIT) & evalue(LSTJCRIT2)
+&                                     & REGFLG<>2
+                            Break
+                        Next
+                        If [F:STJ]ITMREF<>""
+                            LACTQTYSTJ=[F:STJ]ACTQTY
+                            Raz [F:SJV]
+                            [F:SJV] = [F:STJ]
+                            Read [SJV] =
+                            #---- Récupérer les valeurs dans les valeurs d'ordre et de valo de SVW
+                            Call SJV2SVW(0,3,0) From STKVALECR
+                            # Issue 88345 - 2013-03-04 by CCC
+                            If [M:SVW]LNK(0)=0
+                               [M:SVW]LNK(0) = max([M:SVW]LNK)+1
+                            Endif
+# Issue 107154 - 2015-03-20 by CCC : Performance
+#                             Columns [STJ] (STOFCY,UPDCOD,ITMREF,IPTDAT,MVTSEQ,MVTIND)
+#                             For [STJ]reckey Where STOFCY=[F:STJ]STOFCY
+#&                                          & UPDCOD=2
+#&                                          & ITMREF=[F:STJ]ITMREF
+#&                                          & IPTDAT=[F:STJ]IPTDAT
+#&                                          & VCRTYP=[M:STW]VCRTYP
+#&                                          & VCRNUM=[M:STW]VCRNUM
+#&                                          & VCRLIN=[M:STW]VCRLIN
+#                                 For [SJO] Where STOFCY=[F:STJ]STOFCY
+#&                                              & UPDCOD=2
+#&                                              & ITMREF=[F:STJ]ITMREF
+#&                                              & IPTDAT=[F:STJ]IPTDAT
+#&                                              & MVTSEQ=[F:STJ]MVTSEQ
+#&                                              & MVTIND=[F:STJ]MVTIND      # Lecture des SJO correspondant à STJ
+#                                     Call SJO2SVW2(I,LACTQTYSTJ/LACTQTY) From STKVALECR
+#                                 Next
+#                             Next
+#                             Columns [STJ]
+
+                            # index 0 could have been filled with SJO with previous line process => reset to avoid the copy in COPSVW2
+                            If !F & LVALMVTFLG(0)=1
+                                For J=0 To [M:SVW]NBONA-1
+                                    If [M:SVW]OLNK(J) = [M:SVW]LNK(0)
+                                        [M:SVW]OLNK(J) = 0
+                                    Endif
+                                Next
+                                [M:SVW]LNK(0) = 0
+                            Endif
+
+                            If LACTQTY=0
+                                # This case shouldn't happen
+                                Call COPSVW2(0,I,[M:STW]QTYSTUACT(I)/LACTQTYSTJ,1,0,3) From STKVALECR
+                            Else
+                                Call COPSVW2(0,I,[M:STW]QTYSTUACT(I)/LACTQTYSTJ,[M:STW]QTYSTUACT(I)/LACTQTY,0,3) From STKVALECR
+                            Endif
+
+                            # If valuation by movement then get overheads of the movement, not of the whole document line
+                            If !F & LVALMVTFLG(0)=1
+                                If [M:SVW]LNK(I)=0
+                                   [M:SVW]LNK(I) = max([M:SVW]LNK)+1
+                                Endif
+                                For [SJO] Where STOFCY=[F:STJ]STOFCY
+&                                             & UPDCOD=2
+&                                             & ITMREF=[F:STJ]ITMREF
+&                                             & IPTDAT=[F:STJ]IPTDAT
+&                                             & MVTSEQ=[F:STJ]MVTSEQ
+&                                             & MVTIND=[F:STJ]MVTIND
+                                    Call SJO2SVW2(I,[M:STW]QTYSTUACT(I)/LACTQTYSTJ) From STKVALECR
+                                Next
+                            Endif
+                        Endif
+                    When "C" :
+                        For LNUMVLT=0 To GACTVLT2
+                            #Call ADDCRIT(LSTJCRIT,GBIDI1,"","REGFLG<>2","&") From GOBJSUB
+                            Raz [F:STJ]
+                            For [STJ] Hint Key STJ1
+&                                     Where evalue(LSTJCRIT) & evalue(LSTJCRITC(LNUMVLT))
+                                Break
+                            Next
+
+                            If [F:STJ]ITMREF<>""
+                                LACTQTYSTJ=[F:STJ]ACTQTY
+                                Raz [F:SJV]
+                                [F:SJV] = [F:STJ]
+                                Read [SJV] =
+                                #---- Récupérer les valeurs dans les valeurs d'ordre et de valo de SVW
+                                # Issue 109924 - 2015-09-23 by CCC : 1st & 2nd valuation are managed idenpedently
+                                #Call SJV2SVW2(0,1+2,0) From STKVALECR
+                                Call SJV2SVW2(0,(LNUMVLT=0)*(1+2)+(LNUMVLT=1)*8,0) From STKVALECR
+                                # Issue 88345 - 2013-03-04 by CCC
+                                If [M:SVW]LNK(0)=0
+                                    [M:SVW]LNK(0) = max([M:SVW]LNK)+1
+                                Endif
+    # Issue 107154 - 2015-03-20 by CCC : Performance
+    #                             Columns [STJ] (STOFCY,UPDCOD,ITMREF,IPTDAT,MVTSEQ,MVTIND)
+    #                             For [STJ]reckey Where STOFCY=[F:STJ]STOFCY
+    #&                                          & UPDCOD=2
+    #&                                          & ITMREF=[F:STJ]ITMREF
+    #&                                          & IPTDAT=[F:STJ]IPTDAT
+    #&                                          & VCRTYP=[M:STW]VCRTYP
+    #&                                          & VCRNUM=[M:STW]VCRNUM
+    #&                                          & VCRLIN=[M:STW]VCRLIN
+    #                                 For [SJO] Where STOFCY=[F:STJ]STOFCY
+    #&                                              & UPDCOD=2
+    #&                                              & ITMREF=[F:STJ]ITMREF
+    #&                                              & IPTDAT=[F:STJ]IPTDAT
+    #&                                              & MVTSEQ=[F:STJ]MVTSEQ
+    #&                                              & MVTIND=[F:STJ]MVTIND      # Lecture des SJO correspondant à STJ
+    #                                     Call SJO2SVW2(I,LACTQTYSTJ/LACTQTY) From STKVALECR
+    #                                 Next
+    #                             Next
+    #                             Columns [STJ]
+                                # Overhead categories are only linked to 1st valuation method
+                                If LNUMVLT=0 & LVALMVTFLG(LNUMVLT)=0 | LNUMVLT=1
+                                    If LACTQTY=0
+                                        # This case shouldn't happen
+                                        Call COPSVW3(0,I,[M:STW]QTYSTUACT(I)/LACTQTYSTJ,1,0,(LNUMVLT=0)*(1+2)+(LNUMVLT=1)*4) From STKVALECR
+                                    Else
+                                        Call COPSVW3(0,I,[M:STW]QTYSTUACT(I)/LACTQTYSTJ,[M:STW]QTYSTUACT(I)/LACTQTY,0,(LNUMVLT=0)*(1+2)+(LNUMVLT=1)*4) From STKVALECR
+                                    Endif
+                                Else
+                                    # If valuation is by movement then get overheads categories of the movement
+                                    For [SJO] Where STOFCY=[F:STJ]STOFCY
+&                                                 & UPDCOD=2
+&                                                 & ITMREF=[F:STJ]ITMREF
+&                                                 & IPTDAT=[F:STJ]IPTDAT
+&                                                 & MVTSEQ=[F:STJ]MVTSEQ
+&                                                 & MVTIND=[F:STJ]MVTIND
+                                       Call SJO2SVW2(0,1) From STKVALECR
+                                    Next
+                                    Call REPOVESVW(0,GRNDVAL) From STKVALECR
+                                    If LACTQTYSTJ<>0
+                                        Call COPSVW3(0,I,[M:STW]QTYSTUACT(I)/LACTQTYSTJ,[M:STW]QTYSTUACT(I)/LACTQTYSTJ,0,(LNUMVLT=0)*(1+2)+(LNUMVLT=1)*4) From STKVALECR
+                                    Endif
+                                Endif
+                            # Issue 109924 - 2015-09-22 by CCC
+                            Elsif LVALMVTFLG(LNUMVLT)=1
+                                If func VALAUZ(I)    # Les mouvements en attente ne sont pas valorisés
+                                    Call DEFPRI2([M:STW]ITMREF,[M:STW]ECCVALMAJ(I),[M:STW]ECCVALMIN(I),[M:STW]STOFCY,[M:STW]TRSTYP,[M:STW]TRSCOD,
+&                                                [M:STW]LOT(I),[M:STW]SLO(I),[M:STW]IPTDAT,0,abs([M:STW]QTYSTUACT(I)),
+&                                                [M:SVW]PRIORD(I),LPRINAT,LPRI,0,string$([M:STW]TRSTYP=14,"I"),LRET) From STKVAL
+                                    Case LRET
+                                        When 1 : [M:STW]ERRCOD=11
+                                        When 2 : [M:STW]ERRCOD=4
+                                        When 3 : [M:STW]ERRCOD=29 : If [F:ITF]VLTCOD=""  Raz LRET : Endif
+                                        When 4 : [M:STW]ERRCOD=30
+                                    Endcase
+                                    If LRET>0
+                                        LRET = [M:STW]ERRCOD
+                                        Break 3
+                                    Endif
+                                    If LNUMVLT=0
+                                        [M:SVW]PRINAT(I) = LPRINAT(0)
+                                        [M:SVW]AMTVAL(I) = arr(LPRI(0)*[M:STW]QTYSTUACT(I),GRNDVAL)
+                                        Call COPSDP2SVWVAL_2(I,[M:STW]QTYSTUACT(I),LNUMVLT+1) From STKVALECR
+                                        # PRIVAL modified by COPSDP2SVW
+                                        [M:SVW]PRIVAL(I) = LPRI(0)
+
+                                        Call COPVAL2ORD(I) From STKVALECR
+                                        [M:SVW]PRIORD(I) = [M:SVW]PRIVAL(I)
+                                        [M:SVW]AMTORD(I) = [M:SVW]AMTVAL(I)
+                                        # see Issue 85187 : Ajout des natures bidon
+                                        For J=2 To 5
+                                            Case J
+                                                When 2 : LMNT=[M:SVW]OOVEMATTOT(I)
+                                                When 3 : LMNT=[M:SVW]OOVEMACTOT(I)
+                                                When 4 : LMNT=[M:SVW]OOVELABTOT(I)
+                                                When 5 : LMNT=[M:SVW]OOVESCOTOT(I)
+                                            Endcase
+                                            If LMNT<>0
+                                                K=find(I+1,[M:SVW]LNK)-1
+                                                If K<0
+                                                    [M:SVW]OVENAT([M:SVW]NBONA) = "ZZZ"
+                                                    [M:SVW]ONATYP([M:SVW]NBONA) = J
+                                                    [M:SVW]ONAAMT([M:SVW]NBONA) = LMNT
+                                                    If [M:SVW]LNK(I)=0
+                                                        [M:SVW]LNK(I) = max([M:SVW]LNK)+1
+                                                    Endif
+                                                    [M:SVW]OLNK([M:SVW]NBONA)   = [M:SVW]LNK(I)
+                                                    [M:SVW]NBONA += 1
+                                                Else
+                                                    [M:SVW]ONATYP(K) = 1
+                                                    [M:SVW]ONAAMT(K) += LMNT
+                                                Endif
+                                            Endif
+                                        Next
+                                    Else
+                                        [M:SVW]PRINAT2(I) = LPRINAT(1)
+                                        [M:SVW]AMTVAL2(I) = arr(LPRI(1)*[M:STW]QTYSTUACT(I),GRNDVAL)
+                                        Call COPSDP2SVWVAL_2(I,[M:STW]QTYSTUACT(I),LNUMVLT+1) From STKVALECR
+                                        # PRIVAL modified by COPSDP2SVW
+                                        [M:SVW]PRIVAL2(I) = LPRI(1)
+                                    Endif
+                                Endif
+                            Endif
+                        Next
+                Endcase
+            Next
+            If F=1
+                [M:SVWD] = [M:SVW]
+            Endif
+        Next
+    Endif
+Return
+
+#################################################################
+# Valorisation des changements stock et transferts inter-sites
+#################################################################
+$LOAD_CHG
+# 1- Valorisation de la sortie ----------------------
+Gosub LOAD_FROM_VALO
+If LRET
+    Return
+Endif
+
+[M:SVW]NBLIG = [M:STW]NBLIG
+
+# 2- Valorisation de l'entrée ----------------------
+If [M:STW]TRSTYP=14
+    If !clalev([M:SVW1]) : Local Mask STOVALWORK [SVW1] : Endif
+    [M:SVW1] = [M:SVW]
+    For I=0 To [M:SVW]NBLIG-1
+        Call COPSVW(I,I,0,0,2) From STKVALECR    # --> met à 0 les valeurs de valo
+        [M:SVW]PRIVAL(I)  = 0
+        [M:SVW]PRINAT(I)  = 0
+        [M:SVW]PRIVAL2(I) = 0
+        [M:SVW]PRINAT2(I) = 0
+    Next
+    # Dans le cas de l'inter-sociétés, le prix a été saisi => VALW déjà alimenté
+    If [M:STW]BETCPY=2
+        LVALFCY = [M:STW]TRFFCY
+        Gosub LOAD_FROM_MASK    # Inter-société : prix saisi
+    Else        # Dans le cas de l'inter-sites, le prix n'a pas été saisi => VALW doit être alimenté
+        # SVW --> SDP --> VALW
+        If !clalev([M:SDP]) : Local Mask SAIDECPRI [SDP] : Endif
+        # Issue 79512 - 2012-02-08 by CCC : Si le détail prix n'est pas activé, il faut récupérer le prix
+        If GACTDECCST
+            Call SUMSVW2SDP("SDP", 0) From SUBSDPCOM
+            Gosub CAL_TOT From SUBSDP    # PRI = somme des composantes
+            [M:SDP]AMTTOT = [M:SDP]PRI
+            [M:SDP]PRI /= sum([M:STW]QTYSTUACT)
+            Call PROSDP("SDP",1/sum([M:STW]QTYSTUACT)) From SUBSDPCOM
+        Else
+            [M:SDP]AMTTOT=[M:SVW]AMTORD
+            [M:SDP]PRI=[M:SVW]PRIORD
+        Endif
+        LLIGW = find(LLIG, [M:VALW]WSTOSEQ)-1
+        If LLIGW = -1
+            LLIGW = [M:VALW]NBLIG
+            [M:VALW]WSTOSEQ(LLIGW) = LLIG
+            [M:VALW]NBLIG += 1
+        Endif
+        Call COPSDP2VALW(LLIGW,"VALW","SDP") From SUBSDPCOM
+        LVALFCY = [M:STW]TRFFCY
+        Gosub LOAD_FROM_MASK
+    Endif
+    [M:SVWD] = [M:SVW]
+    [M:SVW]  = [M:SVW1]
+Else    # le site ne change pas, donc la valo destination est la même que l'origine
+    [M:SVWD] = [M:SVW]
+Endif
+Return
+
+#######################################################
+# LOAD_FROM_MASK : charge les valeurs d'ordre à partir du masque VALW
+#        !!!! On est forcément en création !!!!
+# Le site en cours de valo doit être renseigné dans LVALFCY
+#######################################################
+$LOAD_FROM_MASK
+
+If LVALFCY="" : LVALFCY=[M:STW]STOFCY : Endif
+
+Local Integer I
+Local Decimal LBAS, LOVEAMT(4)
+Local Decimal LDPRI, LDOVEAMT(4)
+Local Decimal LPRI(2)
+Local Integer LPRINAT(2)
+
+Raz LBAS, LOVEAMT
+Raz LDPRI, LDOVEAMT
+
+    If clalev([M:VALW])
+        If [M:VALW]NBLIG=0    # Cela n'est pas sensé arriver, c'est une sécurité
+            Call DEFPRI([M:STW]ITMREF,"","",[M:STW]TRFFCY,[M:STW]TRSTYP,[M:STW]TRSCOD,
+&                       "","",[M:STW]IPTDAT,sum([M:STW]QTYSTUACT),sum([M:STW]QTYSTUACT),0,
+&                       LPRINAT,LPRI,LRET) From STKVAL
+            Call SETNEWPRIOVE([M:STW]ITMREF,"","",[M:STW]TRFFCY,[M:STW]IPTDAT,
+&                             LLIG,LPRI,
+&                             [M:STW]TRSTYP,sum([M:STW]QTYSTUACT),"",LRET) From STKVAL
+        Endif
+        LLIGW = find(LLIG, [M:VALW]WSTOSEQ)-1
+        If LLIGW<0
+            LRET=ERRVAL+1
+            GMESSAGE="ALIVALWORK --> LRET="+num$(LRET)
+            Return
+        Endif
+
+        GBIDI1 = [M:SVW]FILUPD
+        Raz [M:SVW]
+        [M:SVW]FILUPD = GBIDI1
+
+        For I=0 To [M:STW]NBLIG-1
+# Issue 94044 - 2013-10-31 by CCC : set ORD values as it's done for VAL values (total calculated before detail)
+#            #---- Matière ----#
+#            For J=0 To GACTMAT-1
+#                [M:SVW]OMATCST(I*GACTMAT+J)  = arr([M:VALW]OMATCST(LLIGW*GACTMAT+J)*[M:STW]QTYSTU(I),GRNDVAL)
+#            Next
+#
+#            [M:SVW]OMATTOT(I)   = sigma(0,GACTMAT-1,[M:SVW]OMATCST(I*GACTMAT+indcum))
+#
+#            [M:SVW]OOVEMATTOT(I)= arr([M:VALW]OOVEMATCST(LLIGW)*[M:STW]QTYSTU(I),GRNDVAL)
+#
+#            #---- Machine ----#
+#            For J=0 To GACTMAC-1
+#                [M:SVW]OMACCST(I*GACTMAC+J)  = arr([M:VALW]OMACCST(LLIGW*GACTMAC+J)*[M:STW]QTYSTU(I),GRNDVAL)
+#            Next
+#
+#            [M:SVW]OMACTOT(I)   = sigma(0,GACTMAC-1,[M:SVW]OMACCST(I*GACTMAC+indcum))
+#
+#            [M:SVW]OOVEMACTOT(I)= arr([M:VALW]OOVEMACCST(LLIGW)*[M:STW]QTYSTU(I),GRNDVAL)
+#
+#            #---- Main d'oeuvre ----#
+#            For J=0 To GACTLAB-1
+#                [M:SVW]OLABCST(I*GACTLAB+J)  = arr([M:VALW]OLABCST(LLIGW*GACTLAB+J)*[M:STW]QTYSTU(I),GRNDVAL)
+#            Next
+#
+#            [M:SVW]OLABTOT(I)   = sigma(0,GACTLAB-1,[M:SVW]OLABCST(I*GACTLAB+indcum))
+#
+#            [M:SVW]OOVELABTOT(I)= arr([M:VALW]OOVELABCST(LLIGW)*[M:STW]QTYSTU(I),GRNDVAL)
+#
+#            #---- Sous-traitance ----#
+#            [M:SVW]OSCOTOT(I)   = arr([M:VALW]OSCOTOT(LLIGW)*[M:STW]QTYSTU(I),GRNDVAL)
+#            [M:SVW]OOVESCOTOT(I)= arr([M:VALW]OOVESCOCST(LLIGW)*[M:STW]QTYSTU(I),GRNDVAL)
+#
+#            [M:SVW]OINVDTA(I)   = arr([M:VALW]OINVDTACST(LLIGW)*[M:STW]QTYSTU(I),GRNDVAL)
+#
+#            #---- Natures FG ----#
+#            LLIGO = find(LLIG, [M:VALW]OWSTOSEQ)-1
+#            If LLIGO>=0
+#                If I>0
+#                    [M:SVW]LNK(I) = [M:SVW]LNK(I-1)+1
+#                Else
+#                    [M:SVW]LNK(I) = 1
+#                Endif
+#                For J=LLIGO To dim([M:VALW]OWSTOSEQ)-1
+#                    If [M:VALW]OWSTOSEQ(J)<>LLIG | [M:VALW]OVENAT(J)=""
+#                        Break
+#                    Endif
+#                    [M:SVW]OVENAT([M:SVW]NBONA) = [M:VALW]OVENAT(J)
+#                    [M:SVW]ONATYP([M:SVW]NBONA) = [M:VALW]ONATYP(J)
+#                    # Issue 82631 - 2012-06-04 by CCC
+#                    #[M:SVW]ONAAMT([M:SVW]NBONA) = arr([M:VALW]ONAAMT(J)*[M:STW]QTYSTU(I)/sum([M:STW]QTYSTU),GRNDVAL)
+#                    [M:SVW]ONAAMT([M:SVW]NBONA) = arr([M:VALW]ONAAMT(J)*[M:STW]QTYSTU(I),GRNDVAL)
+#                    [M:SVW]OLNK([M:SVW]NBONA)   = [M:SVW]LNK(I)
+#                    [M:SVW]NBONA += 1
+#                Next
+#            Endif
+#
+#            #---- totaux STW ----#
+#            [M:SVW]PRIORD(I) = [M:VALW]PRI(LLIGW)#+arr(sum(LOVEAMT)/sum([M:STW]QTYSTU),GRNDVAL)
+#            If GACTDECCST
+#                [M:SVW]AMTORD(I) = [M:SVW]OMATTOT(I)+[M:SVW]OMACTOT(I)+[M:SVW]OLABTOT(I)+[M:SVW]OSCOTOT(I)+[M:SVW]OINVDTA(I)
+#&                                + [M:SVW]OOVEMATTOT(I)+[M:SVW]OOVEMACTOT(I)+[M:SVW]OOVELABTOT(I)+[M:SVW]OOVESCOTOT(I)
+#            Else
+#                [M:SVW]AMTORD(I) = arr([M:SVW]PRIORD(I)*[M:STW]QTYSTU(I),GRNDVAL)
+#            Endif
+
+            # Issue 118426 - 2016-10-25 by CCC : [SVW]PRIORD has to be for active quantity but in VALW unit price is for physical quantity
+            #[M:SVW]PRIORD(I) = [M:VALW]PRI(LLIGW)
+            #[M:SVW]AMTORD(I) = arr([M:SVW]PRIORD(I)*[M:STW]QTYSTU(I),GRNDVAL)
+            [M:SVW]AMTORD(I) = arr([M:VALW]PRI(LLIGW)*[M:STW]QTYSTU(I),GRNDVAL)
+            [M:SVW]PRIORD(I) = arr([M:SVW]AMTORD(I)/[M:STW]QTYSTUACT(I),GRNDVAL)
+
+            If dim(LTABVAL)<=0 : Local Decimal LTABVAL(1+GACTMAT+GACTMAC+GACTLAB+1+1+4+1) : Endif
+            Call LOADVAR3(LTABVAL,"[M:VALW]",0, "O", "CST", LLIGW, [M:STW]QTYSTU(I), 0, 0) From STKVALECR
+            Call REPVAL([M:SVW]AMTORD(I),LTABVAL, GRNDVAL, LTABVAL) From STKVALECR
+            Call LOADFIC2("[M:SVW]", LTABVAL, "O", "CST", I, 1, 0) From STKVALECR
+
+            [M:SVW]OMATTOT(I)   = sigma(0,GACTMAT-1,[M:SVW]OMATCST(I*GACTMAT+indcum))
+            [M:SVW]OMACTOT(I)   = sigma(0,GACTMAC-1,[M:SVW]OMACCST(I*GACTMAC+indcum))
+            [M:SVW]OLABTOT(I)   = sigma(0,GACTLAB-1,[M:SVW]OLABCST(I*GACTLAB+indcum))
+
+
+            #---- Natures FG ----#
+            LLIGO = find(LLIG, [M:VALW]OWSTOSEQ)-1
+            If LLIGO>=0
+                If I>0
+                    [M:SVW]LNK(I) = [M:SVW]LNK(I-1)+1
+                Else
+                    [M:SVW]LNK(I) = 1
+                Endif
+                For J=LLIGO To dim([M:VALW]OWSTOSEQ)-1
+                    If [M:VALW]OWSTOSEQ(J)<>LLIG | [M:VALW]OVENAT(J)=""
+                        Break
+                    Endif
+                    [M:SVW]OVENAT([M:SVW]NBONA) = [M:VALW]OVENAT(J)
+                    [M:SVW]ONATYP([M:SVW]NBONA) = [M:VALW]ONATYP(J)
+                    # Issue 82631 - 2012-06-04 by CCC
+                    #[M:SVW]ONAAMT([M:SVW]NBONA) = arr([M:VALW]ONAAMT(J)*[M:STW]QTYSTU(I)/sum([M:STW]QTYSTU),GRNDVAL)
+                    [M:SVW]ONAAMT([M:SVW]NBONA) = arr([M:VALW]ONAAMT(J)*[M:STW]QTYSTU(I),GRNDVAL)
+                    [M:SVW]OLNK([M:SVW]NBONA)   = [M:SVW]LNK(I)
+                    [M:SVW]NBONA += 1
+                Next
+            Endif
+
+        Next
+        [M:SVW]NBLIG = [M:STW]NBLIG     # Issue 121417 - 2017-02-13 by CCC : necessary for LOAD_CHG in inter-sites transfer
+    Else
+        LLIGW = -1
+        For I=0 To [M:STW]NBLIG-1
+            # Issue 118426 - 2016-10-25 by CCC : [SVW]PRIORD has to be for active quantity but in VALW unit price is for physical quantity
+            #[M:SVW]PRIORD(I) = [M:STW]PRIORDH
+            #[M:SVW]AMTORD(I) = arr([M:SVW]PRIORD(I)*[M:STW]QTYSTU(I),GRNDVAL)
+            [M:SVW]AMTORD(I) = arr([M:STW]PRIORDH*[M:STW]QTYSTU(I),GRNDVAL)
+            [M:SVW]PRIORD(I) = arr([M:SVW]AMTORD(I)/[M:STW]QTYSTUACT(I),GRNDVAL)
+
+            # Issue 80482 - 2012-04-24 by CCC : Dans le pire des cas, on renseigne la part matière pour ne pas créer de désynchro
+            If GACTDECCST
+                [M:SVW]OMATCST(I*GACTMAT+max(0,[F:ITM]BRDCOD-1)) = [M:SVW]AMTORD(I)
+            Endif
+        Next
+    Endif
+
+    Call DEFPRISVW(LLIGW,LVALFCY,"",LRET)
+
+    If LRET
+        LRET += ERRVAL
+    Endif
+
+Return
+
+###############################################
+# Call STKVAL.DEFPRI and set the result in [M:SVW]
+# If needed, DEFPRI is called for each movement (average cost by lot, standard cost whith version number)
+Subprog DEFPRISVW(PLIGVALW,PFCY,PSUP,PRET)
+Value    Integer PLIGVALW
+Value    Char    PFCY
+Value    Char    PSUP
+Variable Integer PRET
+
+Local Decimal LQTYTOT
+Local Decimal LPRI(2)
+Local Decimal LPRITMP
+Local Integer LPRINAT(2)
+Local Integer LDEFPRI(2)
+Local Integer I,J
+Local Integer LIND
+
+If !clalev([M:SDP])  : Local Mask SAIDECPRI [SDP]  : Endif    # Pour la 1ère méthode
+If !clalev([M:SDP2]) : Local Mask SAIDECPRI [SDP2] : Endif    # Pour la 2nde méthode
+
+# Ne sont pas valorisés :
+# - Les mvts en attente
+# - Les mouvements dont le propriétaire n'est pas le site faisant le mouvement
+
+    LQTYTOT = abs(sigma(0,[M:STW]NBLIG-1,[M:STW]QTYSTUACT(indcum)*(-2*([M:STW]MAJCOD(indcum)="A")+1)
+&                                       *func VALAUZ(indcum)
+&                      )
+&                )
+
+    Raz [M:SDP]
+    If GACTVLT2
+        Raz [M:SDP2]
+    Endif
+    If LQTYTOT=0    # S'il n'y a que des mouvements non valorisés (en attente, stock propriétaire) on sort
+        End
+    Endif
+    # LIND = indice de la 1ère ligne à valoriser
+    Raz J
+    LIND = sigma(0,[M:STW]NBLIG-1,(indcum+1) *( J=0 & func VALAUZ(indcum) & sigma(J=1,1,1) ) )
+    # Issue 118426 - 2016-10-25 by CCC : use of [M:VALW]PRI(PLIGVALW) instead of [M:SVW]PRIORD(LIND-1) to use a unit price for physical quantity
+    # Issue X3-50895 - 2017-08-03 by ERMIL : VALW is not always open here.  So use VALW when avail, otherwise SVW
+
+    If clalev([M:VALW])
+      LPRITMP = [M:VALW]PRI(PLIGVALW)
+    Else
+      LPRITMP = [M:SVW]PRIORD(LIND-1)
+    Endif
+    Call DEFPRI2([M:STW]ITMREF,[M:STW]ECCVALMAJ(LIND-1),[M:STW]ECCVALMIN(LIND-1),PFCY,[M:STW]TRSTYP,[M:STW]TRSCOD,
+&                [M:STW]LOT(LIND-1),[M:STW]SLO(LIND-1),[M:STW]IPTDAT,LQTYTOT,abs([M:STW]QTYSTUACT(LIND-1)),
+&                LPRITMP,LPRINAT,LPRI,PLIGVALW,PSUP,PRET) From STKVAL
+
+#    # Si entrée sous-produit, les FG sont annulés
+#    If [M:STW]TRSTYP=5
+#&    & [F:MKI]MFGTRKNUM=[M:STW]VCRNUM & [F:MKI]ITMTRKLIN=[M:STW]VCRLIN
+#&    & [F:MKI]ITMREF=[M:STW]ITMREF & [F:MKI]ITMTYP=2
+#        Local Integer CCRET
+#        Call OUINON([M:STW]ITMREF-"SP CORRECTION ?", CCRET) From GESECRAN
+#        If CCRET=2
+#        Dbgaff
+#        [M:SDP]PRI -= [M:SDP]OVEMATCST+[M:SDP]OVEMACCST+[M:SDP]OVELABCST+[M:SDP]OVESCOCST
+#        LPRI = [M:SDP]PRI
+#        Raz [M:SDP]OVEMATCST,[M:SDP]OVEMACCST,[M:SDP]OVELABCST,[M:SDP]OVESCOCST
+#        If GACTVLT2
+#            [M:SDP2]PRI -= [M:SDP]OVEMATCST+[M:SDP]OVEMACCST+[M:SDP]OVELABCST+[M:SDP]OVESCOCST
+#            Raz [M:SDP2]OVEMATCST,[M:SDP]OVEMACCST,[M:SDP]OVELABCST,[M:SDP]OVESCOCST
+#            LPRI(1) = [M:SDP2]PRI
+#        Endif
+#        Endif
+#    Endif
+
+    [M:SVW]PRINAT(LIND-1) = LPRINAT(0)
+    [M:SVW]PRIVAL(LIND-1) = LPRI(0)
+    If GACTVLT2
+        [M:SVW]PRINAT2(LIND-1) = LPRINAT(1)
+        [M:SVW]PRIVAL2(LIND-1) = LPRI(1)
+    Endif
+    Case PRET
+      When 1 : [M:STW]ERRCOD=11
+      When 2 : [M:STW]ERRCOD=4
+      When 3 : [M:STW]ERRCOD=29 : If [F:ITF]VLTCOD=""  Raz PRET : Endif
+      When 4 : [M:STW]ERRCOD=30
+      When 5 : PRET = 6
+    Endcase
+    If PRET>0
+        If [M:STW]ERRCOD
+            PRET = [M:STW]ERRCOD
+        Endif
+        End
+    Endif
+
+    # Il faut d'abord s'occuper de toutes les méthodes de valo avant le PM Lot
+    # car DEFPRI va être rappelé et modifier SDP et/ou SDP2
+    For LNUMVLT=0 To GACTVLT2
+        LDEFPRI(LNUMVLT)=0
+        Case evalue("[M:SVW]PRINAT"+string$(LNUMVLT,"2")+"(LIND-1)")
+            When 7 : # Traité après
+                    LDEFPRI(LNUMVLT)=1      # DEFPRI has to be done for each line
+            When 8 : # Les prix sont saisis pour des quantités physiques
+                    For I=LIND-1 To [M:STW]NBLIG-1
+                        If func VALAUZ(I)    # Les mouvements en attente ne sont pas valorisés
+                            # Issue 92701 - 2013-10-18 by CCC
+                            #Call COPSDP2SVWVAL_2(I,[M:STW]QTYSTU(I),LNUMVLT+1) From STKVALECR
+                            If LNUMVLT=0
+                                #[M:SVW]AMTVAL(I) = arr([M:SVW]PRIVAL(I)*[M:STW]QTYSTU(I),GRNDVAL)
+                                [M:SVW]AMTVAL(I) = arr([M:SDP]PRI*[M:STW]QTYSTU(I),GRNDVAL)
+                                Call COPSDP2SVWVAL_2(I,[M:STW]QTYSTU(I),LNUMVLT+1) From STKVALECR
+                                # PRIVAL modified by COPSDP2SVW
+                                [M:SVW]PRIVAL(I) = arr([M:SVW]AMTVAL(I)/[M:STW]QTYSTUACT(I),GRNDVAL)
+                                # Issue 114340 - 2016-05-13 by CCC : index 0 can be a waiting transaction => no prinat => take prinat of 1st valued transaction
+                                #[M:SVW]PRINAT(I) = [M:SVW]PRINAT(0)
+                                [M:SVW]PRINAT(I) = [M:SVW]PRINAT(LIND-1)
+                            Else
+                                #[M:SVW]AMTVAL2(I) = arr([M:SVW]PRIVAL2(I)*[M:STW]QTYSTU(I),GRNDVAL)
+                                [M:SVW]AMTVAL2(I) = arr([M:SDP2]PRI*[M:STW]QTYSTU(I),GRNDVAL)
+                                Call COPSDP2SVWVAL_2(I,[M:STW]QTYSTU(I),LNUMVLT+1) From STKVALECR
+                                # PRIVAL modified by COPSDP2SVW
+                                [M:SVW]PRIVAL2(I) = arr([M:SVW]AMTVAL2(I)/[M:STW]QTYSTUACT(I),GRNDVAL)
+                                # Issue 114340 - 2016-05-13 by CCC : index 0 can be a waiting transaction => no prinat => take prinat of 1st valued transaction
+                                #[M:SVW]PRINAT2(I) = [M:SVW]PRINAT2(0)
+                                [M:SVW]PRINAT2(I) = [M:SVW]PRINAT2(LIND-1)
+                            Endif
+                        Endif
+                    Next
+
+            When Default :
+                    If find(evalue("[M:SVW]PRINAT"+string$(LNUMVLT,"2")+"(LIND-1)"),2,3)
+&                    & [M:STW]ECCVALMAJ(LIND-1)<>""
+                        LDEFPRI(LNUMVLT)=1  # DEFPRI has to be done for each line
+                    Else
+                        For I=LIND-1 To [M:STW]NBLIG-1
+                            If func VALAUZ(I)    # Les mouvements en attente ne sont pas valorisés
+                                # Issue 92701 - 2013-10-18 by CCC
+                                #Call COPSDP2SVWVAL_2(I,[M:STW]QTYSTUACT(I),LNUMVLT+1) From STKVALECR
+                                If LNUMVLT=0
+                                    #[M:SVW]AMTVAL(I) = arr([M:SVW]PRIVAL(I)*[M:STW]QTYSTUACT(I),GRNDVAL)
+                                    [M:SVW]AMTVAL(I) = arr([M:SDP]PRI*[M:STW]QTYSTUACT(I),GRNDVAL)
+                                    # Issue 114340 - 2016-05-13 by CCC : index 0 can be a waiting transaction => no prinat => take prinat of 1st valued transaction
+                                    #[M:SVW]PRINAT(I) = [M:SVW]PRINAT(0)
+                                    [M:SVW]PRINAT(I) = [M:SVW]PRINAT(LIND-1)
+                                Else
+                                    #[M:SVW]AMTVAL2(I) = arr([M:SVW]PRIVAL2(I)*[M:STW]QTYSTUACT(I),GRNDVAL)
+                                    [M:SVW]AMTVAL2(I) = arr([M:SDP2]PRI*[M:STW]QTYSTUACT(I),GRNDVAL)
+                                    # Issue 114340 - 2016-05-13 by CCC : index 0 can be a waiting transaction => no prinat => take prinat of 1st valued transaction
+                                    #[M:SVW]PRINAT2(I) = [M:SVW]PRINAT2(0)
+                                    [M:SVW]PRINAT2(I) = [M:SVW]PRINAT2(LIND-1)
+                                Endif
+                                Call COPSDP2SVWVAL_2(I,[M:STW]QTYSTUACT(I),LNUMVLT+1) From STKVALECR
+                            Endif
+                        Next
+                    Endif
+        Endcase
+    Next
+    # On récupère la valeur PM Lot déjà calculée pour la 1ère ligne
+    For LNUMVLT=0 To GACTVLT2
+        If LDEFPRI(LNUMVLT)=1
+            # Issue 92701 - 2013-10-18 by CCC
+            #Call COPSDP2SVWVAL_2(LIND-1,[M:STW]QTYSTUACT(LIND-1),LNUMVLT+1) From STKVALECR
+            If LNUMVLT=0
+                [M:SVW]AMTVAL(LIND-1) = arr([M:SDP]PRI*[M:STW]QTYSTUACT(LIND-1),GRNDVAL)
+            Else
+                [M:SVW]AMTVAL2(LIND-1) = arr([M:SDP2]PRI*[M:STW]QTYSTUACT(LIND-1),GRNDVAL)
+            Endif
+            Call COPSDP2SVWVAL_2(LIND-1,[M:STW]QTYSTUACT(LIND-1),LNUMVLT+1) From STKVALECR
+        Endif
+    Next
+    # Ensuite on s'occupe des autres lignes
+    For LNUMVLT=0 To GACTVLT2
+        If LDEFPRI(LNUMVLT)=1
+            If LNUMVLT=0
+                Raz [M:SDP]
+            Else
+                Raz [M:SDP2]
+            Endif
+            For J=LIND To [M:STW]NBLIG-1
+                If func VALAUZ(J)    # Les mouvements en attente ne sont pas valorisés
+                    # Issue 118426 - 2016-10-25 by CCC : use of [M:VALW]PRI(PLIGVALW) instead of [M:SVW]PRIORD(J) to use a unit price for physical quantity
+                    # Issue X3-50895 - 2017-08-03 by ERMIL : VALW is not always open here.  So use VALW when avail, otherwise SVW
+                    If clalev([M:VALW])
+                      LPRITMP = [M:VALW]PRI(PLIGVALW)
+                    Else
+                      LPRITMP = [M:SVW]PRIORD(LIND-1)
+                    Endif
+                    Call DEFPRI2([M:STW]ITMREF,[M:STW]ECCVALMAJ(J),[M:STW]ECCVALMIN(J),PFCY,[M:STW]TRSTYP,[M:STW]TRSCOD
+&                                ,[M:STW]LOT(J),[M:STW]SLO(J),[M:STW]IPTDAT,0,abs([M:STW]QTYSTUACT(J)),
+&                                LPRITMP,LPRINAT,LPRI,PLIGVALW,PSUP,PRET) From STKVAL
+                    Case PRET
+                      When 1 : [M:STW]ERRCOD=11
+                      When 2 : [M:STW]ERRCOD=4
+                      When 3 : [M:STW]ERRCOD=29 : If [F:ITF]VLTCOD=""  Raz PRET : Endif
+                      When 4 : [M:STW]ERRCOD=30
+                    Endcase
+                    If PRET>0
+                        PRET = [M:STW]ERRCOD
+                        Break
+                    Endif
+                    # Issue 92701 - 2013-10-18 by CCC
+                    #Call COPSDP2SVWVAL_2(J,[M:STW]QTYSTUACT(J),LNUMVLT+1) From STKVALECR
+                    If LNUMVLT=0
+                        [M:SVW]PRINAT(J) = LPRINAT(0)
+                        [M:SVW]AMTVAL(J) = arr(LPRI(0)*[M:STW]QTYSTUACT(J),GRNDVAL)
+                        Call COPSDP2SVWVAL_2(J,[M:STW]QTYSTUACT(J),LNUMVLT+1) From STKVALECR
+                        # PRIVAL modified by COPSDP2SVW
+                        [M:SVW]PRIVAL(J) = LPRI(0)
+                    Else
+                        [M:SVW]PRINAT2(J) = LPRINAT(1)
+                        [M:SVW]AMTVAL2(J) = arr(LPRI(1)*[M:STW]QTYSTUACT(J),GRNDVAL)
+                        Call COPSDP2SVWVAL_2(J,[M:STW]QTYSTUACT(J),LNUMVLT+1) From STKVALECR
+                        # PRIVAL modified by COPSDP2SVW
+                        [M:SVW]PRIVAL2(J) = LPRI(1)
+                    Endif
+                Endif
+            Next
+        Endif
+    Next
+
+End
+
+#######################################################
+# LOAD_FROM_VALO : charge les valeurs d'ordre à partir des valeurs de valo
+#######################################################
+$LOAD_FROM_VALO
+
+Local Char LSUP : Raz LSUP
+# Pour la valo de sortie des transferts inter-sites, on impose la valo de sortie
+LSUP = string$([M:STW]TRSTYP=14,"I")
+
+If !clalev([M:VALW]) : Local Mask STOVALW [VALW] : Endif
+
+#X3-63380 MJH.sn
+LLIGW = find(LLIG, [M:VALW]WSTOSEQ)-1
+If LLIGW<0  : LLIGW = 0 : Endif
+Call DEFPRISVW(LLIGW,[M:STW]STOFCY,LSUP, LRET)
+#X3-63380 MJH.en
+#Call DEFPRISVW(0,[M:STW]STOFCY,LSUP, LRET) #X3-63380 MJH.o
+If LRET
+    LRET+=ERRVAL
+    Return
+Endif
+
+For I=0 To [M:STW]NBLIG-1
+  Call COPVAL2ORD(I) From STKVALECR
+  [M:SVW]PRIORD(I) = [M:SVW]PRIVAL(I)
+  [M:SVW]AMTORD(I) = [M:SVW]AMTVAL(I)
+  # Issue 85187 - 2012-10-17 by CCC : Ajout des natures bidon
+  For J=2 To 5
+    Case J
+      When 2 : LMNT=[M:SVW]OOVEMATTOT(I)
+      When 3 : LMNT=[M:SVW]OOVEMACTOT(I)
+      When 4 : LMNT=[M:SVW]OOVELABTOT(I)
+      When 5 : LMNT=[M:SVW]OOVESCOTOT(I)
+    Endcase
+    If LMNT<>0
+      K=find(I+1,[M:SVW]LNK)-1
+      If K<0
+        [M:SVW]OVENAT([M:SVW]NBONA) = "ZZZ"
+        [M:SVW]ONATYP([M:SVW]NBONA) = J
+        [M:SVW]ONAAMT([M:SVW]NBONA) = LMNT
+        [M:SVW]LNK(I)               = I+1
+        [M:SVW]OLNK([M:SVW]NBONA)   = [M:SVW]LNK(I)
+        [M:SVW]NBONA += 1
+      Else
+        [M:SVW]ONATYP(K) = 1
+        [M:SVW]ONAAMT(K) += LMNT
+      Endif
+    Endif
+  Next
+Next
+Return
+
+#######################################################
+# LOAD_FROM_STJ : charge les valeurs d'ordre à partir d'anciens mouvements
+#######################################################
+$LOAD_FROM_STJ
+If !clalev([F:STJ]) : Local File STOJOU [STJ] : Endif
+If !clalev([F:STO]) : Local File STOCK  [STO] : Endif
+If !clalev([F:SJV]) : Local File STOJOUVAL [SJV] : Endif
+If !clalev([F:SJO]) : Local File STOJOUOVE [SJO] : Endif
+
+If !clalev([M:VALW]) : Local Mask STOVALW [VALW] : Endif
+
+# Issue 96705 - 2014-04-14 by CCC : Calculates default value in case of not any SJV
+If dim(GDIMCST)<=0 : Global Integer GDIMCST : Endif
+GDIMCST = GACTMAT+GACTMAC+GACTLAB+2+4     # = dim mat + dim mac + dim lab + sco + invdta + fg mat + fg mac + fg lab + fg sco
+Local Decimal LDEFVAL(1+GDIMCST), LVALREP(1+GDIMCST)
+If GACTDECCST
+    Local Integer LMET(3)
+    Call GETTCM([M:STW]ITMREF,[M:STW]STOFCY,GBIDC1,LRET) From STKVAL
+    Case [F:TCM]ISSVLTCOD
+        When       1 : LMET(0)=1 : LMET(1)=2 : LMET(2)=4    # std; act std; avc
+        When       4 : LMET(0)=4 : LMET(1)=2 : LMET(2)=1    # avc; act std; std
+        When Default : LMET(0)=2 : LMET(1)=1 : LMET(2)=4    # act std; std; avc
+    Endcase
+    Raz I
+    Repeat
+        Case LMET(I)
+            When 1,2 : If clalev([F:ITC])=0 : Local File ITMCOST [ITC] : Endif
+                       Raz [F:ITC]
+                       If fstat
+                           Filter [ITC] Where STOFCY = [F:STJ]STOFCY
+&                                           & ITMREF = [F:STJ]ITMREF
+&                                           & CSTTYP = LMET(I)
+&                                           & ITCSTRDAT<= [M:STW]IPTDAT & [M:STW]IPTDAT<=ITCENDDAT
+&                                           & UID    = 0
+&                                       Order By Key ITC0
+                           Read [ITC] First
+                       Endif
+
+                       If fstat    # Si le prix standard de l'année de la fin d'exercice en cours n'est pas trouvé, on essaie avec l'année précédente
+                           Filter [ITC] Where STOFCY = [F:STJ]STOFCY
+&                                           & ITMREF = [F:STJ]ITMREF
+&                                           & CSTTYP = LMET(I)
+&                                           & ITCSTRDAT<= [M:STW]IPTDAT
+&                                           & UID    = 0
+&                                       Order By Key ITC2
+                           Read [ITC]ITC2 Last
+                       Endif
+                       Call LOADVAR(LDEFVAL, "[F:ITC]", 0, "", 1, 0, 0) From STKVALECR
+
+            When 4   : If clalev([F:ITV])=0 : Local File ITMMVT [ITV] : Endif
+                       Raz [F:ITV]
+                       Read [ITV]ITV0=[F:STJ]ITMREF;[F:STJ]STOFCY
+                       Call LOADVAR(LDEFVAL, "[F:ITV]", 0, "A", 1, 0, 0) From STKVALECR
+        Endcase
+        I+=1
+    Until (sum(LDEFVAL)<>0 | I>=3)
+    If sum(LDEFVAL)=0
+        Raz LDEFVAL
+        LDEFVAL([F:ITM]BRDCOD)=1
+    Endif
+Endif
+
+    For I=0 To [M:STW]NBLIG-1
+      If [M:STW]MAJCOD(I)<>"A" # Issue X3-83019 - 2018-03-21 by ERMIL : Do no cost if this is an A caused by a shortage
+        #---- Chercher le mouvement qui nous intéresse
+        # Lecture du fichier Stock au cas où le filtre sur STJ en ai besoin
+        # par exemple le plan de rangement
+        If [M:STW]STOCOU(I)>0 & ([F:STO]STOCOU<>[M:STW]STOCOU(I) | [F:STO]STOFCY<>[M:STW]STOFCY)
+            Read [STO]STO0=[M:STW]STOFCY;[M:STW]STOCOU(I)
+        Endif
+        Raz [F:SJV], [F:STJ], LACTQTY
+        For [STJ] Where evalue(LSTJCRIT) & evalue(LSTJCRIT2) & evalue(LSTJCRIT3)
+            Raz [F:SJV]     # Issue 96694 - 2014-03-31 by CCC
+            Read [SJV]SJV0=[F:STJ]STOFCY;2;[F:STJ]ITMREF;[F:STJ]IPTDAT;[F:STJ]MVTSEQ;[F:STJ]MVTIND      # Lecture du SJV correspondant
+            If fstat & GDATDECCST<=[M:STW]IPTDAT
+                Gosub ALIM_SJV_DEF
+            Endif
+            #---- Récupérer les valeurs dans les valeurs d'ordre de SVW
+            Call SJV2SVW(I,LSJVORDVAL,1) From STKVALECR
+            LACTQTY += [F:STJ]ACTQTY
+            If [L]FINDPRIORD<>"AJ"
+                Break
+            Endif
+        Next
+
+        If [F:STJ]ITMREF="" & LSTJCRIT3<>"1=1"
+            For [STJ] Where evalue(LSTJCRIT) & evalue(LSTJCRIT2)
+                Read [SJV]SJV0=[F:STJ]STOFCY;2;[F:STJ]ITMREF;[F:STJ]IPTDAT;[F:STJ]MVTSEQ;[F:STJ]MVTIND      # Lecture du SJV correspondant
+                If fstat & GDATDECCST<=[M:STW]IPTDAT
+                    Gosub ALIM_SJV_DEF
+                Endif
+                #---- Récupérer les valeurs dans les valeurs d'ordre de SVW
+                Call SJV2SVW(I,LSJVORDVAL,1) From STKVALECR
+                LACTQTY += [F:STJ]ACTQTY
+                If [L]FINDPRIORD<>"AJ"
+                    Break
+                Endif
+            Next
+        Endif
+
+        # Normalement, le critère LSTJCRIT2 devrait être respecté mais si jamais ce n'est pas le cas
+        # on ne bloque pas et on va se contenter de LSTJCRIT
+        If [F:STJ]ITMREF=""
+            For [STJ] Where evalue(LSTJCRIT)
+                Read [SJV]SJV0=[F:STJ]STOFCY;2;[F:STJ]ITMREF;[F:STJ]IPTDAT;[F:STJ]MVTSEQ;[F:STJ]MVTIND      # Lecture du SJV correspondant
+                If fstat & GDATDECCST<=[M:STW]IPTDAT
+                    Gosub ALIM_SJV_DEF
+                Endif
+                #---- Récupérer les valeurs dans les valeurs d'ordre de SVW
+                Call SJV2SVW(I,LSJVORDVAL,1) From STKVALECR
+                LACTQTY += [F:STJ]ACTQTY
+                If [L]FINDPRIORD<>"AJ"
+                    Break
+                Endif
+            Next
+
+            If [F:STJ]ITMREF=""
+                GMESSAGE=mess(333,184,1)    # Mouvement d'origine non trouvé
+                LRET = 3+ERRVAL
+                Break
+            Endif
+        Endif
+
+        #---- Récupérer les valeurs des natures de FG dans SVW
+        [M:SVW]LNK(I) = max([M:SVW]LNK)+1
+        For [SJO] Where STOFCY=[F:STJ]STOFCY
+&                     & UPDCOD=2
+&                     & ITMREF=[F:STJ]ITMREF
+&                     & IPTDAT=[F:STJ]IPTDAT
+&                     & MVTSEQ=[F:STJ]MVTSEQ
+&                     & MVTIND=[F:STJ]MVTIND      # Lecture des SJO correspondant à STJ
+
+            Call SJO2SVW2(I,[M:STW]QTYSTU(I)/sum([M:STW]QTYSTU)) From STKVALECR
+        Next
+        # Issue 75393 - 2011-09-07 by CCC : Une régul d'entrée sur une autre période peut créer un mvt avec qté=0. C'est bien la somme qu'il faut contrôler
+        #If [F:STJ]ACTQTY=0
+        If LACTQTY=0
+            LRET = 5+ERRVAL
+            GMESSAGE="ALIVALWORK --> LRET="+num$(LRET)
+            Break
+        Else
+            # Issue 96694 - 2014-05-21 by CCC
+            #Call COPSVW(I,I,[M:STW]QTYSTUACT(I)/LACTQTY,0,LSJVORDVAL) From STKVALECR
+            Call COPSVW(I,I,[M:STW]QTYSTUACT(I)/LACTQTY,0,LSJVORDVAL-2*(LSJVORDVAL>=4)) From STKVALECR
+            # ccc (2009-11-20) Bug 60056 : Dans le cas des réceptions inter-sites, on récupère la vraie valeur des éléments de facturation de la réception
+            If LADDVALWFLG=1
+                # Issue 104485 - 2014-12-17 by CCC : Add all elements in VALW
+                #Gosub SET_INVDTA
+                Gosub ADD_VALW
+            Endif
+            If [L]FINDPRIORD="AJ"
+                If mod(LSJVORDVAL,2)>=1
+                    [M:SVW]PRIORD(I) = [M:SVW]AMTORD(I)/[M:STW]QTYSTUACT(I)
+                Endif
+                If mod(LSJVORDVAL,4)>=2
+                    [M:SVW]PRIVAL(I) = [M:SVW]AMTVAL(I)/[M:STW]QTYSTUACT(I)
+                    If GACTVLT2
+                        [M:SVW]PRIVAL2(I) = [M:SVW]AMTVAL2(I)/[M:STW]QTYSTUACT(I)
+                    Endif
+                Endif
+                If mod(LSJVORDVAL,8)>=4
+                    [M:SVW]PRIVAL(I) = [M:SVW]AMTVAL(I)/[M:STW]QTYSTUACT(I)
+                    If GACTVLT2
+                        [M:SVW]PRIVAL2(I) = [M:SVW]AMTVAL2(I)/[M:STW]QTYSTUACT(I)
+                    Endif
+                Endif
+            Endif
+            # Issue 84704 - 2012-10-24 by CCC
+            GPOINT="CHGPRIORD"
+            Gosub ENTREE From EXEFNC
+        Endif
+      Endif
+    Next
+
+    # Issue 118426 - 2016-10-25 by CCC : fill [VALW] only when it's necessary (calculate a valuation)
+    If LSJVORDVAL=1
+        # SVW has been loaded with order price from SJV => we have to fill VALW with the same values
+        # because VALW can be used as a reference (in STKVAL.DEFPRI which is called by DEFPRISVW) to know the order price
+        LLIGW = find(LLIG, [M:VALW]WSTOSEQ)-1
+        # Issue 100812 & 96694 - 2014-07-09 by CCC : affect LLIGW if line doesn't exist in VALW
+        If LLIGW<0
+            LLIGW = [M:VALW]NBLIG
+            [M:VALW]WSTOSEQ(LLIGW) = LLIG
+            [M:VALW]NBLIG+=1
+        Endif
+        # Issue 118426 - 2016-10-25 by CCC : use of QTYSTU instead of QTYSTUACT because VALW has to have price in physical qty
+        If LLIGW>=0 & sum([M:STW]QTYSTU)<>0
+            Call SVW2VALW(LLIGW,1/sum([M:STW]QTYSTU)) From STKVALECR   # VALW contains unit price
+        Endif
+        For I=0 To [M:STW]NBLIG-1
+            #---- Calculer la valo
+
+            If LLIGW>=0#X3-81584.sn MJH - 23 April 2018
+              Call DEFPRISVW(LLIGW,[M:STW]STOFCY,"",LRET)
+            Else
+              Call DEFPRISVW(0,[M:STW]STOFCY,"",LRET) #X3-81584.o
+            Endif#X3-81584.en
+
+            If LRET
+                LRET += ERRVAL
+                Break
+            Endif
+        Next
+    Endif
+    # Issue 77372 - 2011-10-25 by CCC
+    If [M:STW]TRSTYP=22
+        [M:SVWD] = [M:SVW]
+    Endif
+Return
+
+$ALIM_SJV_DEF
+    Call REPVAL([F:STJ]AMTORD, LDEFVAL, GRNDVAL, LVALREP) From STKVALECR
+    Call LOADFIC("[F:SJV]", LVALREP, "O", "CST", 1, 0) From STKVALECR
+    Call REPVAL([F:STJ]AMTVAL, LDEFVAL, GRNDVAL, LVALREP) From STKVALECR
+    Call LOADFIC("[F:SJV]", LVALREP, "V", "CST", 1, 0) From STKVALECR
+    Call REPVAL([F:STJ]AMTVAL2, LDEFVAL, GRNDVAL, LVALREP) From STKVALECR
+    Call LOADFIC("[F:SJV]", LVALREP, "V2", "CST", 1, 0) From STKVALECR
+Return
+
+# Issue 104485 - 2014-12-17 by CCC : Add all elements in VALW
+# Modifie la valeur des éléments de facturation dans la classe SVW
+#$SET_INVDTA
+$ADD_VALW
+    LLIGW = find(LLIG, [M:VALW]WSTOSEQ)-1
+    If LLIGW>=0 & sum([M:STW]QTYSTUACT)<>0
+
+# Issue 104485 - 2014-12-15 by CCC
+#        # Issue 69220 - 2010-11-22 by CCC : On ne retire pas les éléments de facturation de la livraison. Ils font parti du coût de revient.
+#        [M:SVW]AMTORD(I) += [M:VALW]OINVDTACST(LLIGW)*[M:STW]QTYSTUACT(I)
+#        [M:SVW]PRIORD(I) += [M:VALW]OINVDTACST(LLIGW)
+#        [M:SVW]OINVDTA(I)+= [M:VALW]OINVDTACST(LLIGW)*[M:STW]QTYSTUACT(I)
+#        If [F:STJ]PRINAT>3
+#            [M:SVW]AMTVAL(I) += [M:VALW]OINVDTACST(LLIGW)*[M:STW]QTYSTUACT(I)
+#            [M:SVW]PRIVAL(I) += [M:VALW]OINVDTACST(LLIGW)
+#            [M:SVW]VINVDTA(I)+= [M:VALW]OINVDTACST(LLIGW)*[M:STW]QTYSTUACT(I)
+#            If GACTVLT2
+#                [M:SVW]AMTVAL2(I) += [M:VALW]OINVDTACST(LLIGW)*[M:STW]QTYSTUACT(I)
+#                [M:SVW]PRIVAL2(I) += [M:VALW]OINVDTACST(LLIGW)
+#                [M:SVW]V2INVDTA(I)+= [M:VALW]OINVDTACST(LLIGW)*[M:STW]QTYSTUACT(I)
+#            Endif
+#        Endif
+
+        If dim(LTABVAL)<=0 : Local Decimal LTABVAL(1+GACTMAT+GACTMAC+GACTLAB+1+1+4+1) : Endif
+        Local Decimal LTMPVAL
+        Call LOADVAR3(LTABVAL,"[M:VALW]",0, "O", "CST", LLIGW, [M:STW]QTYSTUACT(I), 0, 0) From STKVALECR
+        LTMPVAL = arr(sum(LTABVAL),GRNDVAL)
+        Call REPVAL(LTMPVAL,LTABVAL, GRNDVAL, LTABVAL) From STKVALECR
+
+        [M:SVW]AMTORD(I) += LTMPVAL
+        [M:SVW]PRIORD(I) += arr(LTMPVAL/[M:STW]QTYSTUACT(I),GRNDVAL)
+        Call LOADFIC2("[M:SVW]", LTABVAL, "O", "CST", I, 1, 1) From STKVALECR
+
+        If [F:STJ]PRINAT>3
+            [M:SVW]AMTVAL(I) += LTMPVAL
+            [M:SVW]PRIVAL(I) += arr(LTMPVAL/[M:STW]QTYSTUACT(I),GRNDVAL)
+            Call LOADFIC2("[M:SVW]", LTABVAL, "V", "CST", I, 1, 1) From STKVALECR
+            If GACTVLT2
+                [M:SVW]AMTVAL2(I) += LTMPVAL
+                [M:SVW]PRIVAL2(I) += arr(LTMPVAL/[M:STW]QTYSTUACT(I),GRNDVAL)
+                Call LOADFIC2("[M:SVW]", LTABVAL, "V2", "CST", I, 1, 1) From STKVALECR
+            Endif
+        Endif
+    Endif
+Return
+
+#######################################################
+# LOAD_FROM_CUD : charge les valeurs d'ordre à partir des enreg d'inventaire
+#######################################################
+$LOAD_FROM_CUD
+Local Decimal LPRI(2)
+Local Integer LPRINAT(2)
+
+If !clalev([M:SDP])  : Local Mask SAIDECPRI [SDP]  : Endif
+If !clalev([M:SDP2]) : Local Mask SAIDECPRI [SDP2] : Endif
+If !clalev([M:VALW]) : Local Mask STOVALW   [VALW] : Endif
+
+    For I=0 To [M:STW]NBLIG-1
+        Raz [M:VALW]
+        # SVW a été chargé dans STKINT
+        # Issue 79416 - 2012-01-19 by CCC : on a des montants dans SVW =>  / [M:STW]QTYSTU(I)
+        For J=0 To GACTMAT-1
+            [M:VALW]OMATCST(J) = [M:SVW]OMATCST(I*GACTMAT+J) / [M:STW]QTYSTU(I)
+        Next
+        [M:VALW]OOVEMATCST(0) = [M:SVW]OOVEMATTOT(I) / [M:STW]QTYSTU(I)
+
+        For J=0 To GACTMAC-1
+            [M:VALW]OMACCST(J) = [M:SVW]OMACCST(I*GACTMAC+J) / [M:STW]QTYSTU(I)
+        Next
+        [M:VALW]OOVEMACCST(0) = [M:SVW]OOVEMACTOT(I) / [M:STW]QTYSTU(I)
+
+        For J=0 To GACTLAB-1
+            [M:VALW]OLABCST(J) = [M:SVW]OLABCST(I*GACTLAB+J) / [M:STW]QTYSTU(I)
+        Next
+        [M:VALW]OOVELABCST(0) = [M:SVW]OOVELABTOT(I) / [M:STW]QTYSTU(I)
+
+        [M:VALW]OSCOTOT(0) = [M:SVW]OSCOTOT(I) / [M:STW]QTYSTU(I)
+        [M:VALW]OOVESCOCST(0) = [M:SVW]OOVESCOTOT(I) / [M:STW]QTYSTU(I)
+
+        [M:VALW]OINVDTACST(0) = [M:SVW]OINVDTA(I) / [M:STW]QTYSTU(I)
+
+        [M:VALW]PRI(0) = [M:SVW]AMTORD(I) / [M:STW]QTYSTU(I)
+
+        ##---- Transforme les valeurs d'ordre de SVW en montants ----#
+        # Issue 79416 - 2012-01-19 by CCC
+        #Call COPSVW(I,I,[M:STW]QTYSTUACT(I),0,1) From STKVALECR
+
+        Raz [M:SDP]
+        If GACTVLT2
+            Raz [M:SDP2]
+        Endif
+        # Calcul de l'offset sur pile FIFO => chaque mouvement d'inventaire (qui correspond en fait à une ligne de doc)
+        # a sa propre valo FIFO
+        # Issue 98450 - 2014-09-11 by CCC : calculate offset from issue quantity only
+        #GBIDD1 = sigma(0,I-1,[M:STW]QTYSTUACT(indcum)*([M:STW]MAJTYP(I)="S"))
+        GBIDD1 = sigma(0,I-1,[M:STW]QTYSTUACT(indcum)*([M:STW]MAJTYP(indcum)="S"))
+        Call DEFPRI2([M:STW]ITMREF,[M:STW]ECCVALMAJ(I),[M:STW]ECCVALMIN(I),[M:STW]STOFCY,[M:STW]TRSTYP,[M:STW]TRSCOD
+&                    ,[M:STW]LOT(I),[M:STW]SLO(I),[M:STW]IPTDAT,GBIDD1,[M:STW]QTYSTUACT(I)*(-2*([M:STW]MAJTYP(I)="S")+1),
+&                    [M:VALW]PRI(0),LPRINAT,LPRI,0,"O",LRET) From STKVAL
+        [M:SVW]PRINAT(I) = LPRINAT(0)
+        [M:SVW]PRIVAL(I) = LPRI(0)
+        If GACTVLT2
+            [M:SVW]PRINAT2(I) = LPRINAT(1)
+            [M:SVW]PRIVAL2(I) = LPRI(1)
+        Endif
+        Case LRET
+          When 1 : [M:STW]ERRCOD=11
+          When 2 : [M:STW]ERRCOD=4
+          When 3 : [M:STW]ERRCOD=29 : If [F:ITF]VLTCOD=""  Raz LRET : Endif
+          When 4 : [M:STW]ERRCOD=30
+        Endcase
+        If LRET>0
+            LRET = ERRVAL+[M:STW]ERRCOD
+            Break
+        Endif
+
+        #---- Transforme les valeurs de valo de SVW en montants ----#
+        Case [M:SVW]PRINAT(I)
+            When 8 :    #Saisi => le prix est en unité physique on le transforme en unité active
+                # Issue 92701 - 2013-10-18 by CCC
+                #Call COPSDP2SVWVAL(I,[M:STW]QTYSTU(I)) From STKVALECR
+                [M:SVW]AMTVAL(I) = arr([M:SVW]PRIVAL(I)*[M:STW]QTYSTU(I),GRNDVAL)
+                If GACTVLT2
+                    [M:SVW]AMTVAL2(I) = arr([M:SVW]PRIVAL2(I)*[M:STW]QTYSTU(I),GRNDVAL)
+                Endif
+                Call COPSDP2SVWVAL(I,[M:STW]QTYSTU(I)) From STKVALECR
+                [M:SVW]PRIVAL(I) = arr([M:SVW]AMTVAL(I)/[M:STW]QTYSTUACT(I),GRNDVAL)
+                If GACTVLT2
+                    [M:SVW]PRIVAL2(I) = arr([M:SVW]AMTVAL2(I)/[M:STW]QTYSTUACT(I),GRNDVAL)
+                Endif
+
+        When Default :
+                # Issue 92701 - 2013-10-18 by CCC
+                #Call COPSDP2SVWVAL(I,[M:STW]QTYSTUACT(I)) From STKVALECR
+                [M:SVW]AMTVAL(I) = arr([M:SVW]PRIVAL(I)*[M:STW]QTYSTUACT(I),GRNDVAL)
+                If GACTVLT2
+                    [M:SVW]AMTVAL2(I) = arr([M:SVW]PRIVAL2(I)*[M:STW]QTYSTUACT(I),GRNDVAL)
+                Endif
+                Call COPSDP2SVWVAL(I,[M:STW]QTYSTUACT(I)) From STKVALECR
+        Endcase
+
+        [M:SVW]PRIVAL(I) = arr([M:SVW]PRIVAL(I),GRNDVAL)
+
+        # Si ancienne ligne de stock, ordre=valo
+        # Si nouvelle ligne de stock la valo peut être forcée au prix d'ordre
+        # donc on peut toujours récupérer la valo dans le prix d'ordre
+        Call COPVAL2ORD(I) From STKVALECR
+        [M:SVW]PRIORD(I) = [M:SVW]PRIVAL(I)
+        [M:SVW]AMTORD(I) = [M:SVW]AMTVAL(I)
+    Next
+Return
+
+
+#######################################################
+# LOAD_FROM_LOT : charge les valeurs d'ordre à partir des valeurs de lot
+#######################################################
+$LOAD_FROM_LOT
+Local Decimal LPRI
+
+    For I=0 To [M:STW]NBLIG-1
+        If [F:SLF]ITMREF<>[M:STW]ITMREF | [F:SLF]LOT<>[M:STW]LOT(I) | [F:SLF]SLO<>[M:STW]SLO(I) | [F:SLF]STOFCY<>[M:STW]STOFCY
+            Read [F:SLF]SLF0 = [M:STW]ITMREF;[M:STW]LOT(I);[M:STW]SLO(I);[M:STW]STOFCY
+            If fstat
+                WFIC="STOLOTFCY" : WCLE=[M:STW]ITMREF+";"+[M:STW]LOT(I)+";"+[M:STW]SLO(I)+";"+[M:STW]STOFCY
+                Call RSTA("SLF",WCLE) From GLOCK
+                LRET = ERRVAL+60
+                [M:STW]ERRCOD = 60
+                Return
+            Endif
+        Endif
+        If [F:ITM]ITMREF<>[M:STW]ITMREF
+            Read [ITM]ITM0=[M:STW]ITMREF
+            If fstat
+                WFIC="ITMREF" : WCLE=[M:STW]ITMREF
+                Call RSTA("ITM",WCLE) From GLOCK
+                LRET = ERRVAL+60
+                [M:STW]ERRCOD = 60
+                Return
+            Endif
+        Endif
+
+        Call GETPRI([M:STW]ITMREF,"","",[M:STW]STOFCY,[M:STW]IPTDAT,[M:STW]QTYSTUACT(I),[M:STW]LOT(I),[M:STW]SLO(I),6,LPRI,LRET) From STKVAL
+        # Issue 92701 - 2013-10-18 by CCC
+        #Call COPSDP2SVWVAL(I,[M:STW]QTYSTUACT(I)) From STKVALECR
+        #Call COPVAL2ORD(I) From STKVALECR
+        [M:SVW]PRIORD(I) = [F:SLF]AVC
+        [M:SVW]AMTORD(I) = arr([M:SVW]PRIORD(I)*[M:STW]QTYSTUACT(I),GRNDVAL)
+        [M:SVW]AMTVAL(I) = [M:SVW]AMTORD(I)
+        Call COPSDP2SVWVAL(I,[M:STW]QTYSTUACT(I)) From STKVALECR
+        Call COPVAL2ORD(I) From STKVALECR
+        [M:SVW]PRIVAL(I) = [M:SVW]PRIORD(I)
+        [M:SVW]PRINAT(I) = 7   # 117684.n - Set PRINAT to 7 (Lot AUC)
+    Next
+Return
+
+
+######################################
+# SPLIT_SVW : La ligne indicée PIND a été splittée dans STW
+#             il faut donc faire de même dans SVW
+######################################
+Subprog SPLIT_SVW(PIND,PCOE)
+Value Integer PIND
+Value Decimal PCOE
+
+# Issue 77372 - 2011-10-27 by CCC
+## C'est un cas qui ne devrait pas arriver mais s'il arrive, il doit être bien géré (erreur) ensuite par stkmaj
+#If [M:STW]QTYSTUACT(PIND)=0
+#    End
+#Endif
+
+# On ne peut pas faire Insa sur MATCST, MACCST et LABCST car le nombre de lignes diffère (lié à GACTMAT, GACTMAC et GACTLAB)
+# On décale donc les valeurs de chaque composante...
+    For I=[M:SVW]NBLIG To PIND+2 Step -1
+        For J=GACTMAT-1 To 0 Step -1
+            [M:SVW]OMATCST(I*GACTMAT+J) = [M:SVW]OMATCST((I-1)*GACTMAT+J)
+            [M:SVW]VMATCST(I*GACTMAT+J) = [M:SVW]VMATCST((I-1)*GACTMAT+J)
+            If dim([M:SVW]V2MATCST)>0
+                [M:SVW]V2MATCST(I*GACTMAT+J) = [M:SVW]V2MATCST((I-1)*GACTMAT+J)
+            Endif
+        Next
+        For J=GACTMAC-1 To 0 Step -1
+            [M:SVW]OMACCST(I*GACTMAC+J) = [M:SVW]OMACCST((I-1)*GACTMAC+J)
+            [M:SVW]VMACCST(I*GACTMAC+J) = [M:SVW]VMACCST((I-1)*GACTMAC+J)
+            If dim([M:SVW]V2MACCST)>0
+                [M:SVW]V2MACCST(I*GACTMAC+J) = [M:SVW]V2MACCST((I-1)*GACTMAC+J)
+            Endif
+        Next
+        For J=GACTLAB-1 To 0 Step -1
+            [M:SVW]OLABCST(I*GACTLAB+J) = [M:SVW]OLABCST((I-1)*GACTLAB+J)
+            [M:SVW]VLABCST(I*GACTLAB+J) = [M:SVW]VLABCST((I-1)*GACTLAB+J)
+            If dim([M:SVW]V2LABCST)>0
+                [M:SVW]V2LABCST(I*GACTLAB+J) = [M:SVW]V2LABCST((I-1)*GACTLAB+J)
+            Endif
+        Next
+    Next
+    # ... puis on efface les valeurs de ce qui correspond à la nouvelle ligne de STW
+    For J=0 To GACTMAT-1
+        Raz [M:SVW]OMATCST((PIND+1)*GACTMAT+J)
+        Raz [M:SVW]VMATCST((PIND+1)*GACTMAT+J)
+        If dim([M:SVW]V2MATCST)>0
+            Raz [M:SVW]V2MATCST((PIND+1)*GACTMAT+J)
+        Endif
+    Next
+    For J=0 To GACTMAC-1
+        Raz [M:SVW]OMACCST((PIND+1)*GACTMAC+J)
+        Raz [M:SVW]VMACCST((PIND+1)*GACTMAC+J)
+        If dim([M:SVW]V2MACCST)>0
+            Raz [M:SVW]V2MACCST((PIND+1)*GACTMAC+J)
+        Endif
+    Next
+    For J=0 To GACTLAB-1
+        Raz [M:SVW]OLABCST((PIND+1)*GACTLAB+J)
+        Raz [M:SVW]VLABCST((PIND+1)*GACTLAB+J)
+        If dim([M:SVW]V2LABCST)>0
+            Raz [M:SVW]V2LABCST((PIND+1)*GACTLAB+J)
+        Endif
+    Next
+
+    Insa PIND+1,1,[M:SVW]NBLIG+1 [M:SVW]NBLIG
+
+    [M:SVW]NBLIG+=1
+    Call COPSVW(PIND,PIND+1,PCOE,0,3) From STKVALECR
+    Call COPSVW(PIND+1,PIND,-1,1,3) From STKVALECR
+    If clalev([M:SVWD])
+        For I=[M:SVWD]NBLIG To PIND+2 Step -1
+            For J=GACTMAT-1 To 0 Step -1
+                [M:SVWD]OMATCST(I*GACTMAT+J) = [M:SVWD]OMATCST((I-1)*GACTMAT+J)
+                [M:SVWD]VMATCST(I*GACTMAT+J) = [M:SVWD]VMATCST((I-1)*GACTMAT+J)
+                If dim([M:SVWD]V2MATCST)>0
+                    [M:SVWD]V2MATCST(I*GACTMAT+J) = [M:SVWD]V2MATCST((I-1)*GACTMAT+J)
+                Endif
+            Next
+            For J=GACTMAC-1 To 0 Step -1
+                [M:SVWD]OMACCST(I*GACTMAC+J) = [M:SVWD]OMACCST((I-1)*GACTMAC+J)
+                [M:SVWD]VMACCST(I*GACTMAC+J) = [M:SVWD]VMACCST((I-1)*GACTMAC+J)
+                If dim([M:SVWD]V2MACCST)>0
+                    [M:SVWD]V2MACCST(I*GACTMAC+J) = [M:SVWD]V2MACCST((I-1)*GACTMAC+J)
+                Endif
+            Next
+            For J=GACTLAB-1 To 0 Step -1
+                [M:SVWD]OLABCST(I*GACTLAB+J) = [M:SVWD]OLABCST((I-1)*GACTLAB+J)
+                [M:SVWD]VLABCST(I*GACTLAB+J) = [M:SVWD]VLABCST((I-1)*GACTLAB+J)
+                If dim([M:SVWD]V2LABCST)>0
+                    [M:SVWD]V2LABCST(I*GACTLAB+J) = [M:SVWD]V2LABCST((I-1)*GACTLAB+J)
+                Endif
+            Next
+        Next
+        # ... puis on efface les valeurs de ce qui correspond à la nouvelle ligne de STW
+        For J=0 To GACTMAT-1
+            Raz [M:SVWD]OMATCST((PIND+1)*GACTMAT+J)
+            Raz [M:SVWD]VMATCST((PIND+1)*GACTMAT+J)
+            If dim([M:SVWD]V2MATCST)>0
+                Raz [M:SVWD]V2MATCST((PIND+1)*GACTMAT+J)
+            Endif
+        Next
+        For J=0 To GACTMAC-1
+            Raz [M:SVWD]OMACCST((PIND+1)*GACTMAC+J)
+            Raz [M:SVWD]VMACCST((PIND+1)*GACTMAC+J)
+            If dim([M:SVWD]V2MACCST)>0
+                Raz [M:SVWD]V2MACCST((PIND+1)*GACTMAC+J)
+            Endif
+        Next
+        For J=0 To GACTLAB-1
+            Raz [M:SVWD]OLABCST((PIND+1)*GACTLAB+J)
+            Raz [M:SVWD]VLABCST((PIND+1)*GACTLAB+J)
+            If dim([M:SVWD]V2LABCST)>0
+                Raz [M:SVWD]V2LABCST((PIND+1)*GACTLAB+J)
+            Endif
+        Next
+
+        Insa PIND+1,1,[M:SVWD]NBLIG+1 [M:SVWD]NBLIG
+        [M:SVWD]NBLIG+=1
+        Call COPSVWD(PIND,PIND+1,PCOE,0,3) From STKVALECR
+        Call COPSVWD(PIND+1,PIND,-1,1,3) From STKVALECR
+    Endif
+End
+
+# Issue 121417 - 2017-02-13 by CCC : Need to delete a line of SVW in STKMAJC
+#**----------------------------------------------------------------<br/>
+#* DEL_SVW : Remove a line in SVW
+#**<br/>----------------------------------------------------------------<br/>
+#* @param PIND = line index
+#**<br/>----------------------------------------------------------------
+#*!
+Subprog DEL_SVW(PIND)
+Value Integer PIND
+
+# We can't write "dela" for MATCST, MACCST and LABCST because the index depends on the value of (GACTMAT, GACTMAC et GACTLAB)
+# => we have to shift each value
+    For I=PIND+1 To [M:SVW]NBLIG-1
+        For J=0 To GACTMAT-1
+            [M:SVW]OMATCST((I-1)*GACTMAT+J) = [M:SVW]OMATCST(I*GACTMAT+J)
+            [M:SVW]VMATCST((I-1)*GACTMAT+J) = [M:SVW]VMATCST(I*GACTMAT+J)
+            If dim([M:SVW]V2MATCST)>0
+                [M:SVW]V2MATCST((I-1)*GACTMAT+J) = [M:SVW]V2MATCST(I*GACTMAT+J)
+            Endif
+        Next
+        For J=0 To GACTMAC-1
+            [M:SVW]OMACCST((I-1)*GACTMAC+J) = [M:SVW]OMACCST(I*GACTMAC+J)
+            [M:SVW]VMACCST((I-1)*GACTMAC+J) = [M:SVW]VMACCST(I*GACTMAC+J)
+            If dim([M:SVW]V2MACCST)>0
+                [M:SVW]V2MACCST((I-1)*GACTMAC+J) = [M:SVW]V2MACCST(I*GACTMAC+J)
+            Endif
+        Next
+        For J=0 To GACTLAB-1
+            [M:SVW]OLABCST((I-1)*GACTLAB+J) = [M:SVW]OLABCST(I*GACTLAB+J)
+            [M:SVW]VLABCST((I-1)*GACTLAB+J) = [M:SVW]VLABCST(I*GACTLAB+J)
+            If dim([M:SVW]V2LABCST)>0
+                [M:SVW]V2LABCST((I-1)*GACTLAB+J) = [M:SVW]V2LABCST(I*GACTLAB+J)
+            Endif
+        Next
+    Next
+    # ... puis on efface les valeurs de ce qui correspond à la ligne de STW supprimée
+    For J=0 To GACTMAT-1
+        Raz [M:SVW]OMATCST(([M:SVW]NBLIG-1)*GACTMAT+J)
+        Raz [M:SVW]VMATCST(([M:SVW]NBLIG-1)*GACTMAT+J)
+        If dim([M:SVW]V2MATCST)>0
+            Raz [M:SVW]V2MATCST(([M:SVW]NBLIG-1)*GACTMAT+J)
+        Endif
+    Next
+    For J=0 To GACTMAC-1
+        Raz [M:SVW]OMACCST(([M:SVW]NBLIG-1)*GACTMAC+J)
+        Raz [M:SVW]VMACCST(([M:SVW]NBLIG-1)*GACTMAC+J)
+        If dim([M:SVW]V2MACCST)>0
+            Raz [M:SVW]V2MACCST(([M:SVW]NBLIG-1)*GACTMAC+J)
+        Endif
+    Next
+    For J=0 To GACTLAB-1
+        Raz [M:SVW]OLABCST(([M:SVW]NBLIG-1)*GACTLAB+J)
+        Raz [M:SVW]VLABCST(([M:SVW]NBLIG-1)*GACTLAB+J)
+        If dim([M:SVW]V2LABCST)>0
+            Raz [M:SVW]V2LABCST(([M:SVW]NBLIG-1)*GACTLAB+J)
+        Endif
+    Next
+
+    Dela PIND,1 [M:SVW]NBLIG
+
+    [M:SVW]NBLIG-=1
+
+    If clalev([M:SVWD])
+        For I=PIND+1 To [M:SVWD]NBLIG-1
+            For J=0 To GACTMAT-1
+                [M:SVWD]OMATCST((I-1)*GACTMAT+J) = [M:SVWD]OMATCST(I*GACTMAT+J)
+                [M:SVWD]VMATCST((I-1)*GACTMAT+J) = [M:SVWD]VMATCST(I*GACTMAT+J)
+                If dim([M:SVWD]V2MATCST)>0
+                    [M:SVWD]V2MATCST((I-1)*GACTMAT+J) = [M:SVWD]V2MATCST(I*GACTMAT+J)
+                Endif
+            Next
+            For J=0 To GACTMAC-1
+                [M:SVWD]OMACCST((I-1)*GACTMAC+J) = [M:SVWD]OMACCST(I*GACTMAC+J)
+                [M:SVWD]VMACCST((I-1)*GACTMAC+J) = [M:SVWD]VMACCST(I*GACTMAC+J)
+                If dim([M:SVWD]V2MACCST)>0
+                    [M:SVWD]V2MACCST((I-1)*GACTMAC+J) = [M:SVWD]V2MACCST(I*GACTMAC+J)
+                Endif
+            Next
+            For J=0 To GACTLAB-1
+                [M:SVWD]OLABCST((I-1)*GACTLAB+J) = [M:SVWD]OLABCST(I*GACTLAB+J)
+                [M:SVWD]VLABCST((I-1)*GACTLAB+J) = [M:SVWD]VLABCST(I*GACTLAB+J)
+                If dim([M:SVWD]V2LABCST)>0
+                    [M:SVWD]V2LABCST((I-1)*GACTLAB+J) = [M:SVWD]V2LABCST(I*GACTLAB+J)
+                Endif
+            Next
+        Next
+        # ... puis on efface les valeurs de ce qui correspond à la nouvelle ligne de STW
+        For J=0 To GACTMAT-1
+            Raz [M:SVWD]OMATCST(([M:SVWD]NBLIG-1)*GACTMAT+J)
+            Raz [M:SVWD]VMATCST(([M:SVWD]NBLIG-1)*GACTMAT+J)
+            If dim([M:SVWD]V2MATCST)>0
+                Raz [M:SVWD]V2MATCST(([M:SVWD]NBLIG-1)*GACTMAT+J)
+            Endif
+        Next
+        For J=0 To GACTMAC-1
+            Raz [M:SVWD]OMACCST(([M:SVWD]NBLIG-1)*GACTMAC+J)
+            Raz [M:SVWD]VMACCST(([M:SVWD]NBLIG-1)*GACTMAC+J)
+            If dim([M:SVWD]V2MACCST)>0
+                Raz [M:SVWD]V2MACCST(([M:SVWD]NBLIG-1)*GACTMAC+J)
+            Endif
+        Next
+        For J=0 To GACTLAB-1
+            Raz [M:SVWD]OLABCST(([M:SVWD]NBLIG-1)*GACTLAB+J)
+            Raz [M:SVWD]VLABCST(([M:SVWD]NBLIG-1)*GACTLAB+J)
+            If dim([M:SVWD]V2LABCST)>0
+                Raz [M:SVWD]V2LABCST(([M:SVWD]NBLIG-1)*GACTLAB+J)
+            Endif
+        Next
+
+        Dela PIND,1 [M:SVWD]NBLIG
+
+        [M:SVWD]NBLIG-=1
+    Endif
+
+End
+
+
+######################################
+# BEFUPDSTJ : Juste avant l'appel à la mise à jour d'un mouvement
+#             Cela peut avoir lieu en régul des mouvements de sorties
+#             Chargement des montants dans STJ1
+# [F:STJ] correspond au mouvement qu'il faudrait créer en plus
+# [F:STJ1] correspond au mouvement à mettre à jour
+######################################
+Subprog BEFUPDSTJ(PLIGW)
+Value Integer PLIGW
+
+# Issue 86184 - 2012-12-05 by CCC : Si mvt en attente => pas de valo
+If [M:SVW]NBLIG=0 | [F:STJ1]UPDCOD=1
+    End
+Endif
+
+Local Integer I, SAV_GSERVEUR
+    #!! Attention à l'ordre !!
+    If ([F:STJ]QTYSTU+[F:STJ1]QTYSTU)<>0
+        [F:STJ1]PRIORD=arr((sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTORD(PLIGW))+[F:STJ1]AMTORD)/([F:STJ]QTYSTU+[F:STJ1]QTYSTU),10^-GDECPRI)
+        [F:STJ1]PRIVAL=arr((sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTVAL(PLIGW))+[F:STJ1]AMTVAL)/([F:STJ]QTYSTU+[F:STJ1]QTYSTU),10^-GDECPRI)
+    Endif
+
+    [F:STJ1]AMTORD = sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTORD(PLIGW))
+    [F:STJ1]AMTVAL = sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTVAL(PLIGW))
+# Issue 74401 - 2011-06-15 by CCC : [F:STJ]AMTxxx ne sont pas encore alimentés. Par contre [F:STJ1] contient les bonnes valeurs
+#    [F:STJ1]VARORD = [F:STJ]AMTORD
+#    [F:STJ1]VARVAL = [F:STJ]AMTVAL
+    [F:STJ1]VARORD = [F:STJ1]AMTORD
+    [F:STJ1]VARVAL = [F:STJ1]AMTVAL
+
+    [F:STJ1]PRINAT = [M:SVW]PRINAT(PLIGW)
+    If GACTVLT2
+        [F:STJ1]AMTVAL2= sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTVAL2(PLIGW))
+# Issue 74401 - 2011-06-15 by CCC : [F:STJ]AMTxxx ne sont pas encore alimentés. Par contre [F:STJ1] contient les bonnes valeurs
+#        [F:STJ1]VARVAL2= [F:STJ]AMTVAL2
+        [F:STJ1]VARVAL2= [F:STJ1]AMTVAL2
+        [F:STJ1]PRIVAL2= abs([M:SVW]PRIVAL2(PLIGW))
+        [F:STJ1]PRINAT2= [M:SVW]PRINAT2(PLIGW)
+    Endif
+
+    If GACTDECCST
+        Read [SJV]SJV0=[F:STJ1]STOFCY;2;[F:STJ1]ITMREF;[F:STJ1]IPTDAT;[F:STJ1]MVTSEQ;[F:STJ1]MVTIND      # Lecture du SJV correspondant au mouvement déjà existant
+        If !fstat
+            # Issue 77056 - 2011-10-12 by CCC : Ne pas modifier SVW qui peut être utilisé dans MWIPLIB
+            ## On additionne dans les valeurs de SVW les valeurs du mouvement déjà existant
+            #Call SJV2SVW(PLIGW,1+2,sgn([F:STJ]ACTQTY)) From STKVALECR
+            ## Puis on réécrit l'addition
+# Issue 81304 - 2012-06-06 by CCC : le signe est déjà correct dans SVW
+#            Call SVW2SJV2(PLIGW,1,sgn([F:STJ]ACTQTY),1) From STKVALECR
+            Call SVW2SJV2(PLIGW,1,1*sgn([F:STJ]ACTQTY*[M:STW]QTYSTUACT(PLIGW))) From STKVALECR
+            [F:SJV]UPDDAT = date$
+            [F:SJV]UPDUSR = GUSER
+            If GSTOTRACE=4
+                WFIC="STOJOUVAL"
+                Gosub TRACE_HYPER_DETAIL From STKMAJSUP
+            Endif
+            Rewrite [SJV]
+            If fstat
+                GOK=0
+                End
+            Endif
+            #---- Natures de FG -----#
+            If [M:SVW]LNK(PLIGW)<>0
+                Raz I
+                For [SJO] Where STOFCY=[F:STJ1]STOFCY
+&                             & UPDCOD=2
+&                             & ITMREF=[F:STJ1]ITMREF
+&                             & IPTDAT=[F:STJ1]IPTDAT
+&                             & MVTSEQ=[F:STJ1]MVTSEQ
+&                             & MVTIND=[F:STJ1]MVTIND
+                    I=sigma(I,[M:SVW]NBONA-1,(indcum+1)*([M:SVW]LNK(PLIGW)=[M:SVW]OLNK(indcum) & [M:SVW]OVENAT(indcum)=[F:SJO]OVENAT))-1
+                    If I>=0
+                        # Issue 81304 - 2012-06-06 by CCC
+                        Call SVW2SJO(I,1,1*sgn([F:STJ]ACTQTY*[M:STW]QTYSTUACT(PLIGW))) From STKVALECR
+                        [F:SJO]UPDDAT = date$
+                        [F:SJO]UPDUSR = GUSER
+                        Rewrite [SJO]
+                        If fstat
+                            GOK=0 : Break
+                        Endif
+                        I+=1
+                    Endif
+                Next
+                If GOK=0 End Endif
+            Endif
+        Else
+            # Si SJV n'a pas été trouvé, ce n'est pas normal mais on ne bloque pas pour autant
+            SAV_GSERVEUR = GSERVEUR
+            GSERVEUR = 1  # Pour écrire dans la trace le message correspondant au fstat
+            [F:SJV]=[F:STJ1]
+            Call FSTA("SJV") From GLOCK
+            GSERVEUR = SAV_GSERVEUR
+        Endif
+    Endif
+End
+
+######################################
+# BEFWRISTJ : Juste avant l'appel à l'écriture de STJ
+#        Chargement des montants dans STJ
+######################################
+Subprog BEFWRISTJ(PLIGW)
+Value Integer PLIGW
+Local Decimal LCOE
+If clalev([M:SVW]) & [M:SVW]NBLIG>0
+    # ccc (2009-11-05) Bug 59583 : Dans le cas des n° de série, la quantité de STW (=1) ne correspond pas forcément à la quantité de SVW (=nb n° série)
+    If [F:ITM]SERMGTCOD=1 | [M:SVW]QTYSTUACT(PLIGW)=0
+        LCOE = 1
+    Else
+        LCOE = [M:STW]QTYSTUACT(PLIGW)/[M:SVW]QTYSTUACT(PLIGW)
+    Endif
+    # Issue 91323 - 2013-08-13 by CCC
+    #If [M:STW]TRSTYP=14 & [F:STJ]ACTQTY>0
+    If [F:STJ]TRSTYP=14 & ([M:STW]MAJCODH<>"A" & [F:STJ]ACTQTY>0 | [M:STW]MAJCODH="A" & [F:STJ]ACTQTY<0)
+        [F:STJ]AMTORD = sgn([F:STJ]ACTQTY)*abs([M:SVWD]AMTORD(PLIGW)*LCOE)
+        [F:STJ]AMTVAL = sgn([F:STJ]ACTQTY)*abs([M:SVWD]AMTVAL(PLIGW)*LCOE)
+        [F:STJ]VARORD = [F:STJ]AMTORD
+        [F:STJ]VARVAL = [F:STJ]AMTVAL
+        [F:STJ]PRIORD = abs([M:SVWD]PRIORD(PLIGW))
+        [F:STJ]PRIVAL = abs([M:SVWD]PRIVAL(PLIGW))
+        [F:STJ]PRINAT = [M:SVWD]PRINAT(PLIGW)
+        If GACTVLT2
+            [F:STJ]AMTVAL2= sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTVAL2(PLIGW)*LCOE)
+            [F:STJ]VARVAL2= [F:STJ]AMTVAL2
+            [F:STJ]PRIVAL2= abs([M:SVW]PRIVAL2(PLIGW))
+            [F:STJ]PRINAT2= [M:SVW]PRINAT2(PLIGW)
+        Endif
+        [M:SVWD]AMTDEV(PLIGW)  = [F:STJ]VARORD-[F:STJ]VARVAL
+        [F:STJ]AMTDEV  = [M:SVWD]AMTDEV(PLIGW)
+        If GACTVLT2 & [F:STJ]PRINAT2<>0
+            [M:SVWD]AMTDEV2(PLIGW) = [F:STJ]VARORD-[F:STJ]VARVAL2
+            [F:STJ]AMTDEV2 = [M:SVWD]AMTDEV2(PLIGW)
+        Endif
+    Else
+        [F:STJ]AMTORD = sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTORD(PLIGW)*LCOE)
+        [F:STJ]AMTVAL = sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTVAL(PLIGW)*LCOE)
+        [F:STJ]VARORD = [F:STJ]AMTORD
+        [F:STJ]VARVAL = [F:STJ]AMTVAL
+        [F:STJ]PRIORD = abs([M:SVW]PRIORD(PLIGW))
+        [F:STJ]PRIVAL = abs([M:SVW]PRIVAL(PLIGW))
+        [F:STJ]PRINAT = [M:SVW]PRINAT(PLIGW)
+        If GACTVLT2
+            [F:STJ]AMTVAL2= sgn([F:STJ]ACTQTY)*abs([M:SVW]AMTVAL2(PLIGW)*LCOE)
+            [F:STJ]VARVAL2= [F:STJ]AMTVAL2
+            [F:STJ]PRIVAL2= abs([M:SVW]PRIVAL2(PLIGW))
+            [F:STJ]PRINAT2= [M:SVW]PRINAT2(PLIGW)
+        Endif
+        [M:SVW]AMTDEV(PLIGW)  = [F:STJ]VARORD-[F:STJ]VARVAL
+        [F:STJ]AMTDEV  = [M:SVW]AMTDEV(PLIGW)
+        If GACTVLT2 & [F:STJ]PRINAT2<>0
+            [M:SVW]AMTDEV2(PLIGW) = [F:STJ]VARORD-[F:STJ]VARVAL2
+            [F:STJ]AMTDEV2 = [M:SVW]AMTDEV2(PLIGW)
+        Endif
+    Endif
+Endif
+End
+
+######################################
+# AFTWRISTJ : Juste après l'appel à l'écriture de STJ si elle s'est bien passée
+#        Ecriture d'un enregistrement SJV
+######################################
+Subprog AFTWRISTJ(PLIGW)
+Value Integer PLIGW
+
+Local Decimal LCOE
+
+    If !clalev([M:SVW]) | [M:SVW]NBLIG=0 | !GACTDECCST
+        End
+    Endif
+
+    [F:SJV] = [F:STJ]    # Récupération de la clé
+    # Cas de l'entrée inter-sites et de la suppression d'entrée inter-sites
+    # où les valeurs sont dans [SVWD]
+    # ccc (2009-11-05) Bug 59583 : Dans le cas des n° de série, la quantité de STW (=1) ne correspond pas forcément à la quantité de SVW (=nb n° série)
+    If [F:ITM]SERMGTCOD=1 | [M:SVW]QTYSTUACT(PLIGW)=0
+        LCOE = 1
+    Else
+        LCOE = [M:STW]QTYSTUACT(PLIGW)/[M:SVW]QTYSTUACT(PLIGW)
+    Endif
+    If [F:STJ]TRSTYP=14 & ([M:STW]MAJCODH<>"A" & [F:STJ]ACTQTY>0 | [M:STW]MAJCODH="A" & [F:STJ]ACTQTY<0)
+        # Issue 81304 - 2012-06-06 by CCC
+        #Call SVWD2SJV(PLIGW,sgn([F:STJ]ACTQTY),LCOE) From STKVALECR
+        Call SVWD2SJV(PLIGW,LCOE*sgn([F:STJ]ACTQTY*[M:STW]QTYSTUACT(PLIGW))) From STKVALECR
+    Else
+        #Call SVW2SJV(PLIGW,sgn([F:STJ]ACTQTY),LCOE) From STKVALECR
+        Call SVW2SJV(PLIGW,LCOE*sgn([F:STJ]ACTQTY*[M:STW]QTYSTUACT(PLIGW))) From STKVALECR
+    Endif
+    [F:SJV]CREDAT = date$
+    [F:SJV]CREUSR = GUSER
+    Write [SJV]
+    If fstat
+        GOK=0
+        End
+    Endif
+    #---- Natures de FG -----#
+    If [M:SVW]LNK(PLIGW)<>0
+        [F:SJO] = [F:STJ]    # Récupération de la clé
+        For I=0 To [M:SVW]NBONA-1
+            If [M:SVW]OLNK(I) = [M:SVW]LNK(PLIGW)
+                # Cas de l'entrée inter-sites, où les valeurs sont dans [SVWD]
+                # Issue 91323 - 2013-08-13 by CCC
+                #If [F:STJ]TRSTYP=14 & [F:STJ]ACTQTY>0
+                If [F:STJ]TRSTYP=14 & ([M:STW]MAJCODH<>"A" & [F:STJ]ACTQTY>0 | [M:STW]MAJCODH="A" & [F:STJ]ACTQTY<0)
+                    # Issue 81304 - 2012-06-06 by CCC
+                    #Call SVWD2SJO(I,sgn([F:STJ]ACTQTY),LCOE) From STKVALECR
+                    Call SVWD2SJO(I,LCOE*sgn([F:STJ]ACTQTY*[M:STW]QTYSTUACT(PLIGW))) From STKVALECR
+                Else
+                    # Issue 81304 - 2012-06-06 by CCC
+                    #Call SVW2SJO(I,sgn([F:STJ]ACTQTY),0,LCOE) From STKVALECR
+                    Call SVW2SJO(I,0,LCOE*sgn([F:STJ]ACTQTY*[M:STW]QTYSTUACT(PLIGW))) From STKVALECR
+                Endif
+                [F:SJO]CREDAT = date$
+                [F:SJO]CREUSR = GUSER
+                Write [SJO]
+                If fstat
+                    GOK=0
+                    End
+                Endif
+            Endif
+        Next
+    Endif
+End
+
+
+######################################################################
+# UPDSTJDEV : Crée un mvt avec l'écart non absorbé
+
+# Issue 71240 & 78854 - 2012-06-01 by CCC : comment
+#Subprog UPDSTJDEV(PDEV, PSEQSTR, PSEQEND)
+#Value Decimal PDEV(,)
+#Value Integer PSEQSTR
+#Value Integer PSEQEND
+
+Subprog UPDSTJDEV(PDEV, PITM, PFCY, PIPT, PTYP, PNUM, PLIN, PSEQ)
+Value Decimal PDEV(,)
+Value Char    PITM
+Value Char    PFCY
+Value Date    PIPT
+Value Integer PTYP
+Value Char    PNUM
+Value Integer PLIN
+Value Integer PSEQ
+
+Call UPDSTJDEV2(PDEV, "O", PITM, PFCY, PIPT, PTYP, PNUM, PLIN, PSEQ)
+
+End
+
+Subprog UPDSTJDEV2(PDEV, PREFIX, PITM, PFCY, PIPT, PTYP, PNUM, PLIN, PSEQ)
+Value Decimal PDEV(,)
+Value Char    PREFIX
+Value Char    PITM
+Value Char    PFCY
+Value Date    PIPT
+Value Integer PTYP
+Value Char    PNUM
+Value Integer PLIN
+Value Integer PSEQ
+
+Local Integer LRET
+Local Decimal WSTJDEV(dim(PDEV,2))
+Local Integer I, J ,LNUMVLT
+
+# Issue 93040 - 2013-10-02 by CCC : PSEQ is not necessarily appropriate and can be wrong in inter-sites transferts
+#Filter [STJ] Where STOFCY=PFCY & ITMREF=PITM & IPTDAT=PIPT & VCRTYP=PTYP & VCRNUM=PNUM & VCRLIN=PLIN
+#&                & MVTSEQ=PSEQ
+#Read [STJ] reckey First
+#Dbgaff
+Filter [STJ] Where STOFCY=PFCY & UPDCOD = 2 & ITMREF=PITM & IPTDAT=PIPT & VCRTYP=PTYP & VCRNUM=PNUM & VCRLIN=PLIN
+Read [STJ]STJ0 First
+Filter [STJ]
+
+Raz [F:STJ]AMTORD, [F:STJ]VARORD
+Raz [F:STJ]AMTVAL, [F:STJ]VARVAL, [F:STJ]AMTDEV
+If GACTVLT2
+    Raz [F:STJ]AMTVAL2, [F:STJ]VARVAL2, [F:STJ]AMTDEV2
+Endif
+Case PREFIX
+    When "O"
+        [F:STJ]AMTORD=-PDEV
+        [F:STJ]VARORD=-PDEV
+        [F:STJ]AMTDEV=-PDEV
+        #[F:STJ]PRIVAL = inchangé
+        If [F:STJ]ACTQTY
+            [F:STJ]PRIORD = abs(arr([F:STJ]AMTORD / [F:STJ]ACTQTY,10^-GDECPRI))
+        Endif
+    When "V"
+        [F:STJ]AMTVAL=PDEV
+        [F:STJ]VARVAL=PDEV
+        [F:STJ]AMTDEV=-PDEV
+        If PDEV=0
+            [F:STJ]PRINAT = 0
+        Endif
+        #[F:STJ]PRIORD = inchangé
+        If [F:STJ]ACTQTY
+            [F:STJ]PRIVAL = abs(arr([F:STJ]AMTVAL / [F:STJ]ACTQTY,10^-GDECPRI))
+        Endif
+        If GACTVLT2
+            [F:STJ]AMTVAL2=PDEV(1,0)
+            [F:STJ]VARVAL2=PDEV(1,0)
+            [F:STJ]AMTDEV2=-PDEV(1,0)
+            If PDEV(1,0)=0
+                [F:STJ]PRINAT2 = 0
+            Endif
+            If [F:STJ]ACTQTY
+                [F:STJ]PRIVAL2 = abs(arr([F:STJ]AMTVAL2 / [F:STJ]ACTQTY,10^-GDECPRI))
+            Endif
+        Endif
+Endcase
+
+[F:STJ]TRSTYP=35
+[F:STJ]REGFLG=2
+
+#MJH X3-47253. 2 July 2018
+#MJH X3-104722. 13 August 2018. Add dim([M:STW]ITCSTRDAT) > 0
+If dim([M:STW]ITCSTRDAT) > 0 and [M:STW]ITCSTRDAT <> [0/0/0] and [M:STW]ITCSTRDAT <> [F:STJ]IPTDAT
+  [F:STJ]IPTDAT=[M:STW]ITCSTRDAT
+Endif
+
+# Issue 91859 - 2016-07-14 by ERMIL : Do not use an auto journal if the source document did not have an auto journal
+If [F:STJ]ENTCOD <> ""
+#  [F:STJ]ENTCOD = "STKUV"     # Issue 84400 - 2012-09-11 by CCC
+  Call PARAM(PFCY,"ACCCSTADJ",[F:STJ]ENTCOD) From ADOVAL # Issue 91856 - 2016-07-18 MJH : Allow the user to define the Automatic journal code through a parameter
+Endif
+
+#[F:STJ]CCE(x) = inchangés
+
+Raz [F:STJ]ACTQTY, [F:STJ]QTYSTU, [F:STJ]QTYPCU
+Raz [F:STJ]LOT, [F:STJ]SLO, [F:STJ]STA, [F:STJ]LOC, [F:STJ]BPSLOT, [F:STJ]WRH, [F:STJ]SERNUM
+Raz [F:STJ]USRFLD1, [F:STJ]USRFLD2, [F:STJ]USRFLD3, [F:STJ]USRFLD4
+Raz [F:STJ]ECCVALMAJ, [F:STJ]ECCVALMIN
+# Issue 116922 - 2016-06-01 by CCC : Reset fields concerning accounting
+[F:STJ]AGGIFAFLG=1
+Raz [F:STJ]ACCDAT, [F:STJ]NUMVCR, [F:STJ]GTE
+
+Call ECRSTJ(0,LRET) From STKLIB
+
+    If GACTDECCST & [F:STJ]CREMVTDAT>=GDATDECCST
+        Raz [F:SJV]
+        [F:SJV]=[F:STJ]
+        If PREFIX="O"
+            For I=1 To dim(WSTJDEV)-1
+                WSTJDEV(I) = arr(PDEV(LNUMVLT,I),10^-6)
+            Next
+            Call LOADFIC("[F:SJV]",WSTJDEV, "DEV", "CST", -1, 1) From STKVALECR
+            Call LOADFIC("[F:SJV]",WSTJDEV, "O", "CST", -1, 1) From STKVALECR
+            [F:SJV]OMATTOT = sum([F:SJV]OMATCST)
+            [F:SJV]OMACTOT = sum([F:SJV]OMACCST)
+            [F:SJV]OLABTOT = sum([F:SJV]OLABCST)
+            Call LOADFIC("[F:SJV]",WSTJDEV, "DO", "CST", -1, 1) From STKVALECR
+            [F:SJV]DOMATTOT = sum([F:SJV]DOMATCST)
+            [F:SJV]DOMACTOT = sum([F:SJV]DOMACCST)
+            [F:SJV]DOLABTOT = sum([F:SJV]DOLABCST)
+        Else
+            For LNUMVLT=0 To GACTVLT2
+                For I=1 To dim(WSTJDEV)-1
+                    WSTJDEV(I) = arr(PDEV(LNUMVLT,I),10^-6)
+                Next
+                If LNUMVLT=0
+                    Call LOADFIC("[F:SJV]",WSTJDEV, "DEV", "CST", -1, 1) From STKVALECR
+                    Call LOADFIC("[F:SJV]",WSTJDEV, "V", "CST", 1, 1) From STKVALECR
+                    [F:SJV]VMATTOT = sum([F:SJV]VMATCST)
+                    [F:SJV]VMACTOT = sum([F:SJV]VMACCST)
+                    [F:SJV]VLABTOT = sum([F:SJV]VLABCST)
+                    Call LOADFIC("[F:SJV]",WSTJDEV, "DV", "CST", 1, 1) From STKVALECR
+                    [F:SJV]DVMATTOT = sum([F:SJV]DVMATCST)
+                    [F:SJV]DVMACTOT = sum([F:SJV]DVMACCST)
+                    [F:SJV]DVLABTOT = sum([F:SJV]DVLABCST)
+                Else
+                    Call LOADFIC("[F:SJV]",WSTJDEV, "DEV", "2", -1, 1) From STKVALECR
+                    Call LOADFIC("[F:SJV]",WSTJDEV, "V2", "CST", 1, 1) From STKVALECR
+                    [F:SJV]V2MATTOT = sum([F:SJV]V2MATCST)
+                    [F:SJV]V2MACTOT = sum([F:SJV]V2MACCST)
+                    [F:SJV]V2LABTOT = sum([F:SJV]V2LABCST)
+                    Call LOADFIC("[F:SJV]",WSTJDEV, "DV2", "CST", 1, 1) From STKVALECR
+                    [F:SJV]DV2MATTOT = sum([F:SJV]DV2MATCST)
+                    [F:SJV]DV2MACTOT = sum([F:SJV]DV2MACCST)
+                    [F:SJV]DV2LABTOT = sum([F:SJV]DV2LABCST)
+                Endif
+            Next
+        Endif
+        Write [SJV]
+    Endif
+End
+
+
+##########################################################
+# CALOVELIN : Calcule les FG de la ligne de document en cours de traitement
+##########################################################
+# Paramètres E : PBAS = base de calcul des FG
+#            S : POVEAMT = tableau renvoyant les différentes valeurs de FG (mat, mac, lab et sco)
+# Cette fonction s'appuie sur le masque [M:STW] et la table OVERHEAD [OVE]
+##########################################################
+Subprog CALOVELIN(PBAS,POVEAMT)
+Value Decimal PBAS
+Variable Decimal POVEAMT()
+
+Local Char    LTABNAT(3)(dim([F:OVE]OVENAT))
+Local Integer LTABTYP(dim([F:OVE]OVENAT))
+Local Decimal LNATAMT(dim([F:OVE]OVENAT))
+
+Call CALOVELIN2(PBAS,POVEAMT,LTABNAT, LTABTYP, LNATAMT)
+End
+
+Subprog CALOVELIN2(PBAS,POVEAMT,PTABNAT, PTABTYP, PNATAMT)
+Value Decimal PBAS
+Variable Decimal POVEAMT()
+Variable Char    PTABNAT()
+Variable Integer PTABTYP()
+Variable Decimal PNATAMT()
+
+
+Local Char    LTABNAT(GLONONA)(dim([F:OVE]OVENAT))
+Local Decimal LTABFXD(dim([F:OVE]OVENAT))
+Local Decimal LTABVAR(dim([F:OVE]OVENAT))
+Local Integer LTABTYP(dim([F:OVE]OVENAT))
+Local Decimal LBAS, LCOE
+Local Char LCOL(10)
+
+Raz LTABNAT,LTABFXD,LTABVAR,LTABTYP
+Raz POVEAMT
+LBAS = PBAS
+
+Call PARAM([M:STW]STOFCY,"OVECOLSTK",LCOL) From ADOVAL
+GOVECOLSTK = val(LCOL)
+
+#--- FG document ---#
+Call CLCOVE(LBAS, [F:OVE]OVECOD, mid$("ABCD",GOVECOLSTK,1), 1, LTABNAT, LTABTYP, LTABFXD, LTABVAR) From TRTCST
+For I=0 To dim(POVEAMT)-1
+    POVEAMT(I) = sigma(0,dim(LTABFXD)-1,LTABFXD(indcum)*(LTABTYP(indcum)=I+1))
+&               +sigma(0,dim(LTABVAR)-1,LTABVAR(indcum)*(LTABTYP(indcum)=I+1))
+Next
+
+Raz PTABNAT, PTABTYP, PNATAMT
+Call ADDOVE(LTABNAT, LTABTYP, LTABFXD, LTABVAR, 1, PTABNAT, PTABTYP, PNATAMT) From STKVALECR
+
+#--- FG document origine ---#
+If func STKVALPAR.ISORIOVE([M:STW]VCRTYPORI)
+    Raz LBAS, LCOE
+    Case [M:STW]VCRTYPORI
+        When 14:    # commande achat
+            If !clalev([F:POQ]) : Local File PORDERQ [POQ] : Endif
+            If !clalev([F:POP]) : Local File PORDERP [POP] : Endif
+            Read [POQ]POQ0=[M:STW]VCRNUMORI;[M:STW]VCRLINORI;[M:STW]VCRSEQORI
+            If !fstat
+                If [F:OVE]FORBASIS=1    # Base montant
+                    If [F:POQ]POHTYP<>2
+                        Read [POP]POP0=[F:POQ]POHNUM;[F:POQ]POPLIN;1
+                    Else
+                        Filter [POP] Where POHNUM=[F:POQ]POHNUM & POPLIN=[F:POQ]POPLIN & POPDAT>=[F:POQ]DEMRCPDAT
+                        Read [POP]POP1 First
+                        Filter [POP]
+                    Endif
+                    If fstat : Raz [F:POP] : Endif
+                    LBAS = [F:POQ]QTYSTU*[F:POP]NETPRI
+                Else                    # Base quantité
+                    LBAS = [F:POQ]QTYSTU
+                Endif
+                If [F:POQ]QTYSTU<>0
+                    # On proratise sur la quantité réceptionnée
+                    LCOE = sum([M:STW]QTYSTU)/[F:POQ]QTYSTU
+                Endif
+            Endif
+    Endcase
+    Call CLCOVE(LBAS, [F:OVE]OVECOD, mid$("ABCD",GOVECOLSTK,1), 2, LTABNAT, LTABTYP, LTABFXD, LTABVAR) From TRTCST
+    For I=0 To dim(POVEAMT)-1
+        POVEAMT(I) += LCOE *( sigma(0,dim(LTABFXD)-1,LTABFXD(indcum)*(LTABTYP(indcum)=I+1))
+&                            +sigma(0,dim(LTABVAR)-1,LTABVAR(indcum)*(LTABTYP(indcum)=I+1)) )
+    Next
+    Call ADDOVE(LTABNAT, LTABTYP, LTABFXD, LTABVAR, 1, PTABNAT, PTABTYP, PNATAMT) From STKVALECR
+
+Endif
+
+End
+
+##################################################################
+# Sous-programme appelé après la mise à jour des stocks d'une ligne de document
+Subprog AFTUPDLIN
+Local Decimal LBAS, LAMT, LQTY, LCURRND
+Local Decimal LBASO, LOVE, LOVEAMT(4), LOVEAMTO(4)
+Local Integer LRET
+Local Decimal LCNVRPT    # Taux de conversion devise société vers devise dossier
+Local Char LMAJTYP(1)
+
+LMAJTYP = mid$("ESC",abs(func STKLIB.SENSTRS([M:STW]TRSTYP)),1)
+
+#----- Mise à jour des montants des mouvements d'une ligne de document qui vient d'être modifiée ----#
+If [M:STW]MAJCODH<>"C" & [M:STW]UPDPRI=1
+    #---- Si suppression complète de la ligne, on ne fait rien ----#
+    If sigma(0,[M:STW]NBLIG-1,[M:STW]MAJCOD(indcum)="A") = [M:STW]NBLIG
+        Raz LQTY
+        For [F:STJ]STJ1 Where STOFCY=[M:STW]STOFCY
+&                       & VCRTYP=[M:STW]VCRTYP
+&                       & VCRNUM=[M:STW]VCRNUM
+&                       & VCRLIN=[M:STW]VCRLIN
+&                       & ITMREF=[M:STW]ITMREF
+&                       & UPDCOD=2
+&                       & REGFLG<>2
+            LQTY += [F:STJ]ACTQTY
+        Next
+        If LQTY=0
+            End
+        Endif
+    Endif
+    If func STKVALPAR.WITHOVE([M:STW]TRSTYP,-1)
+        If !clalev ([F:OVE]) : Local File OVERHEAD [OVE] : Endif
+        If !clalev([M:SDP]) : Local Mask SAIDECPRI [SDP] : Endif
+        Local Char    LTABNAT(GLONONA)(dim([M:SDP]OVENAT))
+        Local Decimal LNATAMT(dim([M:SDP]OVENAT))
+        Local Integer LTABTYP(dim([M:SDP]OVENAT))
+        Local Char    LTABNATO(GLONONA)(dim([M:SDP]OVENAT))
+        Local Decimal LNATAMTO(dim([M:SDP]OVENAT))
+        Local Integer LTABTYPO(dim([M:SDP]OVENAT))
+        Call LECOVE([M:STW]ITMREF,[M:STW]STOFCY,[M:STW]TRSTYP,LRET) From STKVAL
+        If !LRET
+            Raz LQTY, LBAS, LTABNAT, LTABTYP, LNATAMT
+            For [STJ]STJ1 Where STOFCY=[M:STW]STOFCY
+&                         & VCRTYP=[M:STW]VCRTYP
+&                         & VCRNUM=[M:STW]VCRNUM
+&                         & VCRLIN=[M:STW]VCRLIN
+&                         & ITMREF=[M:STW]ITMREF
+&                         & UPDCOD=2
+&                         & REGFLG<>2
+                If GACTDECCST
+                    [F:SJV] = [F:STJ]
+                    Read [SJV]=
+                    LAMT += [F:SJV]OMATTOT+[F:SJV]OMACTOT+[F:SJV]OLABTOT+[F:SJV]OSCOTOT    # On ne met pas les éléments de facturation pour le calcul des FG
+                    For [SJO] Where STOFCY=[F:STJ]STOFCY
+&                                 & UPDCOD=2
+&                                 & ITMREF=[F:STJ]ITMREF
+&                                 & IPTDAT=[F:STJ]IPTDAT
+&                                 & MVTSEQ=[F:STJ]MVTSEQ
+&                                 & MVTIND=[F:STJ]MVTIND
+                        Call SJO2VAR(LTABNATO, LTABTYPO, LNATAMTO) From STKVALECR
+                    Next
+                Else
+                    LAMT += [F:STJ]AMTORD
+                Endif
+                LQTY += [F:STJ]ACTQTY
+            Next
+            If !GACTDECCST
+                # Si les FG ont pour base le montant -> on recherche la base d'origine
+                If !clalev([F:FCY]) : Local File FACILITY [FCY] : Endif
+                If [F:FCY]FCY <>[M:STW]STOFCY
+                    Read [FCY]FCY0=[M:STW]STOFCY
+                Endif
+                Call GET_CUR_RND([F:FCY]LEGCPY, LCURRND, LRET) From MWIPLIB
+                LAMT = func MWIPLIB.CALBAS(LCURRND, [F:OVE]OVECOD, LAMT)
+            Endif
+            If [F:OVE]FORBASIS=1
+                LBAS = LAMT
+                If GACTDECCST
+                    LBASO = LAMT - sigma(0,[M:STW]NBLIG-1,( [M:SVW]OMATTOT(indcum)+[M:SVW]OMACTOT(indcum)
+&                                                         +[M:SVW]OLABTOT(indcum)+[M:SVW]OSCOTOT(indcum))
+&                                                       *(-2*([M:STW]MAJCOD(indcum)="A")+1)
+&                                                       *([M:STW]MAJTYP(indcum)=LMAJTYP))
+                Else
+                    LBASO = LAMT * (LQTY - sigma(0,[M:STW]NBLIG-1,[M:STW]QTYSTUACT(indcum)
+&                                                 *(-2*([M:STW]MAJCOD(indcum)="A")+1)
+&                                                 *([M:STW]MAJTYP(indcum)=LMAJTYP)))
+&                           / LQTY
+
+                Endif
+            Else
+                LBAS = LQTY
+                LBASO= LQTY - sigma(0,[M:STW]NBLIG-1,[M:STW]QTYSTUACT(indcum)
+&                                                   *(-2*([M:STW]MAJCOD(indcum)="A")+1)
+&                                                   *([M:STW]MAJTYP(indcum)=LMAJTYP))
+            Endif
+
+            # Issue 100192 - 2014-06-23 by CCC
+            GPOINT = "BASFGUPDLIN"
+            Gosub ENTREE From EXEFNC
+
+            Call CALOVELIN2(LBAS, LOVEAMT, LTABNAT, LTABTYP, LNATAMT)
+#            Call CALOVELIN2(LBASO, LOVEAMTO, LTABNATO, LTABTYPO, LNATAMTO)
+
+            Raz [M:SDP]
+#            [M:SDP]OVEMATCST = LOVEAMT(0)-LOVEAMTO(0)*LQTY / (LQTY - sigma(0,[M:STW]NBLIG-1,[M:STW]QTYSTUACT(indcum)
+#&                                                                                          *(-2*([M:STW]MAJCOD(indcum)="A")+1)
+#&                                                                                          *([M:STW]MAJTYP(indcum)=LMAJTYP)))
+#            [M:SDP]OVEMACCST = LOVEAMT(1)-LOVEAMTO(1)*LQTY / (LQTY - sigma(0,[M:STW]NBLIG-1,[M:STW]QTYSTUACT(indcum)
+#&                                                                                          *(-2*([M:STW]MAJCOD(indcum)="A")+1)
+#&                                                                                          *([M:STW]MAJTYP(indcum)=LMAJTYP)))
+#            [M:SDP]OVELABCST = LOVEAMT(2)-LOVEAMTO(2)*LQTY / (LQTY - sigma(0,[M:STW]NBLIG-1,[M:STW]QTYSTUACT(indcum)
+#&                                                                                          *(-2*([M:STW]MAJCOD(indcum)="A")+1)
+#&                                                                                          *([M:STW]MAJTYP(indcum)=LMAJTYP)))
+#            [M:SDP]OVESCOCST = LOVEAMT(3)-LOVEAMTO(3)*LQTY / (LQTY - sigma(0,[M:STW]NBLIG-1,[M:STW]QTYSTUACT(indcum)
+#&                                                                                          *(-2*([M:STW]MAJCOD(indcum)="A")+1)
+#&                                                                                          *([M:STW]MAJTYP(indcum)=LMAJTYP)))
+            Local Decimal LEMPTY(dim(LNATAMT)) : Raz LEMPTY
+            Call ADDOVE(LTABNAT, LTABTYP, LEMPTY, LNATAMT, 1, [M:SDP]OVENAT, [M:SDP]ONATYP, [M:SDP]ONAAMT) From STKVALECR
+            Call ADDOVE(LTABNATO, LTABTYPO, LEMPTY, LNATAMTO, -1, [M:SDP]OVENAT, [M:SDP]ONATYP, [M:SDP]ONAAMT) From STKVALECR
+            [M:SDP]NBONA=find("",[M:SDP]OVENAT)
+            If [M:SDP]NBONA=0
+                [M:SDP]NBONA = dim([M:SDP]OVENAT)
+            Else
+                [M:SDP]NBONA -= 1
+            Endif
+
+            [M:SDP]OVEMATCST = sigma(0,dim([M:SDP]OVENAT)-1,[M:SDP]ONAAMT(indcum) * ([M:SDP]ONATYP(indcum)=1 | [M:SDP]ONATYP=2))
+            [M:SDP]OVEMACCST = sigma(0,dim([M:SDP]OVENAT)-1,[M:SDP]ONAAMT(indcum) * ([M:SDP]ONATYP(indcum)=3))
+            [M:SDP]OVELABCST = sigma(0,dim([M:SDP]OVENAT)-1,[M:SDP]ONAAMT(indcum) * ([M:SDP]ONATYP(indcum)=4))
+            [M:SDP]OVESCOCST = sigma(0,dim([M:SDP]OVENAT)-1,[M:SDP]ONAAMT(indcum) * ([M:SDP]ONATYP(indcum)=5))
+
+            Gosub CAL_TOT From SUBSDP    # Calcule PRI = somme de toutes les composantes
+
+            [M:SDP]QTY    = 0    # On passe un delta
+            [M:SDP]AMTTOT = [M:SDP]PRI
+
+            Call CONVERT2(GLOCALDEV,GSYSCUR,GLOCALDEV,GCHGTYP,[M:STW]IPTDAT,
+&                         1,LCNVRPT,LRET) From TRTDEV
+            Call REGPRIX([M:STW]STOFCY, [M:STW]TRSTYP, [M:STW]ITMREF, [M:STW]IPTDAT,
+&                        [M:STW]TRSCOD, [M:STW]VCRTYP, [M:STW]VCRNUM, [M:STW]VCRLIN,
+&                        [M:STW]VCRTYP, [M:STW]VCRNUM, [M:STW]VCRLIN, LCNVRPT,
+&                        LRET) From STKVALREG
+            If LRET
+                Call ERREUR([M:STW]VCRNUM-mess(519,197,1)-"("+num$(LRET)+")") From GESECRAN
+                GOK=0
+                End
+            Endif
+        Elsif LRET=1
+            Raz LRET
+        Endif
+    Endif
+
+Endif
+End
+
+###########################################################
+# Renvoie 1 si la ligne de [M:STW] doit être valorisée
+###########################################################
+Funprog VALAUZ(PIND)
+Value Integer PIND
+
+End [M:STW]WAIFLG(PIND)=0 & find([M:STW]OWNER(PIND),"",[M:STW]STOFCY,[M:STW]TRFFCY)>0
+
+################################################################
+# PERCLOCTR : Indique si une période peut être fermée pour les stocks
+################################################################
+# Parameters E : PLEG = législation
+#                PCPY = société
+#                PEXE = n° exercice
+#                PPER = n° période
+# Return       :  0 = OK
+#                +1 = Des mouvements de stock restent à comptabiliser
+#                +2 = Des en-cours de production restent à comptabiliser
+################################################################
+Funprog PERCLOCTR(PLEG,PCPY,PDATSTR,PDATEND)
+Value Char    PLEG
+Value Char    PCPY
+Value Date    PDATSTR
+Value Date    PDATEND
+
+# Si le module stock n'est pas actif, aucun contrôle n'est à faire
+If GMODU(7)<>2 : End 0 : Endif
+
+Local Integer LRET, I, J
+Local Char LACCIFA, LOPEIFA, LSCOIFA
+Local Integer LTABTRS(1..len(mess(0,704,1))), LNBTRS
+Local Integer LTRSACC(len(mess(0,704,1)))
+Local Integer LTRAOPEN
+LTRAOPEN = 0
+
+If clalev([F:FCY])=0 : Local File FACILITY [FCY] : Endif
+If clalev([F:STJ])=0 : Local File STOJOU [STJ] : Endif
+
+# Si la table WIPCOST n'existe pas, on ne cherche pas les en-cours
+If filinfo(filpath("FIL","WIPCOST","fde",-1),0)>0
+    If clalev([F:MWI])=0 : Local File WIPCOST [MWI] : Endif
+Endif
+
+
+If GTRACE=""
+    Call OUVRE_TRACE(mess(101,107,1)) From LECFIC
+    LTRAOPEN=1
+Endif
+
+For [FCY] Where LEGCPY=PCPY & (WRHFLG=2 | MFGFLG=2)
+    If [F:FCY]WRHFLG=2
+        Call PARAM([F:FCY]FCY,"ACCIFA",LACCIFA) From ADOVAL
+        If val(LACCIFA)>=2
+            Raz LTABTRS
+            Call TRSTYPACC(PLEG,PCPY,[F:FCY]FCY,LTABTRS) From STKVALMAJ
+            Raz J, LTRSACC
+            For I=1 To dim(LTABTRS)
+                If LTABTRS(I) = 0
+                  LTRSACC(J) = I
+                  J+=1
+                Endif
+            Next
+            Filter [STJ] Where STOFCY=[F:FCY]FCY
+&                            & IPTDAT>=PDATSTR & IPTDAT<=PDATEND
+&                            & find(TRSTYP,LTRSACC)
+&                            & ENTCOD<>""
+&                            & AGGIFAFLG<>2
+            Look [STJ] First With Nohint
+            Filter [STJ]
+            If !fstat
+                LRET = fix(LRET/2)*2 + 1
+                Call ECR_TRACE([F:FCY]FCY-":"-mess(364,184,1),1) From GESECRAN
+            Endif
+        Endif
+    Endif
+    If clalev([F:MWI]) & ([F:FCY]MFGFLG=2 | [F:FCY]WRHFLG=2 & [F:FCY]PURFLG=2)
+        Call PARAM([F:FCY]FCY,"OPEIFA",LOPEIFA) From ADOVAL
+        Call PARAM([F:FCY]FCY,"SCOIFA",LSCOIFA) From ADOVAL
+        If [F:FCY]MFGFLG=2 & val(LOPEIFA)>1 | val(LSCOIFA)>1
+            Filter [MWI] Where MFGFCY=[F:FCY]FCY
+&                            & TXNDAT>=PDATSTR & TXNDAT<=PDATEND
+&                            & ENTCOD<>""
+&                            & GLPSTA<>2
+            Look [MWI] First With Nohint
+            Filter [MWI]
+            If !fstat
+                LRET += (LRET<2)*2
+                Call ECR_TRACE([F:FCY]FCY-":"-mess(96,187,1),1) From GESECRAN
+            Endif
+        Endif
+    Endif
+Next
+
+If LTRAOPEN
+    Call FERME_TRACE() From LECFIC
+    Call LEC_TRACE From LECFIC
+Endif
+
+End LRET
+
+###################################################################
+Subprog SRGVAL(PCOE,PARR)
+Value Decimal PCOE
+Value Decimal PARR
+
+Local Integer I
+
+[F:STJ]AMTORD=arr([F:STJ1]AMTORD*PCOE,PARR)
+[F:STJ]AMTVAL=arr([F:STJ1]AMTVAL*PCOE,PARR)
+[F:STJ]AMTDEV=0
+[F:STJ]VARORD=0
+[F:STJ]VARVAL=0
+If GACTVLT2
+    [F:STJ]AMTVAL2=arr([F:STJ1]AMTVAL2*PCOE,PARR)
+    [F:STJ]VARVAL2=0
+Endif
+
+If GACTDECCST
+    Raz [SJV]
+    # Issue 100163 - 2014-11-27 by CCC : if original document had not been valued [M:SVW] is void
+    #If PCOE<>0
+    If PCOE<>0 & [M:SVW]NBLIG>0
+        Read [SJV]SJV0=[F:STJ1]STOFCY;[F:STJ1]UPDCOD;[F:STJ1]ITMREF;[F:STJ1]IPTDAT;[F:STJ1]MVTSEQ;[F:STJ1]MVTIND
+        If fstat
+            Call FSTA("SJV") From GLOCK
+            End
+        Endif
+
+        Call PROSJV("O",PCOE,PARR)
+        Call PROSJV("V",PCOE,PARR)
+        Call PROSJV("DO",0,PARR)
+        Call PROSJV("DV",0,PARR)
+        Call PROSJV("DEV",0,PARR)
+        If GACTVLT2
+            Call PROSJV("V2",PCOE,PARR)
+            Call PROSJV("DV2",0,PARR)
+            Call PROSJV("DEV2",0,PARR)
+        Endif
+    Endif
+Endif
+
+End
+
+
+Subprog PROSJV(PTYP,PCOE,PARR)
+Value Char PTYP
+Value Decimal PCOE
+Value Decimal PARR
+Case PTYP
+  When "O" : [F:SJV]OMATTOT=arr([F:SJV]OMATTOT*PCOE,PARR)
+             [F:SJV]OMACTOT=arr([F:SJV]OMACTOT*PCOE,PARR)
+             [F:SJV]OLABTOT=arr([F:SJV]OLABTOT*PCOE,PARR)
+             [F:SJV]OSCOTOT=arr([F:SJV]OSCOTOT*PCOE,PARR)
+             [F:SJV]OINVDTATOT=arr([F:SJV]OINVDTATOT*PCOE,PARR)
+             [F:SJV]OOVEMATTOT=arr([F:SJV]OOVEMATTOT*PCOE,PARR)
+             [F:SJV]OOVEMACTOT=arr([F:SJV]OOVEMACTOT*PCOE,PARR)
+             [F:SJV]OOVELABTOT=arr([F:SJV]OOVELABTOT*PCOE,PARR)
+             [F:SJV]OOVESCOTOT=arr([F:SJV]OOVESCOTOT*PCOE,PARR)
+
+             For I=0 To GACTMAT-1
+                 [F:SJV]OMATCST(I)=arr([F:SJV]OMATCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTMAC-1
+                 [F:SJV]OMACCST(I)=arr([F:SJV]OMACCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTLAB-1
+                 [F:SJV]OLABCST(I)=arr([F:SJV]OLABCST(I)*PCOE,PARR)
+             Next
+
+  When "V" : [F:SJV]VMATTOT=arr([F:SJV]VMATTOT*PCOE,PARR)
+             [F:SJV]VMACTOT=arr([F:SJV]VMACTOT*PCOE,PARR)
+             [F:SJV]VLABTOT=arr([F:SJV]VLABTOT*PCOE,PARR)
+             [F:SJV]VSCOTOT=arr([F:SJV]VSCOTOT*PCOE,PARR)
+             [F:SJV]VINVDTATOT=arr([F:SJV]VINVDTATOT*PCOE,PARR)
+             [F:SJV]VOVEMATTOT=arr([F:SJV]VOVEMATTOT*PCOE,PARR)
+             [F:SJV]VOVEMACTOT=arr([F:SJV]VOVEMACTOT*PCOE,PARR)
+             [F:SJV]VOVELABTOT=arr([F:SJV]VOVELABTOT*PCOE,PARR)
+             [F:SJV]VOVESCOTOT=arr([F:SJV]VOVESCOTOT*PCOE,PARR)
+
+             For I=0 To GACTMAT-1
+                 [F:SJV]VMATCST(I)=arr([F:SJV]VMATCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTMAC-1
+                 [F:SJV]VMACCST(I)=arr([F:SJV]VMACCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTLAB-1
+                 [F:SJV]VLABCST(I)=arr([F:SJV]VLABCST(I)*PCOE,PARR)
+             Next
+
+  When "DO": [F:SJV]DOMATTOT=arr([F:SJV]DOMATTOT*PCOE,PARR)
+             [F:SJV]DOMACTOT=arr([F:SJV]DOMACTOT*PCOE,PARR)
+             [F:SJV]DOLABTOT=arr([F:SJV]DOLABTOT*PCOE,PARR)
+             [F:SJV]DOSCOTOT=arr([F:SJV]DOSCOTOT*PCOE,PARR)
+             [F:SJV]DOINVDTA=arr([F:SJV]DOINVDTA*PCOE,PARR)
+             [F:SJV]DOOVEMAT=arr([F:SJV]DOOVEMAT*PCOE,PARR)
+             [F:SJV]DOOVEMAC=arr([F:SJV]DOOVEMAC*PCOE,PARR)
+             [F:SJV]DOOVELAB=arr([F:SJV]DOOVELAB*PCOE,PARR)
+             [F:SJV]DOOVESCO=arr([F:SJV]DOOVESCO*PCOE,PARR)
+
+             For I=0 To GACTMAT-1
+                 [F:SJV]DOMATCST(I)=arr([F:SJV]DOMATCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTMAC-1
+                 [F:SJV]DOMACCST(I)=arr([F:SJV]DOMACCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTLAB-1
+                 [F:SJV]DOLABCST(I)=arr([F:SJV]DOLABCST(I)*PCOE,PARR)
+             Next
+
+  When "DV": [F:SJV]DVMATTOT=arr([F:SJV]DVMATTOT*PCOE,PARR)
+             [F:SJV]DVMACTOT=arr([F:SJV]DVMACTOT*PCOE,PARR)
+             [F:SJV]DVLABTOT=arr([F:SJV]DVLABTOT*PCOE,PARR)
+             [F:SJV]DVSCOTOT=arr([F:SJV]DVSCOTOT*PCOE,PARR)
+             [F:SJV]DVINVDTA=arr([F:SJV]DVINVDTA*PCOE,PARR)
+             [F:SJV]DVOVEMAT=arr([F:SJV]DVOVEMAT*PCOE,PARR)
+             [F:SJV]DVOVEMAC=arr([F:SJV]DVOVEMAC*PCOE,PARR)
+             [F:SJV]DVOVELAB=arr([F:SJV]DVOVELAB*PCOE,PARR)
+             [F:SJV]DVOVESCO=arr([F:SJV]DVOVESCO*PCOE,PARR)
+
+             For I=0 To GACTMAT-1
+                 [F:SJV]DVMATCST(I)=arr([F:SJV]DVMATCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTMAC-1
+                 [F:SJV]DVMACCST(I)=arr([F:SJV]DVMACCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTLAB-1
+                 [F:SJV]DVLABCST(I)=arr([F:SJV]DVLABCST(I)*PCOE,PARR)
+             Next
+
+  When "V2": [F:SJV]V2MATTOT=arr([F:SJV]V2MATTOT*PCOE,PARR)
+             [F:SJV]V2MACTOT=arr([F:SJV]V2MACTOT*PCOE,PARR)
+             [F:SJV]V2LABTOT=arr([F:SJV]V2LABTOT*PCOE,PARR)
+             [F:SJV]V2SCOTOT=arr([F:SJV]V2SCOTOT*PCOE,PARR)
+             [F:SJV]V2INVDTA=arr([F:SJV]V2INVDTA*PCOE,PARR)
+             [F:SJV]V2OVEMAT=arr([F:SJV]V2OVEMAT*PCOE,PARR)
+             [F:SJV]V2OVEMAC=arr([F:SJV]V2OVEMAC*PCOE,PARR)
+             [F:SJV]V2OVELAB=arr([F:SJV]V2OVELAB*PCOE,PARR)
+             [F:SJV]V2OVESCO=arr([F:SJV]V2OVESCO*PCOE,PARR)
+
+             For I=0 To GACTMAT-1
+                 [F:SJV]V2MATCST(I)=arr([F:SJV]V2MATCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTMAC-1
+                 [F:SJV]V2MACCST(I)=arr([F:SJV]V2MACCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTLAB-1
+                 [F:SJV]V2LABCST(I)=arr([F:SJV]V2LABCST(I)*PCOE,PARR)
+             Next
+
+  When "DV2": [F:SJV]DV2MATTOT=arr([F:SJV]DV2MATTOT*PCOE,PARR)
+             [F:SJV]DV2MACTOT=arr([F:SJV]DV2MACTOT*PCOE,PARR)
+             [F:SJV]DV2LABTOT=arr([F:SJV]DV2LABTOT*PCOE,PARR)
+             [F:SJV]DV2SCOTOT=arr([F:SJV]DV2SCOTOT*PCOE,PARR)
+             [F:SJV]DV2INVDTA=arr([F:SJV]DV2INVDTA*PCOE,PARR)
+             [F:SJV]DV2OVEMAT=arr([F:SJV]DV2OVEMAT*PCOE,PARR)
+             [F:SJV]DV2OVEMAC=arr([F:SJV]DV2OVEMAC*PCOE,PARR)
+             [F:SJV]DV2OVELAB=arr([F:SJV]DV2OVELAB*PCOE,PARR)
+             [F:SJV]DV2OVESCO=arr([F:SJV]DV2OVESCO*PCOE,PARR)
+
+             For I=0 To GACTMAT-1
+                 [F:SJV]DV2MATCST(I)=arr([F:SJV]DV2MATCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTMAC-1
+                 [F:SJV]DV2MACCST(I)=arr([F:SJV]DV2MACCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTLAB-1
+                 [F:SJV]DV2LABCST(I)=arr([F:SJV]DV2LABCST(I)*PCOE,PARR)
+             Next
+
+  When "DEV": [F:SJV]DEVSCOCST=arr([F:SJV]DEVSCOCST*PCOE,PARR)
+             [F:SJV]DEVINVDTA=arr([F:SJV]DEVINVDTA*PCOE,PARR)
+             [F:SJV]DEVOVEMAT=arr([F:SJV]DEVOVEMAT*PCOE,PARR)
+             [F:SJV]DEVOVEMAC=arr([F:SJV]DEVOVEMAC*PCOE,PARR)
+             [F:SJV]DEVOVELAB=arr([F:SJV]DEVOVELAB*PCOE,PARR)
+             [F:SJV]DEVOVESCO=arr([F:SJV]DEVOVESCO*PCOE,PARR)
+
+             For I=0 To GACTMAT-1
+                 [F:SJV]DEVMATCST(I)=arr([F:SJV]DEVMATCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTMAC-1
+                 [F:SJV]DEVMACCST(I)=arr([F:SJV]DEVMACCST(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTLAB-1
+                 [F:SJV]DEVLABCST(I)=arr([F:SJV]DEVLABCST(I)*PCOE,PARR)
+             Next
+
+  When "DEV2": [F:SJV]DEVSCOCST2=arr([F:SJV]DEVSCOCST2*PCOE,PARR)
+             [F:SJV]DEVINVDTA2=arr([F:SJV]DEVINVDTA2*PCOE,PARR)
+             [F:SJV]DEVOVEMAT2=arr([F:SJV]DEVOVEMAT2*PCOE,PARR)
+             [F:SJV]DEVOVEMAC2=arr([F:SJV]DEVOVEMAC2*PCOE,PARR)
+             [F:SJV]DEVOVELAB2=arr([F:SJV]DEVOVELAB2*PCOE,PARR)
+             [F:SJV]DEVOVESCO2=arr([F:SJV]DEVOVESCO2*PCOE,PARR)
+
+             For I=0 To GACTMAT-1
+                 [F:SJV]DEVMATCST2(I)=arr([F:SJV]DEVMATCST2(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTMAC-1
+                 [F:SJV]DEVMACCST2(I)=arr([F:SJV]DEVMACCST2(I)*PCOE,PARR)
+             Next
+             For I=0 To GACTLAB-1
+                 [F:SJV]DEVLABCST2(I)=arr([F:SJV]DEVLABCST2(I)*PCOE,PARR)
+             Next
+Endcase
+
+End
+

@@ -1,0 +1,635 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+####################################################################################
+# Average Lot Cost adjustment
+####################################################################################
+# Prerequisites:
+# - value change not allowed
+# - Entry price adjustment based on lot-facility
+#
+# - Tester avec absorption d'écart non absorbé sur réception
+# - Tester avec assemblage
+# - Penser au changement lot
+# - Voir cas où la ligne de doc (entrée et sortie) est supprimée mais doit être régularisée
+####################################################################################
+
+Subprog GETALC(PITM,PFCY,PLOT,PSLO,PIPT,PDAT,PTIM,PSEQ,PNUMVLT,PSUP,PQTYACT,PAMT)
+Value    Char    PITM
+Value    Char    PFCY
+Value    Char    PLOT
+Value    Char    PSLO
+Value    Date    PIPT
+Value    Date    PDAT
+Value    Char    PTIM
+Value    Integer PSEQ
+Value    Integer PNUMVLT
+Value    Char    PSUP
+Variable Decimal PQTYACT
+Variable Decimal PAMT()
+
+Local Integer LMINREG, LMINAGG, I
+Local Decimal LAMTDEL(dim(PAMT))
+Local Char REQ(250)
+
+Call ECRTRACE("GETALC(PITM,PFCY,PLOT,PSLO,PIPT,PDAT,PTIM,PSEQ,PNUMVLT,PSUP,PQTYACT,PAMT)",0) From FUNSADJB
+Call ECRTRACE("GETALC("+PITM+","+PFCY+","+PLOT+","+PSLO+","+num$(PIPT)+","+num$(PDAT)+","+PTIM+","+num$(PSEQ)+","+num$(PNUMVLT)+","+PSUP+","+num$(PQTYACT)+","+num$(PAMT)+")",0) From FUNSADJB
+
+
+If !clalev([M:SDPA]) : Local Mask SAIDECPRI [SDPA] : Endif   # Masque qui contient le détail du montant PMLot (calculé dans GETALC)
+
+If !clalev([F:SLF]) : Local File STOLOTFCY : Endif
+
+If [F:SLF]ITMREF<>PITM | [F:SLF]STOFCY<>PFCY | [F:SLF]LOT<>PLOT | [F:SLF]SLO<>PSLO
+    Read [SLF]SLF0=PITM;PLOT;PSLO;PFCY
+Endif
+
+PQTYACT = [F:SLF]AVCBASQTY
+PAMT    = [F:SLF]AVCBASAMT
+If GACTDECCST
+    Call LOADVAR2(PAMT,"[F:SLF]", 0, "A", "CST", 1, 0, 0) From STKVALECR
+Endif
+
+If instr(1,PSUP,"B")
+    Filter [STJ] Where STOFCY  = PFCY
+&                    & UPDCOD  = 2
+&                    & ITMREF  = PITM
+&                    & LOT     = PLOT
+&                    & SLO     = PSLO
+&                    & ( IPTDAT  > PIPT
+&                      | (IPTDAT  = PIPT
+&                        & ( CREMVTDAT > PDAT
+&                          | (CREMVTDAT = PDAT
+&                            & ( CREMVTTIM > PTIM
+&                              | CREMVTTIM = PTIM & CREMVTSEQ>=PSEQ))
+&                          )
+&                        )
+&                      )
+Else
+    Filter [STJ] Where STOFCY  = PFCY
+&                    & UPDCOD  = 2
+&                    & ITMREF  = PITM
+&                    & LOT     = PLOT
+&                    & SLO     = PSLO
+&                    & ( IPTDAT  > PIPT
+&                      | (IPTDAT  = PIPT
+&                        & ( CREMVTDAT > PDAT
+&                          | (CREMVTDAT = PDAT
+&                            & ( CREMVTTIM > PTIM
+&                              | CREMVTTIM = PTIM & CREMVTSEQ>PSEQ))
+&                          )
+&                        )
+&                      )
+Endif
+
+For [STJ]STJ1(4)
+    LMINREG = 2
+    Raz LAMTDEL
+    # La recherche de minreg doit se faire hors filtre sur IPTDAT
+    # car une ligne de document peut avoir plusieurs dates d'imputation à cause des régul sur période fermée
+    REQ="SELECT MIN(REGFLG_0) FROM STOJOU"
+&      + " WHERE STOFCY_0='"+PFCY+"'"
+&      + " AND VCRTYP_0="+num$([F:STJ]VCRTYP)
+&      + " AND VCRNUM_0='"+[F:STJ]VCRNUM+"'"
+&      + " AND VCRLIN_0="+num$([F:STJ]VCRLIN)
+&      + " AND ITMREF_0='"+[F:STJ]ITMREF+"'"
+&      + " AND LOT_0='"+[F:STJ]LOT+"'"
+&      + " AND SLO_0='"+[F:STJ]SLO+"'"
+    For (Integer MINREG) From num$(GTYPDBA*2+1) Sql REQ As [STJX]
+        LMINREG=[F:STJX]MINREG
+    Next
+    For [STJ]STJ1
+        # Issue 88107 - 2013-02-20 by CCC
+        If GACTDECCST
+            Raz [F:SJV]
+        Endif
+        If GACTDECCST & [F:STJ]CREMVTDAT>=GDATDECCST
+            Read [SJV]SJV0=[F:STJ]STOFCY;[F:STJ]UPDCOD;[F:STJ]ITMREF;[F:STJ]IPTDAT;[F:STJ]MVTSEQ;[F:STJ]MVTIND
+        Endif
+        # L'écart non absorbé (comme son nom l'indique) n'a pas été absorbé par AVCBASAMT
+        # on n'en tient donc pas compte lors de la remontée des mouvements pour trouver le pmp à date
+        # Par contre, les écarts non absorbés sur les sorties ou entrées négatives doivent être pris en compte
+        If find([F:STJ]TRSTYP,11,2,4,6,24,27)
+            Case PNUMVLT
+                When 0 :
+                    If [F:STJ]AMTDEV<>0
+&                    | GACTDECCST & [F:STJ]CREMVTDAT>=GDATDECCST
+&                    & ( sigma(0,GACTMAT-1,abs([F:SJV]DEVMATCST(indcum)))>0
+&                      | sigma(0,GACTMAC-1,abs([F:SJV]DEVMACCST(indcum)))>0
+&                      | sigma(0,GACTLAB-1,abs([F:SJV]DEVLABCST(indcum)))>0
+&                      | [F:SJV]DEVSCOCST<>0
+&                      | [F:SJV]DEVINVDTA<>0
+&                      | [F:SJV]DEVOVEMAT<>0
+&                      | [F:SJV]DEVOVEMAC<>0
+&                      | [F:SJV]DEVOVELAB<>0
+&                      | [F:SJV]DEVOVESCO<>0
+&                      )
+                        PAMT    += [F:STJ]AMTDEV
+                        If GACTDECCST
+                            Call LOADVAR2(PAMT,"[F:SJV]", PNUMVLT, "DEV", "CST", 1, 1, 0) From STKVALECR
+                        Endif
+                    Endif
+                When 1:
+                    If [F:STJ]AMTDEV2<>0
+&                    | GACTDECCST & [F:STJ]CREMVTDAT>=GDATDECCST
+&                    & ( sigma(0,GACTMAT-1,abs([F:SJV]DEVMATCST2(indcum)))>0
+&                      | sigma(0,GACTMAC-1,abs([F:SJV]DEVMACCST2(indcum)))>0
+&                      | sigma(0,GACTLAB-1,abs([F:SJV]DEVLABCST2(indcum)))>0
+&                      | [F:SJV]DEVSCOCST2<>0
+&                      | [F:SJV]DEVINVDTA2<>0
+&                      | [F:SJV]DEVOVEMAT2<>0
+&                      | [F:SJV]DEVOVEMAC2<>0
+&                      | [F:SJV]DEVOVELAB2<>0
+&                      | [F:SJV]DEVOVESCO2<>0
+&                      )
+                        PAMT    += [F:STJ]AMTDEV2
+                        If GACTDECCST
+                            Call LOADVAR2(PAMT,"[F:SJV]", PNUMVLT, "DEV", "CST", 1, 1, 0) From STKVALECR
+                        Endif
+                    Endif
+            Endcase
+        Endif
+        If [F:STJ]REGFLG=1 | [F:STJ]TRSTYP=35
+            # De plus, le pmp est calculé avec le montant d'ordre, pas le montant de valo => utilisation d'AMTORD
+            If PNUMVLT=1 & [F:STJ]PRINAT2=5
+                PAMT    -= [F:STJ]AMTVAL2
+            Else
+                PAMT    -= [F:STJ]AMTORD
+            Endif
+            If GACTDECCST & [F:STJ]CREMVTDAT>=GDATDECCST
+                Call LOADVAR2(PAMT,"[F:SJV]", 0, "O", "CST", -1, 1, 0) From STKVALECR
+            Endif
+            PQTYACT -= [F:STJ]ACTQTY
+        Else
+            LAMTDEL -= [F:STJ]AMTORD
+            If GACTDECCST & [F:STJ]CREMVTDAT>=GDATDECCST
+                Call LOADVAR2(LAMTDEL,"[F:SJV]", 0, "O", "CST", -1, 1, 0) From STKVALECR
+            Endif
+        Endif
+    Next
+    If LMINREG=2   # Document supprimé (mais pas comptabilisé) => normalement mnt=0 mais peut être <>0 si au moment de la suppression le stock passait à 0
+        For I=0 To dim(PAMT)-1
+            PAMT(I) += LAMTDEL(I)
+        Next
+    Endif
+Next
+Filter [STJ]
+
+Call ECRTRACE("GETALC --> PQTYACT="+num$(PQTYACT)+" PAMT="+num$(PAMT)+")",0) From FUNSADJB
+End
+
+########################################################################
+# CALVALDOC : calcule la valeur d'ordre d'une ligne de doc
+########################################################################
+# Paramètres E : PFCY = Site
+#                PITM = Article (nécessaire car la ligne a pu être créée puis supprimée pour un autre article)
+#                PTYP = Type de doc
+#                PNUM = N° de doc
+#                PLIN = Ligne de doc
+#                PNUMVLT = 0 ou 1 : renvoie l'écart non absorbé de la 1ère ou 2nde méthode de valo
+#                PSUPP = O --> renvoie la velur d'ordre
+#                        V --> renvoie la valeur de valo (en fonction de LNUMVLT)
+#            S : PNBMVT = nombre de mouvements actifs pour la ligne de doc
+#                PQTY = Quantité physique
+#                PQTYACT = Quantité active
+#                PAMT() = Montant d'ordre
+#                PDEV() = Ecart non absorbé
+########################################################################
+Subprog CALVALDOCLOT(PFCY, PITM, PLOT, PSLO, PTYP, PNUM, PLIN, PCRESEQ, PNUMVLT, PSUPP, PNBMVT, PQTY, PQTYACT, PAMT, PDEV)
+Value Char       PFCY
+Value Char       PITM
+Value    Char    PLOT
+Value    Char    PSLO
+Value Integer    PTYP
+Value Char       PNUM
+Value Integer    PLIN
+Value Integer    PCRESEQ
+Value Integer    PNUMVLT
+Value Char       PSUPP
+Variable Integer PNBMVT
+Variable Decimal PQTY
+Variable Decimal PQTYACT
+Variable Decimal PAMT()
+Variable Decimal PDEV()
+
+Local Decimal LDEVAMT(dim(PDEV))
+Local Date LIPT : Raz LIPT
+
+Call CALVALDOCLOT2(PFCY, PITM, PLOT, PSLO, LIPT, PTYP, PNUM, PLIN, PCRESEQ, PNUMVLT, PSUPP, PNBMVT, PQTY, PQTYACT, PAMT, PDEV, LDEVAMT)
+End
+
+Subprog CALVALDOCLOT2(PFCY, PITM, PLOT, PSLO, PIPT, PTYP, PNUM, PLIN, PCRESEQ, PNUMVLT, PSUPP, PNBMVT, PQTY, PQTYACT, PAMT, PDEV, PDEVAMT)
+Value Char       PFCY
+Value Char       PITM
+Value    Char    PLOT
+Value    Char    PSLO
+Value Date       PIPT
+Value Integer    PTYP
+Value Char       PNUM
+Value Integer    PLIN
+Value Integer    PCRESEQ
+Value Integer    PNUMVLT
+Value Char       PSUPP
+Variable Integer PNBMVT
+Variable Decimal PQTY
+Variable Decimal PQTYACT
+Variable Decimal PAMT()
+Variable Decimal PDEV()
+Variable Decimal PDEVAMT()
+
+Raz PNBMVT, PQTY, PQTYACT, PAMT, PDEV
+Local Char LFIL(250)
+
+Columns [STJ] (PRINAT,AMTDEV, ACTQTY, VARORD, VARVAL, AMTDEV2, VARVAL2, REGFLG, QTYSTU,STOFCY,UPDCOD,ITMREF,IPTDAT,MVTSEQ,MVTIND,CREMVTDAT,TRSTYP,LOT,SLO)
+
+LFIL="STOFCY=PFCY & ITMREF=PITM & VCRTYP=PTYP & VCRNUM=PNUM & VCRLIN=PLIN & UPDCOD=2 & LOT=PLOT & SLO=PSLO"
+If PCRESEQ>0
+    LFIL+="&CREMVTSEQ=PCRESEQ"
+Endif
+If PIPT<>[0/0/0]
+    LFIL+="&IPTDAT=PIPT"
+Endif
+
+# Issue 84744 - 2013-04-08 by CCC : Ne pas tenir compte des TRSTYP=35 sur coût standard
+For [STJ] reckey Where evalue(LFIL) & !(TRSTYP=35 & find(PRINAT,0,2,3))
+    PNBMVT  += ([F:STJ]REGFLG=1)
+    PQTY    += [F:STJ]QTYSTU * ([F:STJ]REGFLG=1)
+    PQTYACT += [F:STJ]ACTQTY * ([F:STJ]REGFLG=1)
+    If instr(1,PSUPP,"V")
+        If PNUMVLT=0
+            PAMT    += [F:STJ]VARVAL
+        Else
+            PAMT    += [F:STJ]VARVAL2
+        Endif
+    Else
+        PAMT    += [F:STJ]VARORD * ([F:STJ]TRSTYP<>35)
+    Endif
+    # Dans le cas d'un mouvement qui serait valorisé au coût standard, l'écart non absorbé n'est pas siginficatif lorsqu'on souhaite connaitre le montant d'ordre
+    If instr(1,PSUPP,"V") | [F:STJ]PRINAT>3
+        If PNUMVLT=0
+            PDEVAMT += [F:STJ]AMTDEV * ([F:STJ]TRSTYP=35)
+            PDEV    += [F:STJ]AMTDEV * ([F:STJ]TRSTYP<>35)
+        Else
+            PDEV    += [F:STJ]AMTDEV2
+        Endif
+    Endif
+    If GACTDECCST & [F:STJ]CREMVTDAT>=GDATDECCST
+        Read [F:SJV]SJV0 = [F:STJ]STOFCY;[F:STJ]UPDCOD;[F:STJ]ITMREF;[F:STJ]IPTDAT;[F:STJ]MVTSEQ;[F:STJ]MVTIND
+        If !fstat
+            I=1
+            For J=0 To GACTMAT-1
+                If instr(1,PSUPP,"V")
+                    If PNUMVLT=0
+                        PAMT(I) += [F:SJV]DVMATCST(J)
+                    Else
+                        PAMT(I) += [F:SJV]DV2MATCST(J)
+                    Endif
+                Else
+                    PAMT(I) += [F:SJV]DOMATCST(J) * ([F:STJ]TRSTYP<>35)
+                Endif
+                If instr(1,PSUPP,"V") | [F:STJ]PRINAT>3
+                    If PNUMVLT=0
+                        PDEV(I) += [F:SJV]DEVMATCST(J) * ([F:STJ]TRSTYP<>35)
+                        PDEVAMT(I) += [F:SJV]DEVMATCST(J) * ([F:STJ]TRSTYP=35)
+                    Else
+                        PDEV(I) += [F:SJV]DEVMATCST2(J) * ([F:STJ]TRSTYP<>35)
+                        PDEVAMT(I) += [F:SJV]DEVMATCST2(J) * ([F:STJ]TRSTYP=35)
+                    Endif
+                Endif
+                I+=1
+            Next
+            For J=0 To GACTMAC-1
+                If instr(1,PSUPP,"V")
+                    If PNUMVLT=0
+                        PAMT(I) += [F:SJV]DVMACCST(J)
+                    Else
+                        PAMT(I) += [F:SJV]DV2MACCST(J)
+                    Endif
+                Else
+                    PAMT(I) += [F:SJV]DOMACCST(J) * ([F:STJ]TRSTYP<>35)
+                Endif
+                If instr(1,PSUPP,"V") | [F:STJ]PRINAT>3
+                    If PNUMVLT=0
+                        PDEV(I) += [F:SJV]DEVMACCST(J) * ([F:STJ]TRSTYP<>35)
+                        PDEVAMT(I) += [F:SJV]DEVMACCST(J) * ([F:STJ]TRSTYP=35)
+                    Else
+                        PDEV(I) += [F:SJV]DEVMACCST2(J) * ([F:STJ]TRSTYP<>35)
+                        PDEVAMT(I) += [F:SJV]DEVMACCST2(J) * ([F:STJ]TRSTYP=35)
+                    Endif
+                Endif
+                I+=1
+            Next
+            For J=0 To GACTLAB-1
+                If instr(1,PSUPP,"V")
+                    If PNUMVLT=0
+                        PAMT(I) += [F:SJV]DVLABCST(J)
+                    Else
+                        PAMT(I) += [F:SJV]DVLABCST(J)
+                    Endif
+                Else
+                    PAMT(I) += [F:SJV]DOLABCST(J) * ([F:STJ]TRSTYP<>35)
+                Endif
+                If instr(1,PSUPP,"V") | [F:STJ]PRINAT>3
+                    If PNUMVLT=0
+                        PDEV(I) += [F:SJV]DEVLABCST(J) * ([F:STJ]TRSTYP<>35)
+                        PDEVAMT(I) += [F:SJV]DEVLABCST(J) * ([F:STJ]TRSTYP=35)
+                    Else
+                        PDEV(I) += [F:SJV]DEVLABCST2(J) * ([F:STJ]TRSTYP<>35)
+                        PDEVAMT(I) += [F:SJV]DEVLABCST2(J) * ([F:STJ]TRSTYP=35)
+                    Endif
+                Endif
+                I+=1
+            Next
+            If instr(1,PSUPP,"V")
+                If PNUMVLT=0
+                    PAMT(I) += [F:SJV]DVSCOTOT
+                    I+=1
+                    PAMT(I) += [F:SJV]DVINVDTA
+                    I+=1
+                    PAMT(I) += [F:SJV]DVOVEMAT
+                    I+=1
+                    PAMT(I) += [F:SJV]DVOVEMAC
+                    I+=1
+                    PAMT(I) += [F:SJV]DVOVELAB
+                    I+=1
+                    PAMT(I) += [F:SJV]DVOVESCO
+                Else
+                    PAMT(I) += [F:SJV]DV2SCOTOT
+                    I+=1
+                    PAMT(I) += [F:SJV]DV2INVDTA
+                    I+=1
+                    PAMT(I) += [F:SJV]DV2OVEMAT
+                    I+=1
+                    PAMT(I) += [F:SJV]DV2OVEMAC
+                    I+=1
+                    PAMT(I) += [F:SJV]DV2OVELAB
+                    I+=1
+                    PAMT(I) += [F:SJV]DV2OVESCO
+                Endif
+            Else
+                PAMT(I) += [F:SJV]DOSCOTOT * ([F:STJ]TRSTYP<>35)
+                I+=1
+                PAMT(I) += [F:SJV]DOINVDTA * ([F:STJ]TRSTYP<>35)
+                I+=1
+                PAMT(I) += [F:SJV]DOOVEMAT * ([F:STJ]TRSTYP<>35)
+                I+=1
+                PAMT(I) += [F:SJV]DOOVEMAC * ([F:STJ]TRSTYP<>35)
+                I+=1
+                PAMT(I) += [F:SJV]DOOVELAB * ([F:STJ]TRSTYP<>35)
+                I+=1
+                PAMT(I) += [F:SJV]DOOVESCO * ([F:STJ]TRSTYP<>35)
+            Endif
+            If instr(1,PSUPP,"V") | [F:STJ]PRINAT>3
+                I-=5
+                If PNUMVLT=0
+                    PDEV(I) += [F:SJV]DEVSCOCST * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVSCOCST * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVINVDTA * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVINVDTA * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVOVEMAT * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVOVEMAT * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVOVEMAC * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVOVEMAC * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVOVELAB * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVOVELAB * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVOVESCO * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVOVESCO * ([F:STJ]TRSTYP=35)
+                Else
+                    PDEV(I) += [F:SJV]DEVSCOCST2 * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVSCOCST2 * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVINVDTA2 * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVINVDTA2 * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVOVEMAT2 * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVOVEMAT2 * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVOVEMAC2 * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVOVEMAC2 * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVOVELAB2 * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVOVELAB2 * ([F:STJ]TRSTYP=35)
+                    I+=1
+                    PDEV(I) += [F:SJV]DEVOVESCO2 * ([F:STJ]TRSTYP<>35)
+                    PDEVAMT(I) += [F:SJV]DEVOVESCO2 * ([F:STJ]TRSTYP=35)
+                Endif
+            Endif
+        Endif
+    Endif
+
+Next
+Filter [STJ]
+Columns [STJ]
+
+End
+
+###############################################################################
+# ECRSRW2 : Ecrit un enregistrement [SRW]
+###############################################################################
+Subprog ECRSRWLOT2(PFCY, PITM, PLOT, PSLO, PVCRTYP, PVCRNUM, PVCRLIN, PCREMVTSEQ, PQTYACT, PAMT)
+Value Char    PFCY
+Value Char    PITM
+Value Char    PLOT
+Value Char    PSLO
+Value Integer PVCRTYP
+Value Char    PVCRNUM
+Value Integer PVCRLIN
+Value Integer PCREMVTSEQ
+Value Decimal PQTYACT
+Value Decimal PAMT
+
+Local Integer I,J, LRET
+
+If PVCRNUM=""
+    End
+Endif
+
+    Call GETSOC(PFCY) From DEVSUB
+    # Issue 71160 - 2011-01-31 by CCC
+    #Read [SRW]SRW0=PVCRNUM;PVCRLIN;PVCRTYP;GSOCIETE
+    Raz [F:SRW]
+    Read [SRW]SRW0=PVCRNUM;PVCRLIN;PVCRTYP;PCREMVTSEQ;GSOCIETE;PITM;PLOT;PSLO
+
+    [F:SRW]QTY += PQTYACT
+    [F:SRW]AMT += PAMT(0)
+    # PAMT peut ne pas être renseigné dans le cas des OF
+    If GACTDECCST & dim(PAMT)>1
+        Call LOADFIC("[F:SRW]",PAMT, "", "CST", 1, 0) From STKVALECR
+    Endif
+    Case fstat
+        When 0       : Rewrite [SRW]
+        When 1       :
+        When Default : [F:SRW]CPY  = GSOCIETE
+                       [F:SRW]STOFCY = PFCY
+                       [F:SRW]LOT    = PLOT
+                       [F:SRW]SLO    = PSLO
+                       [F:SRW]VCRTYP = PVCRTYP
+                       [F:SRW]VCRNUM = PVCRNUM
+                       [F:SRW]VCRLIN = PVCRLIN
+                       [F:SRW]CREMVTSEQ = PCREMVTSEQ
+                       [F:SRW]ITMREF = PITM     # L'article n'est pas renseigné pour les sorties matières
+                       Write [SRW]
+    Endcase
+
+    If fstat
+        Call RSTA("SRW",PVCRNUM+";"+num$(PVCRLIN)+";"
+&                       +num$(PVCRTYP)+";"+num$([F:SRW]CREMVTSEQ)+";"+num$(GSOCIETE)) From GLOCK
+        Raz GOK
+    Else
+        If !find(PVCRTYP,9,10,36)
+            Read [STJ]STJ1=PFCY;PVCRTYP;PVCRNUM;PVCRLIN
+            LITM = [F:STJ]ITMREF
+            For [STJ]STJ1(4) Where VCRTYPORI = PVCRTYP
+&                                & VCRNUMORI = PVCRNUM
+&                                & VCRLINORI = PVCRLIN
+&                                & UPDCOD = 2
+&                                & ITMREF = LITM
+                # 118579.m - Added TRSTYP & CREMVTSEQ as a parameter to CRESMALOT
+                Call CRESMALOT([F:STJ]STOFCY,[F:STJ]ITMREF,[F:STJ]LOT,[F:STJ]SLO,[F:STJ]VCRTYP,[F:STJ]VCRNUM,[F:STJ]VCRLIN,[F:STJ]TRSTYP,[F:STJ]CREMVTSEQ,PVCRTYP,PVCRNUM,PVCRLIN,1,1,LRET)
+            Next
+            [G:STJ]currind=1
+            [G:STJ]currlen=0
+        Endif
+    Endif
+
+End
+
+#####################################################################
+# Création d'un enregistrement dans STKMVTADJ pour régul de sortie
+#####################################################################
+Subprog CRESMALOT(PFCY,PITM,PLOT,PSLO,PVCRTYP,PVCRNUM,PVCRLIN,PTRSTYP,PCRESEQ,PVCRTYPREG,PVCRNUMREG,PVCRLINREG,PQTY,PAMT,PRET)
+Value    Char    PFCY
+Value    Char    PITM
+Value    Char    PLOT
+Value    Char    PSLO
+Value    Integer PVCRTYP
+Value    Char    PVCRNUM
+Value    Integer PVCRLIN
+Value    Integer PTRSTYP  # 118579.n - Include TRSTYP in STKMVTADJ table
+Value    Integer PCRESEQ  # 118579.n - Include CREMVTSEQ in STKMVTADJ table
+Value    Integer PVCRTYPREG
+Value    Char    PVCRNUMREG
+Value    Integer PVCRLINREG
+Value    Decimal PQTY
+Value    Decimal PAMT
+Variable Integer PRET
+
+Local Integer LTRANS : Raz LTRANS
+Local Integer ISITE, LREW
+Local Integer LNUM
+Local Char REQ(250)
+
+If !clalev ([F:SMA2]) : Local File STKMVTADJ [SMA2] : Endif
+If filinfo(filpath("FIL","ITMBOM","fde",nomap),0)>0
+    If !clalev([F:ITB]) : Local File ITMBOM [ITB] : Endif
+Endif
+
+If adxlog=0
+    LTRANS = 1
+    Trbegin [SMA2]
+Endif
+
+REQ = "SELECT max(NUM_0) From STKMVTADJ"
+LNUM=1
+For (Integer NUM) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+    LNUM = [F:SQLX]NUM+1
+    Break
+Next
+
+Raz [F:SMA2]
+
+[F:SMA2]STOFCY = PFCY
+[F:SMA2]ITMREF = PITM
+[F:SMA2]LOT    = PLOT
+[F:SMA2]SLO    = PSLO
+[F:SMA2]VCRTYP = PVCRTYP
+[F:SMA2]TRSTYP = PTRSTYP    # 118579.n
+[F:SMA2]VCRNUM = PVCRNUM
+[F:SMA2]VCRLIN = PVCRLIN
+If PVCRTYPREG=0
+    [F:SMA2]VCRTYPREG = PVCRTYP
+    [F:SMA2]VCRNUMREG = PVCRNUM
+    [F:SMA2]VCRLINREG = PVCRLIN
+Else
+    [F:SMA2]VCRTYPREG = PVCRTYPREG
+    [F:SMA2]VCRNUMREG = PVCRNUMREG
+    [F:SMA2]VCRLINREG = PVCRLINREG
+Endif
+[F:SMA2]CREMVTSEQ = PCRESEQ    # 118579.n
+
+Readlock [SMA2]SMA0=[F:SMA2]VCRNUM;[F:SMA2]VCRLIN;[F:SMA2]VCRTYP;[F:SMA2]STOFCY;[F:SMA2]VCRNUMREG;[F:SMA2]VCRLINREG;[F:SMA2]VCRTYPREG;[F:SMA2]LOT;[F:SMA2]SLO
+
+If fstat=1
+    PRET=1
+    GOK = 0
+    If LTRANS
+        Rollback
+    Endif
+    End
+Elsif !fstat
+    LREW = 1
+Else
+    LREW = 0
+Endif
+
+If !LREW
+    [F:SMA2]CREDAT = date$
+    [F:SMA2]CRETIM = mid$(time$,1,2)+mid$(time$,4,2)+mid$(time$,7,2)
+    If [F:ITM]ITMREF<>[F:STJ]ITMREF
+       Read [ITM]ITM0=[F:STJ]ITMREF
+       If fstat
+          PRET=1
+          GOK=0
+       Endif
+    Endif
+    If GOK
+        ISITE = find([F:SMA2]STOFCY,GSITE(1..GNBSITE))
+        [F:SMA2]ITMREF= [F:STJ]ITMREF
+        [F:SMA2]CPY   = GSOCSITE(ISITE)
+        [F:SMA2]TCLCOD= [F:ITM]TCLCOD
+    Endif
+Endif
+
+If GOK = 0
+    If LTRANS
+        Rollback
+    Endif
+    End
+Endif
+
+[F:SMA2]QTY += PQTY
+[F:SMA2]AMT += PAMT
+# Il faut enregistrer le PMP car pour le changement de valeur
+# le montant du mouvement a été calculé pour atteindre ce PMP
+# et donc lors de la régul de sortie, le but sera d'avoir ce PMP à la date d'imputation de ce chgt de valeur
+If clalev([F:SLF])
+    If [F:SLF]ITMREF<>PITM | [F:SLF]STOFCY<>PFCY | [F:SLF]LOT<>PLOT | [F:SLF]SLO<>PSLO
+        Read [SLF]SLF0=PITM;PLOT;PSLO;PFCY
+    Endif
+    [F:SMA2]AVCQTY = [F:SLF]AVCBASQTY
+    [F:SMA2]AVCAMT = [F:SLF]AVCBASAMT
+Endif
+
+If clalev([F:ITB])
+    Raz [F:SMA2]LLC
+    For [ITB] Where ITMREF=[F:SMA2]ITMREF
+        [F:SMA2]LLC=max([F:SMA2]LLC,[F:ITB]LLC)
+    Next
+Endif
+
+If LREW
+    Rewrite [SMA2]
+Else
+    [F:SMA2]NUM=LNUM
+    Write [SMA2]
+Endif
+
+If LTRANS
+    Commit
+Endif
+
+End
+

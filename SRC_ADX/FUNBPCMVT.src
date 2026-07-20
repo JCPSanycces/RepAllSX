@@ -1,0 +1,772 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+#########################################################################
+#                                                                       #
+#     RESYNCHRONISATION des EN-COURS CLIENTS                            #
+#                                                                       #
+#     - Traitement        : FUNBPCMVT                                   #
+#     - Action e_commerce : TRTBPCMVT  (Traitement standard)            #
+#                                                                       #
+#########################################################################
+#########################################################################
+# Etiquettes ACTION                                                     #
+#########################################################################
+$ACTION
+#--- Actions liées au traitement standard
+Case ACTION
+ When "INIT"        : Gosub INIT_BPCMVT
+ When "OUVRE_BATCH" : Gosub INIT_BPCMVT
+ When "CONTROLE"    : Gosub CONTROLE_BPCMVT
+ When "EXEC"        : Gosub EXEC_BPCMVT
+ When "TERMINE"     : Gosub TERMINE_BPCMVT
+ When Default
+Endcase
+#--- Actions liées à la fenêtre de saisie
+Case ACTION
+    When "DEBUT"      : Gosub DEBUT : # FGR 06/11/2009 : X3SUIVI57591 Affzo [DIA]1-99
+    When "OK"         : GOK=1
+    When "END"        : GOK=0 : FIN=1
+    When Default
+Endcase
+Return
+
+#########################################################################
+# Détail des actions liées au traitement standard                       #
+#########################################################################
+##########################################################################################################
+$DEBUT
+  If [M]TOUSOC = 2 Then
+    Grizo [M]SOC
+  Else
+    Actzo [M]SOC
+  Endif
+  If [M]TOUCLIENT = 2 Then
+    Grizo [M]CLIENT
+  Else
+    Actzo [M]CLIENT
+  Endif
+  Affzo [DIA]1-99
+Return
+
+#########################################################################
+$INIT_BPCMVT
+# En batch , il vaut mieux mettre onerrgo
+If GSERVEUR
+    Onerrgo ERRBATCH
+Endif
+
+Gosub OUVRE
+
+Local Mask BPCMVT [DIA]
+
+# --------------------------------------------------- #
+# Chargement de l'écran en fonction des habilitations #
+# --------------------------------------------------- #
+Raz [M:DIA]
+
+[M:DIA]TOUSOC=2
+If GUSRFCY(1)<>"\" & GNBAUZ<>GNBSITE : [M:DIA]TOUSOC = 1 : Endif
+If [M:DIA]TOUSOC = 1
+    Call INICPY([M:DIA]SOC) From CPTSUB
+    GSOCIETE=[M:DIA]SOC
+Else
+    Raz GSOCIETE
+Endif
+
+[M]TOUCLIENT = 2
+[M]TRACE     = 2
+
+Call LECMEMO ("STD","[M:DIA]","vu1") From GMEMO
+
+Return
+
+#########################################################################
+$CONTROLE_BPCMVT
+If GOK < 1  FIN=1 Else TMP=1  Endif
+
+TMP=1
+
+Return
+
+#########################################################################
+$EXEC_BPCMVT
+Call RESYNCHRO_BPCMVT([M:DIA]TOUSOC,[M:DIA]SOC,[M:DIA]TOUCLIENT,[M:DIA]CLIENT,[M:DIA]TRACE)
+Return
+
+
+##############################################
+# Resynchronisation des encours clients      #
+# ------------------------------------------ #
+# L_TOUSOC    : Indicateur toutes société    #
+#               1 = Non,  2 = Oui            #
+# L_SOC       : Société à traiter            #
+# L_TOUCLIENT : Indicateur tous clients      #
+#               1 = Non,  2 = Oui            #
+# L_CLIENT    : Client à traiter             #
+# L_TRACE     : Ecriture d'une trrace        #
+#               1 = Non,  2 = Oui            #
+##############################################
+Subprog RESYNCHRO_BPCMVT(L_TOUSOC,L_SOC,L_TOUCLIENT,L_CLIENT,L_TRACE)
+Value Integer  L_TOUSOC
+Value Char     L_SOC
+Value Integer  L_TOUCLIENT
+Value Char     L_CLIENT
+Value Integer  L_TRACE
+
+Local Char    CRIT(250)
+Local Char    CLE1, CLE2, WSENS(1)
+Local Char    WTYPMVC # FGR 06/08/2009 : X3SUIVI57009
+Local Integer I, J, K, OK, WI, STOP
+Local Decimal WQUONOT, WQUOATI, WDLVATI
+Local Char    WCPY (GLONCPY)
+Local Decimal WORDNOT, WORDATI      : # 84771 : Pb update last document
+
+Gosub OUVRE_FIC
+Gosub TRT_BPCMVT
+End
+
+
+#----------------------------------------------------------#
+# Traitement de resynchronisation des encours client       #
+#----------------------------------------------------------#
+$TRT_BPCMVT
+If !GSERVEUR
+   If L_TRACE=2 & GTRACE=""
+      # --> ouverture de la trace
+      Call OUVRE_TRACE(mess(87,191,1)) From LECFIC
+      Call ECR_TRACE(" ",0) From GESECRAN
+      Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+      Call PRTSCR("BPCMVT","DIA","",0,1) From ATRTX3
+      Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+      Call ECR_TRACE(" ",0) From GESECRAN
+   Endif
+Endif
+#--------------------------------------------------------------------------------
+# Si on ne travaille que sur une société, on peut charger sa devise dès le départ
+If L_SOC<>""
+    GSOCIETE=L_SOC
+    GISOC = find(GSOCIETE,GSOC(1..GNBSOC))
+    If GISOC
+     GLOCALDEV = GDEVSOC(GISOC)
+    Else
+     GLOCALDEV = "EUR" : # Devise par défaut en cas de pb
+    Endif
+    # --> Récupération du paramètre vente : GSOHAPPOST    : Mvts client si commandes non signées
+    Local Char     WPARAM(GLONADP)
+    Call PARAML(GSOCIETE,"SOHAPPOST",WPARAM) From ADOVAL      # FGR 28/07/2015 : X3SUIVI108078 : Plus Call PARAM (performances)
+    GSOHAPPOST= val(WPARAM)
+Endif
+
+Gosub SET_FIRST From TRTFIRST                    # FGR 09/10/2015 : X3SUIVI111623
+
+#------------------------------------------------------------------------
+CRIT='1=1'
+If L_SOC   <>"" CRIT+=' & CPY=L_SOC' Endif
+If L_CLIENT<>"" CRIT+=' & BPCNUM=L_CLIENT' Endif
+
+##-----------------------------------------------------------------------------------------
+## On commence par supprimer tous les enr. concernés par la sélection de la table BPCUSTMVT
+##-----------------------------------------------------------------------------------------
+Trbegin [MVC]
+Delete [MVC] Where evalue(CRIT)
+If fstat
+    Rollback
+    GOK=0
+    If L_TRACE=2
+        Call ECR_TRACE("File BPCUSTMVT, Error ="-num$(fstat),1) From GESECRAN
+    Endif
+    #Return                                      # FGR 09/10/2015 : X3SUIVI111623
+    Goto END_RESYNCHRO_BPCMVT                    # FGR 09/10/2015 : X3SUIVI111623
+Else
+    Commit
+Endif
+
+#Filter [MVC] Where evalue(CRIT)
+#Raz CLE1, CLE2
+#Raz STOP
+#Trbegin [MVC]
+#$LOOP_MVC
+#If STOP=1
+#   STOP=2 : CRIT='BPCNUM="'+CLE1+'"'+' & CPY>="'+CLE2+'"'
+#Elsif STOP=2
+#   STOP=0 : CRIT='BPCNUM>"'+CLE1+'"'
+#Else
+#   CRIT='1=1'
+#Endif
+#Raz I
+#For [MVC]MVC1 Where evalue(CRIT)
+#   Raz [F:MVC]QUONOTC, [F:MVC]QUONOTL, [F:MVC]QUONOTR
+#   Raz [F:MVC]QUOATIC, [F:MVC]QUOATIL, [F:MVC]QUOATIR
+#   Raz [F:MVC]ORDBPCNOTC, [F:MVC]ORDBPCNOTL, [F:MVC]ORDBPCNOTR
+#   Raz [F:MVC]ORDBPCATIC, [F:MVC]ORDBPCATIL, [F:MVC]ORDBPCATIR
+#   Raz [F:MVC]ORDBPINOTC, [F:MVC]ORDBPINOTL, [F:MVC]ORDBPINOTR
+#   Raz [F:MVC]ORDBPIATIC, [F:MVC]ORDBPIATIL, [F:MVC]ORDBPIATIR
+#   Raz [F:MVC]DLVOSTC, [F:MVC]DLVOSTL, [F:MVC]DLVOSTR
+#   Raz [F:MVC]NIVDLVC, [F:MVC]NIVDLVL, [F:MVC]NIVDLVR
+#   Raz [F:MVC]NPTINVC, [F:MVC]NPTINVL, [F:MVC]NPTINVR
+#   Raz [F:MVC]LNDBPCNOTC, [F:MVC]LNDBPCNOTL, [F:MVC]LNDBPCNOTR
+#   Raz [F:MVC]LNDBPCATIC, [F:MVC]LNDBPCATIL, [F:MVC]LNDBPCATIR
+#   Raz [F:MVC]LNDBPINOTC, [F:MVC]LNDBPINOTL, [F:MVC]LNDBPINOTR
+#   Raz [F:MVC]LNDBPIATIC, [F:MVC]LNDBPIATIL, [F:MVC]LNDBPIATIR
+#   Raz [F:MVC]LNDDLVC, [F:MVC]LNDDLVL, [F:MVC]LNDDLVR
+#   Rewrite [MVC]
+#   If fstat & [M]TRACE=2
+#      Call ECR_TRACE("File BPCUSTMVT, Error ="-num$(fstat),1) From GESECRAN
+#   Endif
+#   If I > 200
+#      Commit
+#      Trbegin [MVC]
+#      CLE1=[F:MVC]BPCNUM : CLE2=[F:MVC]CPY
+#      STOP=1 : Break
+#   Endif
+#Next
+#If STOP Goto LOOP_MVC Endif
+#Commit
+#Filter [MVC]
+
+### PENSER A SUPPRIMER LES ENR MAJ PAR RECUPSOL SI BESOIN
+
+##------------------------------------------------------------------------------------------
+## On commence par supprimer tous les enr. concernés par la sélection de la table LASTCUSMVT
+##------------------------------------------------------------------------------------------
+Trbegin [LCM]
+Delete [LCM] Where evalue(CRIT) & find([F:LCM]IFFTYP,4,5,6,7,8,9,10)
+If fstat
+    Rollback
+    GOK=0
+    If L_TRACE=2
+        Call ECR_TRACE("File LASTCUSMVT, Error ="-num$(fstat),1) From GESECRAN
+    Endif
+    #Return                                      # FGR 09/10/2015 : X3SUIVI111623
+    Goto END_RESYNCHRO_BPCMVT                    # FGR 09/10/2015 : X3SUIVI111623
+Else
+    Commit
+Endif
+
+# --------------------------------------
+# FGR 09/10/2015 : X3SUIVI111623 (début)
+Local Char SQH_HINT(GLONANX)
+Local Char SOH_HINT(GLONANX)
+Local Char SDH_HINT(GLONANX)
+Local Char SIH_HINT(GLONANX)
+Local Char SRH_HINT(GLONANX)
+
+Raz SQH_HINT
+Raz SOH_HINT
+Raz SDH_HINT
+Raz SIH_HINT
+Raz SRH_HINT
+GPOINT = "SYNCBPCMVT" : Gosub ENTREE From EXEFNC
+# FGR 09/10/2015 : X3SUIVI111623 (fin)
+# --------------------------------------
+
+#------------------------------------------------------------------------
+#    TRAITEMENT DES DEVIS
+#------------------------------------------------------------------------
+If L_TRACE=2
+   Call ECR_TRACE(" ",0) From GESECRAN
+   Call ECR_TRACE(mess(149,191,1),0) From GESECRAN
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+
+CRIT='1=1'
+# 84771 : Pb update last quote in LASCUSTMVT
+# Necessary to consider ordered quote to update LASCUSTMVT
+#CRIT='[F:SQH]QUOSTA<3'
+# 84771
+If L_SOC    <> "" CRIT +=' & [F:SQH]CPY=L_SOC' Endif
+If L_CLIENT <> "" CRIT +=' & [F:SQH]BPCORD=L_CLIENT'  Endif
+
+Raz CLE1
+Raz WCPY
+Trbegin [SQH]
+
+Raz J
+$LOOP_SQH
+Raz I,STOP
+
+#For [SQH]SQH0 Where SQHNUM>CLE1 & evalue(CRIT)                      # FGR 09/10/2015 : X3SUIVI111623
+For [SQH]SQH0 Hint Key=SQH_HINT Where SQHNUM>CLE1 & evalue(CRIT)     # FGR 09/10/2015 : X3SUIVI111623
+   # Si on travaille sur ttes les sociétés, on charge sa devise
+   If L_SOC="" & WCPY<>[F:SQH]CPY
+       Call GETDEV([F:SQH]SALFCY) From DEVSUB
+       WCPY=[F:SQH]CPY
+   Endif
+   # Maj de l'en devis
+   GOK=1
+   If [F:SQH]QUOSTA=1
+       Call MAJMVC ([F:SQH]BPCORD, [F:SQH]CUR, [F:SQH]CHGTYP, 0, [F:SQH]QUODAT, [F:SQH]SQHNUM, [F:SQH]SALFCY,
+&                   [F:SQH]QUONOT, [F:SQH]QUOATI, "+", "Q", "C", 0) From TRTBPMVT
+   Else
+      # Si devis partiellement cdé, il ne faut prendre que ce qui est non commandé
+      Raz WQUONOT, WQUOATI
+      If [F:SQH]QUOSTA <> 3 Then                 # FGR 09/10/2015 : X3SUIVI111623 : pas la peine autrement, on écrase avec les valeurs de l'entête
+        For [SQD]SQD0 Where SQHNUM=[F:SQH]SQHNUM
+            If [F:SQD]ORDFLG=1 & [F:SQD]ORDQTY<[F:SQD]QTY
+                WQUOATI += ([F:SQD]QTY-[F:SQD]ORDQTY)*[F:SQD]NETPRIATI
+                WQUONOT += ([F:SQD]QTY-[F:SQD]ORDQTY)*[F:SQD]NETPRINOT
+            Endif
+        Next
+      Endif
+      # 84771 :  Pb update last quote in LASCUSTMVT
+      If [F:SQH]QUOSTA<>3
+          WSENS = "+"
+      Else
+          # If Ordered quote  : Just update LASCUSTMVT (with total amount quote)
+          WSENS = "0"
+          WQUONOT=[F:SQH]QUONOT : WQUOATI=[F:SQH]QUOATI
+      Endif
+#      Call MAJMVC ([F:SQH]BPCORD, [F:SQH]CUR, [F:SQH]CHGTYP, 0, [F:SQH]QUODAT, [F:SQH]SQHNUM, [F:SQH]SALFCY,
+#&                  WQUONOT, WQUOATI, "+", "Q", "C", 0) From TRTBPMVT
+      Call MAJMVC ([F:SQH]BPCORD, [F:SQH]CUR, [F:SQH]CHGTYP, 0, [F:SQH]QUODAT, [F:SQH]SQHNUM, [F:SQH]SALFCY,
+&                  WQUONOT, WQUOATI, WSENS, "Q", "C", 0) From TRTBPMVT
+      # 84771
+
+   Endif
+   J+=1
+   #If I > 200                                   # FGR 09/10/2015 : X3SUIVI111623
+   If I > GMAXUPDTRS Then                        # FGR 09/10/2015 : X3SUIVI111623
+      Commit
+      Trbegin [SQH]
+      CLE1=[F:SQH]SQHNUM : STOP=1 : Break
+   Endif
+Next
+If STOP Goto LOOP_SQH Endif
+
+Commit
+
+If L_TRACE=2
+   Call ECR_TRACE(mess(657,197,1)-":"-num$(J)-mess(121,198,1)-mess(325,197,1),0) From GESECRAN
+Endif
+
+
+#------------------------------------------------------------------------
+#    TRAITEMENT DES COMMANDES
+#------------------------------------------------------------------------
+If L_TRACE=2
+   Call ECR_TRACE(" ",0) From GESECRAN
+   Call ECR_TRACE(mess(83,191,1),0) From GESECRAN
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+
+CRIT='[F:SOH]SOHCAT<>4 & ([F:SOH]BETFCY=1 | ([F:SOH]BETFCY=2 & [F:SOH]BETCPY=2))'
+If L_SOC   <>"" CRIT +=' & CPY=L_SOC' Endif
+If L_CLIENT<>"" CRIT +=' & ([F:SOH]BPCINV=L_CLIENT | [F:SOH]BPCORD=L_CLIENT)'  Endif
+
+Raz CLE1
+Raz WCPY
+Trbegin [SOH]
+
+Raz J,K
+$LOOP_SOH
+Raz I,STOP
+
+#For [SOH]SOH0 Where SOHNUM>CLE1 & evalue(CRIT)                      # FGR 09/10/2015 : X3SUIVI111623
+For [SOH]SOH0 Hint Key=SOH_HINT Where SOHNUM>CLE1 & evalue(CRIT)     # FGR 09/10/2015 : X3SUIVI111623
+   # Si on travaille sur ttes les sociétés, on charge sa devise
+   If L_SOC="" & WCPY<>[F:SOH]CPY
+       Call GETDEV([F:SOH]SALFCY) From DEVSUB
+       WCPY=[F:SOH]CPY
+       # --> Récupération du paramètre vente : GSOHAPPOST    : Mvts client si commandes non signées
+       Local Char     WPARAM(GLONADP)
+       Call PARAML([F:SOH]SALFCY,"SOHAPPOST",WPARAM) From ADOVAL      # FGR 28/07/2015 : X3SUIVI108078 : Plus Call PARAM (performances)
+       GSOHAPPOST= val(WPARAM)
+   Endif
+   # Maj de l'en commande client cde
+   If [F:SOH]APPFLG>2 | GSOHAPPOST=2
+       If L_CLIENT="" | (L_CLIENT<>"" & [F:SOH]BPCORD=L_CLIENT)
+          GOK=1
+          Call MAJMVC ([F:SOH]BPCORD, [F:SOH]CUR, [F:SOH]CHGTYP, 0, [F:SOH]ORDDAT, [F:SOH]SOHNUM, [F:SOH]SALFCY,
+&              [F:SOH]ORDNOT, [F:SOH]ORDATI, "+", "C", "", [F:SOH]SOHCAT) From TRTBPMVT         : # Bug 68943
+#&              [F:SOH]DLRNOT, [F:SOH]DLRATI, "+", "C", "", [F:SOH]SOHCAT) From TRTBPMVT        : # Bug 68943
+          I+=1
+          J+=1
+       Endif
+       If L_CLIENT="" | (L_CLIENT<>"" & [F:SOH]BPCORD=L_CLIENT) : # Bug 62857
+
+          # 84771 : Pb update last order in LASCUSTMVT
+          If [F:SOH]ORDSTA<>2
+              WSENS = "+"
+              # 107888 : Scheduled invoices : New fields 'To invoice' - X3-15184 (LD:10/01/17)
+              # Unclosed order, On order amount = 'To deliver' + 'To invoice scheduled invoice'
+              #WORDNOT = [F:SOH]DLRNOT : WORDATI = [F:SOH]DLRATI
+              WORDNOT = [F:SOH]DLRNOT+[F:SOH]INRSCHNOT : WORDATI = [F:SOH]DLRATI+[F:SOH]INRSCHATI
+              # 107888 : Scheduled invoices : New fields 'To invoice' - X3-15184 (LD:10/01/17)
+          Else
+              # If closed order  : Just update LASCUSTMVT (with total amount order)
+              WSENS = "0"
+              WORDNOT = [F:SOH]ORDNOT : WORDATI = [F:SOH]ORDATI
+          Endif
+             # Maj de l'en commande
+             # Si la cde n'est pas soldée, on ne prend que ce qui reste à livrer
+             GOK=1
+#             Call MAJMVC ([F:SOH]BPCORD, [F:SOH]CUR, [F:SOH]CHGTYP, 0, [F:SOH]ORDDAT, [F:SOH]SOHNUM, [F:SOH]SALFCY,
+#&                 [F:SOH]DLRNOT, [F:SOH]DLRATI, "+", "F", "C", [F:SOH]SOHCAT) From TRTBPMVT
+             Call MAJMVC ([F:SOH]BPCORD, [F:SOH]CUR, [F:SOH]CHGTYP, 0, [F:SOH]ORDDAT, [F:SOH]SOHNUM, [F:SOH]SALFCY,
+&                 WORDNOT, WORDATI, WSENS, "F", "C", [F:SOH]SOHCAT) From TRTBPMVT
+             I+=1
+             K+=1
+          #Endif :
+          # 84771
+       Endif
+   Endif
+   #If I > 200                                   # FGR 09/10/2015 : X3SUIVI111623
+   If I > GMAXUPDTRS Then                        # FGR 09/10/2015 : X3SUIVI111623
+      Commit
+      Trbegin [SOH]
+      CLE1=[F:SOH]SOHNUM : STOP=1 : Break
+   Endif
+Next
+If STOP Goto LOOP_SOH Endif
+
+Commit
+
+If L_TRACE=2
+   Call ECR_TRACE(mess(326,197,1)-":"-num$(J)-mess(48,198,1)-mess(325,197,1),0) From GESECRAN
+   Call ECR_TRACE(mess(327,197,1)-":"-num$(K)-mess(48,198,1)-mess(325,197,1),0) From GESECRAN
+Endif
+
+#------------------------------------------------------------------------
+#    TRAITEMENT DES LIVRAISONS
+#------------------------------------------------------------------------
+If L_TRACE=2
+   Call ECR_TRACE(" ",0) From GESECRAN
+   Call ECR_TRACE(mess(84,191,1),0) From GESECRAN
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+
+# 84771 : Pb update last delivery in LASCUSTMVT
+# Necessary to consider invoiced deliveries to update LASCUSTMVT
+#CRIT='[F:SDH]INVFLG<>2 & ([F:SDH]BETFCY=1 | ([F:SDH]BETFCY=2 & [F:SDH]BETCPY=2)) & [F:SDH]SDHCAT<>2'
+# X3-99659 (LCC 22/08/18) Customer balances resync adds the nonbillable deliveries
+#CRIT='([F:SDH]BETFCY=1 | ([F:SDH]BETFCY=2 & [F:SDH]BETCPY=2)) & [F:SDH]SDHCAT<>2'
+# X3-107334 LCC Loan shipment amount erased from credit level total by FUNBPCMVT
+#CRIT='([F:SDH]BETFCY=1 | ([F:SDH]BETFCY=2 & [F:SDH]BETCPY=2)) & [F:SDH]SDHCAT<>2 & [F:SDH]SDHCAT<>4'
+CRIT='([F:SDH]BETFCY=1 | ([F:SDH]BETFCY=2 & [F:SDH]BETCPY=2)) & [F:SDH]SDHCAT<>4'
+# End X3-99659 (LCC 22/08/18) Customer balances resync adds the nonbillable deliveries
+# 84771
+If L_SOC   <>"" CRIT +=' & CPY=L_SOC' Endif
+#If L_CLIENT<>"" CRIT +=' & [F:SDH]BPCINV=L_CLIENT'  Endif    : # Bug 74273
+If L_CLIENT<>"" CRIT +=' & [F:SDH]BPCORD=L_CLIENT'  Endif     : # Bug 74273
+
+Raz CLE1
+Raz WCPY
+Trbegin [SDH]
+
+Raz J,K
+$LOOP_SDH
+Raz I,STOP
+#For [SDH]SDH0 Where SDHNUM>CLE1 & evalue(CRIT)                      # FGR 09/10/2015 : X3SUIVI111623
+For [SDH]SDH0 Hint Key=SDH_HINT Where SDHNUM>CLE1 & evalue(CRIT)     # FGR 09/10/2015 : X3SUIVI111623
+   # Si on travaille sur ttes les sociétés, on charge sa devise
+   If L_SOC="" & WCPY<>[F:SDH]CPY
+       Call GETDEV([F:SDH]SALFCY) From DEVSUB
+       WCPY=[F:SDH]CPY
+   Endif
+   GOK=1
+   If [F:SDH]CFMFLG<>2
+      # Maj de l'en-cours livraison
+      Call MAJMVC ([F:SDH]BPCORD, [F:SDH]CUR, [F:SDH]CHGTYP, 0, [F:SDH]SHIDAT, [F:SDH]SDHNUM, [F:SDH]SALFCY,
+&                  0, [F:SDH]DLVATI, "+", "O", "", [F:SDH]LND) From TRTBPMVT
+      J+=1
+   Else
+      Raz WDLVATI
+      # Si livraison validé, il faut déduire les retours
+      If [F:SDH]INVFLG <> 2 Then       # FGR 09/10/2015 : X3SUIVI111623 : pas la peine autrement, on écrase avec les valeurs de l'entête
+        For [SDD]SDD0 Where SDHNUM=[F:SDH]SDHNUM
+            # 103871 : Resynchro des mvts client et pb en calcul livré non facturé
+            #WDLVATI += ([F:SDD]QTY-[F:SDD]RTNQTY)*[F:SDD]NETPRIATI
+            If GDLVRTNCNO=1 | [F:SDH]INVFLG=2
+                # Pas de facturation des qtés retours
+                # --> On ne facture que ce qui n'est pas retourné
+                # Facturation des qtés retours et Livraison facturée
+                # --> On ne facture que ce qui n'est pas retourné
+                WDLVATI += ([F:SDD]QTY-[F:SDD]RTNQTY)*[F:SDD]NETPRIATI
+            Else
+                # Facturation des qtés retours et livraison non facturée
+                # --> On facture tout
+                WDLVATI += [F:SDD]QTY*[F:SDD]NETPRIATI
+            Endif
+            # 103871
+        Next
+      Endif
+      # 84771 :  Pb update last delivery in LASCUSTMVT
+      If [F:SDH]INVFLG<>2
+          WSENS = "+"
+      Else
+          # If Invoiced delivery : Just update LASCUSTMVT (with total amount delivery)
+          WSENS = "0"
+          WDLVATI = [F:SDH]DLVATI
+      Endif
+
+      # Maj du livré non facturé
+#      Call MAJMVC ([F:SDH]BPCORD, [F:SDH]CUR, [F:SDH]CHGTYP, 0, [F:SDH]SHIDAT, [F:SDH]SDHNUM, [F:SDH]SALFCY,
+#&                  0, WDLVATI, "+", "D", "C", [F:SDH]LND) From TRTBPMVT
+      Call MAJMVC ([F:SDH]BPCORD, [F:SDH]CUR, [F:SDH]CHGTYP, 0, [F:SDH]SHIDAT, [F:SDH]SDHNUM, [F:SDH]SALFCY,
+&                  0, WDLVATI, WSENS, "D", "C", [F:SDH]LND) From TRTBPMVT
+      # Bug 84771
+      K+=1
+   Endif
+#   If GOK>0 Call ECR_TRACE(mess(5,159,1)-":"-[F:SDH]SDHNUM,0) From GESECRAN Endif
+   I+=1
+   #If I > 200                                   # FGR 09/10/2015 : X3SUIVI111623
+   If I > GMAXUPDTRS Then                        # FGR 09/10/2015 : X3SUIVI111623
+      Commit
+      Trbegin [SDH]
+      CLE1=[F:SDH]SDHNUM : STOP=1 : Break
+   Endif
+Next
+If STOP Goto LOOP_SDH Endif
+
+Commit
+
+If L_TRACE=2
+   Call ECR_TRACE(mess(328,197,1)-":"-num$(J)-mess(90,198,1)-mess(325,197,1),0) From GESECRAN
+   Call ECR_TRACE(mess(329,197,1)-":"-num$(K)-mess(90,198,1)-mess(325,197,1),0) From GESECRAN
+Endif
+
+#------------------------------------------------------------------------
+#    TRAITEMENT DES FACTURES
+#------------------------------------------------------------------------
+If L_TRACE=2
+   Call ECR_TRACE(" ",0) From GESECRAN
+   Call ECR_TRACE(mess(85,191,1),0) From GESECRAN
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+
+#CRIT='[F:SIH]ORIMOD=5 & [F:SIH]INVTYP<3 & [F:SIH]STA<>3' : # Bug 49409 : Prendre en compte les factures tiers
+CRIT='[F:SIH]INVTYP<3'                                    : # Bug 49409
+
+If L_SOC   <>"" CRIT +=' & CPY=L_SOC' Endif
+If L_CLIENT<>"" CRIT += ' & [F:SIH]BPR=L_CLIENT'  Endif
+
+Raz CLE1
+Raz WCPY
+Trbegin [SIH]
+
+Raz J,K
+$LOOP_SIH
+Raz I,STOP
+#For [SIH]SIH0 Where NUM>CLE1 & evalue(CRIT)                         # FGR 09/10/2015 : X3SUIVI111623
+For [SIH]SIH0 Hint Key=SIH_HINT Where NUM>CLE1 & evalue(CRIT)        # FGR 09/10/2015 : X3SUIVI111623
+   # Si on travaille sur ttes les sociétés, on charge sa devise
+   If L_SOC="" & WCPY<>[F:SIH]CPY
+       Call GETDEV([F:SIH]FCY) From DEVSUB
+       WCPY=[F:SIH]CPY
+   Endif
+   Local Decimal WCOURS : WCOURS=0
+   WI=find(GLOCALDEV,[F:SIH]CURLED)
+   If WI & [F:SIH]RATDIV(WI-1)<>0 WCOURS=arr([F:SIH]RATMLT(WI-1)/[F:SIH]RATDIV(WI-1), 10^-GDECRCU) Endif
+   If [F:SIH]STA<>3                                                    : # Bug 49409
+       If [F:SIH]INVTYP = 1
+          WSENS = "+"  :    # Facture
+          WTYPMVC = "I"     # FGR 06/08/2009 : X3SUIVI57009 Facture
+          J+=1
+       Else
+          WSENS = "-"  :    # Avoir
+          WTYPMVC = "N"     # FGR 06/08/2009 : X3SUIVI57009 Avoir
+          K+=1
+       Endif
+       GOK=1
+#        Call  MAJMVC ([F:SIH]BPR, [F:SIH]CUR, [F:SIH]CURTYP, WCOURS, [F:SIH]ACCDAT, [F:SIH]NUM, [F:SIH]FCY,
+#&                    0, [F:SIH]AMTATI, WSENS,  "I", "C", 0) From TRTBPMVT
+       Call  MAJMVC ([F:SIH]BPR, [F:SIH]CUR, [F:SIH]CURTYP, WCOURS, [F:SIH]ACCDAT, [F:SIH]NUM, [F:SIH]FCY,
+&                    0, [F:SIH]AMTATI, WSENS,  WTYPMVC, "C", 0) From TRTBPMVT   # FGR 06/08/2009 : X3SUIVI57009
+   Else                                                                : # Bug 49409
+       # Bug 49409 : Facture validée : Maj uniquement n°dernière facture
+       If [F:SIH]INVTYP = 1 : # Facture                                : # Bug 49409
+          WTYPMVC = "I"     # FGR 06/08/2009 : X3SUIVI57009 Facture    : # Bug 49409
+       Else                 : # Avoir                                  : # Bug 49409
+          WTYPMVC = "N"     # FGR 06/08/2009 : X3SUIVI57009 Avoir      : # Bug 49409
+       Endif                                                           : # Bug 49409
+       WSENS = "0"                                                     : # Bug 49409
+       GOK=1                                                           : # Bug 49409
+       Call  MAJMVC ([F:SIH]BPR, [F:SIH]CUR, [F:SIH]CURTYP, WCOURS, [F:SIH]ACCDAT, [F:SIH]NUM, [F:SIH]FCY,
+&                    0, [F:SIH]AMTATI, WSENS,  WTYPMVC, "V", 0) From TRTBPMVT   # FGR 06/08/2009 : X3SUIVI57009
+   Endif
+#   If GOK>0 Call ECR_TRACE(mess(5,159,1)-":"-[F:SIH]NUM,0) From GESECRAN Endif
+   I+=1
+   #If I > 200                                   # FGR 09/10/2015 : X3SUIVI111623
+   If I > GMAXUPDTRS Then                        # FGR 09/10/2015 : X3SUIVI111623
+      Commit
+      Trbegin [SIH]
+      CLE1=[F:SIH]NUM : STOP=1 : Break
+   Endif
+Next
+If STOP Goto LOOP_SIH Endif
+Commit
+If L_TRACE=2
+   Call ECR_TRACE(mess(330,197,1)-":"-num$(J)-mess(369,198,1)-mess(325,197,1),0) From GESECRAN
+   Call ECR_TRACE(mess(330,197,1)-":"-num$(K)-mess(331,197,1)-mess(325,197,1),0) From GESECRAN
+Endif
+
+#------------------------------------------------------------------------
+#    TRAITEMENT DES RETOURS
+#------------------------------------------------------------------------
+If L_TRACE=2
+   Call ECR_TRACE(" ",0) From GESECRAN
+   Call ECR_TRACE(mess(211,191,1),0) From GESECRAN
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+
+CRIT='1=1'
+If L_SOC    <> "" CRIT +=' & [F:SRH]CPY=L_SOC' Endif
+If L_CLIENT <> "" CRIT +=' & [F:SRH]BPCORD=L_CLIENT'  Endif
+Raz CLE1
+Raz WCPY
+Trbegin [SRH]
+
+$LOOP_SRH
+Raz I,STOP
+
+#For [SRH]SRH0 Where SRHNUM>CLE1 & evalue(CRIT)                      # FGR 09/10/2015 : X3SUIVI111623
+For [SRH]SRH0 Hint Key=SRH_HINT Where SRHNUM>CLE1 & evalue(CRIT)     # FGR 09/10/2015 : X3SUIVI111623
+   # Si on travaille sur ttes les sociétés, on charge sa devise
+   If L_SOC="" & WCPY<>[F:SRH]CPY
+       Call GETDEV([F:SRH]STOFCY) From DEVSUB
+       WCPY=[F:SRH]CPY
+   Endif
+   # Maj du dernier retour
+   GOK=1
+   Call MAJMVC ([F:SRH]BPCORD, "", 0, 0, [F:SRH]RTNDAT, [F:SRH]SRHNUM, [F:SRH]STOFCY,
+&               0, 0, "+", "R", "C", 0) From TRTBPMVT
+   #If I > 200                                   # FGR 09/10/2015 : X3SUIVI111623
+   If I > GMAXUPDTRS Then                        # FGR 09/10/2015 : X3SUIVI111623
+      Commit
+      Trbegin [SRH]
+      CLE1=[F:SRH]SRHNUM : STOP=1 : Break
+   Endif
+Next
+If STOP Goto LOOP_SRH Endif
+
+Commit
+
+#-------------------------------------------------------------#
+# Traitement des mouvements comptables si module compta actif #
+#     - Mt solde comptable (BLCC/L/R)                         #
+#     - Mts portefeuille   (NYTBILC/L/R)                      #
+#-------------------------------------------------------------#
+If !clalev([F:ADS]) & GMODU(2)=2
+  # L_SOC  : Société
+  # CLI    : Client 1/2 (Non/Oui)
+  # FOU    : Fournisseur 1/2 (Non/Oui)
+  # SOL    : Solde comptable 1/2 (Non/Oui)
+  # POR    : Portefeuille 1/2 (Non/Oui)
+  # BATCH  : Batch 0/1 (Non/Oui)
+  # DIRECT : Paramètres de récup non saisis
+  # TRACE  : Trace 0/1 (Non/Oui)
+  Call RECUPSOL(L_SOC,2,1,2,2,GSERVEUR,1,L_TRACE-1) From RECUPSOL
+  #If GOK<1  Return : Endif                      # FGR 09/10/2015 : X3SUIVI111623
+  If GOK<1 Goto END_RESYNCHRO_BPCMVT : Endif     # FGR 09/10/2015 : X3SUIVI111623
+Endif
+
+$END_RESYNCHRO_BPCMVT                            # FGR 09/10/2015 : X3SUIVI111623
+  Gosub UNSET_FIRST From TRTFIRST                # FGR 09/10/2015 : X3SUIVI111623
+Return
+
+#########################################################################
+$TERMINE_BPCMVT
+
+Close Local File [BPC]
+Close Local File [MVC]
+Close Local File [LCM]
+Close Local File [SQH]
+Close Local File [SQD]
+Close Local File [SOH]
+Close Local File [SDH]
+Close Local File [SDD]
+Close Local File [SIH]
+Close Local File [SIV]
+Close Local File [SRH]
+
+If !GSERVEUR
+   If [M]TRACE=2
+      Call FERME_TRACE From LECFIC
+      TRA = 1
+   Endif
+Endif
+
+Return
+
+#########################################################################
+$OUVRE
+
+Gosub OUVRE_FIC
+
+Return
+
+#########################################################################
+$OUVRE_FIC
+
+If !clalev([F:BPC])  Local File BPCUSTOMER [BPC] : Endif
+If !clalev([F:MVC])  Local File BPCUSTMVT  [MVC] : Endif
+If !clalev([F:LCM])  Local File LASTCUSMVT [LCM] : Endif
+If !clalev([F:SQH])  Local File SQUOTE     [SQH] : Endif
+If !clalev([F:SQD])  Local File SQUOTED    [SQD] : Endif
+If !clalev([F:SOH])  Local File SORDER     [SOH] : Endif
+If !clalev([F:SDH])  Local File SDELIVERY  [SDH] : Endif
+If !clalev([F:SDD])  Local File SDELIVERYD [SDD] : Endif
+If !clalev([F:SIH])  Local File SINVOICE   [SIH] : Endif
+If !clalev([F:SIV])  Local File SINVOICEV  [SIV] : Endif
+If !clalev([F:SRH])  Local File SRETURN    [SRH] : Endif
+
+Return
+
+#########################################################################
+$ERRBATCH
+Call ECR_TRACE(errmes$(errn)-num$(errl)-errm,1) From GESECRAN
+End
+
+#########################################################################
+# Détail des actions liées à l'écran de sélection                       #
+#########################################################################
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran BPCMVT) 28/04/2006 14:57:17 (LD)
+######################################################################################
+Subprog AS_TOUSOC(VALEUR)
+Variable Integer VALEUR
+If GUSRFCY(1)<>"\" & GNBAUZ<>GNBSITE : mkstat = 1 : End : Endif
+End
+
+#########################################################
+Subprog AM_TOUSOC(VALEUR)
+Variable Integer VALEUR
+
+  # FGR 06/11/2009 : X3SUIVI57591
+  If VALEUR = 2 Then
+    Raz GSOCIETE
+    Raz [M]SOC
+    Grizo [M]SOC
+  Else
+    Call INICPY([M]SOC) From CPTSUB
+    GSOCIETE=[M]SOC
+    Actzo [M]SOC
+  Endif
+End
+#########################################################
+Subprog AS_SOC(VALEUR)
+Variable Char    VALEUR()
+
+  If [M:DIA]TOUSOC = 2 : mkstat = 1 : End : Endif
+End
+
+######################################################################################
+#########################################################
+Subprog AM_TOUCLIENT(VALEUR)
+Variable Integer VALEUR
+
+  # FGR 06/11/2009 : X3SUIVI57591
+  #If VALEUR = 2 Raz [M]CLIENT : Affzo [M]CLIENT Endif
+  If VALEUR = 2 Then
+    Raz [M]CLIENT
+    Grizo [M]CLIENT
+  Else
+    Actzo [M]CLIENT
+  Endif
+End
+#########################################################
+Subprog AS_CLIENT(VALEUR)
+Variable Char    VALEUR()
+
+  If [M]TOUCLIENT = 2 Raz VALEUR : mkstat = 1 Endif
+End
+

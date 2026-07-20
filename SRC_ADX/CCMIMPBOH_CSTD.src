@@ -1,0 +1,577 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Class CCMIMPBOH_CSTD
+# Issue 109096/2 - 2015-11-24 by BAKHA : For non-conformance, send email to actioners
+
+$METHODS
+Case [L]CURPTH
+   When ""
+      Case [L]ACTION
+        When "AINIT"                            : Gosub INITIALISE
+        When "CREATE_IMPACT_BOMS_BATCH"         : Gosub CREATE_IMPACT_BOMS_BATCH
+        When "CREATE_IMPACT_BOMS"               : Gosub CREATE_IMPACT_BOMS
+        When "CREATE_IMPACT_BOM_LINES"          : Gosub CREATE_IMPACT_BOM_LINES
+        When "VALIDATE_IMPLEMENT"               : Gosub VALIDATE_IMPLEMENT
+        When "UPDATE_STATUS"                    : Gosub UPDATE_STATUS
+        When "AUPDATE_AFTER"                    : Gosub NOTIFY_ACTIONER
+      Endcase
+Endcase
+
+Return
+
+# --------------------------------------------------
+# Initialise BOM Header properties.
+$INITIALISE
+
+  this.HOLD       = 1 # No
+  this.IMPLEMENT  = 1 # No
+  this.NUMBOM     = 0
+  this.BOHPLASTA  = 4
+  this.TOTALLINES = 0
+
+  this.IMPACTANAL = 0
+
+Return
+
+# ------------------------------------------------------
+# Operation: CREATE_IMPACT_BOMS_BATCH
+#
+# Called from Impact Analysis summary links.
+# Instantiate Batch Server process, Task: CCMIMPBATT.
+#
+$CREATE_IMPACT_BOMS_BATCH
+
+  Local Integer LOCAL_STATUS
+  Local Instance IMPBOH Using C_CCMIMPBOH
+  IMPBOH = NewInstance C_CCMIMPBOH AllocGroup null
+
+  Local Char    AFOLDER(30)
+  Local Char    USER(30)
+  Local Char    TASKNAME(30)
+  Local Date    DAT
+  Local Char    TIM(5)
+  Local Char    TBPAR(30)(1..10)
+  Local Char    TBVAL(250)(1..10)
+  Local Integer NBPAR
+  Local Integer TASKID
+  Local Char    TASKMESSAGE(250)
+
+  Local Integer LTIME
+  Local Char    CTIME(4)
+
+  # Read CHANGE REQUEST and impact header
+  LOCAL_STATUS = fmet IMPBOH.AREAD(CRID)
+
+  ASTATUS = CST_AOK
+
+  If (IMPBOH.IMPACTANAL <> 1)
+
+    LTIME = time : CTIME = format$("N00:2", int(LTIME/3600)) +format$("N00:2", int((LTIME -(int(LTIME/3600) *3600)) /60))
+
+    USER       = IMPBOH.ACTX.USER
+    TASKNAME  = "CCMIMPBATT"
+    DAT       = date$
+    TIM       = CTIME
+    NBPAR = 1  : TBPAR(NBPAR) = "CRID"        : TBVAL(NBPAR) = CRID
+    NBPAR += 1 : TBPAR(NBPAR) = "TRANSACTION" : TBVAL(NBPAR) = "3"
+
+    # Impact Analysis 'Created' flag = "No" ...
+    IMPBOH.IMPACTANAL = 1
+    LOCAL_STATUS = fmet IMPBOH.AUPDATE()
+
+    ASTATUS = func ASYRMNGTREQ.CRERQT(IMPBOH.ACTX,
+&                              IMPBOH.ACTX.AFOLDER,
+&                              USER,
+&                              TASKNAME,
+&                              DAT,
+&                              TIM,
+&                              TBPAR,
+&                              TBVAL,
+&                              NBPAR,
+&                              TASKID,
+&                              TASKMESSAGE)
+
+  Endif
+
+  FreeGroup IMPBOH
+  ARET_VALUE = ASTATUS
+
+Return
+
+# Delete existing Impact analysis for BOM, and
+# create new list of all BOMs where this product is used
+
+$CREATE_IMPACT_BOMS
+  Local Integer LOCSTATUS, I, COUNT, FOUND
+  Local Instance SELCHGREQ Using C_CCMCHGREQ
+  Local Instance SELIMPBOH Using C_CCMIMPBOH
+  Local File CCMIMPBOD [CCMIBOD]
+
+  # Begin a Database Transaction ...
+  Local Integer TRANSACTION_PENDING
+  TRANSACTION_PENDING = adxlog
+  If (adxlog = 0)
+    Trbegin [CCMIBOD]
+  Endif
+
+ # Read CHANGE REQUEST
+  SELCHGREQ = NewInstance C_CCMCHGREQ AllocGroup null
+  LOCSTATUS = fmet SELCHGREQ.AREAD(CRID)
+
+  # Read BOM header
+  SELIMPBOH = NewInstance C_CCMIMPBOH AllocGroup null
+  LOCSTATUS = fmet SELIMPBOH.AREAD(CRID)
+
+  # If request in review, and refresh can be done
+  If (LOCSTATUS = [V]CST_AOK and SELCHGREQ.CRSTATUS = 2 and SELIMPBOH.HOLD <> 2)
+
+    # Clear lines ...
+    Delete [CCMIBOD] Where CRID = SELIMPBOH.CRID
+
+    SELIMPBOH.HOLD = 1      # No
+    SELIMPBOH.IMPLEMENT = 1 # No
+    SELIMPBOH.NUMBOM = 0
+    SELIMPBOH.TOTALLINES  = 0
+
+    LOCSTATUS = fmet SELIMPBOH.CREATE_IMPACT_BOM_LINES (SELIMPBOH.CRID, SELCHGREQ.PRODUCT, SELCHGREQ.ECCVALMAJ, SELCHGREQ.ECCVALMIN)
+
+  Endif
+
+    #If lines exist then set the status to Plan else Not applicale
+    If SELIMPBOH.NUMBOM >= 1
+      SELIMPBOH.BOHPLASTA = 1 # Plan
+    Else
+      SELIMPBOH.BOHPLASTA = 4
+      # If Plan Status is 4 (None) then Implement flag is always ticked ...
+      SELIMPBOH.IMPLEMENT = 2
+    Endif
+
+    SELIMPBOH.IMPACTANAL = 2
+
+    LOCSTATUS= fmet SELIMPBOH.AUPDATE()
+
+  # Commit or Rollback the Database Transaction ...
+  If (TRANSACTION_PENDING = 0)
+    If (ASTATUS <= [V]CST_AINFO)
+      Commit
+    Else
+      Rollback
+    Endif
+  Endif
+
+  LogicClose File [CCMIBOD]
+  FreeGroup SELIMPBOH
+  FreeGroup SELCHGREQ
+
+
+Return
+
+
+#
+# --------------------------------------------------
+# FUNCTION NAME:        CREATE_IMPACT_BOM_LINES
+# FUNCTION DESCRIPTION:
+# FUNCTION TYPE:        Method
+# PARAMETERS:           CRID          (Value) - Change Request ID
+#                       PRODUCT       (Value) - Change Request Product
+#                       MAJOR_VERSION (Value) - Change Request Major Version
+#                       MINOR_VERSION (Value) - Change Request Minor Version
+# RETURN_VALUE:         None
+#
+#
+$CREATE_IMPACT_BOM_LINES
+
+  # Local Char    LAST_ITMREF(20)
+  Local Integer LINE_NUMBER
+
+  Local Date    WDATREF         : WDATREF = AVOID.ADATE
+  Local Integer WLSTTYP         : WLSTTYP = 3      # 1 = first level, 2 = last level, 3 = multi-level
+  Local Integer WALTTYPSTR      : WALTTYPSTR = 1   # 1 = Sales (kit), 2 = WO (Manufacturing), 3 = EO (subcontracting BOM)
+  Local Integer WALTTYPEND      : WALTTYPEND = 3   # 1 = Sales (kit), 2 = WO (Manufacturing), 3 = EO (subcontracting BOM)
+  Local Integer WALTSTR         : WALTSTR = 0      # From alt number : 0 = all alternatives
+  Local Integer WALTEND         : WALTEND = 0      # From alt number : 0 = all alternatives
+  Local Char    MYCRIT(250)     : MYCRIT = "1=1"   # No particular Where criteria
+  Local Char    MYFOR(GLONFOR)  : MYFOR = ""       # Reference of a Formula in table TABFOR [F:TFO] with FORTYP=31
+  Local Integer WRET
+
+  Local File BOMWUS [BOW]
+  Local File ITMMASTER [ITM]
+  Local File ITMCATEG [ITG]
+  Local File ECCVAL [EVL]
+
+  Local Instance CHANGE_REQUEST Using C_CCMCHGREQ
+  CHANGE_REQUEST = NewInstance C_CCMCHGREQ AllocGroup null
+  Local Instance CCMIMPBOD Using C_CCMIMPBOD
+  CCMIMPBOD = NewInstance C_CCMIMPBOD AllocGroup null
+
+  #CATUA X3-38562.sn Set Product Code length to GLONITM
+  Local Char PARENT_PRODUCT(GLONITM)
+  #CATUA X3-38562.en
+  Local Char PARM_MAJOR_VERSION(10)
+  Local Char PARM_MINOR_VERSION(10)
+
+  Local Char CRITERIA(250)
+
+  LINE_NUMBER = 0     # Reset The Number of the Impact Analysis Line.
+
+  Gosub PROCESS_PRODUCT_AS_PARENT
+
+  # Determine the WHERE_USED BOMs (records in BOMWUS [BOW] table) ...
+  Call CALCULATE_WHERE_USED_ECC(this.ACTX,
+&                               PRODUCT,
+&                               MAJOR_VERSION,
+&                               MINOR_VERSION,
+&                               WDATREF,
+&                               WLSTTYP,
+&                               WALTTYPSTR,
+&                               WALTTYPEND,
+&                               WALTSTR,
+&                               WALTEND,
+&                               MYCRIT,
+&                               MYFOR,
+&                               WRET) From SUBBOW_SYRA
+
+  this.NUMBOM = 0     # Reset Number of BOMs found.
+
+  LAST_ITMREF = ""  # Reset Last BOM Parent Product. Determines unique BOM Parent Products.
+
+  # Iterate through the WHERE_USED BOMs in BOMWUS [BOW] table ...
+  For [BOW] Where CREUSR = this.ACTX.USER and
+&                 BOWUID = adxuid(1)
+
+    # Include ALL BOMs ...
+    If ([F:BOW]ITMREF <> LAST_ITMREF)
+
+      # Retrieve PARENT_PRODUCT versions ...
+      PARENT_PRODUCT = [F:BOW]ITMREF
+      If (fmet CHANGE_REQUEST.IS_PRODUCT_VERSION_MANAGED(PARENT_PRODUCT) > 1)
+        CRITERIA = " 1=1 "
+        If [F:BOW]BOMSTRDAT <> [0/0/0]
+          CRITERIA += " & STRDAT>=["+format$(GFMD,[F:BOW]BOMSTRDAT)+"]"
+        Endif
+        If [F:BOW]BOMENDDAT <> [0/0/0]
+          CRITERIA += " & STRDAT<=["+format$(GFMD,[F:BOW]BOMENDDAT)+"]"
+        Endif
+        For [EVL] Where ITMREF = [F:BOW]ITMREF and
+&                       ECCTYP = [F:BOW]BOMALTTYP and
+&                       BOMALT = [F:BOW]BOMALT and
+&                       evalue(CRITERIA)
+          PARM_MAJOR_VERSION = [F:EVL]ECCVALMAJ
+          PARM_MINOR_VERSION = [F:EVL]ECCVALMIN
+          Gosub CREATE_IMPACT_ANALYSIS_LINE
+        Next
+      Else
+        PARM_MAJOR_VERSION = ""
+        PARM_MINOR_VERSION = ""
+        Gosub CREATE_IMPACT_ANALYSIS_LINE
+      Endif
+
+    # Include ALL BOMs ...
+    Endif
+    LAST_ITMREF = [F:BOW]ITMREF
+
+  Next
+
+  # Clear WHERE_USED BOMs (records in BOMWUS [BOW] table) ...
+  Delete [BOW] Where CREUSR = this.ACTX.USER & BOWUID = adxuid(1)
+
+  # Store Number of BOMs found, together with the Number of Impact Analysis Lines ...
+  this.NUMBOM = LINE_NUMBER
+  this.TOTALLINES = LINE_NUMBER
+
+  FreeGroup CHANGE_REQUEST
+  FreeGroup CCMIMPBOD
+  Close Local File [BOW]
+  Close Local File [ITM]
+  Close Local File [ITG]
+
+Return
+
+#
+# --------------------------------------------------
+# FUNCTION NAME:        PROCESS_PRODUCT_AS_PARENT
+# FUNCTION DESCRIPTION: Look Up BOMs directly - in case this Change Request Product is a 'Finished Goods'.
+#                       Called from CREATE_IMPACT_BOM_LINES
+# FUNCTION TYPE:        Subroutine
+# PARAMETERS:           N/A
+# RETURN_VALUE:         N/A
+#
+#
+$PROCESS_PRODUCT_AS_PARENT
+
+  Local File BOM [BOH]
+  Local Integer VERSION_MANAGED : VERSION_MANAGED = CST_AFALSE
+
+  PARENT_PRODUCT = PRODUCT
+
+  If (fmet CHANGE_REQUEST.IS_PRODUCT_VERSION_MANAGED(PARENT_PRODUCT) > 1)
+    VERSION_MANAGED = CST_ATRUE
+  Endif
+
+  # Header only ...
+  # [F:BOW]BOMSEQ    = 0
+  # [F:BOW]QTYRND    = ""
+  # [F:BOW]BOMUOM    = ""
+  # [F:BOW]LIKQTY    = 0
+  # [F:BOW]NIV       = 0
+  # [F:BOW]BOMSHO    = ""
+
+  Filter [BOH] Where [F:BOH]ITMREF = PRODUCT
+  For [BOH]BOH0
+
+    [F:BOW]BOMALT    = [F:BOH]BOMALT
+    [F:BOW]BOMALTTYP = [F:BOH]BOMALTTYP
+
+    If (VERSION_MANAGED = CST_ATRUE)
+      CRITERIA = " 1=1 "
+      If (MAJOR_VERSION <> "")
+        CRITERIA += "and ECCVALMAJ = '" +MAJOR_VERSION +"'"
+      Endif
+      If (MINOR_VERSION <> "")
+        CRITERIA += "and ECCVALMIN = '" +MINOR_VERSION +"'"
+      Endif
+      For [EVL] Where ITMREF = PARENT_PRODUCT and
+&                     ECCTYP = [F:BOH]BOMALTTYP and
+&                     BOMALT = [F:BOH]BOMALT and
+&                     evalue(CRITERIA)
+          PARM_MAJOR_VERSION = [F:EVL]ECCVALMAJ
+          PARM_MINOR_VERSION = [F:EVL]ECCVALMIN
+          Gosub CREATE_IMPACT_ANALYSIS_LINE
+      Next
+    Else
+      PARM_MAJOR_VERSION = ""
+      PARM_MINOR_VERSION = ""
+      Gosub CREATE_IMPACT_ANALYSIS_LINE
+    Endif
+
+  Next
+
+  Close Local File [BOH]
+
+Return
+
+#
+# --------------------------------------------------
+# FUNCTION NAME:        CREATE_IMPACT_ANALYSIS_LINE
+# FUNCTION DESCRIPTION: INSERTs a line into the Impact Analysis BOM table.
+#                       Called from CREATE_IMPACT_BOM_LINES and PROCESS_PRODUCT_AS_PARENT
+# FUNCTION TYPE:        Subroutine
+# PARAMETERS:           N/A
+# RETURN_VALUE:         N/A
+#
+#
+$CREATE_IMPACT_ANALYSIS_LINE
+
+  Local Integer LOCSTATUS
+
+  LOCSTATUS = fmet CCMIMPBOD.AINIT()
+
+  LINE_NUMBER += 1
+
+  CCMIMPBOD.CRID         = CRID
+  CCMIMPBOD.LINENO       = LINE_NUMBER
+  CCMIMPBOD.SORTSEQ      = LINE_NUMBER
+  CCMIMPBOD.ITMREF       = PARENT_PRODUCT
+  CCMIMPBOD.BOMALTTYP    = [F:BOW]BOMALTTYP
+  CCMIMPBOD.ECCVALMAJ    = PARM_MAJOR_VERSION
+  CCMIMPBOD.ECCVALMIN    = PARM_MINOR_VERSION
+  CCMIMPBOD.BOMALT       = [F:BOW]BOMALT
+  CCMIMPBOD.BOMSEQ       = [F:BOW]BOMSEQ
+  CCMIMPBOD.QTYRND       = [F:BOW]QTYRND
+  CCMIMPBOD.BOMUOM       = [F:BOW]BOMUOM
+  CCMIMPBOD.LIKQTY       = [F:BOW]LIKQTY
+  CCMIMPBOD.NIV          = [F:BOW]NIV
+  CCMIMPBOD.BOMSHO       = [F:BOW]BOMSHO
+  CCMIMPBOD.BLOCK        = 1 # 1 = No
+  CCMIMPBOD.TRANTYPE     = 3 # 3 = BOM
+  CCMIMPBOD.LINESTATUS   = 1 # 1 = Pending
+  CCMIMPBOD.STARTDATE    = AVOID.ADATE
+  CCMIMPBOD.ENDDATE      = AVOID.ADATE
+  CCMIMPBOD.COMPLETEDATE = AVOID.ADATE
+  CCMIMPBOD.ACTIONID     = ""
+  CCMIMPBOD.ACTIONER     = ""
+  CCMIMPBOD.COMMENT      = ""
+  CCMIMPBOD.COMMENT = PARM_MAJOR_VERSION + PARM_MINOR_VERSION
+
+  LOCSTATUS = fmet CCMIMPBOD.AINSERT()
+
+Return
+
+# -------------------------------------------------------------------------------
+# Update Sales Oreder Detail Plan 'header' status.
+#
+# Set status to:
+#
+# 4 'Not applicable'  ... if (No sales order lines) or (No actionable sales order lines and Planning complete),
+# 3 'Complete'        ... if (All actionable sales order lines are complete),
+# 2 'Implement'       ... if (Actionable sales order lines and Planning complete),
+# 1 'Plan'            ... if (Planning is not complete).
+
+$UPDATE_STATUS
+
+  Local Integer ACTIONLINES, LINESCOMP
+
+  # Count number of action lines ...
+  Local File CCMIMPBOD [CCMBOD]
+  Filter [CCMBOD] Where CRID = this.CRID and ACTIONID <> ""
+  ACTIONLINES = rowcount([CCMBOD])
+
+  # Count number of action lines completed ...
+  Filter [CCMBOD] Where CRID = this.CRID and LINESTATUS = 3
+  LINESCOMP = rowcount([CCMBOD])
+
+  Filter [CCMBOD]
+  LogicClose File [CCMBOD]
+
+  If (this.NUMBOM = 0) or
+&    (ACTIONLINES = 0 and this.IMPLEMENT = 2)
+    this.BOHPLASTA = 4
+  Elsif (ACTIONLINES <> 0 and ACTIONLINES = LINESCOMP)
+    this.BOHPLASTA = 3
+  Elsif (this.IMPLEMENT = 2)
+    this.BOHPLASTA = 2
+  Else
+    this.BOHPLASTA = 1
+  Endif
+
+  ARET_VALUE = CST_ATRUE
+
+Return
+
+# -------------------------------------------------------------------------------
+# "Planning complete" flag validation ...
+$VALIDATE_IMPLEMENT
+  Local Integer ACTIONLINES, LOCSTATUS
+
+  # count number of action lines
+  Local File CCMIMPBOD [CCMBOD]
+  Filter [CCMBOD] Where CRID = this.CRID and ACTIONID <> ""
+  ACTIONLINES = rowcount([CCMBOD])
+  Filter [CCMBOD]
+  LogicClose File [CCMBOD]
+
+  ASTATUS = CST_AOK
+
+  If (this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+    If (this.TOTALLINES > ACTIONLINES)
+#      LOCSTATUS = fmet this.ASETERROR ("IMPLEMENT", mess(62,2038,1), CST_AINFO)
+      LOCSTATUS = fmet this.ASETERROR ("", mess(62,2038,1), CST_AINFO)
+    Endif
+  Endif
+
+  ARET_VALUE = ASTATUS
+
+Return
+
+#
+# --------------------------------------------------
+# FUNCTION NAME:        NOTIFY_ACTIONER
+# FUNCTION DESCRIPTION: Notify Actioner
+# FUNCTION TYPE:        Subroutine
+# PARAMETERS:           N/A
+# RETURN_VALUE:         N/A
+#
+#
+$NOTIFY_ACTIONER
+  Local Instance CHANGE_REQUEST Using C_CCMCHGREQ
+  CHANGE_REQUEST = NewInstance C_CCMCHGREQ AllocGroup null
+  Local File CCMIMPBOD [CCMIBOD]
+  Local Char LAST_ACTIONER(5) : LAST_ACTIONER = ""
+  Local Integer STAT
+  Local Integer EMAIL_TYPE
+  Local Char SUBJECT(250)
+  Local Clbfile BODY(0), OTHER_BODY(0)
+  Local Integer AC_EMAIL : AC_EMAIL = CST_AFALSE
+# Issue 109096/2 - send e-mails to actioners
+  Local Integer SENDEMAIL : SENDEMAIL = CST_AFALSE
+  STAT = fmet CHANGE_REQUEST.AREAD(this.CRID)
+
+  If (CHANGE_REQUEST.NCSREC = 2)
+    # Issue X3-76268 - 2018-02-13 by JUSYN : Remove/deactivate email notification NCS
+#    If (fmet this.ACTX.APARAM.AGETVALNUM(CST_ALEVFOLD, this.ACTX.AFOLDER, "NCSEMAILAC") <> 1 and
+#&     this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+#
+#      SENDEMAIL = CST_ATRUE
+#      EMAIL_TYPE = 3713  # Actioner
+#      BODY(0) = AVOID.ACLOB
+#      OTHER_BODY(0) = AVOID.ACLOB
+#      Append OTHER_BODY, mess(3,2039,1) +chr$(10)
+#      STAT = fmet CHANGE_REQUEST.BUILD_EMAIL(EMAIL_TYPE, SUBJECT, BODY, OTHER_BODY, "NCSPLABOH")
+#    Endif
+    # End issue X3-76268
+  Else
+# End issue 109096/2
+
+    If (fmet this.ACTX.APARAM.AGETVALNUM(CST_ALEVFOLD, this.ACTX.AFOLDER, "CCMEMAILAC") <> 1 and
+&     this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+
+      SENDEMAIL = CST_ATRUE
+      EMAIL_TYPE = 2066  # Actioner
+      BODY(0) = AVOID.ACLOB
+      OTHER_BODY(0) = AVOID.ACLOB
+      Append OTHER_BODY, mess(3,2039,1) +chr$(10)
+      STAT = fmet CHANGE_REQUEST.BUILD_EMAIL(EMAIL_TYPE, SUBJECT, BODY, OTHER_BODY, "CCMPLABOH")
+    Endif
+# Issue 109096/2
+  Endif
+
+  If (SENDEMAIL = CST_ATRUE)
+# End issue 109096/2
+    Filter [CCMIBOD] Where CRID = this.CRID and ACTIONER <> "" Order By ACTIONER
+    For [CCMIBOD]
+      If ([F:CCMIBOD]ACTIONER <> LAST_ACTIONER and
+&         [F:CCMIBOD]ACTIONER <> this.ACTX.USER)
+
+        STAT = fmet CHANGE_REQUEST.SEND_EMAIL(this.ACTX.USER, [F:CCMIBOD]ACTIONER, "", SUBJECT, BODY)
+
+        If (STAT = CST_AOK)
+          AC_EMAIL = CST_ATRUE
+        Endif
+
+        LAST_ACTIONER = [F:CCMIBOD]ACTIONER
+
+      Endif
+    Next
+
+    If (AC_EMAIL = CST_ATRUE)
+      STAT = fmet this.ASETERROR("", mess(60,2038,1), CST_AINFO)
+    Endif
+    Filter [CCMIBOD]
+
+  Endif
+
+  LogicClose File [CCMIBOD]
+  FreeGroup CHANGE_REQUEST
+
+Return
+
+$PROPERTIES
+Case [L]CURPRO
+Endcase
+Return
+
+
+#**
+#* Label for coding event of CRUD
+#* @param CURPTH Local Char(250), contains the class path
+#* @param AEVENT Local Char(20), contains the event code
+#* @return ASTATUS Local Integer
+#*!
+$EVENTS
+#Case [L]CURPTH
+#   When ""
+#    Case [L]AEVENT
+#    Endcase
+#Endcase
+Return
+
+
+#**
+#* Label for coding your operations
+#* @param AOPERATION Local Char(20), contains the operation code
+#* @return ARET_VALUE (the type of the return value is declared in the method)
+#*!
+$OPERATIONS
+#Case [L]AOPERATION
+#Endcase
+Return
+

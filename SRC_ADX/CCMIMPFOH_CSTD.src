@@ -1,0 +1,647 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Class CCMIMPFOH - Demand Forecasts Impact Analysis 'header'
+# Issue 109096/2 - 2015-11-24 by BAKHA : For non-conformance, send email to actioners
+
+$METHODS
+Case [L]CURPTH
+   When ""
+      Case [L]ACTION
+        When "AINIT"                            : Gosub INITIALISE
+        When "CREATE_IMPACT_FORECAST_BATCH"     : Gosub CREATE_IMPACT_FORECAST_BATCH
+        When "CREATE_IMPACT_FORECAST"           : Gosub CREATE_IMPACT_FORECAST
+        When "CREATE_IMPACT_FORECAST_LINES"     : Gosub CREATE_IMPACT_FORECAST_LINES
+        When "START_DATE"                       : Gosub START_DATE
+        When "END_DATE"                         : Gosub END_DATE
+        When "VALIDATE_IMPLEMENT"               : Gosub VALIDATE_IMPLEMENT
+        When "UPDATE_STATUS"                    : Gosub UPDATE_STATUS
+        When "AUPDATE_AFTER"                    : Gosub NOTIFY_ACTIONER
+      Endcase
+Endcase
+
+Return
+
+# --------------------------------------------------
+# Initialise 'header' properties ...
+$INITIALISE
+
+  Local Integer LINES
+
+  this.HOLD       = 1
+  this.IMPLEMENT  = 1
+  this.FOHMONTHS  = 0
+  this.FOHQTY     = 0
+  this.FOHPLASTA  = 4
+
+  this.IMPACTANAL = 0
+
+Return
+
+# ------------------------------------------------------
+# Operation: CREATE_IMPACT_FORECAST_BATCH
+#
+# Called from Impact Analysis summary links.
+# Instantiate Batch Server process, Task: CCMIMPBATT.
+#
+$CREATE_IMPACT_FORECAST_BATCH
+
+  Local Integer LOCAL_STATUS
+  Local Instance IMPFOH Using C_CCMIMPFOH
+  IMPFOH = NewInstance C_CCMIMPFOH AllocGroup null
+
+  Local Char    AFOLDER(30)
+  Local Char    USER(30)
+  Local Char    TASKNAME(30)
+  Local Date    DAT
+  Local Char    TIM(5)
+  Local Char    TBPAR(30)(1..10)
+  Local Char    TBVAL(250)(1..10)
+  Local Integer NBPAR
+  Local Integer TASKID
+  Local Char    TASKMESSAGE(250)
+
+  Local Integer LTIME
+  Local Char    CTIME(4)
+
+  # Read impact header
+  LOCAL_STATUS = fmet IMPFOH.AREAD(CRID)
+
+  ASTATUS = CST_AOK
+
+  If (IMPFOH.IMPACTANAL <> 1)
+
+    LTIME = time : CTIME = format$("N00:2", int(LTIME/3600)) +format$("N00:2", int((LTIME -(int(LTIME/3600) *3600)) /60))
+
+    USER       = IMPFOH.ACTX.USER
+    TASKNAME  = "CCMIMPBATT"
+    DAT       = date$
+    TIM       = CTIME
+    NBPAR = 1  : TBPAR(NBPAR) = "CRID"        : TBVAL(NBPAR) = CRID
+    NBPAR += 1 : TBPAR(NBPAR) = "TRANSACTION" : TBVAL(NBPAR) = "5"
+
+    # Impact Analysis 'Created' flag = "No" ...
+    IMPFOH.IMPACTANAL = 1
+    LOCAL_STATUS = fmet IMPFOH.AUPDATE()
+
+    ASTATUS = func ASYRMNGTREQ.CRERQT(IMPFOH.ACTX,
+&                              IMPFOH.ACTX.AFOLDER,
+&                              USER,
+&                              TASKNAME,
+&                              DAT,
+&                              TIM,
+&                              TBPAR,
+&                              TBVAL,
+&                              NBPAR,
+&                              TASKID,
+&                              TASKMESSAGE)
+
+  Endif
+
+  FreeGroup IMPFOH
+  ARET_VALUE = ASTATUS
+
+Return
+
+# -------------------------------------------------------------------------------
+# Custom Operation ...
+#
+# Called from (a) Change Request - change of status to "In review", and
+#             (b) Impact Analysis Forecasts - refresh.
+#
+$CREATE_IMPACT_FORECAST
+
+  Local Integer LOCSTATUS
+  Local File CCMIMPFOD [CCMIFOD]
+  Local Instance SELCHGREQ Using C_CCMCHGREQ
+  Local Instance SELIMPFOH Using C_CCMIMPFOH
+
+  # Begin a Database Transaction ...
+  Local Integer TRANSACTION_PENDING
+  TRANSACTION_PENDING = adxlog
+  If (adxlog = 0)
+    Trbegin [CCMIFOD]
+  Endif
+
+  # Read Change Request ...
+  SELCHGREQ = NewInstance C_CCMCHGREQ AllocGroup null
+  LOCSTATUS = fmet SELCHGREQ.AREAD(CRID)
+
+  # Read Impact Analysis 'header' ...
+  SELIMPFOH = NewInstance C_CCMIMPFOH AllocGroup null
+  LOCSTATUS = fmet SELIMPFOH.AREAD(CRID)
+
+  # Is refresh possible? ...
+  If (LOCSTATUS = [V]CST_AOK and
+&     SELCHGREQ.CRSTATUS = 2 and
+&     SELIMPFOH.HOLD <> 2)
+
+    # Clear lines ...
+    Delete [CCMIFOD] Where CRID = SELIMPFOH.CRID
+
+    # Initialise 'header' properties ...
+    SELIMPFOH.HOLD      = 1
+    SELIMPFOH.IMPLEMENT = 1
+    SELIMPFOH.FOHMONTHS = 0
+    SELIMPFOH.FOHQTY    = 0
+
+    LOCSTATUS = fmet SELIMPFOH.CREATE_IMPACT_FORECAST_LINES (SELIMPFOH.CRID, SELCHGREQ.PRODUCT, SELCHGREQ.ECCVALMAJ, SELCHGREQ.ECCVALMIN)
+
+  Endif
+
+  # If lines (i.e. unique forecasts) then set status to 1 (Plan) else set to 4 (None) ...
+  If (SELIMPFOH.FOHMONTHS >= 1)
+    SELIMPFOH.FOHPLASTA = 1
+  Else
+    SELIMPFOH.FOHPLASTA = 4
+    # If Plan Status is 4 (None) then Implement flag is always ticked ...
+    SELIMPFOH.IMPLEMENT = 2
+  Endif
+
+  SELIMPFOH.IMPACTANAL = 2
+
+  LOCSTATUS= fmet SELIMPFOH.AUPDATE()
+
+  # Commit or Rollback the Database Transaction ...
+  If (TRANSACTION_PENDING = 0)
+    If (ASTATUS <= [V]CST_AINFO)
+      Commit
+    Else
+      Rollback
+    Endif
+  Endif
+
+  FreeGroup SELIMPFOH
+  FreeGroup SELCHGREQ
+
+  LogicClose File [CCMIFOD]
+
+Return
+
+# -------------------------------------------------------------------------------
+# Custom Method ...
+#
+# Called from $CREATE_IMPACT_FORECAST (above).
+#
+$CREATE_IMPACT_FORECAST_LINES
+  Local Char CRITERIA(250)
+  Local Integer I, LOCSTATUS, WRET
+  #MGG X3-38337_Product_Code_length_&_GLONITM_function
+  Local Char LAST_ITMREF(GLONITM)    : LAST_ITMREF = ""
+  #END MGG X3-38337_Product_Code_length_&_GLONITM_function
+  Local Date    WDATREF         : WDATREF     = AVOID.ADATE
+  Local Integer WLSTTYP         : WLSTTYP     = 3     # 1=first level, 2=last level, 3= multi-level
+  Local Integer WALTTYPSTR      : WALTTYPSTR  = 1     # 1=Sales (kit), 2=WO (Manufacturing), 3=EO (subcontracting BOM)
+  Local Integer WALTTYPEND      : WALTTYPEND  = 3     # 1=Sales (kit), 2=WO (Manufacturing), 3=EO (subcontracting BOM)
+  Local Integer WALTSTR         : WALTSTR     = 0     # From alt number : 0=all alternatives
+  Local Integer WALTEND         : WALTEND     = 0     # From alt number : 0=all alternatives
+  Local Char    MYCRIT(250)     : MYCRIT      = "1=1" # No particular Where criteria
+  Local Char    MYFOR (GLONFOR) : MYFOR       = ""    # Reference of a formula in table TABFOR [F:TFO] with FORTYP=31
+  Local File ITMMASTER [ITM]
+  Local File ITMCATEG [ITG]
+  Local Integer LINE_NUMBER     : LINE_NUMBER = 0
+  Local Char MONTHS(14)(0..)
+  Local Integer NO_MONTHS       : NO_MONTHS = 0
+  Local Integer TOTAL_QUANTITY  : TOTAL_QUANTITY = 0
+  #CATUA X3-38562.sn Set Product Code length to GLONITM
+  Local Char SUB_LINES_PRODUCT(GLONITM)
+  #CATUA X3-38562.sn
+  Local Char SUB_ECCVALMAJ(10)
+  Local Char SUB_ECCVALMIN(10)
+
+  # Create lines for Change Request Product ...
+  SUB_LINES_PRODUCT = PRODUCT
+  SUB_ECCVALMAJ = ""
+  SUB_ECCVALMIN = ""
+  Gosub CREATE_FORECAST_SUB_LINES
+
+  # Check for semi-finished goods ...
+  Read [ITM]ITM0 = PRODUCT
+  If (fstat = 0)
+
+    Read [ITG]ITG1 = [F:ITM]TCLCOD; ""
+    If (fstat = 0 and
+&       [F:ITG]SALFLG = 2)
+
+      # CCM ...
+      Local File BOMWUS [BOW]
+      Call CALCULATE_WHERE_USED_ECC(this.ACTX,
+&                               PRODUCT,
+&                               "",
+&                               "",
+&                               WDATREF,
+&                               WLSTTYP,
+&                               WALTTYPSTR,
+&                               WALTTYPEND,
+&                               WALTSTR,
+&                               WALTEND,
+&                               MYCRIT,
+&                               MYFOR,
+&                               WRET) From SUBBOW_SYRA
+      Filter [BOW] Where CREUSR = this.ACTX.USER and
+&                        BOWUID = adxuid(1)
+&                  Order By ITMREF
+      For [BOW]
+        If ([F:BOW]ITMREF <> LAST_ITMREF)
+          SUB_LINES_PRODUCT = [F:BOW]ITMREF
+          SUB_ECCVALMAJ = ""
+          SUB_ECCVALMIN = ""
+          Gosub CREATE_FORECAST_SUB_LINES
+        Endif
+        LAST_ITMREF = [F:BOW]ITMREF
+      Next
+      # CCM ...
+      Delete [BOW] Where CREUSR = this.ACTX.USER and BOWUID = adxuid(1)
+
+      Close Local File [BOW]
+
+    Endif
+  Endif
+
+  # Update summary totals ...
+  this.FOHMONTHS = NO_MONTHS
+  this.FOHQTY    = TOTAL_QUANTITY
+
+  this.TOTALLINES = LINE_NUMBER
+
+  Close Local File [ITM]
+  Close Local File [ITG]
+
+Return
+
+# -------------------------------------------------------------------------------
+$CREATE_FORECAST_SUB_LINES
+
+  Local Instance CCMIMPFOD Using C_CCMIMPFOD
+  CCMIMPFOD = NewInstance C_CCMIMPFOD AllocGroup null
+
+  Local Date SEARCH_DATE, START_DATE
+  Local Integer MM, LAST_MM, YY, LAST_YY, LINE_COUNT, ROW, TOTAL_MONTH_QTY, QTY_BUCKET, START_WEEK, DAYS
+
+  Local Integer J_START_DATE, J_ENDDAT
+
+  Local File ORDERS [ORD]
+  Local Char SITE(10), LAST_SITE(10)
+
+  LAST_MM    = 0
+  LAST_YY    = 0
+  LAST_SITE  = ""
+  LINE_COUNT = 0
+
+  SEARCH_DATE = gdat$(1,month(date$),year(date$))
+
+  Local Char CRITERIA(250)
+
+  CRITERIA = " 1=1 "
+  If (SUB_ECCVALMAJ <> "")
+    CRITERIA += " and [F:ORD]ECCVALMAJ = SUB_ECCVALMAJ"
+
+    If (SUB_ECCVALMIN <>  "")
+        CRITERIA += " and [F:ORD]ECCVALMIN = SUB_ECCVALMIN"
+    Endif
+  Endif
+
+  Filter [ORD] Where
+&   ITMREF = SUB_LINES_PRODUCT and
+&   ENDDAT >= SEARCH_DATE and
+&   ABBFIL = "" and evalue(CRITERIA)
+&   Order By STOFCY Asc; ENDDAT Asc
+
+  For [ORD]
+
+    MM = month([F:ORD]ENDDAT)
+    YY = year([F:ORD]ENDDAT)
+    SITE = [F:ORD]STOFCY
+
+    If (MM <> LAST_MM or SITE <> LAST_SITE)
+
+      If (LAST_MM <> 0 or LAST_SITE <> "")
+        CCMIMPFOD.TOTQTY = TOTAL_MONTH_QTY
+        TOTAL_QUANTITY += TOTAL_MONTH_QTY
+
+        START_DATE = fmet this.START_DATE([F:ORD]ENDDAT)
+        CCMIMPFOD.MONTHEND = nday$(nday(START_DATE) - 1)
+#        CCMIMPFOD.MONTHEND = fmet this.END_DATE(gdat$(LAST_DD,LAST_MM,LAST_YY))
+
+        LOCSTATUS = fmet CCMIMPFOD.AINSERT()
+
+        Gosub NUMBER_OF_MONTHS
+
+      Endif
+
+      Gosub NEW_ROW
+
+    Endif
+
+    LAST_MM = MM
+    LAST_YY = year([F:ORD]ENDDAT)
+    LAST_SITE = SITE
+
+    J_START_DATE = nday(START_DATE)
+    J_ENDDAT = nday([F:ORD]ENDDAT)
+    QTY_BUCKET = (J_ENDDAT - J_START_DATE) / 7 + 1
+
+    Case QTY_BUCKET
+      When 1 : CCMIMPFOD.WEEQTY1 = [F:ORD]EXTQTY
+      When 2 : CCMIMPFOD.WEEQTY2 = [F:ORD]EXTQTY
+      When 3 : CCMIMPFOD.WEEQTY3 = [F:ORD]EXTQTY
+      When 4 : CCMIMPFOD.WEEQTY4 = [F:ORD]EXTQTY
+      When 5 : CCMIMPFOD.WEEQTY5 = [F:ORD]EXTQTY
+    Endcase
+
+    TOTAL_MONTH_QTY += [F:ORD]EXTQTY
+
+  Next
+
+  If (LAST_MM <> 0 or LAST_SITE <> "")
+    CCMIMPFOD.TOTQTY = TOTAL_MONTH_QTY
+    TOTAL_QUANTITY += TOTAL_MONTH_QTY
+
+#    START_DATE = fmet this.START_DATE([F:ORD]ENDDAT)
+#    CCMIMPFOD.MONTHEND = nday$(nday(START_DATE) - 1)
+    CCMIMPFOD.MONTHEND = fmet this.END_DATE(gdat$(1,LAST_MM,LAST_YY))
+
+    LOCSTATUS = fmet CCMIMPFOD.AINSERT()
+
+    Gosub NUMBER_OF_MONTHS
+
+  Endif
+
+  LogicClose File [ORD]
+
+Return
+
+# -------------------------------------------------------------------------------
+$NEW_ROW
+
+  Local Integer LOCSTATUS
+
+  LOCSTATUS = fmet CCMIMPFOD.AINIT()
+
+  LINE_NUMBER += 1
+
+  CCMIMPFOD.CRID          = CRID
+  CCMIMPFOD.LINENO        = LINE_NUMBER
+  CCMIMPFOD.SORTSEQ       = LINE_NUMBER
+  CCMIMPFOD.SITE          = [F:ORD]STOFCY
+  CCMIMPFOD.ITMREF        = [F:ORD]ITMREF
+  CCMIMPFOD.ECCVALMAJ     = [F:ORD]ECCVALMAJ
+  CCMIMPFOD.ECCVALMIN     = [F:ORD]ECCVALMIN
+  CCMIMPFOD.YEA           = num$(YY)
+  CCMIMPFOD.MONTHNAME     = month$(MM)
+  CCMIMPFOD.ORDSTATUS     = "Forecast"
+
+  START_DATE = fmet this.START_DATE([F:ORD]ENDDAT)
+#  START_DATE = fmet this.START_DATE(gdat$(1,month([F:ORD]ENDDAT),year([F:ORD]ENDDAT)))
+
+  CCMIMPFOD.MONTHSTART = START_DATE
+
+  CCMIMPFOD.TRANTYPE      = 5
+  CCMIMPFOD.LINESTATUS    = 1
+  CCMIMPFOD.STARTDATE     = AVOID.ADATE
+  CCMIMPFOD.ENDDATE       = AVOID.ADATE
+  CCMIMPFOD.COMPLETEDATE  = AVOID.ADATE
+  CCMIMPFOD.ACTIONID      = ""
+  CCMIMPFOD.ACTIONER      = ""
+  CCMIMPFOD.COMMENT       = ""
+
+  CCMIMPFOD.WEEQTY1 = 0
+  CCMIMPFOD.WEEQTY2 = 0
+  CCMIMPFOD.WEEQTY3 = 0
+  CCMIMPFOD.WEEQTY4 = 0
+  CCMIMPFOD.WEEQTY5 = 0
+
+  TOTAL_MONTH_QTY = 0
+
+Return
+
+# -------------------------------------------------------------------------------
+$NUMBER_OF_MONTHS
+
+  Local Integer COUNT, FOUND
+  Local Char YEAR_AND_MONTH(14)
+
+  YEAR_AND_MONTH = CCMIMPFOD.YEA + CCMIMPFOD.MONTHNAME
+  FOUND = CST_AFALSE
+  For COUNT = 0 To NO_MONTHS
+    If (YEAR_AND_MONTH = MONTHS(COUNT))
+      FOUND = CST_ATRUE
+      Break
+    Endif
+  Next
+  If (FOUND = CST_AFALSE)
+    MONTHS(NO_MONTHS) = YEAR_AND_MONTH
+    NO_MONTHS = NO_MONTHS +1
+  Endif
+
+Return
+
+# -------------------------------------------------------------------------------
+$START_DATE
+
+  Local Date START_DATE
+  Local Integer START_WEEK, YY
+
+  START_WEEK = week(REF_DATE)
+  YY = year(REF_DATE)
+  START_DATE = aweek(START_WEEK, YY)
+
+  ARET_VALUE = START_DATE
+
+Return
+
+# -------------------------------------------------------------------------------
+$END_DATE
+
+  Local Date END_DATE
+  Local Integer DAY_NUMBER, J_DATE
+
+  END_DATE = eomonth(REF_DATE)
+  DAY_NUMBER = dayn(END_DATE)
+  If (DAY_NUMBER >= 4)
+    J_DATE = nday(END_DATE) + (7 -DAY_NUMBER)
+  Else
+    J_DATE = nday(END_DATE) - DAY_NUMBER
+  Endif
+  END_DATE = nday$(J_DATE)
+
+  ARET_VALUE = END_DATE
+
+Return
+
+# -------------------------------------------------------------------------------
+# Update Sales Oreder Detail Plan 'header' status.
+#
+# Set status to:
+#
+# 4 'Not applicable'  ... if (No sales order lines) or (No actionable sales order lines and Planning complete),
+# 3 'Complete'        ... if (All actionable sales order lines are complete),
+# 2 'Implement'       ... if (Actionable sales order lines and Planning complete),
+# 1 'Plan'            ... if (Planning is not complete).
+
+$UPDATE_STATUS
+
+  Local Integer STAT, ACTIONLINES, LINESCOMP
+
+  # Count number of action lines ...
+  Local File CCMIMPFOD [CCMFOD]
+  Filter [CCMFOD] Where CRID = this.CRID and ACTIONID <> ""
+  ACTIONLINES = rowcount([CCMFOD])
+
+  # Count number of action lines completed ...
+  Filter [CCMFOD] Where CRID = this.CRID and LINESTATUS = 3
+  LINESCOMP = rowcount([CCMFOD])
+
+  Filter [CCMFOD]
+  LogicClose File [CCMFOD]
+
+  If (this.FOHMONTHS = 0) or
+&    (ACTIONLINES = 0 and this.IMPLEMENT = 2)
+    this.FOHPLASTA = 4
+  Elsif (ACTIONLINES <> 0 and ACTIONLINES = LINESCOMP)
+    this.FOHPLASTA = 3
+  Elsif (this.IMPLEMENT = 2)
+    this.FOHPLASTA = 2
+  Else
+    this.FOHPLASTA = 1
+  Endif
+
+  ARET_VALUE = CST_ATRUE
+
+Return
+
+# -------------------------------------------------------------------------------
+# "Planning complete" flag validation ...
+$VALIDATE_IMPLEMENT
+  Local Integer ACTIONLINES, LOCSTATUS
+
+  # count number of action lines
+  Local File CCMIMPFOD [CCMFOD]
+  Filter [CCMFOD] Where CRID = this.CRID and ACTIONID <> ""
+  ACTIONLINES = rowcount([CCMFOD])
+  Filter [CCMFOD]
+  LogicClose File [CCMFOD]
+
+  ASTATUS = CST_AOK
+
+  If (this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+    If (this.TOTALLINES > ACTIONLINES)
+#      LOCSTATUS = fmet this.ASETERROR ("IMPLEMENT", mess(62,2038,1), CST_AINFO)
+      LOCSTATUS = fmet this.ASETERROR ("", mess(62,2038,1), CST_AINFO)
+    Endif
+  Endif
+
+ ARET_VALUE = ASTATUS
+
+Return
+
+#
+# --------------------------------------------------
+# FUNCTION NAME:        NOTIFY_ACTIONER
+# FUNCTION DESCRIPTION: Notify Actioner
+# FUNCTION TYPE:        Subroutine
+# PARAMETERS:           N/A
+# RETURN_VALUE:         N/A
+#
+#
+$NOTIFY_ACTIONER
+
+  Local Instance CHANGE_REQUEST Using C_CCMCHGREQ
+  CHANGE_REQUEST = NewInstance C_CCMCHGREQ AllocGroup null
+  Local File CCMIMPFOD [FOD]
+  Local Char LAST_ACTIONER(5)
+  Local Integer STAT
+  Local Integer EMAIL_TYPE
+  Local Char SUBJECT(250)
+  Local Clbfile BODY(0), OTHER_BODY(0)
+  Local Integer AC_EMAIL : AC_EMAIL = CST_AFALSE
+# Issue 109096/2 - send e-mails to actioners
+  Local Integer SENDEMAIL : SENDEMAIL = CST_AFALSE
+  STAT = fmet CHANGE_REQUEST.AREAD(this.CRID)
+
+  If (CHANGE_REQUEST.NCSREC = 2)
+    # Issue X3-76268 - 2018-02-13 by JUSYN : Remove/deactivate email notification NCS
+#    If (fmet this.ACTX.APARAM.AGETVALNUM(CST_ALEVFOLD, this.ACTX.AFOLDER, "NCSEMAILAC") <> 1 and
+#&     this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+#
+#      SENDEMAIL = CST_ATRUE
+#      EMAIL_TYPE = 3713  # Actioner
+#      BODY(0) = AVOID.ACLOB
+#      OTHER_BODY(0) = AVOID.ACLOB
+#      Append OTHER_BODY, mess(5,2039,1) +chr$(10)
+#      STAT = fmet CHANGE_REQUEST.BUILD_EMAIL(EMAIL_TYPE, SUBJECT, BODY, OTHER_BODY, "NCSPLAFOH")
+#    Endif
+    # End issue X3-76268
+  Else
+# End issue 109096/2
+    If (fmet this.ACTX.APARAM.AGETVALNUM(CST_ALEVFOLD, this.ACTX.AFOLDER, "CCMEMAILAC") <> 1 and
+&     this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+
+      SENDEMAIL = CST_ATRUE
+      EMAIL_TYPE = 2066  # Actioner
+      BODY(0) = AVOID.ACLOB
+      OTHER_BODY(0) = AVOID.ACLOB
+      Append OTHER_BODY, mess(5,2039,1) +chr$(10)
+      STAT = fmet CHANGE_REQUEST.BUILD_EMAIL(EMAIL_TYPE, SUBJECT, BODY, OTHER_BODY, "CCMPLAFOH")
+    Endif
+# Issue 109096/2
+  Endif
+
+  If (SENDEMAIL = CST_ATRUE)
+# End issue 109096/2
+    Filter [FOD] Where CRID = this.CRID and ACTIONER <> "" Order By ACTIONER
+    For [FOD]
+      If ([F:FOD]ACTIONER <> LAST_ACTIONER and
+&         [F:FOD]ACTIONER <> this.ACTX.USER)
+
+        STAT = fmet CHANGE_REQUEST.SEND_EMAIL(this.ACTX.USER, [F:FOD]ACTIONER, "", SUBJECT, BODY)
+
+        If (STAT = CST_AOK)
+          AC_EMAIL = CST_ATRUE
+        Endif
+
+        LAST_ACTIONER = [F:FOD]ACTIONER
+
+      Endif
+    Next
+
+    If (AC_EMAIL = CST_ATRUE)
+      ASTATUS = fmet this.ASETERROR("", mess(60,2038,1), CST_AINFO)
+    Endif
+
+  Endif
+  Filter [FOD]
+  LogicClose File [FOD]
+  FreeGroup CHANGE_REQUEST
+
+Return
+
+$PROPERTIES
+Case [L]CURPRO
+Endcase
+Return
+
+
+#**
+#* Label for coding event of CRUD
+#* @param CURPTH Local Char(250), contains the class path
+#* @param AEVENT Local Char(20), contains the event code
+#* @return ASTATUS Local Integer
+#*!
+$EVENTS
+#Case [L]CURPTH
+#   When ""
+#    Case [L]AEVENT
+#    Endcase
+#Endcase
+Return
+
+
+#**
+#* Label for coding your operations
+#* @param AOPERATION Local Char(20), contains the operation code
+#* @return ARET_VALUE (the type of the return value is declared in the method)
+#*!
+$OPERATIONS
+#Case [L]AOPERATION
+#Endcase
+Return
+

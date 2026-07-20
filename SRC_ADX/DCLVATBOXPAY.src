@@ -1,0 +1,1578 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#  TVA SUR ENCAISSEMENTS  #
+###########################
+#####################################################################
+# 1°) On met à jour les montants déclarés ([DAE]AMTVAT) pour :
+#    - Les comptes de TVA sur encaissements
+#    - Les comptes soumis à TVA sur encaissements
+# 2°) Si une ligne d'écriture ne contient pas de code taxe
+# on considère le compte comme non soumis.
+# Il existe obligatoirement au moins un code taxe 'exonéré' dans
+# le paramétrage de codes de taxes. Une ligne peut contenir un
+# compte de type 'soumis à TVA' alors qu'il n'y a pas de code taxe
+# associé. Dans ce cas, il ne faut pas la prendre en compte
+#######################################################################
+
+#############################################################################################
+# Contraintes (règles de gestion)
+# 1°) Les comptes doivent être correctement paramétrés en ce qui concerne les zones 'Gestion
+# de TVA' (soumis, non soumis, compte de TVA) et 'Imputation taxe' (collectée ventes,
+# collectée immos, déductible achats, déductible immos)
+# 2°) Les types de pièces "déclenchants" (règlements) doivent être correctement
+# paramétrés dans le paramétrage des types de pièces
+# 3°) La pièce à utiliser pour le versement ou la réception d'un acompte
+# peut être non déclenchante ou déclenchante
+# 4°) La pièce à utiliser pour l'imputation de l'acompte sur la facture doit être
+# déclenchante
+# 5°) Dans le cas d'un versement ou de la réception d'un acompte relatif à une
+# prestation de service, le compte de TVA à régulariser doit être paramétré comme
+# compte non soumis
+# 6°) Dans le cas où les pièces ne sont pas générées automatiquement mais saisies
+# diretement en comptabilité, les codes taxes au niveau des lignes d'écritures
+# doivent être correctement renseignés et le lettrage des écritures doit être correct
+#######################################################################################
+# Issue X3-74646 - 2018-02-05 by FHA : UK VAT Vat Box management
+# Issue X3-82605 - 2018-03-20 by FHA : Making DCLVATPAY Subrog independant of DIA screen
+# Issue X3-63066 - 2018-04-23 by FHA : Activity code of this process in the dictionary (GASADC) is set from VATBX to DCL
+# Issue X3-75723 - 2018-04-23 by FHA : CEE VAT value negative amounts when multiple payments : Bug fix
+
+###########################
+#  TVA SUR ENCAISSEMENTS  #
+###########################
+Subprog DCLVATPAY(SOC,SIT,DATDEB,DATFIN,SIMUL,OPTPAY,TTYP,NBTYP,COA,DEVLED,ERR_STOP,DATPCE,ECRAUX,OFFFLG,LOGFLG,DIAFCY)
+Value Char       SOC()       : # The VAT declaration is running for this company
+Value Char       SIT()       : # The VAT declaration is running for this site
+Value Date       DATDEB      : # Starting declaration date
+Value Date       DATFIN      : # Ending declaration date
+Value Integer    SIMUL       : # 1=Not a simulation 2=Simulation
+Value Char       OPTPAY()    : # 1=Tax/Charges Paid First 2=Pro Rata
+Value Char       TTYP()(1..) : # List of GTE (document types) to take into account for the VAT declaration
+Value Integer    NBTYP       : # Number of document types (GTE)
+Value Char       COA()       : # Chart of account
+Value Char       DEVLED()    : # Currency of the general main ledger
+Variable Integer ERR_STOP    : # If an error occurs,the program continue to complete the log file but no table is updated
+Variable Date    DATPCE      : # Issue number X3-82605 Max due date
+Variable Integer ECRAUX      : # Issue number X3-82605 Auxiliary postings flag
+Variable Integer OFFFLG      : # Issue number X3-82605 Off declaration flag
+Variable Integer LOGFLG      : # Issue number X3-82605 Log file flag
+Value Char       DIAFCY()    : # Issue number X3-82605 Site of [DIA] screen
+
+Gosub OPEN_FIL
+
+GOK=1 : Gosub DECLARE
+If !GOK : GOK=1 : End : Endif
+
+Gosub TR_DVP
+End
+
+
+$TR_DVP
+Trbegin [DLVBP]
+
+ Raz [L]FILTER1
+ If CALL_PT : GPOINT = "FILTER1" : Gosub ENTREE From EXEFNC : Endif
+
+ If [L]FILTER1="" & NBTYP<=50
+  # Option Perf.
+  # Issue number X3-82605 [M]ECRAUX replaced by ECRAUX subprog parameter
+  If ECRAUX = 1 : # On prend toutes les écritures comment avant (auxiliarisées ou pas)
+   Filter [DAE] Where CPY=SOC & FCYLIN=SIT & LEDTYP=GTYPGEN
+&                  & MTCDAT>=DATDEB & MTCDAT<=DATFIN
+&                  & find([F:DAE]TYP,TTYP(1..NBTYP))<>0
+  Else
+   Filter [DAE] Where CPY=SOC & FCYLIN=SIT & LEDTYP=GTYPGEN
+&                 & MTCDAT>=DATDEB & MTCDAT<=DATFIN & BPR<>""
+&                 & find([F:DAE]TYP,TTYP(1..NBTYP))<>0
+  Endif
+ Else
+  If [L]FILTER1="" : [L]FILTER1 = "1=1" : Endif
+  # Issue number X3-82605 [M]ECRAUX replaced by ECRAUX subprog parameter
+  If ECRAUX = 1 : # On prend toutes les écritures comment avant (auxiliarisées ou pas)
+   Filter [DAE] Where CPY=SOC & FCYLIN=SIT & LEDTYP=GTYPGEN
+&                  & MTCDAT>=DATDEB & MTCDAT<=DATFIN
+&                  & find([F:DAE]TYP,TTYP(1..NBTYP)) & evalue([L]FILTER1)
+  Else
+   Filter [DAE] Where CPY=SOC & FCYLIN=SIT & LEDTYP=GTYPGEN
+&                 & MTCDAT>=DATDEB & MTCDAT<=DATFIN & BPR<>""
+&                 & find([F:DAE]TYP,TTYP(1..NBTYP)) & evalue([L]FILTER1)
+  Endif
+ Endif
+
+ # Parcours des groupes de lettrage (compte,tiers,lettre)
+ For [DAE]CLE(4) Where MTC<>"" With Nohint
+
+  Raz NBCODDEB, NBCODENC, TCODDEB, TCODENC
+  Raz BASDEB, TVADEB, BASENC,TVAENC
+  Raz AMTVAT_BASE, AMTVAT_TVA
+  Raz TOTPAY_ENC, TOTPAY_DEB
+  Raz TBACCNUM, NBACCNUM
+  Raz TBACCNUMDEB, NBACCNUMDEB
+  Raz TBTYPBOXBASENC, TBTYPBOXBASDEB
+  Raz TBTYPBOXTVAENC, TBTYPBOXTVADEB
+  Raz TAMTLED, TAMTVAT
+  Raz NBCODVCR, TCODVCR
+  Raz TBASNOT, TBASVAT
+  Raz TOTPAY, TOTATI
+  Raz WRITE_OK
+  [L]TYPREC = 1
+
+  ACCMTCGRU = [F:DAE]ACC
+  BPRMTCGRU = [F:DAE]BPR
+  MTCGRU    = [F:DAE]MTC
+  DATMTCGRU = [F:DAE]MTCDAT
+  SACMTCGRU = [F:DAE]SAC
+
+  # Parcours des pièces par groupe de lettrage. Les pièces lettrées
+  # ensemble peuvent être soit des factures, soit des pièces de règlements
+  # Les acomptes seront traités plus loin...
+  # Ajout de "& CPY=SOC & FCYLIN=SIT" car suite à une fusion tiers, certains codes lettrage
+  # peuvent être identiques sur 2 sites différents. Exemple 401000 tiers 1 fusionne avec 401000 tiers2.
+  # L'attribution du code lettrage (MATCHCODE) se fait par compte/tiers/COA. On peut donc avoir un
+  # même code lettrage qui lettre 401000 tiers1 avec 5121 sur soc1 et 401000 tiers2 avec 5122 sur soc2
+  # Si tiers1 fusionne avec tiers2 on a le même code lettrage => En simulation en lançant toutes sociétés
+  # on prendra 2 fois les 2 factures et les 2 règlements
+  For [DAE1]CLE(6) Where LEDTYP=GTYPGEN & ACC=ACCMTCGRU & BPR=BPRMTCGRU & MTC=MTCGRU & CPY=SOC & FCYLIN=SIT
+   IPTPREPAY = 0
+   If !find([F:DAE1]ACC,TACPT(1..NBACPT)) : # C'est pas un compte d'acompte
+    # Le compte du groupe de lettrage n'est pas un compte d'acompte mais il peut
+    # y avoir dans la pièce une ligne avec un compte d'acompte si on est sur une pièce
+    # d'imputation d'acompte. Dans ce cas, il ne faut pas prendre en compte cette pièce
+    # dans le calcul des bases et montants ($VATCLC) puisqu'on déclare cette pièce
+    # en sens inverse quand on traite le cas des acomptes. Cependant, on ne peut pas exclure
+    # cette pièce à ce niveau car le montant du compte tiers contenu dans ACCMTCGRU doit être
+    # cumulé à TOTPAY
+    If NBACPT>0
+     Filter [DAE2] Where TYP = [F:DAE1]TYP & NUM = [F:DAE1]NUM & LEDTYP=GTYPGEN & find([F:DAE2]ACC,TACPT(1..NBACPT))
+     Read [DAE2]DAE0 First
+     If fstat = 0 : IPTPREPAY = 1 : Endif # C'est une pièce d'imputation d'acompte
+     Filter [DAE2]
+    Endif
+    OKDIM = 1
+    Link [DAE2] With  [HAE]HAE0~=[F:DAE2]TYP;[F:DAE2]NUM  As [LNK_2]
+&               Where  TYP=[F:DAE1]TYP & NUM=[F:DAE1]NUM & LEDTYP=[F:DAE1]LEDTYP
+    For [LNK_2]DAE0
+     # Parcours des lignes d'écritures de la pièce [F:DAE1]TYP-[F:DAE1]NUM appartenant au groupe de lettrage.
+     # On regarde si c'est une pièce règlement pour MAJ le montant du règlement
+     If find([F:DAE2]TYP,TTYP(1..NBTYP)) & [F:DAE2]MTC=MTCGRU & [F:DAE2]ACC=ACCMTCGRU & [F:DAE2]BPR=BPRMTCGRU
+      # On ne déclare la TVA qu'à l'échéance du règlement
+      #If [F:HAE]DUDDAT<=[M]DATPCE                    :# Issue number X3-82605
+      If [F:HAE]DUDDAT<=DATPCE                        :# Issue number X3-82605
+       TOTPAY += [F:DAE2]SNS*[F:DAE2]AMTLED
+      #Elsif [F:HAE]DUDDAT>[M]DATPCE & GTRACE<>""     :# Issue number X3-82605
+      Elsif [F:HAE]DUDDAT>DATPCE & GTRACE<>""         :# Issue number X3-82605
+       # On mentionne les règlements lettrés mais non échus dans le fichier de trace
+       Call ECR_TRACE(mess(12,107,1)-[F:HAE]TYP-[F:HAE]NUM-","-mess(15,105,1)-format$("D:"+GFMDAT,[F:HAE]DUDDAT)
+&                -":"-mess(87,107,1),0) From GESECRAN
+      Endif
+     Endif
+     # On va calculer ici les bases, montants de TVA, et les montants de TVA déclarés par code TVA.
+     # La TVA déclarée est mise à jour pour les comptes de TVA et les comptes soumis à la TVA
+     If !IPTPREPAY
+      Gosub VATCLC
+      If !OKDIM & GTRACE<>""
+       Call ECR_TRACE(ACCMTCGRU-BPRMTCGRU-MTCGRU-":"-mess(90,107,1)-"(>"+num$(MAXLIG)+")",1) From GESECRAN
+       Break 2
+      Endif
+     Endif
+    Next
+    Gosub CONT_CODENC
+    If !OKCODENC & GTRACE<>""
+     Call ECR_TRACE(ACCMTCGRU-BPRMTCGRU-MTCGRU-mess(90,107,1)-":"-mess(93,107,1)-"("+mid$(TCODENC(I),2,GLONVAT)+")",-1) From GESECRAN
+     Break
+    Endif
+    Gosub CONT_CODDEB
+    If !OKCODDEB
+     If NBCODENC > 0 & GTRACE<>""
+      Call ECR_TRACE(ACCMTCGRU-BPRMTCGRU-MTCGRU-mess(90,107,1)-":"-mess(93,107,1)-"("+mid$(TCODDEB(I),2,GLONVAT)+")",-1) From GESECRAN
+      Break
+     Endif
+    Endif
+   Endif
+  Next
+  # Demande 22603 : Cas de la facture CEE
+  For IND=1 To NBCODENC
+   If AMTVAT_BASE(IND)=0 and AMTVAT_TVA(IND)<>0
+    CAT= val(left$(TCODENC(IND),1))
+    If CAT=1 | CAT=2 | CAT=7 | CAT=8 : SIGN=-1 : Else : SIGN=1 : Endif
+    COD= mid$(TCODENC(IND),2,GLONVAT)
+    Call LEC_TVT_LEG([F:CPY]LEG,COD) From CPTLEC
+    Call LEC_TVB([F:CPY]LEG,[F:TVT]VATVAC) From CPTLEC
+    If !fstat & [F:TVB]REGVAC=4
+     AMTVAT_TVA(IND)=AMTVAT_TVA(IND)*SIGN
+     For I=1 To NBACCNUM(IND)
+      TAMTVAT(IND,I)=TAMTVAT(IND,I)*SIGN
+     Next
+    Endif
+   Endif
+  Next
+  If OKDIM & OKCODENC & OKCODDEB
+   TOTDEB = sum(BASDEB(1..NBCODDEB))+sum(TVADEB(1..NBCODDEB))
+   TOTENC = sum(BASENC(1..NBCODENC))+sum(TVAENC(1..NBCODENC))
+   TOTDECLAR = sum(AMTVAT_BASE(1..NBCODENC))+sum(AMTVAT_TVA(1..NBCODENC)) : # TOTDECLAR : montant déjà déclaré pr le grp lettrage
+   Gosub CLC_DECLAR
+   If GOK<1 : Break : Endif
+   If WRITE_OK
+    Call LEC_GAC([L]ACCMTCGRU,[L]COA) From CPTLEC
+    Raz [F:VTD], [F:DAEA], [L]WAMTLED
+    [L]TYPREC = 0
+    Gosub UPD_DCLVATBOXPAY
+    If GOK<1 : Break : Endif
+   Endif
+  Endif
+  Gosub TR_MTCGRU_BOX
+ Next
+ If GOK<0   : Goto ROLL_TR_DVP
+ Elsif !GOK : Goto AB_TR_DVP
+ Endif
+ Filter [DAE]
+
+ Gosub TR_UNMTC
+ If GOK<0   : Goto ROLL_TR_DVP
+ Elsif !GOK : Goto AB_TR_DVP
+ Endif
+
+ Gosub TR_PREPAY
+ If GOK<0   : Goto ROLL_TR_DVP
+ Elsif !GOK : Goto AB_TR_DVP
+ Endif
+
+ Gosub UPD_DCLVATBOXH
+ If GOK<0   : Goto ROLL_TR_DVP
+ Elsif !GOK : Goto AB_TR_DVP
+ Endif
+
+ # If one error occurs, the files are not updated
+ #If ERR>0 & [M:DIA]TYPGEN=1 : ERR_STOP = 1 : Goto AB_TR_DVP : Endif
+ If ERR>0 & SIMUL=1 : ERR_STOP = 1 : Goto AB_TR_DVP : Endif         :# Issue number X3-82605
+
+ Gosub PAY_UNMTC
+
+Commit
+Return
+
+$AB_TR_DVP
+Rollback
+Return
+
+$ROLL_TR_DVP
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR_DVP : Endif
+
+$VATCLC
+If [F:DAE2]TAX<>""
+ Call LEC_GAC([F:DAE2]ACC,[L]COA) From CPTLEC
+ If !fstat
+  CAT = [F:GAC]VATIPT
+  NBBLC = GLONVAT-len([F:DAE2]TAX)
+  COD = [F:DAE2]TAX+space$(NBBLC)
+  Gosub LECTAXD2
+  CATCOD = num$(CAT)+COD+num$(VAT_RAT)
+  Case TYPREC
+   When 1 : Gosub VATCLC_MTCGRU
+   When 2 : Gosub VATCLC_UNMTC
+   When 3 : Gosub VATCLC_PREPAY
+  Endcase
+ Endif
+Endif
+Return
+
+$VATCLC_MTCGRU
+If [F:TVT]VATPAY = 2
+ IND = find(CATCOD,TCODENC(1..NBCODENC))
+ If !IND : NBCODENC += 1 : IND = NBCODENC : TCODENC(IND) = CATCOD : Endif
+ NBBLC  = GLONGTE-len([F:DAE2]TYP)
+ CODVCR = [F:DAE2]TYP+space$(NBBLC)+[F:DAE2]NUM
+ INDVCR = find(CODVCR,TCODVCR(IND,1..NBCODVCR(IND)))
+ If !INDVCR
+  If NBCODVCR(IND)>=MAXLIG : OKDIM = 0 : Return : Endif
+  NBCODVCR(IND) += 1 : INDVCR = NBCODVCR(IND) : TCODVCR(IND,NBCODVCR(IND)) = CODVCR
+ Endif
+ If NBACCNUM(IND)>=MAXLIG : OKDIM = 0 : Return : Endif
+ NBACCNUM(IND)  += 1 : TBACCNUM(IND,NBACCNUM(IND)) = [F:DAE2]ACCNUM
+ Case [F:GAC]FLGVAT
+   When 2
+    If TBTYPBOXBASENC(IND)=0 : Gosub TR_MTCGRU_BOXOFF_ENC : Endif
+    If TBTYPBOXBASENC(IND)=2
+     BASENC(IND)      += [F:DAE2]SNS*[F:DAE2]AMTLED
+     AMTVAT_BASE(IND) += [F:DAE2]AMTVAT
+     TAMTLED(IND,NBACCNUM(IND)) = [F:DAE2]SNS*[F:DAE2]AMTLED
+     TAMTVAT(IND,NBACCNUM(IND)) = [F:DAE2]AMTVAT
+     TBASNOT(IND,INDVCR) += [F:DAE2]SNS*[F:DAE2]AMTLED
+     TOTATI += [F:DAE2]SNS*[F:DAE2]AMTLED
+    Endif
+   When 3, 4
+    If TBTYPBOXTVAENC(IND)=0 : Gosub TR_MTCGRU_BOXOFF_ENC : Endif
+    If TBTYPBOXTVAENC(IND)=2
+     TVAENC(IND)     += [F:DAE2]SNS*[F:DAE2]AMTLED
+     AMTVAT_TVA(IND) += [F:DAE2]AMTVAT
+     TAMTLED(IND,NBACCNUM(IND)) = [F:DAE2]SNS*[F:DAE2]AMTLED
+     TAMTVAT(IND,NBACCNUM(IND)) = [F:DAE2]AMTVAT
+     TBASVAT(IND,INDVCR) += [F:DAE2]SNS*[F:DAE2]AMTLED
+     TOTATI += [F:DAE2]SNS*[F:DAE2]AMTLED
+    Endif
+ Endcase
+Else
+ IND = find(CATCOD,TCODDEB(1..NBCODDEB))
+ If !IND : NBCODDEB += 1 : IND = NBCODDEB : TCODDEB(IND) = CATCOD : Endif
+ If NBACCNUMDEB(IND)>=MAXLIG : OKDIM = 0 : Return : Endif
+ NBACCNUMDEB(IND)  += 1 : TBACCNUMDEB(IND,NBACCNUMDEB(IND)) = [F:DAE2]ACCNUM
+  Case [F:GAC]FLGVAT
+  When 2   :
+    If TBTYPBOXBASDEB(IND)=0 : Gosub TR_MTCGRU_BOXOFF_DEB : Endif
+    If TBTYPBOXBASDEB(IND)=2
+     BASDEB(IND)    += [F:DAE2]SNS*[F:DAE2]AMTLED
+     TOTATI += [F:DAE2]SNS*[F:DAE2]AMTLED
+    Endif
+   When 3,4 :
+    If TBTYPBOXTVADEB(IND)=0 : Gosub TR_MTCGRU_BOXOFF_DEB : Endif
+    If TBTYPBOXTVADEB(IND)=2
+     TVADEB(IND)    += [F:DAE2]SNS*[F:DAE2]AMTLED
+     TOTATI += [F:DAE2]SNS*[F:DAE2]AMTLED
+    Endif
+ Endcase
+Endif
+Return
+
+$CLC_DECLAR
+TOTAL  = TOTDEB + TOTENC
+If TOTPAY<0 : # Le règlement est une recette
+ TOTPAY    = -TOTPAY
+ TOTDEB    = -TOTDEB
+ TOTENC    = -TOTENC
+ TOTAL     = -TOTAL
+Endif
+If TOTDECLAR<0
+ TOTDECLAR = -TOTDECLAR
+Endif
+If TOTPAY>0 & TOTAL>0 & TOTDECLAR>0 & TOTENC<0
+ TOTDECLAR = -TOTDECLAR
+Endif
+Case OPTPAY
+ When "1"
+  # On suppose que la TVA sur débits est payée en premier.
+  # Par conséquence,  on diminue le règlement du montant sur débits.
+  # Ex : Fact. 1000 Euros HT + 200 Euros TVA sur débits
+  #            1000 Euros HT + 200 Euros TVA sur encaissements
+  #            Total = 2400 Euros TTC
+  # On a un règlement de 1500 Euros.
+  # Dans ce cas, le montant de la TVA sur débits sera de 1200 Euros et la TVA sur encaissements sera de 300 Euros.
+  # En fait la TVA sur encaissements à déclarer sera égale à : (300/1200)*200 soit 50 Euros
+  If TOTPAY = 0
+   TOTPAY_ENC = -TOTDECLAR
+  Else
+   TOTPAY_DEB = min(TOTPAY,TOTDEB)
+   TOTPAY_ENC = TOTPAY-TOTPAY_DEB-TOTDECLAR
+   If TOTPAY_ENC>TOTENC-TOTDECLAR
+    TOTPAY_ENC = TOTENC-TOTDECLAR
+   Endif
+  Endif
+ When "2"
+  # On suppose qu'on paye on prorata. On proratise le règlement par rapport au rapport
+  #   base + TVA sur encaissements / Total base + TVA (TVAENC/TOTAL)
+  If TOTPAY = 0
+   TOTPAY_ENC = -TOTDECLAR
+  Elsif TOTPAY <= TOTAL & TOTAL<>0
+   TOTPAY_ENC = (TOTPAY)*(TOTENC/TOTAL)-TOTDECLAR
+  Elsif TOTAL>0
+   # le montant du règlement est supérieur au montant restant à déclarer
+   # (sur les factures lettrées avec le (ou les) réglement(s), il y a des comptes non soumis à la TVA...)
+   TOTPAY_ENC = TOTENC-TOTDECLAR
+  Endif
+Endcase
+
+If TOTPAY_ENC<>0
+ Link [DAEA] With  [HAE]HAE0~=[F:DAEA]TYP;[F:DAEA]NUM,  [GAC]GAC0~=[L]COA;[F:DAEA]ACC  As [LNK]
+ For IND=1 To NBCODENC
+  CAT     = val(left$(TCODENC(IND),1))
+  COD     = mid$(TCODENC(IND),2,GLONVAT)
+  VAT_RAT = val(right$(TCODENC(IND),GLONVAT+2))
+  If CAT=1 | CAT=2 | CAT=7 | CAT=8 : SIGN=-1 : Else : SIGN=1 : Endif
+
+  # Issue X3-75723
+  Local Integer W_REGVACCEE
+  If AMTVAT_BASE(IND)=0 and AMTVAT_TVA(IND)<>0
+      Call LEC_TVT_LEG([F:CPY]LEG,COD) From CPTLEC
+      Call LEC_TVB([F:CPY]LEG,[F:TVT]VATVAC) From CPTLEC
+      If !fstat & [F:TVB]REGVAC=4
+       [L]W_REGVACCEE = 2
+      Endif
+  Endif
+  # End issue X3-75723
+
+  If TVAENC(IND)<>0 | BASENC(IND)<>0 | (TVAENC(IND)=0 & BASENC(IND)=0 & TOTPAY_ENC<>0 & AMTVAT_BASE(IND)<>0 & AMTVAT_TVA(IND)<>0)
+   MTHT       = SIGN*BASENC(IND)
+   MTTVA      = SIGN*TVAENC(IND)
+   MTTTC      = TOTENC
+   If TOTPAY<>0 & MTTTC<>0
+    If MTTTC>0
+     MTVCR = min(TOTPAY_ENC,MTTTC)
+    Else
+     MTVCR = max(TOTPAY_ENC,MTTTC)
+    Endif
+    MONTANT    = arr(MTTVA*MTVCR/MTTTC,GARODEV)
+    BASE       = arr(MTHT*MTVCR/MTTTC,GARODEV)
+   Else
+    # Montant règlement=0 => on déclare en sens inverse !!!
+    # ou Montant règlement<>0, pas de TVA/enc à déclarer pourtant des montants de TVA déjà déclarés => On déclare en sens inverse !!
+    MONTANT = -AMTVAT_TVA(IND)
+    BASE    = -AMTVAT_BASE(IND)
+   Endif
+   For INBA=1 To NBACCNUM(IND)
+    #Read [DAEA]DAE2 = TBACCNUM(IND,INBA)
+    Read [LNK]DAE2 = TBACCNUM(IND,INBA)
+    If !fstat
+     #Call LEC_GAC([F:DAEA]ACC,[L]COA) From CPTLEC
+     If ([F:GAC]FLGVAT=2 & BASE<>0) | (find([F:GAC]FLGVAT,3,4) & MONTANT<>0)
+      # On proratise les montants à déclarer par rapport au montant total des pièces du même groupe de lettrage
+      If SIMUL = 1 : OKMAJ = 1 : Endif
+      If [F:GAC]FLGVAT = 2
+       If BASENC(IND)<>0
+        BASVAT_PAY = SIGN*TAMTLED(IND,INBA)*((AMTVAT_BASE(IND)+BASE)/(SIGN*BASENC(IND)))
+       Elsif BASENC(IND)=0 & AMTVAT_BASE(IND)<>0 & TAMTVAT(IND,INBA)=AMTVAT_BASE(IND)
+        BASVAT_PAY = 0
+       Else
+        OKMAJ = 0
+      Endif
+      Elsif find([F:GAC]FLGVAT,3,4) & MONTANT<>0
+
+       # Issue X3-75723 local Sign correction in CEE case
+       If dim([L]W_REGVACCEE)>0 and [L]W_REGVACCEE = 2 and TOTPAY<>0
+         AMTVAT_TVA(IND)=AMTVAT_TVA(IND)*SIGN
+         TAMTVAT(IND,INBA)=TAMTVAT(IND,INBA)*SIGN
+       Endif
+       # End issue X3-75723
+
+       If TVAENC(IND)<>0
+        AMTVAT_PAY = SIGN*TAMTLED(IND,INBA)*((AMTVAT_TVA(IND)+MONTANT)/(SIGN*TVAENC(IND)))
+       Elsif TVAENC(IND)=0 & AMTVAT_TVA(IND)<>0 & TAMTVAT(IND,INBA)=AMTVAT_TVA(IND)
+        AMTVAT_PAY = 0
+       Else
+        OKMAJ = 0
+       Endif
+      Endif
+      If [F:GAC]FLGVAT = 2
+       [L]WAMTLED = BASVAT_PAY-TAMTVAT(IND,INBA)
+      Elsif find([F:GAC]FLGVAT,3,4)
+       [L]WAMTLED = AMTVAT_PAY-TAMTVAT(IND,INBA)
+      Endif
+      FIND_OK = 0
+      Gosub AMOUNT_CASE
+      If GOK<1 : Break 2 : Endif
+
+      # Issue X3-75723 local sign correction restore in CEE case
+      If find([F:GAC]FLGVAT,3,4) & MONTANT<>0
+       If dim([L]W_REGVACCEE)>0 and [L]W_REGVACCEE = 2 and TOTPAY<>0
+         AMTVAT_TVA(IND)=AMTVAT_TVA(IND)*SIGN
+         TAMTVAT(IND,INBA)=TAMTVAT(IND,INBA)*SIGN
+       Endif
+      Endif
+      # End issue X3-75723
+
+      If FIND_OK=1  : # The amount is assigned at least to one detail vat box
+       If SIMUL = 1 & OKMAJ = 1
+        ## Actual declaration => update AMTVAT in the GACCENTRYD table
+        ## On lance la déclaration de TVA sur encaissements en réel.
+        ## On va donc mettre à jour le montant de TVA déclarée dans la ligne d'écriture (GACCENTRYD).
+        If [F:GAC]FLGVAT = 2
+         [L]WAMTLED = BASVAT_PAY
+        Elsif find([F:GAC]FLGVAT,3,4)
+         [L]WAMTLED = AMTVAT_PAY
+        Endif
+        Gosub UPD_AMTVAT
+        If GOK<1 : Break 2 : Endif
+       Endif
+       Endif
+     Endif
+    Endif
+   Next
+  Endif
+ Next
+ If GOK < 1 : Return : Endif
+Endif
+Return
+
+# On contrôle qu'on n'ait pas dans le groupe de lettrage une base = 0
+# et un montant de TVA<>0 (ou le contraire) pour un code taxe.
+# Exception à cela :
+#   1°) Code taxe exonéré (taux=0) pour lequel on aura une base<>0 et un
+#       montant de TVA=0
+#   2°) Code taxe auquel correspond un régime de taxe export (régime de type 2)
+#       pour lequel on aura une base<>0 et un montant de TVA=0
+#   3°) Code taxe auquel correspond un régime de taxe suspension de taxe (régime de type 3)
+#       pour lequel on aura une base<>0 et un montant de TVA=0
+#   4°) Code taxe auquel correspond un régime de taxe CEE (régime de type 4)
+#       pour lequel on aura une base=0 et un montant de TVA<>0
+$CONT_CODENC
+OKCODENC = 1
+For I=1 To NBCODENC
+ IND2 = find(vireblc(mid$(TCODENC(I),2,GLONVAT),4),T_CODENC(1..NB_CODENC))
+ If IND2 & T_RATENC(IND2)<>0 & !find(T_TYPPAYENC(IND2),2,3,4) & (BASENC(I)=0 | TVAENC(I)=0) & (BASENC(I)+TVAENC(I)<>0)
+  OKCODENC = 0 : Break
+ Endif
+Next
+Return
+
+$CONT_CODDEB
+OKCODDEB = 1
+For I=1 To NBCODDEB
+ IND2 = find(vireblc(mid$(TCODDEB(I),2,GLONVAT),4),T_CODDEB(1..NB_CODDEB))
+ If IND2 & T_RATDEB(IND2)<>0 & !find(T_TYPPAYDEB(IND2),2,3,4) & (BASDEB(I)=0 | TVADEB(I)=0) & (BASDEB(I)+TVADEB(I)<>0)
+  OKCODDEB = 0 : Break
+ Endif
+Next
+Return
+
+######################################################################################
+## Search in the VATBOX table all the tax cases that matches with the journal entry
+#*!
+$AMOUNT_CASE
+Call LEC_TVT_LEG([F:CPY]LEG,[F:DAEA]TAX) From CPTLEC
+If fstat : Return : Endif
+
+# Issue number X3-82605 [M:DIA]DATPCE replaced by DATPCE subprog parameter
+Filter [LNK_V] Where (VCRTYP=[F:HAE]TYP | VCRTYP="") & FLGVAT=[F:GAC]FLGVAT & VATIPT=[F:GAC]VATIPT & VAT=[F:DAEA]TAX
+&&    (VLYSTR=[0/0/0] | DATPCE>=VLYSTR) & (VLYEND=[0/0/0] | DATPCE<=VLYEND)
+
+For [LNK_V]
+ # The type of the vat box is necessarily "Detail" because the field "FLGVAT" is not empty for the "detail" vat boxes
+ # but is empty for the "out of declaration" vat boxes
+ FIND_OK = 1
+ # Sum for each vat box
+ INDB = find([F:VTD]VATBOX,TBOX(1..INDBOX))
+ If !INDB
+  INDBOX +=1
+  TBOX(INDBOX)      = [F:VTD]VATBOX
+  AMTBOX(INDBOX)    = [F:VTD]SNS*[L]WAMTLED
+  FLGVATBOX(INDBOX) = [F:GAC]FLGVAT
+  VATIPTBOX(INDBOX) = [F:GAC]VATIPT
+  LINBOX(INDBOX)    = [F:VTB]LIN
+ Else
+  AMTBOX(INDB) += [F:VTD]SNS*[L]WAMTLED
+ Endif
+ Gosub UPD_DCLVATBOXPAY
+ If GOK<1 : Break : Endif
+Next
+Filter [LNK_V]
+If GOK<1 : Return : Endif
+
+If FIND_OK=0
+ Filter [LNK_V] Where VAT=[F:DAEA]TAX & [VTB]TYPBOX=4
+ # If TYPBOX=4 =(out declaration) Then VLYSTR=null VLYEND=null VCRTYP=null FLGVAT=null VATIPT=null
+ For [LNK_V]
+  FIND_OK = 2
+  #If  [M:DIA]DETDCL=2 # We print the tax boxes "Out declaration"       :# Issue number X3-82605
+  If  OFFFLG=2 # We print the tax boxes "Out declaration"               :# Issue number X3-82605
+   Call ECR_TRACE(mess(367,107,1)+"-"+mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)+"-"+
+&                mess(39,105,1)-[F:DAEA]TAX-"("+mess([F:TVT]VATPAY,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,0) From GESECRAN
+  Else
+   Break
+  Endif
+ Next
+ Filter [LNK_V]
+Endif
+
+If FIND_OK=0
+ ERR+=1
+ #If [M:DIA]TRCFLG=2      :# Issue number X3-82605
+ If LOGFLG=2              :# Issue number X3-82605
+  Call ECR_TRACE(mess(366,107,1)-"-"-mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)-"-"-
+&                mess(39,105,1)-[F:DAEA]TAX-"("+mess([F:TVT]VATPAY,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,1) From GESECRAN
+ Endif
+Endif
+Return
+
+######################################################################################
+$UPD_DCLVATBOXPAY
+If [F:GAC]FLGVAT > 1 or [L]TYPREC = 0
+ Readlock [F:DLVBP]DLVBP0=SOC;SIT;DATDEB;[F:GAC]ACC;BPRMTCGRU;MTCGRU;[F:VTD]VATBOX;[F:VTD]VAT;[F:VTD]VATIPT;GNUMRPT2;[F:DAEA]TYP;[F:DAEA]NUM;[F:DAEA]LIN
+ If !fstat
+  [F:DLVBP]AMT +=[F:VTD]SNS*[L]WAMTLED
+  Rewrite [DLVBP]
+  If fstat
+   GOK=0 : Call FSTA("DLVBP") From GLOCK : Return
+  Endif
+ Elsif fstat=1
+  GOK=0 : Call FSTA("DLVBP") From GLOCK : Return
+ Else
+  Raz [F:DLVBP]
+  [F:DLVBP]CPY    = SOC
+  [F:DLVBP]FCY    = SIT
+  [F:DLVBP]STRDAT = DATDEB
+  [F:DLVBP]ENDDAT = DATFIN
+
+  If [L]TYPREC > 0
+   [F:DLVBP]VATBOX = [F:VTD]VATBOX
+   [F:DLVBP]VATIPT = [F:VTD]VATIPT
+   [F:DLVBP]VAT    = [F:VTD]VAT
+   [F:DLVBP]FLGVAT = [F:VTD]FLGVAT
+   Case [F:VTD]FLGVAT
+    When 2, 5 : [F:DLVBP]TYPAMT = 1
+    When 3, 4 : [F:DLVBP]TYPAMT = 2
+   Endcase
+   Gosub LECTAXD3   :# Search the tax rate
+   [F:DLVBP]VATRAT = [L]VAT_RAT
+
+   [F:DLVBP]TYP    = [F:DAEA]TYP
+   [F:DLVBP]NUM    = [F:DAEA]NUM
+   [F:DLVBP]LIN    = [F:DAEA]LIN
+   [F:DLVBP]ACCDAT = [F:DAEA]ACCDAT
+
+   NBBLC  = GLONGTE-len([F:DAEA]TYP)
+   CODVCR = [F:DAEA]TYP+space$(NBBLC)+[F:DAEA]NUM
+   INDVCR = find(CODVCR,TCODVCR(IND,1..NBCODVCR(IND)))
+   If INDVCR
+    [F:DLVBP]BASNOTLIN =  TBASNOT(IND,INDVCR)*SIGN
+    [F:DLVBP]BASVATLIN =  TBASVAT(IND,INDVCR)*SIGN
+   Endif
+   [F:DLVBP]ACCNUM = TBACCNUM(IND,INBA)
+  Endif
+  [F:DLVBP]AMT    = [F:VTD]SNS*[L]WAMTLED
+
+  [F:DLVBP]NUMRPT = GNUMRPT2
+  [F:DLVBP]CUR    = DEVLED
+  [F:DLVBP]SIM    = SIMUL
+  [F:DLVBP]OPT    = val(OPTPAY)
+  #[F:DLVBP]DATMAX = [M:DIA]DATPCE  :# Issue number X3-82605
+  [F:DLVBP]DATMAX = DATPCE          :# Issue number X3-82605
+  [F:DLVBP]TYPREC = [L]TYPREC
+
+  Case [L]TYPREC
+   When 0 :
+    [F:DLVBP]COA    = [L]COA
+    [F:DLVBP]ACC    = [F:GAC]ACC
+    [F:DLVBP]ACCBPR = [F:GAC]ACCSHO
+    [F:DLVBP]MTCBPR = [F:GAC]ACCSHO
+    [F:DLVBP]MTCACC = ACCMTCGRU
+    [F:DLVBP]BPR    = BPRMTCGRU
+    [F:DLVBP]MTC    = MTCGRU
+    [F:DLVBP]AMTVCR = TOTPAY
+    [F:DLVBP]ATIVCR = abs(TOTATI)
+
+   When 1 :
+    [F:DLVBP]COA    = [L]COA
+    [F:DLVBP]ACC    = [F:GAC]ACC
+    [F:DLVBP]ACCBPR = [F:GAC]ACCSHO
+    [F:DLVBP]MTCBPR = SACMTCGRU
+    [F:DLVBP]MTCACC = ACCMTCGRU
+    [F:DLVBP]BPR    = BPRMTCGRU
+    [F:DLVBP]MTC    = MTCGRU
+    [F:DLVBP]MTCDAT = DATMTCGRU
+    [F:DLVBP]AMTVCR = TOTPAY
+    [F:DLVBP]ATIVCR = abs(TOTATI)
+    If NBCODDEB>0 & TOTDEB>0 : [F:DLVBP]FLGVATPAI=2 : Endif
+
+  When 2 :
+    [F:DLVBP]COA    = [L]COA
+    [F:DLVBP]ACC    = [F:GAC]ACC
+    [F:DLVBP]ACCBPR = [F:GAC]ACCSHO
+    [F:DLVBP]MTCBPR = [F:DAE3]SAC
+    [F:DLVBP]MTCACC = [F:DAE3]ACC
+    [F:DLVBP]BPR    = BPRMTCGRU
+    [F:DLVBP]MTCDAT = [F:DAE3]MTCDAT
+
+
+   When 3 :
+    [F:DLVBP]COA    = [L]COA
+    [F:DLVBP]ACC    = [F:GAC]ACC
+    [F:DLVBP]ACCBPR = [F:GAC]ACCSHO
+    [F:DLVBP]MTCBPR = SACMTCGRU
+    [F:DLVBP]MTCACC = ACCMTCGRU
+    [F:DLVBP]BPR    = BPRMTCGRU
+    [F:DLVBP]MTC    = MTCGRU
+    [F:DLVBP]MTCDAT = [F:DAEA]ACCDAT
+    [F:DLVBP]ACCNUM = [F:DAEA]ACCNUM
+
+  Endcase
+
+  If CALL_PT : GPOINT = "BEFWRIDLVBP" : Gosub ENTREE From EXEFNC : Endif
+  Write [DLVBP]
+  If fstat
+   GOK=0 : Call FSTA("DLVBP") From GLOCK : Return
+  Endif
+ Endif
+ WRITE_OK = 1
+Endif
+Return
+
+######################################################################################
+$UPD_DCLVATBOXH
+For INDB=1 To INDBOX
+ #If AMTBOX(INDB)<>0
+
+  Readlock [F:DLVB]DLVB0="";SOC;2;GNUMRPT2;TBOX(INDB)
+  If !fstat
+   [F:DLVB]AMT += AMTBOX(INDB)
+   Case VATIPTBOX(INDB)
+     When 1,2,7,8 : # Collected
+       If [F:DLVB]FLGVAT=2 | [F:DLVB]FLGVAT=5
+        [F:DLVB]AMTNOTCLT += AMTBOX(INDB)
+        [F:DLVB]GRPVAT     = 1
+       Elsif [F:DLVB]FLGVAT=3 | [F:DLVB]FLGVAT=4
+        [F:DLVB]AMTVATCLT += AMTBOX(INDB)
+        [F:DLVB]GRPVAT     = 2
+       Endif
+     When 3,4,5,6 : # Deductible
+       If [F:DLVB]FLGVAT=2 | [F:DLVB]FLGVAT=5
+        [F:DLVB]AMTNOTDED += AMTBOX(INDB)
+        [F:DLVB]GRPVAT     = 3
+       Elsif [F:DLVB]FLGVAT=3 | [F:DLVB]FLGVAT=4
+        [F:DLVB]AMTVATDED += AMTBOX(INDB)
+        [F:DLVB]GRPVAT     = 4
+       Endif
+   Endcase
+
+   DLVB_UW = "U"
+   Gosub PE_BEFWRIDLVB
+
+   Rewrite [DLVB]
+   If fstat
+    GOK=0 : Call FSTA("DLVB") From GLOCK : Break
+   Endif
+  Elsif fstat=1
+   GOK=0 : Call FSTA("DLVB") From GLOCK : Break
+  Else
+   Raz [F:DLVB]
+   [F:DLVB]DCLVATTYP = 2 : # Paid
+   [F:DLVB]NUMRPT = GNUMRPT2
+   [F:DLVB]GRPCPY = ""
+   [F:DLVB]CPY   = SOC
+   [F:DLVB]VATBOX = TBOX(INDB)
+   #[F:DLVB]FCY    = [M:DIA]FCY
+   [F:DLVB]FCY    = DIAFCY
+   [F:DLVB]STRDAT = DATDEB
+   [F:DLVB]ENDDAT = DATFIN
+   [F:DLVB]FLGVAT = FLGVATBOX(INDB)
+   [F:DLVB]VATIPT = VATIPTBOX(INDB)
+   [F:DLVB]CUR    = DEVLED
+   [F:DLVB]TYPBOX = 2
+   Case FLGVATBOX(INDB)
+     When 2, 5 : [F:DLVB]TYPAMT = 1
+     When 3, 4 : [F:DLVB]TYPAMT = 2
+   Endcase
+   [F:DLVB]AMT    = AMTBOX(INDB)
+   Case VATIPTBOX(INDB)
+     When 1,2,7,8
+       If [F:DLVB]FLGVAT=2 | [F:DLVB]FLGVAT=5
+        [F:DLVB]AMTNOTCLT = [F:DLVB]AMT
+        [F:DLVB]GRPVAT    = 1
+       Elsif [F:DLVB]FLGVAT=3 | [F:DLVB]FLGVAT=4
+        [F:DLVB]AMTVATCLT = [F:DLVB]AMT
+        [F:DLVB]GRPVAT    = 2
+       Endif
+     When 3,4,5,6
+       If [F:DLVB]FLGVAT=2 | [F:DLVB]FLGVAT=5
+        [F:DLVB]AMTNOTDED= [F:DLVB]AMT
+        [F:DLVB]GRPVAT= 3
+       Elsif [F:DLVB]FLGVAT=3 | [F:DLVB]FLGVAT=4
+        [F:DLVB]AMTVATDED = [F:DLVB]AMT
+        [F:DLVB]GRPVAT    = 4
+       Endif
+   Endcase
+   [F:DLVB]SIM    = SIMUL
+   [F:DLVB]LIN    = LINBOX(INDB)
+   [F:DLVB]REFTEX = [F:VTB]LEG+"~"+num$(LINBOX(INDB))
+   [F:DLVB]VATFNC = [F:VTB]VATFNC
+   [F:DLVB]OPT    =  val(OPTPAY)
+   #[F:DLVB]DATMAX = [M:DIA]DATPCE          :# Issue number X3-82605
+   [F:DLVB]DATMAX = DATPCE           :# Issue number X3-82605
+
+   DLVB_UW = "W"
+   Gosub PE_BEFWRIDLVB
+
+   Write [F:DLVB]
+   If fstat
+    GOK=0 : Call FSTA("DLVB") From GLOCK : Break
+   Endif
+  Endif
+ #Endif
+Next
+Return
+
+########################################################################################################
+$PE_BEFWRIDLVB
+If CALL_PT : GPOINT = "BEFWRIDLVB" : Gosub ENTREE From EXEFNC : Endif
+Return
+
+
+#####################################################################################
+$TR_UNMTC
+
+[L]TYPREC = 2
+
+# On ne va trouver ici que des factures puisque les règlements ne comportent pas de TVA
+# déclarée. On teste donc par rapport à la date de pièce et non par rapport à la date d'échéance
+# NB : quand on délettre une pièce, seule la lettre est remise à zéro. On conserve
+# la date de lettrage de façon à pouvoir borner ici sur la date lettrage.
+# Donc si une ligne d'écriture a la zone MTC à vide et la zone MTCDAT différente de vide,
+# cela veut dire que le pièce a été délettrée. MTCDAT contient la date du délettrage.
+
+Raz [L]FILTER3
+If CALL_PT : GPOINT = "FILTER3" : Gosub ENTREE From EXEFNC : Endif
+If [L]FILTER3="" : [L]FILTER3="1=1" : Endif
+
+# Issue number X3-82605 [M]DATPCE replaced by DATPCE subprog parameter
+Filter [DAE3] Where CPY=SOC & FCYLIN=SIT & LEDTYP=GTYPGEN & BPR<>""
+&                 & MTCDAT>=DATDEB & MTCDAT<=DATFIN & MTC=""
+&                 & ACCDAT<=DATPCE
+&                 & evalue([L]FILTER3)
+
+For [DAE3]DAE0(2) With Nohint
+
+ MAJVAT = 0
+ Raz NBCODENC, TCODENC
+ Raz NBACCNUM, TBACCNUM
+ Raz NBCODVCR, TCODVCR
+ Raz TBASNOT, TBASVAT
+ Raz TAMTVAT, TOTATI
+
+ For [DAE2]DAE0 Where TYP=[F:DAE3]TYP & NUM=[F:DAE3]NUM & LEDTYP=[F:DAE3]LEDTYP & AMTVAT<>0
+  MAJVAT = 1
+  Gosub VATCLC
+ Next
+ If MAJVAT : Gosub RAZAMTVAT : Endif
+Next
+Filter [DAE3]
+Return
+
+$RAZAMTVAT
+Raz MTCGRU
+BPRMTCGRU =[F:DAE3]BPR
+Link [DAEA] With  [HAE]HAE0~=[F:DAEA]TYP;[F:DAEA]NUM,  [GAC]GAC0~=[L]COA;[F:DAEA]ACC  As [LNK]
+For IND=1 To NBCODENC
+ CAT     = val(left$(TCODENC(IND),1))
+ COD     = mid$(TCODENC(IND),2,GLONVAT)
+ VAT_RAT = val(right$(TCODENC(IND),5))
+ If CAT=1 | CAT=2 | CAT=7 | CAT=8 : SIGN=-1 : Else : SIGN=1 : Endif
+ For INBA=1 To NBACCNUM(IND)
+  #Read [DAEA]DAE2 = TBACCNUM(IND,INBA)
+  Read [LNK]DAE2 = TBACCNUM(IND,INBA)
+  If !fstat & TAMTVAT(IND,INBA)<>0
+   #Call LEC_GAC([F:DAEA]ACC,[L]COA) From CPTLEC
+   [L]WAMTLED = TAMTVAT(IND,INBA)*-1
+   FIND_OK = 0
+   Gosub AMOUNT_CASE
+   If GOK<1 : Break 2 : Endif
+   If FIND_OK=1 & SIMUL = 1
+    # The amount is assigned at least to one detail vat box
+    # Actual declaration => update AMTVAT in the GACCENTRYD table
+    [L]WAMTLED = 0
+    Gosub UPD_AMTVAT
+    If GOK<1 : Break 2 : Endif
+   Endif
+  Endif
+ Next
+Next
+Return
+
+$VATCLC_UNMTC
+If [F:TVT]VATPAY = 2
+ IND = find(CATCOD,TCODENC(1..NBCODENC))
+ If !IND : NBCODENC += 1 : IND = NBCODENC : TCODENC(IND) = CATCOD : Endif
+ If NBACCNUM(IND)>=MAXLIG : OKDIM = 0 : Return :  Endif
+ NBBLC  = GLONGTE-len([F:DAE2]TYP)
+ CODVCR = [F:DAE2]TYP+space$(NBBLC)+[F:DAE2]NUM
+ INDVCR = find(CODVCR,TCODVCR(IND,1..NBCODVCR(IND)))
+ If !INDVCR
+  If NBCODVCR(IND)>=MAXLIG : OKDIM = 0 : Return : Endif
+  NBCODVCR(IND) += 1 : INDVCR = NBCODVCR(IND) : TCODVCR(IND,NBCODVCR(IND)) = CODVCR
+ Endif
+ Case [F:GAC]FLGVAT
+  When 2     : TBASNOT(IND,INDVCR) += [F:DAE2]SNS*[F:DAE2]AMTLED
+  When 3, 4  : TBASVAT(IND,INDVCR) += [F:DAE2]SNS*[F:DAE2]AMTLED
+ Endcase
+ NBACCNUM(IND)  += 1 : TBACCNUM(IND,NBACCNUM(IND)) = [F:DAE2]ACCNUM
+ TAMTVAT(IND,NBACCNUM(IND)) = [F:DAE2]AMTVAT
+ TOTATI += [F:DAE2]SNS*[F:DAE2]AMTLED
+Endif
+Return
+
+#####################################################################################
+$TR_PREPAY
+
+[L]TYPREC = 3
+
+## Cas des acomptes
+# Lors d'un versement ou de la réception d'un acompte relatif à une prestation de service,
+# l'acompte est considéré comme porteur de TVA qu'il faut déclarer.
+# Le compte d'acompte (409, 419) reçu ou versé relatif à une prestation de service doit être paramétré en "Compte d'acompte".
+# La pièce constatant le règlement ou le versement d'un acompte peut être déclenchante ou non déclenchante.
+# Par contre, la pièce d'imputation d'acompte doit être déclenchante.
+# On parcourt les comptes d'acompte (pour lesquels FLGVAT=5) pour traiter le cas des acomptes
+
+
+Raz TYPVCR, NUMVCR, NUMPREPAY
+
+Filter [DAE3] Where CPY=SOC & FCYLIN=SIT & LEDTYP=GTYPGEN
+# Issue number X3-82605 [M]DATPCE replaced by DATPCE subprog parameter
+Link [DAE3] With [GAC]GAC0~=[F:DAE3]COA;[F:DAE3]ACC, [HAE]HAE0~=[F:DAE3]TYP;[F:DAE3]NUM  As [LNK_3]
+&           Where  [F:GAC]COA=[L]COA & [F:GAC]FLGVAT=5 &
+&                  [F:HAE]DUDDAT>=DATDEB & [F:HAE]DUDDAT<=DATPCE & [F:HAE]FLGREP<>2
+
+For [LNK_3]
+ If !([F:DAE3]TYP=TYPVCR & [F:DAE3]NUM=NUMVCR)
+  TYPVCR    = [F:DAE3]TYP
+  NUMVCR    = [F:DAE3]NUM
+  ACCMTCGRU = [F:DAE3]ACC
+  SACMTCGRU = [F:DAE3]SAC
+  BPRMTCGRU = [F:DAE3]BPR
+ # LS NUMPREPAY += 1           : # Juste pour l'état Crystal Report...
+  MTCGRU = num$(NUMPREPAY)
+
+  Raz NBCODENC, TCODENC
+  Raz NBACCNUM, TBACCNUM
+  Raz NBCODVCR, TCODVCR
+  Raz TBASNOT, TBASVAT
+
+  For [DAE2]DAE0 Where TYP=TYPVCR & NUM=NUMVCR & LEDTYP=[F:DAE3]LEDTYP & AMTVAT=0
+   Gosub VATCLC
+  Next
+  Link [DAEA] With  [HAE]HAE0~=[F:DAEA]TYP;[F:DAEA]NUM,  [GAC]GAC0~=[L]COA;[F:DAEA]ACC  As [LNK]
+  For IND=1 To NBCODENC
+   CAT     = val(left$(TCODENC(IND),1))
+   COD     = mid$(TCODENC(IND),2,GLONVAT)
+   VAT_RAT = val(right$(TCODENC(IND),5))
+   If CAT=1 | CAT=2 | CAT=7 | CAT=8 : SIGN=-1 : Else : SIGN=1 : Endif
+   For INBA=1 To NBACCNUM(IND)
+    #Read [DAEA]DAE2 = TBACCNUM(IND,INBA)
+    Read [LNK]DAE2 = TBACCNUM(IND,INBA)
+    If !fstat
+     NBBLC  = GLONGTE-len([F:DAEA]TYP)
+     CODVCR = [F:DAEA]TYP+space$(NBBLC)+[F:DAEA]NUM
+     INDVCR = find(CODVCR,TCODVCR(IND,1..NBCODVCR(IND)))
+     If INDVCR
+      Call LEC_GAC([F:DAEA]ACC,[L]COA) From CPTLEC
+      If [F:GAC]FLGVAT = 5
+       [L]WAMTLED = (TBASNOT(IND,INDVCR)-TBASVAT(IND,INDVCR))*SIGN
+      Elsif find([F:GAC]FLGVAT,3,4)
+       [L]WAMTLED = TBASVAT(IND,INDVCR)*SIGN
+      Endif
+      FIND_OK = 0
+      Gosub AMOUNT_CASE
+      If GOK<1 : Break 3 : Endif
+      If FIND_OK=1 & SIMUL = 1
+       # The amount is assigned at least to one detail vat box
+       # Actual declaration => update AMTVAT in the GACCENTRYD table
+       [L]WAMTLED = TAMTLED2(IND,INBA)
+       Gosub UPD_AMTVAT
+       If GOK<1 : Break 3 : Endif
+      Endif
+     Endif
+    Endif
+   Next
+  Next
+ Endif
+Next
+Filter [DAE3]
+Return
+
+$VATCLC_PREPAY
+If [F:TVT]VATPAY = 2
+ IND = find(CATCOD,TCODENC(1..NBCODENC))
+ If !IND : NBCODENC += 1 : IND = NBCODENC : TCODENC(IND) = CATCOD : Endif
+ NBBLC  = GLONGTE-len([F:DAE2]TYP)
+ CODVCR = [F:DAE2]TYP+space$(NBBLC)+[F:DAE2]NUM
+ INDVCR = find(CODVCR,TCODVCR(IND,1..NBCODVCR(IND)))
+ If !INDVCR
+  If NBCODVCR(IND)>=MAXLIG : OKDIM = 0 : Return : Endif
+  NBCODVCR(IND) += 1 : INDVCR = NBCODVCR(IND) : TCODVCR(IND,NBCODVCR(IND)) = CODVCR
+ Endif
+ Case [F:GAC]FLGVAT
+   When 5
+    If NBACCNUM(IND)>=MAXLIG : OKDIM = 0 : Return : Endif
+    NBACCNUM(IND)  += 1 : TBACCNUM(IND,NBACCNUM(IND)) = [F:DAE2]ACCNUM
+    TAMTLED(IND,NBACCNUM(IND))  = [F:DAE2]SNS*[F:DAE2]AMTLED
+    TAMTLED2(IND,NBACCNUM(IND)) = [F:DAE2]AMTLED
+    TBASNOT(IND,INDVCR) += [F:DAE2]SNS*[F:DAE2]AMTLED
+   When 3, 4
+    If NBACCNUM(IND)>=MAXLIG : OKDIM = 0 : Return : Endif
+    NBACCNUM(IND)  += 1 : TBACCNUM(IND,NBACCNUM(IND)) = [F:DAE2]ACCNUM
+    TAMTLED(IND,NBACCNUM(IND))  = [F:DAE2]SNS*[F:DAE2]AMTLED
+    TAMTLED2(IND,NBACCNUM(IND)) = [F:DAE2]AMTLED
+    TBASVAT(IND,INDVCR) += [F:DAE2]SNS*[F:DAE2]AMTLED
+ Endcase
+ TOTATI += [F:DAE2]SNS*[F:DAE2]AMTLED
+Endif
+Return
+
+#####################################################################################
+$PAY_UNMTC
+# On met dans le fichier de trace les règlements échus et non lettrés
+If GTRACE="" : Return : Endif
+
+# Issue number X3-82605 [M]DATPCE replaced by DATPCE subprog parameter
+For [HAE]HAE0 Where [F:HAE]DUDDAT <= DATPCE & find([F:HAE]TYP,TTYP(1..NBTYP)) & CPY=SOC & FCY=SIT
+&                 & NUMDCL<>0 With Nohint
+ FLGMTC = 0 : NBACCMTC = 0
+ Link [DAE4] With [GAC]GAC0~=[F:DAE4]COA;[F:DAE4]ACC  As [LNK_4]
+&            Where  TYP=[F:HAE]TYP & NUM=[F:HAE]NUM & LEDTYP=GTYPGEN & BPR<>""
+
+ For [LNK_4]DAE0
+  If [F:GAC]FLGVAT<>3 & [F:GAC]MTC=2 : NBACCMTC += 1 : Endif
+  If [F:DAE4]MTC<>"" : FLGMTC = 1 : Break : Endif
+ Next
+ If !FLGMTC & NBACCMTC>0
+  # Le règlement est échu et il n'y a aucune ligne d'écriture de la pièce de règlement déclenchante lettrée ==> on affiche l'anomalie
+  Call ECR_TRACE(mess(12,107,1)-[F:HAE]TYP-[F:HAE]NUM-","-mess(15,105,1)-format$("D:"+GFMDAT,[F:HAE]DUDDAT)
+&                 -":"-mess(88,107,1),0) From GESECRAN
+ Endif
+Next
+Return
+
+
+########################################################################################################
+$LECTAXD2
+Call LEC_TVT_LEG([F:CPY]LEG,[F:DAE2]TAX) From CPTLEC
+Filter [TRA] Where VAT=[F:DAE2]TAX & CPY=SOC & STRDAT<=[F:DAE2]ACCDAT & LEG=[F:TVT]LEG
+Read [TRA]TRA0 Last
+If !fstat
+ VAT_RAT = [F:TRA]VATRAT
+Else
+ Filter [TRA] Where VAT=[F:DAE2]TAX & CPY="" & STRDAT<=[F:DAE2]ACCDAT & LEG=[F:TVT]LEG
+ Read [TRA]TRA0 Last
+ If !fstat
+  VAT_RAT = [F:TRA]VATRAT
+ Endif
+Endif
+Filter [TRA]
+Return
+
+########################################################################################################
+$LECTAXD3
+VAT_RAT = 0
+Call LEC_TVT_LEG([F:CPY]LEG,[F:DAEA]TAX) From CPTLEC
+Filter [F:TRA] Where VAT=[F:DAEA]TAX & CPY=SOC & STRDAT<=[F:DAEA]ACCDAT & LEG=[F:TVT]LEG
+Read [F:TRA]TRA0 Last
+If !fstat
+ [L]VAT_RAT= [F:TRA]VATRAT
+Else
+ Filter [F:TRA] Where VAT=[F:DAEA]TAX & CPY="" & STRDAT<=[F:DAEA]ACCDAT & LEG=[F:TVT]LEG
+ Read [F:TRA]TRA0 Last
+ If !fstat
+  [L]VAT_RAT= [F:TRA]VATRAT
+ Endif
+Endif
+Filter [TRA]
+Return
+
+######################################################################################
+# Update the tax amount declared in the GACCENTRYD table
+$UPD_AMTVAT
+If find([F:GAC]FLGVAT,2,3,4,5)
+ Readlock [DAEB]DAE2=[F:DAEA]ACCNUM
+ If !fstat
+  [F:DAEB]AMTVAT =  [L]WAMTLED
+  Rewrite [DAEB]
+  If fstat
+   GOK=0 : Call FSTA("DAEB") From GLOCK : Return
+  Endif
+ Endif
+Endif
+Return
+
+#####################################################################################
+$TR_MTCGRU_BOXOFF_ENC
+FIND_OK = 0
+# Issue number X3-82605 [M:DIA]DATPCE replaced by DATPCE subprog parameter
+Filter [LNK_V] Where (VCRTYP=[F:HAE]TYP | VCRTYP="") & FLGVAT=[F:GAC]FLGVAT & VATIPT=[F:GAC]VATIPT & VAT=[F:DAE2]TAX
+&&                        (VLYSTR=[0/0/0] | DATPCE>=VLYSTR) & (VLYEND=[0/0/0] | DATPCE<=VLYEND)
+For [LNK_V]
+ FIND_OK=1 : Break
+Next
+Filter [LNK_V]
+If FIND_OK
+ Case [F:GAC]FLGVAT
+  When 2   :  TBTYPBOXBASENC(IND) = 2   #Detail
+  When 3,4 :  TBTYPBOXTVAENC(IND) = 2   #Detail
+ Endcase
+Else
+ Filter [LNK_V] Where VAT=[F:DAE2]TAX & [VTB]TYPBOX=4
+ # If TYPBOX=4 =(out declaration) Then VLYSTR=null VLYEND=null VCRTYP=null FLGVAT=null VATIPT=null
+ For [LNK_V]
+  Case [F:GAC]FLGVAT
+   When 2   :  TBTYPBOXBASENC(IND) = 4   #Off declaration
+   When 3,4 :  TBTYPBOXTVAENC(IND) = 4   #Off declaration
+  Endcase
+  FIND_OK = 2 : Break
+ Next
+ Filter [LNK_V]
+Endif
+If FIND_OK=0
+  Case [F:GAC]FLGVAT
+   When 2   :  TBTYPBOXBASENC(IND) = -1   # NOT declaration
+   When 3,4 :  TBTYPBOXTVAENC(IND) = -1   # NOT declaration
+  Endcase
+Endif
+Return
+
+$TR_MTCGRU_BOXOFF_DEB
+FIND_OK = 0
+# Issue number X3-82605 [M:DIA]DATPCE replaced by DATPCE subprog parameter
+Filter [LNK_D] Where (VCRTYP=[F:HAE]TYP | VCRTYP="") & FLGVAT=[F:GAC]FLGVAT & VATIPT=[F:GAC]VATIPT & VAT=[F:DAE2]TAX
+&&                        (VLYSTR=[0/0/0] | DATPCE>=VLYSTR) & (VLYEND=[0/0/0] | DATPCE<=VLYEND)
+For [LNK_D]
+ FIND_OK=1 : Break
+Next
+Filter [LNK_D]
+If FIND_OK
+ Case [F:GAC]FLGVAT
+  When 2   :  TBTYPBOXBASDEB(IND) = 2   #Detail
+  When 3,4 :  TBTYPBOXTVADEB(IND) = 2   #Detail
+ Endcase
+Else
+ Filter [LNK_D] Where VAT=[F:DAE2]TAX & [VTBD]TYPBOX=4
+ # If TYPBOX=4 =(out declaration) Then VLYSTR=null VLYEND=null VCRTYP=null FLGVAT=null VATIPT=null
+ For [LNK_D]
+  Case [F:GAC]FLGVAT
+   When 2   :  TBTYPBOXBASDEB(IND) = 4   #Off declaration
+   When 3,4 :  TBTYPBOXTVADEB(IND) = 4   #Off declaration
+  Endcase
+  FIND_OK = 2 : Break
+ Next
+ Filter [LNK_D]
+Endif
+If FIND_OK=0
+ Case [F:GAC]FLGVAT
+  When 2   :  TBTYPBOXBASDEB(IND) = -1   # NOT declaration
+  When 3,4 :  TBTYPBOXTVADEB(IND) = -1   # NOT declaration
+ Endcase
+Endif
+Return
+
+#####################################################################################
+$TR_MTCGRU_BOX
+Link [DAEA] With  [HAE]HAE0~=[F:DAEA]TYP;[F:DAEA]NUM,  [GAC]GAC0~=[L]COA;[F:DAEA]ACC  As [LNK]
+
+For IND=1 To NBCODENC
+ If TBTYPBOXBASENC(IND)=4 or TBTYPBOXTVAENC(IND)=4 or TBTYPBOXBASENC(IND)=-1 or TBTYPBOXTVAENC(IND)=-1
+  For INBA=1 To NBACCNUM(IND)
+   Read [LNK]DAE2 = TBACCNUM(IND,INBA)
+   If !fstat
+    #If [M:DIA]DETDCL=2 # We print the tax boxes "Out declaration"   :# Issue number X3-82605
+    If OFFFLG=2 # We print the tax boxes "Out declaration"           :# Issue number X3-82605
+     If TBTYPBOXBASENC(IND)=4 or TBTYPBOXTVAENC(IND)=4
+      Case [F:GAC]FLGVAT
+       When 2   :
+        If  TBTYPBOXBASENC(IND) = 4
+         Call ECR_TRACE(mess(367,107,1)+"-"+mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)+"-"+
+&                       mess(39,105,1)-[F:DAEA]TAX-"("+mess(2,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,0) From GESECRAN
+        Endif
+       When 3,4 :
+       If  TBTYPBOXTVAENC(IND) = 4
+        Call ECR_TRACE(mess(367,107,1)+"-"+mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)+"-"+
+&                      mess(39,105,1)-[F:DAEA]TAX-"("+mess(2,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,0) From GESECRAN
+       Endif
+      Endcase
+     Endif
+    Endif
+    If TBTYPBOXBASENC(IND)=-1 or TBTYPBOXTVAENC(IND)=-1
+     ERR+=1
+     #If [M:DIA]TRCFLG=2        :# Issue number X3-82605
+     If LOGFLG=2                :# Issue number X3-82605
+      Case [F:GAC]FLGVAT
+       When 2   :
+        If  TBTYPBOXBASENC(IND) = -1
+         Call ECR_TRACE(mess(366,107,1)-"-"-mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)-"-"-
+&                       mess(39,105,1)-[F:DAEA]TAX-"("+mess(2,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,1) From GESECRAN
+        Endif
+       When 3,4 :
+        If  TBTYPBOXTVAENC(IND) = -1
+         Call ECR_TRACE(mess(366,107,1)-"-"-mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)-"-"-
+&                       mess(39,105,1)-[F:DAEA]TAX-"("+mess(2,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,1) From GESECRAN
+        Endif
+      Endcase
+     Endif
+    Endif
+   Endif
+  Next
+ Endif
+Next
+For IND=1 To NBCODDEB
+ If TBTYPBOXBASDEB(IND)=4 or TBTYPBOXTVADEB(IND)=4 or TBTYPBOXBASDEB(IND)=-1 or TBTYPBOXTVADEB(IND)=-1
+  For INBA=1 To NBACCNUMDEB(IND)
+   Read [LNK]DAE2 = TBACCNUMDEB(IND,INBA)
+   If !fstat
+    #If [M:DIA]DETDCL=2 # We print the tax boxes "Out declaration"     :# Issue number X3-82605
+    If OFFFLG=2 # We print the tax boxes "Out declaration"             :# Issue number X3-82605
+     If TBTYPBOXBASDEB(IND)=4 or TBTYPBOXTVADEB(IND)=4
+      Case [F:GAC]FLGVAT
+       When 2   :
+        If  TBTYPBOXBASDEB(IND) = 4
+         Call ECR_TRACE(mess(367,107,1)+"-"+mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)+"-"+
+&                       mess(39,105,1)-[F:DAEA]TAX-"("+mess(1,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,0) From GESECRAN
+        Endif
+       When 3,4   :
+        If  TBTYPBOXTVADEB(IND) = 4
+         Call ECR_TRACE(mess(367,107,1)+"-"+mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)+"-"+
+&                       mess(39,105,1)-[F:DAEA]TAX-"("+mess(1,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,0) From GESECRAN
+        Endif
+      Endcase
+     Endif
+    Endif
+    If TBTYPBOXBASDEB(IND)=-1 or TBTYPBOXTVADEB(IND)=-1
+     ERR+=1
+     #If [M:DIA]TRCFLG=2      :# Issue number X3-82605
+     If LOGFLG=2              :# Issue number X3-82605
+      Case [F:GAC]FLGVAT
+       When 2   :
+        If  TBTYPBOXBASDEB(IND) = -1
+         Call ECR_TRACE(mess(366,107,1)-"-"-mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)-"-"-
+&                       mess(39,105,1)-[F:DAEA]TAX-"("+mess(1,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,1) From GESECRAN
+        Endif
+       When 3,4   :
+        If  TBTYPBOXTVADEB(IND) = -1
+         Call ECR_TRACE(mess(366,107,1)-"-"-mess(12,107,1)-[F:DAEA]TYP-[F:DAEA]NUM-mess(136,105,1)-num$([F:DAEA]LIN)-"-"-
+&                       mess(39,105,1)-[F:DAEA]TAX-"("+mess(1,204,1)+")"-"-"-mess(45,102,1)-[F:DAEA]ACC,1) From GESECRAN
+        Endif
+      Endcase
+     Endif
+    Endif
+   Endif
+  Next
+ Endif
+Next
+Return
+
+#####################################################################################
+$OPEN_FIL
+Local File GACCENTRYD [DAE]  Order By Key CLE = LEDTYP;ACC;BPR;MTC;TYP;NUM;LIN
+Local File GACCENTRYD [DAE1] Order By Key CLE = LEDTYP;ACC;BPR;MTC;TYP;NUM;LIN
+
+
+If clalev([F:DLVBP])=0  : Local File DCLVATBOXPYD  [DLVBP]  : Endif : # Fichier temp. pour décl. TVA/enc
+If clalev([F:DLVBP2])=0 : Local File DCLVATBOXPYD  [DLVBP2] : Endif : # Fichier temp. pour décl. TVA/enc
+If clalev([F:HAE])=0    : Local File GACCENTRY     [HAE]    : Endif : # En-tête de pièces
+If clalev([F:DAE2])=0   : Local File GACCENTRYD    [DAE2]   : Endif : # Lignes d'écritures
+If clalev([F:DAE3])=0   : Local File GACCENTRYD    [DAE3]   : Endif : # Lignes d'écritures
+If clalev([F:DAE4])=0   : Local File GACCENTRYD    [DAE4]   : Endif : # Lignes d'écritures
+If clalev([F:HAE2])=0   : Local File GACCENTRY     [HAE2]   : Endif : # En-tête de pièces
+If clalev([F:DAEA])=0   : Local File GACCENTRYD    [DAEA]   : Endif : # Lignes d'écritures
+If clalev([F:DAEB])=0   : Local File GACCENTRYD    [DAEB]   : Endif : # Lignes d'écritures
+If clalev([F:GAC])=0    : Local File GACCOUNT      [GAC]    : Endif : # Comptes
+If clalev([F:GAC2])=0   : Local File GACCOUNT      [GAC2]   : Endif : # Comptes
+If clalev([F:TVB])=0    : Local File TABVACBPR     [TVB]    : Endif : # Régime de taxes tiers
+Return
+
+
+######################################################################################
+$DECLARE
+
+#-----------------------------------------------------------------------------------------------
+# Table des comptes d'acomptes (pour exclure les comptes d'acomptes dans la TVA/encaissements)
+Local Char    TACPT(GLONGAC)(1..100)       : # Table des comptes d'acomptes
+Local Integer NBACPT                       : # Nombre de comptes d'acomptes
+Raz NBACPT, TACPT
+For [GAC]GAC0 Where COA=[L]COA & FLGVAT = 5
+ NBACPT += 1
+ TACPT(NBACPT) = [F:GAC]ACC
+Next
+
+#-----------------------------------------------------------------------------------------------
+# Table pour les CODES TAXES
+Local Integer NBMAXCODDEB            : # Nombre de codes taxes TVA/débits paramétrés * 2
+Local Integer NBMAXCODENC            : # Nombre de codes taxes TVA/encaissements paramétrés * 2
+Local Integer NB_CODDEB              : # Nombre de codes taxes TVA/débits paramétrés
+Local Integer NB_CODENC              : # Nombre de codes taxes TVA/encaissements paramétrés
+NBMAXCODDEB = 0 : NB_CODDEB = 0
+NBMAXCODENC = 0 : NB_CODENC = 0
+
+Filter [TVT] Where LEG=[F:CPY]LEG | LEG="" Order By Key CLE=VAT Asc ; LEG Desc
+For [TVT]CLE(1)
+ If [F:TVT]VATPAY = 1
+  NBMAXCODDEB += 2
+  NB_CODDEB += 1
+ Else
+  NBMAXCODENC += 2
+  # +=2 car cette variable va nous servir à dimensionner les tableaux tels que BASENC, TVAENC, ...
+  # et ces tableaux contiennent les montants d'un groupe de lettrage par CATCOD (code taxe/
+  # Imputation taxe). On considère donc qu'on a pour un groupe de lettrage soit du collectée
+  # (Ventes ou Immos), soit du déductible (Achats ou Immos) (Donc 2 imputations de taxe possibles
+  # par code taxe dans un groupe de lettrage)
+  NB_CODENC += 1
+ Endif
+Next
+Filter [TVT]
+If NBMAXCODENC=0 : GOK=0 : Return : Endif
+If NBMAXCODDEB=0 : NBMAXCODDEB=1 : NB_CODDEB=1 : Endif
+
+# Ces tableaux vont servir pour les contrôles effectuées dans dans $CONT_CODDEB et $CONT_CODENC
+Local Char    T_CODDEB(10)(1..NB_CODDEB)  : # Table des codes taxes TVA sur débits existants
+Local Char    T_CODENC(10)(1..NB_CODENC)  : # Table des codes taxes TVA sur encaissements existants
+Local Integer T_TYPPAYDEB(1..NB_CODDEB)   : # Table des types régime des codes taxes TVA/débits
+Local Integer T_TYPPAYENC(1..NB_CODENC)   : # Table des types régime des codes taxes TVA/encaissements
+Local Decimal T_RATDEB(1..NB_CODDEB)      : # Table des taux des codes taxes TVA/débits
+Local Decimal T_RATENC(1..NB_CODENC)      : # Table des taux des codes taxes TVA/encaissements
+
+NB_CODDEB = 0 : NB_CODENC = 0
+Filter [TVT] Where LEG=[F:CPY]LEG | LEG="" Order By Key CLE=VAT Asc ; LEG Desc
+For [TVT]CLE(1)
+ If [F:TVT]VATPAY = 1
+  NB_CODDEB += 1
+  T_CODDEB(NB_CODDEB) = [F:TVT]VAT
+  Call LEC_TVB([F:CPY]LEG,[F:TVT]VATVAC) From CPTLEC
+  If !fstat
+   T_TYPPAYDEB(NB_CODDEB) = [F:TVB]REGVAC
+  Endif
+  Filter [TRA] Where CPY = SOC & VAT = [F:TVT]VAT & LEG = [F:TVT]LEG
+  Read [TRA]TRA0 Last
+  If !fstat
+   T_RATDEB(NB_CODDEB) = [F:TRA]VATRAT*[TRA]DEDRAT
+  Else
+   # On se rabat sur le code dossier
+   Filter [TRA] Where CPY = "" & VAT = [F:TVT]VAT & LEG = [F:TVT]LEG
+   Read [TRA]TRA0 Last
+   If !fstat
+    T_RATDEB(NB_CODDEB) = [F:TRA]VATRAT*[TRA]DEDRAT
+   Endif
+  Endif
+  Filter [TRA]
+ Else
+  NB_CODENC += 1
+  T_CODENC(NB_CODENC) = [F:TVT]VAT
+  Call LEC_TVB([F:CPY]LEG,[F:TVT]VATVAC) From CPTLEC
+  If !fstat
+   T_TYPPAYENC(NB_CODENC) = [F:TVB]REGVAC
+  Endif
+  Filter [TRA] Where CPY = SOC & VAT = [F:TVT]VAT & LEG = [F:TVT]LEG
+  Read [TRA]TRA0 Last
+  If !fstat
+   T_RATENC(NB_CODENC) = [F:TRA]VATRAT*[TRA]DEDRAT
+  Else
+   # On se rabat sur le code dossier
+   Filter [TRA] Where CPY = "" & VAT = [F:TVT]VAT & LEG = [F:TVT]LEG
+   Read [TRA]TRA0 Last
+   If !fstat
+    T_RATENC(NB_CODENC) = [F:TRA]VATRAT*[TRA]DEDRAT
+   Endif
+  Endif
+  Filter [TRA]
+ Endif
+Next
+Filter [TVT]
+#-----------------------------------------------------------------------------------------------
+
+
+Local Integer MAXLIG , OKDIM , WRITE_OK
+Local Char    PARAM(10)
+Call PARAM("","MAXDCLVAT",PARAM) From ADOVAL
+MAXLIG = max(val(PARAM),300)
+
+Local Char    ACCMTCGRU(GLONGAC)
+Local Char    SACMTCGRU(GLONSAC)
+Local Char    BPRMTCGRU(GLONBPR)
+Local Date    DATMTCGRU
+Local Char    MTCGRU(5)
+
+Local Integer OKCODENC, OKCODDEB
+Local Integer NBCODENC                          : # Nb codes taxes dues sur les encaissements
+Local Integer NBCODDEB                          : # Nb codes taxes dues sur les débits
+Local Char    TCODENC(15)(1..NBMAXCODENC)       : # Table codes taxes dues sur les encaissements
+Local Char    TCODDEB(15)(1..NBMAXCODDEB)       : # Table codes taxes dues sur les débits
+
+Local Integer NBACCNUM(1..NBMAXCODENC)          : # Nombre de lignes de pièces ayant même lettrage et même CATCOD
+Local Integer TBACCNUM(1..NBMAXCODENC,1..MAXLIG): # Table des lignes de pièces ayant même CATCOD et auquel
+                                                : # est associé un code taxe TVA sur encaissements
+
+Local Integer NBACCNUMDEB(1..NBMAXCODDEB)          : # Nombre de lignes de pièces ayant même lettrage et même CATCOD
+Local Integer TBACCNUMDEB(1..NBMAXCODDEB,1..MAXLIG): # Table des lignes de pièces ayant même CATCOD et auquel
+                                                   : # est associé un code taxe TVA sur débit
+Local Integer TBTYPBOXBASENC(1..NBMAXCODENC)
+Local Integer TBTYPBOXTVAENC(1..NBMAXCODENC)
+Local Integer TBTYPBOXBASDEB(1..NBMAXCODDEB)
+Local Integer TBTYPBOXTVADEB(1..NBMAXCODDEB)
+
+Local Integer SIGN, IND, IND2, INBA
+Local Integer STAT
+Local Integer OKMAJ
+Local Integer FLGMTC, NBACCMTC
+
+Local Decimal TAMTLED(1..NBMAXCODENC,1..MAXLIG): # Table des montants (AMTLED) des lignes de pièces ayant même
+                                               : # CATCOD, auquel est associé un code taxe TVA/encaissements
+Local Decimal TAMTVAT(1..NBMAXCODENC,1..MAXLIG): # Table des montants déclarés (AMTVAT) des lignes de pièces ayant
+                                               : # CATCOD, auquel est associé un code taxe TVA/encaissements
+Local Decimal TOTAL
+Local Decimal MTPAY                : # Montant règlements traités pour l'option TVA/débits d'abord
+Local Decimal TOTDEB               : # TVA+base TVA sur débits d'un groupe de lettrage (montants déjà déclarés compris)
+Local Decimal TOTENC               : # TVA+base TVA sur encaissements d'un groupe de lettrage (montants déjà déclarés compris)
+Local Decimal TOTDECLAR            : # TVA+base TVA sur encaissements d'un groupe de lettrage déjà déclaré
+
+Local Decimal MTHT, MTTVA, MTTTC, MTVCR
+
+Local Decimal VAT_RAT
+Local Decimal BASENC(1..NBMAXCODENC)     : # Tableau des montants des bases de TVA sur encaissements
+Local Decimal TVAENC(1..NBMAXCODENC)     : # Tableau des montants de TVA sur encaissements
+Local Decimal AMTVAT_BASE(1..NBMAXCODENC): # Tableau des montants déclarés (base) pour la TVA/encaiss.
+Local Decimal AMTVAT_TVA(1..NBMAXCODENC) : # Tableau des montants déclarés (montant TVA) pour la TVA/encaiss.
+Local Decimal BASDEB(1..NBMAXCODDEB)     : # Tableau des montants des bases de TVA sur débits
+Local Decimal TVADEB(1..NBMAXCODDEB)     : # Tableau des montants de TVA sur débits
+Local Decimal TOTPAY_DEB                 : # TVA+base TVA sur débits d'un grp de lettrage à déclarer
+Local Decimal TOTPAY_ENC                 : # TVA+base TVA sur encaissements d'un grp de lettrage à déclarer
+
+Local Decimal BASVAT_PAY                 : # Montant déclaré d'une écriture si compte soumis à TVA
+Local Decimal AMTVAT_PAY                 : # Montant déclaré d'une écriture si compte de TVA
+
+Local Decimal TOTPAY                     : # Montant des règlements (des pièces d'un même groupe de lettrage)
+Local Decimal TOTATI                     : # Montant des bases HT+TVA (des pièces d'un même groupe de lettrage)
+Local Integer TYPREC                     : # sert à différencier les diff cas : classiques, acomptes, pièces délettrées
+
+Local Integer CAT
+Local Char    CATCOD(30)
+
+Local Char    TCODVCR(GLONGTE+GLONVCR)(1..NBMAXCODENC,1..MAXLIG)
+Local Decimal TBASNOT(1..NBMAXCODENC,1..MAXLIG)
+Local Decimal TBASVAT(1..NBMAXCODENC,1..MAXLIG)
+
+Local Char COD(30), CODVCR(30)
+Local Integer INDVCR, NBCODVCR(1..NBMAXCODENC)
+
+# Management of VAT box
+Local Integer FIND_OK, ERR : # Miscellaneous variables
+Local Decimal WAMTLED
+
+Local Integer INDBOX                : # Index of each vat box in the list
+INDBOX =  rowcount([LNK_V])
+If INDBOX=0 : GOK=0 : Return : Endif
+
+Local Char    TBOX(5)(1..INDBOX)    : # List of the vat boxes
+Local Decimal AMTBOX(1..INDBOX)     : # List of the tax amount for each vat box
+Local Integer FLGVATBOX(1..INDBOX)  : # List of the FLGVAT value of the account
+Local Integer VATIPTBOX(1..INDBOX)  : # List of the VATIPT value of the account
+Local Integer LINBOX(1..INDBOX)     : # List of the line number of the vat box
+Raz INDBOX
+
+
+#-----------------------------------------------------------------------------------------------
+# Management of pre-payment
+Local Char    TYPVCR(GLONGTE), NUMVCR(GLONVCR)
+Local Integer IPTPREPAY, PREPAY, NUMPREPAY
+Local Decimal TAMTLED2(1..NBMAXCODENC,1..MAXLIG)
+
+#-----------------------------------------------------------------------------------------------
+# Management of Entry point
+Local Char    FILTER1(255), FILTER3(255)
+Local Integer CALL_PT
+Raz CALL_PT
+If dim(GNBENTREE)>0 & GNBENTREE>0 & find("DCLVATBOXPAY",GENTSTD(1..GNBENTREE))
+ CALL_PT=1
+Endif
+Local Char    DLVB_UW(1)
+
+Return
+
+######################################################################################
+$TR_UPDREPORT_FRA
+
+Trbegin [DLVB]
+ ## Add the vat boxes whose type=Title or Total (VATBOX table) and validity period is ok, in the DCLVATFRA table
+ # Issue X3-74646 Replacing DCLVATFRA by GDCLFNCORI
+ For [VTB] Where VATFNC=GDCLFNCORI & LEG=[F:CPY]LEG & (TYPBOX=1 or TYPBOX=3)
+&&               (VLYSTR=[0/0/0] | VLYSTR<=[M:DIA]DATPCE) & (VLYEND=[0/0/0] | VLYEND>=[M:DIA]DATPCE)
+  Raz [DLVB]
+  [F:DLVB]DCLVATTYP = 2
+  [F:DLVB]NUMRPT = GNUMRPT2
+  [F:DLVB]GRPCPY = ""
+  [F:DLVB]CPY    = [F:CPY]CPY
+  [F:DLVB]FCY    = [M:DIA]FCY
+  [F:DLVB]STRDAT = [M:DIA]STRDAT2
+  [F:DLVB]ENDDAT = [M:DIA]ENDDAT2
+  [F:DLVB]VATBOX = [F:VTB]VATBOX
+  [F:DLVB]TYPBOX = [F:VTB]TYPBOX
+  [F:DLVB]SIM    = [M:DIA]TYPGEN
+  [F:DLVB]LIN    = [F:VTB]LIN
+  [F:DLVB]REFTEX = [F:VTB]LEG+"~"+num$([F:VTB]LIN)
+  [F:DLVB]VATFNC = [F:VTB]VATFNC
+  [F:DLVB]OPT    =  val(OPTPAY)
+  [F:DLVB]DATMAX = [M:DIA]DATPCE
+  If [F:DLVB]TYPBOX=3 : # Total
+   [F:DLVB]AMT = func CALCFOR([F:VTB]CLCFOR)
+   If ([F:VTB]CNDFOR = 2)
+    # Balance must be positive
+    If ([F:DLVB]AMT < 0) Then : [F:DLVB]AMT = 0 : Endif
+   Elsif([F:VTB]CNDFOR = 3)
+    # Balance must be negative
+    If ([F:DLVB]AMT > 0) Then : [F:DLVB]AMT = 0 : Endif
+   Endif
+  Endif
+  [F:DLVB]CUR    = [L]DEVLED
+  Write [DLVB]
+  If fstat
+   GOK=0 : Call FSTA("DLVB") From GLOCK : Break
+  Endif
+ Next
+ If GOK=0 : Rollback : Return : Endif
+ ## Add the vat boxes whose type=detail (VATBOX table) and validity period is ok (VATBOXD table) which don't
+ ## have any record in DCLVATBEL
+
+ #For [VTB] Where VATFNC="DCLVATFRA" & LEG=[F:CPY]LEG & [VTB]TYPBOX=2       :# Issue X3-74646
+ For [VTB] Where VATFNC=GDCLFNCORI & LEG=[F:CPY]LEG & [VTB]TYPBOX=2         :# Issue X3-74646
+  Look [DLVB]DLVB0="";[F:CPY]CPY;2;GNUMRPT2;[F:VTB]VATBOX
+  If fstat
+   OK = 1
+   #For [VTD] Where VATFNC="DCLVATFRA" & LEG=[F:CPY]LEG & VATBOX=[F:VTB]VATBOX       :# Issue X3-74646
+   For [VTD] Where VATFNC=GDCLFNCORI & LEG=[F:CPY]LEG & VATBOX=[F:VTB]VATBOX         :# Issue X3-74646
+    OK = 0
+    If ([F:VTD]VLYSTR=[0/0/0] | [F:VTD]VLYSTR<=[M:DIA]DATPCE) & ([F:VTD]VLYEND=[0/0/0] | [F:VTD]VLYEND>=[M:DIA]DATPCE)
+     OK = 1 : Break
+    Endif
+   Next
+   If OK=1
+    Raz [DLVB]
+    [F:DLVB]DCLVATTYP = 2
+    [F:DLVB]NUMRPT = GNUMRPT2
+    [F:DLVB]GRPCPY = ""
+    [F:DLVB]CPY    = [F:CPY]CPY
+    [F:DLVB]FCY    = [M:DIA]FCY
+    [F:DLVB]STRDAT = [M:DIA]STRDAT2
+    [F:DLVB]ENDDAT = [M:DIA]ENDDAT2
+    [F:DLVB]VATBOX = [F:VTB]VATBOX
+    [F:DLVB]TYPBOX = [F:VTB]TYPBOX
+    [F:DLVB]SIM    = [M:DIA]TYPGEN
+    [F:DLVB]AMT    = 0
+    [F:DLVB]LIN    = [F:VTB]LIN
+    [F:DLVB]REFTEX = [F:VTB]LEG+"~"+num$([F:VTB]LIN)
+    [F:DLVB]VATFNC = [F:VTB]VATFNC
+    [F:DLVB]OPT    =  val(OPTPAY)
+    [F:DLVB]DATMAX = [M:DIA]DATPCE
+    [F:DLVB]CUR    = [L]DEVLED
+    Write [DLVB]
+    If fstat
+     GOK=0 : Call FSTA("DLVB") From GLOCK : Break
+    Endif
+   Endif
+  Endif
+ Next
+ If GOK=0 : Rollback : Return : Endif
+Commit
+Return
+
+
+Funprog CALCFOR(FORMULE)
+Value    Char    FORMULE
+Local Decimal TOTAL
+Local Char    CHAINE1(250), CHAINE2(250)
+Local Integer I, SNSNEG
+TOTAL = 0
+CHAINE1 = vireblc(FORMULE,2)
+Repeat I = instr(1,CHAINE1," ")
+ Raz SNSNEG
+ If I<>0
+  CHAINE2 = vireblc(left$(CHAINE1,I-1),2)
+  CHAINE1 = vireblc(right$(CHAINE1,I+1),2)
+ Else
+  CHAINE2 = CHAINE1
+ Endif
+ If left$(CHAINE2,1)="-"
+  CHAINE2 = right$(CHAINE2,2)
+  SNSNEG = 1
+ Endif
+ Read [DLVB1]DLVB0="";[F:CPY]CPY;2;GNUMRPT2;CHAINE2
+ If !fstat
+  If SNSNEG
+   TOTAL -= [F:DLVB1]AMT
+  Else
+   TOTAL += [F:DLVB1]AMT
+  Endif
+ Endif
+Until I=0
+End TOTAL
+

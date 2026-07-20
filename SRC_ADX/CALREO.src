@@ -1,0 +1,658 @@
+#<AdxTL>@(#)4.0.0.0 $Revision$
+#################################################################
+# Calcul des réapprovionnements zones consommation  action CALREO
+#################################################################
+$ACTION
+
+Case ACTION
+ When "OUVRE_BATCH"   : Gosub OPEN_FILE
+ When "INIT"          : Gosub OPEN_FILE
+ When "DEBUT"         : Gosub DEBUT                       # hcb 96776
+ When "EXEC"          : Gosub EXEC
+ When "CONTROLE"      : If GOK<1 : FIN =1 : Endif
+ When "OK"            : GOK=1
+ When "END"           : GOK=0 :FIN=1
+ When "FIN"           : Gosub FIN
+ When Default
+Endcase
+Return
+
+# hcb 96776   deb
+######################################################################"
+#                                                                DEBUT  
+######################################################################"
+$DEBUT
+Call LECMEMO("STD","[M:DIA]","reo") From GMEMO
+Affzo [M:DIA]
+Return
+# hcb 96776   fin
+
+######################################################################"
+#                                                                OUVRE  
+######################################################################"
+$OPEN_FILE
+
+If clalev([F:FCY])=0 Local File FACILITY   [FCY]  Endif
+If clalev([F:STE])=0 Local File STOPAR     [STE]  Endif
+If clalev([F:STL])=0 Local File STOLOT     [STL]  Endif
+If clalev([F:ITF])=0 Local File ITMFACILIT [ITF]  Endif
+If clalev([F:ITM])=0 Local File ITMMASTER  [ITM]  Endif
+If clalev([F:STO])=0 Local File STOCK      [STO]  Endif
+If clalev([F:REO])=0 Local File STOREO     [REO]  Endif
+If clalev([F:TLO])=0 Local File TABLOCTYP  [TLO]  Endif
+If clalev([F:STC])=0 Local File STOLOC     [STC]  Endif
+If clalev([F:STF])=0 Local File STOLOCAFF  [STF]  Endif
+If clalev([F:TFO])=0 Local File TABFOR     [TFO]  Endif
+If clalev([F:MWS])=0 Local File WORKSTATIO [MWS]  Endif
+If clalev([F:BPD])=0 Local File BPDLVCUST  [BPD]  Endif
+If clalev([F:BPC])=0 Local File BPCUSTOMER [BPC]  Endif
+If clalev([F:STA])=0 Local File STOALL     [STA]  Endif
+If GWRHACT=2
+   If clalev([F:WRH])=0 Local File WAREHOUSE [WRH] Endif
+Endif
+If dim(GSIMREO) > 0
+   Kill GSIMREO
+Endif   
+
+# En batch , il vaut mieux mettre onerrgo
+If GSERVEUR
+    Onerrgo ERRBATCH
+Endif
+
+Local Mask CALREO[DIA]
+
+Raz [M:DIA]
+           
+Return
+
+######################################################################"
+#                                                                   OK  
+######################################################################"
+$EXEC
+Call TRT_REAPPRO From CALREO
+
+Return
+
+######################################################################
+# Calcul reappro                                           TRT_REAPPRO  
+######################################################################
+Subprog TRT_REAPPRO
+Raz [M:DIA]DELNBR        
+Raz [M:DIA]WRINBR
+Raz [M:DIA]SRGNBR
+Local    Decimal WSTOQTYSTU           # qte en stock
+Local    Decimal WMANQUANT            # qte manquant
+Local    Decimal WSTOQTYALL           # qte allouée
+Local    Decimal WSTOQTYRUP           # qte rupture
+Local    Decimal WNBRLOTECO           # qtypcu
+Local    Decimal WQTYECOUS            # qty economique en us
+Local    Char    WMSG(140)
+Local    Char    WINT(15)
+Global   Char    GLSTRANGE(15)        # HCB 170404  
+Global   Decimal GQTYRANGE            # qte en  liste 
+
+#--- Demande 49875
+Local Integer WOK, WNEW
+
+Local Char    WFILSTF(250)       : WFILSTF   = "1=1"    #  filtre sur STOLOCAFF
+Local Char    WFILSTC(250)       : WFILSTC   = "1=1"    #  filtre sur STOLOC
+Local Char    WFILITM(250)       : WFILITM   = "1=1"    #  filtre sur ITMMASTER / ITMFACILIT
+Local Char    WFILMWS(250)       : WFILMWS   = "1=1"    #  filtre sur WORKSTATIO
+# Préparation filtre STOLOCAFF
+
+If [F:FCY]FCY<>[M:DIA]STOFCY
+   Read [FCY]FCY0=[M:DIA]STOFCY
+   If fstat Raz [F:FCY]WRHGES Endif
+Endif
+
+#Site de stockage    
+WFILSTF = "[F:STF]STOFCY=[M:DIA]STOFCY" 
+#Emplacement    
+If [M:DIA]LOCSTR <> "" | [M:DIA]LOCEND <> "" 
+   WFILSTF= WFILSTF+"&[F:STF]LOC>=[M:DIA]LOCSTR&[F:STF]LOC<=[M:DIA]LOCEND" 
+Endif 
+#Article    
+If [M:DIA]ITMREFSTR <> "" | [M:DIA]ITMREFEND <> "" 
+   WFILSTF= WFILSTF+"&[F:STF]ITMREF>=[M:DIA]ITMREFSTR&[F:STF]ITMREF<=[M:DIA]ITMREFEND" 
+Endif 
+
+# Préparation filtre STOLOC
+
+#Réapprovisionnable     
+WFILSTC = "[F:STC]REAFLG=2" 
+#Type emplacement     
+If [M:DIA]LOCTYPSTR <> "" | [M:DIA]LOCTYPEND <> "" 
+   WFILSTC= WFILSTC+"&[F:STC]LOCTYP>=[M:DIA]LOCTYPSTR&[F:STC]LOCTYP<=[M:DIA]LOCTYPEND" 
+Endif 
+#Catégorie emplacement interne et sous-traitant à oui   
+If [M:DIA]INTFLG = 2 & [M:DIA]SCOFLG =  2   
+    WFILSTC= WFILSTC+"&([F:STC]LOCCAT=1|[F:STC]LOCCAT=4)" 
+Else
+#Catégorie emplacement interne à non       
+    If [M:DIA]INTFLG <> 2  
+       WFILSTC= WFILSTC+"&[F:STC]LOCCAT=4" 
+    Endif 
+#Catégorie emplacement Sous traitant à non     
+    If [M:DIA]SCOFLG <> 2  
+       WFILSTC= WFILSTC+"&[F:STC]LOCCAT=1" 
+    Endif 
+Endif
+If GWRHACT=2 & [F:FCY]WRHGES=2
+   If [M:DIA]WRHSTR <> "" | [M:DIA]WRHEND <> "" 
+      WFILSTC= WFILSTC+"&[F:STC]WRH>=[M:DIA]WRHSTR&[F:STC]WRH<=[M:DIA]WRHEND" 
+   Endif
+Endif
+
+# Préparation filtre formule ITMMASTER ITMFACILIT
+If [M:DIA]SELFOR <> ""
+   WFILITM = func SUBTFO.LECTFO(19,[M:DIA]SELFOR)
+Endif
+
+# Préparation filtre WORKSTATIO
+
+#Postes de charge      
+If [M:DIA]WSTSTR <> "" | [M:DIA]WSTEND <> "" 
+   WFILMWS= "[F:MWS]WST>=[M:DIA]WSTSTR&[F:MWS]WST<=[M:DIA]WSTEND" 
+Endif 
+
+
+If [M:DIA]TRACE = 2 | dim(GSIMREO) > 0
+    Gosub OUVRE_TRACE
+Endif 
+
+#message opération en cours ...
+Call TEMPON("O") From GESECRAN 
+
+#--- Demande 49875
+#Link [STF] With [STC]STC0=[F:STF]STOFCY;[F:STF]LOC 
+#&          As [INV] 
+#&          Where evalue(WFILSTF) & evalue(WFILSTC)     
+#&          Order By Key STF0  
+WNEW = 0
+GPOINT = "FILTRE_STF" : Gosub ENTREE From EXEFNC
+If WNEW=0
+   Link [STF] With [STC]STC0=[F:STF]STOFCY;[F:STF]LOC 
+&             As [INV] 
+&             Where evalue(WFILSTF) & evalue(WFILSTC)     
+&             Order By Key STF0  
+Endif
+#---
+
+For [INV]
+
+   #--- Demande 49875
+   WOK = 1
+   GPOINT = "VERIF_STA" : Gosub ENTREE From EXEFNC
+   If WOK<>1
+      Goto NEXTSTF
+   Endif 
+   #---
+
+   # test si poste de charge 
+   If WFILMWS <> "1=1"    
+      Filter [MWS] Where WCRFCY = [F:STF]STOFCY      &
+&                        STOLOC = [F:STF]LOC    &
+&                        evalue(WFILMWS)        
+      Look [MWS]WST4 First
+      Filter [MWS]
+      If fstat 
+         Goto NEXTSTF
+      Endif 
+   Endif
+   # test si formule
+   If WFILITM <> "1=1"      
+      Onerrgo ERR_FORM
+      Link [ITF] With [ITM]ITM0=[F:ITF]ITMREF 
+&                As [ART] 
+&                Where STOFCY =  [F:STF]STOFCY    &
+&                      ITMREF =  [F:STF]ITMREF    &
+&                      evalue(WFILITM)     
+      Look [ART]First
+      Filter [ART]
+      If fstat 
+         Goto NEXTSTF
+      Endif 
+   Endif
+
+   Call DEBTRANS From GLOCK
+   Trbegin [REO]   
+
+   Gosub CTR_STOREO
+   If GOK > 0
+
+      #--- Demande 49875
+      #Gosub CAL_STO
+      WNEW = 0
+      GPOINT = "NEW_CALSTO" : Gosub ENTREE From EXEFNC
+      If WNEW=0
+         Gosub CAL_STO
+      Endif
+      #---
+
+      WSTOQTYSTU = WSTOQTYSTU - WSTOQTYALL 
+      WSTOQTYSTU = WSTOQTYSTU - WSTOQTYRUP 
+      If WSTOQTYSTU <= [F:STF]REOTSD       # si qte stock inferieure au seuil on calcul le besoin
+         Gosub TRT_REA
+      Else
+         If [M:DIA]TRACE = 2 | dim(GSIMREO) > 0
+            Raz WMSG
+            Call TEXTFIC("STOLOCAFF","LOC",3,WINT) From OBJDIV
+            WMSG = WMSG+WINT+" : "+[F:STF]LOC+" "
+            Call TEXTFIC("STOLOCAFF","ITMREF",3,WINT) From OBJDIV
+            WMSG = WMSG+WINT+" : "+[F:STF]ITMREF+" "
+            Call TEXTFIC("STOLOCAFF","REOTSD",3,WINT) From OBJDIV
+            WMSG = WMSG+WINT+" : "+num$([F:STF]REOTSD)+" "
+            WMSG = WMSG+ mess(102,198,1)+" : "+num$(WSTOQTYSTU)+"   "
+            Call ECR_TRACE(WMSG,0) From GESECRAN                            
+
+            If GLSTRANGE <> ""                                              
+               WMSG = +"      *   "+ mess(454,198,1)+" : "+GLSTRANGE+"   * "    
+               Call ECR_TRACE(WMSG,0) From GESECRAN                      
+            Endif                                                         
+         Endif
+      Endif
+   Endif
+   If GOK  < 1
+      Gosub AB_TRT
+   Else
+      Commit
+   Endif 
+
+$NEXTSTF
+Next
+$FINSTF
+Filter [INV]  
+
+#suppression message opération en cours ...
+Call TEMPOFF   From GESECRAN
+ 
+If [M:DIA]TRACE = 2 | dim(GSIMREO) > 0 & !GSERVEUR         #MAE bg68381
+   Call ECR_TRACE("---------------------------------------------------------------",0) From GESECRAN  
+   If dim(GSIMREO) > 0 
+      Call ECR_TRACE("*** "-mess(27,107,1)-" ***",0) From GESECRAN                # Simulation
+   Endif
+   Call ECR_TRACE("*"-mess(042,197,1)-" : "-num$([M:DIA]DELNBR),0) From GESECRAN  # Enregistrements effacés
+   Call ECR_TRACE("*"-mess(103,141,1)-" : "-num$([M:DIA]WRINBR),0) From GESECRAN  # Enregistrements créés
+   Call ECR_TRACE("*"-mess(462,198,1)-" : "-num$([M:DIA]SRGNBR),0) From GESECRAN  # Enregistrements associés à une liste à ranger
+   Call ECR_TRACE("---------------------------------------------------------------",0) From GESECRAN  
+    If !GSERVEUR        #MAE, bg68381
+       Call FERME_TRACE From LECFIC 
+       Call LEC_TRACE   From LECFIC 
+    Endif
+Endif
+
+End
+
+$ERR_FORM
+Call MESSAGE (mess(65,106,1)) From GESECRAN
+Goto FINSTF
+
+######################################################################## 
+# CTR_STOREO                    Controle sur STOREO et suppression si OK
+######################################################################## 
+$CTR_STOREO 
+Raz GLSTRANGE           
+Raz GQTYRANGE
+# controle de la presence de l emplacement article dans STOREO 
+#             si present et STAFLG à 2 on sort 
+#             si present et VCRNUM <> "" on sort
+Local Integer WOK
+Read [F:REO]REO0=[F:STF]STOFCY;[F:STF]LOC;[F:STF]ITMREF 
+If fstat
+   Return 
+Endif
+If [F:REO]STAFLG = 2
+   GOK = 0
+   Return
+Endif
+If [F:REO]VCRNUM <> "" 
+   [M:DIA]SRGNBR += 1
+    GLSTRANGE = [F:REO]VCRNUM 
+    GQTYRANGE = [F:REO]QTYSTUORIA          
+   Return
+Endif
+If dim(GSIMREO) > 0 
+   Goto CTR_STOREO_SUIT
+Endif
+
+Delete [REO]
+If fstat 
+   GOK = 0
+   Call FSTA("REO") From GLOCK
+   Return
+Endif
+
+
+$CTR_STOREO_SUIT
+[M:DIA]DELNBR += 1
+Return 
+
+######################################################################## 
+# CAL_STO                                                   Calcul stock 
+######################################################################## 
+$CAL_STO 
+WSTOQTYSTU = 0                               # quantite en stock (US)
+WSTOQTYALL = 0                               # quantite alloué
+WSTOQTYRUP = 0                               # quantite rupture
+
+# Point d'entrée CRIT_STO : calcul réappro zone consommation (Hcb demande 39689)
+Local Char CRITSTO(250)
+Raz CRITSTO
+GPOINT = "CRIT_STO" : Gosub ENTREE From EXEFNC
+If CRITSTO = "" 
+   CRITSTO = "1=1" 
+Endif
+
+Filter [STO] Where LOC    = [F:STF]LOC     &
+&                  STOFCY = [F:STF]STOFCY  &
+&                  ITMREF = [F:STF]ITMREF
+&                & evalue(CRITSTO)     
+&            Order By Key STO4
+Columns [STO] (QTYSTU, CUMALLQTY)
+For [STO] 
+  WSTOQTYSTU += [F:STO]QTYSTU
+  If [M:DIA]ALLFLG = 2 
+      WSTOQTYALL += [F:STO]CUMALLQTY
+  Endif
+Next
+Filter  [STO]
+Columns [STO]
+
+# rupflg n a plus lieu d etre en  V6 fonctionnalité remplacée par la reappro des "rupture sur emplacement"
+# hcb Demande 74126 deb : reintégration  de cette fonctionnalite
+
+If [M:DIA]RUPFLG = 2 
+   Filter [STA] Where LOC    = [F:STF]LOC     &
+&                     STOFCY = [F:STF]STOFCY  &
+&                     ITMREF = [F:STF]ITMREF  &
+&                     ALLTYP = 4
+&               Order By Key STA0
+   Columns [STA] (QTYSTUACT)
+   For [STA] 
+       WSTOQTYRUP += [F:STA]QTYSTUACT
+   Next
+   Filter  [STA]
+   Columns [STA]
+Endif
+# hcb 74126 fin
+
+Return 
+
+######################################################################## 
+# TRT_REA              Traitement réapprovisionnement zones consommation
+######################################################################## 
+$TRT_REA 
+If [F:STF]PCUSTUCOE = 0
+   [F:STF]PCUSTUCOE = 1
+Endif
+If [F:STF]QTYPCU = 0
+   [F:STF]QTYPCU = 1
+Endif
+
+#lecture ITMMASTER  pour recuperer l US     # hcb 90068
+If [F:ITM]ITMREF<>[F:STF]ITMREF
+   Read [ITM]ITM0=[F:STF]ITMREF
+   If fstat 
+      Raz [F:ITM]
+   Endif
+Endif
+#calcul du manquant
+
+# hcb 56298 
+If WSTOQTYSTU >= 0
+   WMANQUANT = max([F:STF]MAXSTO - (WSTOQTYSTU),0)
+Else
+   WMANQUANT = max([F:STF]MAXSTO + ((WSTOQTYSTU) * -1),0)
+Endif
+If WMANQUANT <> 0 
+   Call QTEARR(WMANQUANT,[F:ITM]STU) From TRTDIV    # hcb 90068
+Endif
+
+#calcul de la quantite economique en US
+WQTYECOUS = [F:STF]QTYPCU * [F:STF]PCUSTUCOE
+#calcul du nombre de lot economique 
+WNBRLOTECO = int(WMANQUANT /  WQTYECOUS)
+# peut etre mettre 1 dans ce cas ....
+If WNBRLOTECO = 0
+   Return
+Endif
+
+#lecture STOLOC pour recuperer la catégorie emplacement
+If [F:STC]STOFCY<>[F:STF]STOFCY| [F:STC]LOC<>[F:STF]LOC
+    Read [STC]STC0=[F:STF]STOFCY;[F:STF]LOC 
+    If fstat 
+       Raz [F:STC]
+    Endif
+Endif
+
+#lecture ITMFACILIT  pour recuperer STOMGTCOD   hcb ST
+If [F:ITF]STOFCY <> [F:STF]STOFCY | [F:ITF]ITMREF <> [F:STF]ITMREF 
+   Read [ITF]ITF0=[F:STF]ITMREF;[F:STF]STOFCY
+   If fstat 
+      Raz [F:ITF]
+   Endif
+Endif
+
+If [F:STF]PCU = ""
+   [F:STF]PCU = [F:ITM]STU
+Endif
+
+#SI l emplacement est de type sous-traitance  lecture du fichier BPDLVCUST
+ #     POUR récupérer le tiers et l adresse  (uniquement dans le cas ou 
+ #     L emplacement n est renseigné que sur un seul enregistrement  (test sur SCOLOC)
+
+Raz [F:BPD]                    # hcb 1006 + 38799
+If [F:STC]LOCCAT = 4
+   Gosub TRT_BPDLVCUST
+Endif
+
+# Chargement buffer STOREO
+Raz [F:REO]
+[F:REO]STOFCY    = [F:STF]STOFCY
+[F:REO]ITMREF    = [F:STF]ITMREF
+[F:REO]LOCCAT    = [F:STC]LOCCAT
+[F:REO]LOC       = [F:STF]LOC 
+[F:REO]WRH       = [F:STC]WRH 
+[F:REO]PCU       = [F:STF]PCU
+[F:REO]QTYPCU    = [F:STF]QTYPCU * WNBRLOTECO
+[F:REO]PCUSTUCOE = [F:STF]PCUSTUCOE
+[F:REO]STU       = [F:ITM]STU
+[F:REO]DEFPOT    = [F:ITM]DEFPOT
+Raz GPE                         # hcb 60699
+GPOINT = "CAL_QTYSTU"           # hcb 60699
+Gosub  ENTREE From EXEFNC       # hcb 60699
+If GPE =  0                     # hcb 60699
+   [F:REO]QTYSTU    = [F:REO]QTYPCU * [F:REO]PCUSTUCOE
+   Call QTEARR([F:REO]QTYSTU,[F:REO]STU) From TRTDIV 
+Endif                           # hcb 60699
+# pour 1 article titré la quantitée à reaprovisionner est calculée à partir du titre par défaut
+If [F:ITF]STOMGTCOD = 3                                          
+   [F:REO]QTYSTUACT = ([F:REO]QTYSTU * ([F:ITM]DEFPOT / 100))
+   Call QTEARR([F:REO]QTYSTUACT,[F:ITM]STU) From TRTDIV
+Else
+   [F:REO]QTYSTUACT = [F:REO]QTYSTU
+Endif
+
+
+[F:REO]BESDAT    = date$
+[F:REO]STAFLG    = 1
+[F:REO]BPRNUM    = [F:BPD]BPCNUM
+[F:REO]BPAADD    = [F:BPD]BPAADD
+
+[F:REO]PROTIM    = mid$(time$,1,2)+mid$(time$,4,2)
+[F:REO]CREUSR    = GUSER
+[F:REO]CREDAT    = date$
+[F:REO]EXPNUM    = [C]EXPORT
+
+If GLSTRANGE <> ""         
+   Goto TRT_REA_SUIT1      
+Endif                     
+
+
+If dim(GSIMREO) > 0 
+   Goto TRT_REA_SUIT
+Endif
+# vcrlin calculé ici pour permettre de faire le lien avec STOALL si liste à ranger 
+#[F:REO]VCRLIN    =uniqid([REO])  en 150 fait dans trtreoa au moment de la reecriture REO avec liste
+
+# Récupération du code préparation
+Call REC_PRECOD([F:REO]STOFCY,[F:REO]ITMREF,[F:ITM]TCLCOD,[F:ITM]TSICOD(0),
+&               [F:ITM]TSICOD(1),[F:ITM]TSICOD(2),[F:ITM]TSICOD(3),
+&               [F:ITM]TSICOD(4),[F:BPD]BPCNUM,[F:BPC]BCGCOD,[F:BPC]TSCCOD(0),
+&               [F:BPC]TSCCOD(1),[F:BPC]TSCCOD(2),[F:BPC]TSCCOD(3),
+&               [F:BPC]TSCCOD(4),[F:REO]PRECOD)  From STKLIB
+
+
+GPOINT = "WRIT_REO" : Gosub ENTREE From EXEFNC    # hcb 39412
+
+Write [REO]
+If fstat 
+   GOK = 0 
+   Call FSTA("REO") From GLOCK 
+   Return
+Endif
+
+$TRT_REA_SUIT
+
+[M:DIA]WRINBR += 1
+
+$TRT_REA_SUIT1     
+
+Raz WMSG
+If [M:DIA]TRACE = 2 | dim(GSIMREO) > 0
+  Call TEXTFIC("STOREO","LOC",3,WINT) From OBJDIV
+  WMSG = WMSG+WINT+" : "+[F:REO]LOC+" "
+  Call TEXTFIC("STOREO","ITMREF",3,WINT) From OBJDIV
+  WMSG = WMSG+WINT+" : "+[F:REO]ITMREF+" "
+  Call TEXTFIC("STOLOCAFF","REOTSD",3,WINT) From OBJDIV
+  WMSG = WMSG+WINT+" : "+num$([F:STF]REOTSD)+" "
+  WMSG = WMSG+ mess(102,198,1)+" : "+num$(WSTOQTYSTU)+" "
+  Call TEXTFIC("STOREO","PCU",3,WINT) From OBJDIV
+  WMSG = WMSG+"  "+WINT+" : "+[F:REO]PCU+" "
+  Call TEXTFIC("STOREO","QTYPCU",3,WINT) From OBJDIV
+  WMSG = WMSG+WINT+" : "+num$([F:REO]QTYPCU)+" "
+  Call TEXTFIC("STOREO","PCUSTUCOE",3,WINT) From OBJDIV
+  WMSG = WMSG+WINT+" : "+num$([F:REO]PCUSTUCOE)+" "
+  Call TEXTFIC("STOREO","QTYSTU",3,WINT) From OBJDIV
+  WMSG = WMSG+WINT+" : "+num$([F:REO]QTYSTU)+" "
+  If [F:REO]DEFPOT <> 0
+     Call TEXTFIC("STOREO","DEFPOT",3,WINT) From OBJDIV
+     WMSG = WMSG+WINT+" : "+num$([F:REO]DEFPOT)+"   "
+     If [F:REO]QTYSTUACT = 0 
+        WMSG = WMSG+" * "+ mess(7,21,1)+" *  "
+     Endif
+  Endif
+  Call ECR_TRACE(WMSG,0) From GESECRAN                           
+  If GLSTRANGE <> ""                                              
+     WMSG = +"      *   "+ mess(454,198,1)+" : "+GLSTRANGE  
+     If GQTYRANGE < [F:REO]QTYSTUACT 
+        WMSG = WMSG+" "+ mess(601,197,1)+"   "
+     Endif
+     WMSG = WMSG+"   * "
+     Call ECR_TRACE(WMSG,0) From GESECRAN                        
+  Endif                                                        
+
+Endif
+
+
+Return 
+
+
+######################################################################## 
+# AB_TRT                                       Abandon de la transaction
+######################################################################## 
+$AB_TRT 
+Rollback 
+Return 
+
+######################################################################## 
+# OUVRE_TRACE                                    Ouverture fichier trace
+######################################################################## 
+$OUVRE_TRACE 
+If !GSERVEUR    #MAE, bg 68381
+    Call OUVRE_TRACE(mess(868,196,1)) From LECFIC 
+Endif
+Call ECR_TRACE("*"-mess(41,120,1),0) From GESECRAN                           # Critères de sélection
+Call ECR_TRACE("-"-mess(565,197,1)-" : "-[M:DIA]STOFCY,0) From GESECRAN      # Site de stockage
+Call ECR_TRACE("*"-mess(174,100,1),0) From GESECRAN                          # Paramètres
+If [M:DIA]ALLFLG = 2
+   Call ECR_TRACE("-"-mess(566,197,1),0) From GESECRAN                       # déduction allocations
+Endif
+# hcb 74126
+
+If [M:DIA]RUPFLG = 2
+   Call ECR_TRACE("-"-mess(579,197,1),0) From GESECRAN                       # déduction ruptures
+Endif
+Call ECR_TRACE("*"-mess(562,197,1),0) From GESECRAN                          # Bornes début / fin
+
+If GWRHACT=2 & [F:FCY]WRHGES=2
+   If [M:DIA]WRHEND <> ""
+      Call ECR_TRACE("-"-mess(299,195,1)-" : "-[M:DIA]WRHSTR-" / "-[M:DIA]WRHEND,0) From GESECRAN     # Dépôt
+   Endif
+Endif
+If [M:DIA]LOCTYPEND <> ""
+   Call ECR_TRACE("-"-mess(567,197,1)-" : "-[M:DIA]LOCTYPSTR-" / "-[M:DIA]LOCTYPEND,0) From GESECRAN  # Type emplacement
+Endif
+If [M:DIA]LOCEND <> ""
+   Call ECR_TRACE("-"-mess(568,197,1)-" : "-[M:DIA]LOCSTR-" / "-[M:DIA]LOCEND,0) From GESECRAN        # Emplacement
+Endif
+If [M:DIA]ITMREFEND <> ""
+   Call ECR_TRACE("-"-mess(569,197,1)-" : "-[M:DIA]ITMREFSTR-" / "-[M:DIA]ITMREFEND,0) From GESECRAN  # Article
+Endif
+If [M:DIA]WSTEND <> ""
+   Call ECR_TRACE("-"-mess(570,197,1)-" : "-[M:DIA]WSTSTR-" / "-[M:DIA]WSTEND,0) From GESECRAN        # Poste de charge
+Endif
+Call ECR_TRACE("*"-mess(563,197,1),0) From GESECRAN                          # Catégorie emplacement
+If [M:DIA]INTFLG = 2
+   Call ECR_TRACE("-"-mess(571,197,1),0) From GESECRAN                       # Interne              
+Endif
+If [M:DIA]SCOFLG = 2
+   Call ECR_TRACE("-"-mess(572,197,1),0) From GESECRAN                       # Sous-traitant        
+Endif
+Call ECR_TRACE("*"-mess(564,197,1),0) From GESECRAN                          # Critères supplémentaires
+If [M:DIA]SELFOR <> ""
+   Local Char WDES
+   Call LECTEXTRA(WDES,"TABFOR","DES","19",[M:DIA]SELFOR) From ATEXTRA
+   Call ECR_TRACE("-"-mess(573,197,1)-" : "-[M:DIA]SELFOR-"  "-WDES,0) From GESECRAN   # Formule 
+Endif
+Call ECR_TRACE("---------------------------------------------------------------",0) From GESECRAN  
+
+Return 
+
+######################################################################## 
+ # TRT_BPDLVCUST Récupéreration du tiers et adresse dans le cas d un 
+ #               emplacement de sous traitance  (L emplacement ne doit 
+ #               etre renseigné que sur un seul enregistrement  (SCOLOC)
+######################################################################## 
+$TRT_BPDLVCUST
+Raz [BPD]
+Filter [BPD] Where SCOLOC = [F:STF]LOC  &   
+&                  STOFCY = [F:STF]STOFCY 
+&            Order By Key BPD0
+Read [BPD]BPD0 First
+If fstat
+   Filter [BPD]
+   Return
+Endif
+Read [BPD]BPD0 Next
+If !fstat        
+   Raz [BPD]
+Endif
+Filter [BPD]
+# Lecture client pour récup code stat
+If [F:BPD]BPCNUM<>""
+   Read [BPC]BPC0=[F:BPD]BPCNUM
+   If fstat Raz [BPC] Endif
+Endif   
+
+Return
+#########################################################################
+$ERRBATCH
+Call ECR_TRACE(errmes$(errn)-num$(errl)-errm,1) From GESECRAN
+Return
+
+$FIN
+
+Return
+
+

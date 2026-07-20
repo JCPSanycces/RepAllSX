@@ -1,0 +1,1261 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+###########################################################################
+# INTERFACE COMPTABLE DES STOCKS  v 140  T.Blanc  01/2004                 #
+# Traitement FUNSTKACC (Direct ou batch)                                  #
+# Ecran de sélection : STKACC                                             #
+#     L'abréviation de cet écran peut varier (ce n'est pas toujours DIA)  #
+#     en particulier dans STKLIB.FUNSTKACC => utilisation variable LABR   #
+###########################################################################
+#*X3-39795   MDJ  Manage ORIGIN and ORICOD fields in GL Entry
+#
+$ACTION
+Case ACTION
+ When "INIT"          Gosub INIT
+ When "OUVRE_BATCH"   Gosub INIT
+ When "INIT_DIA"      Gosub INIT_DIA
+ When "CONTROLE"      Gosub CONTROLE
+ When "EXEC"          Gosub EXEC
+ When "TERMINE"       Gosub TERMINE
+ When "SORTIE"
+Endcase
+Return
+
+$INIT_DIA
+If dim(LABR)<=0 : Local Char LABR(GLONABR) : Endif
+If LABR="" : LABR="DIA" : Endif
+
+# lecture du fichier paramètre
+# Issue 101389 - 2017-02-09 by ERMIL : Get last date for the current site or global running
+Filter [SAC] Where evalue("FINFCY=[M:"+LABR+"]FINFCY | FINFCY=''")
+Read [SAC]SAC0 Last
+Filter [SAC]  # 101389.n
+If !fstat
+    Assign "[M:"+LABR+"]LASPRODAT" With [F:SAC]PRODAT
+Endif
+Assign "[M:"+LABR+"]PRODAT" With date$  # mvts filtrés selon dates ET flag
+      # attention en batch ou abonnt le GETPAR écrasera le [M]PRODAT initialisé !!
+      # autoriser date vide et l'interpréter... ??
+
+# positionner un champ quand on paramètre l'abonnement
+If clalev([M:ABA1]) > 0
+    Assign "[M:"+LABR+"]ABT" With 1
+Endif
+
+#>>Call GETDEV(GFCYDEF(7)) From DEVSUB # récupérer le site financier du site/défaut ?
+#>>[M]FINFCY = GFINRSP
+
+Assign "[M:"+LABR+"]DATSEL" With 2    # par défaut date d'imputation
+Return
+
+#########-- -- -- -- -- --#########################
+$INIT
+If dim(LABR)<=0 : Local Char LABR(GLONABR) : Endif
+If LABR="" : LABR="DIA" : Endif
+
+If GMODU(2) <> 2
+# "Le module Compta n'est pas présent"
+   GMESSAGE = mess(174,196,1) : GERR = 1
+   Return
+Endif
+
+Local Integer CTL_OK, OK, LRET
+Local Char    TIT_ECR(50) : TIT_ECR = mess(189,195,1)
+Local Char    SYMBOLE(10)
+Local Char    CRITERE(250)   # pour filtrer par tranches (nécessaire si màj de STJ)
+Local Char    CRITSUP(250)
+Local Char    CLE1(GLONFCY), CLE3(GLONITM)
+Local Date    CLE2
+Local Integer CLE4, CLE5     # pour se repositionner après une boucle
+Local Integer STOP,NB
+Local Char    ERR_TRA(132)
+Local Integer LOUVTRA : LOUVTRA=0
+Local Char    TZONE(10)(1..10) : # Table of the zones to be forced (Ex: ORICOD)   #*X3-39795
+Local Char    TVAL(30)(1..10)  : # Table of values for zones to be forced         #*X3-39795
+
+#--MDJ US-102691 Presence of the fixed assets module
+Local Integer LGESFAS : LGESFAS=0
+If (GMODU(14)=2) and (func AFNC.ACTIV("FAS"))
+  LGESFAS=1
+Endif #--/US-102691
+
+Local Char    USR_FLD(20)  :# zone supplémentaire chargée en spécifique
+Local Integer TRT_OLD   # =1 s'il reste des enreg qui n'ont pas été comptabilisés (29/06)
+Local Decimal NO_EXE, NO_PER
+
+# La variable LACCBKG indique par son existance que l'interface est lancée en arrière plan
+# Pour éviter de modifier les buffers, onforce l'ouverture de toutes les tables
+# LACCBKG mod 2 : transaction déjà ouverte
+# LACCBKG mod 4 : pas d'écriture dans STOACCPAR [SAC]
+If !clalev([F:ITC]) | dim(LACCBKG)>0 Local File ITMCOST     [ITC] Endif
+If !clalev([F:STJ]) | dim(LACCBKG)>0 Local File STOJOU      [STJ] Endif
+If !clalev([F:STJX])| dim(LACCBKG)>0 Local File STOJOU      [STJX] Endif
+If !clalev([F:SJV]) | dim(LACCBKG)>0 Local File STOJOUVAL   [SJV] Endif
+If !clalev([F:SJT]) | dim(LACCBKG)>0 Local File STJTMP      [SJT] Endif # Table temporaire de clés (!! abréviation [SJT]!!)
+If !clalev([F:SJT1]) | dim(LACCBKG)>0 Local File STJTMP      [SJT1] Endif
+If !clalev([F:SAC]) | dim(LACCBKG)>0 Local File STOACCPAR   [SAC] Endif # paramètres v130 = date dernier trt
+If !clalev([F:PAS]) | dim(LACCBKG)>0 Local File PARSTOACC   [PAS] Endif # paramètres d'agrégation
+If !clalev([F:ITF]) | dim(LACCBKG)>0 Local File ITMFACILIT  [ITF] Endif
+If !clalev([F:ITV]) | dim(LACCBKG)>0 Local File ITMMVT      [ITV] Endif
+If !clalev([F:TCM]) | dim(LACCBKG)>0 Local File TABCOSTMET  [TCM] Endif
+If !clalev([F:TCU]) | dim(LACCBKG)>0 Local File TABCUR      [TCU] Endif
+If !clalev([F:PER]) | dim(LACCBKG)>0 Local File PERIOD      [PER] Endif  # pour date fin de période
+If !clalev([F:FCY]) | dim(LACCBKG)>0 Local File FACILITY    [FCY] Endif
+If !clalev([F:CPY]) | dim(LACCBKG)>0 Local File COMPANY     [CPY] Endif
+If !clalev([F:ITM]) | dim(LACCBKG)>0 Local File ITMMASTER   [ITM] Endif # US-102691
+# ouverture des tables correspondant aux pièces origine ...
+# Issue 70726 - 2011-01-14 by CCC : rationalisation des ouvertures de tables si appel depuis document
+If GMODU(6) = 2
+    If !clalev([F:PTH]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,6)  Local File PRECEIPT    [PTH] Endif
+    If !clalev([F:PTD]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,6)  Local File PRECEIPTD   [PTD] Endif
+    If !clalev([F:PTD2]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,6)  Local File PRECEIPTD  [PTD2] Endif
+    If !clalev([F:PIH]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,6,8)Local File PINVOICE    [PIH] Endif
+    If !clalev([F:PID]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,6,8)Local File PINVOICED   [PID] Endif
+    If !clalev([F:PIV]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,6,8)Local File PINVOICEV   [PIV] Endif
+    If !clalev([F:PNH]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,8)  Local File PRETURN     [PNH] Endif
+    If !clalev([F:PND]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,8)  Local File PRETURND    [PND] Endif
+    If !clalev([F:SCI]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,8)  Local File SCOITM      [SCI] Endif
+Endif
+If GMODU(5) = 2
+        If !clalev([F:SDH]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,4,13) Local File SDELIVERY   [SDH] Endif
+        If !clalev([F:SDD]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,4)    Local File SDELIVERYD  [SDD] Endif
+        If !clalev([F:SIH]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,5,18) Local File SINVOICE    [SIH] Endif
+        If !clalev([F:SID]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,5,18) Local File SINVOICED   [SID] Endif
+        If !clalev([F:SRH]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,13)   Local File SRETURN     [SRH] Endif
+        If !clalev([F:SRD]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,13)   Local File SRETURND    [SRD] Endif
+Endif
+
+If !clalev([F:SMH]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,19,20,31,32) : Local File SMVTH       [SMH] : Endif
+If !clalev([F:SMD]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,19,20,31,32) : Local File SMVTD       [SMD] : Endif
+If !clalev([F:BPC]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,13)          : Local File BPCUSTOMER  [BPC] : Endif
+If !clalev([F:CUD]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,9)           : Local File CUNLISDET   [CUD] : Endif
+If !clalev([F:SGH]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,29)          : Local File SCHGH       [SGH] : Endif
+If !clalev([F:SGD]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,29)          : Local File SCHGD       [SGD] : Endif
+
+If GMODU(12)=2
+ If !clalev([F:HDT]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,33) : Local File HDKTASK    [HDT] : Endif
+ If !clalev([F:SRE]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,23) : Local File SERREQUEST [SRE] : Endif
+Endif
+
+If GMODU(8) = 2
+  If !clalev([F:MKM]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,12) Local File MFGMATTRK   [MKM] Endif
+  If !clalev([F:MKI]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,15) Local File MFGITMTRK   [MKI] Endif
+  If !clalev([F:MFO]) | dim(LACCBKG)>0 & dim(LACCBKGTYP)>0 & find(LACCBKGTYP,15) Local File MFGOPE      [MFO] Endif
+Endif
+If !clalev([F:GAU]) | dim(LACCBKG)>0 : Local File GAUTACE     [GAU] : Endif # pour vérifier 'pièce groupée'
+
+If dim(LACCBKG)<=0
+    Local Integer LACCBKG
+Endif
+Return
+#########-- -- -- -- -- --#########################
+
+# contrôle des sélections  (cohérence des paramètres...)
+$CONTROLE
+If evalue("[M:"+LABR+"]FINFCY") <> ""
+    Call GETSOC(evalue("[M:"+LABR+"]FINFCY")) From DEVSUB
+    If func FUNSTKACC.CTRLPARAM(nomap, GCURLEG)
+        FIN=1
+    Endif
+Else
+    If func FUNSTKACC.CTRLPARAM(nomap, "")
+        FIN=1
+    Endif
+Endif
+# Issue 75759 - 2012-02-10 by CCC : Alimentation de LASPRODAT pour trace correcte
+If GSERVEUR
+    Read [SAC]SAC0 Last
+    If !fstat
+        Assign "[M:"+LABR+"]LASPRODAT" With [F:SAC]PRODAT
+    Endif
+Endif
+Return
+
+$EXEC
+If !GSERVEUR & GTRACE=""
+   Call OUVRE_TRACE(mess(189,195,1)) From LECFIC
+   LOUVTRA=1
+Endif
+
+Lock STOACC With lockwait=0  # à faire avant la génération du trt (eventuellmt lu par qq'un)
+ ## ou locker par société à partir d'un code site saisi MAIS le trt généré ne doit pas être touché !
+ # lock identique dans l'objet PAS (paramétrage agrégation) avant de générer le trt
+If fstat
+  # Afficher un message d'erreur, car quelqu'un est déjà en train de comptabiliser les stocks
+    If GSERVEUR
+        ERR_TRA = mess(270,197,1) # "Interface comptable deja en cours"
+        Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+    Else
+        GMESSAGE = mess(270,197,1)
+        GERR = 1
+    Endif
+Else
+    Call GENTRT(nomap,LRET)   # (sortir si il y a eu erreur)
+    If LRET = 0
+        Gosub CPTSTJ
+    Endif
+    Unlock STOACC
+Endif
+Return
+
+##########################################################################
+## Etiquette utilisée par le générateur de pièce automatique (TB)
+##########################################################################
+$LIENDECL
+#Local Decimal W_ORIPRI, W_AMTORI
+#Local Char    W_ORICCE(15)(1..9) # sections venant de la pièce d'origine
+#Local Char    W_ORICUR(3)
+# si besoin, déclarées ici puisque l'appel est fait depuis la validation de pièces.
+# Liens à établir à partir de la table déclenchante [SJT] (ouverte sous TB0 par le générateur)
+
+# CCC (12/04/05) DM 29696 : Faire le lien sur le coût standard
+Local Decimal NOYEA
+Local Decimal LAMT, LQTY
+Local Char REQ(250)(2)
+Local Integer IREQ
+
+If dim(GLASTSTJ)<=0 : Global Char GLASTSTJ(250) : Endif
+GLASTSTJ = "STOFCY="+[F:TB0]STOFCY-"ITMREF="+[F:TB0]ITMREF-"IPTDAT="+num$([F:TB0]IPTDAT)-"MVTSEQ="+num$([F:TB0]MVTSEQ)-"MVTIND="+num$([F:TB0]MVTIND)
+Raz [F:STJX]
+Read [STJ]STJ0=[F:TB0]STOFCY;2;[F:TB0]ITMREF;[F:TB0]IPTDAT;[F:TB0]MVTSEQ;[F:TB0]MVTIND
+If fstat
+ Raz [F:STJ]
+Else
+ # Issue 67004 - 2010-09-03 by CCC
+ If GACTDECCST & clalev([F:SJV])
+    Raz [F:SJV]     # Issue 88540 - 2013-03-08 by CCC
+    Read [SJV]SJV0=[F:TB0]STOFCY;2;[F:TB0]ITMREF;[F:TB0]IPTDAT;[F:TB0]MVTSEQ;[F:TB0]MVTIND
+ Endif
+ # ccc (2009-11-05) DM 59567 : préciser le n° de doc
+ GLASTSTJ -= mess([F:STJ]VCRTYP,701,1)-"VCRNUM="+[F:STJ]VCRNUM-"VCRLIN="+num$([F:STJ]VCRLIN)
+ # lire les pièces origines selon VCRTYP et ramener le prix et les CCE...
+ Case [F:STJ]VCRTYP
+   When 4 : #-------------- Livraison ------------------#
+            Read [SDD]SDD0 = [F:STJ]VCRNUM;[F:STJ]VCRLIN
+            If !fstat
+             Read [SDH]SDH0 = [F:STJ]VCRNUM : # pour récupérer la devise
+             # W_ORIPRI = [F:SDD]NETPRINOT
+             # If [F:SDD]SAUSTUCOE > 0
+             #   W_ORIPRI = W_ORIPRI / [F:SDD]SAUSTUCOE
+             # Endif                              # le prix est défini pour une UV
+             # W_AMTORI = W_ORIPRI * [F:STJ]QTYSTU
+             # W_ORICUR = [F:SDH]CUR
+             # For I=1 To 9
+             #  W_ORICCE(I) = evalue("[F:SDD]CCE"+num$(I))
+             # Next
+            Else
+              Raz [F:SDD]
+            Endif
+   When 5,18 : #-------------- Facture vente et Avoir vente ----------#
+            Read [SID]SID0 = [F:STJ]VCRNUM;[F:STJ]VCRLIN :# (fact directe 24/05/00)
+            If !fstat
+             Read [SIH]SIH0 = [F:STJ]VCRNUM : # pour récupérer la devise
+             # W_ORIPRI = [F:SID]NETPRINOT
+             # If [F:SID]SAUSTUCOE > 0
+             #   W_ORIPRI = W_ORIPRI / [F:SID]SAUSTUCOE
+             # Endif                              # le prix est défini pour une UV
+             # W_AMTORI = W_ORIPRI * [F:STJ]QTYSTU
+             # W_ORICUR = [F:SIH]CUR
+             # For I=1 To 9
+             #  W_ORICCE(I) = evalue("[F:SID]CCE"+num$(I))
+             # Next
+            Else
+              Raz [F:SID]
+            Endif
+   When 6 : #----------------- Réception ----------------#
+            Read [PTH]PTH0 = [F:STJ]VCRNUM
+            If fstat
+             Raz [F:PTH]
+            Endif
+            Read [PTD]PTD0 = [F:STJ]VCRNUM;[F:STJ]VCRLIN :#CPRCUR est dispo
+            If fstat
+              Raz [F:PTD]
+            Endif
+
+            # Issue 94933 - 2014-03-06 by CCC : FAR sous-traitance
+            Raz [F:PTD2]
+            If [F:STJ]VCRTYPORI=36
+                Filter [SCI] Where SCONUM=[F:STJ]VCRNUMORI
+                Read [SCI] First
+                Filter [SCI]
+                Raz LAMT, [F:PTD2]
+                If !fstat & [F:SCI]ITMREF=[F:STJ]ITMREF
+                    Raz REQ, IREQ, LQTY
+                    # Si le document est supprimé on passe l'inverse du montant déjà comptabilisé
+                    # Pour savoir si le document est en cours de suppression, on ne peut que se baser sur les mouvements
+                    Call ADDCRIT(REQ, IREQ, "", "SELECT sum(ACTQTY_0) From STOJOU", " ") From GOBJSUB
+                    Call ADDCRIT(REQ, IREQ, "", "Where STOFCY_0='"+[F:STJ]STOFCY+"'", " ") From GOBJSUB
+                    Call ADDCRIT(REQ, IREQ, "",   "and UPDCOD_0=2", " ") From GOBJSUB
+                    Call ADDCRIT(REQ, IREQ, "",   "and ITMREF_0='"+[F:STJ]ITMREF+"'", " ") From GOBJSUB
+                    Call ADDCRIT(REQ, IREQ, "",   "and VCRTYP_0="+num$([F:STJ]VCRTYP), " ") From GOBJSUB
+                    Call ADDCRIT(REQ, IREQ, "",   "and VCRNUM_0='"+[F:STJ]VCRNUM+"'", " ") From GOBJSUB
+                    Call ADDCRIT(REQ, IREQ, "",   "and VCRLIN_0="+num$([F:STJ]VCRLIN), " ") From GOBJSUB
+                    For (Decimal QTY) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+                        LQTY=[F:SQLX]QTY
+                    Next
+                    If LQTY<>0
+                        Filter [PTD2] Where PTHNUM=[F:STJ]VCRNUM
+&                                         & PTDLIN>[F:STJ]VCRLIN
+&                                     Order By PTDLIN;LINTYP
+                        Read [PTD2] First
+                        While (!fstat & find([F:PTD2]LINTYP,3,4)<>0)
+                            LAMT += [F:PTD2]LINAMT
+                            Read [PTD2] Next
+                        Wend
+                        Filter [PTD2]
+                    Endif
+                    Raz [F:PTD2]
+                    Read [PTD2]PTD0=[F:STJ]VCRNUM;[F:STJ]VCRLIN
+                    If !fstat
+                        LAMT -= [F:PTD2]SCOCSTCPT
+                        [F:PTD2]SCOCSTCPT += LAMT
+                        Rewrite [PTD2]
+                        [F:PTD2]LINAMT = LAMT
+                    Endif
+                Endif
+            Endif
+
+            If [F:STJ]VCRNUMREG <> ""
+                # pour une régul on peut avoir besoin de la date facture :
+                Read [F:PIH]PIH0=[F:STJ]VCRNUMREG
+                If fstat
+                 Raz [F:PIH]
+                Endif
+                Read [F:PIV]PIV0=[F:STJ]VCRNUMREG
+                If fstat
+                 Raz [F:PIV]
+                Endif
+                Read [F:PID]PID0=[F:STJ]VCRNUMREG;[F:STJ]VCRLINREG
+                If fstat
+                 Raz [F:PID]
+                Endif
+            Endif
+
+             # Issue 88463 - 2013-06-06 by CCC : Comptabilisation des landed costs
+             Raz [F:STJX]
+             If [F:STJ]PRINAT=8
+                Raz REQ, IREQ
+                Call ADDCRIT(REQ,IREQ,"","SELECT sum(ACTQTY_0)"," ") From GOBJSUB
+                Call ADDCRIT(REQ,IREQ,"","From STOJOU"," ") From GOBJSUB
+                Call ADDCRIT(REQ,IREQ,"","Where STOFCY_0='"+[F:STJ]STOFCY+"'"," ") From GOBJSUB
+                Call ADDCRIT(REQ,IREQ,"","  and VCRTYP_0=6"," ") From GOBJSUB
+                Call ADDCRIT(REQ,IREQ,"","  and VCRNUM_0='"+[F:STJ]VCRNUM+"'"," ") From GOBJSUB
+                Call ADDCRIT(REQ,IREQ,"","  and VCRLIN_0="+num$([F:STJ]VCRLIN)," ") From GOBJSUB
+                Call ADDCRIT(REQ,IREQ,"","  and ITMREF_0='"+[F:STJ]ITMREF+"'"," ") From GOBJSUB
+                For (Decimal QTY) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+                    If [F:SQLX]QTY=0
+                        [F:PTD]FCSCPR=0 # Pour gérer le cas de la comptabilisation en cours de suppression
+                    Endif
+                Next
+                If [F:PTD]FCSCPR <> [F:PTD]FCSCPRCPT
+                    [F:STJX] = [F:STJ]
+                    Raz [F:STJX]AMTORD, [F:STJX]AMTVAL, [F:STJX]VARORD, [F:STJX]VARVAL, [F:STJX]PRIORD, [F:STJX]PRIVAL
+                    [F:STJX]VARVAL = [F:PTD]FCSCPR - [F:PTD]FCSCPRCPT
+                    [F:PTD]FCSCPRCPT = [F:PTD]FCSCPR
+                    Rewrite [PTD]
+                Endif
+             Endif
+
+            Gosub GET_ITC
+   When 8 : #--------------- Retour fournisseur ------------#
+            Read [PNH]PNH0 = [F:STJ]VCRNUM
+            If fstat
+             Raz [F:PNH]
+            Endif
+            Read [PND]PND0 = [F:STJ]VCRNUM;[F:STJ]VCRLIN :#CPRCUR est dispo
+            If fstat
+              Raz [F:PND]
+            Endif
+            If [F:STJ]VCRNUMREG <> ""
+                # pour une régul on peut avoir besoin de la date facture :
+                Read [F:PIH]PIH0=[F:STJ]VCRNUMREG
+                If fstat
+                 Raz [F:PIH]
+                Endif
+                Read [F:PIV]PIV0=[F:STJ]VCRNUMREG
+                If fstat
+                 Raz [F:PIV]
+                Endif
+                Read [F:PID]PID0=[F:STJ]VCRNUMREG;[F:STJ]VCRLINREG
+                If fstat
+                 Raz [F:PID]
+                Endif
+            Endif
+   When 9  : #--------------- Inventaire ---------------------#
+             Read [CUD]CUD0=[F:STJ]VCRNUMORI;[F:STJ]VCRNUM;[STJ]VCRLIN
+             If fstat
+              Raz [F:CUD]
+             Endif
+   When 12 : #-------------- Suivi matière --------------------#
+             Read [MKM]MKM0 = [F:STJ]VCRNUM;[F:STJ]VCRLIN
+             If fstat
+               Raz [F:MKM]
+             Endif
+   When 13 : #---------- Retour client -----------#
+             Read [SRH]SRH0=[F:STJ]VCRNUM
+             If fstat
+              Raz [F:SRH]
+             Endif
+             Read [SRD]SRD0=[F:STJ]VCRNUM;[F:STJ]VCRLIN
+             If fstat
+              Raz [F:SRD]
+             Endif
+             Read [BPC]BPC0=[F:STJ]BPRNUM
+             If fstat
+              Raz [F:BPC]
+             Endif
+             If clalev([SDH])
+                 Read [SDH]SDH0=[F:STJ]VCRNUMORI
+                 If fstat
+                     Raz [F:SDH]
+                 Endif
+             Endif
+   When 15 : #----------------- Déclaration de production ---------------------#
+             Read [MKI]MKI0 = [F:STJ]VCRNUM;[F:STJ]VCRLIN
+             If fstat
+               Raz [F:MKI]
+             Endif
+             Read [MFO]MFO0(1)=[F:STJ]VCRNUMORI
+             [G:MFO]currlen = 0
+             If fstat
+               Raz [F:MFO]
+             Endif
+   When 19,20,31,32 : #-------- Entrée et sorties diverses & assemblage désassemblage ---------#
+             Read [SMH]SMH0=[F:STJ]VCRTYP;[F:STJ]VCRNUM
+             If fstat
+                 Raz [F:SMH]
+             Endif
+             Read [SMD]SMD0=[F:STJ]VCRTYP;[F:STJ]VCRNUM;[F:STJ]VCRLIN ###CH
+             If fstat
+                 Raz [F:SMD]
+             Endif
+             # Issue 60688 - 2010-07-08 by CCC : Calcul de la variance
+             Raz [F:STJX]
+             If [F:STJ]VCRTYP=32 & [F:SMH]VCRNUM<>""
+                Local Decimal LDBYDEV
+                Raz LDBYDEV
+                For [STJX] Where STOFCY=[F:STJ]STOFCY
+&                              & VCRTYP=[F:STJ]VCRTYP
+&                              & VCRNUM=[F:STJ]VCRNUM
+                    # Issue 83351 - 2012-08-20 by CCC : [F:STJ]VARVAL --> [F:STJX]VARVAL
+                    LDBYDEV += arr([F:STJX]VARVAL,[F:TCU]CURRND)
+                Next
+                If [F:SMH]DBYDEV <> LDBYDEV
+                    [F:STJX] = [F:STJ]
+                    Raz [F:STJX]AMTORD, [F:STJX]AMTVAL, [F:STJX]VARORD, [F:STJX]VARVAL, [F:STJX]PRIORD, [F:STJX]PRIVAL
+                    [F:STJX]VARVAL = LDBYDEV - [F:SMH]DBYDEV
+                    [F:SMH]DBYDEV = LDBYDEV
+                    Rewrite [SMH]
+                Else
+                    Raz [F:STJX]
+                Endif
+             Endif
+   When 29 : #--------------- Changement stock -----------------#
+             Read [SGH]SGH0=[F:STJ]VCRNUM
+             If fstat
+                 Raz [F:SGH]
+             Endif
+             Read [SGD]SGD0=[F:STJ]VCRNUM;[F:STJ]VCRLIN ###CH
+             If fstat
+                 Raz [F:SGD]
+             Endif
+   When 33 : #-------------- Demande de service -----------------#
+             Read [HDT]HDT0=[F:STJ]VCRNUM
+             If fstat
+                 Raz [F:HDT]
+             Endif
+             If [HDT]SRENUM<>""
+                 Read [SRE]SRE0=[HDT]SRENUM
+                 If fstat
+                     Raz [F:SRE]
+                 Endif
+             Endif
+
+ Endcase
+
+ Read [ITF]ITF0=[F:TB0]ITMREF;[F:TB0]STOFCY
+ If !fstat
+    # avoir la méthode de valorisation en ligne pour conditionner la pièce auto
+    Call GETTCM([F:TB0]ITMREF,[F:TB0]STOFCY,GBIDC1,GBIDI1) From STKVAL    #GETTCM se positionne sur [F:TCM]
+ Endif
+ # cas particulier des mvts de chgt de valeur /variation coûts (distinguer par / VCRNUM="" ?)
+ If [F:STJ]TRSTYP = 23 & find([F:STJ]PRINAT,2,3)
+    Read [ITV]ITV0=[F:TB0]ITMREF;[F:TB0]STOFCY # pour lire le stock physique
+ Endif
+Endif
+
+# CCC (08/03/06) DM 35203
+GPOINT="LNKSTKACC"
+Gosub ENTREE From EXEFNC
+
+#If find([F:STJ]VCRTYP,4,5,6,8) & W_ORICUR <> GLOCALDEV
+#   Call CONVERT2(W_ORICUR,GLOCALDEV,GLOCALDEV,1,GHIDATE,W_AMTORI,GBIDD3,STAT) From TRTDEV
+#   W_AMTORI = arr(GBIDD3,[F:TCU]CURRND)
+#   Call CONVERT2(W_ORICUR,GLOCALDEV,GLOCALDEV,1,GHIDATE,W_ORIPRI,GBIDD3,STAT) From TRTDEV
+#   W_ORIPRI = arr(GBIDD3,10^-GDECPRI) # GLOCALDEV ou GCUR ???
+#Endif
+Return
+
+#####################################################################################
+# Contrôle que le paramétrage dans la table PARSTOACC est complet
+#       appelée aussi à la création/modif des paramètres (fonction GESPAS)
+#####################################################################################
+# Paramètres E : PDOS = dossier
+#              : PLEG = code législation (facultatif)
+#            S : LRET = code erreur (0=OK)
+#                                   (1=Paramétrage incomplet)
+#                                   (2=Paramétrage manquant pour une législation)
+#####################################################################################
+Funprog CTRLPARAM(PDOS,PLEG)
+Value Char PDOS
+Value Char PLEG
+
+Local Char CRITERE(250)
+Local Integer LRET, I
+Local Integer LTABTRS(1..len(mess(0,704,1))), LNBTRS, LNB, LTRS, LTRSERR
+
+
+If clalev([F:PAS])=0 :     Local File =PDOS+".PARSTOACC" [PAS] Endif
+
+If PLEG=""
+    # Issue 94243 - 2014-11-24 by CCC
+    #CRITERE = "1=1"
+    CRITERE = "find(LEG,GDOSLEG)<>0 & LEG<>''"
+Else
+    CRITERE = "LEG='"+PLEG+"'"
+Endif
+
+For [PAS]PAS0(1) Where evalue(CRITERE)
+    For [PAS]PAS0(2)
+        Call TRSTYPACC([F:PAS]LEG,[F:PAS]CPY,"",LTABTRS) From STKVALMAJ
+        LNBTRS = sigma(1,dim(LTABTRS),LTABTRS(indcum)=0)
+        Raz LNB, LTRSERR
+        LTRS = find(0,LTABTRS)
+        For [PAS]PAS0
+            If LTRS<[F:PAS]TRSTYP & LTRSERR=0
+                LTRSERR = LTRS
+                Break
+            Else
+                # CCC (2009-04-17) Bug 54141 : S'il existe un paramétrage de trop on le supprime.
+                # Cela peut arriver lorsque le paramètre OPEIFA passe de 2 à 1
+                # LTABTRS contient la liste exhaustive des types de mouvements comptabilisables. Donc si on
+                # cherche à traiter un type qui n'y est pas c'est que le paramétrage est en trop.
+                If LTRS>[F:PAS]TRSTYP
+                    Delete [F:PAS] Curr
+                Else
+                    LTRS += find(0,LTABTRS(LTRS+1..dim(LTABTRS)))
+                    LNB +=1
+                Endif
+            Endif
+        Next
+        If LNB<>LNBTRS
+            If LTRSERR=0 : LTRSERR=LTRS : Endif
+            LRET=1
+            If GTRACE<>""
+                Call ECR_TRACE(mess(161,7770,1)-":"-mess(238,133,1)+"="+[F:PAS]LEG-string$([F:PAS]CPY<>"",mess(2,45,1)+"="+[F:PAS]CPY)-mess(LTRSERR,704,1),1) From GESECRAN
+            Else
+                Call ERREUR(mess(161,7770,1)-":"-mess(238,133,1)+"="+[F:PAS]LEG-string$([F:PAS]CPY<>"",mess(2,45,1)+"="+[F:PAS]CPY)-mess(LTRSERR,704,1)) From GESECRAN
+                Break 2
+            Endif
+        Endif
+    Next
+Next
+
+If LRET
+    End LRET
+Endif
+
+For I=1 To GNBLEG
+    If PLEG="" | GDOSLEG(I)=PLEG
+        Filter [PAS] Where LEG=GDOSLEG(I)
+        Look [PAS] First
+        Filter [PAS]
+        If fstat
+            LRET=2
+            # Paramétrage incomplet
+            If GTRACE<>""
+                Call ECR_TRACE(mess(161,7770,1)-":"-mess(238,133,1)+"="+GDOSLEG(I),1) From GESECRAN
+            Else
+                Call ERREUR(mess(161,7770,1)-":"-mess(238,133,1)+"="+GDOSLEG(I)) From GESECRAN
+                Break
+            Endif
+        Endif
+    Endif
+Next
+
+End LRET
+
+#####################################################################################
+# Génération du traitement automatique à partir des paramètres de la table PARSTOACC
+#       appelée aussi à la création/modif des paramètres (fonction GESPAS)
+#####################################################################################
+# Paramètres E : PDOS = dossier
+#            S : PRET = code erreur (0=OK)
+#                                   (3=Validation traitement en erreur)
+#####################################################################################
+Subprog GENTRT(PDOS,PRET)
+Value Char PDOS
+Variable Integer PRET
+
+Raz PRET
+
+If clalev([F:PAS])=0 :     Local File =PDOS+".PARSTOACC" [PAS] Endif
+Local Integer I
+Local Char CHPRAZ(250),TRTGEN(20),FICTRT(250)
+Local Char SAV_IFS(10), SAV_IRS(10)
+
+TRTGEN='WSTOACC'
+FICTRT=filpath('TRT',TRTGEN,'src',PDOS)
+SAV_IFS = adxifs # sauvegarde des variables systèmes séparateurs
+SAV_IRS = adxirs
+adxifs = ""
+adxirs = chr$(10)  # ou utiliser Iomode
+
+Openo FICTRT , 0
+##Infbox "erreur en retour : "+num$(errn)
+Wrseq "#<AdxT"+GADOVERS+">@(#)0.0.0.0 $Revision:   1.0  $"-"Alimentation du fichier temporaire d'agrégation"
+Wrseq
+Wrseq "$LOAD_SJT"
+Wrseq " If !clalev([F:STJX]) : Local File STOJOU [STJX] : Endif"
+# Dans le cas des plans de rangement, on récupère le TRSTYP d'origine
+Wrseq " If [F:STJ]TRSTYP=22"
+Wrseq "   Filter [STJX] Where STOFCY=[F:STJ]STOFCY&ITMREF=[F:STJ]ITMREF&VCRTYP=[F:STJ]VCRTYP&VCRNUM=[F:STJ]VCRNUM&VCRLIN=[F:STJ]VCRLIN"
+Wrseq "   Read [STJX]STJ0 Last"
+Wrseq "   Filter [STJX]"
+Wrseq " Else"
+Wrseq "   [F:STJX]TRSTYP = [F:STJ]TRSTYP"
+Wrseq " Endif"
+Wrseq " [F:SJT]=[F:STJ]" # pour les zones clés de STJ + ENTCOD
+# Issue 74388 - 2011-06-20 by CCC
+Wrseq " If [F:FCY]FCY<>[F:STJ]STOFCY"
+Wrseq "      Read [FCY]FCY0=[F:STJ]STOFCY"
+Wrseq " Endif"
+Wrseq " [F:SJT]CPY=[F:FCY]LEGCPY"
+Wrseq " If [F:CPY]CPY<>[F:SJT]CPY"
+Wrseq "    Read [CPY]CPY0=[F:SJT]CPY"
+Wrseq " Endif"
+
+Filter [PAS] Order By Key PAS0 Desc
+Wrseq " Case [F:CPY]LEG"
+For [PAS]PAS0(1)
+    If [PAS]LEG<>""
+        Wrseq "     When '"+num$([F:PAS]LEG)+"'"
+    Else
+        Wrseq "     When Default"
+    Endif
+    Wrseq "         Case [F:SJT]CPY"
+    For [PAS]PAS0(2)
+        If [PAS]CPY<>""
+            Wrseq "             When '"+num$([F:PAS]CPY)+"'"
+        Else
+            Wrseq "             When Default"
+        Endif
+        Wrseq "                 Case [F:STJX]TRSTYP"
+        For [PAS]PAS0
+            CHPRAZ=""
+            Wrseq "                     When "+num$([F:PAS]TRSTYP)
+            For I=1 To 5
+                If evalue("[F:PAS]KEY"+num$(I))<>""
+                    Wrseq "                         [F:SJT]KEY"+num$(I)+"="+evalue("[F:PAS]KEY"+num$(I))
+                    # Issue 87615 - 2013-01-29 by CCC
+                    Wrseq "                         [F:SJT]KEY"+num$(I)+"+= string$([SJT]KEY"+num$(I)+"='','#')"
+                Else
+                    Wrseq "                         [F:SJT]KEY"+num$(I)+"='~'"
+                    # pour imposer qqch dans la clause where du filtre du générateur cpta (CH)
+                    # sinon les enreg seraient traités 2x (1ère quand KEY="" et 2è quand KEY<>"")
+                Endif
+            Next I
+        Next
+        Wrseq "                 Endcase"
+    Next
+    Wrseq "         Endcase"
+Next
+
+Filter [PAS]    # Issue 88808 - 2013-07-03 by CCC
+
+Wrseq " Endcase"
+Wrseq "Return"
+
+Openo
+
+adxifs = SAV_IFS
+adxirs = SAV_IRS
+Call VALID("TRT",TRTGEN,PDOS,PRET) From VALMSKSUB
+If PRET = 0
+    PRET=3
+    Call ECR_TRACE(mess(20,123,1),1) From GESECRAN    #"Erreur en validation du traitement
+Else
+    Raz PRET
+Endif
+End
+
+#######################################################
+#
+# Sous-programme de comptabilisation exploitant STJTMP
+#
+$CPTSTJ
+Local Integer NBSTJTRT, STAT, STOP, I
+Local Char    MESSA(250), CRITSEL(250)(2)
+Local Char    IDENT(30)(1..13), LACCIFA(2), LFINFCY(GLONFCY), LNULIFA(2), LSCOIFA(2)
+Local Char    PCEDEB(GLONVCR),PCEFIN(GLONVCR)
+Local Integer LTABTRS(1..len(mess(0,704,1)))
+Local Char    LFCY(GLONFCY)
+Local Date    LIPT
+Local Integer LTRSTYP
+Local Decimal LARR : LARR=0 # Issue 91861 - 2014-11-21 by CCC
+
+#----------------------------------------------------
+#   Criteria for the filter of STOJOU
+#----------------------------------------------------
+
+Raz CRITSEL
+# Enregistrements non encore comptabilisés
+CRITSEL = "[STJ]AGGIFAFLG<2 & UPDCOD=2" # << changer le nom de zone ?
+# DATSEL permet d'extraire STJ selon la date d'imputation ou la date de création
+If evalue("[M:"+LABR+"]DATSEL") = 2
+  CRITSEL += "& IPTDAT<=[M:"+LABR+"]PRODAT"
+Else
+  CRITSEL += "& CREDAT<=[M:"+LABR+"]PRODAT"
+Endif
+
+If evalue("[M:"+LABR+"]FINFCY") <> ""
+  CRITSEL += "& FINRSPFCY=[M:"+LABR+"]FINFCY" # site financier sélectionné
+Endif
+
+# Issue 95618 - 2014-03-14 by CCC
+# Issue X3-91539 - 2018-06-01 by ERMIL : Added TRSTYP 36 to the excluded list
+#CRITSEL(1)="& !find(TRSTYP,7,8,9,10,15,16,17,18,20,21,22,25,26,27,28,30,31,32,33,34)"
+CRITSEL(1)="& find(TRSTYP,7,8,9,10,15,16,17,18,20,21,25,26,27,28,30,31,32,33,34,36)=0"
+
+# Critère supplémentaire alimenté par l'appelant
+If CRITSUP=""
+    CRITSUP="1=1"
+Endif
+
+# On efface tout ce qui se trouve dans le fichier temporaire de clés
+If mod(LACCBKG,2)=0
+    Trbegin [SJT]
+       Delete [SJT] Where 1=1
+    Commit
+Else
+    Delete [SJT] Where 1=1
+Endif
+
+# Issue 89393 - 2013-04-18 by CCC
+Local Integer FILACCNUL     # Mettre une valeur <>0 pour déclencher le PE FILACCNUL
+FILACCNUL=0
+GPOINT = "FILACC"
+Gosub ENTREE From EXEFNC
+
+# Remplissage de la table de clés
+Raz STOP
+$DEBTRANS
+If STOP = 1
+  STOP = 2
+  CRITERE = "STOFCY=CLE1 & IPTDAT=CLE2 & ITMREF=CLE3 & MVTSEQ=CLE4 & MVTIND>CLE5"
+Elsif STOP = 2
+  STOP = 3
+  CRITERE = "STOFCY=CLE1 & IPTDAT=CLE2 & ITMREF=CLE3 & MVTSEQ>CLE4"
+Elsif STOP = 3
+  STOP = 4
+  CRITERE = "STOFCY=CLE1 & IPTDAT=CLE2 & ITMREF>CLE3" # attention sens clé (-) !?
+Elsif STOP = 4
+  STOP = 5
+  CRITERE = "STOFCY=CLE1 & IPTDAT>CLE2"
+Elsif STOP = 5
+  STOP = 0
+  CRITERE = "STOFCY>CLE1"  # refaire le repositionnement sur STJ
+Else
+  CRITERE = "1=1"
+Endif
+
+NBSTJTRT=0
+If mod(LACCBKG,2)=0
+    Call DEBTRANS From GLOCK
+    Trbegin [SJT]
+Endif
+
+Onerrgo ERR_KEY
+# Parcours des Stojou non comptabilisés
+Filter [STJ] Where ENTCOD <>"" & evalue(CRITERE) & evalue(CRITSEL) & evalue(CRITSUP)
+&            Order By STOFCY;IPTDAT;ITMREF;MVTSEQ;MVTIND
+For [STJ]
+    If CLE1<>[F:STJ]STOFCY
+        CLE1=[F:STJ]STOFCY
+        Call PARAM(CLE1,"ACCIFA",LACCIFA) From ADOVAL
+        GACCIFA = val(LACCIFA)
+        If GACCIFA<2  # Accounting interface set to no for this site
+            # Store the current key values (UPDCOD is already forced to 2)
+            CLE1 = [F:STJ]STOFCY
+            CLE2 = [F:STJ]IPTDAT
+            CLE3 = [F:STJ]ITMREF
+            CLE4 = [F:STJ]MVTSEQ
+            CLE5 = [F:STJ]MVTIND
+            STOP=5  # Go to the next site
+            # Set the aggregated flags to True for Stock acct and Point in Time valuation
+            If GACTVLT2
+              Update [STJ] Where STOFCY=CLE1 & (AGGIFAFLG<>2 | PITVALFLG<>2 | PITVALFLG2<>2) With AGGIFAFLG=2 & PITVALFLG=2 & PITVALFLG2=2
+            Else
+              Update [STJ] Where STOFCY=CLE1 & (AGGIFAFLG<>2 | PITVALFLG<>2) With AGGIFAFLG=2 & PITVALFLG=2
+            Endif
+            Break
+        Endif
+        Call PARAM(CLE1,"NULAMTIFA",LNULIFA) From ADOVAL
+        Call PARAM(CLE1,"SCOIFA",LSCOIFA) From ADOVAL
+        Call TRSTYPACC("","",[F:STJ]STOFCY,LTABTRS) From STKVALMAJ    # renvoie 1 à l'indice du type de mouvement non comptabilisé (sert à l'affectation de GMENLOC)
+
+        # Issue 91861 - 2014-11-21 by CCC : get currency rounding
+        Call GETDEV([F:STJ]STOFCY) From DEVSUB  # read TCU
+        LARR = [F:TCU]CURRND
+    Endif
+    # Issue 95618 - 2014-03-14 by CCC
+    LTRSTYP = [F:STJ]TRSTYP
+    If [F:STJ]TRSTYP=22
+        Columns [STJX] (TRSTYP)
+        Filter [STJX] Where STOFCY=[F:STJ]STOFCY
+&                         & ITMREF=[F:STJ]ITMREF
+&                         & VCRTYP=[F:STJ]VCRTYP & VCRNUM=[F:STJ]VCRNUM & VCRLIN=[F:STJ]VCRLIN
+&                         & TRSTYP<>22
+&                     Order By Key STJ0 Desc
+        For [STJX]
+            [F:STJ]TRSTYP=[F:STJX]TRSTYP
+            Break
+        Next
+        Filter [STJX]
+        Columns [STJX]
+    Endif
+    # Issue X3-31259/106099 - 2017-04-24 by ERMIL : Add TRSTYP 29
+    If [F:STJ]TRSTYP<=0 | [F:STJ]TRSTYP>dim(LTABTRS) | LTABTRS([F:STJ]TRSTYP)<>0
+&   | (([F:STJ]TRSTYP=29 | ([F:STJ]TRSTYP=3 & [F:STJ]VCRTYPORI=36)) & val(LSCOIFA)>=2)
+        Goto NEXT_STJ
+    Endif
+    [F:STJ]TRSTYP = LTRSTYP
+
+    # Issue 89393 - 2013-04-18 by CCC
+    #   Set GPE to 1 to force posting
+    #   Set GPE to 2 to force non-posting
+    GPE=0
+    If FILACCNUL<>0
+        GPOINT="FILACCNUL"
+        Gosub ENTREE From EXEFNC
+    Endif
+
+# Issue 77594 - 2011-11-04 by CCC
+#    If LNULIFA<>"2" & [F:STJ]VARVAL=0
+    If GPE=2
+&    | GPE=0
+&    & LNULIFA<>"2"
+&    & ( arr([F:STJ]VARVAL,LARR)=0 & arr([F:STJ]AMTDEV,LARR)=0 )        # Issue 91861 - 2014-11-21 by CCC : use currency rounding to test null value
+        # Store the current key values (UPDCOD is already forced to 2)
+        CLE1 = [F:STJ]STOFCY
+        CLE2 = [F:STJ]IPTDAT
+        CLE3 = [F:STJ]ITMREF
+        CLE4 = [F:STJ]MVTSEQ
+        CLE5 = [F:STJ]MVTIND
+        [F:STJ]AGGIFAFLG=2
+        Rewrite [STJ]
+        Goto NEXT_STJ
+    Endif
+
+    # vérifier que la pièce est de type 'pièce groupée'
+    If [F:GAU]COD<>[F:STJ]ENTCOD
+        Read [GAU]GAU0 = [F:STJ]ENTCOD
+        If fstat
+          ERR_TRA = [F:STJ]ENTCOD-":"-mess(39,114,1) : # pièce automatique inexistante
+          Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+          Raz [F:GAU]
+          Goto NEXT_STJ
+        Else
+          If [F:GAU]GRPFLG = 1
+            ERR_TRA = [F:STJ]ENTCOD-":"-mess(892,196,1)+mess(2,669,1)
+            #"xxxxx:La pièce automatique doit obligatoirement être de type Pièce groupée"
+            Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+            Raz [F:GAU]
+            Goto NEXT_STJ
+          Endif
+          If [F:GAU]TBL <> "STJTMP"
+            ERR_TRA = [F:STJ]ENTCOD-":"-mess(61,119,1)-"STJTMP" # La table déclenchante n'est pas STJTMP
+            Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+            Raz [F:GAU]
+            Goto NEXT_STJ
+          Endif
+        Endif
+    Endif
+
+    If LFCY<>[F:STJ]STOFCY
+        Call GETDEV([F:STJ]STOFCY) From DEVSUB  # << ne sert à rien ici car rupture par société >> devise société
+        If [F:TCU]CUR <> GLOCALDEV
+            Read [TCU]TCU0 = GLOCALDEV
+        Endif
+    Endif
+    If LFCY<>[F:STJ]STOFCY | LIPT<>[F:STJ]IPTDAT
+        # mettre la période en ligne pour permettre d'agréger sur une date de fin de période
+        Call GETPERSOC(GSOCIETE,GTYPGEN,[F:STJ]IPTDAT,NO_EXE,NO_PER) From CPTSUB
+    Endif
+
+    If [F:STJ]VCRTYP=6
+      Read [PTD]PTD0 = [F:STJ]VCRNUM;[F:STJ]VCRLIN :#CPRCUR est dispo
+      If !fstat
+        If [F:STJ]VCRNUMREG <> ""
+        # pour une régul on peut avoir besoin de la date facture en ENTETE de pièce
+         # il peut être alors utilisé en paramétrage comme KEYx
+        Read [F:PID]PID0=[F:STJ]VCRNUMREG;[F:STJ]VCRLINREG
+        If fstat
+         Raz [F:PID]
+        Endif
+        Endif
+      Else
+        Raz [F:PTD]
+      Endif
+    Endif
+
+    OK = 1  # ou utiliser GPE
+    # Entry point to add additional selection criteria
+    GPOINT = "CRITSUPPL" : Gosub ENTREE From EXEFNC :# pour charger la zone
+    # (encore utile si on veut lire une table où l'on prend un critère utilisé dans [PAS])
+    If OK
+      Gosub LOAD_SJT From WSTOACC : # chargement de SJT par le traitement généré
+      If GOK = 0
+        Break  # en cas d'erreur d'évaluation des KEYx
+      Endif
+      Write [SJT]
+      If fstat
+        ERR_TRA = mess(22,2363,1) #"Erreur à la génération de table temporaire"
+        Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+        # Voir comment on traite l'erreur
+        GOK = 0
+        Break
+      Endif
+      LFCY=[F:STJ]STOFCY
+      LIPT=[F:STJ]IPTDAT
+      NBSTJTRT+=1
+      If mod(LACCBKG,2)=0
+          If NBSTJTRT>GMAXUPDTRS
+            # conserver la clé courante (UPDCOD est forcément à 2)
+            CLE1 = [F:STJ]STOFCY
+            CLE2 = [F:STJ]IPTDAT
+            CLE3 = [F:STJ]ITMREF
+            CLE4 = [F:STJ]MVTSEQ
+            CLE5 = [F:STJ]MVTIND
+            STOP = 1
+            Break
+          Endif
+      Endif
+    Endif
+$NEXT_STJ
+Next
+Filter [STJ]
+Onerrgo
+If mod(LACCBKG,2)=0
+    If GOK
+      Commit
+# Issue 80331 - 2012-02-23 by CCC
+#      If NBSTJTRT>1000 | STOP  # retraiter la table à partir du repositionnement
+      If STOP  # retraiter la table à partir du repositionnement
+        Goto DEBTRANS
+      Endif
+    Else
+      Rollback
+      Return
+    Endif
+Endif
+Local Integer LNB
+# Exploitation de la table de clés pour passer les écritures
+# On ouvre le masque d'en-tête de pièce pour récupérer la pièce passée
+Local Mask GACCENT0 [HAE0]
+#If GUSER="TB" GTEST = 1  Endif  ####### <<<<<<<<<<< T E S T ########## permet d'afficher la pièce
+For [SJT1]SJT0(2) :  # Pour chaque modèle de pièce automatique à générer, et chaque société
+  IDENT(1)=[SJT1]ENTCOD
+  IDENT(2)=[SJT1]CPY
+  # charger GCUR (devise de la société utilisée dans les pièces)
+  GISOC = find([F:SJT1]CPY,GSOC(1..GNBSOC))
+  GCUR  = GDEVSOC(GISOC)
+
+  For [SJT1]SJT0(7) : # On regroupe par critères d'agrégation
+    IDENT(3) =[SJT1]KEY1
+    IDENT(4) =[SJT1]KEY2
+    IDENT(5) =[SJT1]KEY3
+    IDENT(6) =[SJT1]KEY4
+    IDENT(7) =[SJT1]KEY5  # toute la clé sauf l'identifiant de l'enreg STOJOU
+    IDENT(8) =""
+    IDENT(9) =""
+    IDENT(10)=""
+    IDENT(11)=""
+    IDENT(12)=""
+    IDENT(13)=""
+    If mod(LACCBKG,2)=0
+        Call DEBTRANS From GLOCK
+        Trbegin [STJ]
+    Endif
+    # Call ECR_TRACE("valpce :"+[F:SJT1]ENTCOD+";"+[F:SJT1]CPY+";"+[F:SJT1]KEY1+";"+[F:SJT1]KEY2+";"+[F:SJT1]KEY3+";"+[F:SJT1]KEY4+";"+[F:SJT1]KEY5,0) From GESECRAN
+    #*X3-39795    Call VALPCE([SJT1]ENTCOD,IDENT,STAT,MESSA) From CPTAUTO : # Pièce auto basée sur [SJT] lié à [STJ]
+    Raz TZONE, TVAL  #*X3-39795
+    TZONE(5)= "ORIGIN" : TVAL(5)= "2"            #Automatic loading  #*X3-39795
+    TZONE(6)= "ORICOD" : TVAL(6)= [SJT1]ENTCOD                       #*X3-39795
+    Call VALPCE3([SJT1]ENTCOD,IDENT,STAT,MESSA,TZONE,TVAL) From CPTAUTO : # Pièce auto basée sur [SJT] lié à [STJ] #*X3-39795
+    If STAT=0 & MESSA<>"" : # La pièce a été créée, on va mettre à jour le numéro de pièce dans STOJOU
+                            ### CH. Si tout s'est bien passé on a le numéro de pièce dans MESSA
+      Raz LNB
+      For [SJT1]SJT0
+        Update [STJ] Where STOFCY=[F:SJT1]STOFCY & UPDCOD=2 & ITMREF=[F:SJT1]ITMREF
+&                    & IPTDAT=[F:SJT1]IPTDAT & MVTSEQ=[F:SJT1]MVTSEQ & MVTIND=[F:SJT1]MVTIND
+&              With AGGIFAFLG=2, GTE=[M:HAE0]TYP, NUMVCR=[M:HAE0]NUM, ACCDAT=[M:HAE0]ACCDAT
+#        Call ECR_TRACE("nb update stj="+num$(adxuprec),0) From GESECRAN
+        LNB+=adxuprec
+        If fstat=1
+            # traiter l'erreur et sortir
+            GOK=0
+            MESSA = [F:SJT1]STOFCY+";2;"+[F:SJT1]ITMREF+";"+num$([F:SJT1]IPTDAT)+";"+num$([F:SJT1]MVTSEQ)+";"+num$([F:SJT1]MVTIND)
+            Call ECR_TRACE(mess(60,100,1)+MESSA,1) From GLOCK
+            Break
+        Endif
+        #--MDJ US-102691 FA Expense creation on stock issue
+        # The fixed assets module exists and Journal type= "Miscellaneous issue"
+        If LGESFAS and [F:SJT1]VCRTYP = 20
+          If  [ITM]ITMREF <> [F:SJT1]ITMREF
+            Read [ITM]ITM0 = [F:SJT1]ITMREF
+            If fstat
+              #'Erreure en lecture de l'article
+              MESSA =  mess(42,7772,1)-[F:SJT1]ITMREF
+              Call ECR_TRACE(MESSA,1) From GESECRAN
+            Endif
+          Endif
+          If [F:ITM]FLGFAS=2
+            Read[STJ]STJ0=[F:SJT1]STOFCY;2;[F:SJT1]ITMREF;[F:SJT1]IPTDAT;[F:SJT1]MVTSEQ;[F:SJT1]MVTIND
+            If !fstat
+              Call CREDEP("STJ", MESSA) From SUBLOF2
+              If !GOK
+                Call ECR_TRACE(MESSA,1) From GESECRAN
+                Break
+              Endif
+            Endif
+          Endif
+        Endif
+        #--/US-102691
+      Next
+#      Call ECR_TRACE("nbtot update="+num$(LNB),0) From GESECRAN
+      If mod(LACCBKG,2)=0
+        If GOK=1
+          Commit
+        Else
+            Rollback
+      Endif
+      Elsif !GOK
+        Break
+      Endif
+      If PCEDEB = "" PCEDEB = MESSA Endif # n° de pièce en retour
+      PCEFIN = MESSA
+    Else
+      MESSA -= "stat="+num$(STAT)-"KEY1="+[SJT1]KEY1-"KEY2="+[SJT1]KEY2-"KEY3="+[SJT1]KEY3-"KEY4="+[SJT1]KEY4-"KEY5="+[SJT1]KEY5
+      Call ECR_TRACE(MESSA,1) From GESECRAN
+      If dim(GLASTSTJ)>0 & GLASTSTJ<>""
+          MESSA = mess(308,184,1)-":"-GLASTSTJ
+          Call ECR_TRACE(MESSA,0) From GESECRAN
+          Raz GLASTSTJ
+      Endif
+      If mod(LACCBKG,2)=0
+          Rollback
+      Else
+          GOK= 0
+          Break    # Le roolback est à faire par le programme appelant
+      Endif
+    Endif
+  Next
+  If mod(LACCBKG,2)<>0 & !GOK
+      Break
+  Endif
+  # "Pièces automatiques terminées : numéros de pièces #### -> ####
+  ERR_TRA = mess(284,197,1)+"."- mess(169,100,1)-":"-PCEDEB-"-"-PCEFIN # (GNUMPCE et [M:HAE0]NUM sont incorrects après une erreur)
+  Call ECR_TRACE(ERR_TRA,0) From GESECRAN
+  Raz PCEDEB, PCEFIN
+Next
+
+
+# Et enfin, on purge et on déverrouille
+If mod(LACCBKG,2)=0
+ Trbegin [SJT]
+Endif
+
+Update [STJ] Where AGGIFAFLG=1 & ENTCOD="" With AGGIFAFLG=2
+ Delete [SJT] Where 1=1
+
+If mod(LACCBKG,2)=0
+ Commit
+Endif
+
+## Loop through all posted records to add to Point in Time valuation
+Raz CRITSEL
+If GACTVLT2
+  CRITSEL = "[F:STJ]AGGIFAFLG=2 & ([F:STJ]PITVALFLG <> 2 | [F:STJ]PITVALFLG2 <> 2)"
+Else
+  CRITSEL = "[F:STJ]AGGIFAFLG=2 & [F:STJ]PITVALFLG <> 2"
+Endif
+
+CRITSEL += " & ([F:STJ]ENTCOD<>'' | [F:STJ]TRSTYP=22)"
+
+If evalue("[M:"+LABR+"]DATSEL") = 2
+  CRITSEL += " & IPTDAT<=[M:"+LABR+"]PRODAT"
+Else
+  CRITSEL += " & CREDAT<=[M:"+LABR+"]PRODAT"
+Endif
+
+If evalue("[M:"+LABR+"]FINFCY") <> ""
+  CRITSEL += " & FINRSPFCY=[M:"+LABR+"]FINFCY"
+Endif
+
+Filter [STJ] Where evalue(CRITSEL)
+&            Order By STOFCY;IPTDAT;ITMREF;MVTSEQ;MVTIND
+For [STJ]
+	# Call Point in Time Valuation
+  Call PITUPDATE From STKPITLIB
+Next
+Filter [STJ]
+
+# Set PIT posted flag to true for all records that do not get included
+If GACTVLT2
+  Update [STJ] Where AGGIFAFLG=2 & ENTCOD="" & TRSTYP<>22 & (PITVALFLG<>2 | PITVALFLG2<>2) With PITVALFLG=2, PITVALFLG2=2
+Else
+  Update [STJ] Where AGGIFAFLG=2 & ENTCOD="" & TRSTYP<>22 & PITVALFLG<>2 With PITVALFLG=2
+Endif
+
+If mod(LACCBKG,4)<2
+    Gosub ECR_SAC
+Endif
+
+Return
+
+$TERMINE
+If !GSERVEUR & LOUVTRA
+   Call FERME_TRACE From LECFIC
+   LOUVTRA=0
+   TRA = 1
+Endif
+
+Return
+
+$ERR_KEY
+# erreur de parametrage des agrégations (PARSTOACC)
+ERR_TRA = errmes$(errn)+"\|"+ errm +"|"+ errp +"|"+ num$(errl) +"|"
+ERR_TRA += "\"+mess(352,184,1)- "("+ [F:STJ]STOFCY-[F:STJ]ITMREF-format$(GFMD,[F:STJ]IPTDAT) + ")"
+Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+GOK = 0 : # erreur de formule bloquante
+Resume
+
+##########################################################################
+$ECR_SAC
+# Création du fichier paramètre (ou màj si lancement à même date)
+If mod(LACCBKG,2)<1
+    Call DEBTRANS From GLOCK
+    Trbegin [SAC]
+Endif
+Readlock [SAC]SAC0=evalue("[M:"+LABR+"]PRODAT");evalue("[M:"+LABR+"]FINFCY")
+If fstat
+  [F:SAC]PRODAT = evalue("[M:"+LABR+"]PRODAT")
+ # [F:SAC]IFAFLG = evalue("[M:"+LABR+"]IFAFLG")
+  [F:SAC]FINFCY = evalue("[M:"+LABR+"]FINFCY")  # 21/03/02 Site financier
+  [F:SAC]CREDAT = date$
+  [F:SAC]CREUSR = GUSER
+  [F:SAC]EXPNUM = [C]EXPORT
+  Write [SAC]
+  If fstat
+    If mod(LACCBKG,2)<1
+        Rollback
+    Endif
+#   "Problème à la création du fichier paramètre"
+    ERR_TRA = mess(172,196,1)
+    Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+  Endif
+#Elsif [F:SAC]IFAFLG <> [M]IFAFLG
+# # [F:SAC]IFAFLG = [M]IFAFLG
+#  Rewrite [SAC]
+#  If fstat
+#    Rollback
+#    # "Erreur mise à jour fichier ..."
+#    ERR_TRA = mess(13,100,1)-"STOACCPAR"-format$(GFMD,[M]PRODAT)
+#    Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+#  Endif
+Endif
+
+If !fstat
+    If mod(LACCBKG,2)<1
+        Commit # si rien n'est fait ou si l'écriture est OK
+    Endif
+Endif
+Return
+
+# CCC (11/04/05) DM 29696
+# Se positionne sur la fiche coût standard correspondant au STOJOU
+# afin d'utiliser la répartition des FG
+$GET_ITC
+    Raz [F:ITC]
+    Case [F:STJ]PRINAT
+        When 3:       LTYP = 2
+        When Default: LTYP = 1
+    Endcase
+    Filter [ITC] Where STOFCY = [F:STJ]STOFCY
+&                    & ITMREF = [F:STJ]ITMREF
+&                    & CSTTYP = LTYP
+&                    & ITCSTRDAT<= [F:STJ]IPTDAT
+&                    & ITCENDDAT>= [F:STJ]IPTDAT
+&                    & UID = 0
+&                Order By Key ITC0
+    Read [ITC]ITC0 First
+    Filter [ITC]
+    If fstat
+        Filter [ITC] Where STOFCY = [F:STJ]STOFCY
+&                        & ITMREF = [F:STJ]ITMREF
+&                        & CSTTYP = LTYP
+&                        & ITCSTRDAT>= [F:STJ]IPTDAT
+&                        & ITCENDDAT>= [F:STJ]IPTDAT
+&                        & UID=0
+&                    Order By Key ITC1
+        Read [ITC]ITC1 First
+        Filter [ITC]
+    Endif
+Return
+
+#************************************************************<br>
+#* SENSTRS35 : Indicates if a movement (with trstyp=35)
+#*             is linked to an entry or an issue<br>
+#************************************************************<br>
+#* @param PABR         = STOJOU table abreviation
+#* @return return_value = 1 for an entry,
+#*                      -1 for a negative entry,
+#*                       2 for an issue,
+#*                      -2 for a negative issue,
+#*                       3 for internal movement (location change),
+#*                       0 otherwise
+#*!
+Funprog SENSTRS35( PABR )
+Value Char PABR
+
+Local Char REQ(250)
+Local Integer I
+Local Integer LSENS
+
+Local Char LABR(len(PABR)+4)
+If left$(PABR,1)<>"["
+    LABR = "[F:"+PABR+"]"
+Else
+    LABR = PABR
+Endif
+
+If PABR="" | evalue("clalev("+LABR+")")<=0
+    End 0
+Endif
+
+LSENS = func STKLIB.SENSVCR(evalue(LABR+"VCRTYP"))
+
+# particular cases :
+# - if VCRTYP=subcontract receipt and itmref<>product => this movement was for subcontract issue => returns 2
+If evalue(LABR+"VCRTYP")=6 & evalue(LABR+"VCRTYPORI")=36
+    Raz REQ, I
+    Call ADDCRIT(REQ, I, "", "SELECT ITMREF_0 From SCOITM", " ") From GOBJSUB
+    Call ADDCRIT(REQ, I, "", "Where SCONUM_0='"+evalue(LABR+"VCRNUMORI")+"'", " ") From GOBJSUB
+    Call ADDCRIT(REQ, I, "",   "and ITMREF_0='"+evalue(LABR+"ITMREF")+"'", " ") From GOBJSUB
+    LSENS=2
+    For (Char ITMREF) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+        LSENS=1
+    Next
+Endif
+End LSENS
+

@@ -1,0 +1,930 @@
+#<AdxTL>@(#)9.0.0.0 $Revision$
+################################################################################
+##############     Comptabilisation des frais  (Module FRAIS)      #############
+################################################################################
+#*X3-39795   MDJ  Manage ORIGIN and ORICOD fields in GL Entry
+Local Char PARBOUT(250)(1..1)
+Local Char VALBOUT(30)
+Call TRAITE_CHAR(VALBOUT,PARBOUT,"","SUBEXG","DCRITEXG",4,"") From GTRAITE
+End
+
+$ACTION
+Case ACTION
+ When "INIT"      : Gosub INIT
+ When "AVANT_PAR" : Gosub AVANT_PAR
+ When "CONTROLE"  : Gosub CONTROLE
+ When "EXEC"      : Gosub EXEC
+ When "TERMINE"   : Gosub TERMINE
+ When "OK"        : FIN = 1 : GOK = 1
+ When "END"       : FIN = 1 : GOK = 0 : If dim([M:EXS0]NBR)>0 : GLOAD=1 : mkstat=4 : Endif
+ When "DEBUT"     : Gosub DEBUT
+Endcase
+Return
+
+################################################################################
+$DEBUT
+################################################################################
+Affzo [DIA]
+Call DEBUT(GUSER) From CPTTRT
+Setmok [DIA] With 0
+Return
+
+################################################################################
+$INIT
+################################################################################
+If !clalev([F:AUS])  : Local File AUTILIS    [AUS]  : Endif
+If !clalev([F:EXS])  : Local File EXPENSES   [EXS]  : Endif
+If !clalev([F:EXS2]) : Local File EXPENSES   [EXS2] : Endif
+If !clalev([F:CPY])  : Local File COMPANY    [CPY]  : Endif
+If !clalev([F:FCY])  : Local File FACILITY   [FCY]  : Endif
+If !clalev([F:GCU])  : Local File GRPCUR     [GCU]  : Endif
+If !clalev([F:HAE])  : Local File GACCENTRY  [HAE]  : Endif
+If !clalev([F:DAE])  : Local File GACCENTRYD [DAE]  : Endif
+If !clalev([F:DAA])  : Local File GACCENTRYA [DAA]  : Endif
+If !clalev([F:DUD])  : Local File GACCDUDATE [DUD]  : Endif
+If !clalev([F:EXT])  : Local File TMPEXPENSE [EXT]  : Endif
+If !clalev([F:BPR])  : Local File BPARTNER   [BPR]  : Endif
+If !clalev([F:JOU])  : Local File GJOURNAL   [JOU]  : Endif
+If !clalev([F:GTE])  : Local File GTYPACCENT [GTE]  : Endif
+If !clalev([F:GAC])  : Local File GACCOUNT   [GAC]  : Endif
+If !clalev([F:COA])  : Local File GCOA       [COA]  : Endif
+
+
+Local Integer I, J, K, MORT, OK, PCE, STAT, SVG_EXPFCY, STAECT
+
+# Variables pour effectur le filtre des relevés.
+Local Char FILTEXS(250)(1..4)
+Local Integer IFILT
+
+
+# Variables utilisées pour la génération des pièces automatiques.
+ #*X3-39795 Local Char TZONE(12)(1..5)            : # Table des zones à forcer
+ #*X3-39795 Local Char TVAL(12)(1..5)             : # Table des valeurs des zones à forcer
+Local Char TZONE(10)(1..10)           : # Table of the zones to be forced (Ex: ORICOD)   #*X3-39795
+Local Char TVAL(30)(1..10)            : # Table of values for zones to be forced         #*X3-39795
+Local Char IDENT(20)(1..6)            : # Identificateurs pour génération pièce comptable
+Local Char MESSAGE(255)               : # Message d'erreur si NOK sinon Numéro de pièce crée.
+Local Char PCEAUTO(GLONGAU)           : # Nom de la pièce automatique
+
+# Variables de sauvegardes pour mettre à jour le fichier des relévés en indiqant les pièces comptables.
+Local Integer SVG_NB, INT_NB          : # Nombre de pièces comptables crées
+Local Integer MAXPCE                  : # Maximum de pièces
+MAXPCE = 500
+Local Char SVG_TYP(GLONGTE)(1..MAXPCE)    : # Sauvegarde des types de pièces
+Local Char SVG_NUM(GLONVCR)(1..MAXPCE)    : # Sauvegarde des numéros de pièces
+
+# Totaux dans la trace
+Local Decimal MT,MT2
+
+Local Char    TSYMBOLE(50)(1..nbrecord([F:AUS]))
+Local Integer NBCLB
+
+Local Mask EXG0 [DIA]
+Call LECMEMO("STD","[M:DIA]","exp") From GMEMO
+Return
+
+################################################################################
+$AVANT_PAR
+################################################################################
+Local Char    WPAR(10)
+If [M:DIA]DATSTR="00/00/00"
+ Call PARAM("","EXPSTRDAT",WPAR) From ADOVAL
+ If WPAR<>"" : [M:DIA]DATSTR = gdat$(WPAR) : Endif
+Endif
+If [M:DIA]DATEND="00/00/00"
+ Call PARAM("","EXPENDDAT",WPAR) From ADOVAL
+ If WPAR<>"" : [M:DIA]DATEND = gdat$(WPAR) : Endif
+Endif
+Return
+
+################################################################################
+$CONTROLE
+################################################################################
+If GOK<1 :  FIN = 1 : Return : Endif
+
+If FIN : Return : Endif
+If [M:DIA]GENECR = 2
+ Call AVERTDGI([M:DIA]ALLCPY,[M:DIA]CPY,[M:DIA]CAT,SAI) From CPTDIV2
+Endif
+If SAI : Return : Endif
+
+# Vérification de la tâche batch.
+If [M:DIA]GENECR=2 & [M:DIA]CAT<3
+ Call PRESENCE(MORT) From CPTBATCH
+ If MORT
+  GERR = 1 : GMESSAGE = mess(49,134,1) : Return
+ Endif
+Endif
+If dim(GCURLEG)>0 : Local Char SAV_GCURLEG(GLONADI) : SAV_GCURLEG = GCURLEG   : Endif
+If GNBLEG=1
+ GCURLEG = GDOSLEG(1)
+Else
+ GCURLEG=[M:DIA]LEG
+Endif
+
+# Initialization of the filter
+Gosub FILTRE
+
+# Trace
+If !GSERVEUR & [M:DIA]TRACE=2
+ Call OUVRE_TRACE(mess(51,107,1)) From LECFIC   # Génération
+ Gosub ENTETE_TRACE
+Endif
+TRA = 1 : TMP=1 : TIT="V"
+
+Return
+
+################################################################################
+$EXEC
+################################################################################
+# Filter the selected expenses forms
+Filter [EXS] Where evalue(FILTEXS)
+
+Link [EXS] With [CPY]CPY1~=GCURLEG;CPY
+&          As [LNK]
+
+If rowcount([LNK])=0
+ Call ECR_TRACE(mess(45,107,1),0) From GESECRAN     # Aucune pièce à générer
+ Filter [EXS]
+ Return
+Endif
+
+# Lock on employee ("EXH"+CLB=symbole GOBJET Expenses form entry)
+# to ensure that expenses forms are not being updated
+FIN=0
+Raz NBCLB
+Raz TSYMBOLE
+
+For [LNK]EXS0(1)
+ NBCLB += 1
+ TSYMBOLE(NBCLB) = "EXH"+[F:EXS]CLB
+ Lock =TSYMBOLE(NBCLB) With lockwait=0
+ If fstat
+  If GTRACE <> "" Call ECR_TRACE([F:EXS]CLB,0) From GESECRAN  : Endif
+  FIN=1
+ Endif
+Next
+
+If FIN
+ If GTRACE<>""
+  Call ECR_TRACE("\"-mess(20,129,1),0) From GESECRAN
+ Else
+  Call ECR_TRACE(mess(39,129,1),0) From GESECRAN
+ Endif
+ Filter [EXS]
+ Return
+Endif
+
+
+# Posting can start ...
+Gosub TR1
+
+# Unlock on employee
+Local Integer CLB
+For CLB=1 To NBCLB
+ Unlock =TSYMBOLE(CLB) With lockwait=0
+Next
+
+Filter [EXS]
+Return
+
+################################################################################
+$TERMINE
+################################################################################
+If !GSERVEUR & [M:DIA]TRACE=2
+ Call FERME_TRACE From LECFIC
+ TRA=1  ## Permet d'ouvrir la trace
+Endif
+SAI=1  ## Permet de revenir sur l'écran (à partir de l'action AVANT_PAR)
+If dim(SAV_GCURLEG)>0 : GCURLEG = SAV_GCURLEG : Endif
+Return
+
+
+################################################################################
+###############  Expense posting  ########################
+################################################################################
+$TR1
+GOK = 1 : GTRANS=1
+Trbegin [EXS], [EXT], [HAE] , [DAE] , [DAA] , [DUD]
+
+# Delete the simulated journal entries
+If [M:DIA]GENECR = 2
+ Gosub ANUPCE
+ If GOK<1 : Goto AB_TR1  : Endif
+Endif
+
+# Delete data in the temporary table
+Gosub ANUTMP
+If GOK<1 : Goto AB_TR1 : Endif
+
+# Fill in the temporary table
+For [LNK]EXS2
+
+ If [F:EXS]VCRNUM = ""
+  [F:EXT]=[F:EXS]
+
+  # On relit le paramètrage
+  Call PARAMUTIL("EXPBPR",[F:EXT]EXPBPR,[F:EXS]CLB,"") From SUBAUS
+  Call LEC_BPR([F:EXT]EXPBPR) From CPTLEC
+  [F:EXT]BPRGTETYP = [F:BPR]BPRGTETYP
+
+  If [M:DIA]EXPCLB=2 : [F:EXT]SEP=[F:EXS]CLB : Endif
+
+  Write [EXT]
+  If fstat :  GOK=0 : Call FSTA("EXS") From GLOCK : Goto AB_TR1 : Endif
+ Endif
+Next
+
+# Journal entry posting
+Gosub VALPCE
+If   GOK<0 : Goto ROLL_TR1
+Elsif !GOK :
+ If SVG_NB>=MAXPCE & GTRACE<>""
+  Call ECR_TRACE(mess(44,129,1)-"("+num$(MAXPCE)+")",1) From GESECRAN    # Trop de pièces à générer
+ Endif
+ Goto AB_TR1
+Endif
+
+# Update expenses forms
+Gosub MAJREL
+If   GOK<0 : Goto ROLL_TR1
+Elsif !GOK : Goto AB_TR1
+Endif
+
+# Totaux dans la trace
+If [M:DIA]TRACE=2
+ Gosub FIN_TRACE
+Endif
+
+If [M:DIA]GENECR=2 : Commit : Else : Rollback : Endif
+GTRANS=0
+Return
+
+###############################################################################################
+###############################################################################################
+$VALPCE
+GOK=1
+SVG_NB=0
+Raz TZONE
+Raz TVAL
+
+TZONE(1)="CAT"    : TVAL(1)=num$([M:DIA]CAT)
+
+TZONE(3)="ACCDAT" : TVAL(3)=[M:DIA]ACCDAT
+TZONE(4)="TYP"    : TVAL(4)=[M:DIA]TYPPCE
+TZONE(5)="JOU"    : TVAL(5)=[M:DIA]JOU
+
+For [EXT]EXT0(1)
+ Call LEC_CPY([F:EXT]CPY) From CPTLEC
+ STAECT = [M:DIA]STA : TVAL(2)=num$(STAECT)
+ If [M:DIA]CAT=1 & func AFNC.PARAM("FRADGI",[F:EXT]CPY)="2"
+  STAECT = 2 : TVAL(2)=num$(STAECT)
+ Endif
+ TZONE(2)="STA"    : TVAL(2)=num$(STAECT)
+ Call PARAML([F:EXT]CPY,"GAUEXP",[L]PCEAUTO)From ADOVAL
+ If [L]PCEAUTO="" : [L]PCEAUTO="EXP" : Endif
+ Call PARAM([F:EXT]CPY,"EXPFCY",VALEUR) From ADOVAL     :# Relevé mono/multi site (1:mono,2:multi)
+ SVG_EXPFCY=val(VALEUR)
+ If SVG_EXPFCY=2
+  For [EXT]EXT0(2)
+   For [EXT]EXT0(3)
+    If [F:EXT]SEP<>""
+     For [EXT]EXT0(5)
+      Gosub VALIDATION
+      If !GOK : Break 4 : Endif
+     Next
+    Else
+     Gosub VALIDATION
+     If !GOK : Break 3 : Endif
+    Endif
+   Next
+  Next
+ Else
+  For [EXT]EXT0(2)
+   For [EXT]EXT0(3)
+    For [EXT]EXT0(4)
+     If [F:EXT]SEP<>""
+      For [EXT]EXT0(5)
+       Gosub VALIDATION
+       If !GOK : Break 5 : Endif
+      Next
+     Else
+      Gosub VALIDATION
+      If !GOK : Break 4 : Endif
+     Endif
+    Next
+   Next
+  Next
+ Endif
+Next
+Return
+
+$VALIDATION
+STAT=0
+IDENT(1) = [F:EXT]CPY
+IDENT(2) = [F:EXT]CUR
+IDENT(3) = [F:EXT]BPRGTETYP
+If SVG_EXPFCY=2      :# Relevé mono/multi site (1:mono,2:multi)
+ IDENT(4) = ""
+Else
+ IDENT(4) = [F:EXT]FCY
+Endif
+If [F:EXT]SEP<>""
+ IDENT(5)= [F:EXT]SEP
+Else
+ IDENT(5)= ""
+Endif
+IDENT(6) = ""
+
+If func AFNC.ACTIV("GDD")
+ If !clalev([F:EXT2])  : Local File TMPEXPENSE [EXT2]  : Endif
+ Local Char FILTEXT(255)
+ Local Integer INDANA
+ FILTEXT  = "[F:EXT2]CPY='"+IDENT(1)+"'"
+ FILTEXT += "&[F:EXT2]CUR='"+IDENT(2)+"'"
+ FILTEXT += "&[F:EXT2]BPRGTETYP='"+IDENT(3)+"'"
+ If IDENT(4)<>""
+  FILTEXT += "&[F:EXT2]FCY='"+IDENT(4)+"'"
+ Endif
+ If IDENT(5)<>""
+  FILTEXT += "&[F:EXT2]SEP='"+IDENT(5)+"'"
+ Endif
+ Call SETMAINREF([F:EXT]CPY,GTYPGEN,GTYPANA) From CPTDIV
+
+ Link [EXT2] With [EXS]EXS1~=[F:EXT2]ACCNUM As [LNK]
+&              Where evalue(FILTEXT)
+
+ For [LNK] Where [F:EXS]ACC(GTYPANA-1)<>""
+  For INDANA=0 To dim([F:EXT2]CCE)-1
+   If [F:EXT2]DIE(INDANA)="" : Break : Endif
+   If [F:EXT2]CCE(INDANA)<>""
+    Call CTLCCE([F:EXT2]CCE(INDANA),[F:EXT2]DIE(INDANA),[F:EXT2]FCY,[F:EXT2]DATEXS,0,[F:EXT2]DIE(INDANA),[F:EXT2]CCE(INDANA),[F:EXS]COA(GTYPANA-1),[F:EXS]ACC(GTYPANA-1)) From SELCCE
+    If mkstat : Break 2 : Endif
+   Endif
+  Next
+ Next
+ Filter [EXT2]
+ If mkstat
+  Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+  GOK=0 : Return
+ Endif
+Endif
+TZONE(6)= "ORIGIN" : TVAL(6)= "2"            #Automatic loading  #*X3-39795
+TZONE(7)= "ORICOD" : TVAL(7)= [L]PCEAUTO                         #*X3-39795
+If [M:DIA]GENECR=2
+ Call VALPCE3([L]PCEAUTO,IDENT,STAT,MESSAGE,TZONE,TVAL) From CPTAUTO
+Else
+ Call SIMPCE3([L]PCEAUTO,IDENT,STAT,MESSAGE,TZONE,TVAL) From CPTAUTO
+Endif
+
+If STAT
+ # Erreur en création de pièce automatique
+ MESSAGE = MESSAGE-"("-num$(STAT)-")"
+ Call ECR_TRACE(MESSAGE,1) From GESECRAN
+ GOK=0 : Return
+Else
+ # Création de pièce
+ If SVG_NB>=MAXPCE : GOK=0 : Return : Endif
+ SVG_NB+=1
+ SVG_TYP(SVG_NB)=GTYPPCE
+ SVG_NUM(SVG_NB)=MESSAGE
+Endif
+Return
+
+###############################################################################################
+$MAJREL
+SVG_NB=0
+INT_NB=1
+GOK=1
+For [EXT]EXT0(1)
+ Call LEC_CPY([F:EXT]CPY) From CPTLEC
+ If [M:DIA]CAT=1 & func AFNC.PARAM("FRADGI",[F:EXT]CPY)="2"
+  STAECT = 2
+ Else
+  STAECT = [M:DIA]STA
+ Endif
+ If SVG_EXPFCY=2
+  For [EXT]EXT0(2)
+   For [EXT]EXT0(3)
+    If [EXT]SEP<>""
+     For [EXT]EXT0(5)
+      SVG_NB+=1
+      For [EXT]EXT0
+       Gosub MAJ
+       If !GOK : Break 5 : Endif
+      Next
+     Next
+    Else
+     SVG_NB+=1
+     For [EXT]EXT0
+      Gosub MAJ
+      If !GOK : Break 4 : Endif
+     Next
+    Endif
+   Next
+  Next
+ Else
+  For [EXT]EXT0(2)
+   For [EXT]EXT0(3)
+    For [EXT]EXT0(4)
+     If [EXT]SEP<>""
+      For [EXT]EXT0(5)
+       SVG_NB+=1
+       For [EXT]EXT0
+        Gosub MAJ
+        If !GOK : Break 5 : Endif
+       Next
+      Next
+     Else
+      SVG_NB+=1
+      For [EXT]EXT0
+       Gosub MAJ
+       If !GOK : Break 4 : Endif
+      Next
+     Endif
+    Next
+   Next
+  Next
+ Endif
+Next
+Return
+
+$MAJ
+Read [EXS]EXS1=[F:EXT]ACCNUM
+[F:EXS]VCRTYP = SVG_TYP(SVG_NB)
+[F:EXS]VCRNUM = SVG_NUM(SVG_NB)
+If [M:DIA]CAT=1
+ [F:EXS]STA=3
+Else
+ [F:EXS]STA=2
+Endif
+Rewrite [F:EXS]
+If fstat
+ GOK=0 : Call FSTA("EXS") From GLOCK : Return
+Endif
+
+If GTRACE<>""
+ If INT_NB=SVG_NB
+  If [M:DIA]GENECR=2
+   If [M:DIA]CAT=1 & [M:DIA]STA<>STAECT
+    MESSAGE=mess(40,107,1)-SVG_TYP(SVG_NB)-SVG_NUM(SVG_NB)-"("+tolower(mess(192,107,1))+")"  # Création de la pièce
+   Else
+    MESSAGE=mess(40,107,1)-SVG_TYP(SVG_NB)-SVG_NUM(SVG_NB)  # Création de la pièce
+   Endif
+  Else
+   MESSAGE=mess(27,107,1)-" - "-mess(40,129,1)             # Simulation - Relevés de frais
+  Endif
+  Call ECR_TRACE(MESSAGE,0) From GESECRAN
+  INT_NB+=1
+ Endif
+ Call ECR_TRACE([F:EXT]FCY-"("+[F:EXT]CPY+")"-"-"-format$("D:"+GFMDAT,[F:EXT]DATEXS)-"-"+[F:EXT]CLB-"-"
+&           -num$([F:EXT]QTY)-" - "-[F:EXT]CODEXP-" - "-num$([F:EXT]AMTATI)-[F:EXT]CUR,0) From GESECRAN
+Endif
+Return
+
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else Goto TR1 : Endif
+
+$AB_TR1
+Rollback : Return
+
+
+
+################################################
+$FILTRE
+Raz FILTEXS, IFILT
+# Relevé : Non comptabilisé
+Call ADDCRIT(FILTEXS, IFILT,"STA",'STA<3'," & ") From GOBJSUB
+
+# Société
+If [M:DIA]ALLCPY<>2
+ Call ADDCRIT(FILTEXS, IFILT,"CPY",'CPY="'+[M:DIA]CPY+'"'," & ") From GOBJSUB
+Endif
+
+# Site
+If [M:DIA]ALLFCY<>2
+ Call ADDCRIT(FILTEXS, IFILT,"FCY",'FCY="'+[M:DIA]FCY+'"'," & ") From GOBJSUB
+Endif
+
+# Collaborateur
+If [M:DIA]ALLCLB<>2
+ If [M:DIA]CLBSTR<>""
+  If [M:DIA]CLBSTR=[M:DIA]CLBEND
+   Call ADDCRIT(FILTEXS, IFILT,"CLB","CLB ='"+[M:DIA]CLBSTR+"'"," & ") From GOBJSUB
+  Else
+   Call ADDCRIT(FILTEXS, IFILT,"CLB","CLB >='"+[M:DIA]CLBSTR+"'"," & ") From GOBJSUB
+  Endif
+ Endif
+ If [M:DIA]CLBEND<>"" & [M:DIA]CLBEND<>[M:DIA]CLBSTR
+  Call ADDCRIT(FILTEXS, IFILT,"CLB","CLB <='"+[M:DIA]CLBEND+"'"," & ") From GOBJSUB
+ Endif
+Endif
+
+# Relevés validées.
+If [M:DIA]VISA=2
+ Call ADDCRIT(FILTEXS, IFILT,"VISA","VISA <> ''"," & ") From GOBJSUB
+Endif
+
+# Devise
+If [M:DIA]CUR<>""
+ Call ADDCRIT(FILTEXS, IFILT,"CUR","CUR='"+[M:DIA]CUR+"'"," & ") From GOBJSUB
+Elsif [M:DIA]GRPCUR<>""
+ Call LECTURE("GCU",[M:DIA]GRPCUR,"") From CONTOBJ
+ If !fstat & [F:GCU]NBRCUR>0
+  Call ADDCRIT(FILTEXS, IFILT,"CUR","find(CUR"," & ") From GOBJSUB
+  For I = 1 To [F:GCU]NBRCUR
+   Call ADDCRIT(FILTEXS, IFILT,"CUR","'"+[F:GCU]CUR(I-1)+"'",",") From GOBJSUB
+  Next I
+  Call ADDCRIT(FILTEXS, IFILT,"CUR",")","") From GOBJSUB Endif
+Endif
+
+# Date de relevés.
+Call ADDCRIT(FILTEXS, IFILT,"DATEXS","DATEXS>=["+format$(GFMD,[M:DIA]DATSTR)+"]"," & ") From GOBJSUB
+Call ADDCRIT(FILTEXS, IFILT,"DATEXS","DATEXS<=["+format$(GFMD,[M:DIA]DATEND)+"]"," & ") From GOBJSUB
+
+Return
+
+################################################
+$ENTETE_TRACE
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Call ECR_TRACE(mess(14,103,1)-":",0) From GESECRAN
+
+# Critères
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+
+# Toutes sociétés / Société xxx
+If [M:DIA]ALLCPY = 2 :
+ Call ECR_TRACE(mess(28,129,1),0) From GESECRAN
+Else
+ Call ECR_TRACE(mess(2,116,1)-" : "-[M:DIA]CPY,0) From GESECRAN
+Endif
+# Tous sites / Site xxx
+If [M:DIA]ALLFCY = 2 :
+ Call ECR_TRACE(mess(29,129,1),0) From GESECRAN
+Else
+ Call ECR_TRACE(mess(5,116,1)-" : "-[M:DIA]FCY,0) From GESECRAN
+Endif
+
+# Tous collaborateurs / Collaborateurs :
+If [M:DIA]ALLCLB = 2 :
+ Call ECR_TRACE(mess(30,129,1),0) From GESECRAN
+Else
+ Call ECR_TRACE(mess(33,129,1)-":"-[M:DIA]CLBSTR-"-"-[M:DIA]CLBEND,0) From GESECRAN
+Endif
+
+# Toutes devises / Groupe de devises / Devise
+If [M:DIA]ALLCUR = 2 :
+ Call ECR_TRACE(mess(32,129,1),0) From GESECRAN
+Elsif [M:DIA]GRPCUR<>""
+ Call ECR_TRACE(mess(36,129,1)-":"-[M:DIA]GRPCUR,0) From GESECRAN
+Else
+    Call ECR_TRACE(mess(55,116,1)-":"-[M:DIA]CUR,0) From GESECRAN
+Endif
+
+# Relevés validés
+If [M:DIA]VISA=2
+ Call ECR_TRACE(mess(37,129,1),0) From GESECRAN
+Endif
+
+# Dates de frais
+Call ECR_TRACE(mess(38,129,1)-":"-format$(GFMDAT,[M:DIA]DATSTR)-"-"-format$(GFMDAT,[M:DIA]DATEND),0) From GESECRAN
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Return
+
+####################################
+$FIN_TRACE
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+
+# Total Devise
+Filter [EXT] Order By Key CLE=CUR
+For [EXT]CLE(1)
+ MT=0 :
+ For [EXT]CLE
+  MT+=[F:EXT]AMTATI
+ Next
+ Call ECR_TRACE(mess(69,116,1)-mess(18,105,1)-[F:EXT]CUR-":"-num$(MT)-[F:EXT]CUR,0) From GESECRAN
+Next
+Filter [EXT]
+Return
+
+####################################
+$ANUPCE
+Local Char WVCR(50) : Raz WVCR
+Local Integer WFIND
+
+GOK=1
+Filter [EXS] Where evalue(FILTEXS) and VCRNUM<>"" Order By Key CLE=[F:EXS]VCRTYP;[F:EXS]VCRNUM;[F:EXS]ACCNUM
+
+For [EXS]CLE
+ If WVCR<>[F:EXS]VCRTYP+[F:EXS]VCRNUM
+  WFIND = 1
+  Read [HAE]=[EXS]VCRTYP;[EXS]VCRNUM
+  If fstat
+   WFIND = 0
+  Elsif !fstat & [F:HAE]CAT>1
+   # Annulation pièce simulée.
+   Call DELPCE([F:HAE]TYP,[F:HAE]NUM) From CPTBATCH
+   If GOK<1 : Break : Endif
+   If GTRACE<>"" : Call ECR_TRACE(mess(41,107,1)-[F:EXS]VCRTYP-[F:EXS]VCRNUM,0) From GESECRAN : Endif
+   WFIND = 0
+  Endif
+  If !WFIND
+   Filter [EXS2] Where VCRTYP=[F:EXS]VCRTYP and VCRNUM=[F:EXS]VCRNUM
+   For [EXS2]EXS3
+    Raz [F:EXS2]VCRTYP
+    Raz [F:EXS2]VCRNUM
+    [F:EXS2]STA = 1
+    Rewrite [F:EXS2]
+    If fstat
+     GOK=0 : Call FSTA("EXS") From GLOCK : Break
+    Endif
+   Next
+   If GOK<1 : Break : Endif
+  Endif
+  WVCR=[F:EXS]VCRTYP+[F:EXS]VCRNUM
+ Endif
+Next
+If GOK<1 : Return : Endif
+If GTRACE<>"" : Call ECR_TRACE(string$(70,"-"),0) From GESECRAN  : Endif
+Filter [EXS] Where evalue(FILTEXS)
+Return
+
+####################################
+$ANUTMP
+GOK = 1
+# Suppression des données de la table temporaire
+Delete  [EXT] Where 1=1
+If fstat : GOK = 0 : Call FSTA("EXT") From GLOCK : Goto AB_TR1 : Endif
+Return
+
+######################################################
+#    Etiquettes du masque                            #
+######################################################
+Subprog AS_ALLCPY(VALEUR)
+Variable Integer VALEUR
+Call AS_ALLCPY(VALEUR) From CPTTRT
+End
+
+Subprog C_ALLCPY(VALEUR)
+Variable Integer VALEUR
+Call C_ALLCPY(VALEUR) From CPTTRT
+If VALEUR<>[M]ALLCPY : Raz TYPPCE, JOU : Endif
+End
+
+Subprog AS_CPY(VALEUR)
+Variable Char    VALEUR()
+Call AS_CPY(VALEUR) From CPTTRT
+End
+
+Subprog C_CPY(VALEUR)
+Variable Char    VALEUR()
+If VALEUR<>[M]CPY : Raz TYPPCE, JOU : Endif
+Call C_CPY(VALEUR)From CPTTRT
+End
+
+Subprog C_LEG(VALEUR)
+Variable Char    VALEUR()
+Call C_LEG(VALEUR)From CPTTRT
+End
+
+
+Subprog AS_ALLFCY(VALEUR)
+Variable Integer  VALEUR
+Call AS_ALLFCY(VALEUR) From CPTTRT
+End
+
+Subprog C_ALLFCY(VALEUR)
+Variable Integer VALEUR
+Call C_ALLFCY(VALEUR) From CPTTRT
+If VALEUR<>[M]ALLFCY : Raz TYPPCE, JOU : Endif
+End
+
+Subprog AS_FCY(VALEUR)
+Variable Char    VALEUR()
+Call AS_FCY(VALEUR) From CPTTRT
+End
+
+Subprog C_FCY(VALEUR)
+Variable Char    VALEUR()
+If VALEUR<>[M]FCY : Raz TYPPCE, JOU : Endif
+Call C_FCY(VALEUR) From CPTTRT
+End
+
+Subprog C_ALLCLB(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+ Effzo CLBSTR, CLBEND : Grizo CLBSTR, CLBEND
+Else
+ Actzo CLBSTR, CLBEND
+Endif
+End
+
+Subprog AS_CLBSTR(VALEUR)
+Variable Char    VALEUR()
+If [M]ALLCLB=2 : mkstat = 1 : Endif
+End
+
+Subprog AS_CLBEND(VALEUR)
+Variable Char    VALEUR()
+If [M]ALLCLB=2 : mkstat = 1 : End : Endif
+If VALEUR="" | VALEUR<[M]CLBSTR : VALEUR=[M]CLBSTR : Endif
+End
+
+Subprog C_CLBEND(VALEUR)
+Variable Char    VALEUR()
+If VALEUR<>"" & VALEUR<[M]CLBSTR
+ GMESSAGE = mess(44,199,1)
+ mkstat = 2 : End
+Endif
+End
+
+Subprog C_ALLCUR(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+ Effzo GRPCUR, CUR : Grizo GRPCUR, CUR
+Else
+ Actzo GRPCUR
+ If [M]GRPCUR<>"" : Effzo GRPCUR : Grizo CUR : Else : Actzo CUR : Endif
+Endif
+End
+
+Subprog AS_GRPCUR(VALEUR)
+Variable Char     VALEUR
+If [M]ALLCUR=2 :  mkstat=1 : Endif
+End
+
+Subprog C_GRPCUR(VALEUR)
+Variable Char VALEUR()
+If VALEUR<>""
+ Effzo CUR : Grizo CUR
+Else
+ Actzo CUR
+Endif
+End
+
+Subprog AS_CUR(VALEUR)
+Variable Char     VALEUR
+If [M]ALLCUR=2 | [M]GRPCUR<>"" :  mkstat=1 : End : Endif
+End
+
+Subprog C_CUR(VALEUR)
+Variable Char    VALEUR()
+If VALEUR="" : End : Endif
+End
+
+Subprog AV_INI(VALEUR)
+Variable Decimal VALEUR
+Gosub GRISE
+End
+
+########
+$GRISE
+If [M]ALLCPY=2
+ Effzo CPY, FCY : Grizo CPY, FCY
+ [M]ALLFCY=2 : Affzo ALLFCY  : Grizo ALLFCY
+Else
+ Actzo CPY, ALLFCY
+ If [M]ALLCPY=2
+  Effzo FCY : Grizo FCY
+ Else
+  Actzo FCY
+ Endif
+Endif
+
+If [M:DIA]ALLCLB=2
+ Effzo [DIA]CLBSTR : Grizo [DIA]CLBSTR
+ Effzo [DIA]CLBEND : Grizo [DIA]CLBEND
+Else
+ Actzo [DIA]CLBSTR : Actzo [DIA]CLBEND
+Endif
+
+If [M:DIA]ALLCUR=2
+   Effzo [DIA]GRPCUR : Grizo [DIA]GRPCUR
+   Effzo [DIA]CUR    : Grizo [DIA]CUR
+Else
+ Actzo [DIA]GRPCUR
+ If [M:DIA]GRPCUR<>""
+  Effzo [DIA]CUR : Grizo [DIA]CUR
+ Else
+  Actzo [DIA]CUR
+ Endif
+Endif
+Return
+
+Subprog C_GENECR(VALEUR)
+Variable Integer VALEUR
+If VALEUR<>2
+ Grizo CAT,STA,TYPPCE,JOU,ACCDAT
+ [M]TRACE=2
+Else
+ Actzo CAT,STA,TYPPCE,JOU,ACCDAT
+Endif
+End
+
+Subprog C_CAT(VALEUR)
+Variable Integer VALEUR
+If VALEUR<>1 : Grizo STA Else Actzo STA : Endif
+End
+
+Subprog AS_STA(VALEUR)
+Variable Integer VALEUR
+If [M]CPY<>""
+ If func AFNC.PARAM("FRADGI",[M]CPY)="2" : # Paramètre à Oui
+  VALEUR = 2 : mkstat = 2 : End
+ Endif
+Endif
+End
+
+Subprog AS_TYPPCE(VALEUR)
+Variable Char    VALEUR()
+If VALEUR=""
+ If [M]FCY<>""
+  Call PARAML([M]FCY,"TYPACC",VALEUR) From ADOVAL
+ Elsif [M]CPY<>""
+  Call PARAML([M]CPY,"TYPACC",VALEUR) From ADOVAL
+ Elsif GCURLEG<>""
+  Call PARAM(GCURLEG,"TYPACC",VALEUR) From CPTLEC
+ Endif
+Endif
+End
+
+Subprog C_TYPPCE(VALEUR)
+Variable Char    VALEUR()
+If VALEUR="" : End : Endif
+Call LEC_GTE_LEG(GCURLEG,VALEUR) From CPTLEC
+Call CONTEXE([F:GTE]ACS) From CPTSUB : If mkstat : End : Endif
+If ([M]CAT=2 | [M]CAT=3) & [F:GTE]VCRSIM<>2
+ GMESSAGE = mess(32,107,1) : mkstat = 2 : End
+Elsif [F:GTE]COU=""
+ GMESSAGE = mess(31,107,1) : mkstat = 2 : End
+Endif
+End
+
+Subprog AS_JOU(VALEUR)
+Variable Char    VALEUR()
+If VALEUR=""
+ VALEUR = [F:GTE]DEFJOU
+Endif
+End
+
+Subprog C_JOU(VALEUR)
+Variable Char    VALEUR()
+Call CTL_JOUDES(VALEUR,GCURLEG) From CPTTRT
+End
+
+Subprog AS_TRACE(VALEUR)
+Variable Integer VALEUR
+If [M]GENECR<>2 : mkstat=2 : Endif
+End
+
+
+############################################################################
+# AMTFORCE : renvoie le montant "forcé"
+# TYP est le type de montant : 1 : montant en devise transaction ; dans ce cas LEDTYP=0
+#                              2 : montant en devise référentiel ; dans ce cas LEDTYP= valeur menu local 2644)
+############################################################################
+Subprog AMTFORCE(TYP,LEDTYP,MNTDEV,MONTANT,STAT)
+Value    Integer TYP
+Value    Integer LEDTYP
+Value    Decimal MNTDEV
+Variable Decimal MONTANT
+Variable Integer STAT
+
+If clalev([F:CPY])=0  : Local File COMPANY   [CPY] : Endif
+If clalev([F:GAG2])=0 : Local File GAUTACEF [GAG2] : Endif
+If clalev([F:GAG3])=0 : Local File GAUTACEF [GAG3] : Endif
+
+Local Char    CODLED(GLONLED), DEVLED(GLONCUR)
+Local Integer SPSTAT
+Local Decimal COURS
+
+Case TYP
+ When 1 : # Montant devise transaction
+    #
+ When 2 : # Montant devise référentiel
+  Call LECTURE("CPY",[F:TB0]CPY,"") From CONTOBJ
+  Call LECLED([F:TB0]CPY,LEDTYP,CODLED,DEVLED) From CPTDIV
+  If CODLED="" : End : Endif
+  If [F:TB0]CUR<>DEVLED
+   Read [GAG2]GAG0=[F:GAU]COD;0;"DIV"+num$(LEDTYP)
+   If fstat : End : Endif
+   Read [GAG3]GAG0=[F:GAU]COD;0;"MLT"+num$(LEDTYP)
+   If fstat : End : Endif
+   If evalue([F:GAG2]FORCLC)=1 & evalue([F:GAG3]FORCLC)<>0
+    COURS = evalue([F:GAG3]FORCLC)
+   Elsif evalue([F:GAG2]FORCLC)<>0
+    COURS  = evalue([F:GAG3]FORCLC)/evalue([F:GAG2]FORCLC)
+   Endif
+   If COURS<>0
+    Call CONVERT3([F:TB0]CUR,[L]DEVLED,[F:CPY]ACCCUR,[F:TB0]TYPRAT
+&            ,[F:TB0]RATDAT,MNTDEV,MONTANT,[L]COURS,STAT) From CPTSUB
+    If SPSTAT
+     STAT = 98 : GMESSAGE = "AMTLED"+num$(LEDTYP)-":"-mess(4,109,1)-[F:TB0]CUR-"=>"-[L]DEVLED
+    Endif
+   Endif
+  Endif
+ Endcase
+End
+

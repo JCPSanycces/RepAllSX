@@ -1,0 +1,340 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+############################################################
+# Resynchronisation des lignes de stocks
+# - A partir du dernier inventaire global
+# - Par déroulement des mouvements de stocks postérieurs 
+# Action TRTSYSSTO
+############################################################
+
+$ACTION
+Case ACTION
+  When "OUVRE_BATCH"  : Gosub OUVRE_BATCH
+  When "INIT"         : Gosub INIT
+  When "EXEC"         : Gosub EXEC
+  When "TERMINE"      : Gosub TERMINE
+Endcase 
+Return
+
+############################################################
+$OUVRE_BATCH
+# En batch , il vaut mieux mettre onerrgo
+If GSERVEUR
+  Onerrgo ERRBATCH
+Endif
+Gosub OPEN_FILE
+Return
+
+############################################################
+$INIT
+TMP=1
+Gosub OPEN_FILE
+Return
+
+#############################################################
+$EXEC
+Local Char    WFIL(250), WCRIT(250) 
+Local Char    WCUNSSSNUM(GLONVCR)
+Local Integer WSEQ, WMVTSEQ, WSTJ
+Local Decimal WQTYSTO, WQTYNEW
+
+If !GSERVEUR
+  Call OUVRE_TRACE(TIT) From LECFIC
+  Call ECR_TRACE(" ",0) From GESECRAN
+  Call ECR_TRACE(string$(70,"-"),0) From GESECRAN 
+  Call PRTSCR("SYNSTO","DIA","",0,1) From ATRTX3
+  Call ECR_TRACE(string$(70,"-"),0) From GESECRAN 
+  Call ECR_TRACE(" ",0) From GESECRAN 
+Endif
+
+WFIL = "[F:ITV]STOFCY=[M:DIA]STOFCY"
+
+If [M:DIA]ITMREFSTR<>""
+  WFIL += "& [F:ITV]ITMREF >= [M:DIA]ITMREFSTR" 
+Endif
+If [M:DIA]ITMREFEND<>""
+  WFIL += "& [F:ITV]ITMREF <= [M:DIA]ITMREFEND"
+Endif                                                       
+
+For [ITV]ITV1 Where evalue(WFIL) 
+  Gosub TRAITEMENT
+Next
+
+Onerrgo
+Return
+
+#############################################################
+$TERMINE
+If !GSERVEUR
+  Call FERME_TRACE From LECFIC
+Endif
+TRA = 1
+
+Return
+
+############################################################
+# Traitement de resynchronisation d'un article-site
+###########################################################
+$TRAITEMENT
+
+Raz WQTYSTO, WQTYNEW
+
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN 
+Call ECR_TRACE("Site"-[F:ITV]STOFCY-"Article"-[F:ITV]ITMREF,0) From GESECRAN
+
+Readlock [ITV] Curr
+If fstat=1
+  GLOCK = "ITMMVT"-[F:ITV]STOFCY-[F:ITV]ITMREF
+  Call ECR_TRACE(mess(20,100,1)-mess(55,100,1)-GLOCK,1) From GESECRAN 
+  Return
+Elsif fstat
+  Call RSTA("ITV",[F:ITV]STOFCY-[F:ITV]ITMREF) From GLOCK
+  Return
+Endif
+
+Read [ITM]ITM0=[F:ITV]ITMREF
+If fstat 
+  Call RSTA("ITM",[F:ITM]ITMREF) From GLOCK
+  Return
+Endif
+
+# Pas d'inventaire global, on ne fait rien
+If [F:ITV]LASCUNLIS="" | [F:ITV]LASCUNDAT=[0/0/0]
+  Call ECR_TRACE("Rien à traiter : pas d'inventaire global",0) From GESECRAN 
+  Return 
+Else
+  Call ECR_TRACE("Date dernier inventaire global:"-[F:ITV]LASCUNDAT,0) From GESECRAN 
+Endif
+
+Trbegin [SYW]
+GOK=1 
+
+For [SYW]
+  Delete [SYW]
+Next
+
+Raz WSEQ
+# Alimentation situation stock initiale
+For [CUD]CUD1 Where STOFCY    = [F:ITV]STOFCY
+&                 & ITMREF    = [F:ITV]ITMREF
+&                 & CUNLISNUM = [F:ITV]LASCUNLIS
+  Raz [F:SYW]
+  WSEQ += 1
+  If WSEQ=1 WCUNSSSNUM=[F:CUD]CUNSSSNUM Endif
+  [F:SYW]       = [F:CUD]
+  [F:SYW]SEQ    = WSEQ
+  [F:SYW]CREDAT = date$   
+  [F:SYW]CREUSR = GUSER
+  Raz [F:SYW]STOCOU
+  Write [SYW]
+  If fstat
+    Raz GOK : Break
+  Endif
+Next
+If WSEQ=0 | !GOK 
+  Call ECR_TRACE([F:ITV]STOFCY-[F:ITV]ITMREF-":"-mess(459,199,1),0) From GESECRAN 
+  Goto AB_TRT
+Endif
+
+#Commit
+
+# Récupération du MVTSEQ du mouvement d'inventaire bidon
+Columns [STJ] (MVTSEQ)
+Filter [STJ] Where STOFCY    = [F:ITV]STOFCY
+&                & UPDCOD    = 2
+&                & ITMREF    = [F:ITV]ITMREF
+&                & IPTDAT    = [F:ITV]LASCUNDAT
+&                & MVTIND    = 0
+&                & VCRTYP    = 9
+&                & VCRNUM    = [F:ITV]LASCUNLIS
+&                & VCRNUMORI = WCUNSSSNUM
+&                & REGFLG    = 2
+Read [STJ]STJ0 First 
+If fstat
+  Filter [STJ]
+  Columns [STJ] 
+  Commit
+  Return
+Endif
+WMVTSEQ = [F:STJ]MVTSEQ
+Filter [STJ]
+Columns [STJ]
+
+#Trbegin [SYW]
+#GOK=1 
+
+# Déroulement de tous les mouvements réalisés depuis l'inventaire
+Raz WSTJ
+Filter [STJ] Where STOFCY  = [F:ITV]STOFCY
+&          & UPDCOD  = 2
+&          & ITMREF  = [F:ITV]ITMREF
+&          & IPTDAT >= [F:ITV]LASCUNDAT
+&            Order By Key STJ0 Desc 
+For [STJ]
+  # Si date mvt = date inventaire, on exclu les mvts antérieurs à l'inventaire 
+  If [F:STJ]IPTDAT=[F:ITV]LASCUNDAT & [F:STJ]MVTSEQ>=WMVTSEQ
+    Goto NEXT_STJ
+  Endif
+  # On exclu les mouvements de changements de valeur
+  If [F:STJ]TRSTYP=23
+    Goto NEXT_STJ
+  Endif
+
+  Raz WCRIT
+  If [F:ITM]SERMGTCOD=3 : WCRIT+='SERNUM=[F:STJ]SERNUM&' : Endif
+  WCRIT += 'LOT=[F:STJ]LOT&SLO=[F:STJ]SLO&LOC=[F:STJ]LOC&STA=[F:STJ]STA&'
+  WCRIT += 'PALNUM=[F:STJ]PALNUM&CTRNUM=[F:STJ]CTRNUM&QLYCTLDEM=[F:STJ]QLYCTLDEM&' 
+  WCRIT += 'OWNER=[F:STJ]OWNER&PCU=[F:STJ]PCU&PCUSTUCOE=[F:STJ]PCUSTUCOE' 
+
+  Filter [SYW] Where STOFCY    = [F:STJ]STOFCY
+&                  & ITMREF    = [F:STJ]ITMREF 
+&                  & evalue(WCRIT)
+  If [F:ITM]SERMGTCOD=3
+    Read [SYW]SYW2 First
+  Else
+    Read [SYW]SYW1 First
+  Endif
+  Filter [SYW]
+  # L'enregistrement de travail stock existe, on le met à jour
+  If !fstat
+    Readlock [SYW] Curr
+    [F:SYW]QTYSTUNEW += [F:STJ]QTYSTU
+    [F:SYW]QTYPCUNEW += [F:STJ]QTYPCU
+    Rewrite [SYW]
+    If fstat
+      Raz GOK : Break
+    Endif
+  # L'enregistrement de travail stock n'existe pas, on le crée
+  Else
+    Raz [F:SYW]
+    WSEQ      += 1
+    [F:SYW]    = [F:STJ]
+    [F:SYW]SEQ = WSEQ
+    If [F:ITM]SERMGTCOD<>3 Raz [F:SYW]SERNUM Endif
+    [F:SYW]CUNLISNUM = [F:ITV]LASCUNLIS
+    [F:SYW]QTYSTUNEW = [F:STJ]QTYSTU
+    [F:SYW]QTYPCUNEW = [F:STJ]QTYPCU
+    [F:SYW]CREDAT    = date$   
+    [F:SYW]CREUSR    = GUSER
+    Write [SYW]
+    If fstat
+      Raz GOK : Break
+    Endif
+  Endif
+  WSTJ += 1
+$NEXT_STJ
+Next
+Filter [STJ]
+If !GOK Goto AB_TRT Endif
+
+# Déroulement des lignes de stocks 
+# pour comparaison et mise à jour du fichier de travail [SYW]
+WCRIT  = 'LOT=[F:STO]LOT&SLO=[F:STO]SLO&LOC=[F:STO]LOC&STA=[F:STO]STA&'
+WCRIT += 'SERNUM=[F:STO]SERNUM&PALNUM=[F:STO]PALNUM&CTRNUM=[F:STO]CTRNUM&'
+WCRIT += 'QLYCTLDEM=[F:STO]QLYCTLDEM&OWNER=[F:STJ]OWNER&PCU=[F:STO]PCU&'
+WCRIT += 'PCUSTUCOE=[F:STO]PCUSTUCOE' 
+
+For [STO]STO3 Where ITMREF=[F:ITV]ITMREF & STOFCY=[F:ITV]STOFCY
+
+  Filter [SYW] Where STOFCY    = [F:STO]STOFCY
+&                  & ITMREF    = [F:STO]ITMREF 
+&                  & evalue(WCRIT)
+  If [F:ITM]SERMGTCOD=3
+    Read [SYW]SYW2 First
+  Else
+    Read [SYW]SYW1 First
+  Endif
+  Filter [SYW]
+  # L'enregistrement de travail stock existe, 
+  # on met le chrono stock et les qtés de la ligne stock
+  If !fstat
+    Readlock [SYW] Curr
+    [F:SYW]QTYSTUSTO = [F:STO]QTYSTU
+    [F:SYW]QTYPCUSTO = [F:STO]QTYPCU
+    [F:SYW]STOCOU    = [F:STO]STOCOU
+    Rewrite [SYW]
+    If fstat
+      Raz GOK : Break
+    Endif
+  # L'enregistrement de travail stock n'existe pas,
+  # on le crée avec le chrono stock et les qtés de la ligne stock
+  Else
+    Raz [F:SYW]
+    WSEQ      += 1
+    [F:SYW]    = [F:STO]
+    [F:SYW]SEQ = WSEQ
+    [F:SYW]CUNLISNUM = [F:ITV]LASCUNLIS
+    [F:SYW]QTYSTUSTO = [F:STO]QTYSTU
+    [F:SYW]QTYPCUSTO = [F:STO]QTYPCU
+    [F:SYW]CREDAT    = date$   
+    [F:SYW]CREUSR    = GUSER
+    Write [SYW]
+    If fstat
+      Raz GOK : Break
+    Endif
+  Endif
+
+Next
+
+If !GOK Goto AB_TRT Endif
+Commit
+
+For [SYW]SYW0
+
+  If [F:SYW]STOCOU=0 
+    If [F:SYW]QTYSTUNEW<>0
+      Call ECR_TRACE("Stock à créer, quantité"-num$([F:SYW]QTYSTUNEW),1) From GESECRAN
+      Call ECR_TRACE("--- Caractéristiques :"-"Sernum:"+[F:SYW]SERNUM-"Lot:"+[F:SYW]LOT-"Slo:"+[F:SYW]SLO-"Loc:"+[F:SYW]LOC-"Sta:"+[F:SYW]STA-"Palnum:"+[F:SYW]PALNUM-"Ctrnum:"+[F:SYW]CTRNUM-"Pcu:"+[F:SYW]PCU-"Pcustucoe:"+num$([F:SYW]PCUSTUCOE)-"Qlyctldem:"+[F:SYW]QLYCTLDEM,1) From GESECRAN
+    Endif 
+  Elsif [F:SYW]QTYSTUNEW=0
+    If [F:SYW]QTYSTUSTO<>0
+      Read [STO]STO0=[F:ITV]STOFCY;[F:SYW]STOCOU
+      Call ECR_TRACE("Stock à supprimer chrono"+num$([F:SYW]STOCOU)-": quantité"-num$([F:SYW]QTYSTUSTO)-[F:SYW]SERNUM,1) From GESECRAN
+      If [F:STO]CUMWIPQTY+[F:STO]CUMALLQTY > 0 
+        Call ECR_TRACE("--- Stock alloué :"-num$([F:STO]CUMALLQTY)-" Stock en cours de traitement :"-num$([F:STO]CUMWIPQTY),1)
+&            From GESECRAN
+      Endif
+    Endif 
+  Elsif [F:SYW]QTYSTUSTO<>[F:SYW]QTYSTUNEW
+    Read [STO]STO0=[F:ITV]STOFCY;[F:SYW]STOCOU
+    Call ECR_TRACE("Stock à modifier chrono"+num$([F:SYW]STOCOU)-": old qty"-num$([F:SYW]QTYSTUSTO)-": new qty"-num$([F:SYW]QTYSTUNEW)-[F:SYW]SERNUM,1)
+&        From GESECRAN 
+    If [F:STO]CUMWIPQTY+[F:STO]CUMALLQTY > [F:SYW]QTYSTUNEW 
+      Call ECR_TRACE("--- Stock alloué :"-num$([F:STO]CUMALLQTY)-" Stock en cours de traitement :"-num$([F:STO]CUMWIPQTY),1)
+&          From GESECRAN
+    Endif
+  Else
+    Call ECR_TRACE("Stock OK chrono"+num$([F:SYW]STOCOU)-": quantité"-num$([F:SYW]QTYSTUSTO),0) From GESECRAN 
+  Endif
+  WQTYSTO += [F:SYW]QTYSTUSTO
+  WQTYNEW += [F:SYW]QTYSTUNEW
+
+Next
+
+Call ECR_TRACE("Total stock : old qty"-num$(WQTYSTO)-"/ new qty"-num$(WQTYNEW),0) From GESECRAN
+Call ECR_TRACE("Nombre de mouvements traités :"-num$(WSTJ),0) From GESECRAN
+
+Return
+
+#############################################################
+$OPEN_FILE
+Local Char TIT(50)
+TIT = mess(96,184,1)
+If clalev([F:ITV]) = 0 : Local File ITMMVT    [ITV]  : Endif
+If clalev([F:ITM]) = 0 : Local File ITMMASTER [ITM]  : Endif
+If clalev([F:CUD]) = 0 : Local File CUNLISDET [CUD]  : Endif
+If clalev([F:STJ]) = 0 : Local File STOJOU    [STJ]  : Endif
+If clalev([F:STO]) = 0 : Local File STOCK     [STO]  : Endif
+If clalev([F:SYW]) = 0 : Local File STOSYNW   [SYW]  : Endif
+Return
+
+##########################################################################
+$AB_TRT
+Rollback
+Return
+
+##########################################################################
+$ERRBATCH
+Call ECR_TRACE(errmes$(errn)-num$(errl)-errm,1) From GESECRAN
+End
+
+##########################################################################

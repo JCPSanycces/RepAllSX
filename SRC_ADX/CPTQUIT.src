@@ -1,0 +1,1020 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$ Gestion du masque CPTQUIT
+########################################################################
+#             COMPTABILISATION DES QUITTANCES SUBROGATIVES             #
+# - débite le compte du Factor, crédite le cpte client affacturé       #
+# - on génère une pièce par devise                                     #
+# - utilise la pièce automatique "FCTQ"                                #
+########################################################################
+#*X3-39795   MDJ  Manage ORIGIN and ORICOD fields in GL Entry
+#*
+Local Char PARAM(10)(1..2) , VALEUR(10)
+Call TRAITE_CHAR(VALEUR,PARAM,"","CPTQUIT","FCPTQUIT",3,"") From GTRAITE
+End
+
+
+$ACTION
+Case ACTION
+ When "INIT_DIA"   : Gosub INIT_DIA
+ When "CONTROLE"   : Gosub CONTROLE
+ When "EXEC"       : Gosub EXEC
+ When "SORTIE"     : Gosub SORTIE # <JFL>
+Endcase
+Return
+
+$INIT_DIA
+Local Integer OK, CODRET, I, IDEV, NBDEV, NB, CPT, STAT
+Local Char    CRIT1(120), TDEVCUR(GLONCUR)(10), DEVCUR(GLONCUR), MESSA(80), REF_SIM(20)
+#*X3-39795 Local Char    TZONE(10)(1..7)   : # Table des zones à forcer (Ex:réference simulation)
+#*X3-39795 Local Char    TVAL(20)(1..7)    : # Table des valeurs des zones à forcer
+Local Char    TZONE(10)(1..10)   : # Table des zones à forcer (Ex:réference simulation)
+Local Char    TVAL(20)(1..10)    : # Table des valeurs des zones à forcer
+Local Decimal XAMTIPT(1..2)     : # Lettrage: montants à lettrer
+Local Integer XACCNUM(1..2)     : #    "    : numéros d'écritures comptables
+Local Integer XDUDLIG(1..2)     : #    "    : numéros de ligne
+Local Char    PCEAUTO(GLONGAU), SITE(GLONFCY), SYMBOL(30)
+
+TIT = mess(68,121,1)    # Validation des quittances
+Gosub OUVRE_FIC
+Default Mask [DIA]
+
+
+Local Char QTCCPY(GLONCPY)        # Quittance est mono-société
+Local Char QTCCOA(GLONCOA)        # Plan comptable du Référentiel Général principal
+Local Char QTCACC(GLONGAC)        # Compte Client
+Local Integer QTCSAC              # Flag collectif compte Client
+Local Integer STAECT
+Return
+
+$CONTROLE
+
+TMP = 1    # Pour afficher des tempon/tempoff
+
+Filter [SIH1] Where BPRFCT=[M]BPRFCT & FCTVCR=[M]FCTVCR & FCTVCRFLG=0
+&             Order By Key CLE = CUR
+Read [SIH1]First
+[L]QTCCPY=[F:SIH1]CPY
+# SAM 88426   Factoring management
+QTCFCY=[F:SIH1]FCY
+Call PARAM(QTCFCY,"GAUFCTQ",[L]PCEAUTO) From ADOVAL
+If [L]PCEAUTO="" : [L]PCEAUTO="FCTQ" : Endif
+# End 88426
+Call SETMAINREF([L]QTCCPY,GTYPGEN,GTYPANA) From CPTDIV
+Call LECPLAN([L]QTCCPY,GTYPGEN,[L]QTCCOA) From CPTDIV
+
+If FIN : Return : Endif
+Call AVERTDGI(1,[L]QTCCPY,[M:DIA]TYPGEN,SAI) From CPTDIV2
+If SAI : Return : Endif
+Return
+
+$EXEC
+If GSERVEUR
+### batch
+ [M:DIA]TRACE = 2
+Endif
+If !GSERVEUR & [M:DIA]TRACE=2
+ Call OUVRE_TRACE(TIT) From LECFIC
+Endif
+If [M:DIA]TRACE=2
+ Call ECR_TRACE(TIT-":"-[M:DIA]FCTVCR,0) From GESECRAN
+ Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+
+SYMBOL = "CPTQUIT\"+[M:DIA]FCTVCR
+Lock =SYMBOL With lockwait=0
+If fstat=1
+ # Quittance ... Validation en cours
+ Call ECR_TRACE(mess(77,121,1)-[M:DIA]FCTVCR-":"-mess(1,100,1),1) From GESECRAN
+Elsif !fstat
+ Gosub VALID
+Endif
+Unlock =SYMBOL
+
+If !GSERVEUR & [M]TRACE=2
+ Call FERME_TRACE From LECFIC
+ TRA = 1
+Endif
+Return
+
+$VALID
+### nombre de devise différentes dans la liste des factures
+Global Char GLASTNUM(GLONVCR) ## SAM 88426   Factoring management
+Raz TDEVCUR, NBDEV
+For [F:SIH1]CLE(1)
+ TDEVCUR(NBDEV) = [F:SIH1]CUR
+ NBDEV += 1
+Next
+Filter [SIH1]
+
+## SAM 88426   Factoring management
+Filter [SIH1] Where BPRFCT=[M]BPRFCT & FCTVCR=[M]FCTVCR & FCTVCRFLG=0 & CUR=TDEVCUR(NBDEV-1)
+&             Order By Key CLE = NUM
+Read [SIH1]CLE Last
+GLASTNUM=[F:SIH1]NUM
+Filter [SIH1]
+## Ens SAM 88426
+
+### Génération des pièces
+Call DEBTRANS From GLOCK
+Gosub TR1
+
+### Génération du fichier magnétique
+If GOK=1 & [M]TYPGEN=1    # Réel
+ Call ENREG([M]BPRFCT,[M]FCTVCR) From GENFIC
+Endif
+Return
+
+# On génère 1 pièce par devise
+$TR1
+GOK=1
+Trbegin [HAE], [DAE], [DAA], [DUD], [SIH], [MVC]
+For IDEV = 0 To NBDEV-1
+ DEVCUR = TDEVCUR(IDEV)
+ REF_SIM = "QT" + [M]BPRFCT + DEVCUR
+ # Annulation des pièces de simulation
+ Gosub ANUPCE
+ If GOK<1 : Break : Endif
+ # Création de pièce
+ Gosub TR2
+ If GOK<1 : Break : Endif
+Next IDEV
+Kill GLASTNUM # SAM 88426   Factoring management
+If GOK<0   : Goto ROLL_TR1
+Elsif !GOK : Goto AB_TR1
+Endif
+Commit
+Return
+
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+
+$AB_TR1
+Rollback
+Return
+
+$SORTIE
+Return
+
+####################################################
+$OUVRE_FIC
+If clalev([F:SIH])=0  : Local File SINVOICE   [SIH]  : Endif
+If clalev([F:SIH1])=0 : Local File SINVOICE   [SIH1] : Endif
+If clalev([F:CPY])=0  : Local File COMPANY    [CPY]  : Endif
+If clalev([F:FCY])=0  : Local File FACILITY   [FCY]  : Endif
+If clalev([F:FCT])=0  : Local File FACTOR     [FCT]  : Endif
+If clalev([F:GTE])=0  : Local File GTYPACCENT [GTE]  : Endif
+If clalev([F:JOU])=0  : Local File GJOURNAL   [JOU]  : Endif
+If clalev([F:MVC])=0  : Local File BPCUSTMVT  [MVC]  : Endif
+If clalev([F:DUD])=0  : Local File GACCDUDATE [DUD]  : Endif
+If clalev([F:GAU])=0  : Local File GAUTACE    [GAU]  : Endif
+
+If clalev([F:GAC])=0  : Local File GACCOUNT   [GAC]  : Endif
+If clalev([F:CAC])=0  : Local File GACCCODE   [CAC]  : Endif
+
+If clalev([F:HAE])=0  : Local File GACCENTRY  [HAE]  : Endif
+If clalev([F:HA2])=0  : Local File GACCENTRY  [HA2]  : Endif
+If clalev([F:DAE])=0  : Local File GACCENTRYD [DAE]  : Endif
+If clalev([F:DAA])=0  : Local File GACCENTRYA [DAA]  : Endif
+
+If clalev([M:HAE2])=0 : Local Mask GACCENT2   [HAE2] : Endif
+If clalev([M:HAEW])=0 : Local Mask GACCENTW   [HAEW] : Endif
+If clalev([M:HAEF])=0 : Local Mask GACCENTFMT [HAEF] : Endif
+
+Return
+
+##############
+$ANUPCE
+GTRANS = 1
+For [HA2]HAE2 Where REFSIM=REF_SIM & CAT>1
+ Call LEC_HAE([F:HA2]TYP, [F:HA2]NUM) From CPTLEC
+ Call DELPCE([F:HA2]TYP,[F:HA2]NUM) From CPTBATCH
+ If GOK=1 & GTRACE<>""
+  Call ECR_TRACE(mess(41,107,1)-[F:HA2]TYP-[F:HA2]NUM,0) From GESECRAN   :# Annulation pièce
+ Endif
+ If GOK<1 : Break : Endif
+Next
+GTRANS = 0
+Return
+
+####################################################
+$TR2
+CRIT1 = "BPRFCT='"+[M]BPRFCT+"' & FCTVCR='"+[M]FCTVCR+"' & CUR='"+DEVCUR+"' & FCTVCRFLG=0"
+Raz TZONE, TVAL, CODRET, MESSA
+# critère sur factor, n° quittance, devise et quittance non comptabilisée
+If [M]TYPGEN=1 & [L]QTCCPY<>"" & func AFNC.PARAM("FRADGI",[L]QTCCPY)="2"
+ STAECT = 2
+Else
+ STAECT = [M]SIMSTA
+Endif
+TZONE(1) = "REFSIM"
+If [M]TYPGEN<>1
+ TVAL(1) = REF_SIM
+Endif
+TZONE(2) = "ACCDAT" : TVAL(2) = [M]ACCDAT
+TZONE(3) = "CAT"    : TVAL(3) = num$([M]TYPGEN)
+TZONE(4) = "STA"    : TVAL(4) = num$([L]STAECT)
+TZONE(5) = "TYP"    : TVAL(5) = [M]TYPPCE
+TZONE(6) = "JOU"    : TVAL(6) = [M]JOU
+TZONE(7) = "CUR"    : TVAL(7) = DEVCUR
+TZONE(8) = "ORIGIN" : TVAL(8)= "2"              #Automatic loading  #*X3-39795
+TZONE(9) = "ORICOD" : TVAL(9)= [L]PCEAUTO                           #*X3-39795
+
+
+#### SAM 88426   Factoring management
+If [F:FCT]FCTTYP>1: TVAL(7)="": Endif
+Local Integer FLAG(10)
+#### ENd SAM 88426
+
+#Call VALPCE4([L]PCEAUTO,CRIT1,CODRET,MESSA,TZONE,TVAL) From CPTAUTO       SAM 88426   Factoring management
+Local Char MESSA(100)(1..10)                                            ## SAM 88426   Factoring management
+Call VALGRP4([L]PCEAUTO,CRIT1,CODRET,MESSA,TZONE,TVAL,FLAG) From VALGRP ## SAM 88426   Factoring management
+
+If CODRET
+ GOK=0 : Call ECR_TRACE(MESSA,1) From GESECRAN
+ Return
+Elsif GTRACE<>""
+ If [M]TYPGEN=1 & [M]SIMSTA<>STAECT
+  Call ECR_TRACE(mess(40,107,1)-GTYPPCE-MESSA-"("+tolower(mess(192,107,1))+")",0) From GESECRAN   # Création pièce
+ Else
+  Call ECR_TRACE(mess(40,107,1)-GTYPPCE-MESSA,0) From GESECRAN   # Création pièce
+ Endif
+ ## SAM 88426   Factoring management
+ For I=2 To 10
+  If MESSA(I)="": Break: Endif
+  Call ECR_TRACE(mess(40,107,1)-GTYPPCE-MESSA(I),0) From GESECRAN
+ Next
+ ## End SAM 88426   Factoring management
+Endif
+
+If [M]TYPGEN=1   :# génération en réel
+ Gosub UPDECR
+Endif
+Return
+
+$UPDECR
+#--- Ajout du no d'ecriture comptable de la quittance sur les factures
+Call LECTURE("FCT",[M:DIA]BPRFCT,"") From CONTOBJ             :# Lecture du Factor
+Call LEC_CAC(21, [F:FCT]ACCCOD, [L]QTCCOA) From CPTLEC # Code comptable
+#If fstat
+# Call ECR_TRACE([F:FCT]ACCCOD-":"-mess(179,105,1)-"("+mess(134,107,1)-[L]QTCCOA+")",1) From GESECRAN
+# GOK=0 : Return
+#Endif
+
+# Compte client
+If [F:FCT]FCTTYP<2 ## # SAM 88426   Factoring management
+Call LEC_GAC([F:CAC]ACC(1), [L]QTCCOA) From CPTLEC # Affacturage Compte Client  (collectif)
+If !fstat
+ [L]QTCACC=[F:GAC]ACC : [L]QTCSAC = 1
+Else
+ Call LEC_GAC([F:CAC]ACC(2), [L]QTCCOA) From CPTLEC # Affacturage Compte Client (non collectif)
+ If !fstat
+  [L]QTCACC=[F:GAC]ACC : [L]QTCSAC = 0
+   Endif
+Endif
+Else ## # SAM 88426   Factoring management
+# Compte client
+ If [F:FCT]FCTTYP=2
+  Call LEC_GAC([F:CAC]ACC(4),[L]QTCCOA) From CPTLEC
+ Else
+  Call LEC_GAC([F:CAC]ACC(3),[L]QTCCOA) From CPTLEC
+ Endif
+  If !fstat
+    [L]QTCACC=[F:GAC]ACC : [L]QTCSAC = 1
+ Endif
+Endif
+# End SAM 88426
+
+Filter [SIH] Where evalue(CRIT1)
+Local Integer NUMFAC: NUMFAC=0: ## # SAM 88426   Factoring management -
+Local Integer NUMFAC2: NUMFAC2=0: ## # SAM 88426   Factoring management -
+##Local Char BPRFACFCT(GLONBPR): Raz BPRFACFCT ## # SAM 88426   Factoring management -
+
+For [SIH]SIH0
+# ## # SAM 88426   Factoring management -
+# If [F:SIH]BPR<>BPRFACFCT
+#    Raz NUMFAC
+#    BPRFACFCT=[F:SIH]BPR
+# Endif
+ NUMFAC+=1
+ ## end SAM 88426   Factoring management -
+ #-- Recherche du compte
+ I=0
+ If [L]QTCSAC    # sur compte collectif client
+  If find([F:SIH]INVTYP,1,3)   :# facture ou note de débit
+   While I<=[M:HAEW]NB-1 & (GTYPGEN<>[M:HAEW]LEDTYP(I) | [F:SIH]BPR<>[M:HAEW]BPR(I) | [M:HAEW]CDT(I)=0)
+    I+=1
+   Wend
+  Elsif find([F:SIH]INVTYP,2,4)   :# avoir ou note de crédit
+   While I<=[M:HAEW]NB-1 & (GTYPGEN<>[M:HAEW]LEDTYP(I) | [F:SIH]BPR<>[M:HAEW]BPR(I) | [M:HAEW]DEB(I)=0)
+    I+=1
+   Wend
+  Endif
+ Else    # sur compte client
+  If find([F:SIH]INVTYP,1,3)   :# facture ou note de débit
+   While I<=[M:HAEW]NB-1 & (GTYPGEN<>[M:HAEW]LEDTYP(I) | [L]QTCACC<>[M:HAEW]ACC(I) | [M:HAEW]CDT(I)=0)
+    I+=1
+   Wend
+  Elsif find([F:SIH]INVTYP,2,4)   :# avoir ou note de crédit
+   While I<=[M:HAEW]NB-1 & (GTYPGEN<>[M:HAEW]LEDTYP(I) | [L]QTCACC<>[M:HAEW]ACC(I) | [M:HAEW]DEB(I)=0)
+    I+=1
+   Wend
+  Endif
+ Endif
+ [F:SIH]QTCACCNUM = [M:HAEW]ACCNUM(I)
+ # SAM 88426   Factoring management
+ If [F:FCT]FCTTYP=2
+
+   I=instr(0,MESSA(1),"~")
+   If !clalev([F:DAT]): Local File GACCTMPD: Endif
+   Filter [DAT] Where TYP=left$(MESSA(1),I-1) & NUM=right$(MESSA(1),I+1) & LEDTYP=1 & ACC=QTCACC
+   Read [DAT]DAT0 First
+   If !fstat
+    Raz NUMFAC2
+    For [DAT]DAT0
+     NUMFAC2+=1
+     If NUMFAC2=NUMFAC
+      [F:SIH]QTCACCNUM = [F:DAT]ACCNUM:  Break
+     Endif
+    Next
+   Else
+    Filter [DAE] Where TYP=left$(MESSA(1),I-1) & NUM=right$(MESSA(1),I+1) & LEDTYP=1 & ACC=QTCACC
+    Raz NUMFAC2
+    For [DAE]DAE0
+     NUMFAC2+=1
+     If NUMFAC2=NUMFAC
+      [F:SIH]QTCACCNUM = [F:DAE]ACCNUM:  Break
+     Endif
+    Next
+   Endif
+ Endif
+
+ If [F:FCT]FCTTYP=3
+
+   Local Char MESSA2(250), MESSA1(250)
+   Local Integer Y
+   MESSA1=MESSA(1): MESSA2=MESSA(2)
+   I=instr(0,MESSA2,"~"): Y=instr(0,MESSA1,"~")
+   If !clalev([F:DAT]): Local File GACCTMPD: Endif
+   Filter [F:DAT] Where ((TYP=left$(MESSA2,I-1) & NUM=right$(MESSA2,I+1)) | (TYP=left$(MESSA1,Y-1)  & NUM=right$(MESSA1,Y+1)))
+&               & LEDTYP=1 & ACC = [L]QTCACC & BPR=[F:SIH]BPR
+&               & FCYLIN=[F:SIH]FCY
+   Read [DAT]DAT0 First
+   [F:SIH]QTCACCNUM = [F:DAT]ACCNUM
+   If fstat
+    Filter [DAE] Where ((TYP=left$(MESSA2,I-1) & NUM=right$(MESSA2,I+1)) | (TYP=left$(MESSA1,Y-1)  & NUM=right$(MESSA1,Y+1)))
+&                    & LEDTYP=1 & ACC=[L]QTCACC & BPR=[F:SIH]BPR
+&                    & FCYLIN=[F:SIH]FCY
+    Read [DAE]DAE0 First
+    If !fstat
+     [F:SIH]QTCACCNUM = [F:DAE]ACCNUM
+    Endif
+  Endif
+ Endif
+# END SAM 88426   Factoring management -
+
+ Rewrite [SIH]
+ If fstat
+  GOK=0 : Call FSTA("SIH") From GLOCK : Break
+ Endif
+Next
+Filter [SIH]
+If GOK<1 : Return : Endif
+
+Filter [SIH] Where evalue(CRIT1) Order By Key CLE = BPR
+For [SIH]CLE(1)
+
+ For [SIH]CLE
+
+  # Mise à jour du flag 'quittance validée'
+  [F:SIH]FCTVCRFLG = 1
+
+  # pré-lettrage des avoirs
+ If [F:FCT]FCTTYP<2 # SAM 88426   Factoring management -
+  If [F:SIH]INVTYP=2 & [F:SIH]INVNUM<>""
+   Read [SIH1]SIH0 = [F:SIH]INVNUM
+   If !fstat
+    XACCNUM(1)=[F:SIH1]QTCACCNUM : XDUDLIG(1)=1 : XAMTIPT(1)=[F:SIH1]AMTATI
+    XACCNUM(2)=[F:SIH]QTCACCNUM  : XDUDLIG(2)=1 : XAMTIPT(2)=[F:SIH]AMTATI
+    Call LETDIF2(2,XACCNUM,XDUDLIG,XAMTIPT,1) From CPTLET     :# lettrage en devise de société par défaut
+    If GOK<1 : Break 2 : Endif
+    Endif
+   Endif
+  Endif # SAM 88426   Factoring management -
+  Call PARAM([F:SIH]CPY,"DCLVATPAY",GBIDC3) From ADOVAL
+# SAM 88426   Factoring management -
+
+  If [F:FCT]FCTTYP=2 & GBIDC3<>"2"
+    XACCNUM(1)=[F:SIH]ACCNUM     : XDUDLIG(1)=1 : XAMTIPT(1)=[F:SIH]AMTATI
+
+    I=instr(0,MESSA(1),"~")
+    If !clalev([F:DAT]): Local File GACCTMPD: Endif
+    Filter [DAT] Where TYP=left$(MESSA(1),I-1) & NUM=right$(MESSA(1),I+1) & LEDTYP=1 & SAC=[F:SIH]BPRSAC & BPR=[F:SIH]BPR
+    Read [DAT]DAT0 First
+    XACCNUM(2)=[F:DAT]ACCNUM  : XDUDLIG(2)=1: XAMTIPT(2)=[F:SIH]AMTATI
+    If fstat
+       Filter [DAE] Where TYP=left$(MESSA(1),I-1) & NUM=right$(MESSA(1),I+1) & LEDTYP=1 & SAC=[F:SIH]BPRSAC & BPR=[F:SIH]BPR
+       Read [DAE]DAE0 First
+       XACCNUM(2)=[F:DAE]ACCNUM  : XDUDLIG(2)=1: XAMTIPT(2)=[F:SIH]AMTATI
+    Endif
+    Call LETDIF2(2,XACCNUM,XDUDLIG,XAMTIPT,2) From CPTLET#  Endif
+  Endif
+ # end SAM 88426   Factoring management -
+
+
+  Rewrite [SIH]
+  If fstat
+    GOK=0 : Call FSTA("SIH") From GLOCK : Break 2
+   Endif
+ Next   :# [SIH]CLE
+Next
+Filter [SIH]
+If GOK<1 : Return : Endif
+Return
+############################################################
+# SAM 88426   Factoring management
+############################################################
+$CAL_AMOUNT
+Local Decimal WAMT, WAMTD
+Local Integer WCHGTYP, STAT
+Local Char CRITERE(50)
+
+If clalev([F:DUD])=0  : Local File GACCDUDATE [DUD]  : Endif
+
+If ZONE="BPRFCT"
+ CRITERE= 'BPRFCT="'+VALEUR+'" & FCTVCR="'+[M]FCTVCR+'"'
+Elsif ZONE="FCTVCR"
+ CRITERE= 'BPRFCT="'+[M]BPRFCT+'" & FCTVCR="'+VALEUR+'"'
+Elsif ZONE="ACCDAT"
+ CRITERE= 'BPRFCT="'+[M]BPRFCT+'" & FCTVCR="'+[M]FCTVCR+'"'
+Endif
+
+WCHQTYP=[M]TYPRAT
+
+Raz [M]AMT, RESAMT
+
+For [SIH] Where evalue(CRITERE)
+ Raz WAMT
+ For [DUD] Where TYP=[F:SIH]GTE & NUM=[F:SIH]NUM & FCTVCR=[F:SIH]FCTVCR
+  WAMT += ([F:DUD]AMTCUR-[F:DUD]PAYCUR-[F:DUD]TMPCUR)*[F:DUD]SNS
+ Next
+ If [M]CUR<>[F:DUD]CUR
+   Call CONVERT([F:DUD]CUR,[M]CUR,[M]CUR,WCHQTYP,[M]ACCDAT,WAMT,WAMTD,STAT) From TRTDEV
+   If STAT=0: WAMT=WAMTD
+   Else: GMESSAGE=[F:DUD]NUM-mess(71,199,1): mkstat=2: Break
+   Endif
+  Endif
+  [M]AMT += WAMT
+Next
+If STAT: End: Endif
+If [M]FCTTYP=3 and [FCT]FCTRES<>0
+ [M]RESAMT=ar2(([M]AMT*[FCT]FCTRES)/100)
+Endif
+Affzo [M]AMT, RESAMT
+Return
+
+Subprog CAL_TAXAMOUNT(AMOUNT,TAX, BANCPY, TAXAMOUNT, TAXDED)
+Value Decimal AMOUNT
+Value Char TAX
+Value Char BANCPY
+Variable Decimal TAXAMOUNT
+Variable Decimal TAXDED
+If !clalev ([F:TRA]) : Local File TABRATVAT [TRA] : Endif
+If TAX<>"" and TAX<>GEXETAX
+ Filter [TRA] Where CPY=BANCPY & VAT=TAX & STRDAT<=datesyst & LEG=[F:CPY]LEG
+ Read [TRA]TRA0 Last
+ If fstat
+  Filter [TRA] Where CPY="" & VAT=TAX & STRDAT<=datesyst & LEG =[F:CPY]LEG
+  Read [TRA]TRA0 Last
+  If fstat
+    Filter [TRA] Where CPY=BANCPY & VAT=TAX & STRDAT<=datesyst & LEG = ""
+    Read [TRA]TRA0 Last
+    If fstat
+       Filter [TRA] Where CPY="" & VAT=TAX & STRDAT<=datesyst & LEG = ""
+       Read [TRA]TRA0 Last
+    Endif
+  Endif
+ Endif
+ If [TRA]VATEXEFLG=2: [F:TRA]VATRAT=0 : Endif
+ TAXAMOUNT=ar2(AMOUNT*[F:TRA]VATRAT/100)
+ TAXDED=ar2(TAXAMOUNT*[F:TRA]DEDRAT/100)
+Else
+ Raz TAXAMOUNT, TAXDED
+Endif
+End
+
+$CAL_SECDEF
+If clalev([F:GCM])=0  : Local File GACM [GCM]  : Endif
+If clalev([F:LED])=0  : Local File GLED [LED]  : Endif
+Raz [M]CCE, [M]DIE
+Call LEC_CPY([M]BANCPY) From CPTLEC
+Call LEC_GCM([F:CPY]ACM) From CPTLEC
+
+Local Integer NLED, TLED
+Local Char COA(GLONCOA)
+For I=1 To GOPTCANA
+ If [F:CPY]DIE(I-1)="": Break: Endif
+ [M]DIE(I-1)=[F:CPY]DIE(I-1)
+ For NLED=0 To len(mess(0,2644,1))-1
+  If [F:GCM]LED(NLED)="": Break: Endif
+  Call LEC_LED([F:GCM]LED(NLED)) From CPTLEC
+  [L]COA = [F:LED]COA
+  Raz [F:CAC]
+  Call LEC_CAC(21, [F:FCT]ACCCOD, [L]COA) From CPTLEC
+  Call INICCE([M]CCE(I-1),[M]DIE(I-1),[L]COA,[F:CAC]ACC(7),"FCT") From CPTINI
+  If [M]CCE(I-1)<>"" : Break : Endif
+ Next
+Next
+Affzo [M]DIE
+Affzo [M]CCE
+Return
+
+############################################################
+# END SAM 88426   Factoring management
+############################################################
+
+
+#########################################################################################
+# Calcul montant de la quittance à générer : variable associée aux lignes de pièces auto
+# générant la pièce FCTQ
+#########################################################################################
+Subprog AMTFCT(TYP,NUM,FCTVCR,AMTFCT,STAT)
+Value    Char TYP()
+Value    Char NUM()
+Value    Char FCTVCR()
+Variable Decimal AMTFCT
+Variable Integer STAT
+
+If clalev([F:DUD])=0  : Local File GACCDUDATE [DUD]  : Endif
+Raz AMTFCT
+For [DUD] Where TYP=[L]TYP & NUM=[L]NUM & FCTVCR=[L]FCTVCR
+ AMTFCT += [F:DUD]AMTCUR-[F:DUD]PAYCUR-[F:DUD]TMPCUR
+Next
+End
+# SAM 88426   Factoring management
+Subprog AMTFCTNREC(TYP,VCRNUM,FCTVCR,BPRFCT,PAYCUR,TYPCUR,DAT,BAN, AMTFCTNREC,STAT)
+Value    Char TYP()
+Value    Char VCRNUM()
+Value    Char FCTVCR()
+Value    Char BPRFCT()
+Value    Char PAYCUR
+Value    Integer TYPCUR
+Value    Date DAT
+Value    Char BAN()
+Variable Decimal AMTFCTNREC
+Variable Integer STAT
+Local    Char CURLED(GLONCUR)
+Local Decimal AMT
+
+If !clalev([BAN]): Local File BANK: Endif
+If !clalev([SIH]): Local File SINVOICE: Endif
+If !clalev([GAC]): Local File GACCOUNT: Endif
+If !clalev([DUD]): Local File GACCDUDATE : Endif
+Raz AMTFCTNREC
+
+Read [BAN]BAN0=BAN
+If !fstat
+ Read [GAC]GAC0=[BAN]COA;[BAN]BANACC
+Endif
+
+For [SIH] Where BPRFCT=[L]BPRFCT & FCTVCR=[L]FCTVCR & (NUM=VCRNUM or VCRNUM="")
+Raz AMT
+Filter [DUD] Where TYP=[F:SIH]GTE & NUM=[F:SIH]NUM & FCTVCR=[F:SIH]FCTVCR
+For [DUD]
+ AMT += ([F:DUD]AMTCUR-[F:DUD]PAYCUR-[F:DUD]TMPCUR)*[F:DUD]SNS
+Next
+
+If [F:DUD]CUR<>PAYCUR ## and [F:GAC]CUR<>""
+ Call SETCUR(1,[F:DUD]CPY,[L]CURLED) From CPTDIV
+ Call CONVERT([F:DUD]CUR,PAYCUR,CURLED,TYPCUR,DAT,AMT,AMT, STAT) From TRTDEV
+Endif
+AMTFCTNREC+=AMT
+Next
+End
+
+# SAM 88426   Factoring management
+Subprog AMTBAN(AMTBAN, STAT)
+Variable Decimal AMTBAN
+Variable Integer STAT
+Raz AMTBAN
+AMTBAN= [M:DIA]AMT-([M:DIA]AMTFIN-[M:DIA]AMTVAT)-[M:DIA]AMTVAT-[M:DIA]AMTINR
+End
+
+# SAM 88426   Factoring management
+Subprog AMTBANNR(AMTBANNR,STAT)
+Variable Decimal AMTBANNR
+Variable Integer STAT
+Raz AMTBANNR
+AMTBAN= [M:DIA]AMT-([M:DIA]AMTFIN-[M:DIA]AMTVAT)-[M:DIA]AMTVAT-[M:DIA]AMTINR-[M:DIA]AMTRES
+End
+
+# SAM 88426   Factoring management
+Subprog NUMLINFCT(NUMLINFCT,STAT)
+Variable Integer NUMLINFCT
+Variable Integer STAT
+Local Char CRTI1 (100)
+CRIT1 = "BPRFCT='"+BPRFCT+"' & FCTVCR='"+FCTVCR+"' & CUR='"+CUR+"' & FCTVCRFLG=0"
+For [SIH] Where evalue(CRIT1)
+ NUMLINFCT += 1
+Next
+End
+
+################################################
+## Etiquettes du masque CPTQUIT
+################################################
+Subprog AM_BPRFCT(VALEUR)
+Variable Char    VALEUR()
+Local Char CRIT(100)
+Raz [M]FCTVCR
+CRIT = "BPRFCT='"+VALEUR+"' & FCTVCR<>'' & FCTVCRFLG=0"
+If GUSRFCY<>"\" & GNBAUZ<>GNBSITE
+ CRIT -= "& find(FCY, GUSRFCY(1..GNBAUZ))"
+Endif
+# SAM 88426   Factoring management
+
+If [F:FCT]FCTTYP>1
+ [M]FCTTYP=[F:FCT]FCTTYP: Affzo [M]FCTTYP
+ [M]FCTBAN=[F:FCT]FCTBAN: Affzo [M]FCTBAN
+ [M]BANFCY=[F:FCT]BANFCY: Affzo [M]BANFCY
+ If [M]BANFCY=""
+  Call LEC_CPY([F:FCT]BANCPY) From CPTLEC
+  [M]BANFCY=[F:CPY]MAIFCY
+ Endif
+ [M]BANCPY=[F:FCT]BANCPY: Affzo [M]BANCPY
+ [M]CUR=[F:FCT]BANCUR: Affzo [M]CUR
+ [M]TYPRAT=[F:FCT]TYPRAT: Affzo [M]TYPRAT
+ GSOCIETE=[F:FCT]BANCPY
+ ###
+ ### Sections by default
+ Gosub CAL_SECDEF
+
+Else
+ Raz [M]CUR:
+ Raz [M]TYPRAT
+ [M]FCTTYP=1:
+ Raz [M]AMT, [M]RESAMT, [M]COMAMT, [M]INTAMT, [M]VAT, [M]AMTVAT, [M]DEDAMT,[M]BANCPY, [M]FCTBAN, [M]CCE, [M]DIE
+ # Issue X3-75949
+ #Affzo [M]
+Endif
+
+
+### END SAM 88426
+# On propose par défaut le no de quittance non comptabilisée le plus ancien
+Filter [SIH] Where evalue(CRIT) Order By Key CLE = FCTVCR
+Read [SIH]CLE First
+If !fstat
+ [M]FCTVCR = [F:SIH]FCTVCR
+ GCURFCY = [F:SIH]FCY
+ GSOCIETE= [F:SIH]CPY
+ Call LEC_CPY(GSOCIETE) From CPTLEC
+  GCURLEG = [F:CPY]LEG
+
+# SAM 88426   Factoring management
+If [F:FCT]FCTTYP<>1
+ If [M]CUR<>""
+  Local Char ZONE(6)
+  [M]FCTTYP=[F:FCT]FCTTYP
+  [M]FCTBAN=[F:FCT]FCTBAN
+  Affzo [M]FCTTYP, FCTBAN
+  ZONE="BPRFCT"
+  Gosub CAL_AMOUNT
+ Endif
+Endif
+
+Endif
+Filter [SIH]
+End
+
+# SAM 88426   Factoring management
+Subprog AM_FCTVCR(VALEUR)
+Variable Char    VALEUR()
+If [M]CUR<>""
+ Local Char ZONE(6)
+ ZONE="FCTVCR"
+ Gosub CAL_AMOUNT
+ Affzo [M]AMT
+Endif
+End
+
+Subprog C_FCTVCR(VALEUR)
+Variable Char    VALEUR()
+NB = 0
+CPT = 0
+For [SIH] Where BPRFCT=[M]BPRFCT & FCTVCR=VALEUR
+ NB += 1
+ If (GUSRFCY(1)<>"\" & !find([F:SIH]FCY, GUSRFCY(1..GNBAUZ)))
+   GMESSAGE = [F:SIH]FCY-":"-mess(2,104,1)  : # Vous n'avez pas les droits pour ce site
+   mkstat = 2 : Break
+ Endif
+ If [SIH]FCTVCRFLG=0 : CPT = 1 : Break : Endif
+Next
+If !NB
+ GMESSAGE = mess(79,121,1) : mkstat = 2   # Quittance inexistante
+Else
+ If !CPT
+   GMESSAGE = mess(83,121,1) : mkstat = 2   # Pas de factures à comptabiliser
+ Endif
+Endif
+End
+
+# SAM 88426   Factoring management
+Subprog AM_COMAMT(VALEUR)
+Variable Decimal VALEUR
+Raz [M]VAT: Affzo [M]VAT
+If VALEUR=0:  Raz [M]AMTVAT, DEDAMT: Affzo [M]VAT, AMTVAT, DEDAMT: End: Endif
+
+If !clalev ([F:CPY]): Local File COMPANY   [CPY] : Endif
+If !clalev ([F:CAC]): Local File GACCCODE  [CAC] : Endif
+If !clalev ([F:GAC]): Local File GACCOUNT  [GAC] : Endif
+If !clalev ([F:GCM]): Local File GACM      [GCM] : Endif
+If !clalev ([F:LED]): Local File GLED      [LED] : Endif
+
+  Raz [F:CAC]
+  Call LEC_CPY([M]BANCPY) From CPTLEC
+  Call LEC_GCM([F:CPY]ACM) From CPTLEC
+  Call LEC_LED([F:GCM]LED(0)) From CPTLEC
+  If !fstat
+     Call LEC_CAC(21, [F:FCT]ACCCOD,[F:LED]COA ) From CPTLEC
+  Else
+     End
+  Endif
+
+  If [F:CAC]ACC(7)<>""
+   Call LEC_GAC([F:CAC]ACC(7), [F:LED]COA) From CPTLEC
+   If !fstat and [F:GAC]VAT<>""
+    [M]VAT=[F:GAC]VAT
+    Gosub CAL_SECDEF
+   Endif
+
+   If [M]VAT<>"" and [M]VAT<>GEXETAX
+     Call CAL_TAXAMOUNT(VALEUR,[M]VAT,[M]BANCPY, [M]AMTVAT, [M]DEDAMT)
+   Endif
+  Endif
+Affzo [M]VAT, AMTVAT, DEDAMT
+End
+
+# SAM 88426   Factoring management
+Subprog C_VAT(VALEUR)
+Variable Char    VALEUR()
+If VALEUR<>"" or [M]COMAMT=0 : End: Endif
+
+If !clalev ([F:CPY]): Local File COMPANY   [CPY] : Endif
+If !clalev ([F:CAC]): Local File GACCCODE  [CAC] : Endif
+If !clalev ([F:GAC]): Local File GACCOUNT  [GAC] : Endif
+If !clalev ([F:GCM]): Local File GACM      [GCM] : Endif
+If !clalev ([F:LED]): Local File GLED      [LED] : Endif
+
+Raz [F:CAC]
+Call LEC_CPY([M]BANCPY) From CPTLEC
+Call LEC_GCM([F:CPY]ACM) From CPTLEC
+Call LEC_LED([F:GCM]LED(0)) From CPTLEC
+If !fstat
+ Call LEC_CAC(21, [F:FCT]ACCCOD, [F:LED]COA) From CPTLEC
+Else
+ End
+Endif
+
+If [F:CAC]ACC(7)<>""
+ Call LEC_GAC([F:CAC]ACC(7), [F:LED]COA) From CPTLEC
+ If !fstat and [F:GAC]FLGVAT=2
+  GMESSAGE=mess(331,192,1) : mkstat=2
+ Endif
+Endif
+End
+
+# SAM 88426   Factoring management
+Subprog AM_VAT(VALEUR)
+Variable Char    VALEUR()
+Call LEC_CPY([M]BANCPY) From CPTLEC
+If [M]VAT<>"" and [M]VAT<>GEXETAX
+ Call CAL_TAXAMOUNT([M]COMAMT,VALEUR,[M]BANCPY, [M]AMTVAT, [M]DEDAMT)
+Endif
+Gosub CAL_SECDEF
+Affzo [M]VAT, AMTVAT, DEDAMT
+End
+
+Subprog AS_TYPPCE(VALEUR)
+Variable Char    VALEUR()
+Local Integer STAT
+If VALEUR=""
+ If clalev([F:SIH])=0  : Local File SINVOICE   [SIH]  : Endif
+ If clalev([F:CPY])=0  : Local File COMPANY    [CPY]  : Endif
+ Local Char SOCIETE(GLONCPY)
+ SOCIETE = ""
+ Read [SIH]SIH4 = [M]BPRFCT ; [M]FCTVCR
+ If !fstat
+  SOCIETE = [F:SIH]CPY
+  Call LEC_CPY(SOCIETE) From CPTLEC
+  GCURLEG = [F:CPY]LEG
+ GSOCIETE=SOCIETE
+ If GCURFCY=""
+  I = find(GSOCIETE,GSOCSITE(1..GNBSITE))
+  GCURFCY = GSITE(I)
+  Endif
+ Endif
+ If [M]TYPGEN<>1
+  Call PARAM(SOCIETE,"TYPACC",VALEUR) From ADOVAL
+ Else
+  # Pièce auto FCTQ : Quittance d'affacturage
+  Local Char PCEAUTO(GLONGAU)
+  Call PARAM(SOCIETE,"GAUFCTQ",[L]PCEAUTO) From ADOVAL
+  If [L]PCEAUTO="" : [L]PCEAUTO="FCTQ" : Endif
+  Call LECTURE("GAU",[L]PCEAUTO,"") From CONTOBJ
+  If !clalev([F:TB0]) : Local File =[F:GAU]TBL [TB0] : Endif
+  Gosub OUVRE From ="WMGAU"+[F:GAU]COD
+  Gosub LIENS From ="WMGAU"+[F:GAU]COD
+  Call EVAL_CHAR(VALEUR,"GTE",1,0,"",STAT) From CPTAUTO
+ Endif
+Endif
+End
+
+Subprog C_TYPPCE(VALEUR)
+Variable Char    VALEUR()
+Call CONTEXE([F:GTE]ACS) From CPTSUB
+If mkstat : End : Endif
+If [M]TYPGEN=1 & [F:GTE]VCRREA<>2
+ # Type de pièce interdit en réel
+ GMESSAGE = mess(33,107,1) : mkstat = 2 : End
+Elsif [M]TYPGEN>=2 & [F:GTE]VCRSIM<>2
+ # Type de pièce interdit en simulation
+ GMESSAGE = mess(32,107,1) : mkstat = 2 : End
+Endif
+End
+
+Subprog AS_JOU(VALEUR)
+Variable Char    VALEUR()
+Local Integer STAT
+If VALEUR=""
+ If [M]TYPGEN=1
+  Local Char PCEAUTO(GLONGAU)
+  Call PARAM(GSOCIETE,"GAUFCTQ",[L]PCEAUTO) From ADOVAL
+  If [L]PCEAUTO="" : [L]PCEAUTO="FCTQ" : Endif
+  Call LECTURE("GAU",[L]PCEAUTO,"") From CONTOBJ
+  Call EVAL_CHAR(VALEUR,"JOU",1,0,"",STAT) From CPTAUTO
+ Endif
+ If VALEUR=""
+  VALEUR = [F:GTE]DEFJOU
+ Endif
+Endif
+End
+
+Subprog C_JOU(VALEUR)
+Variable Char    VALEUR()
+Call CONTEXE([F:JOU]ACS) From CPTSUB
+If mkstat : GMESSAGE = VALEUR-GMESSAGE : Return : Endif
+If [F:GTE]AUZJOU([F:JOU]TYP-1)<>2
+ GMESSAGE = [F:JOU]JOU-mess(8,106,1) : # Journal non autorisé sur ce type de pièce
+ mkstat = 2 : End
+Endif
+Call VERSOC([F:JOU]FCY,GSOCIETE,GCURFCY,VALEUR) From CFYSUB
+End
+
+Subprog AM_TYPGEN(VALEUR)
+Variable Integer VALEUR
+[M]TYPPCE = ""
+[M]JOU = ""
+If !GIMPORT : Affzo [M]TYPPCE, JOU : Endif
+End
+
+Subprog AS_SIMSTA(VALEUR)
+Variable Integer VALEUR
+Local Char SOCIETE(GLONCPY)
+If [M]TYPGEN<>1 : mkstat=2 : End : Endif
+For [SIH] Where BPRFCT=[M]BPRFCT & FCTVCR=[M]FCTVCR
+ SOCIETE = [F:SIH]CPY : Break
+Next
+If [L]SOCIETE<>""
+ If func AFNC.PARAM("FRADGI",[L]SOCIETE)="2" : # Paramètre à Oui
+  VALEUR = 2 : mkstat = 2 : End
+ Endif
+Endif
+End
+
+######################################################################################
+## # SAM 88426   Factoring management
+######################################################################################
+Subprog C_RESAMT(VALEUR)
+Variable Decimal VALEUR
+If abs(VALEUR) > abs([M]AMT) | ([M]AMT<0 & VALEUR>0)
+  GMESSAGE = mess(207,121,1) : # 'Amount greater than the total of the receipt'
+  mkstat = 2
+Endif
+End
+
+Subprog C_COMAMT(VALEUR)
+Variable Decimal VALEUR
+If VALEUR > abs([M]AMT)
+  GMESSAGE = mess(207,121,1) : # 'Amount greater than the total of the receipt'
+  mkstat = 2
+Endif
+End
+
+Subprog C_INTAMT(VALEUR)
+Variable Decimal VALEUR
+If VALEUR > abs([M]AMT)
+  GMESSAGE = mess(207,121,1) : # 'Amount greater than the total of the receipt'
+  mkstat = 2
+Endif
+End
+
+Subprog C_AMTVAT(VALEUR)
+Variable Decimal VALEUR
+If VALEUR > abs([M]COMAMT)
+  GMESSAGE =mess(207,121,1) : # 'Amount greater than the total of the receipt'
+  mkstat = 2
+Endif
+End
+
+Subprog AM_AMTVAT(VALEUR)
+Variable Decimal VALEUR
+If !clalev ([F:TRA]) : Local File TABRATVAT [TRA] : Endif
+If [M]VAT<>"" and [M]VAT<>GEXETAX
+
+  Call LEC_CPY([M]BANCPY) From CPTLEC
+
+ Filter [TRA] Where CPY=BANCPY & VAT=[M]VAT & STRDAT<=datesyst & LEG=[F:CPY]LEG
+ Read [TRA]TRA0 Last
+ If fstat
+  Filter [TRA] Where CPY="" & VAT=[M]VAT & STRDAT<=datesyst & LEG =[F:CPY]LEG
+  Read [TRA]TRA0 Last
+  If fstat
+    Filter [TRA] Where CPY=BANCPY & VAT=[M]VAT & STRDAT<=datesyst & LEG = ""
+    Read [TRA]TRA0 Last
+    If fstat
+       Filter [TRA] Where CPY="" & VAT=[M]VAT & STRDAT<=datesyst & LEG = ""
+       Read [TRA]TRA0 Last
+    Endif
+  Endif
+ Endif
+
+ [M]DEDAMT=ar2(VALEUR*[F:TRA]DEDRAT/100)
+Else
+ Raz [M]DEDAMT
+Endif
+Affzo [M]DEDAMT
+End
+
+Funprog FCTCUR(FCTTYP, FCTBAN, SIHCUR)
+Value Integer FCTTYP
+Value Char FCTBAN
+Value Char SIHCUR
+Local Char CUR(GLONCUR)
+
+CUR= SIHCUR
+If FCTTYP=1: End CUR: Endif
+
+If !clalev([BAN]): Local File BANK: Endif
+If !clalev([GAC]): Local File GACCOUNT: Endif
+
+Read [BAN]BAN0=FCTBAN
+If !fstat
+ Read [GAC]GAC0=[BAN]COA;[BAN]BANACC
+ If !fstat and [GAC]CUR<>""
+  CUR=[F:GAC]CUR
+ Endif
+Endif
+End CUR
+
+
+Subprog AM_ACCDAT(VALEUR)
+Variable Date    VALEUR
+If [M]FCTTYP>1
+  Local Char ZONE(6): ZONE="ACCDAT"
+  [M]ACCDAT=VALEUR
+  Gosub CAL_AMOUNT
+Endif
+End
+
+
+#####################################################################################
+######################################################################################
+## Section automatically added (screen CPTQUIT) 07/10/2015 12:46:05 (LUCUE)
+######################################################################################
+Subprog AS_VAT(VALEUR)
+Variable Char    VALEUR()
+
+If !clalev ([F:CPY]): Local File COMPANY   [CPY] : Endif
+If !clalev ([F:CAC]): Local File GACCCODE  [CAC] : Endif
+If !clalev ([F:GAC]): Local File GACCOUNT  [GAC] : Endif
+If !clalev ([F:GCM]): Local File GACM      [GCM] : Endif
+If !clalev ([F:LED]): Local File GLED      [LED] : Endif
+
+  Raz [F:CAC]
+  Call LEC_CPY([M]BANCPY) From CPTLEC
+  Call LEC_GCM([F:CPY]ACM) From CPTLEC
+  Call LEC_LED([F:GCM]LED(0)) From CPTLEC
+  If !fstat
+     Call LEC_CAC(21, [F:FCT]ACCCOD,[F:LED]COA ) From CPTLEC
+  Else
+     End
+  Endif
+
+  If [F:CAC]ACC(7)<>""
+   Call LEC_GAC([F:CAC]ACC(7), [F:LED]COA) From CPTLEC
+   If !fstat and [F:GAC]FLGVAT<2
+     Raz [M]VAT: Affzo [M]VAT
+     mkstat=2
+   Endif
+  Endif
+End
+

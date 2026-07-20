@@ -1,0 +1,185 @@
+#<AdxTL>@(#)6.0.0.0 $Revision$
+#############################################################################
+# UTIVEN08 : Utilitaire de resynchro des qtés allouées      Module Vente    #
+#            et des allocations (Bug 48662)                                 #
+# ------------------------------------------------------------------------- #
+# Problème à résoudre :                                                     #
+#   Les qtés rupture (SHTQTY et SHTQTYSTU) de SORDERQ et (SHTQTY) de ORDERS #
+#       restent alimentées à tord après modification des allocations depuis #
+#       la gestion des commandes (modif de la date d'expédition à reporter  #
+#       dans BESDAT de STOALL)                                              #
+#   Bug 36681 : Modification de l'utilitaire                                #
+#        - Traiter également les Qtés allouées :                            #
+#          Raz ALLQTY et ALLQTYSTU ds SORDERQ et ALLQTY ds ORDERS           #
+#          s'il n'y a pas d'allocations dans STOALL                         #
+#        - Ajout d'un flag simulation                                       #
+#############################################################################
+
+Call MAJ_UTIVEN08
+End
+
+##################################
+Subprog MAJ_UTIVEN08
+Local Char DOSSIER(30) : DOSSIER=nomap
+#Call SAIDOS(DOSSIER,"") From SAIDOS
+If DOSSIER<>""
+   Call EXE_UTIVEN08(DOSSIER)
+Endif
+End
+
+##################################
+Subprog EXE_UTIVEN08(DOSSIER)
+Value Char DOSSIER
+
+Local Integer WSIMFLG : WSIMFLG=2
+Call OUINON(mess(6,115,1),WSIMFLG) From GESECRAN
+
+Local Integer I, LRET, WSOQ
+Local Decimal WQTY, WALL, WSHT, WDIF
+Local Decimal WDIMA, WDIMS
+
+Call TEMPON("O") From GESECRAN
+Call OUVRE_TRACE("UTIVEN08 : Liste des commandes mises à jour") From LECFIC
+Call ECR_TRACE("UTIVEN08 : Début traitement du dossier "+DOSSIER,0) From GESECRAN
+
+#----- Ouverture des fichiers -----#
+If clalev([F:SOQ])=0  Local File =DOSSIER+".SORDERQ"    [SOQ]  Endif
+If clalev([F:SOP])=0  Local File =DOSSIER+".SORDERP"    [SOP]  Endif
+If clalev([F:SOC])=0  Local File =DOSSIER+".SORDERC"    [SOC]  Endif
+If clalev([F:STA])=0  Local File =DOSSIER+".STOALL"     [STA]  Endif
+If clalev([F:STO])=0  Local File =DOSSIER+".STOCK"      [STO]  Endif
+If clalev([F:ITV])=0  Local File =DOSSIER+".ITMMVT"     [ITV]  Endif
+If clalev([F:SWW])=0  Local File =DOSSIER+".STOWIPW"    [SWW]  Endif
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE("Resynchronisation des qtés allouées et ruptures avec les allocations",0) From GESECRAN
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Call ECR_TRACE(" ",0) From GESECRAN
+
+Raz I, LRET
+
+# ----------------------------------------------------------------------------------- #
+# Traitement des lignes de commandes ayant une qté rupture n'existant pas dans STOALL #
+# ----------------------------------------------------------------------------------- #
+
+If WSIMFLG<>2
+   Call DEBTRANS From GLOCK
+   Trbegin [SOQ]
+Endif
+# --> Lecture des lignes de commandes soldées
+For [SOQ]SOQ3 Where SOQSTA=3 & SHIDAT>[01/01/2008]
+   I=0
+   # --> Suppression des allocations restant à tord
+   For [STA]STA1 Where VCRTYP=2 & VCRNUM=[F:SOQ]SOHNUM & VCRLIN=[F:SOQ]SOPLIN & VCRSEQ=[F:SOQ]SOQSEQ
+      I+=1
+      If I=1
+         Call ECR_TRACE("*** Ligne commande soldée:"-[F:SOQ]SOHNUM-num$([F:SOQ]SOPLIN)-num$([F:SOQ]SOQSEQ),0) From GESECRAN
+         Call ECR_TRACE("Suppression des allocations restantes",0) From GESECRAN
+      Endif
+      If WSIMFLG<>2 Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,LRET) From STKALL Endif
+   Next
+Next
+# --> Lecture des lignes de commandes non soldées
+For [SOQ]SOQ3 Where SOQSTA<>3 & SHIDAT>[01/01/2008] & STOMGTCOD=2
+   If [F:SOQ]SOHCAT=4
+      Read [SOC]SOC0 = [F:SOQ]SOHNUM; [F:SOQ]SOPLIN
+      [F:SOP]=[F:SOC]
+   Else
+      Read [SOP]SOP0 = [F:SOQ]SOHNUM; [F:SOQ]SOPLIN; [F:SOQ]SOQSEQ
+   Endif
+   I=0
+   WSOQ=0
+   # 107888 : Scheduled invoices : (LD:20/05/16)
+   #If [F:SOQ]SOHCAT=3
+   If [F:SOQ]SOHCAT=3 | ([F:SOQ]SOHCAT=1 & [F:SOQ]DLVFLG=1)
+   # --> Commande à facturation directe
+   # --> Commande normale et article non livrable
+   # 107888 : Scheduled invoices : (LD:20/05/16)
+      WQTY=[F:SOQ]QTYSTU-[F:SOQ]INVQTYSTU
+   Else
+   # --> Commande normale et article livrable      : # 107888 : Scheduled invoices : (LD:20/05/16)
+      WQTY=[F:SOQ]QTYSTU-[F:SOQ]ODLQTYSTU-[F:SOQ]DLVQTYSTU
+   Endif
+   Raz WALL, WSHT
+   If WQTY>0
+      For [STA]STA1 Where VCRTYP=2 & VCRNUM=[F:SOQ]SOHNUM & VCRLIN=[F:SOQ]SOPLIN & VCRSEQ=[F:SOQ]SOQSEQ
+         Case [F:STA]ALLTYP
+          When 1,2 : WALL += [F:STA]QTYSTUACT
+          When 4,5 : WSHT += [F:STA]QTYSTUACT
+         Endcase
+      Next
+      # Les quantités sont égales --> OK
+      If WALL=[F:SOQ]ALLQTYSTU & WSHT=[F:SOQ]SHTQTYSTU
+         Goto NEXT_SOQ
+      Endif
+
+      Call ECR_TRACE("*** Ligne commande :"-[F:SOQ]SOHNUM-num$([F:SOQ]SOPLIN)-num$([F:SOQ]SOQSEQ),0) From GESECRAN
+      # Les ruptures sont > à la qté rupture de la cde
+      If WSHT>[F:SOQ]SHTQTYSTU
+         # Etles alloc+ruptures sont <= reste à traiter --> modification de la qté rupture de la cde
+         If WSHT+WALL<=WQTY
+            Call ECR_TRACE("Augmentation de la qté rupture de la commande :"-num$([F:SOQ]SHTQTYSTU)-"-->"-num$(WSHT),0) From GESECRAN
+            [F:SOQ]SHTQTYSTU=WSHT
+            [F:SOQ]SHTQTY   =WSHT*(1/[F:SOP]SAUSTUCOE)
+            Call QTEARR([F:SOQ]SHTQTY,[F:SOP]SAU) From TRTDIV
+            WSOQ=1
+         # Et les alloc+ruptures sont > reste à traiter --> diminution des ruptures
+         Else
+            Call ECR_TRACE("Diminution des ruptures (table STOALL) :"-num$(WSHT)-"-->"-num$([F:SOQ]SHTQTYSTU),0) From GESECRAN
+            If WSIMFLG<>2
+               Call DIMALL(2,[F:SOQ]SOHNUM,[F:SOQ]SOPLIN,[F:SOQ]SOQSEQ,[F:SOQ]ITMREF,
+&                          2,WSHT-[F:SOQ]SHTQTYSTU,WDIMA,WDIMS,LRET) From STKALL
+            Endif
+            WSHT=[F:SOQ]SHTQTYSTU
+         Endif
+      # La qté rupture de la cde est > aux ruptures
+      Elsif [F:SOQ]SHTQTYSTU>WSHT
+         Call ECR_TRACE("Diminution de la qté rupture de la commande :"-num$([F:SOQ]SHTQTYSTU)-"-->"-num$(WSHT),0) From GESECRAN
+         [F:SOQ]SHTQTYSTU=WSHT
+         [F:SOQ]SHTQTY   =WSHT*(1/[F:SOP]SAUSTUCOE)
+         Call QTEARR([F:SOQ]SHTQTY,[F:SOP]SAU) From TRTDIV
+         WSOQ=1
+      Endif
+
+      # Les allocations sont > à la qté allouée de la cde
+      If WALL>[F:SOQ]ALLQTYSTU
+         # Etles alloc+ruptures sont <= reste à traiter --> modification de la qté allouée de la cde
+         If WALL+WSHT<=WQTY
+            Call ECR_TRACE("Augmentation de la qté allouée de la commande :"-num$([F:SOQ]ALLQTYSTU)-"-->"-num$(WALL),0) From GESECRAN
+            [F:SOQ]ALLQTYSTU=WALL
+            [F:SOQ]ALLQTY   =WALL*(1/[F:SOP]SAUSTUCOE)
+            Call QTEARR([F:SOQ]ALLQTY,[F:SOP]SAU) From TRTDIV
+            WSOQ=1
+         # Et les alloc+ruptures sont > reste à traiter --> diminution des allocations
+         Else
+            Call ECR_TRACE("Diminution des allocations (table STOALL) :"-num$(WALL)-"-->"-num$([F:SOQ]ALLQTYSTU),0) From GESECRAN
+            If WSIMFLG<>2
+               Call DIMALL(2,[F:SOQ]SOHNUM,[F:SOQ]SOPLIN,[F:SOQ]SOQSEQ,[F:SOQ]ITMREF,
+&                          1,WALL-[F:SOQ]ALLQTYSTU,WDIMA,WDIMS,LRET) From STKALL
+            Endif
+            WALL=[F:SOQ]ALLQTYSTU
+         Endif
+      # La qté allouée de la cde est > aux allocations
+      Elsif [F:SOQ]ALLQTYSTU>WALL
+         Call ECR_TRACE("Diminution de la qté allouée de la commande :"-num$([F:SOQ]ALLQTYSTU)-"-->"-num$(WALL),0) From GESECRAN
+         [F:SOQ]ALLQTYSTU=WALL
+         [F:SOQ]ALLQTY   =WALL*(1/[F:SOP]SAUSTUCOE)
+         Call QTEARR([F:SOQ]ALLQTY,[F:SOP]SAU) From TRTDIV
+         WSOQ=1
+      Endif
+   Endif
+   # Il faut réécrire SORDERQ
+   If WSOQ=1
+      If WSIMFLG<>2 Rewrite [SOQ] Endif
+   Endif
+   $NEXT_SOQ
+Next
+If WSIMFLG<>2 Commit Endif
+
+Call TEMPOFF     From GESECRAN
+Call FERME_TRACE From LECFIC
+Call LEC_TRACE   From LECFIC
+
+End
+

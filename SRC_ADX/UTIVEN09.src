@@ -1,0 +1,755 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$
+#####################################################################################
+# UTIVEN09 :                                                Module Vente            #
+#            Utilitaire de vérification des champs contact dans les tables          #
+#            vente suite à une migration V130/V140.                                 #
+#            Si le code contact est bien un contact du client, rien n'est fait      #
+#            Si le code contact n'est pas un contact du client, il est remplacé par #
+#            le contact par défaut du client                                        #
+# --------------------------------------------------------------------------------- #
+# Problème à résoudre :  Bug 58190                                                  # 
+#   Suite à modification de la structure de la table CONTACT, la moulinette de      #
+#   migration V130/V140 alimente mal les champs contact dans les différentes tables #
+#   migrées.                                                                        #
+#   Lors du remplacement du nom du contact par le code du contact, la table des     #
+#   contacts n'est pas lue systémantiquement.                                       #
+#   De ce fait, on peut remplacer le nom du contact par le code du contact du       #
+#   document précédemment traité et ce code peut ne pas être un contact du client   #                                       
+#   L'utilitaire a pour but :                                                       #
+#     - De relire tous les documents. Pour chaque document :                        # 
+#     - De vérifier que le contact existe bien pour le client                       #
+#     - Si ce n'est pas le cas, de le remplacer par le contact par défaut du client #
+#   NB : Cet utilitaire est à lancer uniquement si besoin                           #
+#####################################################################################
+
+Call MAJ_UTIVEN09
+End
+
+##################################
+Subprog MAJ_UTIVEN09
+Local Char DOSSIER(30) : DOSSIER=nomap
+Call SAIDOS(DOSSIER,"") From SAIDOS
+If DOSSIER<>""
+   Call EXE_UTIVEN09(DOSSIER)
+Endif
+End
+
+##################################
+Subprog EXE_UTIVEN09(DOSSIER)
+Value Char DOSSIER
+
+Local Integer WSIMFLG : WSIMFLG=2
+Call OUINON(mess(6,115,1),WSIMFLG) From GESECRAN
+
+Call TEMPON("O") From GESECRAN
+Call OUVRE_TRACE("UTIVEN09 : Utilitaire de vérification des contacts") From LECFIC  
+Call ECR_TRACE("UTIVEN09 : Début traitement du dossier "+DOSSIER,0) From GESECRAN
+
+#----- Ouverture des fichiers -----#
+If clalev([F:SOH])=0  Local File =DOSSIER+".SORDER"     [SOH]  Endif
+If clalev([F:VOH])=0  Local File =DOSSIER+".VSORDER"    [VOH]  Endif
+If clalev([F:SOP])=0  Local File =DOSSIER+".SORDERP"    [SOP]  Endif
+If clalev([F:VOP])=0  Local File =DOSSIER+".VSORDERP"   [VOP]  Endif
+If clalev([F:SQH])=0  Local File =DOSSIER+".SQUOTE"     [SQH]  Endif
+If clalev([F:SQD])=0  Local File =DOSSIER+".SQUOTED"    [SQD]  Endif
+If clalev([F:SDH])=0  Local File =DOSSIER+".SDELIVERY"  [SDH]  Endif
+If clalev([F:SIV])=0  Local File =DOSSIER+".SINVOICEV"  [SIV]  Endif
+If clalev([F:CNT])=0  Local File =DOSSIER+".CONTACT"    [CNT]  Endif
+If clalev([F:BPR])=0  Local File =DOSSIER+".BPARTNER"   [BPR]  Endif
+#----- Chargement globale GMAXUPDTRS -----#
+If dim([V]GMAXUPDTRS)<1  Global Integer GMAXUPDTRS : Endif
+Local File =DOSSIER+".ADOVAL" [ADW] 
+Read [ADW] ADW0="";"";"MAXUPDTRS" : If fstat  Raz [F:ADW] : Endif
+If val([F:ADW]VALEUR)>0
+  GMAXUPDTRS=val([F:ADW]VALEUR)
+Else
+  GMAXUPDTRS=1000
+Endif
+Close Local File [ADW]
+
+Local Char    WBPR(GLONBPR), WCNTNAM(GLONNAM)
+Local Integer COMPTEUR, STOP, WNBRCOR, WNBR 
+Local Char    CLE1 (20)
+Local Integer CLE2, CLE3, WMAJ
+Local Char    CRITERE (150)
+
+#----- Début du traitement -----#
+Gosub TRT_SOH : # Traitement des commandes    
+Gosub TRT_VOH : # Traitement des historiques commandes
+Gosub TRT_SOP : # Traitement des détails commandes    
+Gosub TRT_VOP : # Traitement des historiques détails commandes    
+Gosub TRT_SQH : # Traitement des devis
+Gosub TRT_SQD : # Traitement des détails devis
+Gosub TRT_SDH : # Traitement des livraisons
+Gosub TRT_SIV : # Traitement des factures
+
+#----- Fin du traitement -----#
+ 
+$FIN_UTIVEN09
+Call TEMPOFF     From GESECRAN
+Call FERME_TRACE From LECFIC
+Call LEC_TRACE   From LECFIC
+
+End
+
+
+#--------------------------#
+# Traitement des commandes #
+#--------------------------#
+$TRT_SOH
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+Call ECR_TIME("UTIVEN09 : Sales Order Process : Update SORDER") From DOSSUB
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Raz WNBRCOR
+Raz CLE1
+Raz CLE2, WMAJ
+WNBR=rowcount([SOH])
+
+Trbegin [SOH]
+$BOUCLE_AV_SOH
+Raz COMPTEUR
+Raz STOP
+
+For [SOH]SOH0 Where SOHNUM>CLE1 & (sum(CNTNAM,CNDNAM,CNINAM)<>"")
+    WMAJ=0
+    If [F:SOH]CNTNAM<>"" 
+        # Vérification que le contact existe bien pour ce client
+        If [F:CNT]BPANUM<>[F:SOH]BPCORD | [F:CNT]CCNCRM<>[F:SOH]CNTNAM 
+            Read [F:CNT]CNT0 = 1;[F:SOH]BPCORD;vireblc([F:SOH]CNTNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SOH]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SOH]SOHNUM+":"+[F:SOH]BPCORD-[F:SOH]CNTNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SOH]CNTNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If [F:SOH]CNDNAM<>"" 
+        If [F:CNT]BPANUM<>[F:SOH]BPCORD | [F:CNT]CCNCRM<>[F:SOH]CNDNAM
+            Read [F:CNT]CNT0 = 1;[F:SOH]BPCORD;vireblc([F:SOH]CNDNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SOH]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SOH]SOHNUM+":"+[F:SOH]BPCORD-[F:SOH]CNDNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SOH]CNDNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If [F:SOH]CNINAM<>"" 
+        If [F:CNT]BPANUM<>[F:SOH]BPCINV | [F:CNT]CCNCRM<>[F:SOH]CNINAM
+            Read [F:CNT]CNT0 = 1;[F:SOH]BPCINV;vireblc([F:SOH]CNINAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SOH]BPCINV : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SOH]SOHNUM+":"+[F:SOH]BPCINV-[F:SOH]CNINAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SOH]CNINAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If WMAJ=1 
+        WNBRCOR+=1
+        If WSIMFLG=1
+            Rewrite [SOH]
+            If fstat
+                Call ECR_TRACE("File SORDER, Error ="-num$(fstat),1) From GESECRAN
+            Else
+                Call ECR_TRACE([F:SOH]SOHNUM+":"+[F:SOH]BPCORD,0) From GESECRAN
+                COMPTEUR+=1
+            Endif
+        Endif
+    Endif
+
+    If COMPTEUR>GMAXUPDTRS
+        Commit
+        Trbegin [SOH]
+        CLE1=[F:SOH]SOHNUM : STOP=1 : Break 
+    Endif
+Next
+If STOP Goto BOUCLE_AV_SOH : Endif
+Commit
+Call ECR_TIME("UTIVEN09 : Sales Order Process : Ended ("+num$(WNBRCOR)-"/"-num$(WNBR)+")") From DOSSUB
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Return
+
+
+#--------------------------------------#
+# Traitement des historiques commandes #
+#--------------------------------------#
+$TRT_VOH
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+Call ECR_TIME("UTIVEN09 : Sales Order Process : Update VSORDER") From DOSSUB
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Raz STOP
+Raz WNBRCOR
+Raz CLE1
+Raz CLE2, WMAJ
+WNBR=rowcount([VOH])
+
+Trbegin [VOH]
+$BOUCLE_AV_VOH
+If  STOP=1
+  CRITERE = 'SOHNUM="'+CLE1+'" & REVNUM>'+num$(CLE2)
+  STOP = 2
+Elsif STOP=2
+  CRITERE = 'SOHNUM>"'+CLE1+'"'
+  STOP = 0
+Else
+  CRITERE = "1=1" 
+Endif
+Raz COMPTEUR
+Raz STOP
+
+For [VOH]VOH0 Where evalue(CRITERE) & (sum(CNTNAM,CNDNAM,CNINAM)<>"")
+    WMAJ=0
+    If [F:VOH]CNTNAM<>"" 
+        # Vérification que le contact existe bien pour ce client
+        If [F:CNT]BPANUM<>[F:VOH]BPCORD | [F:CNT]CCNCRM<>[F:VOH]CNTNAM 
+            Read [F:CNT]CNT0 = 1;[F:VOH]BPCORD;vireblc([F:VOH]CNTNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:VOH]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:VOH]SOHNUM-num$([F:VOH]REVNUM)+":"+[F:VOH]BPCORD-[F:VOH]CNTNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:VOH]CNTNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If [F:VOH]CNDNAM<>"" 
+        If [F:CNT]BPANUM<>[F:VOH]BPCORD | [F:CNT]CCNCRM<>[F:VOH]CNDNAM
+            Read [F:CNT]CNT0 = 1;[F:VOH]BPCORD;vireblc([F:VOH]CNDNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:VOH]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:VOH]SOHNUM-num$([F:VOH]REVNUM)+":"+[F:VOH]BPCORD-[F:VOH]CNDNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:VOH]CNDNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If [F:VOH]CNINAM<>"" 
+        If [F:CNT]BPANUM<>[F:VOH]BPCINV | [F:CNT]CCNCRM<>[F:VOH]CNINAM
+            Read [F:CNT]CNT0 = 1;[F:VOH]BPCINV;vireblc([F:VOH]CNINAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:VOH]BPCINV : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:VOH]SOHNUM-num$([F:VOH]REVNUM)+":"+[F:VOH]BPCINV-[F:VOH]CNINAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:VOH]CNINAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If WMAJ=1 
+        WNBRCOR+=1
+        If WSIMFLG=1
+            Rewrite [VOH]
+            If fstat
+                Call ECR_TRACE("File VSORDER, Error ="-num$(fstat),1) From GESECRAN
+            Else
+                Call ECR_TRACE([F:VOH]SOHNUM+":"+[F:VOH]BPCORD,0) From GESECRAN
+                COMPTEUR+=1
+            Endif
+        Endif
+    Endif
+
+    If COMPTEUR>GMAXUPDTRS
+        Commit
+        Trbegin [VOH]
+        CLE1=[F:VOH]SOHNUM : CLE2=[F:VOH]REVNUM : STOP=1 : Break 
+    Endif
+Next
+If STOP Goto BOUCLE_AV_VOH : Endif
+Commit
+Call ECR_TIME("UTIVEN09 : Sales Order Process : Ended ("+num$(WNBRCOR)-"/"-num$(WNBR)+")") From DOSSUB
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Return
+
+#----------------------------------#
+# Traitement des détails commandes #
+#----------------------------------#
+$TRT_SOP
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+Call ECR_TIME("UTIVEN09 : Sales Order Process : Update SORDERP") From DOSSUB
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Raz STOP
+Raz WNBRCOR
+Raz CLE1
+Raz CLE2, CLE3, WMAJ
+WNBR=rowcount([SOP])
+
+Trbegin [SOP]
+$BOUCLE_AV_SOP
+If STOP=1
+  CRITERE='SOHNUM="'+CLE1+'"'+' & SOPLIN='+num$(CLE2)+' & SOPSEQ>'+num$(CLE3)
+  STOP=2
+Elsif STOP=2
+  CRITERE='SOHNUM="'+CLE1+'"'+' & SOPLIN>'+num$(CLE2)
+  STOP=3
+Elsif STOP=3
+  CRITERE='SOHNUM>"'+CLE1+'"'
+  STOP=0
+Else
+  CRITERE="1=1"
+Endif
+
+Raz COMPTEUR
+Raz STOP
+
+For [SOP]SOP0 Where evalue(CRITERE) & CNDNAM<>""
+    WMAJ=0
+    If [F:SOP]CNDNAM<>"" 
+        If [F:CNT]BPANUM<>[F:SOP]BPCORD | [F:CNT]CCNCRM<>[F:SOP]CNDNAM
+            Read [F:CNT]CNT0 = 1;[F:SOP]BPCORD;vireblc([F:SOP]CNDNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SOP]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SOP]SOHNUM-num$([F:SOP]SOPLIN)+":"+[F:SOP]BPCORD-[F:SOP]CNDNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SOP]CNDNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If WMAJ=1 
+        WNBRCOR+=1
+        If WSIMFLG=1
+            Rewrite [SOP]
+            If fstat
+                Call ECR_TRACE("File SORDERP, Error ="-num$(fstat),1) From GESECRAN
+            Else
+                Call ECR_TRACE([F:SOP]SOHNUM-num$([F:SOP]SOPLIN)+":"+[F:SOP]BPCORD,0) From GESECRAN
+                COMPTEUR+=1
+            Endif
+        Endif
+    Endif
+
+    If COMPTEUR>GMAXUPDTRS
+        Commit
+        Trbegin [SOP]
+        CLE1=[F:SOP]SOHNUM : CLE2=[F:SOP]SOPLIN : CLE3=[F:SOP]SOPSEQ : STOP=1 : Break 
+    Endif
+Next
+If STOP Goto BOUCLE_AV_SOP : Endif
+Commit
+Call ECR_TIME("UTIVEN09 : Sales Order Process : Ended ("+num$(WNBRCOR)-"/"-num$(WNBR)+")") From DOSSUB
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Return
+
+#----------------------------------#
+# Traitement des détails commandes #
+#----------------------------------#
+$TRT_VOP
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+Call ECR_TIME("UTIVEN09 : Sales Order Process : Update VSORDERP") From DOSSUB
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Raz STOP
+Raz WNBRCOR
+Raz CLE1
+Raz CLE2, CLE3, WMAJ
+WNBR=rowcount([VOP])
+
+Trbegin [VOP]
+$BOUCLE_AV_VOP
+If STOP=1
+  CRITERE='SOHNUM="'+CLE1+'"'+' & SOPLIN='+num$(CLE2)+' & SOPSEQ>'+num$(CLE3)
+  STOP=2
+Elsif STOP=2
+  CRITERE='SOHNUM="'+CLE1+'"'+' & SOPLIN>'+num$(CLE2)
+  STOP=3
+Elsif STOP=3
+  CRITERE='SOHNUM>"'+CLE1+'"'
+  STOP=0
+Else
+  CRITERE="1=1"
+Endif
+Raz COMPTEUR
+Raz STOP
+
+For [VOP]VOP0 Where evalue(CRITERE) & CNDNAM<>""
+    WMAJ=0
+    If [F:VOP]CNDNAM<>"" 
+        If [F:CNT]BPANUM<>[F:VOP]BPCORD | [F:CNT]CCNCRM<>[F:VOP]CNDNAM
+            Read [F:CNT]CNT0 = 1;[F:VOP]BPCORD;vireblc([F:VOP]CNDNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:VOP]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:VOP]SOHNUM-num$([F:VOP]LINREVNUM)-num$([F:VOP]SOPLIN)+":"+[F:VOP]BPCORD-[F:VOP]CNDNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:VOP]CNDNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If WMAJ=1 
+        WNBRCOR+=1
+        If WSIMFLG=1
+            Rewrite [VOP]
+            If fstat
+                Call ECR_TRACE("File SORDERP, Error ="-num$(fstat),1) From GESECRAN
+            Else
+                Call ECR_TRACE([F:VOP]SOHNUM-num$([F:VOP]LINREVNUM)-num$([F:VOP]SOPLIN)+":"+[F:VOP]BPCORD,0) From GESECRAN
+                COMPTEUR+=1
+            Endif
+        Endif
+    Endif
+
+    If COMPTEUR>GMAXUPDTRS
+        Commit
+        Trbegin [VOP]
+        CLE1=[F:VOP]SOHNUM : CLE2=[F:VOP]SOPLIN : CLE3=[F:VOP]SOPSEQ : STOP=1 : Break 
+    Endif
+Next
+If STOP Goto BOUCLE_AV_VOP : Endif
+Commit
+Call ECR_TIME("UTIVEN09 : Sales Order Process : Ended ("+num$(WNBRCOR)-"/"-num$(WNBR)+")") From DOSSUB
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Return
+
+#--------------------------#
+# Traitement des devis     #
+#--------------------------#
+$TRT_SQH
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+Call ECR_TIME("UTIVEN09 : Sales Quote Process : Update SQUOTE") From DOSSUB
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Raz WNBRCOR
+Raz CLE1
+Raz CLE2, WMAJ
+WNBR=rowcount([SQH])
+
+Trbegin [SQH]
+$BOUCLE_AV_SQH
+Raz COMPTEUR
+Raz STOP
+
+For [SQH]SQH0 Where SQHNUM>CLE1 & (sum(CNCNAM,CNDNAM)<>"")
+    WMAJ=0
+    If [F:SQH]CNCNAM<>"" 
+        # Vérification que le contact existe bien pour ce client
+        If [F:CNT]BPANUM<>[F:SQH]BPCORD | [F:CNT]CCNCRM<>[F:SQH]CNCNAM 
+            Read [F:CNT]CNT0 = 1;[F:SQH]BPCORD;vireblc([F:SQH]CNCNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SQH]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SQH]SQHNUM+":"+[F:SQH]BPCORD-[F:SQH]CNCNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SQH]CNCNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If [F:SQH]CNDNAM<>"" 
+        If [F:CNT]BPANUM<>[F:SQH]BPCORD | [F:CNT]CCNCRM<>[F:SQH]CNDNAM
+            Read [F:CNT]CNT0 = 1;[F:SQH]BPCORD;vireblc([F:SQH]CNDNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SQH]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SQH]SQHNUM+":"+[F:SQH]BPCORD-[F:SQH]CNDNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SQH]CNDNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If WMAJ=1 
+        WNBRCOR+=1
+        If WSIMFLG=1
+            Rewrite [SQH]
+            If fstat
+                Call ECR_TRACE("File SQUOTE, Error ="-num$(fstat),1) From GESECRAN
+            Else
+                Call ECR_TRACE([F:SQH]SQHNUM+":"+[F:SQH]BPCORD,0) From GESECRAN
+                COMPTEUR+=1
+            Endif
+        Endif
+    Endif
+
+    If COMPTEUR>GMAXUPDTRS
+        Commit
+        Trbegin [SQH]
+        CLE1=[F:SQH]SQHNUM : STOP=1 : Break 
+    Endif
+Next
+If STOP Goto BOUCLE_AV_SQH : Endif
+Commit
+Call ECR_TIME("UTIVEN09 : Sales Quote Process : Ended ("+num$(WNBRCOR)-"/"-num$(WNBR)+")") From DOSSUB
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Return
+
+#----------------------------------#
+# Traitement des détails devis     #
+#----------------------------------#
+$TRT_SQD
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+Call ECR_TIME("UTIVEN09 : Sales Quote Process : Update SQUOTED") From DOSSUB
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Raz STOP
+Raz WNBRCOR
+Raz CLE1
+Raz CLE2, WMAJ
+WNBR=rowcount([SQD])
+
+Trbegin [SQD]
+$BOUCLE_AV_SQD
+If  STOP=1
+  CRITERE = 'SQHNUM="'+CLE1+'" & SQDLIN>'+num$(CLE2)
+  STOP = 2
+Elsif STOP=2
+  CRITERE = 'SQHNUM>"'+CLE1+'"'
+  STOP = 0
+Else
+  CRITERE = "1=1" 
+Endif
+
+Raz COMPTEUR
+Raz STOP
+
+For [SQD]SQD0 Where evalue(CRITERE) & CNDNAM<>""
+    WMAJ=0
+    If [F:SQD]CNDNAM<>"" 
+        If [F:CNT]BPANUM<>[F:SQD]BPCORD | [F:CNT]CCNCRM<>[F:SQD]CNDNAM
+            Read [F:CNT]CNT0 = 1;[F:SQD]BPCORD;vireblc([F:SQD]CNDNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SQD]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SQD]SQHNUM+":"+[F:SQD]BPCORD-[F:SQD]CNDNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SQD]CNDNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If WMAJ=1 
+        WNBRCOR+=1
+        If WSIMFLG=1
+            Rewrite [SQD]
+            If fstat
+                Call ECR_TRACE("File SQUOTED, Error ="-num$(fstat),1) From GESECRAN
+            Else
+                Call ECR_TRACE([F:SQD]SQHNUM+":"+[F:SQD]BPCORD,0) From GESECRAN
+                COMPTEUR+=1
+            Endif
+        Endif
+    Endif
+
+    If COMPTEUR>GMAXUPDTRS
+        Commit
+        Trbegin [SQD]
+        CLE1=[F:SQD]SQHNUM : CLE2=[F:SQD]SQDLIN : STOP=1 : Break 
+    Endif
+Next
+If STOP Goto BOUCLE_AV_SQD : Endif
+Commit
+Call ECR_TIME("UTIVEN09 : Sales Quote Process : Ended ("+num$(WNBRCOR)-"/"-num$(WNBR)+")") From DOSSUB
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Return
+
+
+#---------------------------#
+# Traitement des livraisons #
+#---------------------------#
+$TRT_SDH
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+Call ECR_TIME("UTIVEN09 : Sales Delivery Process : Update SDELIVERY") From DOSSUB
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Raz WNBRCOR
+Raz CLE1
+Raz CLE2, WMAJ
+WNBR=rowcount([SDH])
+
+Trbegin [SDH]
+$BOUCLE_AV_SDH
+Raz COMPTEUR
+Raz STOP
+
+For [SDH]SDH0 Where SDHNUM>CLE1 & (sum(CNDNAM,CNINAM)<>"")
+    WMAJ=0
+    If [F:SDH]CNDNAM<>"" 
+        If [F:CNT]BPANUM<>[F:SDH]BPCORD | [F:CNT]CCNCRM<>[F:SDH]CNDNAM
+            Read [F:CNT]CNT0 = 1;[F:SDH]BPCORD;vireblc([F:SDH]CNDNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SDH]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SDH]SDHNUM+":"+[F:SDH]BPCORD-[F:SDH]CNDNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SDH]CNDNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If [F:SDH]CNINAM<>"" 
+        If [F:CNT]BPANUM<>[F:SDH]BPCINV | [F:CNT]CCNCRM<>[F:SDH]CNINAM
+            Read [F:CNT]CNT0 = 1;[F:SDH]BPCINV;vireblc([F:SDH]CNINAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SDH]BPCINV : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SDH]SDHNUM+":"+[F:SDH]BPCINV-[F:SDH]CNINAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SDH]CNINAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If WMAJ=1 
+        WNBRCOR+=1
+        If WSIMFLG=1
+            Rewrite [SDH]
+            If fstat
+                Call ECR_TRACE("File SDELIVERY, Error ="-num$(fstat),1) From GESECRAN
+            Else
+                Call ECR_TRACE([F:SDH]SDHNUM+":"+[F:SDH]BPCORD,0) From GESECRAN
+                COMPTEUR+=1
+            Endif
+        Endif
+    Endif
+
+    If COMPTEUR>GMAXUPDTRS
+        Commit
+        Trbegin [SDH]
+        CLE1=[F:SDH]SDHNUM : STOP=1 : Break 
+    Endif
+Next
+If STOP Goto BOUCLE_AV_SDH : Endif
+Commit
+Call ECR_TIME("UTIVEN09 : Sales Delivery Process : Ended ("+num$(WNBRCOR)-"/"-num$(WNBR)+")") From DOSSUB
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Return
+
+#---------------------------#
+# Traitement des factures   #
+#---------------------------#
+$TRT_SIV
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+Call ECR_TIME("UTIVEN09 : Sales Invoice Process : Update SINVOICEV") From DOSSUB
+If WSIMFLG=2 Call ECR_TRACE(mess(6,115,1),0) From GESECRAN Endif
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Raz WNBRCOR
+Raz CLE1
+Raz CLE2, WMAJ
+WNBR=rowcount([SIV])
+
+Trbegin [SIV]
+$BOUCLE_AV_SIV
+Raz COMPTEUR
+Raz STOP
+
+For [SIV]SIV0 Where NUM>CLE1 & (sum(CNDNAM,CNINAM)<>"")
+    WMAJ=0
+    If [F:SIV]CNDNAM<>"" 
+        If [F:CNT]BPANUM<>[F:SIV]BPCORD | [F:CNT]CCNCRM<>[F:SIV]CNDNAM
+            Read [F:CNT]CNT0 = 1;[F:SIV]BPCORD;vireblc([F:SIV]CNDNAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SIV]BPCORD : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SIV]NUM+":"+[F:SIV]BPCORD-[F:SIV]CNDNAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SIV]CNDNAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If [F:SIV]CNINAM<>"" 
+        If [F:CNT]BPANUM<>[F:SIV]BPCINV | [F:CNT]CCNCRM<>[F:SIV]CNINAM
+            Read [F:CNT]CNT0 = 1;[F:SIV]BPCINV;vireblc([F:SIV]CNINAM,1)
+            If fstat  
+                # Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+                WBPR=[F:SIV]BPCINV : Gosub RECUP_BPR_CNTNAM
+                If WSIMFLG=2 
+                    Call ECR_TRACE([F:SIV]NUM+":"+[F:SIV]BPCINV-[F:SIV]CNINAM+":"+mess(26,199,1)-mess(37,197,1)-WCNTNAM,0) From GESECRAN
+                Endif
+                [F:SIV]CNINAM = WCNTNAM 
+            Endif
+        Endif
+    Endif
+    If WMAJ=1 
+        WNBRCOR+=1
+        If WSIMFLG=1
+            Rewrite [SIV]
+            If fstat
+                Call ECR_TRACE("File SINVOICEV, Error ="-num$(fstat),1) From GESECRAN
+            Else
+                Call ECR_TRACE([F:SIV]NUM+":"+[F:SIV]BPCORD,0) From GESECRAN
+                COMPTEUR+=1
+            Endif
+        Endif
+    Endif
+
+    If COMPTEUR>GMAXUPDTRS
+        Commit
+        Trbegin [SIV]
+        CLE1=[F:SIV]NUM : STOP=1 : Break 
+    Endif
+Next
+If STOP Goto BOUCLE_AV_SIV : Endif
+Commit
+Call ECR_TIME("UTIVEN09 : Sales Invoice Process : Ended ("+num$(WNBRCOR)-"/"-num$(WNBR)+")") From DOSSUB
+Call ECR_TRACE(string$(80,"-"),0) From GESECRAN 
+
+Return
+
+$RECUP_BPR_CNTNAM
+Raz WCNTNAM
+# Le contact n'existe pas pour ce client : On récupère le contact par défaut du tiers
+If [F:BPR]BPRNUM<>WBPR
+    Read [F:BPR]BPR0 = WBPR
+    If fstat Raz [F:BPR] Endif
+Endif
+If [F:BPR]CNTNAM<>""
+    WCNTNAM=[F:BPR]CNTNAM 
+Else
+    Filter [CNT] Where BPATYP=1 & BPANUM=WBPR 
+    Read [CNT]CNT0 First
+    If !fstat WCNTNAM=[F:CNT]CCNCRM : Endif
+    Filter [CNT] 
+Endif
+WMAJ=1
+Return
+
+
+

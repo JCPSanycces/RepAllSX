@@ -1,0 +1,1836 @@
+#<AdxTL>@(#)4.0.0.0 $Revision$
+
+#*********************************************************************
+#
+#                CALCUL DES MONTANTS SUBVENTIONS
+#
+#*********************************************************************
+#    Création
+#    MDJ - 02.01.2008 (V5)
+#
+#*********************************************************************
+#    Modification
+# MDJ   01.06.16 116923     Depreciation basis of subsidy depreciation plan wrongly reset to 0
+# MDJ   11.04.16 114266     Increase depreciation mode length from 2 to 8
+# MDJ   19.03.15 FQ102516_4 : Stratégie d'amortissement suite chgt méthode ou base d'amortissement
+# MWA   25.02.15 FQ102516_3 : Deletion of 2 useless lines.
+# MDJ   13.02.15 FQ102516_1 : Late subsidy (received after FY closure)
+# CBO   06.02.15 FQ105649   : calcul mtt dépense + VAT - VARTR
+# MDJ   27.08.14 FQ102434   : Variable WRESTE used instead of WRESCRB
+# GLE   27.08.14 FQ102296   : Seuls les biens actifs du Projet d'investissement saisi sont calculés
+# CBO   16.07.14 FQ94788    : Ajout d'un point d'entrée pour paramétrer l'impact sur les amortissements (rattrapage) de réceptions tardive des subventions.
+# CBO   14.10.13 FQ91644    : Appel de PARAM from ADOVAL
+# MDJ   19.08.13 FQ91694    : Passage en résiduel uniquement si la base amort a changé
+# MDJ   13.08.13 FQ91676    : Trace calcul des subventions : champs tronqués
+# MDJ   05.08.13 FQ91657    : Chargement du masque de travail contenant le paramétrage comptable de la société
+# MDJ   30.05.12 FQ82221    : Montants subvention non-alimentés dans EVTS si type subvention= % ou plafond
+# MDJ   01.06.11 FQ74429    : Les biens sortis dans un ex. antérieur étaient "à calculer" à tort
+# MDJ   24.05.11 FQ74429    : Les unlocks ne s'effectuaient pas (on ne passe pas par TERMINE)
+# MDJ   11.05.11 FQ73765    : CNXDAT : Variable inexistante (RCNXDAT)
+# GLE   31.03.09 FQ51185    : Modification du nombre de paramètres des fonctions MTC_NRSD_RSD et MTC_RSD_NRSD
+#*********************************************************************
+##----------------------------------------------------------------------------------------------
+##  Le traitement de calcul des subventions comporte les étapes suivantes  :
+##       1- calcul du montant de l'investissement réalisé à partir des dépenses subventionnées
+##          rattachées au projet d'investissement traité
+##       2- calcul du montant des subventions si celui-ci correspond à un pourcentage de
+##          l'investissement réalisé (différent de "forfait")
+##       3- Ventilation des subventions accordées pour un projet d'investissement sur les
+##          dépenses subventionnées et maj de la base des plans de subvention des biens auxquels sont
+##          rattachées ces dépenses
+##       4- Génération d'un événement d'actualisation de la subvention
+##       5- calcul société
+##       6- calcul du montant de réintégration des subventions à partir de la dotation exercice des
+##          plans de subvention
+##----------------------------------------------------------------------------------------------
+##
+Raz GPILOBJ
+Call DEFVAR From GLOBIMM
+Call INIVAR From GLOBIMM
+Local Char VALBOUT(30)
+Local Char PARBOUT(250)(1..10)
+VALBOUT = "12"
+Call TRAITE_CHAR(VALBOUT,PARBOUT,"","TRTGRACAL","DGRACAL",3,"") From GTRAITE
+
+End
+#=================================================================================
+$ACTION
+
+ # Infbox 'ACTION='-num$(ACTION)
+
+Case ACTION
+  When "OUVRE_BATCH" : Gosub OUVRE_BATCH
+  When "INIT"        : Gosub INIT
+  When "AVANT_PAR"   : Gosub AVANT_PAR
+  When "INIT_DIA"    : Gosub INIT_DIA
+  When "CONTROLE"    : Gosub CONTROLE
+  When "EXEC"        : Gosub EXEC
+  When "SORTIE"      : Gosub SORTIE
+  When "OK"          : GOK = 1 : FIN = 1
+  When "END"         : GOK = 0 : FIN = 1
+Endcase
+
+Return
+#=================================================================================
+## (Actions nécessaires la saisie des paramètres)
+#=================================================================================
+$INIT
+
+Local Integer STAT, OKGRA
+Local Char    CRITERE(250)
+Local Char    CRITERE2(250)
+Local Char    TIT(50)
+Local Char    MESSA(50)
+Local Char    SYMBOLE(50)
+Local Integer I , J , K , OK , OPT
+
+Gosub OUVRE_BATCH
+
+Return
+#=================================================================================
+## Ouverture des tables
+#=================================================================================
+$OUVRE_BATCH
+#---------Subventions non réintégrées ----------------------------------------
+If clalev([F:GRT])=0   : Local File GRANTS      [GRT]   : Endif
+If clalev([F:GRTW])=0  : Local File GRANTS      [GRTW]  : Endif
+If clalev([F:CAS])=0   : Local File CASHING     [CAS]   : Endif
+If clalev([F:FAS])=0   : Local File FXDASSETS   [FAS]   : Endif
+If clalev([F:DEP])=0   : Local File DEPREC      [DEP]   : Endif
+If clalev([F:DEPW])=0  : Local File DEPREC      [DEPW]  : Endif
+If clalev([F:CNX])=0   : Local File CONTEXT     [CNX]   : Endif
+#---------Pièces subventionnées ----------------------------------------------
+If clalev([F:LOF])=0   : Local File LAYOUTFAS   [LOF]   : Endif
+If clalev([F:CPY])=0   : Local File COMPANY     [CPY]   : Endif
+If clalev([F:FCY])=0   : Local File FACILITY    [FCY]   : Endif
+If clalev([F:ADW])=0   : Local File ADOVAL      [ADW]   : Endif
+If clalev([F:ADI])=0   : Local File ATABDIV     [ADI]   : Endif
+If clalev([F:ATB])=0   : Local File ATABLE      [ATB]   : Endif : # Table des Tables
+If clalev([F:ALK])  =0 : Local File APLLCK      [ALK]   : Endif : # Table des verrous
+
+Global Integer  GCURCPY                   # Indice société cliquée
+Global Integer  GTRT1PROJ                 # Indic un seul projet traité ou non (G_OUI/G_NON)
+Global Decimal  G_GRAAMT                  # Ecart montant subvention
+Global Decimal  G_MAXGRAAMT               # Ecart montant plafond subvention
+Global Decimal  G_INVGRAAMT               # Ecart montant immobilisé subventionné
+Global Decimal  G_REAGRAAMT               # Ecart montant réalisé subventionné
+Global Decimal  G_CRBGRAAMT               # Ecart montant réintégré dans l'exercice
+Global Decimal  G_CRBGRACUM
+Global Integer  GRTPRVUPD                 # paramètre de remise en cause des montants subventionnés
+Global Integer  G_GRTDVEREG               # paramètre de Stratégie rattrapage d'écart
+Global Date     GPERENDDAT                # Date de fin de période courante plan de subvention
+Global Date     GPERENDDATI               # Date de fin de période courante plan IAS
+
+Global Char GREASON                      # Motif de l'événement
+TIT = mess(16,GML_MSGGRT,1)                     # Calcul des montants de subventions
+
+GTRT1PROJ = G_NON
+
+Return
+#=================================================================================
+$AVANT_PAR
+
+#Infbox "AVANT_PAR"
+
+ If !clalev([M:GRTC]) : Local Mask GRACAL[GRTC] : Endif
+
+ If !GSERVEUR
+  Raz [M:GRTC]
+ Endif
+
+ If GFONCTION="GESGRT" & dim([M:GRT0]GRAREF)>=1
+   [M:GRTC]INVPLN = [M:GRT1]INVPLN
+ Endif
+
+ Gosub AFFICHE
+
+Return
+#=================================================================================
+$INIT_DIA
+
+If GFONCTION="GESGRT" & dim([M:GRT0]GRAREF)>=1
+  [M:GRTC]INVPLN = [M:GRT1]INVPLN
+Endif
+
+Gosub AFFICHE
+
+Return
+####################################################################################################
+$AFFICHE
+Local Integer NOL
+
+If clalev([F:CPY])=0  : Local File COMPANY     [CPY]  : Endif
+If clalev([F:ADI])=0  : Local File ATABDIV     [ADI]  : Endif
+
+  NOL = 1
+  Filter [CPY]
+  For [CPY]
+    Filter[ADI] Where NUMTAB=GTD_INVPLN and A1=[F:CPY]CPY
+    Read [ADI]CODE First
+    Filter[ADI]
+    If fstat = 0
+      [M:GRTC]CPY(NOL-1) = [F:CPY]CPY
+     NOL += 1
+    Endif
+  Next
+  Filter [CPY]
+  [M:GRTC]NBCPY  = NOL-1
+
+  #------------------------------
+  Call ACTION_BLOCK (ACB_AFFZO, "GRACAL", "CPY") From GLOBIENS
+  #------------------------------
+
+Return
+#-------------------------------------------------------------------------------
+$CONTROLE
+Local Integer N_E, N_I, N_NBSOCCLC
+Local Char    LNIVTRACE(1)
+
+  N_NBSOCCLC = 0
+
+  For N_E = 1 To [M:GRTC]NBCPY
+    If [M:GRTC]CLC(N_E-1) = G_OUI
+      N_NBSOCCLC += 1
+    Endif
+    #------------------------------
+    # Suite de la boucle
+  Next N_E
+  #------------------------------
+  If N_NBSOCCLC = 0 & [M:GRTC]INVPLN = ""
+    # Vous devez au-moins cocher une société ou saisir un projet d'investissement.
+    GMESSAGE = mess(70,GML_MSGGRT,1)
+    FIN      = 0
+    GERR     = 1
+  Endif
+  If N_NBSOCCLC > 0
+    Diszo  [M:GRTC]INVPLN
+    Affzo  [M:GRTC]INVPLN
+  Endif
+  #------------------------------
+
+Return
+####################################################################################################
+## Exécution
+####################################################################################################
+$EXEC
+
+##   GML_STATSUB     = 425       : # Numéro de menu local "Statut subvention"
+##   GVML_SUBENC     = 1         : # EN COURS
+##   GVML_SUBIACH    = 2         : # INVESTISSEMENT ACHEVE
+##   GVML_SUBANNU    = 3         : # ANNULEE
+##   GVML_SUBTOTR    = 4         : # TOTALEMENT REINTEGRE
+Local Char    WCNOMPROG
+Local Char    WCLIGNE (GTRC_LGLIGTR)
+Local Char    WCLIGFIXE1 (60)
+Local Char    WCLIGFIXE2 (50)
+Local Char    WCTIRET(120)
+Local Char    WCOUINON
+Local Char    WCDESIFIXE (120)
+Local Char    WCSOC(GLONCPY)
+Local Char    WCDEBUTLIGNE (70)
+Local Integer I
+Local Integer WITRTOK
+Local Integer WILOCK
+Local Integer LOK
+Local Char    WCSOCTRT(GLONCPY)
+Local Integer LCDRET
+Local Integer CDRET
+Local Char    LPARAM, LPARAM2
+Local Char    SVTRACE : SVTRACE=""
+
+  TRA          = 1      : ## affichage trace et conservation
+  WCTIRET      = '------------------'
+  WCNOMPROG    = 'TRTGRACAL'
+  GIPLN        = 0
+
+  If GOK = 0 : Return : Endif
+
+  If GOK
+    Local Integer STA, NBGRT
+    Local Char   MESSA(80)
+    Local Char   CRITERE(250) , CRITERE2(250), CRITERE3(250), CRITERE4(250), SYMBOLE(30)
+    ##---------------------------------------------------------------##
+    ## Demande de confirmation du traitement en réél                 ##
+    ##---------------------------------------------------------------##
+    If [M:GRTC]FLGSIM <>  G_OUI
+        Call OUINON(mess(199,GML_MSGCIG,1), LOK) From GESECRAN
+        If ( LOK = G_OUI)
+            GOK = 1
+            FIN = 1
+        Else
+            GOK = 0
+            FIN = 0
+            End
+        Endif
+    Else
+        GOK = 1
+        FIN = 1
+    Endif
+
+    Gosub OUVRE_TRACE
+    Gosub PARAM_TRACE
+
+    Gosub PRE_CONTROLE_TRAITEMENT
+    If WITRTOK = G_NON
+       If !GSERVEUR : Call FERME_TRACE (1) From TRACEABX3 : Endif
+       Gosub UNLOCK_ALL
+       Return
+    Endif
+
+    Gosub TRAITEMENT
+
+    If [M:GRTC]FLGSIM <> G_OUI
+       SVTRACE = GTRACE
+       Gosub CALCUL_SOC
+       GTRACE = SVTRACE
+       If GLTRACE = 0   # le passage dans le calcul remets GLTRACE à zéro ==> plus d'affichage de la trace
+       Local Char    FICTRA(250)
+          FICTRA = filpath("TRA",GTRACE,"tra",0)
+          GLTRACE   = filinfo(FICTRA,7)
+       Endif
+       Gosub CALCUL_REINTEGRATION_EXERCICE
+    Endif
+
+    #----- fermeture de la trace -----------------
+   If !GSERVEUR : Call FERME_TRACE_FIC(1) From TRACEABX3 : Endif
+
+ Endif
+
+Return
+####################################################################################################
+$OUVRE_TRACE
+##------------------------------------------------------------------------------------------------##
+## - Edition des paramètres de traitement                                                         ##
+##------------------------------------------------------------------------------------------------##
+#Calcul des montants subvention
+
+  If !GSERVEUR
+    Call OUVRE_TRACE_FIC(mess(16,GML_MSGGRT,1),1) From TRACEABX3
+  Endif
+  WCLIGNE = string$(115,"=")
+  Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+
+  #CALCUL DES MONTANTS SUBVENTIONS
+  WCLIGNE = string$(28," ") + mess(17,GML_MSGGRT,1) + " "
+  Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+  WCLIGNE = string$(115,"=")
+  Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+
+  # Paramètres du traitement
+  WCLIGNE = string$(28," ")   + mess(71,GML_MSGGRT,1) + " "
+  Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+
+  # Nom du traitement
+  WCDESIFIXE= format$("Kb:60X", mess(75,GML_MSGGRT,1))
+  Call ECR_TRACE_FIC ("",GTRC_PARAM,WCDESIFIXE + " : " + WCNOMPROG ,0,1) From TRACEABX3
+
+  # Simulation
+  If [M:GRTC]FLGSIM= G_OUI :  WCOUINON  = mess(2,1,1) Else  WCOUINON  = mess(1,1,1)  Endif
+  WCDESIFIXE= format$("Kb:60X", mess(73,GML_MSGGRT,1))
+  Call ECR_TRACE_FIC("",GTRC_PARAM,WCDESIFIXE  + " : " + WCOUINON  ,0,1) From TRACEABX3
+
+Return
+####################################################################################################
+$PARAM_TRACE
+  Local Integer I_CPY
+Return
+####################################################################################################
+## $PRE_CONTROLE_TRAITEMENT :   Pré controle du traitement                                        ##
+####################################################################################################
+$PRE_CONTROLE_TRAITEMENT
+
+Local Integer WALLCPY
+
+  WALLCPY = G_NON
+
+  If [M:GRTC]INVPLN <> ""
+      GTRT1PROJ = G_OUI
+      Gosub LOCK_SOC
+  Else
+    For I_CPY=1 To [M:GRTC]NBCPY
+      If [M:GRTC]CLC(I_CPY-1) = G_OUI
+        Gosub LOCK_ALL
+      Endif
+    Next I_CPY
+  Endif
+
+Return
+####################################################################################################
+## Traitement des Subventions
+##        - Constitution des critères de séection des subventions, pièces et biens
+##        - Appel du traitement de calcul des montants
+##        - Ecriture de fin de trace
+####################################################################################################
+$TRAITEMENT
+Local Integer N_E
+Local Char CHAINE(150)
+Local Integer N_I
+Local Char PCPY
+
+#Infbox "TRAITEMENT "
+
+ PCPY = ""
+#------------ Constitution des critères pour les filtre sur GRA, LOF et FAS ------------------
+
+#---- critères pouvant être définis lors de l'ouverture de la table ----#
+CRITERE  = 'GRASTA = GVML_SUBENC'
+CRITERE2 = 'AASREF <> ""'
+
+If [M:GRTC]INVPLN = ""
+  # GLE 27/08/2014 : le cas où [M:GRTC]INVPLN = "" ne devrait jamais se produire car l'étiquette C_INVPLN interdit ce cas depuis
+  #                  le début de la V5.
+  #                  Je laisse le code car ce n'est pas l'objet de la fiche 102296, mais en l'état il ne sert à rien. S'il
+  #                  devait être réactivé pour pouvoir traiter tous les projets d'investissement d'une société, il
+  #                  faudrait également modifier le filtre de sélection des biens à calculer de CALCUL_SOC ou mettre l'appel
+  #                  à APPEL_SOC directement ici après l'appel à CALCUL
+  N_I  = find(G_OUI,   [M:GRTC]CLC(0.. [M:GRTC]NBCPY))
+  If N_I > 0
+    Filter[ADI] Where NUMTAB=GTD_INVPLN and A1= [M:GRTC]CPY(N_I-1)
+    For[ADI]
+      CRITERE  = 'GRASTA=GVML_SUBENC & CPY="'+[M:GRTC]CPY(N_I-1)+'"& INVPLN="'+[F:ADI]CODE +'"'
+      Gosub CALCUL
+    Next
+    Filter [ADI]
+  Endif
+Else
+  CRITERE  -= '& INVPLN="'+[M:GRTC]INVPLN+'"'
+  Gosub CALCUL
+Endif
+
+ Return
+####################################################################################################
+## Calcul : 3 Etapes
+##       1- calcul des montants de la subvention (INVGRAAMT,REAGRAAMT et GRAAMT)   ==> maj [GRT]
+##       2- réinitialisation du montant subvention et des bases d'amort. des biens
+##            ayant des dépenses  subventionnées    ==> maj [FAS]
+##       3- calcul des montants subventionnés des biens et des pièces
+####################################################################################################
+$CALCUL
+
+#Infbox "CALCUL "
+
+Local Integer WB_DPRBAS_CHG_STD # FQ94788
+Local Integer  NBGRT, NBLOF, I
+Local Char     WAASREF
+Local Decimal  WTOTAMT             # Montant total Attribué aux dépenses
+Local Decimal  WTOTGRAAMT          # Montant total Attribué au projet
+Local Decimal  GTOTGRAAMT          # Montant total Attribué au projet
+Local Decimal  WINVGRAAMT          # Montant Immobilisé subventionné
+Local Decimal  CMREA               # Montant calculé si pourcentage
+Local Decimal  WREAGRAAMT          # Montant Réalisé subventionné
+Local Decimal  WMTCONV             # Montant intermédiaire pour conversion
+Local Decimal  RMONTANT            # Montant intermédiaire pour arrondi
+Local Decimal  WLGRAAMT            # Montant subvention sur les Dépenses
+Local Decimal  WFGRAAMT            # Montant subvention sur les Biens
+Local Decimal  WGGRAAMT            # Montant subvention sur les Subventions
+Local Decimal  WFCRBAMT            # Montant de réintégration Subventions sur les Biens
+Local Decimal  WFCRBCUM            # Montant de cumul réintégration Subventions sur les Biens
+Local Decimal  WSOLDEP             # Montant Dépenses restant à traiter
+Local Decimal  WMTDEPFRC           # Montant Dépenses déjà traitées
+Local Decimal  WMTTOTLOF           # Montant Dépenses rattachées au projet
+Local Decimal  WRESTE
+Local Decimal  WRESCRB
+Local Decimal  WTOTCRB
+Local Decimal  WGCRBAMT
+Local Decimal  WGCRBCUM
+Local Decimal  WMTVENTIL
+Local Decimal  WAMTNOTCPY
+Local Decimal  WAMTGRA
+Local Decimal  WTOTLOF
+Local Integer  STAT                # Status de retour (0 = OK)
+Local Char     WNUMLOF
+Local Integer  WPLN
+Local Char     SINVPLN, SINVPLND, SCPY
+Local Date     PCPTDAT(1..5)
+Local Integer  PRET
+Local Integer  LCNX
+Local Date     PCPTDATI(1..5)
+Global Date    GPERENDDATI
+Local Char TEXTE
+Local Decimal  WMTLOFTVAFR      # FQ105649
+
+Call DEBTRANS From GLOCK
+Trbegin [GRT],[LOF],[FAS],[DEP]
+
+#=================================================================================
+## 1- calcul des montants de la subvention (INVGRAAMT,REAGRAAMT et GRAAMT)
+#        - maj de la table des Subventions (GRT)
+#=================================================================================
+SCPY          = ""
+SINVPLN       = ""
+WTOTGRAAMT    = 0
+GTOTGRAAMT    = 0
+NBGRT        =  0
+#------------ on filtre les subventions de la société sélectionnée---------
+#------------ portant sur la référence investissement sélectionnée ------
+Filter [GRT] Where evalue(CRITERE) Order By INVPLN Asc
+For [GRT] With Stability
+  NBGRT+=1
+  [F:GRTW]  = [F:GRT]
+  If PCPY = ""
+    PCPY = [F:GRT]CPY
+    Call PARAM(PCPY ,"GRTPRVUPD",LPARAM) From ADOVAL   #FQ102516_1
+    GRTPRVUPD = val(LPARAM)                            #FQ102516_1
+    Call PARAM(PCPY ,"GRTDVEREG",LPARAM2) From ADOVAL  #FQ102516_4
+    G_GRTDVEREG = val(LPARAM2)                         #FQ102516_4
+    #*FQ102516_4 Stratégie rattrapage d'écart
+    WCDESIFIXE= format$("Kb:60X", mess(382,GML_MSGFASPR,1))
+    Call ECR_TRACE_FIC("",GTRC_PARAM,WCDESIFIXE  + " : " + num$(G_GRTDVEREG) + "-" +mess(G_GRTDVEREG,3298,1),0,1) From TRACEABX3
+    WCLIGNE = string$(115,"=")
+    Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3  #*/FQ102516_4
+    Read [CPY]CPY0 = PCPY
+    If fstat =  0
+       SCPYD = [F:CPY]CPYNAM
+       #-Date de fin de période courante du contexte CPFI et donc du plan de subvention
+       Call GET_CNX_DAT([F:CPY]CPY,G300CPFI,PCPTDAT,PRET) From GLOBIENS
+       If PCPTDAT(4)<> [0/0/0]
+          GPERENDDAT = PCPTDAT(4)
+       Else
+          GPERENDDAT = PCPTDAT(2)
+       Endif
+       #>Fq-91657 Chargement du masque de travail contenant le paramétrage comptable de la société
+       If !clalev([M:FPC]) : Local Mask FASPARCPY [FPC] : Endif
+       Raz [M:FPC]
+       Local Integer ERR
+       Call LOAD_FASPARCPY(PCPY,"",G_NON,ERR) From GLOFCYCPY
+       #Fq-91657>---------
+       If G_ACTIAS=G_OUI
+          If !clalev([F:CNX]) : Local File CONTEXT [CNX] : Endif
+          Call GET_CNX_FROM_PLAN([F:CPY]CPY, G301IAS, LCNX) From GLOBIENS
+          If (LCNX > 0 )
+            # Date de fin de période courante du plan IAS et donc du plan de subvention
+            Call GET_CNX_DAT([F:CPY]CPY,LCNX,PCPTDATI,PRET) From GLOBIENS
+            If PCPTDATI(4)<> [0/0/0]
+               GPERENDDATI = PCPTDATI(4)
+            Else
+               GPERENDDATI = PCPTDATI(2)
+            Endif
+          Endif
+       Endif
+    Endif
+    LIGNE = "**** "+(mess(74,GML_MSGGRT,1))+" "+num$(PCPY)+"  " +num$(SCPYD)+space$(15)
+    Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+  Endif
+  #-----
+  WINVGRAAMT    = 0
+  WREAGRAAMT    = 0
+  CMREA         = 0
+  WLGRAAMT      = 0
+  WFGRAAMT      = 0
+  WGGRAAMT      = 0
+  WFCRBAMT      = 0
+  WFCRBCUM      = 0
+  WSOLDEP       = 0
+  WMTDEPFRC     = 0
+  WMTVENTIL     = 0
+  WTOTLOF       = 0
+  #---------- boucle sur les dépenses rattachées à  l'investissement ------
+  #---------- et cumul des montants subventionnés dans INVGRAAMT et REAGRAAMT ------
+  #*Fq-82221  Filter [LOF] Where (PLNINV=[F:GRT]INVPLN) & (CPY=[F:GRT]CPY)
+  Filter [LOF] Where (PLNINV=[F:GRT]INVPLN) & (CPY=[F:GRT]CPY) & (FLGGRA=G_OUI)
+  For [LOF] With Stability
+    NBLOF+=1
+    WNUMLOF = sum(num$([F:LOF]CODLOF),num$("/"),num$([F:LOF]LINLOF))
+    If [F:LOF]AASREF <> ""
+        WINVGRAAMT += [F:LOF]AMTNOTCPY
+    Endif
+    WREAGRAAMT +=[F:LOF]AMTNOTCPY
+  Next
+  Filter[LOF]
+  #----------
+  If [F:LOF]CUR <> ""
+    Call CONVERT3([F:LOF]CUR,[F:GRT]CUR,[F:GRT]CUR, [F:LOF]CURTYP,date$,WINVGRAAMT,WMTCONV,[F:LOF]RATCUR,STAT) From CPTSUB
+    Call GET_MNT_ARRONDI(WMTCONV,[F:GRT]CUR,RMONTANT) From GLOBIENS
+  Endif
+  Call GET_MNT_ARRONDI(WINVGRAAMT,[F:GRT]CUR,RMONTANT) From GLOBIENS
+  WINVGRAAMT       = RMONTANT
+
+  If [F:LOF]CUR <> ""
+    Call CONVERT3([F:LOF]CUR,[F:GRT]CUR,[F:GRT]CUR,[F:LOF]CURTYP,date$,WREAGRAAMT,WMTCONV,[F:LOF]RATCUR,STAT) From CPTSUB
+    Call GET_MNT_ARRONDI(WMTCONV,[F:GRT]CUR,RMONTANT) From GLOBIENS
+  Endif
+  Call GET_MNT_ARRONDI(WREAGRAAMT,[F:GRT]CUR,RMONTANT) From GLOBIENS
+  WREAGRAAMT       = RMONTANT
+
+  If  [M:GRTC]FLGSIM <>  G_OUI & ([F:GRT]INVFLGFRC = G_NON or [F:GRT]REAFLGFRC = G_NON)
+    If [F:GRT]INVFLGFRC = G_NON
+      [F:GRT]INVGRAAMT = WINVGRAAMT
+    Endif
+    If [F:GRT]REAFLGFRC = G_NON
+      [F:GRT]REAGRAAMT = WREAGRAAMT
+    Endif
+    #*Fq-82221     Rewrite[GRT]
+    #*Fq-82221     If fstat <>0
+    #*Fq-82221       GOK = 0 : Call FSTA("GRT") From GLOCK : Break
+    #*Fq-82221    Endif
+  Endif
+  #---------- si type de subvention <> de FORFAIT  ------
+  If [F:GRT]GRATYP <> GVML_TSUBFOR
+    #---------- si type POURCENTAGE : maj de GRAAMT dans GRANTS ------
+    If [F:GRT]GRATYP = GVML_TSUBPRC
+      #*Fq-82221       If [M:GRTC]FLGSIM <>  G_OUI
+      #*Fq-82221         CMREA = ([F:GRT]REAGRAAMT* [F:GRT]INVGRARAT)/100
+      #*Fq-82221       Else
+      CMREA = (WREAGRAAMT * [F:GRT]INVGRARAT)/100
+      #*Fq-82221       Endif
+      Call GET_MNT_ARRONDI(CMREA,[F:GRT]CUR,CMREA) From GLOBIENS
+      WGGRAAMT = CMREA
+    Else   #---------- si type POURCENTAGE PLAFONNE :, maj de GRAAMT dans GRANTS ------
+      If [F:GRT]GRATYP = GVML_TSUBPLF
+        If [F:GRT]MAXGRAAMT > 0
+          #*Fq-82221          If [M:GRTC]FLGSIM <>  G_OUI
+          #*Fq-82221             CMREA = ([F:GRT]REAGRAAMT * [F:GRT]INVGRARAT)/100
+          #*Fq-82221           Else
+          CMREA = (WREAGRAAMT  * [F:GRT]INVGRARAT)/100
+          #*Fq-82221          Endif
+          Call GET_MNT_ARRONDI(CMREA,[F:GRT]CUR,CMREA) From GLOBIENS
+          If CMREA > [F:GRT]MAXGRAAMT
+            CMREA = [F:GRT]MAXGRAAMT
+          Endif
+          WGGRAAMT = CMREA
+        Endif
+      Endif
+    Endif
+  Else
+    #---------- si type de subvention =  FORFAIT  ------
+    CMREA=[F:GRT]GRAAMT
+    WGGRAAMT = CMREA
+  Endif
+  #- si on n'est pas en simulation : mise à jour les montants dans GRANTS
+  If  [M:GRTC]FLGSIM <>  G_OUI
+    [F:GRT]GRAAMT = WGGRAAMT
+    Rewrite[GRT]
+    If fstat<>0
+      GOK = 0 : Call FSTA("GRT") From GLOCK : Break
+    Endif
+    # Ecriture d'un événement de création de subvention dans le cas où le montant de subvention est calculé pour
+    # la 1ère fois par le traitement de calcul
+    If [F:GRTW]GRAAMT  <> [F:GRT]GRAAMT
+      G_GRAAMT         = [F:GRT]GRAAMT    - [F:GRTW]GRAAMT
+      G_INVGRAAMT      = [F:GRT]INVGRAAMT - [F:GRTW]INVGRAAMT
+      G_REAGRAAMT      = [F:GRT]REAGRAAMT - [F:GRTW]REAGRAAMT
+      LCDINT= "GRTCRT"+num$(G301CPT)
+      If [F:GRTW]GRAAMT  = 0 and [F:GRT]GRAAMT <> 0
+        # Création
+        GREASON = mess(92,GML_MSGGRT,1)
+      Else
+        # Actualisation
+        GREASON = mess(93,GML_MSGGRT,1)
+      Endif
+      WDATEFF=[F:GRT]APPROVDAT
+      WDATCPTINT = max(WDATEFF, GPERENDDAT)
+      Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,WDATEFF,WDATCPTINT,LCDRET)  From GENEVE
+      If (LCDRET > 20 )
+        GOK = 0
+        Call FSTA("EVEGRT") From GLOCK
+      Endif
+      If G_ACTIAS = G_OUI & GCNXPROIAS = G_OUI
+        #  Evénement de création IAS
+        LCDINT= "GRTCRT"+num$(G301IAS)
+        # GREASON = mess(92,GML_MSGGRT,1)
+        WDATEFF=[F:GRT]APPROVDAT
+        WDATCPTINT = max(WDATEFF, GPERENDDAT)
+        Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,WDATEFF,WDATCPTINT,LCDRET)  From GENEVE
+        If (LCDRET > 20 )
+          GOK = 0
+          Call FSTA("EGRTCRT") From GLOCK
+        Endif
+      Endif
+    Endif
+  Endif
+  #----------------
+  If SINVPLN = "" or [F:GRT]INVPLN <> SINVPLN
+    SINVPLN= [F:GRT]INVPLN
+    WTOTGRAAMT = 0
+    GTOTGRAAMT = 0
+    Read [ADI]CODE = GTD_INVPLN;SINVPLN
+    If fstat =  0
+      Call LECTEXTRA (TEXTE, "ATABDIV", "LNGDES", num$(GTD_INVPLN), [F:ADI]CODE) From ATEXTRA
+      SINVPLND = TEXTE
+    Endif
+    Gosub ECR_ENTETE_PROJ
+  Endif
+
+  If  [M:GRTC]FLGSIM <>  G_OUI
+    Gosub ECR_LIGNE_REEL
+    WTOTGRAAMT +=[F:GRT]GRAAMT
+    GTOTGRAAMT +=[F:GRT]GRAAMT
+  Else  # Simulation
+    Gosub ECR_LIGNE_SIMUL
+    WTOTGRAAMT +=WGGRAAMT
+    GTOTGRAAMT +=WGGRAAMT
+  Endif
+    WMTVENTIL = WTOTGRAAMT - WMTDEPFRC
+ Next
+ Filter[GRT]
+
+ If WTOTGRAAMT <> 0
+   Gosub ECR_LIGNE_TOTAL_GRT
+ Endif
+ #=================================================================================
+ ## 2- réinitialisation du montant subvention et des bases d'amort. des biens
+ ##    ayant des pièces subventionnées
+ ##        - maj de la table des Biens comptables  (FAS)
+ #=================================================================================
+ If GOK
+   WAASREF= ""
+   Filter [GRT] Where evalue(CRITERE) Order By INVPLN Asc
+     Read [GRT] First
+     [F:GRTW]  = [F:GRT]
+     Filter [LOF] Where (CPY=[F:GRTW]CPY) & (PLNINV=[F:GRTW]INVPLN) & ( FLGGRA = G_OUI ) Order By AASREF Asc
+     For [LOF] With Stability
+       If [F:LOF]FLGAMTGRA <> G_OUI
+         WSOLDEP +=  [F:LOF]AMTNOTCPY
+       Else
+         WMTDEPFRC += [F:LOF]AMTGRA
+       Endif
+       WMTVENTIL = WTOTGRAAMT -WMTDEPFRC
+       If ([F:LOF]FLGLIKAAS = G_OUI) & (([F:LOF]AASREF <> WAASREF) or (WAASREF = "") )
+         WAASREF  = [F:LOF]AASREF
+         Read [FAS]FAS0 = WAASREF
+         If fstat = 0  #FQ102516_4
+           If [F:FAS]ISSFIYPRE <> G_OUI  #Fq-74429
+             #--/FQ102516_4 [F:FAS]GRAAMT = 0
+             If  [M:GRTC]FLGSIM <>  G_OUI
+               [F:FAS]FLGCLC = G_OUI
+               [F:FAS]FLGCNXCLC(0) = G_OUI
+               #--FQ102516_1 On initialise le projet sur le bien comptable dans le cas où il n'est pas déjà renseigné
+               If [F:FAS]INVPLN = ""
+                 [F:FAS]INVPLN=[F:LOF]PLNINV
+               Endif #--/FQ102516_1
+               Rewrite [FAS]
+               If fstat<>0
+                 GOK = 0 : Call FSTA("FAS") From GLOCK : Break
+               Endif
+             Endif
+           Endif  #Fq-74429
+         Endif  #FQ102516_4
+       Endif
+     Next
+     Filter[LOF]
+   Filter [GRT]
+Endif
+#=================================================================================
+## 3- Ventilation de la subvention sur les dépenses subventionnées
+##  - Mise à jour du montant subventionné sur chaque bien auxquelles sont rattachées les dépenses subventionnées
+##  - Mise à jour de la base des plans de subvention des biens subventionnés
+#=================================================================================
+#--/FQ102516_1
+If GOK
+
+  Local Char SAASREF (20) #FQ102516_4
+  SAASREF    = ""         #FQ102516_4
+
+  SINVPLN    = ""
+  WMTTOTLOF  = 0
+  NBGRT      = 0
+  WRESTE     = 0
+
+  Filter [GRT] Where (evalue(CRITERE)) Order By INVPLN Asc
+  For [GRT] With Stability
+    NBGRT+=1
+    WFCRBAMT   = 0
+    WFCRBCUM   = 0
+    WRESCRB    = 0
+    WTOTCRB    = 0
+    WGCRBAMT   = 0
+    WGCRBCUM   = 0
+    WFGRAAMT   = 0
+    WTOTAMT    = 0
+    #------------------------------------------------------
+    # On filtre les dépenses liée au projet traité et cochée comme étant subventionnées
+    Filter [LOF] Where (CPY=[F:GRT]CPY) & (PLNINV=[F:GRT]INVPLN) & (FLGGRA=G_OUI) Order By AASREF Asc ; CODLOF Asc
+    For [LOF] With Stability
+      #------------------------------------------------------
+      WNUMLOF  = sum(num$([F:LOF]CODLOF),num$("/"),num$([F:LOF]LINLOF))
+
+      If [F:LOF]AASREF<> "" and SAASREF <> "" and  [F:LOF]AASREF <> SAASREF
+        Gosub UPD_FAS_DEPREC
+        WAMTNOTCPY = 0
+        WAMTGRA    = 0
+        WFGRAAMT   = 0
+        WTOTAMT    = 0
+      Endif
+      SAASREF  = [F:LOF]AASREF
+      # si montant subventionné non forcé
+      If ([F:LOF]FLGAMTGRA <> G_OUI)
+        WLGRAAMT    = 0
+        If ([F:LOF]FLGGRA = G_OUI) & (WSOLDEP <> 0)
+          WMTLOFTVAFR = [F:LOF]AMTNOTCPY + [F:LOF]AMTVATCPY - [F:LOF]AMTVATRCPY
+          WLGRAAMT =  WMTVENTIL *(WMTLOFTVAFR/WSOLDEP)   # (A*Montant HT converti)/B
+          If WLGRAAMT > WMTLOFTVAFR
+            WLGRAAMT = WMTLOFTVAFR
+          Else
+            If WLGRAAMT < 0
+              WLGRAAMT=0
+            Endif
+          Endif
+        Else
+          WLGRAAMT=0
+        Endif
+        Call GET_MNT_ARRONDI(WLGRAAMT,[F:LOF]CUR,WLGRAAMT) From GLOBIENS
+        WTOTAMT +=WLGRAAMT
+        WRESTE = WMTVENTIL - WTOTAMT
+        If WRESTE > 0 & WRESTE < 1
+          WTOTAMT  -=WLGRAAMT
+          WLGRAAMT +=WRESTE
+          WTOTAMT  +=WLGRAAMT
+        Endif
+        WTOTLOF +=WLGRAAMT
+        #---------------------------
+        If  ([M:GRTC]FLGSIM <>  G_OUI)
+          If WLGRAAMT <> 0
+            [F:LOF]AMTGRA=WLGRAAMT
+            WFGRAAMT +=WLGRAAMT
+            Rewrite [LOF]
+            If fstat<>0
+              GOK = 0 : Call FSTA("LOF") From GLOCK : Break
+            Endif
+          Endif
+          #---------------------------
+        Endif
+      Else
+        #--Montant subventionné forcé------------------------------------------
+        WLGRAAMT =  [F:LOF]AMTGRA
+        WTOTLOF +=  WLGRAAMT
+        WFGRAAMT +=  WLGRAAMT  # Issue 116923
+      Endif
+      If NBGRT = 1
+        Gosub ECR_LIGNE_DETAIL
+      Endif
+      #-------------------------------------------------------
+      WMTTOTLOF += [F:LOF]AMTNOTCPY
+      #--------------------------------
+    Next
+    Filter[LOF]
+    #--------------
+    Gosub UPD_FAS_DEPREC
+    If  NBGRT =1
+      Call GET_MNT_ARRONDI(WTOTLOF,[F:LOF]CUR,WTOTLOF) From GLOBIENS
+      Gosub ECR_LIGNE_TOTAL_LOF
+    Endif
+    WAMTNOTCPY = 0
+    WAMTGRA    = 0
+    WTOTLOF    = 0
+  Next
+  Filter[GRT]
+Endif
+
+  #--FQ102516_4 Commit
+  If GOK :  Commit :   Else :  Rollback :   Endif
+
+Return
+#====================================================================================================
+# Mise à jour du montant de subvention
+#  - sur le bien comptable(GRAAMT)
+#  - sur le plan de subvention : mise à jour base d'amortissement (DPRBAS) et
+#    du mode d'amortissement (DPM) qui peut selon la stratégie, passer en résiduel si la base a changé
+#=====================================================================================================
+$UPD_FAS_DEPREC
+
+  If SAASREF = "" : Return : Endif    #FQ102516_4
+
+  Read [F:FAS]FAS0=SAASREF
+  If fstat
+    GOK = 0 : Call FSTA("FAS") From GLOCK
+    Return
+  Endif
+
+  If  [F:FAS]ISSFIYPRE <> G_OUI #Fq-74429
+    Call GET_MNT_ARRONDI (WFGRAAMT, [F:FAS]ACGCUR, RMONTANT) From GLOBIENS
+    WFGRAAMT = RMONTANT
+  Endif #Fq-74429
+
+  Read [CNX]CNX0 = [F:GRT]CPY;G300CPFI
+  WPLN = G301SUB
+  If fstat : Return : Endif
+  #-------------------------------------------------------
+  Local Date    RCNXDAT(1..5)
+  Local Integer RCRET, RCOD
+  Call GET_CNX_DAT([F:GRT]CPY,[F:CNX]CNX,RCNXDAT,RCRET) From GLOBIENS
+  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Read[DEP]DEP0=[F:FAS]AASREF; WPLN; RCNXDAT(2); RCNXDAT(4)
+  If fstat : Return : Endif
+  #* ------------------------------------------------------------
+  # si remise en cause situation antérieure à oui ou
+  # Date de début d'amortissement dans l'exercice courant
+  #*Fq-91694  et que la base d'amortissement a changé
+  #* ------------------------------------------------------------
+  If (GRTPRVUPD = G_OUI) or ([F:DEP]STRDPRDAT >= RCNXDAT(1))
+    #------------------------------------------------
+    WB_DPRBAS_CHG_STD = 1
+    GPOINT = "DPRBAS_CHG" : Gosub ENTREE From EXEFNC
+    #------------------------------------------------
+    If !(WB_DPRBAS_CHG_STD) : Return : Endif
+    If ( [F:FAS]GRAAMT <> 0   and  [F:DEP]LSTCLODAT <> [0/0/0] and  WFGRAAMT <> [F:FAS]GRAAMT )
+      MESSA=""
+      Call DPC_DVE_REG(G_GRTDVEREG, "FAS", "DEP", G_OUI, RCNXDAT(3), RCOD)
+      If ( RCOD > 20 )
+        MESSA = mess(107,7773,1)-" FASMTC - RCOD="+num$(RCOD)
+      Else
+        If (find(RCOD, 2, 3, 8) > 0)
+          MESSA = mess(7,21,1)-" : "-mess(181,7770,1)-" "-[F:FAS]AASREF
+        Endif
+      Endif
+      If RCOD > 0
+        #--- Edition de la ligne d'erreur ----------------------##
+        Call ECR_TRACE_FIC ("",GTRC_CRERREU,MESSA,1,1) From TRACEABX3
+        GOK = 0
+        Return
+      Endif  #--/FQ102516_4
+    Endif
+  Endif
+
+ # MAJ FAS
+   If  [F:FAS]ISSFIYPRE <> G_OUI #Fq-74429
+    Call GET_MNT_ARRONDI (WFGRAAMT, [F:FAS]ACGCUR, RMONTANT) From GLOBIENS
+    [F:FAS]GRAAMT = WFGRAAMT
+  Endif #Fq-74429
+  If  [M:GRTC]FLGSIM <> G_OUI
+    [F:FAS]FLGCLC = G_OUI
+    [F:FAS]FLGCNXCLC(0) = G_OUI
+    #--FQ102516_1 On initialise le projet sur le bien comptable dans le cas où il n'est pas déjà renseigné
+    If [F:FAS]INVPLN = ""
+      [F:FAS]INVPLN=[F:LOF]PLNINV
+    Endif
+    Rewrite [FAS]
+    If fstat <>0
+      GOK = 0 : Call FSTA("FAS") From GLOCK : Return
+    Endif
+ Endif #--/FQ102516_1
+
+ # MAJ DEP
+ [F:DEP]DPRBAS  =    [F:FAS]GRAAMT
+ If [F:DEP]BSEVAL= 0
+   [F:DEP]BSEVAL  =  [F:DEP]DPRBAS
+ Endif
+ WFCRBCUM     += [F:DEP]ENDDPE
+ # -------------------------------
+ If  [M:GRTC]FLGSIM <>  G_OUI #& NBGRT = 1
+   Rewrite [DEP]
+   If fstat<>0
+     GOK = 0 : Call FSTA("DEP") From GLOCK : Return
+   Endif
+ Endif
+
+Return #--/FQ102516_1
+#=================================================================================
+$ROL_TRT1
+Return
+#=================================================================================
+$AB_TRT1
+Return
+#==Fq-74429 ===============================================================================
+$SORTIE
+
+ Gosub UNLOCK_ALL
+
+ #==> Suppression des globales nécessaires à la fonction
+ If dim(GTRT1PROJ)>0        : Kill GTRT1PROJ : Endif
+ If dim(G_GRAAMT)>0      : Kill G_GRAAMT      : Endif
+ If dim(G_MAXGRAAMT)>0   : Kill G_MAXGRAAMT   : Endif
+ If dim(G_INVGRAAMT)>0   : Kill G_INVGRAAMT   : Endif
+ If dim(G_REAGRAAMT)>0   : Kill G_REAGRAAMT   : Endif
+ If dim(G_CRBGRAAMT)>0   : Kill G_CRBGRAAMT   : Endif
+ If dim(G_CRBGRACUM)>0   : Kill G_CRBGRACUM   : Endif
+ If dim(GRTPRVUPD)>0     : Kill GRTPRVUPD     : Endif
+ If dim(G_GRTDVEREG)>0   : Kill G_GRTDVEREG   : Endif
+
+ FIN = 1 : GOK = 0
+
+Return
+#=================================================================================
+################################################################################
+## Etiquettes écran GRACAL
+################################################################################
+####################################################################################################
+$LOCK_SOC
+Local Char    WCOBJLOCK
+Local Char    WCSOCTRT
+#------------------------------------------------------------------------------------------------##
+## Pour chaque société source, le traitement verrouille les contextes et les biens                ##
+##------------------------------------------------------------------------------------------------##
+  WSOC      = ""
+  WI1ERERR1 = G_NON
+
+  If [M:GRTC]INVPLN <> ""     #---- ==> Si on traite une société   ----------------------#
+    Read [ADI]CODE = GTD_INVPLN;[M:GRTC]INVPLN
+    If fstat =  0
+       WCSOCTRT=[F:ADI]A1
+       WIUNOBJLOCK = G_NON
+       #---- Test si la société est lockée pour l'objet LOF ----------------------#
+       WICOBJLOCK   = "LOF"
+       Gosub LOCK_SOC_OBJET
+       If WIUNOBJLOCK = G_OUI
+         WITRTOK      = G_NON
+         WIALLOBJLOCK = G_OUI
+       Endif
+       #---- Test si la société est lockée pour l'objet FAS  ----------------------#
+       WCOBJLOCK   = "FAS"
+       Gosub LOCK_SOC_OBJET
+       If WIUNOBJLOCK = G_OUI
+         WITRTOK      = G_NON
+         WIALLOBJLOCK = G_OUI
+       Endif
+       #---- Test si la société est lockée pour l'objet DEP  ----------------------#
+       WCOBJLOCK   = "DEP"
+       Gosub LOCK_SOC_OBJET
+       If WIUNOBJLOCK = G_OUI
+         WITRTOK      = G_NON
+         WIALLOBJLOCK = G_OUI
+       Endif
+    Endif
+  Endif
+
+Return
+####################################################################################################
+$LOCK_ALL
+Local Char    WCOBJLOCK
+Local Char    WCSOCTRT
+#------------------------------------------------------------------------------------------------##
+## Pour chaque société source, le traitement verrouille les contextes et les biens                ##
+##------------------------------------------------------------------------------------------------##
+  WSOC      = ""
+  WI1ERERR1 = G_NON
+
+  If WALLCPY = G_NON
+     #---- Si on traite une société   ----------------------#
+    If [M:GRTC]CLC(I_CPY) = G_OUI
+       WCSOCTRT=[M:GRTC]CPY(I_CPY)
+       WIUNOBJLOCK = G_NON
+       #---- Test si la société est lockée pour l'objet LOF ----------------------#
+       WICOBJLOCK   = "LOF"
+       Gosub LOCK_SOC_OBJET
+       If WIUNOBJLOCK = G_OUI
+         WITRTOK      = G_NON
+         WIALLOBJLOCK = G_OUI
+       Endif
+       #---- Test si la société est lockée pour l'objet FAS  ----------------------#
+       WCOBJLOCK   = "FAS"
+       Gosub LOCK_SOC_OBJET
+       If WIUNOBJLOCK = G_OUI
+         WITRTOK      = G_NON
+         WIALLOBJLOCK = G_OUI
+       Endif
+       #---- Test si la société est lockée pour l'objet DEP  ----------------------#
+       WCOBJLOCK   = "DEP"
+       Gosub LOCK_SOC_OBJET
+       If WIUNOBJLOCK = G_OUI
+         WITRTOK      = G_NON
+         WIALLOBJLOCK = G_OUI
+       Endif
+    Endif
+  Endif
+
+Return
+#=================================================================================
+####################################################################################################
+## LOCK_SOC_OBJET : Lock de la société d'un objet                                                 ##
+####################################################################################################
+$LOCK_SOC_OBJET
+Local Integer WILOCK
+Local Char WCOBJLOCKLG
+Local Char WCUSERLOCK (80)
+
+  #--- Test si les enregistrements de la société déjà lockés (WILOCK =0) ---##
+  #--- si non , lockage des enregistrements de la société  ---##
+  WILOCK =  func GLOBIENS.IS_SYMBOLE_LOCKED (WCOBJLOCK , WCSOCTRT  , "")
+
+  If WILOCK = 1
+      WILOCK =  func GLOBIENS.LOCK_SYMBOLE (WCOBJLOCK , WCSOCTRT  , "", 5 )
+  Elsif WILOCK = 0
+    If WI1ERERR1     = G_NON
+      WCLIGNE=""                                     :    Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+      WCLIGNE = string$(70,"=")                      :    Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+      WCLIGNE = string$(30," ") + mess(70,GML_MSGCIG,1) : Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+      WCLIGNE = string$(70,"=")                      :    Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+      WCLIGNE = string$(70,"=")                      :    Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+      WCLIGNE = string$(70,"=")                      :    Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+      WI1ERERR1     = G_OUI
+    Endif
+    #--- Recherche du nom de la table lockée --------------------------------------------------------------##
+    Read [F:ATB]ABRFIC = WCOBJLOCK
+    If [S]fstat =  0
+      # Décodification de l'intitulé qui a été récupéré sous forme de nombre
+      Call TEXTE([F:ATB]INTITFIC,WCOBJLOCKLG ) From OBJDIV
+    Endif
+    #--- Recherche de l'utilisateur qui lock --------------------------------------------------------------##
+    WCUSERLOCK = func GLOBIENS.QUI_LOCKE ()
+    WIUNOBJLOCK = G_OUI
+    #--- Edition de la ligne d'erreur           -----------------------------------------------------------##
+    WCLIGNE=   mess(72,GML_MSGREC,1) - "'" + WCOBJLOCKLG + "'" + " " + mess(73,GML_MSGREC,1) - WCSOCTRT   + '.    ' + WCUSERLOCK
+    Call ECR_TRACE_FIC("",GTRC_PARAM,WCLIGNE,0,1) From TRACEABX3
+  Endif
+
+Return
+####################################################################################################
+## $UNLOCK_ALL : Test si la société est lockée pour l'objet traité                                 ##
+####################################################################################################
+$UNLOCK_ALL
+Local Char    WCOBJLOCK
+Local Char    WCMESS1 (120)
+Local Char    WCMESS2 (120)
+Local Integer WINAMOBJ
+Local Integer WIALLOBJLOCK
+Local Integer WIUNOBJLOCK
+
+  WIUNOBJLOCK    = G_NON
+  WIALLOBJLOCK   = G_NON
+  WCSOCSOURCE    = ""
+  WI1ERERR1      = G_NON
+
+  WCOBJLOCK      = 'GRT'
+  WIUNOBJLOCK    = G_NON
+  Call  UNLOCK_SYMBOLE (WCOBJLOCK , "", "") From GLOBIENS
+  If WIUNOBJLOCK = G_OUI
+    WIALLOBJLOCK = G_OUI
+  Endif
+
+  WCOBJLOCK   = 'LOF'
+  WIUNOBJLOCK = G_NON
+  Call  UNLOCK_SYMBOLE (WCOBJLOCK , "", "") From GLOBIENS
+  If WIUNOBJLOCK = G_OUI
+    WIALLOBJLOCK = G_OUI
+  Endif
+  WCOBJLOCK   = 'FAS'
+  WIUNOBJLOCK = G_NON
+  Call  UNLOCK_SYMBOLE (WCOBJLOCK , "", "") From GLOBIENS
+  If WIUNOBJLOCK = G_OUI
+    WIALLOBJLOCK = G_OUI
+  Endif
+
+  WCOBJLOCK   = 'DEP'
+  Call  UNLOCK_SYMBOLE (WCOBJLOCK , "", "") From GLOBIENS
+  If WIUNOBJLOCK = G_OUI
+    WIALLOBJLOCK = G_OUI
+  Endif
+
+Return
+######################################################################################
+Subprog AS_INVPLN(VALEUR)
+Variable Char    VALEUR()
+Local Integer I
+
+  I=find(G_OUI,[M:GRTC]CLC(0..[M:GRTC]NBCPY-1))
+  If I > 0
+     Actzo [M:GRTC]INVPLN : Affzo [M:GRTC]INVPLN
+  Endif
+
+End
+######################################################################################
+Subprog AM_INVPLN(VALEUR)
+Variable Char    VALEUR()
+
+Local Integer I, J
+
+  If VALEUR <> ""
+    [M:GRTC]INVPLN=VALEUR
+    Read [ADI]CODE = GTD_INVPLN;VALEUR
+    If fstat =  0
+      GSOCACALC=[F:ADI]A1
+      I = find(GSOCACALC,[M:GRTC]CPY(0..[M:GRTC]NBCPY-1))
+      If I > 0
+        J=find(G_OUI,[M:GRTC]CLC(0..[M:GRTC]NBCPY-1))
+        If J > 0
+          [M:GRTC]CLC(J-1) = G_NON
+          Affzo[M:GRTC]CLC(J-1)
+        Endif
+        [M:GRTC]CLC(I-1) = G_OUI
+        Affzo[M:GRTC]CLC(I-1)
+      Else
+        # Il n'y a aucune société à traiter pour ce projet d'investissement
+        GMESSAGE = mess(97,GML_MSGGRT,1) :
+        GERR     = 1 : mkstat=2 : End
+      Endif
+    Else
+      # Il n'y a aucune société à traiter pour ce projet d'investissement
+      GMESSAGE = mess(97,GML_MSGGRT,1) :
+      GERR     = 1 : mkstat=2 : End
+    Endif
+  Else
+    # Vous devez choisir un projet d'investissement.
+    GMESSAGE = mess(109,GML_MSGGRT,1) :
+    GERR     = 1 : mkstat=2 : End
+  Endif
+
+End
+######################################################################################
+Subprog C_INVPLN(VALEUR)
+Variable Char    VALEUR()
+
+Local Integer I, J
+
+  If VALEUR <> ""
+    [M:GRTC]INVPLN=VALEUR
+    Read [ADI]CODE = GTD_INVPLN;VALEUR
+    If fstat =  0
+       GSOCACALC=[F:ADI]A1
+       I = find(GSOCACALC,[M:GRTC]CPY(0..[M:GRTC]NBCPY-1))
+       If I > 0
+          J=find(G_OUI,[M:GRTC]CLC(0..[M:GRTC]NBCPY-1))
+          If J > 0
+             [M:GRTC]CLC(J-1) = G_NON
+             Affzo[M:GRTC]CLC(J-1)
+          Endif
+          [M:GRTC]CLC(I-1) = G_OUI
+          Affzo[M:GRTC]CLC(I-1)
+       Else
+          # Il n'y a aucune société à traiter pour ce projet d'investissement
+          GMESSAGE = mess(97,GML_MSGGRT,1) :
+          GERR     = 1 : mkstat=2 : End
+       Endif
+    Else
+       # Il n'y a aucune société à traiter pour ce projet d'investissement
+       GMESSAGE = mess(97,GML_MSGGRT,1) :
+       GERR     = 1 : mkstat=2 : End
+    Endif
+  Else
+      # Vous devez choisir un projet d'investissement.
+      GMESSAGE = mess(109,GML_MSGGRT,1) :
+      GERR     = 1 : mkstat=2 : End
+  Endif
+
+End
+
+######################################################################################
+Subprog B1_NBCPY
+End
+######################################################################################
+Subprog C_CLC(VALEUR)
+Variable Integer VALEUR
+End
+######################################################################################
+Subprog AM_CLC(VALEUR)
+Variable Integer VALEUR
+Local Integer I
+
+If VALEUR = G_OUI
+  I = find(G_OUI,[M:GRTC]CLC(0..[M:GRTC]NBCPY-1))
+  If I <> 0
+    [M:GRTC]CLC(nolign-1) = G_NON
+    Affzo[M:GRTC]CLC(nolign-1)
+    GMESSAGE = mess(91,GML_MSGGRT,1) : # Vous devez cocher une société ou saisir un projet d'investissement.
+    GERR     = 1 : mkstat=2 : End
+  Else
+    Raz [M:GRTC]INVPLN
+    Actzo [M:GRTC]INVPLN
+  Endif
+Else
+  [M:GRTC]CLC(nolign-1) = VALEUR
+  I = find(G_OUI,[M:GRTC]CLC(0..[M:GRTC]NBCPY-1))
+  If I=0
+    Affzo[M:GRTC]INVPLN : Actzo [M:GRTC]INVPLN
+  Endif
+Endif
+
+End
+######################################################################################
+Subprog AM_FLGSIM(VALEUR)
+Variable Integer VALEUR
+Local Integer I
+
+[M:GRTC]FLGSIM = VALEUR
+Affzo[M:GRTC]FLGSIM
+
+End
+####################################################################################################
+###*** $CALCUL_SOC : Lancement du calcul pour chaque bien de la société traitée                   ##
+####################################################################################################
+$CALCUL_SOC
+Local Integer I, I_SOC
+Local Integer ERROR
+
+ I = find([F:FAS]CPY,[M:GRTC]CPY(0..[M:GRTC]NBCPY-1))
+ If I = 0 : Return : Endif
+ For I_SOC = 1 To [M:GRTC]NBCPY
+   If  [M:GRTC]CLC(I_SOC-1) = G_OUI
+     #Fq-74429 Filter[FAS] Where ( FLGCLC = G_OUI ) and ( CPY= [M:GRTC]CPY(I_SOC-1) )
+     #Fq-102296 Filter[FAS] Where ( FLGCLC = G_OUI ) and ( CPY= [M:GRTC]CPY(I_SOC-1) ) and ( ISSFIYPRE <> G_OUI )
+     #          Remarque : pour des besoins de performance un index d'optimisation peut être ajouté sur FXDASSETS
+     #                     avec les colonnes INVPLN+FLGCLC+ENAFLG
+     Filter[FAS] Where ( INVPLN = [M:GRTC]INVPLN ) and ( FLGCLC = G_OUI ) and ( ENAFAS = G_OUI ) and ( ISSFIYPRE <> G_OUI )
+     For [FAS]
+       Call CALCULER_BIEN ([F:FAS]CPY, [F:FAS]AASREF, ERROR) From GLOBI
+     Next
+     Filter[FAS]
+   Endif
+ Next I_SOC
+
+Return
+####################################################################################################
+###*** Calcul du montant réintégration exercice
+####################################################################################################
+$CALCUL_REINTEGRATION_EXERCICE
+Local Decimal WFCRBAMT,WFCRBCUM
+Local Decimal WGCRBAMT,WGCRBCUM
+Local Decimal WGCRBAMT, WGCRBCUM
+Local Decimal WRESCRB, WRESCRBC, WRESTE
+Local Decimal WTOTCRB, WCUMCRB
+Local Date    WDATEFF, WDATCPTINT
+
+  If clalev([F:GRTS])=0   : Local File GRANTS      [GRTS]   : Endif
+
+  Filter [GRT] Where (evalue(CRITERE)) Order By INVPLN Asc
+  For [GRT] With Stability
+    [F:GRTS] = [F:GRT]
+    WFCRBAMT=0
+    WFCRBCUM=0
+    # calcul du montant de réintégration pour chaque subvention liée au projet d'investissement
+    #------------------------------------------------------------------
+    #
+    Filter[FAS]Where INVPLN = [F:GRT]INVPLN
+    For [FAS]
+      Read [LOF]LOF6 = [F:FAS]AASREF      #*Contrôle que le bien a au moins une dépense rattachée
+      If fstat=0
+        WFCRBAMT += [F:FAS]CRBGRAAMT
+        WFCRBCUM += [F:FAS]CRBGRACUM
+      Endif
+    Next # [FAS]
+    Filter [FAS]
+
+    If [M:GRTC]FLGSIM <> G_OUI & GTOTGRAAMT <> 0
+      WGCRBAMT =   WFCRBAMT*([F:GRT]GRAAMT/GTOTGRAAMT)
+      Call GET_MNT_ARRONDI(WGCRBAMT ,[F:GRT]CUR,WGCRBAMT ) From GLOBIENS
+      WTOTCRB +=WGCRBAMT
+      WRESCRB = WFCRBAMT - WTOTCRB
+      If WRESCRB > 0 & WRESCRB < 1
+        WTOTCRB  -=WGCRBAMT
+        #FQ102434 WGCRBAMT +=WRESTE
+        WGCRBAMT +=WRESCRB
+        WTOTCRB  +=WGCRBAMT
+      Endif
+      Call GET_MNT_ARRONDI(WGCRBAMT ,[F:GRT]CUR,WGCRBAMT ) From GLOBIENS
+      [F:GRT]CRBGRAAMT=WGCRBAMT
+      #*Fq-82221 : déplacé après écriture des événements
+      #      Rewrite[GRT]
+      #        If fstat <>0
+      #          GOK = 0 : Call FSTA("GRT") From GLOCK : Break
+      #        Endif
+    Endif
+    #-------------------------------------------------------------
+    # 4-Génération d'un évènement de type "Actualisation de Subvention"
+    #------------------------------------------------------------------
+    If [M:GRTC]FLGSIM <> G_OUI and GOK <> 0
+      If  ( [F:GRT]GRAAMT    <> [F:GRTS]GRAAMT        or
+&       [F:GRT]INVGRAAMT <> [F:GRTS]INVGRAAMT     or
+&       [F:GRT]REAGRAAMT <> [F:GRTS]REAGRAAMT )
+        # Evénement sur plan Comptable
+        LCDINT= "GRTCRT"+num$(G301CPT)
+        G_GRAAMT         = [F:GRT]GRAAMT    - [F:GRTS]GRAAMT
+        G_INVGRAAMT      = [F:GRT]INVGRAAMT - [F:GRTS]INVGRAAMT
+        G_REAGRAAMT      = [F:GRT]REAGRAAMT - [F:GRTS]REAGRAAMT
+        GREASON = mess(93,GML_MSGGRT,1)
+        WDATEFF=date$
+        WDATCPTINT = max (WDATEFF, GPERENDDAT)
+        Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,WDATEFF,WDATCPTINT,LCDRET)  From GENEVE
+        If (LCDRET > 20 )
+          GOK = 0
+          Call FSTA("EGRTCRT") From GLOCK
+        Endif
+        # Evénement sur plan IAS/IFRS
+        If G_ACTIAS = G_OUI & GCNXPROIAS = G_OUI
+           LCDINT= "GRTCRT"+num$(G301IAS)
+           G_GRAAMT         = [F:GRT]GRAAMT    - [F:GRTS]GRAAMT
+           G_INVGRAAMT      = [F:GRT]INVGRAAMT - [F:GRTS]INVGRAAMT
+           G_REAGRAAMT      = [F:GRT]REAGRAAMT - [F:GRTS]REAGRAAMT
+           GREASON = mess(93,GML_MSGGRT,1)
+           WDATEFF=date$
+           WDATCPTINT = max (WDATEFF, GPERENDDATI)
+           Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,WDATEFF,WDATCPTINT,LCDRET)  From GENEVE
+           If (LCDRET > 20 )
+             GOK = 0
+             Call FSTA("EGRTCRT") From GLOCK
+           Endif
+         Endif
+       Endif
+       #-------------------------------------------------------------
+       # 4-Génération d'un évènement de type "Réintégration de Subvention"
+       #------------------------------------------------------------------
+       If ( [F:GRT]CRBGRAAMT <> [F:GRTS]CRBGRAAMT or  [F:GRT]CRBGRACUM <> [F:GRTS]CRBGRACUM )
+         G_CRBGRAAMT      = [F:GRT]CRBGRAAMT - [F:GRTS]CRBGRAAMT
+         G_CRBGRACUM      = [F:GRT]CRBGRACUM - [F:GRTS]CRBGRACUM
+         # Evénement sur plan Comptable
+         LCDINT= "GRTCRB"+num$(G301CPT)
+         GREASON = mess(106,GML_MSGGRT,1)
+         WDATEFF=date$
+         WDATCPTINT = GPERENDDAT
+         Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,WDATEFF,WDATCPTINT,LCDRET)  From GENEVE
+         If (LCDRET > 20 )
+           GOK = 0
+           Call FSTA("EGRTCRB") From GLOCK
+         Endif
+         If G_ACTIAS = G_OUI & GCNXPROIAS = G_OUI
+           # Evénement sur plan IAS/IFRS
+           LCDINT= "GRTCRB"+num$(G301IAS)
+           GREASON = mess(106,GML_MSGGRT,1)
+           WDATEFF=date$
+           WDATCPTINT = GPERENDDATI
+           Call GENER_EVE (GVML_OMSUBV,[F:GRT]CPY,[F:GRT]FCY,[F:GRT]GRAREF,0,LCDINT,WDATEFF,WDATCPTINT,LCDRET)  From GENEVE
+           If (LCDRET > 20 )
+             GOK = 0
+             Call FSTA("EGRTCRB") From GLOCK
+           Endif
+         Endif
+       Endif
+    Endif
+    #*Fq-8221 après écriture des événements
+    Rewrite[GRT]
+    If fstat <>0
+      GOK = 0 : Call FSTA("GRT") From GLOCK : Break
+    Endif
+   Next #[GRT]
+   Filter[GRT]
+
+Return
+####################################################################################################
+$ECR_ENTETE_PROJ
+
+   #========en tête projet =======
+   LIGNE = space$(115)
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+   LIGNE = "  "+(mess(80,GML_MSGGRT,1))+" "+num$([F:GRT]INVPLN)+"  " +num$(SINVPLND )
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+   LIGNE = "  "+string$(6,"-")
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+   LIGNE = space$(52)+string$(63,"-")
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+   LIGNE = space$(61)
+   LIGNE += mess(76,GML_MSGGRT,1)+space$(15)+mess(77,GML_MSGGRT,1)+space$(12)+mess(78,GML_MSGGRT,1)
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+   LIGNE = space$(52)+string$(63,"-")
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+
+Return
+####################################################################################################
+$ECR_LIGNE_REEL
+
+   #*Fq-91676
+   LIGNE = "  "+left$([F:GRT]GRAREF+space$(20),20)+space$(13)
+   LIGNE+=left$([F:GRT]DES+space$(15),15)+" "+space$(1)
+   LIGNE+=space$(18-len(format$('N:'+GFMT3,[F:GRT]GRAAMT)))+format$('N:'+GFMT3,[F:GRT]GRAAMT)
+   If NBGRT = 1
+      LIGNE+=space$(22-len(format$('N:'+GFMT3,[F:GRT]REAGRAAMT)))+format$('N:'+GFMT3,[F:GRT]REAGRAAMT)
+      LIGNE+=space$(22-len(format$('N:'+GFMT3,[F:GRT]INVGRAAMT)))+format$('N:'+GFMT3,[F:GRT]INVGRAAMT)
+   Endif
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+
+Return
+####################################################################################################
+$ECR_LIGNE_SIMUL
+
+   #*Fq-91676
+   LIGNE = "  "+left$([F:GRT]GRAREF+space$(20),20)+space$(13)
+   LIGNE+=left$([F:GRT]DES+space$(15),15)+" "+space$(1)
+   LIGNE+=space$(18-len(format$('N:'+GFMT3,WGGRAAMT)))+format$('N:'+GFMT3,WGGRAAMT)
+   If NBGRT = 1
+      LIGNE+=space$(22-len(format$('N:'+GFMT3,WREAGRAAMT)))+format$('N:'+GFMT3,WREAGRAAMT )
+      LIGNE+=space$(22-len(format$('N:'+GFMT3,WINVGRAAMT)))+format$('N:'+GFMT3,WINVGRAAMT)
+   Endif
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+
+Return
+####################################################################################################
+$ECR_LIGNE_TOTAL_GRT
+
+   LIGNE = space$(55)+string$(15,"-")
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+   LIGNE = space$(33)+(mess(90,GML_MSGGRT,1))+space$(10)
+   LIGNE+=space$(22-len(format$('N:'+GFMT3,WTOTGRAAMT)))+format$('N:'+GFMT3,WTOTGRAAMT)
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+
+Return
+####################################################################################################
+$ECR_LIGNE_TITRE
+
+   LIGNE = space$(52)+string$(63,"-")
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+   LIGNE ="  "+(mess(84,GML_MSGGRT,1)) +space$(44)
+   LIGNE += mess(82,GML_MSGGRT,1)+space$(9)+mess(83,GML_MSGGRT,1)+space$(5)+mess(81,GML_MSGGRT,1)
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+   LIGNE = "  "+string$(8,"-")+space$(42)+string$(63,"-")
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+
+Return
+####################################################################################################
+$ECR_LIGNE_DETAIL
+
+   #*Fq-91676
+   LIGNE = "  "+left$(WNUMLOF+space$(24),24)+"        "+space$(1)
+   LIGNE+=left$([F:LOF]DES+space$(15),15)+" "+space$(1)
+   LIGNE+=space$(18-len(format$('N:'+GFMT3,[F:LOF]AMTNOTCPY)))+format$('N:'+GFMT3,[F:LOF]AMTNOTCPY)
+   LIGNE+=space$(16)+mess([F:LOF]FLGGRA,1,1)
+   LIGNE+=space$(25-len(format$('N:'+GFMT3,[F:LOF]AMTGRA)))+format$('N:'+GFMT3,WLGRAAMT)
+   Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+
+Return
+####################################################################################################
+$ECR_LIGNE_TOTAL_LOF
+
+    #*Fq-91676
+    LIGNE = space$(55)+string$(15,"-")+space$(30)+string$(15,"-")
+    Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+    LIGNE =space$(33)+(mess(90,GML_MSGGRT,1))+space$(12)
+    LIGNE+=space$(20-len(format$('N:'+GFMT3,WMTTOTLOF)))+format$('N:'+GFMT3,WMTTOTLOF)
+    LIGNE+=space$(22)+space$(22-len(format$('N:'+GFMT3,WTOTLOF)))+format$('N:'+GFMT3,WTOTLOF)
+    Call ECR_TRACE_FIC("",GTRC_CRACTIO,LIGNE,0,1) From TRACEABX3
+
+Return
+#--FQ102516_4 ###################################################################################################
+#**
+#* Objet : Ce sous-programme ( si les conditions sont réunies )
+#*         effectue le passage d'un mode non résiduel à son mode résiduel cible paramétré,
+#*         et dans ce dernier cas, génère un événement de changement de méthode si PEVE est à "OUI"
+#*
+#* Contraintes :
+#*         Les variables globales GFAS, GDPN, GDPO ne doivent pas exister
+#*         L'abréviation fichier "WWW" ne doit pas être déjà utilisée.
+#*
+#* @param PSTG   Stratégie d'amortissement pour la société traitée (valeur du paramètre GRTDVEREG)
+#* @param PFAS   Abréviation fichier FXDASSETS
+#* @param PDEP   Abréviation fichier DEPREC
+#* @param PEVE   Génération des événements (G_OUI/G_NON)
+#* @param PDATE  Date de comptabilisation de l'événement
+#* @param RTRN
+#*!
+Subprog DPC_DVE_REG(PSTG, PFAS, PDEP, PEVE, PDATE, RTRN)
+Value integer    PSTG      : # Stratégie d'amortissement pour la société traitée
+Value Char       PFAS      : # Abréviation fichier FXDASSETS
+Value Char       PDEP      : # Abréviation fichier DEPREC
+Value Integer    PEVE      : # Génération des événements (G_OUI/G_NON)
+Value Date       PDATE     : # Date de comptabilisation de l'événement
+Variable Integer RTRN
+
+Local Integer LCDRET
+Local Char    LCDINT(10)
+# Issue 114266 LOCAL Char    L_RSDDPMTGR(2)
+Local Char    L_RSDDPMTGR(GLONDPM)
+Local Integer L_RSDPRATYP(15)
+Local Integer L_RSD(1)   # Passage en mode résiduel ?
+
+  RTRN  = 0 :          # OK
+  L_RSD = G_NON
+
+  If find(PFAS, fileabre(1..dim(fileabre))) =0 : RTRN= 2 : End  : Endif  : # La classe FXDASSETS n'existe pas
+  If find(PDEP, fileabre(1..dim(fileabre))) =0 : RTRN= 3 : End  : Endif  : # La classe DEPREC    n'existe pas
+
+  If dim(GFAS)>0 : If dim(SV_GFAS)>0 : Kill SV_GFAS : Endif : Local Char SV_GFAS : SV_GFAS=GFAS : Else : Global Char GFAS : Endif
+  If dim(GDPO)>0 : If dim(SV_GDPO)>0 : Kill SV_GDPO : Endif : Local Char SV_GDPO : SV_GDPO=GDPO : Else : Global Char GDPO : Endif
+  If dim(GDPN)>0 : If dim(SV_GDPN)>0 : Kill SV_GDPN : Endif : Local Char SV_GDPN : SV_GDPN=GDPN : Else : Global Char GDPN : Endif
+
+  GFAS = "[F:"+PFAS+"]"
+  GDPO = "[F:WWW]"
+  GDPN = "[F:"+PDEP+"]"
+
+  # Affectation MTCTIATYP, MTCTIADAT, MTCDPEDAT en fonction de la stratégie  (ML 3298)
+  Case PSTG
+    When GVML_FIYDVE # Prospective, Prise d’effet début d’exercice
+      Assign GDPN+"MTCTIATYP"   With  GVML_PEDBEX
+      Assign GDPN+"MTCTIADAT"   With  max(evalue(GDPN+"STRDPRDAT"), evalue(GDPN+"FIYSTRDAT"))
+      Assign GDPN+"MTCDPEDAT"   With  max(evalue(GDPN+"STRDPRDAT"), evalue(GDPN+"FIYSTRDAT"))
+      Assign GDPN+"MTCDEVADJ"   With  0
+    When GVML_PERDVE # Prospective, Prise d’effet début de période
+      Assign GDPN+"MTCTIATYP"   With  GVML_PEDBPE
+      Assign GDPN+"MTCTIADAT"   With  max(evalue(GDPN+"STRDPRDAT"), evalue(GDPN+"PERSTRDAT"))
+      Assign GDPN+"MTCDPEDAT"   With  max(evalue(GDPN+"STRDPRDAT"), evalue(GDPN+"PERSTRDAT"))
+      Assign GDPN+"MTCDEVADJ"   With  0
+    When GVML_PERREG # Rattrapage immédiat sur la période
+      Assign GDPN+"MTCTIATYP"   With  GVML_PEDBAM
+      Assign GDPN+"MTCTIADAT"   With  evalue(GDPN+"STRDPRDAT")
+      Assign GDPN+"MTCDPEDAT"   With  evalue(GDPN+"STRDPRDAT")
+      Assign GDPN+"MTCDEVADJ"   With  GVML_RDOTPER
+    When GVML_EXCREG # Rattrapage immédiat sur la période (dotation exceptionnelle)
+      Assign GDPN+"MTCTIATYP"   With  GVML_PEDBAM
+      Assign GDPN+"MTCTIADAT"   With  evalue(GDPN+"STRDPRDAT")
+      Assign GDPN+"MTCDPEDAT"   With  evalue(GDPN+"STRDPRDAT")
+      Assign GDPN+"MTCDEVADJ"   With  GVML_REXCPER
+  Endcase
+
+  If evalue(GDPN+"MTCTIATYP") = GVML_PEDBEX
+    If evalue(GDPN+"STRDPRDAT") < evalue(GDPN+"FIYSTRDAT")
+      # Passage en résiduel
+      L_RSD = G_OUI
+      # PERREFCLC= date début exercice
+      Assign GDPN+"PERREFCLC"  With evalue(GDPN+"FIYSTRDAT")
+      Assign GDPN+"PERREFCLCI" With evalue(GDPN+"FIYSTRDAT")
+      Assign GDPN+"PERREFCLCT" With evalue(GDPN+"FIYSTRDAT")
+    Endif
+  Endif
+
+  If   evalue(GDPN+"MTCTIATYP") = GVML_PEDBPE
+    If evalue(GDPN+"STRDPRDAT") < evalue(GDPN+"FIYSTRDAT") or
+&     (evalue(GDPN+"STRDPRDAT") >= evalue(GDPN+"FIYSTRDAT")) and (evalue(GDPN+"STRDPRDAT") < evalue(GDPN+"PERSTRDAT"))
+      # Passage en résiduel
+      L_RSD = G_OUI
+      # PERREFCLC= date début période
+      Assign GDPN+"PERREFCLC"  With evalue(GDPN+"PERSTRDAT")
+      Assign GDPN+"PERREFCLCI" With evalue(GDPN+"PERSTRDAT")
+      Assign GDPN+"PERREFCLCT" With evalue(GDPN+"PERSTRDAT")
+    Endif
+  Endif
+  #----------------------------
+  # Passage en mode résiduel
+  #----------------------------
+  If L_RSD = G_OUI and (evalue(GDPN+"LSTCLODAT") <> [0/0/0])
+    # Lecture du mode et récupération du mode résiduel
+    If !clalev([F:DPM]) : Local File DPRMOD [DPM] : Endif
+    Read [DPM]DPM0=evalue("[F:"+PDEP+"]"+"DPM");""
+    If !(fstat)
+      L_RSDDPMTGR = [F:DPM]RSDDPMTGR
+      L_RSDPRATYP = [F:DPM]PRATYPTGR
+    Else
+      RTRN = 8 : End  : # Mode d'amortissement inconnu
+    Endif
+    If evalue("[F:"+PDEP+"]DPM") = L_RSDDPMTGR
+      RTRN = -1 : End  : # Le mode d'amortissement est déjà en résiduel. On ne fait rien, ce n'est pas une erreur
+    Endif
+    #---------
+    # Le mode non résiduel passe à résiduel cible et sauvegarde du mode origine
+    Assign GDPN+"DPM"    With L_RSDDPMTGR
+    Assign GDPN+"PRATYP" With L_RSDPRATYP
+    #---------------------------
+    # Génération des événements uniquement si le paramètre PEVE est à oui.
+    If ( PEVE = G_OUI )
+      #---------
+      If !clalev([WWW])
+        Local File DEPREC [WWW]
+        Read [WWW]DEP0= evalue(GDPN+"AASREF");evalue(GDPN+"DPRPLN");evalue(GDPN+"FIYENDDAT");evalue(GDPN+"PERENDDAT")
+        If (fstat)
+          Close Local File [WWW]
+          Kill GFAS, GDPO, GDPN
+          RTRN = 6 : End : # Paramètres incohérents
+        Endif
+      Else
+        Kill GFAS, GDPO, GDPN
+        RTRN = 7 : End : # Classe [F:WWW] déjà ouverte
+      Endif
+      LCDINT= "FASMTC"+num$(evalue(GDPN+"DPRPLN"))
+      Call GENER_EVE (GVML_OMBIEN, evalue(GFAS+"CPY"), evalue(GFAS+"FCY"), evalue(GFAS+"AASREF"),0,LCDINT,PDATE,PDATE,LCDRET)
+&          From GENEVE
+      If (LCDRET > 20)
+        # Erreur technique
+        Kill GFAS, GDPO, GDPN
+        Close Local File [WWW]
+        RTRN = LCDRET  # Erreur à la génération de l'événement
+      Endif
+    Endif
+    Close Local File [WWW]
+  Endif
+  #---------
+  If dim(SV_GFAS)>0 : GFAS=SV_GFAS : Else : Kill GFAS : Endif
+  If dim(SV_GDPO)>0 : GFAS=SV_GDPO : Else : Kill GDPO : Endif
+  If dim(SV_GDPN)>0 : GFAS=SV_GDPN : Else : Kill GDPN : Endif
+
+End
+####################################################################################################
+# Avant $FQ102516_4 ==> A SUPPRIMER
+##=================================================================================
+### 3- Ventilation de la subvention sur les dépenses subventionnées
+###  - Mise à jour du montant subventionné sur chaque bien auxquelles sont rattachées les dépenses subventionnées
+###  - Mise à jour de la base des plans de subvention des biens subventionnés
+##=================================================================================
+$FQ102516_4_A_SUPPRIMER
+
+If GOK
+  SINVPLN    = ""
+  WMTTOTLOF  = 0
+  WTOTAMT    = 0
+  NBGRT      = 0
+  WRESTE     = 0
+
+  Filter [GRT] Where (evalue(CRITERE)) Order By INVPLN Asc
+  For [GRT] With Stability
+    NBGRT+=1
+    WFCRBAMT   = 0
+    WFCRBCUM   = 0
+    WRESCRB    = 0
+    WTOTCRB    = 0
+    WGCRBAMT   = 0
+    WGCRBCUM   = 0
+
+    If  NBGRT=1
+      Gosub ECR_LIGNE_TITRE
+    Endif
+    #------------------------------------------------------
+    #*Fq-82221  Filter [LOF] Where (CPY=[F:GRT]CPY) & (PLNINV=[F:GRT]INVPLN) & (FLGGRA=G_OUI) Order By CODLOF
+    Filter [LOF] Where (CPY=[F:GRT]CPY) & (PLNINV=[F:GRT]INVPLN) & (FLGGRA=G_OUI) Order By AASREF Asc ; CODLOF Asc
+    #------------------------------------------------------
+    For [LOF] With Stability
+      WNUMLOF  = sum(num$([F:LOF]CODLOF),num$("/"),num$([F:LOF]LINLOF))
+      # si montant subventionné non forcé
+      If ([F:LOF]FLGAMTGRA <> G_OUI)
+        WLGRAAMT    = 0
+        If ([F:LOF]FLGGRA = G_OUI) & (WSOLDEP <> 0)
+          # FQ105649   [F:LOF]AMTNOTCPY remplacé par le même + TVAF - TVAR
+          # WLGRAAMT =  WMTVENTIL *([F:LOF]AMTNOTCPY/WSOLDEP)   # (A*Montant HT converti)/B
+          # If WLGRAAMT > [F:LOF]AMTNOTCPY
+          #   WLGRAAMT=[F:LOF]AMTNOTCPY
+          WMTLOFTVAFR = [F:LOF]AMTNOTCPY + [F:LOF]AMTVATCPY - [F:LOF]AMTVATRCPY
+          WLGRAAMT =  WMTVENTIL *(WMTLOFTVAFR/WSOLDEP)   # (A*Montant HT converti)/B
+          #**>Fq-38555
+          If WLGRAAMT > WMTLOFTVAFR
+            WLGRAAMT = WMTLOFTVAFR
+            # <FQ105649
+          Else
+            If WLGRAAMT < 0
+              WLGRAAMT=0
+            Endif
+          Endif
+          #**<Fq-38555
+        Else
+          WLGRAAMT=0
+        Endif
+
+        Call GET_MNT_ARRONDI(WLGRAAMT,[F:LOF]CUR,WLGRAAMT) From GLOBIENS
+        WTOTAMT +=WLGRAAMT
+        WRESTE = WMTVENTIL - WTOTAMT
+        If WRESTE > 0 & WRESTE < 1
+          WTOTAMT  -=WLGRAAMT
+          WLGRAAMT +=WRESTE
+          WTOTAMT  +=WLGRAAMT
+        Endif
+        WTOTLOF +=WLGRAAMT
+        #---------------------------
+        If  ([M:GRTC]FLGSIM <>  G_OUI)
+          If WLGRAAMT <> 0
+            [F:LOF]AMTGRA=WLGRAAMT
+            Rewrite [LOF]
+            If fstat<>0
+              GOK = 0 : Call FSTA("LOF") From GLOCK : Break
+            Endif
+          Endif
+          #---------------------------
+        Endif
+      Else
+        WLGRAAMT =  [F:LOF]AMTGRA
+        WTOTLOF +=  WLGRAAMT
+      Endif
+      If NBGRT = 1
+        #------------- simulation ------------------------------------------
+        Gosub ECR_LIGNE_DETAIL
+      Endif
+      #-------------------------------------------------------
+      WMTTOTLOF += [F:LOF]AMTNOTCPY
+      WFGRAAMT = 0
+      #--------------------------------
+      If [F:LOF]AASREF <>""
+        Read [F:FAS]FAS0=[F:LOF]AASREF
+        If  [F:FAS]ISSFIYPRE <> G_OUI #Fq-74429
+          [F:FAS]GRAAMT +=WLGRAAMT
+          Call GET_MNT_ARRONDI ([F:FAS]GRAAMT, [F:FAS]ACGCUR, RMONTANT) From GLOBIENS
+          WFGRAAMT = RMONTANT
+          #FQ102516_1 déplacé pour tenir compte du paramètre  GRTPRVUPD
+          #FQ102516_1 If  [M:GRTC]FLGSIM <> G_OUI
+          #FQ102516_1   [F:FAS]GRAAMT = WFGRAAMT
+          #FQ102516_1   [F:FAS]FLGCLC = G_OUI
+          #FQ102516_1   [F:FAS]FLGCNXCLC(0) = G_OUI
+          #FQ102516_1   #On initialise le projet sur le bien comptable dans le cas où il n'est pas déjà renseigné
+          #FQ102516_1   If [F:FAS]INVPLN = ""
+          #FQ102516_1     [F:FAS]INVPLN=[F:LOF]PLNINV
+          #FQ102516_1   Endif
+          #FQ102516_1   Rewrite [FAS]
+          #FQ102516_1   If fstat <>0
+          #FQ102516_1     GOK = 0 : Call FSTA("FAS") From GLOCK : Break
+          #FQ102516_1   Endif
+          #FQ102516_1 Endif
+        Endif #Fq-74429
+        Read [CNX]CNX0 = [F:GRT]CPY;G300CPFI
+        WPLN = G301SUB
+        If fstat = 0
+           #-------------------------------------------------------
+           Local Date    RCNXDAT(1..5)
+           Local Integer RCRET, RCOD
+           Call GET_CNX_DAT([F:GRT]CPY,[F:CNX]CNX,RCNXDAT,RCRET) From GLOBIENS
+           #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+           # Lecture période courante du plan de subvention
+           Read[DEP]DEP0=[F:FAS]AASREF; WPLN; RCNXDAT(2); RCNXDAT(4)
+           If fstat = 0
+             #* ------------------------------------------------------------
+              # si remise en cause situation antérieure à oui ou
+              # Date de début d'amortissement dans l'exercice courant
+             #*Fq-91694  et que la base d'amortissement a changé
+             #* ------------------------------------------------------------
+             If (GRTPRVUPD = G_OUI) or ([F:DEP]STRDPRDAT >= RCNXDAT(1))
+               #FQ91694 If  [F:DEP]LSTCLODAT <> [0/0/0]
+               #FQ94788   WB_DPRBAS_CHG_STD
+               #------------------------------------------------
+               WB_DPRBAS_CHG_STD = 1
+                GPOINT = "DPRBAS_CHG" : Gosub ENTREE From EXEFNC
+               #------------------------------------------------
+               If WB_DPRBAS_CHG_STD
+                 #FQ102516_4 If  [F:DEP]LSTCLODAT <> [0/0/0] and WFGRAAMT <>  [F:DEP]DPRBAS
+                 If ( [F:DEP]DPRBAS <> 0 and [F:FAS]GRAAMT >=  [F:DEP]DPRBAS)  and   [F:DEP]LSTCLODAT <> [0/0/0]
+                    MESSA=""
+                    #--FQ102516_4  Call MTC_NRSD_RSD("FAS", "DEP", G_OUI, RCNXDAT(3), RCOD) From TRTFAS
+                    #--FQ102516_4  Nouvelle fonction incluant la prise en compte des stratégies de rattrapage d'écart
+                    Call DPC_DVE_REG(G_GRTDVEREG, "FAS", "DEP", G_OUI, RCNXDAT(3), RCOD)
+                    # Si erreur
+                    If ( RCOD > 20 )
+                      MESSA = mess(107,7773,1)-" FASMTC - RCOD="+num$(RCOD)
+                    Else
+                     If (find(RCOD, 2, 3, 8) > 0)
+                        MESSA = mess(7,21,1)-" : "-mess(181,7770,1)-" "-[F:FAS]AASREF
+                     Endif
+                   Endif
+                   If RCOD > 0
+                      #--- Edition de la ligne d'erreur ----------------------##
+                     Call ECR_TRACE_FIC ("",GTRC_CRERREU,MESSA,1,1) From TRACEABX3
+                     GOK = 0
+                     Break
+                   Endif  #--/FQ102516_4
+                   #*FQ102516_3 [F:DEP]MTCDPEDAT = RCNXDAT(3) # Début période courante
+                Endif
+               Endif
+               If  [M:GRTC]FLGSIM <> G_OUI
+                  [F:FAS]GRAAMT = WFGRAAMT
+                  [F:FAS]FLGCLC = G_OUI
+                  [F:FAS]FLGCNXCLC(0) = G_OUI
+                 #--FQ102516_1 On initialise le projet sur le bien comptable dans le cas où il n'est pas déjà renseigné
+                 If [F:FAS]INVPLN = ""
+                   [F:FAS]INVPLN=[F:LOF]PLNINV
+                  Endif
+                  Rewrite [FAS]
+                  If fstat <>0
+                    GOK = 0 : Call FSTA("FAS") From GLOCK : Break
+                 Endif
+               Endif #--/FQ102516_1
+               #--FQ102516_1 Endif
+               [F:DEP]DPRBAS  = WFGRAAMT
+               If [F:DEP]BSEVAL = 0
+                 [F:DEP]BSEVAL  = WFGRAAMT
+               Endif
+               WFCRBCUM     += [F:DEP]ENDDPE
+              Endif
+              # -------------------------------
+             If  [M:GRTC]FLGSIM <>  G_OUI & NBGRT = 1
+              #*Fq-91694    If  [F:DEP]LSTCLODAT <> [0/0/0]
+              #*Fq-91694      Call MTC_NRSD_RSD("FAS", "DEP", G_OUI, RCNXDAT(3), RCOD) From TRTFAS
+              #*Fq-91694      [F:DEP]MTCDPEDAT = RCNXDAT(3) # Début période courante
+              #*Fq-91694    Endif
+              #*FQ102516_3 [F:DEP]DEPSTA  = GVML_SCNOCAL
+               Rewrite [DEP]
+                If fstat<>0
+                  GOK = 0 : Call FSTA("DEP") From GLOCK : Break
+                Endif
+              Endif
+           Endif
+          Endif
+        Endif
+        #--------------------------------
+      Next
+      Filter[LOF]
+      If  NBGRT =1
+        Call GET_MNT_ARRONDI(WTOTLOF,[F:LOF]CUR,WTOTLOF) From GLOBIENS
+        Gosub ECR_LIGNE_TOTAL_LOF
+      Endif
+      WAMTNOTCPY = 0
+      WAMTGRA    = 0
+      WTOTLOF    = 0
+    Next
+    Filter[GRT]
+  Endif
+
+  #--FQ102516_4 Commit
+  If GOK :  Commit :   Else :  Rollback :   Endif
+
+Return
+

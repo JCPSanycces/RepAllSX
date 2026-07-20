@@ -1,0 +1,516 @@
+#<AdxTL>@(#)12.0.0.0 $Revision$
+#--------------------------------------------------------------------------------------------------------
+# TRTRETCAL : Calculs sur rétroactivité
+#             Appelés depuis les traitements générés du plan de paye si on est en mode de calcul "RETRO"
+#--------------------------------------------------------------------------------------------------------
+End
+
+####################################
+$DECLARATION_RETRO
+Local Integer RETRO_MAXRUB
+[L]RETRO_MAXRUB = func AFNC.ACTIV('RRUB')
+Local Char RETRO_TRUBCOD([V]GLONRUB)(1..[L]RETRO_MAXRUB)
+Local Decimal RETRO_TRAPSAL(1..[L]RETRO_MAXRUB), RETRO_TRAPPAT(1..[L]RETRO_MAXRUB)
+Local Integer RETRO_NBRUB, RETRO_POS, RETRO_RAPPEL, OK_RETRO, RETRO, RETRO_RECHERCHE
+Local Integer VALEUR_TROUVEE
+Local Char NOMVAR(250)
+Local Decimal VALVAR
+Local Char CRIREC(250)
+Local Date RETDATPAY    ###**72216
+Return
+
+####################################
+$CHARGE_RAPPEL
+# Optimisation : on charge en mémoire les rappels à effectuer pour le bulletin qu'on calcule
+# => Rappel pour le salarié, sur ce contrat, qui n'ont pas été pris en compte et dont la date
+#    d'intégration est <= date de paye
+[L]RETRO_RAPPEL = 0                        : # Sera testé sur chaque rubrique
+If [L]RETRO : Return : Endif               : # On ne prends pas en compte les fiches de rétroactivité
+                                             # sur un recalcul de paye pour générer une fiche de rétroactivité
+                                             # Choix discutable mais rien n'est précisé sur la méthode
+                                             # à utiliser.
+
+Raz [L]RETRO_TRUBCOD, [L]RETRO_TRAPSAL, [L]RETRO_TRAPPAT, [L]RETRO_NBRUB
+
+# => Cas du recalcul d'un bulletin sur lequel il y a des rappels, il faut aller les retrouver ....
+[L]CRIREC = "[F:REC]RECBUL = [F:VEP]BUL"
+Gosub SET_CRIREC
+Gosub LECTURE_RAPPEL
+If [V]GOK < 1 : Return : Endif
+
+# => Et maintenant tous les rappels non pris en compte
+[L]CRIREC = "[F:REC]RECBUL = ''"
+Gosub SET_CRIREC
+Gosub LECTURE_RAPPEL
+If [V]GOK < 1 : Return : Endif
+Return
+
+####################################
+$SET_CRIREC
+[L]CRIREC += "&"
+[L]CRIREC += "[F:REC]RECREFNUM = [F:HRCTR]REFNUM"
+[L]CRIREC += "&"
+[L]CRIREC += "[F:REC]RECCTRNUM = [F:HRCTR]CTRNUM"
+[L]CRIREC += "&"
+[L]CRIREC += "[F:REC]RECDATMININT <= [F:VEP]PYRDAT"
+[L]CRIREC += "&"
+[L]CRIREC += "[F:REC]RECRUBCOD <> ''"
+Return
+
+####################################
+$LECTURE_RAPPEL
+Filter [F:REC] Where evalue([L]CRIREC)
+For [F:REC]REC1 With Lock
+    [L]RETRO_RECHERCHE = 2
+    # Si le rappel n'est pas "lié" à une paye ( RECBUL = '' ), on vérifie si la fiche de retroactivité
+    # est active
+    If [F:REC]RECBUL = ""
+        Read [F:RET]RET0 = [F:REC]RETNUM
+        If fstat <> 0 or ( fstat = 0 & [F:RET]ENAFLG <> 2 )
+            [L]RETRO_RECHERCHE  = 1
+        Endif
+    Endif
+    If [L]RETRO_RECHERCHE = 2
+        [L]RETRO_RAPPEL = 1                    : # Y'a des rappels
+        [L]RETRO_POS = find([F:REC]RECRUBCOD, [L]RETRO_TRUBCOD)
+        If [L]RETRO_POS = 0
+            [L]RETRO_NBRUB += 1
+            [L]RETRO_POS = [L]RETRO_NBRUB
+        Endif
+        [L]RETRO_TRUBCOD([L]RETRO_POS) = [F:REC]RECRUBCOD
+        [L]RETRO_TRAPSAL([L]RETRO_POS) += [F:REC]AMTRAPSAL
+        [L]RETRO_TRAPPAT([L]RETRO_POS) += [F:REC]AMTRAPPAT
+        # On est en transaction, on va donc se permettre de "pré flagger" le fait que ces rappels soient pris
+        # en compte ; si souci de calcul, rollback et déflaggage automatique
+        If [F:REC]RECBUL = ""
+            [F:REC]RECBUL = [F:VEP]BUL
+            Rewrite [F:REC]
+            If fstat <> 0
+                [V]GOK = 0
+                Call FSTA("REC") From GLOCK
+                Break
+            Endif
+            # L'analyse indique qu'a partir du moment ou une ligne de la fiche de retro est prise en compte
+            # sur un bulletin, on doit la flagguer validé et qu'elle ne sera plus modifiable <nc>
+            Update [F:RET] Where [F:RET]RETNUM = [F:REC]RETNUM
+&                            With [F:RET]STATUT = 3
+            If fstat <> 0
+                [V]GOK = 0
+                Call FSTA("RET") From GLOCK
+                Break
+            Endif
+            #**72216
+            Update [F:HSR] Where BUL="" & RETNUM = [F:REC]RETNUM & EMP=[F:VEP]EMP & CTRNUM=[F:VEP]CTRNUM
+&                            With BUL=[F:VEP]BUL
+            If fstat <> 0
+                [V]GOK = 0
+                Call FSTA("HSR") From GLOCK
+                Break
+            Endif
+        Endif
+    Endif
+Next
+If fstat = 1 & [V]GOK = 1 : [V]GOK = -1 : [V]GLOCK = "$RETROCAL" : Return : Endif
+Filter [F:REC]
+Return
+
+####################################
+$LECEMP
+Gosub SET_RETRO
+If [L]OK_RETRO & [F:RET]RETTYP <> 2
+ # Si on a une fiche de rétroactivité et qu'on n'est pas en mode "collectif
+ # on se positionne sur le "nouveau" contrat => le dernier contrat flaggé rétroactivité dont la date
+ # d'effet est antérieure ou égale à la fin de période de bulletin traité.
+ Filter [F:HRCTR] Where [F:HRCTR]REFNUM = [L]MATRI & [F:HRCTR]CTRNUM = [L]CTR & [F:HRCTR]FLGRET = 2 & [F:HRCTR]RETDATEFF <= [F:VEP]ENDDAT
+ Read [F:HRCTR]CTR1 Last
+ Filter [F:HRCTR]
+ If fstat <= 2
+  [L]DATMAT = [F:HRCTR]CTRDAT
+ Endif
+Endif
+Return
+
+###**72216
+####################################
+$LECRCR
+Gosub SET_RETRO
+If [L]OK_RETRO & [F:RET]RETTYP <> 2
+ Local Char SAVFIL (250)
+ SAVFIL=dbgstr(2)  : #Pour ne pas perdre le fil d'Ariane :)
+  # Si on a une fiche de rétroactivité et qu'on n'est pas en mode "collectif"
+  # on est normalement positionné sur le "nouveau" contrat => le dernier contrat flaggé rétroactivité dont la date
+  # d'effet est antérieure ou égale à la fin de période de bulletin traité.
+  # Alors on change, à la volée, certaines valeurs de ce contrat par celles définies dans RETROCTR (valeur destination)
+  # Attention ces valeurs peuvent-être différentes par période d'activité.
+ If clalev([F:RCR])=0  : Local File RETROCTR         [RCR] : Endif
+ Local Char ZONE (80)
+ For [F:RCR]RCR1 Where REFNUM=[L]MATRI & CTRNUM=[L]CTR & CTRDAT=[L]DATMAT & STRBUL<=BULLETIN & ENDBUL>=BULLETIN
+  ZONE='[F:HRCTR]'+[F:RCR]FLD
+  Case evalue("type([F:HRCTR]"+[F:RCR]FLD+")")
+   When 1,2,4,5,6,7
+      Assign ZONE With val([F:RCR]VALINTDEN)
+   When 3
+      #Date stokée YYYYMMDD
+      Assign ZONE With gdat$(val(mid$([F:RCR]VALINTDEN,7,2)) , val(mid$([F:RCR]VALINTDEN,5,2)),val(left$([F:RCR]VALINTDEN,4)))
+   When Default
+      Assign ZONE With [F:RCR]VALINTDEN
+  Endcase
+ Next
+ Close File [RCR]
+ Default File SAVFIL
+Endif
+Return
+
+##**72216 : [F:REV]TYPREV : 1 ----> Variable ; 2 ----> Taux AT ; 3 ----> Grille
+####################################
+$LECTXRISK
+Gosub SET_RETRO
+If [L]OK_RETRO
+ # Si on a une fiche de rétroactivité
+ # on a normalement positionné TXRISK (taux AT) en fonction de la date de paie du bulletin en cours
+ # Mais ce taux a pu être modifié dans la fiche rétro (valeur de variable) ****PAS LE CODE RISQUE****
+ # Si c'est le cas alors on recherche ce taux redéfinie on le change, à la volée
+ Filter [F:RVL] Where RETNUM=[F:RET]RETNUM & REFNUM=[L]MATRI & CTRNUM=[L]CTR & CTRDAT=[L]DATMAT
+&                   & STRBUL<=BULLETIN & ENDBUL>=BULLETIN & TYPRVL=2 & VARCOD=[L]CODRISK
+ Read [F:RVL]RVL1 Last
+ Filter [F:RVL]
+ If !fstat
+  TXRISK = [F:RVL]VALDEN
+ Else
+  # mais cette date a pu être modifié dans la fiche rétro (date de valeur)
+  # Si c'est le cas alors on recherche le taux à cette date et on le change, à la volée
+  Read [F:REV]REV1=[F:RET]RETNUM;2;[L]CODRISK
+  If !fstat
+   Filter [F:WAR] Where CODWAC=[L]CODRISK & DATWAC<=[F:REV]DATVAL
+   Read [F:WAR]WAR0 Last
+   Filter [F:WAR]
+   If !fstat : TXRISK = [F:WAR]RATWAC : Endif
+  Endif
+ Endif
+Endif
+Return
+
+##**72216
+####################################
+$LECGRILLE
+Gosub SET_RETRO
+If [L]OK_RETRO
+#  # Si on a une fiche de rétroactivité
+#  # on a normalement positionné GRILLE (code grille)
+#  # En std en recherche les valeurs de grilles en fonction de DATPAY (date de paie courante) (Cf. $GRILLE de GPLAN)
+#  # mais cette date a pu être modifiée dans la fiche rétro (date de valeur)
+#  # Si c'est le cas alors on change DATPAY à la volée le temps de faire notre calcul de rubrique
+ Raz [L]RETDATPAY
+ Read [F:REV]REV1=[F:RET]RETNUM;3;[L]GRILLE
+ If !fstat
+  [L]RETDATPAY=DATPAY
+  DATPAY=[F:REV]DATVAL
+ Endif
+Endif
+Return
+
+##**72216
+# On restaure DATPAY après calcul de notre rubrique grille
+####################################
+$ANUGRILLE
+Gosub SET_RETRO
+If [L]OK_RETRO & [L]RETDATPAY<>[0/0/0]
+ DATPAY=[L]RETDATPAY
+Endif
+Return
+
+####################################
+$LECVRA
+Gosub SET_RETRO
+If [L]OK_RETRO
+    # Pour toutes les variables de la fiche de rétroactivité
+    ##**72216 : [F:REV]TYPREV : 1 ----> Variable ; 2 ----> Taux AT ; 3 ----> Grille
+    For [F:REV]REV1 Where [F:REV]RETNUM = [F:RET]RETNUM & [F:REV]TYPREV=1
+
+        Call LECTURE("VRA",[F:REV]VRACOD,GCURLEG) From CONTOBJ
+
+        # On va chercher une valeur au niveau salarié / site / société / dossier pour prendre en compte
+        # tous les cas
+        [L]NOMVAR = [L]PVAR + [F:REV]VRACOD
+        [L]VALEUR_TROUVEE = 0
+        # A ne pas faire sur les rétroactivité de type extourne ou le "bon" bulletin est déjà
+        # prêt en ce qui concerne les variables salariés
+        # -->
+        If [L]RETRO = 1
+            Link [F:VLA] With
+&                    [F:VEPW]VEP5 = [F:VLA]BUL
+&                    As [LNKW]
+&                    Where [F:VLA]TYP = 4 & [F:VLA]CPY = "" & [F:VLA]FCY = "" & [F:VLA]EMP = [L]MATRI
+&                            & [F:VLA]DAT <= [F:REV]DATVAL
+&                            & [F:VLA]VARCOD = [F:REV]VRACOD
+&                            & [F:VEPW]CTRNUM = [L]CTR
+&                    Order By Key CLE = [F:VLA]EMP ; [F:VEPW]CTRNUM ; [F:VLA]VARCOD ; [F:VLA]DAT ; [F:VEPW]PYRDAT ; [F:VEPW]BUL
+
+            Read [F:LNKW]CLE Last
+            If fstat <= 2
+                Assign [L]NOMVAR With [F:VLA]VARVAL
+                [L]VALEUR_TROUVEE = 1
+            Endif
+        Endif
+        If not [L]VALEUR_TROUVEE
+            Filter [F:VLA] Where [F:VLA]TYP = 3 & [F:VLA]LEG = "" & [F:VLA]CPY = "" & [F:VLA]FCY = [L]SITE & [F:VLA]EMP = ""
+&                    & [F:VLA]DAT <= [F:REV]DATVAL & BUL = ""
+&                    & [F:VLA]VARCOD = [F:REV]VRACOD
+            Read [F:VLA]VLA0 Last
+            Filter [F:VLA]
+            If fstat <= 2
+                Assign [L]NOMVAR With [F:VLA]VARVAL
+                [L]VALEUR_TROUVEE = 1
+                ##**72216 : MAJ des globales variables site
+                 Gosub SET_GLOBALES
+            Endif
+        Endif
+
+        If not [L]VALEUR_TROUVEE
+            Filter [F:VLA] Where [F:VLA]TYP = 2 & [F:VLA]LEG = "" & [F:VLA]CPY = [L]SOCIETE & [F:VLA]FCY = "" & [F:VLA]EMP = ""
+&                    & [F:VLA]DAT <= [F:REV]DATVAL & BUL = ""
+&                    & [F:VLA]VARCOD = [F:REV]VRACOD
+            Read [F:VLA]VLA0 Last
+            Filter [F:VLA]
+            If fstat <= 2
+                Assign [L]NOMVAR With [F:VLA]VARVAL
+                [L]VALEUR_TROUVEE = 1
+                ##**72216 : MAJ des globales variables société
+                Gosub SET_GLOBALES
+             Endif
+        Endif
+
+        #GCURLEG has been set in code generated by GENPLAN
+        If not [L]VALEUR_TROUVEE
+            Filter [F:VLA] Where [F:VLA]TYP = 1 & [F:VLA]LEG = GCURLEG & [F:VLA]CPY = "" & [F:VLA]FCY = "" & [F:VLA]EMP = ""
+&                    & [F:VLA]DAT <= [F:REV]DATVAL & BUL = ""
+&                    & [F:VLA]VARCOD = [F:REV]VRACOD
+            Read [F:VLA]VLA0 Last
+            Filter [F:VLA]
+            If fstat <= 2
+                Assign [L]NOMVAR With [F:VLA]VARVAL
+                [L]VALEUR_TROUVEE = 1
+                ##**72216 : MAJ des globales variables société
+                Gosub SET_GLOBALES
+             Endif
+        Endif
+    Next
+    ###**72216
+    # Mais cette valeur (en date de valeur) a pu être modifiée dans la fiche rétro (valeur de variable)
+    #Si c'est le cas alors on recherche cette nouvelle valeur et on la change, à la volée
+    # A ne pas faire sur les rétroactivité de type extourne ou le "bon" bulletin est déjà
+    # prêt en ce qui concerne les variables salariés
+    # -->
+    Filter [F:RVL] Where RETNUM=[F:RET]RETNUM & REFNUM=[L]MATRI & CTRNUM=[L]CTR
+&                   & STRBUL<=BULLETIN & ENDBUL>=BULLETIN & TYPRVL=1
+     For [F:RVL]RVL1
+      Call LECTURE("VRA",[F:RVL]VARCOD,GCURLEG) From CONTOBJ
+      If [F:VRA]FLGEMP<>2 | [L]RETRO=1
+       [L]NOMVAR = [L]PVAR + [F:RVL]VARCOD
+       Assign [L]NOMVAR With [F:RVL]VALDEN
+       Gosub SET_GLOBALES
+      Endif
+     Next
+    Filter [F:RVL]
+Endif
+Return
+
+#MAJ des globales variables site, société & dossier
+$SET_GLOBALES
+If [F:VRA]FLGFCY=2 & dim(GVARCOD3)>0
+ IVRA=find([F:REV]VRACOD, GVARCOD3(1..GNBRCOD3))
+ If IVRA
+  GVARVAL3(IVRA)= [F:RVL]VALDEN
+ Endif
+Endif
+If [F:VRA]FLGCPY=2 & dim(GVARCOD2)>0
+ IVRA=find([F:REV]VRACOD, GVARCOD2(1..GNBRCOD2))
+ If IVRA
+  GVARVAL2(IVRA)= [F:RVL]VALDEN
+ Endif
+Endif
+If [F:VRA]FLGFDR=2 & dim(GVARCOD1)>0
+ IVRA=find([F:REV]VRACOD, GVARCOD1(1..GNBRCOD1))
+ If IVRA
+  GVARVAL1(IVRA)= [F:RVL]VALDEN
+ Endif
+Endif
+Return
+
+####################################
+$SET_RETRO
+[L]OK_RETRO = 0
+If not [L]RETRO : Return : Endif
+If dim([V]GRETNUM) < 1 : Return : Endif
+Read [F:RET]RET0 = [V]GRETNUM
+If fstat <> 0 : Return : Endif
+[L]OK_RETRO = 1
+Return
+
+####################################
+$RAPPEL
+If not find([L]RUB, [L]RETRO_TRUBCOD) : Return : Endif
+# Les choses sérieuses commencent ... on doit générer une ligne de rappel bien cradingue sur la rubrique que
+# l'on vient de traiter
+# En tant que prestataire on ne se pose pas les questions sur les comportements non prévues comme :
+# - Pourquoi le montant du rappel n'est pas inclu dans la rubrique et donc non pris en compte dans la suite
+#   du calcul si on fait référence à la rubrique , fonctionnement des réguls standards ...
+# - Que faire si la rubrique sur laquelle s'effectue le rappel n'existe pas dans histopaye
+#   (non calculée par la condition ou montant = 0) => Dans ce cas on n'est meme pas appelé à cause du OKRUB
+# - Que faire si la rubrique régularisée est d'un type particulier comme assiette ...
+# - Etc. , j'en passe et des meilleures comme disait l'autre.
+
+[L]RETRO_POS = find([L]RUB, [L]RETRO_TRUBCOD)
+If [L]RETRO_POS & ([L]RETRO_TRAPSAL([L]RETRO_POS) <> 0 or [L]RETRO_TRAPPAT([L]RETRO_POS) <> 0)
+    # Ne rentrer ici que si on a vraiment qqchose à faire.
+    Read [F:RUB]RUB0 = GCURLEG;[L]RUB
+    If fstat <> 0 : Return : Endif
+
+    # Tentative de correction du problème des rappels sur une rubrique non calculée
+     If ![L]OKRUB
+        [L]MEM = 1
+        [L]RANG = [F:RUB]ROW
+        [L]BASE = 0
+        [L]TAUX = 0
+        [L]MONT = 0
+        If [L]TYP=0
+         [L]TYP = 1            : # A controler
+        Endif
+        Gosub MEMRUB From GPLAN
+     Endif
+
+    # Rappel salarial et patronal.
+    If [L]RETRO_TRAPSAL([L]RETRO_POS) <> 0
+        [L]MONT = [L]RETRO_TRAPSAL([L]RETRO_POS)
+        [L]TYP = 7
+        [L]MEM = ([L]MONT <> 0)
+        Gosub MEMRUB From GPLAN
+    Endif
+    If [L]RETRO_TRAPPAT([L]RETRO_POS) <> 0
+        [L]MONT = [L]RETRO_TRAPPAT([L]RETRO_POS)
+        [L]TYP = 8
+        [L]MEM = ([L]MONT <> 0)
+        Gosub MEMRUB From GPLAN
+    Endif
+
+    # Mise à jour des cumuls de la rubrique (=> Comme on ne gère pas de rubrique de régul ce seront
+    #                                         forcément les mêmes que la rubrique régularisée)
+    For [L]I = 0 To [F:RUB]NBRCUM - 1
+        [L]NOMVAR = [L]PCUM + [F:RUB]CUM([L]I)
+        [L]VALVAR = evalue([L]NOMVAR)
+        #91750
+        OKCUM=1
+        If  [F:RUB]CNDCUM(I)<>""
+         Call CONVERT([F:RUB]CNDCUM(I))From GENPLAN
+         OKCUM = evalue(vireblc([F:RUB]CNDCUM(I),2))
+        Endif
+        If OKCUM
+        #
+         Case [F:RUB]OPTCUM(I)
+            When 1 : # -PS
+                [L]VALVAR -= [L]RETRO_TRAPSAL([L]RETRO_POS)
+            When 2 : # -PP
+                [L]VALVAR -= [L]RETRO_TRAPPAT([L]RETRO_POS)
+            When 3 : # +PS
+                [L]VALVAR += [L]RETRO_TRAPSAL([L]RETRO_POS)
+            When 4 : # +PP
+                [L]VALVAR += [L]RETRO_TRAPPAT([L]RETRO_POS)
+            When 5 : # RAZ
+                [L]VALVAR = 0
+         Endcase
+         Assign [L]NOMVAR With [L]VALVAR
+       Endif
+
+    Next I
+
+    # Tentative de contournement du problème fondamental de la régul : la rubrique initiale n'a pas
+    # la bonne valeur dans la suite du calcul ...
+    # Attention aux effets de bord possible pour les gens ayant pris en compte ce phénomène dans leur
+    # plan de paye !
+    # PRUB => Variable contenant le préfixe utilisé pour déclarer les noms de variable "rubrique" à la
+    #         génération du plan de paye. Pour conserver l'info on a tombé dans le WPPLAN l'écriture
+    #         des préfixes utilisés lors de la génération du plan de paye.
+
+    # [L]NOMVAR = [L]PRUB + [L]RUB + "(1)"
+    # [L]VALVAR = evalue([L]NOMVAR)
+    # [L]VALVAR += [L]RETRO_TRAPSAL([L]RETRO_POS)
+    # Assign [L]NOMVAR With [L]VALVAR
+
+    # [L]NOMVAR = [L]PRUB + [L]RUB + "(2)"
+    # [L]VALVAR = evalue([L]NOMVAR)
+    # [L]VALVAR += [L]RETRO_TRAPPAT([L]RETRO_POS)
+    # Assign [L]NOMVAR With [L]VALVAR
+Endif
+Return
+
+#85110
+#Récupération des rappels, présents dans le bulletin extourné, dans les bulletins de remplacements.
+#Ne pas récupérer les réguls de paie car le calcul de paie s'en charge déjà..
+#Appelé à la fin du calcul de paie
+####################################################
+$ADD_REGUL
+Local Char CRITEFF (250)
+GOK=1
+CRITEFF='RETNUM<>""'
+Gosub SET_RETRO
+If [L]OK_RETRO & [F:RET]RETTYP=3
+ CRITEFF = "DAT>=[F:RET]DATEFF"
+Endif
+#Recherche du bulletin d'origine extourné
+Filter [F:VEPW] Where EMP=[L]MATRI & CTRNUM=[L]CTR & PYRDAT=[F:VEP]ORIPYRDAT & STRDAT=[L]PERDEB & ENDDAT=[L]PERFIN
+Read [F:VEPW]VEP5 Last
+Filter [F:VEPW]
+If fstat : Return : Endif
+For [F:HSR]HSR0 Where BUL=[F:VEPW]BUL & evalue(CRITEFF)
+ #Création de la régul dans HISTOPAYE
+ Raz [HSP]
+ Readlock [F:HSP]HSP3=[L]BULLETIN;[F:HSR]RUB;[F:HSR]TYP
+ If fstat = 1
+  [V]GOK = -1
+  [V]GLOCK = "$HISTOPAYE"
+  Break
+ Elsif !fstat
+  [F:HSP]AMT +=[F:HSR]AMT
+  Rewrite [F:HSP]
+ Else
+  [F:HSP]=[F:HSR]
+  [F:HSP]BUL=[L]BULLETIN
+  [F:HSP]DAT=[L]DATVEP
+  Read[F:RUB]RUB0=[F:HSR]RUB
+  If !fstat
+   [F:HSP]ROW=[F:RUB]ROW
+  Else
+   [V]GOK = 0 : Break
+  Endif
+  Write [F:HSP]
+ Endif
+ If fstat
+   [V]GOK = 0
+   Call FSTA("HSP") From GLOCK
+   Break
+ Endif
+ #Création du nouveau détail de réguls dans HISTOREGUL
+ Raz [F:HSRW]
+ Readlock [F:HSRW]HSR0=[F:HSR]RETNUM;[L]BULLETIN;[F:HSR]RUB;[F:HSR]TYP;[F:HSR]ORIBUL
+ If fstat = 1
+  [V]GOK = -1
+  [V]GLOCK = "$HISTOREGUL"
+  Break
+ Elsif !fstat
+  [F:HSRW]AMT +=[F:HSR]AMT
+  Rewrite [F:HSRW]
+ Else
+  [F:HSRW]=[F:HSR]
+  [F:HSRW]RETNUM=""     :#RETNUM<>'' seulement pour les rétro ind & coll
+  [F:HSRW]BUL=[L]BULLETIN
+  [F:HSRW]CTRDAT=[L]DATMAT
+  Write [F:HSRW]
+ Endif
+ If fstat
+   [V]GOK = 0
+   Call FSTA("HSRW") From GLOCK
+   Break
+ Endif
+Next
+If [V]GOK < 1 : Return : Endif
+Return

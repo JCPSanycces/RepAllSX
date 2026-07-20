@@ -1,0 +1,773 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+# ------------------------------------------------------------
+# SUBAPSSTA
+# Version 0005
+#    Serveur de statistiques
+#
+#    E45835 - Geode tunnel
+#
+# ------------------------------------------------------------
+# Extraction des données liées à des statistiques
+# Si la stat est définie sur N niveaux, on peut aller jusqu'au niveau N+1
+# (dans ce cas, on ne reprend qu'une ligne de détail)
+# Exemple d'utilisation avec une stat VTE1, définie sur le déclencheur SID, avec les critères suivants :
+# ITMMASTER / TSICOD(2)
+# SINVOICED / ITMREF
+# BPCUSTOMER / TSCCOD(1)
+# SINVOICEV / BPCINV
+# au niveau 1, on verra toutes les lignes pour chaque famille statistique article
+# au niveau 2, on verra les lignes pour une famille statistique article donnée, avec le détail par articles
+# au niveau 3, on verra, pour un couple famille stat, code article donné, le détail par codes stat clients
+# au niveau 4, on verra, pour le triplet (famstat art, code art, famstat cli), le détail par clients
+# au niveau 5, on restreindra le niveau 4 au code client donné
+
+# Améliorations par rapport au premier essai :
+# - évaluation des formules (page "avancée")
+# - accès aux prévisions et aux périodes précédentes
+
+# Limitations à connaître :
+# - le nombre de lignes extraites est limité (variable GDIMSTAT)
+# - il n'y a pas d'arrondi fait comme le réalise le traitement stat (à faire ultérieurement)
+# Lorsqu'un zoom est envisageable, un tag <ZOOM> a été ajouté, qui donne les paramètres d'appel du zoom
+# Sous-programme de génération (pour le moment sur un fichier fixe)
+# On attend :
+# - le code, la société, le site, les bornes de date début/fin des deux périodes (si un comparatif est fait)
+# - le niveau d'interrogation (1=niveau le plus haut, 2 = 1er zoom, etc...)
+# - les valeurs fixées compte tenu du niveau de zoom sont données par le tableau VALCRIT
+# - on ne redescend pas au niveau de détail le plus fin (interrogation sur la table trop longue)
+# 
+
+# ------------------------------------------------------------
+$S_GENEINIT
+
+Global Integer GDIMSTAT
+GDIMSTAT=100
+Local Char VALCRIT(20)(1..8)    # modif 4 en 8 suite demande DB de 8 crit en saisie
+Local Integer OK , OKTRT
+Local Char CODE, CPY, FCY
+Local Date DATDEB,DATFIN,DDATDEB,DDATFIN
+Local Integer LEVEL
+Local Integer S_LEVELMIN
+
+# Code 
+CODE=S_STACOD
+GFONCTION="CONSSTA" : Call AUTORIS From EXEFNC    # Gestion autorisation std
+If GNBAUZ=0
+    U_MESCODE="X3FNCNOTAUTHORIZE" : U_MESP1=GFONCTION : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+Endif
+
+# Lecture des paramètres sources de données
+#Dbgaff
+LEVELMIN=1    # Level mini autorisé de la stat: levelmin=1 -> pas de critère, =2 -> 1 crit ....
+SW_CTXFOR=mess(40,137,1)-[F:APV]APVCOD-mess(45,137,1)-[F:APV]SRCCODTYP(SW_I)    # contexte
+For SW_I=0 To [F:APV]SRCPARNBR-1
+    SW_PARCOD=[F:APV]SRCPARCOD(SW_I)
+    #U_CTXFOR=SW_CTXFOR-mess(41,137,1)-SW_PARCOD    # contexte
+    #U_EVAFOR=[F:APV]SRCPARFOR(SW_I) : Gosub U_EVAFOR From SUBAPSUTI
+    #If U_ERR=UC_ERRG : Return : Endif    # erreur 
+    #U_TRAMES=U_CTXFOR-mess(41,137,1)-U_PARCODE-":"-U_RESFOR : Gosub U_TRAPUT From SUBAPSUTI
+    U_PARCODE=SW_PARCOD : Gosub U_PARSRCREAD From SUBAPSUTI : If U_ERR=UC_ERRG : Break : Endif
+    
+    Case SW_PARCOD
+    When SC_CPY             # Société
+        CPY=U_PARVAL
+    When SC_FCY             # Site
+        FCY=U_PARVAL
+        If FCY<>"" & GUSRFCY(1)<>"\" & !find(FCY,GUSRFCY(1..GNBAUZ)) # autorisation site      # JPJ E25552
+             U_MESCODE="X3STAFCYNOTAUTHO" : U_MESP1=FCY : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Break
+        Endif     # JPJ E25552
+    When SC_DATDEB1
+        DATDEB=U_PARVALDAT
+        #Gosub $SETDATE : If U_ERR=UC_ERRG : Break : Endif    # erreur
+        #DATDEB=SW_DATE    
+    When SC_DATFIN1
+        DATFIN=U_PARVALDAT
+        #Gosub $SETDATE : If U_ERR=UC_ERRG : Break : Endif    # erreur
+        #DATFIN=SW_DATE    
+    When SC_DATDEB2
+        DDATDEB=U_PARVALDAT
+        #Gosub $SETDATE : If U_ERR=UC_ERRG : Break : Endif    # erreur
+        #DDATDEB=SW_DATE    
+    When SC_DATFIN2
+        DDATFIN=U_PARVALDAT
+        #Gosub $SETDATE : If U_ERR=UC_ERRG : Break : Endif    # erreur
+        #DDATFIN=SW_DATE    
+    When Default
+        SW_J=find(SW_PARCOD,SC_CRIT)
+        If SW_J and vireblc(U_PARVAL,4)<>""    # niveau min sur critère non vide
+            If SW_J+1 > LEVELMIN : LEVELMIN=SW_J+1: Endif
+            VALCRIT(SW_J)=U_PARVAL        # Valeur du paramètre
+        Endif
+    Endcase
+Next
+If U_ERR=UC_ERRG : Return : Endif
+
+
+LEVEL=LEVELMIN                # niveau à traiter
+If ( M_ACTION = SQ_ACTLOAD or M_ACTION = SQ_ACTTITLE)
+    U_QSCODE=SQ_NIVEAU : Gosub U_QSREAD From SUBAPSUTI     
+    If U_QSEXIST
+        SW_I=val(U_QSVAL)
+        If SW_I = 0
+            U_MESCODE="X3STALEVELNOTNUMERIC" : U_MESP1=U_QSVAL : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+        Endif
+        If ( SW_I <1 and SW_I > 9 )
+            U_MESCODE="X3STALEVELINVALID" : U_MESP1=U_QSCODE : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+        Endif
+        If ( SW_I < LEVEL)
+            U_MESCODE="X3STALEVELNOTAUTHO" : U_MESP1=U_QSVAL : U_MESP2="" : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI : Return
+        Endif
+        LEVEL=SW_I
+    Endif
+Endif
+
+For SW_I=1 To LEVELMIN-1                           # Vérifications critères
+    If M_ACTION = SQ_ACTLOAD                          # avertissements si remise en cause des critères fixes
+        U_QSCODE=SQ_CRIT + num$(SW_I) : Gosub U_QSREAD From SUBAPSUTI
+        If U_QSEXIST
+            If  U_QSVAL <> VALCRIT(SW_I)
+                U_MESCODE="X3STACRIFIXED" : U_MESP1=U_QSCODE : U_MESP2=VALCRIT(SW_I) : U_ERR=UC_ERRW : Gosub U_MESPUT From SUBAPSUTI
+            Endif 
+        Endif
+    Endif
+Next
+If M_ACTION = SQ_ACTLOAD                               # Critères zoom 
+    For SW_I=LEVELMIN To 8                                # Dernier non voulu (9) car risque de trop d'enreg.
+        U_QSCODE=SQ_CRIT + num$(SW_I) : Gosub U_QSREAD From SUBAPSUTI
+        If U_QSEXIST : VALCRIT(SW_I)=U_QSVAL : Endif
+    Next
+Endif
+
+#VALCRIT(1)="FR"
+#VALCRIT(2)="AN006"
+#VALCRIT(3)="DIS"
+#VALCRIT(4)="DIS001"
+
+ Local Char CRITVAL(250),CRITFCY(100),CRITRUPT(255),CRITRUPT1(255)
+ Local Integer II,NLI,RUPT,FLGPREC,FLGPREV,JJ, NBLINES
+
+ Local Char CLE(30)(1..GDIMSTAT), LIBCLE(50)(1..GDIMSTAT),CLEINS(30),LIBINS(50)
+ Local Decimal MONTANTS(10,1..GDIMSTAT), MONTPREVPREC(10,1..GDIMSTAT),
+&              MONTPREV(10,1..GDIMSTAT), MONTPREC(10,1..GDIMSTAT),
+&              MONTANT, COLONNE(1..GDIMSTAT)
+
+# Ouverture fichiers complémentaires statistiques
+Local File [PS2], STAT [SAT], STAT [SAT1], STATPRV [SAP], STATPRV [SAP1]  # nota [PS2] ouvert par SUBAPSSTA
+
+# Verif niveau
+If LEVEL > [F:PS2]NBRFLD + 1
+    U_MESCODE="X3STALEVELTOOHIGHT" : U_MESP1=num$(LEVEL) : U_MESP2=num$([F:PS2]NBRFLD+1) : U_ERR=UC_ERRW : Gosub U_MESPUT From SUBAPSUTI
+    LEVEL=[F:PS2]NBRFLD + 1
+Endif
+# Synthese niveaux
+U_TECMES=' <MinLevel>' + num$(LEVELMIN) + '</MinLevel>' : Gosub U_TECPUT From SUBAPSUTI
+U_TECMES=' <CurrentLevel>' + num$(LEVEL) + '</CurrentLevel>' : Gosub U_TECPUT From SUBAPSUTI
+U_TECMES=' <MaxLevel>' + num$([F:PS2]NBRFLD + 1) + '</MaxLevel>' : Gosub U_TECPUT From SUBAPSUTI
+If LEVELMIN < LEVEL     # Info sur niveau précédent
+    # U_HEXTOTXT=[F:PS2]FLDaDES(LEVEL-2) 
+    Call LECTEXTRA(U_HEXTOTXT,"PARSTA2","FLDINTIT",[PS2]COD,num$(LEVEL-1)) From ATEXTRA
+    Gosub U_TXTTOHEX From SUBAPSUTI
+    U_TECMES=' <PrevDetailTitle>' + U_TXTTOHEX + '</PrevDetailTitle>' : Gosub U_TECPUT From SUBAPSUTI
+Endif 
+If LEVEL < [F:PS2]NBRFLD      # Info sur zoom suivant
+    # U_HEXTOTXT=[F:PS2]FLDaDES(LEVEL) 
+    Call LECTEXTRA(U_HEXTOTXT,"PARSTA2","FLDINTIT",[PS2]COD,num$(LEVEL+1)) From ATEXTRA
+    Gosub U_TXTTOHEX From SUBAPSUTI
+    U_TECMES=' <NextDetailTitle>' + U_TXTTOHEX + '</NextDetailTitle>' : Gosub U_TECPUT From SUBAPSUTI
+Endif 
+
+# Critères utilisés
+U_TECMES=' <Criteria>' : Gosub U_TECPUT From SUBAPSUTI
+For SW_I=1 To LEVEL-1
+    U_HEXTOTXT=VALCRIT(SW_I) : Gosub U_TXTTOHEX From SUBAPSUTI
+    U_TECMES='   <Criterion' + num$(SW_I) +'>' + U_TXTTOHEX + '</Criterion' + num$(SW_I) +'>' : Gosub U_TECPUT From SUBAPSUTI
+Next
+U_TECMES=' </Criteria>' : Gosub U_TECPUT From SUBAPSUTI
+
+# Montants pour cumuls
+ Local Decimal MONTCUM(0..[F:PS2]NBRFRM-1), TOTCUM(0..[F:PS2]NBRFRM-1)
+
+# Critère de sélection lié au niveau de stat recherché (aux valeurs connues) et au niveau maximum de la stat
+ For II=1 To [F:PS2]NBRFLD
+     CRITVAL+=string$(CRITVAL<>""," &")-"CRI"+num$(II)
+&         +string$(II=LEVEL,"<>'")+string$(II<>LEVEL,"='")
+&         +string$(II<LEVEL,VALCRIT(II))+string$(II>=LEVEL,'$$$')+"'"
+ Next II
+
+# Critère société/site
+ If CPY<>"" & [PS2]UPDLEV>1
+     CRITFCY="CPY='"+CPY+"'"
+ Endif
+ If FCY<>"" & [PS2]UPDLEV>2
+     CRITFCY+=string$(CRITFCY<>""," & ")+" FCY='"+FCY+"'"
+ Endif
+ CRITFCY+=string$(CRITFCY="","1=1")
+
+
+# Flags mis à 1 si la période précédente est impactée et si les prévisions le sont aussi
+ FLGPREC=0
+ FLGPREV=0
+ For II=1 To [PS2]NBRFRM
+     If sigma(1,10,pat(format$("KTv2:255X",AMTFRM(II-1)),"*CC"+num$(indcum)+"*"))
+         FLGPREC=1
+         Break (FLGPREV=1)
+     Endif
+     If sigma(1,10,pat(format$("KTv2:255X",AMTFRM(II-1)),"*P"+num$(indcum)+"*"))
+         FLGPREV=1
+         Break (FLGPREC=1)
+     Endif
+     If sigma(1,10,pat(format$("KTv2:255X",AMTFRM(II-1)),"*PP"+num$(indcum)+"*"))
+         FLGPREC=1
+         FLGPREV=1
+         Break
+     Endif
+ Next II
+
+# Déclarations pour les cumuls si nécessaire
+ If max([F:PS2]CUMFRM)>2
+     Local Decimal COLCUM(0..[F:PS2]NBRFRM-1,1..GDIMSTAT)
+ Endif
+
+# Opérations préliminaires 
+ Raz MONTANTS
+
+ RUPT=min(LEVEL+1,9)
+ CRITRUPT=sigma(1,RUPT,string$(indcum>1," & ")+"CRI"+num$(indcum)+"=[SAT]CRI"+num$(indcum))
+ CRITRUPT1=sigma(1,RUPT,string$(indcum>1," & ")+"CRI"+num$(indcum)+"=[SAT1]CRI"+num$(indcum))
+
+# Objet lien sur les critéres le cas échéant
+If clalev([F:ATZ])=0  : Local File ATABZON  [ATZ]  : Endif
+If clalev([F:ATY])=0  : Local File ATYPE    [ATY]  : Endif
+#If clalev([F:AOB])=0  : Local File AOBJET   [AOB]  : Endif
+
+For S_NBCOL=0 To [PS2]NBRFLD-1
+    S_COLLINK(II)=""
+    Read [ATZ]CODZONE = [F:PS2]TBL(S_NBCOL);[F:PS2]FLDNAM(S_NBCOL)
+    If fstat=0
+        Read [ATY]CODTYP = [F:ATZ]CODTYP
+        If fstat=0 & [F:ATY]OBJLIEN<>""
+#          Read [AOB]ABREV = [F:ATY]OBJLIEN
+#          If fstat=0
+#              S_COLLINK(S_NBCOL)= [F:AOB]ABREV
+#          Endif
+          # Recherches infos sur la clé de la table principale de l'objet
+          Call EXISTE_ADX("","","WO"+[F:ATY]OBJLIEN,OKTRT) From ORDSYS
+          If OKTRT>0  # trt objet existe
+                Gosub SETCLE From ="WO"+[F:ATY]OBJLIEN        # en retour: CLEPRIM, CLESEC() et CLESUP()
+                # Seule les clés à une seule composante sont gérées
+                If ((GPRODUIT<>1 and CLESEC(0)="") or (GPRODUIT=1 and CLESUP(0)=""))    # Geode E45787 (voir ex WOITC)
+                        S_COLLINK(S_NBCOL)= [F:ATY]OBJLIEN
+                Endif
+          Endif
+        Endif
+    Endif
+Next
+
+Return 
+
+# ------------------------------------------------------------
+$S_GENETIT
+# Trace
+U_TRAMES="--> $S_GENETIT (initialisation)" : Gosub U_TRAPUT From SUBAPSUTI 
+
+# En-tête décrivant les colonnes
+U_SEQPUT='<Titles>' : Gosub S_SEQPUTDEC
+# U_SEQPUT=' <Title>' + [PS2]DEaS + '</Title>' : Gosub S_SEQPUTDEC
+# Codage des caractères spéciaux --   Bug 47832     CC  21/08/2008
+Local Char VALLM(200)
+#U_SEQPUT=' <Title>'+func AFNC.TEXTRA("PARSTA2","INTIT",[F:PS2]COD,"")+'</Title>' 
+VALLM=func AFNC.TEXTRA("PARSTA2","INTIT",[F:PS2]COD,"") : Gosub MVALC From INTRUTILA
+U_SEQPUT=' <Title>'+VALLM+'</Title>' 
+
+ Gosub S_SEQPUTDEC
+
+# U_HEXTOTXT=[F:PS2]FLDaDES(LEVEL-1) 
+Call LECTEXTRA(U_HEXTOTXT,"PARSTA2","FLDINTIT",[PS2]COD,num$(LEVEL)) From ATEXTRA
+Gosub U_TXTTOHEX From SUBAPSUTI
+U_SEQPUT=' <ColTitle Num="1" X3Type="7" >' + U_TXTTOHEX + '</ColTitle>' : Gosub S_SEQPUTDEC     # JPJ E28697
+Call TEXTE(8,U_HEXTOTXT) From OBJDIV : Gosub U_TXTTOHEX From SUBAPSUTI    # 8: intitulé
+U_SEQPUT=' <ColTitle Num="2" X3Type="7" >' + U_TXTTOHEX + '</ColTitle>' : Gosub S_SEQPUTDEC     # JPJ E28697
+For II=0 To [PS2]NBRFRM-1
+    U_HEXTOTXT=func AFNC.TEXTRA("PARSTA2","INTITFRM",[F:PS2]COD,num$(II+1)) 
+    Gosub U_TXTTOHEX From SUBAPSUTI
+    U_SEQPUT=' <ColTitle Num="' + num$(II +3) + '" X3Type="4">' + U_TXTTOHEX + '</ColTitle>' : Gosub S_SEQPUTDEC     # JPJ E28697
+Next II
+U_SEQPUT='</Titles>' : Gosub S_SEQPUTDEC
+Return
+
+# ------------------------------------------------------------
+$S_GENE
+# Trace
+U_TRAMES="--> $S_GENE (génération données) " : Gosub U_TRAPUT From SUBAPSUTI 
+
+# Premier parcours des lignes de stats principales
+SW_STR1= "COD=CODE"
+If DATDEB<>[00/00/00] : SW_STR1+=" & DAT>=DATDEB" : Endif
+If DATFIN<>[00/00/00] : SW_STR1+=" & DAT<=DATFIN" : Endif
+If dim([SAP]CRI8)>0
+    Filter [SAT] Where evalue(SW_STR1) & evalue(CRITVAL) & evalue(CRITFCY)
+&                Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4;CRI5;CRI6;CRI7;CRI8
+Elsif dim([SAP]CRI7)>0
+    Filter [SAT] Where evalue(SW_STR1) & evalue(CRITVAL) & evalue(CRITFCY)
+&                Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4;CRI5;CRI6;CRI7
+Elsif dim([SAP]CRI6)>0
+    Filter [SAT] Where evalue(SW_STR1) & evalue(CRITVAL) & evalue(CRITFCY)
+&                Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4;CRI5;CRI6
+Elsif dim([SAP]CRI5)>0
+    Filter [SAT] Where evalue(SW_STR1) & evalue(CRITVAL) & evalue(CRITFCY)
+&                Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4;CRI5
+Else
+    Filter [SAT] Where evalue(SW_STR1) & evalue(CRITVAL) & evalue(CRITFCY)
+&                Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4
+Endif
+
+Filter [SAP] Where evalue(SW_STR1)
+
+# Calcul des N montants par agrégation des lignes de stats sur la période et les sociétés/sites concernés
+        # Nota [PS2]NBRAMT n'existe plus en 140
+        Local Integer S_DIMSTA
+        If clalev([F:ACV]) = 0 : Local File ACTIV [ACV] : Endif
+        Read [ACV]CODACT="STA"
+        If fstat = 0
+          S_DIMSTA = [F:ACV]DIME
+        Else 
+          S_DIMSTA = 10
+        Endif
+
+ JJ=1
+ For [SAT]CLE(RUPT)
+    For [SAT]CLE
+       For II=0 To S_DIMSTA-1
+           MONTANTS(II,JJ)+=[SAT]AMT(II)
+       Next II
+    Next
+    If FLGPREV
+       For [SAP] Where evalue(CRITRUPT)
+           For II=0 To S_DIMSTA-1
+               MONTPREV(II,JJ)+=[SAP]AMT(II)
+           Next
+       Next
+    Endif
+
+    Gosub CLE_STAT : CLE(JJ)=CLEINS
+    Gosub LIB_STAT : LIBCLE(JJ)=LIBINS
+
+    JJ+=1 : If JJ>GDIMSTAT : Break : Endif
+ Next
+ NBLINES=JJ-1
+
+# Calcul des N montants de la période précédente s'ils existent
+ If FLGPREC
+    If dim([SAT]CRI8)>0 
+        Filter [SAT1] Where COD=CODE & DAT>=DDATDEB & DAT<=DDATFIN & evalue(CRITVAL) & evalue(CRITFCY)
+&                     Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4;CRI5;CRI6;CRI7;CRI8
+    Elsif dim([SAT]CRI7)>0
+        Filter [SAT1] Where COD=CODE & DAT>=DDATDEB & DAT<=DDATFIN & evalue(CRITVAL) & evalue(CRITFCY)
+&                     Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4;CRI5;CRI6;CRI7
+    Elsif dim([SAT]CRI6)>0
+        Filter [SAT1] Where COD=CODE & DAT>=DDATDEB & DAT<=DDATFIN & evalue(CRITVAL) & evalue(CRITFCY)
+&                     Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4;CRI5;CRI6
+    Elsif dim([SAT]CRI5)>0
+        Filter [SAT1] Where COD=CODE & DAT>=DDATDEB & DAT<=DDATFIN & evalue(CRITVAL) & evalue(CRITFCY)
+&                     Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4;CRI5
+    Else
+        Filter [SAT1] Where COD=CODE & DAT>=DDATDEB & DAT<=DDATFIN & evalue(CRITVAL) & evalue(CRITFCY)
+&                Order By Key CLE=COD;CRI1;CRI2;CRI3;CRI4
+ Endif
+
+    Filter [SAP1] Where COD=CODE & DAT>=DDATDEB & DAT<=DDATFIN 
+    JJ=1
+    For [SAT1]CLE(RUPT)
+        #Gosub CLE_STAT
+        Gosub CLE_STAT1 : # 14.1.8
+        If CLEINS>CLE(JJ)
+            Repeat
+                JJ+=1
+            Until JJ>NBLINES or CLEINS<=CLE(JJ)
+            If JJ>NBLINES
+                Break (NBLINES>=GDIMSTAT)
+                NBLINES+=1
+                CLE(JJ)=CLEINS
+                #Gosub LIB_STAT
+                Gosub LIB_STAT1 : # 14.1.8
+                LIBCLE(JJ)=LIBINS
+            Endif
+        Endif
+        If CLEINS<CLE(JJ)
+            NBLINES=min(GDIMSTAT,NBLINES+1)
+            Gosub DEC_JJ
+            CLE(JJ)=CLEINS
+            #Gosub LIB_STAT
+            Gosub LIB_STAT1 : # 14.1.8
+            LIBCLE(JJ)=LIBINS
+            Gosub RAZ_JJ
+        Endif
+        For [SAT1]CLE
+            For II=0 To dim([SAT1]AMT)-1
+                MONTPREC(II,JJ)+=[SAT1]AMT(II)
+            Next II
+        Next
+        If FLGPREV
+            For [SAP1] Where evalue(CRITRUPT1)
+                For II=0 To dim([SAT1]AMT)-1
+                    MONTPREVPREC(II,JJ)+=[SAP1]AMT(II)
+                Next
+            Next
+        Endif
+    Next
+ Endif
+
+# Ecriture des lignes
+ U_SEQPUT='<Lines>' : Gosub S_SEQPUTDEC
+ If max([F:PS2]CUMFRM)<=2
+    Gosub STATS1
+ Else
+    Gosub STATS2
+ Endif
+U_SEQPUT='</Lines>' : Gosub S_SEQPUTDEC
+
+Return
+
+# Recherche des critère plus rapide qu'un evalue, et adapté au fait que CRI8 à CRI5 peuvent ne pas exister
+$CLE_STAT
+    Case LEVEL
+        When 8
+            CLEINS=[SAT]CRI8
+        When 7
+            CLEINS=[SAT]CRI7
+        When 6
+            CLEINS=[SAT]CRI6
+        When 5
+            CLEINS=[SAT]CRI5
+        When Default
+            CLEINS=string$(LEVEL=1,[SAT]CRI1)+string$(LEVEL=2,[SAT]CRI2)+string$(LEVEL=3,[SAT]CRI3)
+&                 +string$(LEVEL=4,[SAT]CRI4)
+    Endcase
+Return
+
+$LIB_STAT
+    Case LEVEL
+        When 8
+            LIBINS=ctrans([SAT]DES8,"<>","  ")
+        When 7
+            LIBINS=ctrans([SAT]DES7,"<>","  ")
+        When 6
+            LIBINS=ctrans([SAT]DES6,"<>","  ")
+        When 5
+            LIBINS=ctrans([SAT]DES5,"<>","  ")
+        When Default
+            LIBINS=ctrans(string$(LEVEL=1,[SAT]DES1)+string$(LEVEL=2,[SAT]DES2)
+&                 +string$(LEVEL=3,[SAT]DES3)+string$(LEVEL=4,[SAT]DES4),"<>","  ")
+    Endcase
+Return
+
+# Recherche des critère plus rapide qu'un evalue, et adapté au fait que CRI8 à CRI5 peuvent ne pas exister
+$CLE_STAT1 : # 14.1.8
+    Case LEVEL
+        When 8
+            CLEINS=[SAT1]CRI8
+        When 7
+            CLEINS=[SAT1]CRI7
+        When 6
+            CLEINS=[SAT1]CRI6
+        When 5
+            CLEINS=[SAT1]CRI5
+        When Default
+            CLEINS=string$(LEVEL=1,[SAT1]CRI1)+string$(LEVEL=2,[SAT1]CRI2)+string$(LEVEL=3,[SAT1]CRI3)
+&                 +string$(LEVEL=4,[SAT1]CRI4)
+    Endcase
+Return
+
+$LIB_STAT1 : # 14.1.8
+    Case LEVEL
+        When 8
+            LIBINS=ctrans([SAT1]DES8,"<>","  ")
+        When 7
+            LIBINS=ctrans([SAT1]DES7,"<>","  ")
+        When 6
+            LIBINS=ctrans([SAT1]DES6,"<>","  ")
+        When 5
+            LIBINS=ctrans([SAT1]DES5,"<>","  ")
+        When Default
+            LIBINS=ctrans(string$(LEVEL=1,[SAT1]DES1)+string$(LEVEL=2,[SAT1]DES2)
+&                 +string$(LEVEL=3,[SAT1]DES3)+string$(LEVEL=4,[SAT1]DES4),"<>","  ")
+    Endcase
+Return
+
+
+# ------------------------------------------------------------
+# Ecriture des lignes de stat (cas simple sans total préliminaire à calculer)
+$STATS1
+ # Trace
+ U_TRAMES="--> $STATS1 (Ecriture des lignes de stat - cas simple) " : Gosub U_TRAPUT From SUBAPSUTI 
+ For JJ=1 To NBLINES
+     Gosub S_DEBLINE
+
+     For II=0 To [PS2]NBRFRM-1
+         Call FORMU([PS2]AMTFRM(II),MONTANT,
+&                    MONTANTS(0,JJ),MONTANTS(1,JJ),MONTANTS(2,JJ),MONTANTS(3,JJ),MONTANTS(4,JJ),
+&                    MONTANTS(5,JJ),MONTANTS(6,JJ),MONTANTS(7,JJ),MONTANTS(8,JJ),MONTANTS(9,JJ),
+&                    MONTPREV(0,JJ),MONTPREV(1,JJ),MONTPREV(2,JJ),MONTPREV(3,JJ),MONTPREV(4,JJ),
+&                    MONTPREV(5,JJ),MONTPREV(6,JJ),MONTPREV(7,JJ),MONTPREV(8,JJ),MONTPREV(9,JJ),
+&                    MONTPREC(0,JJ),MONTPREC(1,JJ),MONTPREC(2,JJ),MONTPREC(3,JJ),MONTPREC(4,JJ),
+&                    MONTPREC(5,JJ),MONTPREC(6,JJ),MONTPREC(7,JJ),MONTPREC(8,JJ),MONTPREC(9,JJ),
+&                    MONTPREVPREC(0,JJ),MONTPREVPREC(1,JJ),MONTPREVPREC(2,JJ),MONTPREVPREC(3,JJ),
+&                    MONTPREVPREC(4,JJ),MONTPREVPREC(5,JJ),MONTPREVPREC(6,JJ),MONTPREVPREC(7,JJ),
+&                    MONTPREVPREC(8,JJ),MONTPREVPREC(9,JJ)
+& )
+         Case [F:PS2]CUMFRM(II)
+            When 1 
+                 SW_STRINTVAL=num$(MONTANT)
+                 SW_STRVAL=format$("NzZ:" + GFM92,MONTANT)
+            When 2 
+                 MONTCUM(II)+=MONTANT
+                 SW_STRINTVAL=num$(MONTCUM(II))
+                 SW_STRVAL=format$("NzZ:" + GFM92,MONTCUM(II))
+         Endcase
+         #  debut
+         U_SEQPUT='  <Col Num="'+num$(II+3)+'" X3Type="4">' : Gosub S_SEQPUTDEC       # type decimal     # JPJ E28697
+         #  valeurs
+         U_SEQPUT='     <X3IntVal>' + SW_STRINTVAL + '</X3IntVal>' : Gosub S_SEQPUTDEC
+         U_SEQPUT='     <X3Value>' + SW_STRVAL + '</X3Value>' : Gosub S_SEQPUTDEC    # valeur avec conversion
+         #  fin colonne
+         U_SEQPUT="    </Col>": Gosub S_SEQPUTDEC
+
+     Next II
+     Gosub ECRIZOOM
+     U_SEQPUT='</Line>' : Gosub S_SEQPUTDEC
+ Next JJ
+Return
+
+# ------------------------------------------------------------
+# Ecriture des lignes de stat (cas où total préliminaire doit être calculé)
+$STATS2
+ # Trace
+ U_TRAMES="--> $STATS2 (Ecriture des lignes de stat - cas complexe) " : Gosub U_TRAPUT From SUBAPSUTI 
+
+ For JJ=1 To NBLINES
+     For II=0 To [PS2]NBRFRM-1
+         Call FORMU([PS2]AMTFRM(II),COLCUM(II,JJ),
+&                    MONTANTS(0,JJ),MONTANTS(1,JJ),MONTANTS(2,JJ),MONTANTS(3,JJ),MONTANTS(4,JJ),
+&                    MONTANTS(5,JJ),MONTANTS(6,JJ),MONTANTS(7,JJ),MONTANTS(8,JJ),MONTANTS(9,JJ),
+&                    MONTPREV(0,JJ),MONTPREV(1,JJ),MONTPREV(2,JJ),MONTPREV(3,JJ),MONTPREV(4,JJ),
+&                    MONTPREV(5,JJ),MONTPREV(6,JJ),MONTPREV(7,JJ),MONTPREV(8,JJ),MONTPREV(9,JJ),
+&                    MONTPREC(0,JJ),MONTPREC(1,JJ),MONTPREC(2,JJ),MONTPREC(3,JJ),MONTPREC(4,JJ),
+&                    MONTPREC(5,JJ),MONTPREC(6,JJ),MONTPREC(7,JJ),MONTPREC(8,JJ),MONTPREC(9,JJ),
+&                    MONTPREVPREC(0,JJ),MONTPREVPREC(1,JJ),MONTPREVPREC(2,JJ),MONTPREVPREC(3,JJ),
+&                    MONTPREVPREC(4,JJ),MONTPREVPREC(5,JJ),MONTPREVPREC(6,JJ),MONTPREVPREC(7,JJ),
+&                    MONTPREVPREC(8,JJ),MONTPREVPREC(9,JJ)
+& )
+        TOTCUM(II)+=COLCUM(II,JJ)
+     Next II
+ Next JJ
+ 
+ # Ecriture lignes
+ For JJ=1 To NBLINES
+     Gosub S_DEBLINE
+
+     For II=0 To [PS2]NBRFRM-1
+         Case [F:PS2]CUMFRM(II)
+            When 1 
+                 SW_STRINTVAL=num$(COLCUM(II,JJ))
+                 SW_STRVAL=format$("NzZ:" + GFM92,COLCUM(II,JJ))
+            When 2 
+                 MONTCUM(II)+=COLCUM(II,JJ)
+                 SW_STRINTVAL=num$(MONTCUM(II))
+                 SW_STRVAL=format$("NzZ:" + GFM92,MONTCUM(II))
+            When 3
+                 SW_DEC1=100*COLCUM(II,JJ)/(TOTCUM(II)+(TOTCUM(II)=0))
+                 SW_STRINTVAL=num$(SW_DEC1)
+                 SW_STRVAL=format$("NzZ:" + GFM92,SW_DEC1)
+            When 4
+                 MONTCUM(II)+=COLCUM(II,JJ)
+                 SW_DEC1=100*MONTCUM(II)/(TOTCUM(II)+(TOTCUM(II)=0))
+                 SW_STRINTVAL=num$(SW_DEC1)
+                 SW_STRVAL=format$("NzZ:" + GFM92,SW_DEC1)
+         Endcase
+         # debut
+         U_SEQPUT='  <Col Num="'+num$(II+3)+'" X3Type="4">' : Gosub S_SEQPUTDEC       # type decimal     # JPJ E28697
+         #  valeurs
+         U_SEQPUT='     <X3IntVal>' + SW_STRINTVAL + '</X3IntVal>' : Gosub S_SEQPUTDEC
+         U_SEQPUT='     <X3Value>' + SW_STRVAL + '</X3Value>' : Gosub S_SEQPUTDEC    # valeur avec conversion
+         #  fin 
+         U_SEQPUT="    </Col>": Gosub S_SEQPUTDEC
+
+     Next II
+
+     Gosub ECRIZOOM
+     U_SEQPUT='</Line>' : Gosub S_SEQPUTDEC
+ Next JJ
+Return
+
+# ------------------------------------------------------------
+$S_DEBLINE
+    U_SEQPUT=' <Line Num="'+num$(JJ)+'" >' : Gosub S_SEQPUTDEC
+
+    U_SEQPUT='  <Col Num="1" X3Type="7" '      # JPJ E28697
+    # Objet lié en fonction du niveau
+    If S_COLLINK(LEVEL-1)<>""    #   lien
+         Call GETURLCLEPRIM(S_COLLINK(LEVEL-1), CLE(JJ), M_MODE, SW_URL) From SUBAPSOBJ
+         If SW_URL<>""
+             U_HEXTOTXT=SW_URL : Gosub U_TXTTOHEX From SUBAPSUTI
+             U_SEQPUT+=' X3Link="' + U_TXTTOHEX + '" '
+         Endif
+    Endif
+    U_SEQPUT +=  ' >': Gosub S_SEQPUTDEC
+
+    U_HEXTOTXT=CLE(JJ) : Gosub U_TXTTOHEX From SUBAPSUTI
+    U_SEQPUT='     <X3IntVal>' + U_TXTTOHEX + '</X3IntVal>' : Gosub S_SEQPUTDEC
+    U_SEQPUT='     <X3Value>' + U_TXTTOHEX + '</X3Value>' : Gosub S_SEQPUTDEC
+    U_SEQPUT="  </Col>": Gosub S_SEQPUTDEC
+    U_HEXTOTXT=LIBCLE(JJ) : Gosub U_TXTTOHEX From SUBAPSUTI
+    U_SEQPUT='  <Col Num="2" X3Type="7">' : Gosub S_SEQPUTDEC     # JPJ E28697
+    U_SEQPUT='     <X3IntVal>' + U_TXTTOHEX + '</X3IntVal>' : Gosub S_SEQPUTDEC
+    U_SEQPUT='     <X3Value>' + U_TXTTOHEX + '</X3Value>' : Gosub S_SEQPUTDEC  
+    U_SEQPUT="  </Col>": Gosub S_SEQPUTDEC
+Return
+
+# ------------------------------------------------------------
+Subprog FORMU(EXPR,RESULT
+& ,C1,C2,C3,C4,C5,C6,C7,C8,C9,C10
+& ,P1,P2,P3,P4,P5,P6,P7,P8,P9,P10
+& ,CC1,CC2,CC3,CC4,CC5,CC6,CC7,CC8,CC9,CC10
+& ,PP1,PP2,PP3,PP4,PP5,PP6,PP7,PP8,PP9,PP10)
+Value    Char    EXPR
+Variable Decimal RESULT
+Value    Decimal C1, C2, C3, C4, C5, C6, C7, C8, C9, C10 
+Value    Decimal P1, P2, P3, P4, P5, P6, P7, P8, P9, P10
+Value    Decimal CC1, CC2, CC3, CC4, CC5, CC6, CC7, CC8, CC9, CC10
+Value    Decimal PP1, PP2, PP3, PP4, PP5, PP6, PP7, PP8, PP9, PP10
+Onerrgo RIEN
+RESULT = evalue(EXPR)
+Onerrgo
+End
+
+$RIEN
+Resume
+
+# Effacement (un peu optimisé en fonction des champs retenus) de la ligne jj
+# Dommage que Raz ne fonctionne pas sur des parties de tableaux !
+$RAZ_JJ
+ If FLGPREV<>0 & FLGPREC<>0
+     For II=0 To dim([SAT1]AMT)-1
+         MONTANTS(II,JJ)=0
+         MONTPREV(II,JJ)=0
+         MONTPREC(II,JJ)=0
+         MONTPREVPREC(II,JJ)=0
+     Next II
+ Elsif FLGPREV
+     For II=0 To dim([SAT1]AMT)-1
+         MONTANTS(II,JJ)=0
+         MONTPREV(II,JJ)=0
+     Next II
+ Elsif FLGPREC
+     For II=0 To dim([SAT1]AMT)-1
+         MONTANTS(II,JJ)=0
+         MONTPREC(II,JJ)=0
+     Next II
+ Else
+     For II=0 To dim([SAT1]AMT)-1
+         MONTANTS(II,JJ)=0
+     Next II
+ Endif
+Return
+
+# Décalage(un peu optimisé en fonction des champs retenus) à partir de la ligne JJ
+# Dommage que Insa ne fonctionne pas sur des parties de tableaux !
+$DEC_JJ
+ If FLGPREV<>0 & FLGPREC<>0 : # Optimisons les tests dans les boucles
+     For KK=NBLINES To JJ+1 Step -1
+         CLE(KK)=CLE(KK-1)
+         LIBCLE(KK)=LIBCLE(KK-1)
+         For II=0 To dim([SAT1]AMT)-1
+             MONTANTS(II,KK)=MONTANTS(II,KK-1)
+             MONTPREV(II,KK)=MONTPREV(II,KK-1)
+             MONTPREC(II,KK)=MONTPREC(II,KK-1)
+             MONTPREVPREC(II,KK)=MONTPREVPREC(II,KK-1)
+         Next II
+     Next KK
+ Elsif FLGPREC
+     For KK=NBLINES To JJ+1 Step -1
+         CLE(KK)=CLE(KK-1)
+         LIBCLE(KK)=LIBCLE(KK-1)
+         For II=0 To dim([SAT1]AMT)-1
+             MONTANTS(II,KK)=MONTANTS(II,KK-1)
+             MONTPREC(II,KK)=MONTPREC(II,KK-1)
+         Next II
+     Next KK
+ Elsif FLGPREV
+     For KK=NBLINES To JJ+1 Step -1
+         CLE(KK)=CLE(KK-1)
+         LIBCLE(KK)=LIBCLE(KK-1)
+         For II=0 To dim([SAT1]AMT)-1
+             MONTANTS(II,KK)=MONTANTS(II,KK-1)
+             MONTPREV(II,KK)=MONTPREV(II,KK-1)
+         Next II
+     Next KK
+ Else
+     For KK=NBLINES To JJ+1 Step -1
+         CLE(KK)=CLE(KK-1)
+         LIBCLE(KK)=LIBCLE(KK-1)
+         For II=0 To dim([SAT1]AMT)-1
+             MONTANTS(II,KK)=MONTANTS(II,KK-1)
+         Next II
+     Next KK
+ Endif
+Return
+
+
+# ------------------------------------------------------------
+$SETDATE
+# Positionne la date SW_DATE à partir de U_RESFOR
+If U_PARVAL <> ""
+    Onerrgo SETDATE_ERR 
+    SW_DATE=U_PARVAL        # l'assignation marche si ordre de la chaine YYYYMMDD
+    Onerrgo
+Else
+    SW_DATE=[00/00/00]    # date nulle
+Endif
+Return
+
+$SETDATE_ERR    # U_EVAFOR contient la formule à évaluer
+U_MESCODE="X3DATEVAERR" : U_MESP1=U_EVAFOR : U_MESP2=errm-errmes$(errn) : U_ERR=UC_ERRG : Gosub U_MESPUT From SUBAPSUTI 
+Resume
+Return
+
+# ------------------------------------------------------------
+$ECRIZOOM
+# Ecriture des infos de zoom au niveau inférieur
+ If LEVEL<[F:PS2]NBRFLD
+
+     U_SEQPUT = "<Zoom>": Gosub S_SEQPUTDEC
+     #    infos issues de la fiche statistique portail
+     # Wrseq 'STAT="'+CODE+'" ';
+     # Wrseq 'CPY="'+CPY+'" ';
+     # Wrseq 'FCY="'+FCY+'" ';
+     # Wrseq 'DATDEB="'+format$("D:DD[-]MM[-]YYYY",DATDEB)+'" ';
+     # Wrseq 'DATFIN="'+format$("D:DD[-]MM[-]YYYY",DATFIN)+'" ';
+     # Wrseq 'DDATDEB="'+format$("D:DD[-]MM[-]YYYY",DDATDEB)+'" ';
+     # Wrseq 'DDATFIN="'+format$("D:DD[-]MM[-]YYYY",DDATFIN)+'" ';
+
+
+     U_SEQPUT = "  <Level>" +num$(LEVEL+1)+ "</Level>": Gosub S_SEQPUTDEC
+     U_SEQPUT = "  <Criteria>" : Gosub S_SEQPUTDEC
+         For II=0 To LEVEL-1
+             SW_STR1=string$(II<LEVEL-1,VALCRIT(II+1)) + string$(II=LEVEL-1,CLE(JJ))
+             U_HEXTOTXT=SW_STR1 : Gosub U_TXTTOHEX From SUBAPSUTI
+             U_SEQPUT = "  <Criterion"+num$(II+1) + ">" + U_TXTTOHEX + "</Criterion"+num$(II+1) + ">"
+             Gosub S_SEQPUTDEC
+         Next II
+     U_SEQPUT = "  </Criteria>" : Gosub S_SEQPUTDEC
+     U_SEQPUT = "</Zoom>": Gosub S_SEQPUTDEC
+ Endif
+Return
+
+
+
+# ------------------------------------------------------------
+#-- Ecriture output avec decalage
+$S_SEQPUTDEC
+  U_SEQPUT=space$(4)+U_SEQPUT :  Gosub U_PUT From SUBAPSUTI
+Return
+
+

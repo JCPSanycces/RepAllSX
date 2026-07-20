@@ -1,0 +1,1502 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ 
+######################################################################################
+######################################################################################
+### before any call to this process, the following variables should exist and have the
+### correct value
+### [L]SOC       = company
+### [L]COMMENT   = comment for saft
+### [L]STRDATE   = starting date of extraction
+### [L]ENDDATE   = end date of extraction
+### [L]FILEPATH  = file name and path
+### [L]SAFTTYPE  = saft type
+### [L]FILDESTYP = file destiny (client/server)
+### [L]LEG       = legislation
+### [L]EVRDOCTYP = todos os tipos de documento (de transporte)
+### [L]DOCTYP    = tipo de documento (de transporte)
+### [L]PIHBPS    = fornecedor de auto-faturação
+### [L]FICHIER   = nome do ficheiro de exportação
+######################################################################################
+######################################################################################
+$ACTION
+
+Case ACTION
+    When "CONTROLE"    Gosub CONTROLE
+    When "EXEC"        Gosub EXEC
+Endcase
+
+Return
+######################################################################################
+######################################################################################
+$CONTROLE
+
+Gosub INIT_CTR
+
+Gosub COMMON_VALUES_AND_CONTROLS
+
+#--- Check if all tax rates have classification
+For [F:TVT] Where ([F:TVT]LEG = [L]LEG | [F:TVT]LEG = "") & find([F:TVT]VATTYP,1,2,3)
+  [L]TVTCTR = 0
+  If find([F:TVT]VATTYP,2,3) & [F:TVT]VATFOR<>""
+    [L]TVTCTR = 1
+  Else
+    Filter [F:TRA] Where [F:TRA]VAT = [F:TVT]VAT & [F:TRA]LEG = [F:TVT]LEG & ([F:TRA]CPY = [L]SOC | [F:TRA]CPY = '')
+    Look [F:TRA] First
+    If fstat = 0
+      [L]TVTCTR = 1
+    Endif
+    Filter [F:TRA]
+  Endif
+  If [L]TVTCTR
+    Read [F:VCL]VCL0=[L]SOC;[F:TVT]VAT
+    If fstat
+      GERR     = 1
+      GMESSAGE = func AFNC.MES1(mess(19,7711,1), [F:TVT]VAT) #Tax code $1$ it's not classified. Review the tax classification.
+      OK       = 0
+      Break
+    Endif
+  Endif
+Next
+If !OK : Return : Endif
+
+If [L]FILDESTYP = 1
+  #get the value from SAFTEXP parameter
+  [L]SAFTPEXP = func AFNC.PARAMUTIL("SAFTEXP",GUSER,[L]SOC)
+Endif
+
+#Check if dates are ok
+Call DATFIY([L]SOC, [L]LEDT, [L]EXE, [L]STRFYDAT, [L]ENDFYDAT) From CPTSUB
+If [L]STRDATE <> [L]STRFYDAT & day([L]STRDATE) <> 1
+  GERR     = 1
+  GMESSAGE = mess(20,7711,1) #Incorrect initial date: it must be the begining of the fiscal year or the begining of a month.
+  OK = 0
+Elsif [L]ENDDATE <> [L]ENDFYDAT & eomonth([L]ENDDATE)<> [L]ENDDATE & [L]ENDDATE <> date$
+  GERR     = 1
+  GMESSAGE = mess(21,7711,1) #Incorrect end date: it must be the end of the fiscal year, the end of a month or the current date.
+  OK = 0
+Elsif !([L]STRDATE >= [L]STRFYDAT & [L]STRDATE <= [L]ENDFYDAT) or !([L]ENDDATE >= [L]STRFYDAT & [L]ENDDATE <= [L]ENDFYDAT)
+  GERR     = 1
+  GMESSAGE = mess(20,107,1) #The dates are not in the same fiscal year
+  OK = 0
+Endif
+If GERR=1 : Return : Endif
+
+[L]STRDATECTB = [L]STRFYDAT #Accounting begining date for extraction is always the initial date of the fiscal year
+[L]ENDDATECTB = [L]ENDDATE  #Accounting ending date for extraction is always the end date entered by the user
+
+Return
+######################################################################################
+######################################################################################
+$INIT_CTR
+
+If !clalev ([F:VCL]) : Local File VATCLS     [VCL] : Endif
+If !clalev ([F:TVT]) : Local File TABVAT     [TVT] : Endif
+If !clalev ([F:FIY]) : Local File FISCALYEAR [FIY] : Endif
+If !clalev ([F:PER]) : Local File PERIOD     [PER] : Endif
+If !clalev ([F:CPY]) : Local File COMPANY    [CPY] : Endif
+If !clalev ([F:TRA]) : Local File TABRATVAT  [TRA] : Endif
+
+Gosub INITIALIZE_VERSION_MANAGEMENT
+
+Gosub COMMON_DECLARE
+
+Local Integer FISCALYEAR
+Local Date    STRFYDAT, ENDFYDAT, STRDATECTB, ENDDATECTB
+Local Char    SAFTPEXP(GDIMFIC)
+
+Return
+######################################################################################
+######################################################################################
+$COMMON_DECLARE
+
+If !clalev ([F:TCY]) : Local File TABCOUNTRY [TCY] : Endif
+
+Local Decimal EXE
+Local Char    SAFTPGROU(2), LAN(GLONLAN)
+
+#Local SAF-T PT Vars
+Local Char     PYR(30)
+Local Char     COA(30)
+Local Char     SYMBOLE(30)
+Local Integer  LEDT
+Local Char     LEDTA(30)
+Local Char     TYPONDAN(30)
+Local Char     SAFPRIRNC(30)
+Local Decimal  SAFPRIRND
+Local Char     SAFPRIFMT(30)
+Local Char     ACCRET(30)
+Local Char     PIHBPS(60)
+Local Integer  OTHIMP        #Other taxes then VAT (for IEC)
+Local Shortint DO_OTHIMP     #Other taxes then VAT - exist on present document (for IEC)
+Local Decimal  VALTMP        #valor a adicionar\subtrair (outros impostos) (for IEC)
+Local Char     ELTAX(5)      #código de taxa a usar para os elementos de faturação sem iva no presente documento (baseado nas linhas)
+Local Integer  TVTCTR        #Para controlar se as taxas estão todas parametrizadas antes da geração do SAF-T
+Local Shortint VENEXEFLG     #Para indicar se a taxa é isenta nas vendas
+
+# Issue X3-31864 - 2017-04-25 by MRDAB - Variable lengths for version maintenance
+Local Integer HETADDREETAIL, GLTACCODESCRL, SUTIADDRDETL, GLEGLSODOCIDL, ITTITMNUMCL, SDHASHCTRLL, SDDELIVERIL, SDSHIPIDL, ADDDETL, STRNAMEL
+Local Integer CUTCUSTAXIDL
+#Footer elements
+Local Integer DIMSVV, DIMSVF : DIMSVV = func AFNC.ACTIV("SVA")  : DIMSVF = func AFNC.ACTIV("SFIV")
+
+If [L]ISSAFTVERCURRENT
+  [L]ADDDETL = 210
+  [L]STRNAMEL = 200
+  [L]HETADDREETAIL = 210
+  [L]GLTACCODESCRL = 100
+  [L]SUTIADDRDETL = 210
+  [L]GLEGLSODOCIDL = 60
+  [L]SDHASHCTRLL = 70
+  [L]SDDELIVERIL = 255
+  [L]SDSHIPIDL = 255
+  [L]ITTITMNUMCL = 60
+  [L]CUTCUSTAXIDL= 30
+Else
+  [L]ADDDETL = 100
+  [L]STRNAMEL = 50
+  [L]HETADDREETAIL = 60
+  [L]GLTACCODESCRL = 60
+  [L]SUTIADDRDETL = 60
+  [L]GLEGLSODOCIDL = 30
+  [L]SDHASHCTRLL = 40
+  [L]SDDELIVERIL = 30
+  [L]SDSHIPIDL = 30
+  [L]ITTITMNUMCL = 50
+  [L]CUTCUSTAXIDL= 20
+Endif
+# End issue X3-31864
+
+# Issue X3-105529 by MRDAB: fixed KIT communication in SAF-T
+Local Char SAFTPRDKITACTIVE(1)
+# Issue X3-105529 end
+
+Return
+######################################################################################
+######################################################################################
+$COMMON_VALUES_AND_CONTROLS
+
+####--- Get the main general ledger
+#Call LECLEDMAIN(1, [L]SOC, [L]LEDT) From CPTDIV
+Gosub SET_LEDT
+
+###---- Get fiscal year
+Call GETEXE([L]SOC, [L]LEDT, [L]STRDATE, [L]EXE) From CPTSUB
+If [L]EXE  = 0
+  GERR     = 1
+  GMESSAGE = mess(7,101,1) #Fiscal Year Not Yet Defined
+  OK       = 0
+  Return
+Endif
+
+#get the value from SAFTPGROU parameter
+Call PARAM([L]SOC,"SAFTPGROU",[L]SAFTPGROU) From ADOVAL
+If val([L]SAFTPGROU) < 1 or val([L]SAFTPGROU) > func AFNC.ACTIV("STI")
+  GERR     = 1
+  GMESSAGE = mess(3,2647,1)+":"-mess(143,105,1)-"SAFTPGROU" #Incorrect value: Parameter SAFTPGROU
+  OK       = 0
+  Return
+Endif
+
+#get default language for company
+If [F:CPY]CPY <> [L]SOC
+  Read [F:CPY]CPY0 = [L]SOC
+  If fstat : Raz [F:CPY] : Endif
+Endif
+Read [F:TCY]TCY0=[F:CPY]CRY
+[L]LAN = [F:TCY]LAN
+
+Return
+######################################################################################
+######################################################################################
+$EXEC
+
+#open trace
+Call OUVRE_TRACE("SAF-T") From LECFIC
+
+# declare and assign variables regarding XML SAF-T schema version management
+Gosub INITIALIZE_VERSION_MANAGEMENT
+
+#open tables and declare variables
+Gosub DECLARE
+
+#empty temporary customer table
+Delete [F:SAFTP] Where 1=1
+
+#Genarel parameters and other variables used on SAF-T POR
+Gosub LOAD_PARAM
+
+# Issue 114518 - 2016-02-18 by RICAR : Verification of accounting documents with Temporary status
+# Issue 114518
+Gosub CHECK_ACCDOCS_STA
+If !OK : Goto END_EXEC : Endif
+# End issue 114518
+
+#open file to write
+Gosub OPEN_FILE
+If !OK
+  Call ECR_TRACE(GMESSAGE, 1) From GESECRAN
+  Goto END_EXEC
+Endif
+
+# Issue X3-99026 by MRDAB - verify connection language
+If GLANGUE <> "POR"
+  Call ECR_TRACE (mess(66,123,1) + ":" - mess(243,7711,1), 1) From GESECRAN
+  # we treat it as a warning so we decrement error counter
+  GERRTRACE -= 1
+Endif
+# Issue X3-99026 end
+
+If find([L]SAFTTYPE,5,7)
+  #Purchanse Auto-invoicing
+  Gosub WRITE_TAGS_PIH From SAFTGENPORPIH
+Else
+  #Sales, Accounting, et..
+  Gosub WRITE_TAGS
+Endif
+
+#close the file
+Gosub CLOSE_FILE
+
+$END_EXEC
+#close the trace
+Call FERME_TRACE From LECFIC
+#read the trace
+Call LEC_TRACE From LECFIC
+
+Return
+######################################################################################
+######################################################################################
+$LOAD_PARAM
+
+Gosub LOAD_COMMON_VALUES
+
+If [L]FILDESTYP = 1
+  #get the value from SAFTEXP parameter
+  [L]SAFTPEXP = func AFNC.PARAMUTIL("SAFTEXP",GUSER,[L]SOC)
+Endif
+
+#write the content of the file
+[L]EVRDOCTYP = [M:SAFT]EVRDOCTYP
+[L]DOCTYP    = [M:SAFT]DOCTYP
+[L]PIHBPS    = [M:SAFT]BPSNUM
+
+Return
+#######################################################################################
+#######################################################################################
+$LOAD_COMMON_VALUES
+
+#Ledgertype
+#Call PARAM([L]SOC, "LEDTYP", [L]LEDTA) From ADOVAL
+#[L]LEDT = val([L]LEDTA)
+#If [L]LEDT = 0
+#  ###--- Get the main general ledger                                 ---###
+#  Call LECLEDMAIN(1, [L]SOC, [L]LEDT) From CPTDIV
+#Endif
+Gosub SET_LEDT
+Gosub SET_COA
+Gosub SET_SAFPRIRND
+
+Call PARAM([L]SOC, "SAFTACCRET",[L]ACCRET) From ADOVAL
+Call PARAM([L]SOC, "TYPONDAN",[L]TYPONDAN) From ADOVAL
+
+If instr(0,SAFPRIRNC,".")
+   SAFPRIFMT = "N20." + num$(len(right$(SAFPRIRNC,instr(0,SAFPRIRNC,".")+1)))
+Else
+   SAFPRIFMT = "N20"
+Endif
+
+#Accounting Pyramid
+Call PARAM([L]SOC, "PORPYR", [L]PYR) From ADOVAL
+If [L]PYR = ""
+    [L]PYR = "POR"
+Endif
+
+Filter [F:TVT] Where [F:TVT]VATTYP <> 1 & ([F:TVT]LEG = "" | [F:TVT]LEG = "POR")
+Read [F:TVT] First
+If !fstat : [L]OTHIMP = 1 : Else : [L]OTHIMP = 0 : Endif
+Filter [F:TVT]
+
+Gosub SET_SAFTPRDKITACTIVE
+
+Return
+#######################################################################################
+#######################################################################################
+$DECLARE
+#Tables
+If !clalev([F:ADI])   : Local File ATABDIV    [ADI]   : Endif #Supervisor
+If !clalev([F:BPC])   : Local File BPCUSTOMER [BPC]   : Endif #Common Data        (9)
+If !clalev([F:PIL])   : Local File BPSINVLIG  [PIL]   : Endif #Common Data        (9)
+If !clalev([F:BPS])   : Local File BPSUPPLIER [BPS]   : Endif #Common Data        (9)
+If !clalev([F:CNT])   : Local File CONTACT    [CNT]   : Endif #Supervisor         (1)
+If !clalev([F:AIN])   : Local File CONTACTCRM [AIN]   : Endif #Supervisor         (1)
+If !clalev([F:FIY])   : Local File FISCALYEAR [FIY]   : Endif #Common Data        (9)
+If !clalev([F:CAC])   : Local File GACCCODE   [CAC]   : Endif #Common Data        (9)
+If !clalev([F:GRY])   : Local File GACCGRUPYM [GRY]   : Endif #Common Data        (9)
+If !clalev([F:GR2])   : Local File GACCGRUPYM [GR2]   : Endif #Common Data        (9)
+If !clalev([F:GYK])   : Local File GACCPYMLIK [GYK]   : Endif #Common Data        (9)
+If !clalev([F:LED])   : Local File GLED       [LED]   : Endif #Common Data        (9)
+If !clalev([F:GTE])   : Local File GTYPACCENT [GTE]   : Endif #Common Data        (9)
+If !clalev([F:ITG])   : Local File ITMCATEG   [ITG]   : Endif #Common Data        (9)
+If !clalev([F:PIH])   : Local File PINVOICE   [PIH]   : Endif #Common Data        (9)
+If !clalev([F:PTH])   : Local File PRECEIPT   [PTH]   : Endif #Common Data        (9)
+If !clalev([F:SAFTP]) : Local File SAFTPTTMP1 [SAFTP] : Endif #Common Data        (9)
+If !clalev([F:TDA])   : Local File TABDEPAGIO [TDA]   : Endif #Common Data        (9)
+If !clalev([F:TPV])   : Local File TABPIVTYP  [TPV]   : Endif #Common Data        (9)
+If !clalev([F:TRA])   : Local File TABRATVAT  [TRA]   : Endif #Common Data        (9)
+
+If GMODU(2) = 2 # test the presence of the Accounting module
+  If !clalev([F:BAL])   : Local File BALANCE    [BAL]   : Endif #Accouting          (2)
+  If !clalev([F:JOU])   : Local File GJOURNAL   [JOU]   : Endif #Accouting          (2)
+  If !clalev([F:HA2])   : Local File GACCENTRY  [HA2]   : Endif #Accouting          (2)
+  If !clalev([F:DA2])   : Local File GACCENTRYD [DA2]   : Endif #Accouting          (2)
+  If !clalev([F:GA2])   : Local File GACCOUNT   [GA2]   : Endif #Accouting          (2)
+  If !clalev([F:PYHV])  : Local File PAYVAT     [PYHV]  : Endif #Accouting          (2)
+  If !clalev([F:CLS])   : Local File GACCCLS    [CLS]   : Endif #Accouting          (2)
+  If !clalev([F:CL2])   : Local File GACCCLS    [CL2]   : Endif #Accouting          (2)
+  If !clalev([F:VER])   : Local File VATEXEREA  [VER]   : Endif #Accouting          (2)
+Endif
+
+If GMODU(3) = 2 # test the presence of the A/P-A/R Accounting module
+  If !clalev([F:PYH]) : Local File PAYMENTH   [PYH] : Endif #A/P-A/R Accounting (3)
+  If !clalev([F:PYD]) : Local File PAYMENTD   [PYD] : Endif #A/P-A/R Accounting (3)
+  If !clalev([F:PH2]) : Local File PAYMENTH   [PH2] : Endif #A/P-A/R Accounting (3)
+  If !clalev([F:CDA]) : Local File GACCDENCOD [CDA] : Endif #A/P-A/R Accounting (3)
+Endif
+
+If GMODU(6) = 2 # test the presence of the Purchase module
+  If !clalev([F:PID])   : Local File PINVOICED  [PID]   : Endif #Purchase        (6)
+  If !clalev([F:PIV])   : Local File PINVOICEV  [PIV]   : Endif #Purchase        (6)
+Endif
+
+If GMODU(7) = 2 # test the presence of the Stock module
+  If !clalev([F:SGH]) :  Local File SCHGH      [SGH]  : Endif #Stock              (7)
+  # Issue X3-31864 - 2017-04-06 by MRDAB:
+  If !clalev([F:STJ])  : Local File STOJOU     [STJ]  : Endif #Stock              (7)
+  # End issue X3-31864
+Endif
+
+Gosub DECLARE_TABS_INVOICE
+
+#Generic Auxiliar variables
+Local Char     AUXTAGNAM(50)  # tag name
+Local Char     AUXTAGVAL(255) # tag value
+Local Integer  STAT           # status flag for diverse operations
+Local Char     FILEPATHTMP(255)# temporary file path
+Local Integer  AMPIND         # counter for the special caracteres processment (in xml)
+Local Integer  IC             # generic counter
+Local Char     STR1           #string genérica
+Local Char     STR2           #string genérica
+Local Char     INVCRIT(255)   #criteria string for invoices (in source documents and customers)
+Local Integer  INTE           # for progress window
+Local Char     SECTION        # current file section being processed
+
+#Variables for progress information
+Local Integer  TOTRECS       # total number of records for the section
+Local Integer  RECSPRO       # records processed for the section
+Local Integer  RECSWRI       # records written in the file for the section
+Local Decimal  PREVPER       # previous completed percentage
+
+#General Ledger Auxiliar variables
+Local Char     CRITBAL(255)   # critere string for balance records
+Local Char     PREVGRU        # previous group
+Local Char     CURRGRU        # current group
+Local Char     PLAN           # Chart of accounts
+
+#Customer auxiliar vairables
+Local Char     PREVEEC        # previous eecnum for searches on invoices
+Local Shortint CCLIND         # index of first mandatory CAC
+
+#Tax table auxiliar variable
+Local Date     STRDATPRETAX   # starting date of the previous tax code
+
+#General ledger auxiliar variables
+Local Char     CTLGLNUM       # control over document number
+Local Char     CTLGLTYP       # control over document type
+Local Char     CTLGLJOU       # control over journal
+Local Char     CTLJOLEG       # control over journal legislation
+Local Char     CTLGELEG       # control over document type legislation
+
+#HEader Tags
+Local Char     HETAUDITFILV(10)
+Local Char     HETCOMPANYID(50)
+Local Integer  HETTAXREGNUM
+Local Char     HETTAXACCBAS(1)
+Local Char     HETCOMPANAME(60)
+Local Char     HETBUSINNAME(60)
+Local Char     HETBUILDNUMB(10)
+Local Char     HETSTREETNAM(50)
+# Issue X3-31864 - 2017-04-06 by MRDAB: extended street name length from 60 to 210
+Local Char     HETADDREETAI([L]HETADDREETAIL)
+# End issue X3-31864
+Local Char     HETCITY(50)
+Local Char     HETPOSTALCOD(8)
+Local Char     HETREGION(50)
+Local Char     HETCOUNTRY(2)
+Local Integer  HETFISCAYEAR
+Local Char     HETSTARTDATE(10)
+Local Char     HETENDDATE(10)
+Local Char     HETCURRECODE(3)
+Local Char     HETDATECREAT(10)
+Local Char     HETTAXENTITY(20)
+Local Char     HETPRCOTAXID(20)
+Local Char     HETSOCERTNUM(20)
+Local Char     HETPRODUCTID(255)
+Local Char     HETPRODUCTVE(30)
+Local Char     HETHEADERCOM(255)
+Local Char     HETTELEPHONE(20)
+Local Char     HETFAX(20)
+Local Char     HETEMAIL(60)
+Local Char     HETWEBSITE(60)
+
+##General Ledger Tags
+Local Char     GLTACCOUNTID(30)
+# Issue X3-31864 - 2017-04-06 by MRDAB: extended account desc length from 60 to 100
+Local Char     GLTACCODESCR([L]GLTACCODESCRL)
+# End issue X3-31864
+# Issue X3-27059 - 2017-03-29 by MANOW
+#new variable required to pass account ID to GROUP_VALUES block, while in GLTACCOUNTID variable we store account ID connected with BPR name (in our case)
+Local Char     GLTACCOUNTID_GROUP(30)
+# End issue X3-27059
+
+Local Decimal  GLTOPDEBBALA
+Local Decimal  GLTOPCREBALA
+Local Char     GLTACC(30)
+Local Char     GLTACCPRV(30)
+Local Decimal  GLTACCDEB
+Local Decimal  GLTACCCRE
+Local Char     GLTGRCAT(2)
+Local Char     GLTGRGRP(30)
+Local Decimal  GLTCLCREBALA
+Local Decimal  GLTCLDEBBALA
+Local Decimal  GLTACCCLCRE
+Local Decimal  GLTACCCLDEB
+Local Decimal  GLTLASTPER
+Local Decimal  GLTLASTEXE
+Local Char     GLTCRIT(255)
+# Issue X3-27059 - 2017-04-03 by MANOW/MRDAB
+#variable containing query containing more general criteria
+Local Char     GLTCRIT_DET2(255)
+#flag to determinate if we will write to extract detailed records for each BPR or we will write generall summary record for sum of all BPR connected to account
+Local Integer  BALBPRDET
+#variable containing BPR value from previous for loop iteration
+Local Char     BALBPRPREV(12)
+# End issue X3-27059
+Local Char     GLTC1
+Local Char     GLTC2
+Local Decimal  GLTPER
+Local Integer  GLTDET
+Local Char     GTAXONCODE(10)
+#Issue X3-31864 - 2017-04-27 by MRDAB: length fixed from 5 to 1
+Local Char     GLEDTYPE(1)
+#End issue X3-31864
+
+#Customer
+Local Char     CUTCUSTOMID(30)
+Local Shortint CUTISNPSYPE    # Is next physical person
+Local Char     CUTCACCOUID(30)
+Local Char     CUTCUSTAXID([L]CUTCUSTAXIDL)
+Local Char     CUTCOMPANAM(60)
+Local Char     CUTCONTACT(50)
+Local Char     CUTIBILNUM(10)
+Local Char     CUTISTRENAM(50)
+Local Char     CUTIADDRDET([L]ADDDETL)
+Local Char     CUTICITY(50)
+Local Char     CUTIPOSTCOD(20)
+Local Char     CUTIREGION(50)
+Local Char     CUTICOUNTRY(12)
+Local Char     CUTSBILNUM(10)
+Local Char     CUTSSTRENAM(50)
+Local Char     CUTSADDRDET(100)
+Local Char     CUTSCITY(50)
+Local Char     CUTSPOSTCOD(20)
+Local Char     CUTSREGION(50)
+Local Char     CUTSCOUNTRY(12)
+Local Char     CUTTELEPHONE(20)
+Local Char     CUTFAX(20)
+Local Char     CUTEMAIL(60)
+Local Char     CUTWEBSITE(60)
+Local Shortint CUTSELFBILIN
+Local Integer  CDIV
+Local Integer  EXCBPC
+
+#SUppliers Tags
+Local Char     SUTSUPPLID(30)
+Local Char     SUTACCOUID(30)
+Local Char     SUTSUPTAXID(20)
+Local Char     SUTCOMPANAM(60)
+Local Char     SUTCONTACT(50)
+Local Char     SUTIBILNUM(10)
+#Issue X3-31864 – 2017-04-14  by MANOW/MRDAB
+Local Char     SUTISTRENAM([L]STRNAMEL)
+Local Char     SUTIADDRDET([L]SUTIADDRDETL)
+# End issue X3-31864
+Local Char     SUTICITY(50)
+Local Char     SUTIPOSTCOD(20)
+Local Char     SUTIREGION(50)
+Local Char     SUTICOUNTRY(12)
+Local Char     SUTSBILNUM(10)
+# Issue X3-31864 - 2017-04-14 by MRDAB:
+Local Char     SUTSSTRENAM([L]STRNAMEL)
+Local Char     SUTSADDRDET([L]ADDDETL)
+# End issue X3-31864
+Local Char     SUTSCITY(50)
+Local Char     SUTSPOSTCOD(20)
+Local Char     SUTSREGION(50)
+Local Char     SUTSCOUNTRY(12)
+Local Char     SUTTELEPHONE(20)
+Local Char     SUTFAX(20)
+Local Char     SUTEMAIL(60)
+Local Char     SUTWEBSITE(60)
+Local Shortint SUTSELFBILIN
+Local Integer  EXCSUP
+
+#ITem Tags
+Local Char     ITTITMTYPE(1)
+Local Char     ITTITMCODE(60)
+Local Char     ITTITMGROU(50)
+Local Char     ITTITMDESC(60)
+
+#Issue X3-31864 – 2017-04-06  by MANOW
+Local Char     ITTITMNUMC([L]ITTITMNUMCL)
+Local Char     ITTITMCNCODE(8)
+Local Char     ITTITMUNNUM(4)
+#End issue X3-31864
+
+#TAx table Tags
+Local Char     TATTAXTYPE(3)
+Local Char     TATTAXCOUREG(5)
+Local Char     TATTAXCODE(10)
+Local Char     TATTDESCR(255)
+Local Char     TATTAXEXPDAT(10)
+Local Decimal  TATTAXPERCEN
+Local Decimal  TATTAXAMOUNT
+Local Integer  TATCT
+Local Date     TATPREVTAXDAT
+
+#GeneralLedgerEntries
+Local Integer  GLENUMOFENTRI
+Local Decimal  GLETOTDEBIT
+Local Decimal  GLETOTCREDIT
+Local Char     GLEJOURNALID(30)
+Local Char     GLEJDESCRIPT(60)
+Local Char     GLETRANSACID(70)
+Local Integer  GLEPERIOD
+Local Char     GLETRANSACDT(10)
+Local Char     GLESOURCEID(30)
+Local Char     GLEMDESCRIPT(60)
+Local Char     GLEDOCARCNUM(20)
+Local Char     GLETRANSTYPE(1)
+Local Char     GLEGLPOSTDAT(19)
+Local Char     GLEGLCUSTOID(30)
+Local Char     GLEGLSUPPLID(30)
+Local Integer  GLEGLRECORDI(10)
+Local Char     GLEGLACCOUNT(30)
+# Issue X3-31864 - 2017-04-06 by MRDAB: extended source document ID length from 30 to 60
+Local Char     GLEGLSODOCID([L]GLEGLSODOCIDL)
+# End issue X3-31864
+Local Char     GLEGLSYSENTD(19)
+Local Char     GLEGLLDESCRI(60)
+Local Decimal  GLEGLLDEBAMO
+Local Decimal  GLEGLLCREAMO
+Local Char     GLNUM(50)
+Local Char     GLTYP(50)
+Local Char     GLJOURN(50)
+Local Char     TYPONDAN(50)
+Local Integer  GLE
+Local Integer  NOTBAL
+Local Integer  GPE_TAX
+
+Gosub DECLARE_VARS_INVOICE
+
+#SourceDocuments:Payments
+Local Date PAYSTRDAT        #Starting date for exporting all payments
+#Payment Header
+Local Integer PAYNUMENT     #NumberOfEntries
+Local Double  PAYTOTDEB     #TotalDebit
+Local Double  PAYTOTCRE     #TotalCredit
+Local Char    PAYNUM(60)    #PaymentRefNo
+Local Char    PAYTRAID(70)  #TransactionID
+Local Char    PAYTRDATE     #TransactionDate
+Local Char    PAYTYPE(2)    #PaymentType
+Local Integer PAYSTA(1)     #PaymentStatus
+Local Char    PAYSTADAT     #PaymentStatusDate
+Local Char    PAYSRCID(30)  #SourceID
+Local Char    PAYSRCPAY(1)  #SourcePayment
+Local Char    PAYMECH(2)    #PaymentMechanism
+Local Double  PAYAMT        #PaymentAmount
+Local Char    PAYDATE       #PaymentDate
+Local Char    PAYSRCID2(30) #SourceID
+Local Char    PAYSYSENT     #SystemEntryDate
+Local Char    PAYCUSTID(30) #CustomerID
+Local Integer PAYPER        #Period
+
+#Issue X3-31864 – 2017-04-11  by MANOW
+Local Char    PAYATCUD(100) #ATCUD
+Local Char    PAYTAXEXAC(3) #TaxExemptionCode
+#End Issue X3-31864
+
+#Payment line
+Local Integer PAYLIN           #Line
+Local Char    PAYORIGON(60)    #OriginitingON
+Local Char    PAYINVDAT        #InvoiceDate
+Local Double  PAYCRELIN        #CreditAmount
+Local Double  PAYDEBLIN        #DebitAmount
+Local Char    PAYTAXTYP(3)     #TaxType
+Local Char    PAYTAXCOU(5)     #TaxCountryRegion
+Local Char    PAYTAXCOD(10)    #TaxCode
+Local Decimal PAYTAXPER        #TaxPercentage
+Local Decimal PAYTAXAMO        #TaxAmount
+Local Double  PAYTAXAMT        #TaxAmount
+Local Char    PAYTAXEXE(60)    #TaxExemptionReason
+
+#Document totals
+Local Double  PAYTAXTOT           #TaxPayable
+Local Double  PAYNETTOT           #NetTotal
+Local Double  PAYGROTOT           #GrossTotal
+Local Char    PAYCURCOD(GLONCUR)  #CurrencyCode
+Local Double  PAYCURAMT           #CurrencyAmount
+Local Double  PAYRAT              #ExchangeRate
+Local Double  PAYSETAMO           #Settlement Amount
+Local Double  WITHHOLDINGTAXAMOUNT #WithholdingTaxAmount #ISSUE 92228 - MNO
+
+Local Integer PAYX        : [L]PAYX       = 0
+Local Double  ALFA        : [L]ALFA       = 0
+Local Double  PTOTDOC     : [L]PTOTDOC    = 0
+Local Double  PAYRATCUR   : [L]PAYRATCUR  = 0
+Local Double  PAYAMTTAX   : [L]PAYAMTTAX  = 0
+Local Char    PAYPREVDOC  : [L]PAYPREVDOC = ''
+Local Double  PTOTPAGO    : [L]PTOTPAGO   = 0
+Local Char    COUNTER2    : [L]COUNTER2   = ''
+Local Char    COMPTEUR(20): [L]COMPTEUR   = ''
+Local Integer STAT        : [L]STAT       = 0
+Local Integer PAYTOTLIN   : [L]PAYTOTLIN  = 0
+Local Integer F           : [L]F = 0
+Local Integer ISWITHHOLDINGTAX
+
+Return
+#######################################################################################
+#######################################################################################
+$DECLARE_TABS_INVOICE
+
+If !clalev([F:ADC]) : Local File BPADDRESS  [ADC] : Endif #Supervisor         (1)
+If !clalev([F:CPY]) : Local File COMPANY    [CPY] : Endif #Supervisor         (1)
+If !clalev([F:FCY]) : Local File FACILITY   [FCY] : Endif #Supervisor         (1)
+
+If !clalev([F:BPR])  : Local File BPARTNER   [BPR]  : Endif #Common Data        (9)
+If !clalev([F:BPD])  : Local File BPDLVCUST  [BPD]  : Endif #Common Data        (9)
+If !clalev([F:DKD])  : Local File DKSDATA    [DKD]  : Endif #Common Data        (9)
+If !clalev([F:DKD2]) : Local File DKSDATA    [DKD2] : Endif #Common Data        (9)
+If !clalev([F:DUD])  : Local File GACCDUDATE [DUD]  : Endif #Common Data        (9)
+If !clalev([F:GAC])  : Local File GACCOUNT   [GAC]  : Endif #Common Data        (9)
+If !clalev([F:GCM])  : Local File GACM       [GCM]  : Endif #Common Data        (9)
+If !clalev([F:ITM])  : Local File ITMMASTER  [ITM]  : Endif #Common Data        (9)
+If !clalev([F:SIH])  : Local File SINVOICE   [SIH]  : Endif #Common Data        (9)
+If !clalev([F:SIH2]) : Local File SINVOICE   [SIH2] : Endif #Common Data        (9)
+If !clalev([F:TCU])  : Local File TABCUR     [TCU]  : Endif #Common Data        (9)
+If !clalev([F:TAM])  : Local File TABPAM     [TAM]  : Endif #Common Data        (9)
+If !clalev([F:TSV])  : Local File TABSIVTYP  [TSV]  : Endif #Common Data        (9)
+If !clalev([F:TVB])  : Local File TABVACBPR  [TVB]  : Endif #Common Data        (9)
+If !clalev([F:TVT])  : Local File TABVAT     [TVT]  : Endif #Common Data        (9)
+If !clalev([F:VCL])  : Local File VATCLS     [VCL]  : Endif #Common Data        (9)
+If !clalev([F:DKK])  : Local File DKSKEY     [DKK]  : Endif #Common Data        (9)
+
+If GMODU(2) = 2 # test the presence of the Accounting module
+  If !clalev([F:DVPT])  : Local File DCLVATPORT [DVPT]  : Endif #Accouting          (2)
+  If !clalev([F:HAE])   : Local File GACCENTRY  [HAE]   : Endif #Accouting          (2)
+  If !clalev([F:DAE])   : Local File GACCENTRYD [DAE]   : Endif #Accouting          (2)
+Endif
+
+If GMODU(3) = 2 # test the presence of the A/P-A/R Accounting module
+  If !clalev([F:SIL]) : Local File BPCINVLIG  [SIL] : Endif #A/P-A/R Accounting (3)
+  If !clalev([F:SI2]) : Local File BPCINVLIG  [SI2] : Endif #A/P-A/R Accounting (3)
+Endif
+
+If GMODU(5) = 2 # test the presence of the Sales module
+  If !clalev([F:SDH]) : Local File SDELIVERY  [SDH] : Endif #Sales              (5)
+  If !clalev([F:SID]) : Local File SINVOICED  [SID] : Endif #Sales              (5)
+  If !clalev([F:SIV]) : Local File SINVOICEV  [SIV] : Endif #Sales              (5)
+  If !clalev([F:SOH]) : Local File SORDER     [SOH] : Endif #Sales              (5)
+  If !clalev([F:SVF]) : Local File SVCRFOOT   [SVF] : Endif #Sales              (5)
+  If !clalev([F:SVV]) : Local File SVCRVAT    [SVV] : Endif #Sales              (5)
+Endif
+
+Return
+#######################################################################################
+#######################################################################################
+$DECLARE_VARS_INVOICE
+
+#SourceDocuments:Invoices
+Local Integer  SDNUMOFENT
+Local Decimal  SDTOTVALOR
+Local Decimal  SDTOTDEBIT
+Local Decimal  SDTOTCREDI
+Local Char     SDINVNUM(60)
+Local Char     SDINVSTA(1)
+Local Char     SDHASH(200)
+# Issue X3-31864 - 2017-04-06 by MRDAB: extended hash control length from 40 to 70
+Local Char     SDHASHCTRL([L]SDHASHCTRLL)
+# End issue X3-31864
+Local Integer  SDPER
+Local Char     SDINVDAT(10)
+Local Char     SDINVTYP(2)
+Local Integer  SDSELFBILL
+Local Char     SDSYSENTDA(19)
+Local Char     SDTRANSAID(70)
+Local Char     SDCUSTOMID(30)
+Local Char     SDINVSTADA(19) #InvoiceStatusDate
+# Issue X3-31864 - 2017-04-06 by MRDAB: extended ship from delivery ID length from 30 to 255
+Local Char     SDDELIVERI([L]SDDELIVERIL)
+# End issue X3-31864
+Local Char     SDDELIVEDT(10)
+Local Char     SDDBUILNUM(10)
+Local Char     SDDSTRENAM(50)
+# Issue X3-31864 - 2017-04-06 by MRDAB: extended address detail length from 100 to 210
+Local Char     SDDADDDETA([L]ADDDETL)
+# End issue X3-31864
+Local Char     SDDCITY(50)
+Local Char     SDDPOSTVOD(20)
+Local Char     SDDREGION(50)
+Local Char     SDDCOUNTR(2)
+# Issue X3-31864 - 2017-04-06 by MRDAB: extended ship to delivery ID length from 30 to 255
+Local Char     SDSHIPID([L]SDSHIPIDL)
+# End issue X3-31864
+Local Char     SDSHIPDT(10)
+Local Char     SDSBUILNUM(10)
+Local Char     SDSSTRENAM(50)
+# Issue X3-31864 - 2017-04-06 by MRDAB: extended address detail length from 100 to 210
+Local Char     SDSADDDETA([L]ADDDETL)
+# End issue X3-31864
+Local Char     SDSCITY(50)
+Local Char     SDSPOSTVOD(20)
+Local Char     SDSREGION(50)
+Local Char     SDSCOUNTR(2)
+Local Integer  SDLINENUM
+Local Char     SDLORDNUM(30)
+Local Char     SDLORDDAT(10)
+Local Char     SDLITMREF(30)
+Local Char     SDLITMDES(200)
+Local Decimal  SDLITMQTY
+Local Char     SDLQTYUOM(20)
+Local Decimal  SDLNETPRI
+Local Char     SDLENTDAT(10)
+Local Char     SDLDOCREF(60)
+Local Char     SDLDOCMOT(50)
+Local Char     SDLPERDEB(10)
+Local Char     SDLPERFIN(10)
+Local Char     SDLDESCRI(200)
+Local Decimal  SDLDEBAMO
+Local Decimal  SDLCREAMO
+Local Char     SDLTAXTYP(3)
+Local Char     SDLTACORE(5)
+Local Char     SDLTAXCOD(10)
+Local Decimal  SDLTAXPER
+Local Decimal  SDLTAXAMO
+Local Char     SDLTAEXRE(60)
+Local Decimal  SDLSETAMO
+Local Decimal  SDTAXPAYA
+Local Decimal  SDNETTOTA
+Local Decimal  SDGROTOTA
+Local Char     SDCUR(3)
+Local Decimal  SDCURCRAM
+Local Decimal  SDCURDEAM
+Local Char     SDSETDISC(30)
+Local Decimal  SDSETAMOU
+Local Char     SDSETDATE(10)
+Local Char     SDPAYMECH(2)
+Local Char     SDSRCBIL(1)
+Local Char     SDSRCIDC(15)
+Local Char     SDSRCIDU(GLONAUS)
+Local Decimal  SDSOURCEWT
+Local Decimal  SDCURAMT
+Local Integer  SDCASHVAT
+Local Integer  SDTHIRDP
+Local Decimal  SDX
+Local Integer  SDVATDOC
+Local Integer  SDASSET
+Local Decimal  SDLDCRECT      #Discount - Value
+Local Decimal  SDLDCRECP      #Discount - Value %
+Local Decimal  SDLDCRECL      #Discount - Line
+Local Char     FACCRITER(255) #Filter
+Local Decimal  SDRATCUR       #Current RATCUR
+Local Char     SDXC1(GLONVCR)
+Local Char     SDXC2(GLONVCR)
+Local Char     SILVAT(GLONVAT)
+
+Local Integer  SAFTWAY            #Variavel para alimentar as variaveis e escrevelas pelo saft
+Local Shortint EFATACTIV          #Variavel para identificar se temos o código de actividade do EFAT activo
+
+# Issue X3-31864 - 2017-04-25 by MRDAB/MANOW: New fields for invoice and movement of goods
+Local Char     SDATCUD(100)
+Local Char     SDLSERNUM(100)(1..)
+Local Char     SDLTAEXCO(3)
+Local Char     SDLARCNO(21)
+Local Decimal  SDLIECAM
+Local Decimal  SDLTAXB
+Local Char     SDLTAXEXAC(3)       #TaxExemptionCode
+#Local Char     MGDTAXEXAC(3)      #TaxExemptionCode
+#Local Char     MGARCNO(21)        #ARCNo
+#Local Decimal  MGIECAM            #IECAmount
+#Local Char     MGATCUD(100)       #ATCUD
+#Local Char     MGSERNUM(100)      #SerialNumber
+#End Issue X3-31864
+Local Integer  WRET
+#Footer  elements
+Local Char     CTRLVAT(5)(1..)
+Local Integer  COUNTVAT, FLG ,K, SDL1
+Local Char     ARRAY_VAT(GLONVAT)(DIMSVV), ARRAY_FOOTVAT(GLONVAT+10)(DIMSVF)
+Local Decimal  ARRAY_VATNET(DIMSVV), ARRAY_FOOTNET(DIMSVF), FOOT_RAT
+
+Return
+#######################################################################################
+#######################################################################################
+$OPEN_FILE
+#Onerrgo $ERROR
+#opening file to write to (on temporary folder)
+#[L]FILEPATHTMP = filpath('tmp','SAFT_PT_'+[L]SOC+"_"+format$("D:DDMMYYYYhhmmss", date$),'xml')
+
+Case [L]SAFTTYPE
+  When 2
+    [L]HETTAXACCBAS = "I"
+  When 3
+    [L]HETTAXACCBAS = "F"
+  When 4
+    [L]HETTAXACCBAS = "C"
+  When 5, 7
+    [L]HETTAXACCBAS = "S"
+  When 6, 8
+    [L]HETTAXACCBAS = "P"
+Endcase
+
+NAM    = 'SAFT_PT_'+[L]SOC+"_"+[L]HETTAXACCBAS+"_"+format$("D:DDMMYYYYhhmmss", date$)
+EXT    = "xml"
+
+FICHIER = [M:SAFT]FIC
+Call MACHINE(FICHIER,MACHINE,CHEMIN) From ORDSYS
+NOMFIC  = [L]NAM
+
+If [L]FILDESTYP=1 : # Client
+ FICHIER = filpath(CHEMIN,NOMFIC,EXT)
+ Call SET_FICNAM(FICHIER,FICDON,URL) From ORDSYS
+Else
+ FICDON = filpath(CHEMIN,NOMFIC,EXT,"","",MACHINE)
+ If filinfo(FICDON,7)>0
+  ## Fichier existant, souhaitez-vous l'écraser ?
+  Call OUINON(mess(127,105,1), OK) From GESECRAN
+  If OK=1 : Return : Endif
+ Endif
+Endif
+
+#empty file if exists
+Openo [L]FICDON, 0              Using [SAFT]
+Iomode adxirs chr$(10)          Using [SAFT]
+Iomode adxifs ''                Using [SAFT]
+Iomode adxium 50                Using [SAFT]
+
+Wrseq '<?xml version="1.0" encoding="Windows-1252"?>' Using [SAFT]
+Wrseq '<AuditFile xmlns="urn:OECD:StandardAuditFile-Tax:PT_'+[L]SAFTVER+'" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' Using [SAFT]
+#Onerrgo
+
+Return
+#######################################################################################
+#######################################################################################
+$WRITE_TAGS
+#Call OUVRE_BOITE("SAF-T",0) From GESECRAN
+
+[L]RECSWRI = 0
+#Header section
+SECTION = "Header"
+Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+Gosub HEADER From SAFTGENPORHD
+Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+If !OK : Goto FIM : Endif
+
+Gosub OPENMASTERFILES From SAFTGENPORTG
+
+[L]RECSWRI = 0
+#GeneralLedger section
+If find([L]SAFTTYPE,2,4)
+  SECTION = "GeneralLedger"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub GENERALLEDGER From SAFTGENPORGLE
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+
+[L]RECSWRI = 0
+#Customers section
+SECTION = "Customers"
+Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+Gosub CUSTOMERS From SAFTGENPORBPC
+Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+
+[L]RECSWRI = 0
+#Suppliers section
+If find([L]SAFTTYPE,2,3,4,8)
+  SECTION = "Suppliers"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub SUPPLIERS From SAFTGENPORBPS
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+
+[L]RECSWRI = 0
+#Products section
+If find([L]SAFTTYPE,2,3)
+  SECTION = "Products"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub PRODUCTS From SAFTGENPORITM
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+
+[L]RECSWRI = 0
+#TaxTable section
+If find([L]SAFTTYPE,2,3,6,7)
+  SECTION = "TaxTable"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub TAX_TABLE From SAFTGENPORVAT
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+Gosub CLOSEMASTERFILES     From SAFTGENPORTG
+
+[L]RECSWRI = 0
+#GeneralLedgerEntries section
+If find([L]SAFTTYPE,2,4)
+  SECTION = "GeneralLedgerEntries"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub GENLEDGENT From SAFTGENPORGLENT
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+
+[L]RECSWRI = 0
+#SourceDocuments section
+#Invoices
+If find([L]SAFTTYPE,2,3,6)
+  SECTION = "SourceDocuments:Invoices"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub INVOICES From SAFTGENPORSIH
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+
+[L]RECSWRI = 0
+#MovementofGoods
+If find([L]SAFTTYPE,2,3,8)
+  SECTION = "SourceDocuments:MovementofGoods"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub MOVEGOODS From SAFTGENPORMG
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+
+[L]RECSWRI = 0
+#WorkingDocuments
+If find([L]SAFTTYPE,2,3)
+  SECTION = "SourceDocuments:WorkingDocuments"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub WORKDOCUMENTS From SAFTGENPORWD
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+
+[L]RECSWRI = 0
+#Payments
+If find([L]SAFTTYPE,2,3,4,6)
+  SECTION = "SourceDocuments:Payments"
+  Call ECR_TRACE (func AFNC.MES1(mess(22,7711,1), SECTION) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+  Gosub PAYMENT From SAFTGENPORPYH
+  Call ECR_TRACE ("   " + num$([L]RECSWRI)-mess(103,141,1), 0) From GESECRAN # n records created
+Endif
+
+$FIM
+#Call FERME_BOITE From GESECRAN
+Call ECR_TRACE (mess(31,154,1) - format$("D:DD[-]MM[-]YYYY", date$) + " " + time$, 0) From GESECRAN
+
+Return
+#######################################################################################
+#######################################################################################
+$CLOSE_FILE
+
+Wrseq '</AuditFile>' Using [SAFT]
+
+#close the file
+Openo Using [SAFT]
+
+[L]STAT = 0
+
+#
+#If [M:SAFT]TYPEXP=1 : # Client
+#  # Check that de file to copy is existing
+#  If filinfo([L]FILEPATHTMP, 7) < 0 Then
+#    GMESSAGE = mess(4,95,1) - [L]FILEPATHTMP - tolower(mess(87,100,1))
+#    GERR = 1
+#    Return
+#  Else
+#    Call COPCLI([L]FILEPATHTMP, [M:SAFT]NOMIMP, [L]STAT) From ORDSYS
+#    If [L]STAT=1
+#      Call ERREUR(mess(164,141,1)) From GESECRAN
+#    Elsif [L]STAT>1
+#      Call ERREUR(mess(101,100,1)-"("+num$(STAT)+")") From GESECRAN
+#    Endif
+#  Endif
+#
+#Else
+#  Call MOVE([L]FILEPATHTMP, [M:SAFT]NOMIMP, [L]STAT) From ORDSYS
+#  If [L]STAT : Call ERREUR (mess(23,7711,1) + " ("+num$([L]STAT)+")") From GESECRAN : Endif
+#Endif
+
+If [L]FILDESTYP=1
+ Call COPCLI(FICDON,FICHIER,STAT) From ORDSYS
+ If STAT=1
+  # Fichier non copié sur le poste client
+  Call ERREUR(mess(164,141,1)) From GESECRAN
+  FIN=1 : TRA=0
+ Elsif STAT>1
+  # Fichier inexistant
+  Call ERREUR(mess(101,100,1)-"("+num$(STAT)+")") From GESECRAN
+  FIN=1 : TRA=0
+ Endif
+Endif
+
+Return
+#######################################################################################
+#######################################################################################
+$ERROR
+
+GMESSAGE = mess(93,100,1)- num$(errl) - "("+errp+"):" - errmes$(errn)+"\"+errm
+OK = 0
+
+Resume
+#######################################################################################
+#######################################################################################
+$ERRONTAGWRI
+
+Call ERREUR (mess(93,100,1)- num$(errl) - "("+errp+"):" - errmes$(errn)+"\"+errm) From GESECRAN
+Call FERME_BOITE From GESECRAN
+
+Resume
+#######################################################################################
+#######################################################################################
+$RAZ_HET #HEader Tags
+Raz HETAUDITFILV
+Raz HETCOMPANYID
+Raz HETTAXREGNUM
+Raz HETTAXACCBAS
+Raz HETCOMPANAME
+Raz HETBUSINNAME
+Raz HETBUILDNUMB
+Raz HETSTREETNAM
+Raz HETADDREETAI
+Raz HETCITY
+Raz HETPOSTALCOD
+Raz HETREGION
+Raz HETCOUNTRY
+Raz HETFISCAYEAR
+Raz HETSTARTDATE
+Raz HETENDDATE
+Raz HETCURRECODE
+Raz HETDATECREAT
+Raz HETTAXENTITY
+Raz HETPRCOTAXID
+Raz HETSOCERTNUM
+Raz HETPRODUCTID
+Raz HETPRODUCTVE
+Raz HETHEADERCOM
+Raz HETTELEPHONE
+Raz HETFAX
+Raz HETEMAIL
+Raz HETWEBSITE
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_GLT #General Ledger Tags
+#Detail accounts
+Raz [L]GLTACCOUNTID,[L]GLTACCODESCR,[L]GLTOPDEBBALA,[L]GLTOPCREBALA,[L]GLTCLDEBBALA,[L]GLTCLCREBALA
+#Accounts
+Raz [L]GLTACC,[L]GLTACCPRV,[L]GLTACCDEB,[L]GLTACCCRE,[L]GLTACCCLDEB,[L]GLTACCCLCRE
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_CUT #CUstomer Tags
+Raz CUTCUSTOMID
+Raz CUTCACCOUID
+Raz CUTCUSTAXID
+Raz CUTCOMPANAM
+Raz CUTCONTACT
+Raz CUTIBILNUM
+Raz CUTISTRENAM
+Raz CUTIADDRDET
+Raz CUTICITY
+Raz CUTIPOSTCOD
+Raz CUTIREGION
+Raz CUTICOUNTRY
+Raz CUTSBILNUM
+Raz CUTSSTRENAM
+Raz CUTSADDRDET
+Raz CUTSCITY
+Raz CUTSPOSTCOD
+Raz CUTSREGION
+Raz CUTSCOUNTRY
+Raz CUTTELEPHONE
+Raz CUTFAX
+Raz CUTEMAIL
+Raz CUTWEBSITE
+Raz CUTSELFBILIN
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_SUT #SUpplier Tags
+Raz SUTSUPPLID
+Raz SUTACCOUID
+Raz SUTSUPTAXID
+Raz SUTCOMPANAM
+Raz SUTCONTACT
+Raz SUTIBILNUM
+Raz SUTISTRENAM
+Raz SUTIADDRDET
+Raz SUTICITY
+Raz SUTIPOSTCOD
+Raz SUTIREGION
+Raz SUTICOUNTRY
+Raz SUTSBILNUM
+Raz SUTSSTRENAM
+Raz SUTSADDRDET
+Raz SUTSCITY
+Raz SUTSPOSTCOD
+Raz SUTSREGION
+Raz SUTSCOUNTRY
+Raz SUTTELEPHONE
+Raz SUTFAX
+Raz SUTEMAIL
+Raz SUTWEBSITE
+Raz SUTSELFBILIN
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_ITT #ITem Tags
+Raz [L]ITTITMTYPE
+Raz [L]ITTITMCODE
+Raz [L]ITTITMGROU
+Raz [L]ITTITMDESC
+Raz [L]ITTITMNUMC
+
+#Issue X3-31864 – 2017-04-06  by MANOW
+Raz [L]ITTITMCNCODE
+Raz [L]ITTITMUNNUM
+#End issue  X3-31864
+
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_TAT #TAxTable Tags
+Raz  TATTAXTYPE
+Raz  TATTAXCOUREG
+Raz  TATTAXCODE
+Raz  TATTDESCR
+Raz  TATTAXEXPDAT
+Raz  TATTAXPERCEN
+Raz  TATTAXAMOUNT
+Raz  TATCT
+Raz  TATPREVTAXDAT
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_GLEH
+Raz GLENUMOFENTRI
+Raz GLETOTDEBIT
+Raz GLETOTCREDIT
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_GLEJ #General Ledger Entries Tags (Journal)
+Raz GLEJOURNALID
+Raz GLEJDESCRIPT
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_GLED #General Ledger Entries Tags (Documents)
+Raz GLETRANSACID
+Raz GLEPERIOD
+Raz GLETRANSACDT
+Raz GLESOURCEID
+Raz GLEMDESCRIPT
+Raz GLEDOCARCNUM
+Raz GLETRANSTYPE
+Raz GLEGLPOSTDAT
+Raz GLEGLCUSTOID
+Raz GLEGLSUPPLID
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_GLEL #General Ledger Entries Tags (Lines)
+Raz GLEGLRECORDI
+Raz GLEGLACCOUNT
+Raz GLEGLSODOCID
+Raz GLEGLSYSENTD
+Raz GLEGLLDESCRI
+Raz GLEGLLDEBAMO
+Raz GLEGLLCREAMO
+Return
+#######################################################################################
+#######################################################################################
+#######################################################################################
+#######################################################################################
+$RAZ_SDH
+Raz [L]SDNUMOFENT
+Raz [L]SDTOTDEBIT
+Raz [L]SDTOTCREDI
+Raz [L]DO_OTHIMP
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_SDD
+Raz [L]SDINVNUM
+Raz [L]SDINVSTA
+Raz [L]SDHASH
+Raz [L]SDHASHCTRL
+Raz [L]SDPER
+Raz [L]SDINVDAT
+Raz [L]SDINVTYP
+Raz [L]SDSELFBILL
+Raz [L]SDSYSENTDA
+Raz [L]SDTRANSAID
+Raz [L]SDCUSTOMID
+Raz [L]SDDELIVERI
+Raz [L]SDDELIVEDT
+Raz [L]SDDBUILNUM
+Raz [L]SDDSTRENAM
+Raz [L]SDDADDDETA
+Raz [L]SDDCITY
+Raz [L]SDDPOSTVOD
+Raz [L]SDDREGION
+Raz [L]SDDCOUNTR
+Raz [L]SDSHIPID
+Raz [L]SDSHIPDT
+Raz [L]SDSBUILNUM
+Raz [L]SDSSTRENAM
+Raz [L]SDSADDDETA
+Raz [L]SDSCITY
+Raz [L]SDSPOSTVOD
+Raz [L]SDSREGION
+Raz [L]SDSCOUNTR
+Raz [L]SDNETTOTA
+Raz [L]SDGROTOTA
+Raz [L]SDCUR
+Raz [L]SDCURCRAM
+Raz [L]SDCURDEAM
+Raz [L]SDSETDISC
+Raz [L]SDSETAMOU
+Raz [L]SDSETDATE
+Raz [L]SDPAYMECH
+Raz [L]SDSOURCEWT
+Raz [L]SDASSET
+Raz [L]SDLDCRECT
+Raz [L]SDLDCRECP
+Raz [L]SDSRCBIL
+Raz [L]SDINVSTADA
+
+Raz [L]DO_OTHIMP
+Raz [L]ELTAX
+# Issue X3-31864 - 2017-04-11 by MRDAB
+Raz [L]SDATCUD
+# End issue X3-31864
+Raz [L]SDLINENUM #Issue X3-90536 – 2018-06-12  by VAVIL
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_SDL
+#Raz [L]SDLINENUM
+Raz [L]SDLORDNUM
+Raz [L]SDLORDDAT
+Raz [L]SDLITMREF
+Raz [L]SDLITMDES
+Raz [L]SDLITMQTY
+Raz [L]SDLQTYUOM
+Raz [L]SDLNETPRI
+Raz [L]SDLENTDAT
+Raz [L]SDLDOCREF
+Raz [L]SDLDOCMOT
+Raz [L]SDLPERDEB
+Raz [L]SDLPERFIN
+Raz [L]SDLDESCRI
+Raz [L]SDLDEBAMO
+Raz [L]SDLCREAMO
+Raz [L]SDLTAXTYP
+Raz [L]SDLTACORE
+Raz [L]SDLTAXCOD
+Raz [L]SDLTAXPER
+Raz [L]SDLTAXAMO
+Raz [L]SDLTAEXRE
+Raz [L]SDLSETAMO
+Raz [L]SDLDCRECL
+
+# Issue X3-31864 - 2017-04-26 by MRDAB/MANOW
+#Raz [L]MGDTAXEXAC
+Raz [L]SDLTAXEXAC
+Raz [L]SDLTAEXCO
+Raz [L]SDLSERNUM
+Raz [L]SDLARCNO
+Raz [L]SDLIECAM
+Raz [L]SDLTAXB
+Kill SDLSERNUM
+Local Char SDLSERNUM(100)(1..)
+# End issue X3-31864
+
+Return
+#######################################################################################
+$RAZ_PYH
+#Header
+Raz [L]PAYTOTDEB,[L]PAYTOTCRE,[L]PAYNUM,[L]PAYTRAID,[L]PAYTRDATE
+Raz [L]PAYTYPE,[L]PAYSTA,[L]PAYSTADAT,[L]PAYSRCID,[L]PAYSRCPAY,[L]PAYMECH,[L]PAYAMT,[L]PAYDATE,[L]PAYSRCID2,[L]PAYSYSENT,[L]PAYCUSTID,[L]PAYLIN
+#Total
+Raz [L]PAYTAXTOT,[L]PAYNETTOT,[L]PAYGROTOT,[L]PAYCURCOD,[L]PAYCURAMT,[L]PAYRATCUR,[L]PAYSETAMO,[L]PAYPER
+Return
+#######################################################################################
+#######################################################################################
+$RAZ_PID
+#Lines
+Raz [L]PAYORIGON,[L]PAYINVDAT,[L]PAYCRELIN,[L]PAYDEBLIN,[L]PAYTAXTYP,[L]PAYTAXCOU,[L]PAYTAXCOD,[L]PAYTAXPER,[L]PAYTAXAMT,[L]PAYTAXEXE,[L]PAYTAXEXAC,[L]PAYATCUD
+Return
+#######################################################################################
+#######################################################################################
+$CHECK_ACCDOCS_STA
+
+# Issue 114518 - 2016-02-18 by RICAR : Verification of accounting documents with Temporary status
+# Issue 114518
+If find([L]SAFTTYPE,2,4) Then
+  Local Integer V_MSG
+
+  If !clalev([F:HAE]) : Local File GACCENTRY  [HAE] : Endif
+  If !clalev([F:JOU]) : Local File GJOURNAL   [JOU] : Endif
+  If !clalev([F:GTE]) : Local File GTYPACCENT [GTE] : Endif
+
+  Link [F:HAE] With [F:JOU]JOU0 = [F:HAE]JOU, [F:GTE]GTE0=[F:HAE]TYP  As [CTA]
+&  Where [F:GTE]PER <> 2 & [F:HAE]CAT = 1 & [F:HAE]ACCDAT >= [L]STRDATE & [F:HAE]ACCDAT  <= [L]ENDDATE &
+& [F:HAE]CPY=[L]SOC & [F:HAE]STA <> 2
+  For [CTA]
+    Call ECR_TRACE (func AFNC.MES1 (mess(198,7711,1),[F:HAE]NUM),0) From GESECRAN
+    [L]V_MSG = 1
+  Next
+
+  If clalev([CTA]) = 1 : Close File [CTA] : Endif
+
+  If [L]V_MSG=1
+    Call ECR_TRACE (mess(199,7711,1),1) From GESECRAN
+    OK = 0
+  Endif
+
+Endif
+# End issue 114518
+
+Return
+#######################################################################################
+#######################################################################################
+$INITIALIZE_VERSION_MANAGEMENT
+
+# Issue X3-31864 - 2017-04-06 by MRDAB: declare var to hold text informing about version current(1) or previous(0)
+Local Char        SAFTVER(30)
+Local Tinyint     ISSAFTVERCURRENT
+
+#If this label is updated, consider PORLEGETFATLIB
+[L]SAFTVER   =  mess ([L]VERSION, 2082, 1)
+
+If [L]SAFTVER = "1.04_01"
+  [L]ISSAFTVERCURRENT = 1
+Else
+  [L]ISSAFTVERCURRENT = 0
+Endif
+# End issue X3-31864
+
+Return
+#######################################################################################
+#######################################################################################
+$SET_LEDT
+#Also called from DKSLIB
+
+#Ledgertype
+Call PARAM([L]SOC, "LEDTYP", [L]LEDTA) From ADOVAL
+[L]LEDT = val([L]LEDTA)
+If [L]LEDT = 0
+  ###--- Get the main general ledger                                 ---###
+  Call LECLEDMAIN(1, [L]SOC, [L]LEDT) From CPTDIV
+Endif
+
+Return
+#######################################################################################
+#######################################################################################
+$SET_COA
+
+Read [F:CPY]CPY0=[L]SOC
+Read [F:GCM]GCM0=[F:CPY]ACM
+Read [F:LED]LED0=[F:GCM]LED([L]LEDT-1)
+[L]COA = [F:LED]COA
+
+Return
+#######################################################################################
+#######################################################################################
+$SET_SAFPRIRND
+
+Call PARAM([L]SOC, "SAFTPRIRN",[L]SAFPRIRNC) From ADOVAL
+
+If SAFPRIRNC = "" | SAFPRIRNC = "0"
+  SAFPRIRNC = "0.0001"
+Endif
+
+SAFPRIRND = val(SAFPRIRNC)
+
+Return
+#######################################################################################
+#######################################################################################
+$SET_SAFTPRDKITACTIVE
+
+# Issue X3-105529 by MRDAB: fixed KIT communication in SAF-T
+If func AFNC.ACTIV("SAFT")
+  Call PARAM([L]SOC, "SAFTPRDKIT", [L]SAFTPRDKITACTIVE) From ADOVAL
+Endif
+# If parameter is not set the default value is YES
+If [L]SAFTPRDKITACTIVE = "" | [L]SAFTPRDKITACTIVE = "0"
+  [L]SAFTPRDKITACTIVE = "2"
+Endif
+# Issue X3-105529 end
+
+Return
+#######################################################################################
+#######################################################################################
+Funprog GET_PERIOD_NUMBER(CPY, DAT)
+#Issue 86039 – 2018-04-17  by MADOR - PT certification - SAF-T Period tag needs to match with the fiscal period
+Value Char CPY
+Value Date DAT
+
+Local Decimal FISCALYEAR , PERIODE
+Local Libelle MAINGENLED, MAINANALED
+Local Date    PERSTRDAT, PERENDDAT
+
+# get main general ledger
+Call SETMAINREF([L]CPY, [L]MAINGENLED, [L]MAINANALED) From CPTDIV
+# get fiscal year
+Call GETEXE([L]CPY, [L]MAINGENLED, [L]DAT, [L]FISCALYEAR) From CPTSUB
+# get start date and end date for the fiscal year
+Call DATEXE([L]CPY, [L]MAINGENLED, [L]FISCALYEAR, [L]PERSTRDAT, [L]PERENDDAT) From CPTSUB
+
+[L]PERIODE = month([L]DAT) - month([L]PERSTRDAT)
+
+If [L]PERIODE < 0
+    [L]PERIODE += 12
+Endif
+
+[L]PERIODE += 1
+#Issue end
+End [L]PERIODE
+#######################################################################################
+#######################################################################################
+Subprog LECTEXTRA_POR(VALEUR, TABLE, CHAMP, CLE1, CLE2)
+Variable Char    VALEUR()
+Value    Char    TABLE, CHAMP, CLE1, CLE2
+
+# Issue X3-99026 by MRDAB
+If clalev([F:AXX])=0 : Local File ATEXTRA [AXX] : Endif
+Read [AXX]AXX0 = TABLE;CHAMP;"POR";CLE1;CLE2
+If fstat = 0
+  VALEUR = [F:AXX]TEXTE
+Else
+  Call LECTEXTRA(VALEUR, TABLE, CHAMP, CLE1, CLE2) From ATEXTRA
+Endif
+# Issue X3-99026 end
+
+End
+#######################################################################################
+#######################################################################################
+

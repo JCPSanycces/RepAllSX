@@ -1,0 +1,919 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#CHECK UNUSED_SOURCE
+# Gestion du masque MWR0        FUNMFCSCO
+# Intégration en std de WIPCOST             2003
+# Solde des encours et recalcul du PRF à partir des WIPCOST de sous-traitance
+# créés pour la variation de valeurs suite à une facture
+##########################################################################
+# NE CONCERNE QUE LES WIPCOST DONT LE MFGWIP POINTE SUR UN OF
+#
+# Partir de la table des OF entête
+# Pour chaque OF
+#    - parcours des MFGITM de l'OF pour charger le tableau Articles de MWF0
+#
+#    - parcours des WIPCOST liés pour charger le tableau ... de MWF0 par type 
+#      Si lié à aucune ligne d'OF, imputer un prorata à chaque ligne Article
+#    - SET_MFC :
+#      - Parcourir le tableau des produits pour alimenter MFGCOST
+#        Si on gère au cout réel ('ACTUAL')
+#            Calculer le montant régularisé
+#            Chercher combien sont en stock selon la valorisation de sortie
+#              - site (lire ITMMVT)
+#              - FIFO : 
+#              - Lot  : 
+#
+#            Eclater dans les zones régul de prix et COGS
+#            Créer un WIPCOST de type 17 (régul) pour la ligne d'OF
+#            imputer un prorata de Régul Stock et COGS sur chaque produit et appeler REGPRIX
+#
+#        Si on gère l'article au cout std ('STANDARD') appel de REGPRIX (pour mnt non absorbé)
+#    - Si on gère au cout std (ou actualisé)
+#        Créer les Wipcost d'écarts (type 9 à 13)
+#    - Sommer les montants de tous les Wipcost lié à l'OF (y compris les derniers créés)
+#        Si ce n'est pas équilibré, créer un Wipcost type 15
+#
+#    - Remettre à jour le flag de MFGWIP
+############################################################################################
+
+$ACTION
+Case ACTION
+ When "INIT"        Gosub INIT
+ When "OUVRE_BATCH" Gosub INIT
+ When "CONTROLE"    Gosub CONTROLE
+ When "EXEC"        Gosub EXEC
+ When "TERMINE"     Gosub TERMINE
+Endcase
+Return
+
+$INIT
+
+Local Integer    LAST_SEQ, ERR, F_RCPVLTCOD, FIRST_VAL, FIRST_NAT
+Local Decimal    L_CURRND
+Local Decimal    ACTUALS(5), STANDARDS(5) # pour éclatement de la régul et Ecarts
+Local Decimal    SUM_CPLQTY, BAL_AMT, SUM_GRP, TOT_AMT
+Local Integer    ON_HAND
+Local Decimal    ON_HAND_PER, TOT_QTY, TOT_QTY2, DIF, MKI_COGSADJ, WPRI, TOT_ABS, TOT_NABS
+Local Integer    WRET, QUOT
+Local Date       WO_CLODAT : # Date cloture OF
+Local Char       WCCE(15)
+Local Char       LTCM(GLONTCM)
+Local Decimal    LCNVRPT    # Taux de conversion de la devise société à la devise dossier
+
+Local Integer    I,J
+
+If !clalev([F:ITM]) Local File ITMMASTER   [ITM] Endif
+If !clalev([F:ITF]) Local File ITMFACILIT  [ITF] Endif
+If !clalev([F:STJ]) Local File STOJOU      [STJ] Endif # pour la régul
+If !clalev([F:STP]) Local File STOCOST     [STP] Endif
+If !clalev([F:SLF]) Local File STOLOTFCY   [SLF] Endif
+If !clalev([F:ITV]) Local File ITMMVT      [ITV] Endif # pour les valorisations
+If !clalev([F:MFC]) Local File MFGCOST     [MFC] Endif
+If !clalev([F:MCN]) Local File MFCNAT      [MCN] Endif # détail de natures FG
+If !clalev([F:MWI]) Local File WIPCOST     [MWI] Endif
+If !clalev([F:MWH]) Local File MFGWIP      [MWH] Endif
+If !clalev([F:MFG]) Local File MFGHEAD     [MFG] Endif
+If !clalev([F:MFI]) Local File MFGITM      [MFI] Endif
+If !clalev([F:MKI]) Local File MFGITMTRK   [MKI] Endif
+If !clalev([F:MWS]) Local File WORKSTATIO  [MWS] Endif
+If !clalev([F:TCM]) Local File TABCOSTMET  [TCM] Endif
+If !clalev([F:TCU]) Local File TABCUR      [TCU] Endif
+If !clalev([F:TUN]) Local File TABUNIT     [TUN] Endif
+If !clalev([F:FCY]) Local File FACILITY    [FCY] Endif
+If !clalev([F:ACV]) Local File ACTIV       [ACV] Endif
+
+# code activité pour utilisation du plafond PROPER dans la régularisation
+Local Integer FLGUSA   # code activité (utilisé en pays anglo-saxons en principe)
+                       # si désactivé : la répartition se fait sans test de plafond
+Read [ACV]CODACT="MPR" # Plafond prorata régul
+If fstat Raz [F:ACV] Endif
+If [F:ACV]FLACT=2 FLGUSA=1 Endif
+
+Local Char    TIT(80) 
+TIT = mess(21,2363,1) # Régularisation de PRF et solde d'encours après facture de sous-traitance
+Local Char    LMSG(250)
+Local Integer NB_MFG, NB_PDT, I_CST
+
+Local Decimal LCPLQTYTOT    # Qté totale réalisée pour une ligne d'OF (calculée à partir des suivis)
+
+Return
+
+$CONTROLE
+# Lecture site et devise
+Read [FCY]FCY0 = [M]STOFCY
+If fstat
+  GERR = 1 
+  GMESSAGE = mess(9,2363,1) - [M]STOFCY #"erreur de lecture sur FACILITY..."
+  Return
+Endif
+
+Call GET_CUR_RND([F:FCY]LEGCPY, L_CURRND, ERR) From MWIPLIB # charge aussi GLOCALDEV
+If ERR = 1
+  GERR = 1
+  GMESSAGE = mess(10,2363,1) - [F:FCY]LEGCPY #"Err lecture sur les devises société..."
+Endif
+Return
+
+$EXEC
+#If GUSER="TB" : Dbgaff : Endif     # <<<<<<<<<<< D E B U G G E R ***test***
+If !GSERVEUR
+   Call OUVRE_TRACE(TIT) From LECFIC
+   Call ECR_TRACE(" ",0) From GESECRAN
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Else
+   Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+# définir le filtre selon la sélection
+If [M]FILMFG = "" 
+ #[M]FILMFG = "MFGNUM = [M]MFGNUM" : # modif GA 08/2006 car plantage
+ [M]FILMFG = "MFGNUM = [M]VCRNUM"
+ # si on a saisi le n° d'OF, les ctrl on été déjà faits !
+Else
+ [M]FILMFG   += " & MFGFCY=[M]STOFCY & [MFG]MFGTRKFLG=6 & MFGSTA=4"
+Endif
+
+# bien préciser la classe car des zones sont communes et le traitement concerne
+# les OF DEJA calculés (FLG à 6) dont l'entête WIP a été mis à 5 !!!
+#Link [MWH] With [MFG]MFG0=[F:MWH]MFGNUM As [MFH] Where [MWH]MFGTRKFLG=5 & evalue([M]FILMFG) 
+ #### le link ne convient pas car on n'a pas de précision de classe dans FILMFG >>> Erreur
+
+    # On part des entetes d'OF  - 1 transaction par OF
+For [MFG]MFG0 Where evalue([M]FILMFG)
+  Read [MWH]MWH0=[F:MFG]MFGNUM
+  If fstat 
+     Call RSTA("MWH",[F:MWH]MFGNUM) From GLOCK
+     Goto NEXT_MFG
+  Elsif [MWH]MFGTRKFLG <> 5
+     Goto NEXT_MFG
+  Endif
+  Call DEBTRANS From GLOCK
+  Trbegin [MWI]
+
+   Raz ACTUALS, STANDARDS          # globaux pour tout l'OF !
+   Raz SUM_CPLQTY, BAL_AMT
+   Raz F_RCPVLTCOD
+   WO_CLODAT = [F:MFG]CLODAT 
+   If WO_CLODAT=[0/0/0] : WO_CLODAT=date$ : Endif # ne devrait jamais etre nulle !
+
+   # CCC (24/02/05) Recalcul des FG des produits suite à modification du coût sous-traitance
+   Call UPDMWIOVE([F:MFG]MFGNUM,ERR) From FUNWIPMFC
+   If ERR : Goto ERROR_BREAK : Endif
+
+   # Calcul à partir des wipcost
+   Gosub CAL_COSTS
+   If ERR = 1 : Goto ERROR_BREAK : Endif
+
+   # écriture en màj du PRF (MFGCOST)
+   Gosub SET_MFC
+   If ERR = 1 : Goto ERROR_BREAK : Endif
+
+   # Calcul de l'écart dans le cas de valorisation standard
+   If F_RCPVLTCOD < 3    # géré au cout STANDARD (du moins le 1er produit)
+      Gosub STANDARD
+      If ERR = 1 : Goto ERROR_BREAK : Endif
+   Endif
+    
+   # Vérification du solde sur les WIPCOST
+   Gosub CHK_BALANCE                                
+   If ERR = 1 : Goto ERROR_BREAK : Endif
+
+   # (re) mise à jour du flag de l'entête Wipcost (MFGWIP)
+   [F:MWH]MFGTRKFLG = 6
+   Rewrite [MWH]
+   If fstat
+      LMSG = mess(13,100,1) - "MFGWIP :"-[F:MWH]MFGNUM
+      Call ECR_TRACE(LMSG,1) From GESECRAN
+      ERR = 1
+      Goto ERROR_BREAK 
+   Endif
+
+ $ERROR_BREAK    
+   # Commit s'il n'y a pas eu d'erreurs
+   If ERR = 1 | GOK < 1
+      Raz LMSG, ERR
+      Rollback
+   Else
+      # "Le calcul de PRF est terminé ..."
+      LMSG = mess(7,2363,1) - [F:MFG]MFGNUM +"\"
+      LMSG += sum([M]ITMREF+" ")     # liste des produits de l'OF
+      Call ECR_TRACE(LMSG,0) From GESECRAN
+      Raz LMSG
+      If BAL_AMT <> 0
+         # "Un solde d'encours a été généré pour ..."
+         LMSG = mess(8,2363,1) - num$(BAL_AMT * (-1))
+         Call ECR_TRACE(LMSG,0) From GESECRAN
+         Raz LMSG
+      Endif
+      Call ECR_TRACE(" ",0) From GESECRAN
+      Commit
+   Endif
+
+$NEXT_MFG
+Next
+
+
+Return
+
+$CAL_COSTS
+I = 0 
+NB_PDT = 0  # Nb de produits de l'OF
+Raz [M]NBLIG, [M]MFGLIN, [M]MFGFCY, [M]CPLQTY, [M]STU , [M]ITMREF
+Raz [M]SCOCST,[M]OVESCOCST
+#CCC (30/07/04) bug 23924 : Raz [M]PRIDIV
+Raz [M]ACTACT,[M]ACTSTD,[M]ISSVLTCOD,[M]PROPER
+Raz [M]NBOVE, [M]MFGLIN1, [M]OVENAT, [M]OVENATAMT, [M]CONCATKEY
+
+For [MFI] Where MFGNUM=[F:MFG]MFGNUM & ITMTYP=1
+   # charger le tableau (NBLIG sera le nb d'articles de l'OF)
+   ## Prendre le cas général d'entrée dans la méthode de valo
+   ## ou le premier PRINAT d'un Wipcost de type 14:déclaration de prod ??
+   Read [ITM]ITM0=[F:MFI]ITMREF
+   Read [ITF]ITF0=[F:MFI]ITMREF;[F:MFI]MFGFCY
+   If F_RCPVLTCOD= 0
+       Call GETTCM([F:MFI]ITMREF,[F:MFI]MFGFCY,LTCM,ERR) From STKVAL    #GETTCM se positionne sur [F:TCM]
+       If !ERR
+        F_RCPVLTCOD = [F:TCM]RCPVLTCOD  # valo des entrées (du PREMIER produit)
+        [M]ISSVLTCOD(I)  = [F:TCM]ISSVLTCOD
+       Endif
+   Endif
+#CCC (30/07/04) bug 23924 :   [M]PRIDIV(I)     = [F:ITM]PRIDIV
+   [M]PROPER(I)     = [F:ITF]PROPER
+
+   [M]MFGLIN(I)     = [F:MFI]MFGLIN
+   [M]MFGFCY(I)     = [F:MFI]MFGFCY
+   [M]ITMREF(I)     = [F:MFI]ITMREF
+   [M]CPLQTY(I)     = [F:MFI]CPLQTY
+   [M]STU(I)        = [F:MFI]STU
+   SUM_CPLQTY      += [F:MFI]CPLQTY
+   NB_PDT += 1      # sera égal à NBLIG
+
+   I += 1
+
+Next
+
+[M]NBLIG = I
+
+# lecture de tous les Wipcost créés après la finalisation
+
+For [MWI] Where MFGNUM=[F:MFG]MFGNUM & TXNACT=2
+  # charger les zones du tableau NBLIG
+  Case [F:MWI]TXNTYP
+    When 4:     # sous-traitance
+                Raz TOT_AMT
+                For I = 0 To [M]NBLIG - 1
+                    If SUM_CPLQTY <> 0
+                       [M]SCOCST(I) += arr(([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT,L_CURRND)
+                       [M]ACTACT(I) += arr(([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT,L_CURRND)
+                       TOT_AMT      += arr(([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT,L_CURRND)
+                    Else
+                       [M]SCOCST(I) += arr((1 / NB_PDT) * [F:MWI]AMOUNT,L_CURRND)
+                       [M]ACTACT(I) += arr((1 / NB_PDT) * [F:MWI]AMOUNT,L_CURRND)
+                       TOT_AMT      += arr((1 / NB_PDT) * [F:MWI]AMOUNT,L_CURRND)
+                    Endif
+                Next
+
+                If TOT_AMT <> [F:MWI]AMOUNT
+                    [M]SCOCST(1) += (TOT_AMT - [F:MWI]AMOUNT)
+                    [M]ACTACT(1) += (TOT_ACT - [F:MWI]AMOUNT)
+                Endif
+
+                # cumul dépense réelle
+                ACTUALS(3)  += [F:MWI]AMOUNT
+
+    When 8    : # frais sous-traitance
+                Raz TOT_AMT
+                For I = 0 To [M]NBLIG - 1
+                   If SUM_CPLQTY <> 0
+                      [M]OVESCOCST(I) += arr(([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT,L_CURRND)
+                      [M]ACTACT(I)    += arr(([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT,L_CURRND)
+                      TOT_AMT         += arr(([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT,L_CURRND)
+                   Else
+                      [M]OVESCOCST(I) += arr((1 / NB_PDT) * [F:MWI]AMOUNT,L_CURRND)
+                      [M]ACTACT(I)    += arr((1 / NB_PDT) * [F:MWI]AMOUNT,L_CURRND)
+                      TOT_AMT         += arr((1 / NB_PDT) * [F:MWI]AMOUNT,L_CURRND)
+                   Endif
+                Next
+
+                If TOT_AMT <> [F:MWI]AMOUNT
+                    [M]OVESCOCST(1) += (TOT_AMT - [F:MWI]AMOUNT)
+                    [M]ACTACT(1)    += (TOT_AMT - [F:MWI]AMOUNT)
+                Endif
+
+                # cumul dépense réelle
+                ACTUALS(4)  += [F:MWI]AMOUNT
+
+                Gosub NAT_OVE
+  Endcase
+
+  # remettre TXNACT à 1 pour éviter de les retraiter lors d'une prochaine facture
+  [F:MWI]TXNACT = 1
+  Rewrite [MWI]
+  If fstat
+     ERR = 1 
+     LMSG = mess(6,2363,1)-[F:MWI]MFGNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+     Call ECR_TRACE(LMSG,1) From GESECRAN
+     Break
+  Endif
+Next
+Return
+
+##################################################
+$NAT_OVE
+# chargement du tableau détail de frais avec la nature courante
+# 1 ligne par combinaison MFGLIN,OVENAT
+# pas arrondi ici mais à l'écriture de la table (en passant à l'unitaire)
+If [F:MWI]MFGLIN <> 0
+    J = find(num$([F:MWI]MFGLIN)+[F:MWI]OVENAT,[M]CONCATKEY)
+    # si je trouve une ligne, je cumule le mnt sinon je créé la ligne
+    If J > 0
+      [M]OVENATAMT(J-1) += [F:MWI]AMOUNT
+    Else
+      [M]MFGLIN1([M]NBOVE)    = [F:MWI]MFGLIN
+      [M]OVENAT([M]NBOVE)     = [F:MWI]OVENAT
+      [M]OVENATAMT([M]NBOVE) += [F:MWI]AMOUNT
+      [M]CONCATKEY([M]NBOVE)  = num$([F:MWI]MFGLIN)+[F:MWI]OVENAT
+      [M]NBOVE +=1
+    Endif
+Else
+  # répartir sur chaque produit (soit les lignes existent, soit il faut les rajouter)
+  Raz TOT_AMT, FIRST_NAT
+  For I=0 To [M]NBLIG -1
+    # si le couple (produit,nature) existe dans le tableau NBOVE, alors cumuler
+    J = find(num$([M]MFGLIN(I))+[F:MWI]OVENAT,[M]CONCATKEY)
+    If J > 0
+      If SUM_CPLQTY > 0
+         [M]OVENATAMT(J-1) +=([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT
+      Else
+         [M]OVENATAMT(J-1) +=(1 / NB_PDT) * [F:MWI]AMOUNT
+      Endif
+      If FIRST_NAT=0  FIRST_NAT = J  Endif
+    Else
+       # rajouter la ligne dans le tableau de frais
+      [M]MFGLIN1([M]NBOVE)    = [M]MFGLIN(I)
+      [M]OVENAT([M]NBOVE)     = [F:MWI]OVENAT
+      [M]OVENATAMT([M]NBOVE)  = ([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT
+      If SUM_CPLQTY > 0
+         [M]OVENATAMT([M]NBOVE) +=([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT
+      Else
+         [M]OVENATAMT([M]NBOVE) +=(1 / NB_PDT) * [F:MWI]AMOUNT
+      Endif
+      [M]CONCATKEY([M]NBOVE)  = num$([M]MFGLIN(I))+[F:MWI]OVENAT
+      [M]NBOVE +=1
+      If FIRST_NAT=0 FIRST_NAT=[M]NBOVE  Endif
+    Endif                   
+    If SUM_CPLQTY > 0
+      TOT_AMT +=([M]CPLQTY(I) / SUM_CPLQTY) * [F:MWI]AMOUNT
+    Else
+      TOT_AMT +=(1 / NB_PDT) * [F:MWI]AMOUNT
+    Endif
+  Next
+
+  If TOT_AMT <> [F:MWI]AMOUNT
+    [M]OVENATAMT(FIRST_NAT-1) += (TOT_AMT - [F:MWI]AMOUNT)
+  Endif
+Endif  
+Return
+
+##################################################
+$SET_MFC
+For I = 0 To [M]NBLIG - 1
+
+  Read [MFI]MFI0 = [F:MFG]MFGNUM;[M]MFGLIN(I)
+  If fstat
+        ERR = 1 
+        LMSG = mess(11,2363,1) - [F:MFG]MFGNUM-num$([M]MFGLIN(I))
+        Call ECR_TRACE(LMSG,1) From GESECRAN # "err lecture sur MFGITM ..."
+        Raz LMSG
+        Break
+  Endif
+
+  # modifier le PRF en rajoutant ce qui vient de la sous-traitance
+  Readlock [MFC]MFC0 = [M]MFGFCY(I);[F:MFI]ITMREF;year([F:MFI]TRKLAST);[F:MFG]MFGNUM;[M]MFGLIN(I)
+  If !fstat
+    WPRI = ([F:MFC]CSTTOT + [F:MFC]OVETOT)* -1 # pour faire la différence à la régul
+
+    If [F:MFC]CPLQTY <> 0
+       [F:MFC]SCOCST    += arr([M]SCOCST(I) / [F:MFC]CPLQTY, 10^-GDECPRI)
+       [F:MFC]OVESCOCST += arr([M]OVESCOCST(I) / [F:MFC]CPLQTY, 10^-GDECPRI)
+    Endif
+    [F:MFC]SCOTOT    = [F:MFC]SCOCST
+    [F:MFC]CSTTOT    = [F:MFC]LABTOT + [F:MFC]MACTOT + [F:MFC]MATTOT + [F:MFC]SCOTOT
+    [F:MFC]OVETOT    = [F:MFC]OVELABCST + [F:MFC]OVEMACCST + [F:MFC]OVEMATCST + [F:MFC]OVESCOCST
+
+    [F:MFC]MFCDAT    = date$
+
+    [F:MFC]EXPNUM    = [C]EXPORT
+    [F:MFC]UPDDAT    = date$
+    [F:MFC]UPDUSR    = GUSER
+
+    Rewrite [F:MFC]
+    If fstat
+        ERR = 1
+        LMSG = mess(4,2363,1)-[F:MFI]MFGNUM-num$([F:MFI]MFGLIN)
+        Call ECR_TRACE(LMSG,1) From GESECRAN # "erreur d'écriture sur MFGCOST"
+        Raz LMSG
+        Break
+    Endif
+
+    # Cas de valorisation autres que std
+    If F_RCPVLTCOD > 2 & [F:MFC]CPLQTY <> 0
+        Gosub REGUL_REEL
+        If ERR = 1 : Break : Endif
+    Else    # Standard
+        WPRI += [F:MFC]CSTTOT + [F:MFC]OVETOT 
+# CCC : Bug 28594
+#        For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN = [F:MFI]MFGLIN
+#          Call REGPRIX2([F:MFC]STOFCY,5,[F:MFC]ITMREF,[F:MFC]MFCDAT,"",15,[F:MKI]MFGTRKNUM,
+#&           [F:MKI]ITMTRKLIN,0,"",0,[F:MKI]CPLQTY*WPRI,[F:MKI]CPLQTY,TOT_ABS,TOT_NABS,WRET) From STKVAL
+          Columns [MKI] (CPLQTY)
+          Raz LCPLQTYTOT
+          For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN = [F:MFI]MFGLIN
+              LCPLQTYTOT += [F:MKI]CPLQTY
+          Next
+          Columns [MKI]
+          If !clalev([M:SDP]) : Local Mask SAIDECPRI [SDP] : Endif
+          Raz [M:SDP]
+          [M:SDP]AMTTOT = [M]SCOCST(I)+[M]OVESCOCST(I)
+          [M:SDP]QTY    = 0    # Le montant est un delta
+          [M:SDP]PRI = [M:SDP]AMTTOT / LCPLQTYTOT
+    
+          [M:SDP]SCOTOT = [M]SCOCST(I)
+          [M:SDP]OVESCOCST = [M]OVESCOCST(I)
+
+# CCC (14/02/05) Bug 28345 : Utilisation devise société dans la valeur du lot
+        Call CONVERT2(GLOCALDEV,GSYSCUR,GLOCALDEV,GCHGTYP,[F:MFC]MFCDAT,
+&                     1,LCNVRPT,WRET) From TRTDEV
+          Call REGPRIX2([F:MFC]STOFCY,5,[F:MFC]ITMREF,[F:MFC]MFCDAT,"",0,"",
+&           0,10,[F:MFI]MFGNUM,[F:MFI]MFGLIN,LCNVRPT,TOT_ABS,TOT_NABS,WRET) From STKVALREG
+          # erreurs en retour / WRET
+            Raz LMSG
+            Case WRET
+                When 7 :       LMSG = GMESSAGE    # "Période indéfinie ou traitement interdit à cette date"
+                When Default : LMSG = mess(519,197,1) +"("+num$(WRET)+")"# Erreur sur la régularisation de prix
+            Endcase
+            If LMSG<>""
+                LMSG += "\"-[F:MFI]MFGNUM-[F:MFI]ITMREF
+                Call ECR_TRACE(LMSG,0) From GESECRAN
+            Endif
+    
+          If GOK = 0 : ERR = 1 : Break 2 : Endif : # inhibiting error
+#        Next
+    Endif
+
+    # alimenter MFCNAT à partir du tableau contenant les éclatements (Produit,nature)
+    For J=0 To [M]NBOVE-1
+      # prendre les lignes natures du produit en cours d'écriture
+      If [M]MFGLIN1(J) = [M]MFGLIN(I)
+        # voir si elle existe déjà   
+        Readlock [MCN]MCN0=[M]MFGFCY(I);[F:MFI]ITMREF;year([F:MFI]TRKLAST);[F:MFG]MFGNUM;[M]MFGLIN(I);[M]OVENAT(J)
+        If fstat=1
+          # erreur
+          ERR = 1  # message pour tous les cas
+        Elsif fstat = 0
+          If [F:MFC]CPLQTY <> 0
+            [F:MCN]NATAMTLEV += arr([M]OVENATAMT(J) / [F:MFC]CPLQTY, 10^-GDECPRI)
+          Endif
+          [F:MCN]EXPNUM    = [C]EXPORT
+          [F:MCN]MFCDAT    = date$
+    
+          [F:MCN]UPDDAT    = date$
+          [F:MCN]UPDUSR    = GUSER
+          Rewrite [F:MCN]
+        Else
+          Raz [F:MCN]
+    
+          [F:MCN] = [F:MFC]  # reprend les parties de clé de MFC écrit juste avant
+    
+          [F:MCN]OVENAT    = [M]OVENAT(J)
+          If [F:MFC]CPLQTY <> 0
+            [F:MCN]NATAMTLEV = arr([M]OVENATAMT(J) / [F:MFC]CPLQTY, 10^-GDECPRI)
+          Endif
+          [F:MCN]EXPNUM    = [C]EXPORT
+          [F:MCN]MFCDAT    = date$
+    
+          [F:MCN]CREDAT    = date$
+          [F:MCN]CREUSR    = GUSER
+          [F:MCN]UPDDAT    = [0/0/0]
+          [F:MCN]UPDUSR    = ""
+          Write [F:MCN]
+        Endif
+        If fstat
+            ERR = 1 # erreur d'écriture sur MFCNAT ... Nature xxx
+            LMSG = mess(15,2363,1)-[F:MFI]MFGNUM-num$([F:MFI]MFGLIN)
+            LMSG += "\"+ mess(309,197,1)+":"+[F:MCN]OVENAT
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Break 2
+        Endif
+      Endif
+    Next
+  Endif
+Next
+Return
+
+##################################################
+$REGUL_REEL
+# régularisation quand on gère au cout réel (prix moyen...)
+
+Call GET_LAST_SEQ([F:MFG]MFGNUM,LAST_SEQ) From MWIPLIB
+
+# Creation du WIPCOST régul
+Raz [F:MWI]
+
+[F:MWI]          = [F:MFI]
+[F:MWI]QTY       = [F:MFI]CPLQTY
+[F:MWI]PRINAT    = [M]ISSVLTCOD(I)+1 # doit correspondre au ML 705 (comme déclaration de prod 14)
+
+[F:MWI]WIPSEQ    = LAST_SEQ + 1
+[F:MWI]TXNTYP    = 17
+[F:MWI]TXNDAT    = WO_CLODAT : #date$
+[F:MWI]TXNACT    = 1
+
+[F:MWI]ENTCOD    = GACCWIPENT 
+[F:MWI]GLPSTA    = 1
+[F:MWI]CREDAT    = date$
+[F:MWI]CREUSR    = GUSER
+[F:MWI]UPDDAT    = [0/0/0]
+[F:MWI]UPDUSR    = ""
+[F:MWI]EXPNUM    = [C]EXPORT
+
+# la régul std - réel avait déjà été faite ; la variation vient seule régulariser le stock
+# et est répartie selon le stock physique du moment.
+[F:MWI]CSTELM(0) = [M]ACTACT(I)
+#[F:MWI]CSTELM(1) = [M]ACTSTD(I)
+[F:MWI]AMOUNT    = ([F:MWI]CSTELM(1) + [F:MWI]CSTELM(0)) * (-1) 
+
+# Détail de montant régularisé au prorata du produit !!! 
+[F:MWI]CSTELM(7) = (ACTUALS(3) + STANDARDS(3)) * [F:MWI]QTY/SUM_CPLQTY * (-1) # Actual Sub-contract Adjustment
+[F:MWI]CSTELM(8) = (ACTUALS(4) + STANDARDS(4)) * [F:MWI]QTY/SUM_CPLQTY * (-1) # Actual Overhead Adjustment
+
+# Recherche stock restant
+Raz [M]BOTLIG,[M]LOT,[M]SLO,[M]LOTSTU,[M]LOTQTY,[M]LOTADJ,[M]LOTOH
+Raz ON_HAND_PER
+Case [F:MWI]PRINAT
+When 5:    # Cas de sortie valorisée au PMP
+           Read [ITV]ITV0 = [F:MFI]ITMREF;[F:MFI]MFGFCY
+           If fstat
+                ERR = 1 
+                LMSG = mess(14,2363,1) - [F:MFI]ITMREF - [F:MFI]MFGFCY
+                Call ECR_TRACE(LMSG,1) From GESECRAN # err lecture sur ITMMVT
+                Call ECR_TRACE(" ",0) From GESECRAN
+                Raz LMSG
+                Return
+           Endif
+
+           [M]LOTSTU(0)    = [F:MFI]STU
+           [M]LOT(0)       = ""
+           [M]LOTADJ(0)    = [F:MWI]AMOUNT
+           [M]LOTQTY(0)    = [F:MFI]CPLQTY   # Qté réalisée
+           [M]LOTOH(0)     = [F:ITV]PHYSTO + [F:ITV]CTLSTO + [F:ITV]REJSTO
+           [M]BOTLIG = 1
+ 
+When 6:    # cas de sortie valorisée au prix FIFO
+           For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN = [F:MFI]MFGLIN
+             #rech STO remplacée par boucle sur STOCOST (>>ou accès direct si 1 pile par ligne de doc)
+             For [STP] Where ITMREF = [F:MKI]ITMREF & VCRTYP = 15 &
+&                      VCRNUM = [F:MKI]MFGTRKNUM & VCRLIN = [F:MKI]ITMTRKLIN
+                 [M]LOTSTU([M]BOTLIG) = [F:MKI]STU
+                 [M]LOT([M]BOTLIG)    = num$([F:STP]CSTCOU)
+                 [M]LOTQTY([M]BOTLIG) = [F:MKI]CPLQTY
+                 [M]LOTOH([M]BOTLIG)  = [F:STP]QTYSTUACT
+                 Break
+             Next
+             [M]BOTLIG   += 1
+           Next
+
+           For J = 0 To [M]BOTLIG - 1
+               If sum([M]LOTQTY) <> 0       
+                  [M]LOTADJ(J) = arr(([M]LOTQTY(J) / sum([M]LOTQTY)) * [F:MWI]AMOUNT,L_CURRND)
+               Endif
+           Next
+
+           If sum([M]LOTADJ) <> [F:MWI]AMOUNT
+               [M]LOTADJ(0) += (sum([M]LOTADJ) - [F:MWI]AMOUNT)
+           Endif
+
+When 7:    # cas de sortie valorisée au prix moyen du lot
+           For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN = [F:MFI]MFGLIN
+             For [STJ]STJ1 Where STOFCY=[F:MKI]MFGFCY & VCRTYP = 15 &
+&                    VCRNUM = [F:MKI]MFGTRKNUM & VCRLIN = [F:MKI]ITMTRKLIN
+               If [M]BOTLIG = 0
+                  [M]LOTSTU([M]BOTLIG) = [F:MKI]STU
+                  [M]LOT([M]BOTLIG)    = [F:STJ]LOT
+                  [M]SLO([M]BOTLIG)    = [F:STJ]SLO
+                  [M]LOTQTY([M]BOTLIG) = [F:STJ]QTYSTU # qté entrée sur ce lot
+                  [M]BOTLIG = 1
+               Else 
+                   For J = 0 To [M]BOTLIG - 1
+                       If [M]LOT(J) = [F:STJ]LOT & [M]SLO(J)=[F:STJ]SLO
+                            [M]LOTQTY(J) += [F:STJ]QTYSTU
+                            Break
+                       Elsif J = [M]BOTLIG - 1
+                           [M]LOTSTU([M]BOTLIG) = [F:MKI]STU
+                           [M]LOT([M]BOTLIG)    = [F:STJ]LOT
+                           [M]SLO([M]BOTLIG)    = [F:STJ]SLO
+                           [M]LOTQTY([M]BOTLIG) = [F:STJ]QTYSTU
+                           [M]BOTLIG += 1
+                       Endif
+                   Next J  
+               Endif
+             Next
+           Next
+
+           For J = 0 To [M]BOTLIG - 1
+               Read [SLF]SLF0 = [F:MFI]ITMREF;[M]LOT(J);[M]SLO(J);[F:MFI]MFGFCY
+               If fstat
+                   [M]LOTOH(J) = 0
+               Else
+                   [M]LOTOH(J) = [F:SLF]AVCBASQTY
+               Endif
+                
+               If sum([M]LOTQTY) <> 0
+                   [M]LOTADJ(J) = arr(([M]LOTQTY(J) / sum([M]LOTQTY)) * [F:MWI]AMOUNT,L_CURRND)
+               Endif
+           Next
+
+           If sum([M]LOTADJ) <> [F:MWI]AMOUNT
+               [M]LOTADJ(0) += (sum([M]LOTADJ) - [F:MWI]AMOUNT)
+           Endif
+
+Endcase
+
+# répartition entre 2 sous-totaux pour imputer sur le compte stock ou sur le compte Coût Biens vendus
+For J = 0 To [M]BOTLIG - 1
+    Raz ON_HAND_PER     # pourcentage de qté restante en stock
+    If [M]LOTQTY(J) <> 0
+        ON_HAND_PER    = ([M]LOTOH(J) / [M]LOTQTY(J)) * 100
+    Endif
+    If [M]LOTOH(J) = 0
+        [F:MWI]CSTELM(2)    += 0
+        [F:MWI]CSTELM(3)    += [M]LOTADJ(J)
+    Else 
+      If (FLGUSA=1 & ON_HAND_PER <= [M]PROPER(I)) | FLGUSA=0  # pourcentage plafond (que pour USA) (18/05/04)
+        [F:MWI]CSTELM(2)    += arr(([M]LOTADJ(J) * ON_HAND_PER)/100,L_CURRND)
+        [F:MWI]CSTELM(3)    += [M]LOTADJ(J) - [F:MWI]CSTELM(2)
+      Else
+        [F:MWI]CSTELM(2)    += [M]LOTADJ(J)
+        [F:MWI]CSTELM(3)    += 0
+      Endif
+    Endif
+Next
+
+If ([F:MWI]CSTELM(2) + [F:MWI]CSTELM(3)) <> [F:MWI]AMOUNT
+    [F:MWI]CSTELM(2) += (([F:MWI]CSTELM(2) + [F:MWI]CSTELM(3)) - [F:MWI]AMOUNT)
+Endif
+
+# Prorata de la régul sur les suivis de production MKI
+TOT_QTY = [F:MFI]CPLQTY
+
+Raz TOT_QTY2, TOT_ABS, TOT_NABS
+For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN=[F:MFI]MFGLIN
+    TOT_QTY2 += arr([F:MKI]CPLQTY / TOT_QTY * [F:MWI]CSTELM(3),L_CURRND)
+Next
+
+If TOT_QTY2 <> [F:MWI]CSTELM(3)
+    DIF = TOT_QTY2 - [F:MWI]CSTELM(3)  # sera affectée sur le premier de la boucle
+Else
+    DIF = 0
+Endif
+# CCC : Bug 28594
+#For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN=[F:MFI]MFGLIN
+#    MKI_COGSADJ = arr(([F:MKI]CPLQTY / TOT_QTY * [F:MWI]CSTELM(3))+DIF,L_CURRND)
+#    If DIF <> 0 : DIF = 0 : Endif
+    
+#    WPRI = arr(((([F:MFC]CSTTOT + [F:MFC]OVETOT) * [F:MKI]CPLQTY) + MKI_COGSADJ) / [F:MKI]CPLQTY,10^-GDECPRI)
+    WPRI = arr(((([F:MFC]CSTTOT + [F:MFC]OVETOT) * [F:MFI]CPLQTY) + [F:MWI]CSTELM(3)) / [F:MFI]CPLQTY,10^-GDECPRI)
+    If WPRI <> 0            # US132R1002 - sn <<<<<<<< ?????? ce ne serait pas le contraire !!??? Non: si tout a été sorti on ne fera pas de régul
+#        WPRI = [F:MFC]CSTTOT + [F:MFC]OVETOT
+        WPRI += [F:MFC]CSTTOT + [F:MFC]OVETOT    # WPRI contenait déjà l'opposé du prix précédent => ça donne la différence
+    Endif                   # US132R1002 - en
+#    Call REGPRIX2([F:MFC]STOFCY,5,[F:MFC]ITMREF,[F:MFC]MFCDAT,"",15,[F:MKI]MFGTRKNUM,
+#&           [F:MKI]ITMTRKLIN,0,"",0,[F:MKI]CPLQTY*WPRI,[F:MKI]CPLQTY,TOT_ABS,TOT_NABS,WRET) From STKVAL # sur le montant global!
+      Columns [MKI] (CPLQTY)
+      Raz LCPLQTYTOT
+      For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN = [F:MFI]MFGLIN
+          LCPLQTYTOT += [F:MKI]CPLQTY
+      Next
+      Columns [MKI]
+      If !clalev([M:SDP]) : Local Mask SAIDECPRI [SDP] : Endif
+      Raz [M:SDP]
+      If WPRI<>0
+          [M:SDP]AMTTOT = [M]SCOCST(I)+[M]OVESCOCST(I)
+          [M:SDP]QTY    = 0    # Le montant est un delta
+          [M:SDP]PRI = [M:SDP]AMTTOT / LCPLQTYTOT
+    
+          [M:SDP]SCOTOT = [M]SCOCST(I)
+          [M:SDP]OVESCOCST = [M]OVESCOCST(I)
+      Endif
+
+# CCC (14/02/05) Bug 28345 : Utilisation devise société dans la valeur du lot
+      Call CONVERT2(GLOCALDEV,GSYSCUR,GLOCALDEV,GCHGTYP,[F:MFC]MFCDAT,
+&                   1,LCNVRPT,WRET) From TRTDEV
+      Call REGPRIX2([F:MFC]STOFCY,5,[F:MFC]ITMREF,[F:MFC]MFCDAT,"",0,"",
+&           0,10,[F:MFI]MFGNUM,[F:MFI]MFGLIN,LCNVRPT,TOT_ABS,TOT_NABS,WRET) From STKVALREG
+    # erreurs en retour / WRET
+    Raz LMSG
+    Case WRET
+        When 7 :       LMSG = GMESSAGE    # "Période indéfinie ou traitement interdit à cette date"
+        When Default : LMSG = mess(519,197,1) +"("+num$(WRET)+")"# Erreur sur la régularisation de prix
+    Endcase
+    If LMSG<>""
+        LMSG += "\"-[F:MFI]MFGNUM-[F:MFI]ITMREF
+        Call ECR_TRACE(LMSG,0) From GESECRAN
+    Endif
+    # écrire aussi le détail absorbé, non-absorbé (param suppl dans REGPRIX2) 
+    [F:MWI]CSTELM(9)  += TOT_ABS
+    [F:MWI]CSTELM(10) += TOT_NABS
+
+#    If GOK = 0 : ERR = 1 : Break : Endif : # inhibiting error
+    If GOK = 0 : ERR = 1 : Endif : # inhibiting error
+
+#Next
+# Write record
+If [F:MWI]AMOUNT <> 0 & !ERR
+    Write [F:MWI]
+    If fstat
+        ERR = 1 
+        LMSG = mess(6,2363,1)-[F:MFI]MFGNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+        Call ECR_TRACE(LMSG,1) From GESECRAN
+        Call ECR_TRACE(" ",0) From GESECRAN
+        Raz LMSG
+    Endif
+Endif
+Return
+
+##################################################
+$STANDARD
+# génération d'enregistrements d'écarts quand on gère au coût std
+
+Call GET_LAST_SEQ([F:MFG]MFGNUM,LAST_SEQ) From MWIPLIB
+    # ou faire 
+For I = 3 To 4
+    Raz [F:MWI]
+    [F:MWI]MFGNUM    = [F:MFG]MFGNUM
+    [F:MWI]WIPSEQ    = LAST_SEQ + 1 + I
+
+    [F:MWI]TXNACT    = 1
+    [F:MWI]MFGFCY    = [F:MFG]MFGFCY
+    [F:MWI]TXNDAT    = WO_CLODAT : #date$
+    [F:MWI]AMOUNT    = ACTUALS(I) * (-1)
+    [F:MWI]CSTELM(0) = ACTUALS(I)
+   
+    [F:MWI]ENTCOD    = GACCWIPENT
+    [F:MWI]GLPSTA    = 1
+    [F:MWI]CREDAT    = date$
+    [F:MWI]CREUSR    = GUSER
+    [F:MWI]EXPNUM    = [C]EXPORT
+
+    Case I
+        When 3 :    [F:MWI]TXNTYP    = 12      # écart sous-traitance
+                    For J = 1 To GOPTCANA
+                        Call INISEC(WCCE,GSCOVARCCE,num$(J)) From SUBCDE
+                        Assign "[F:MWI]CCE"+num$(J) With WCCE
+                    Next
+        When 4 :    [F:MWI]TXNTYP    = 13      # écart frais
+                    For J = 1 To GOPTCANA
+                        Call INISEC(WCCE,GOVEVARCCE,num$(J)) From SUBCDE
+                        Assign "[F:MWI]CCE"+num$(J) With WCCE
+                    Next
+    Endcase
+
+    If [F:MWI]AMOUNT <> 0 # par la sous-traitance il y aura tjrs un "écart"
+                          # mais il va peut-être annuler l'ancien écart passé
+        Write [F:MWI]
+        If fstat
+            ERR = 1 
+            LMSG = mess(6,2363,1)-[F:MFI]MFGNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Break
+        Endif
+    Endif
+Next I
+
+Return
+
+##################################################
+$CHK_BALANCE
+# Read all of WIPCOST records for the Work Order
+For [MWI]MWI5 Where MFGNUM = [F:MFG]MFGNUM 
+    BAL_AMT   += [F:MWI]AMOUNT
+Next
+
+If BAL_AMT <> 0
+    Call GET_LAST_SEQ([F:MFG]MFGNUM,LAST_SEQ) From MWIPLIB
+
+    # Creation du WIPCOST Balance
+    Raz [F:MWI]
+
+    [F:MWI]MFGNUM    = [F:MFG]MFGNUM
+    [F:MWI]WIPSEQ    = LAST_SEQ + 1
+    [F:MWI]TXNTYP    = 15
+    [F:MWI]MFGFCY    = [F:MFG]MFGFCY
+    [F:MWI]TXNDAT    = WO_CLODAT : #date$
+    [F:MWI]TXNACT    = 1
+    [F:MWI]AMOUNT    = BAL_AMT * (-1)
+    For J = 1 To GOPTCANA
+        Call INISEC(WCCE,GBALCCE,num$(J)) From SUBCDE
+        Assign "[F:MWI]CCE"+num$(J) With WCCE
+    Next
+    [F:MWI]ENTCOD    = GACCWIPENT
+    [F:MWI]GLPSTA    = 1
+    [F:MWI]CREDAT    = date$
+    [F:MWI]CREUSR    = GUSER
+    [F:MWI]EXPNUM    = [C]EXPORT
+
+    If [F:MWI]AMOUNT <> 0
+        Write [F:MWI]
+        If fstat
+            ERR = 1 
+            LMSG = mess(6,2363,1)-[F:MFG]MFGNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+        Endif
+    Endif
+Endif
+
+Return
+
+
+##################################################
+$TERMINE
+If !GSERVEUR
+  SAI = 1
+  TRA = 1
+  Raz [M]
+
+  Call FERME_TRACE From LECFIC
+Endif
+Return
+
+##########################################################################
+## Etiquette ajoutée par le superviseur 19/12/2003 09:09:09 (TB)
+##########################################################################
+Subprog AM_STOFCY(VALEUR)
+Variable Char    VALEUR()
+# charger les éventuels paramètres de niveau site
+Call GLOBVAR(VALEUR)    From WWGLOBGPA
+End
+
+Subprog C_MFGNUM(VALEUR)
+Variable Char    VALEUR()
+# après saisie de n° d'OF controler les flag
+If VALEUR <> ""
+  Read [MFG]MFG0 = VALEUR
+  If fstat
+    GMESSAGE = mess(23,100,1)
+    mkstat = 2
+  Else
+    # Controler que l'OF est bien du site choisi
+    If [F:MFG]MFGFCY <> [M]STOFCY
+      mkstat = 2
+      GMESSAGE = mess(224,193,1) #le site de l'ordre ne correspond pas au site sélectionné
+      End
+    # contrôler que l'OF est clos
+    Elsif [F:MFG]MFGSTA < 4 
+      mkstat = 2
+      GMESSAGE = mess(115,193,1) #"Cet ordre de fabrication n'est pas clos"
+      End
+    Elsif [F:MFG]MFGTRKFLG < 6
+      mkstat = 2
+      GMESSAGE = mess(225,193,1) #"Le prix de revient n'a pas encore été calculé pour cet ordre"
+      End
+    Endif
+
+    Read [MWH]MWH0=VALEUR
+    If !fstat
+        If [F:MWH]MFGTRKFLG <> 5
+            mkstat = 2
+            GMESSAGE = mess(226,193,1) #Les factures sous-traitance n'ont pas changé les valeurs d'encours d'OF
+        Endif
+    Else
+        GMESSAGE = mess(227,193,1) #"Pas de valorisation d'encours sur cet OF"
+        mkstat = 2
+    Endif
+  Endif
+Endif
+End
+
+##########################################################################
+## Etiquette ajoutée par le superviseur 22/12/2003 10:39:37 (TB)
+##########################################################################
+Subprog AM_MFGNUM(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" 
+  [M]FILMFG = ""
+Endif
+End
+
+Subprog AV_FILFLG(VALEUR)
+Variable Integer VALEUR
+VALEUR = ([M]FILMFG<>"")+1
+End
+
+##########################################################################
+## Etiquette ajoutée par le superviseur 14/01/2004 16:42:17 (TB)
+##########################################################################
+Subprog D_STOFCY(VALEUR)
+Variable Char    VALEUR()
+VALEUR = GFCYDEF(8)
+End
+
+##########################################################################

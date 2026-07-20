@@ -1,0 +1,1344 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+######################################################################################################
+# Project       : Swiss Localization
+# File          : SWIBVRLIB1
+# Version       : 1.0
+# Author        : Ulrike Bader
+# Creation Date : 26.03.15
+######################################################################################################
+# Module        : ACCOUNTING
+# Description   : - Import ISR
+######################################################################################################
+ # Updates :
+ # Date       |Author   |Version|Description
+ # 2015-07-23 |Bader    |U9     |rename SWIIMPBVR to IMPBVRSWI
+ # 2015-09-10 |Gregolec |U9P0   |INIT_VAR_: rename parameters BVRINVFROM/BVRINVTO to BVRSTRINV/BVRENDINV
+ # 2015-09-11 |Bader    |U9P0   |PAY_REM_: init GCURLEG with "SWI"
+ # 2015-09-14 |Bader    |U9P0   |IMPBVR_/R_PAYMENTH_: read payment entry type from new parameter SWIBVRTPY
+ # 2015-10-06 |Bader    |U9P1   |VERIF_COH3_: check if matching for open item is in progress. If yes, error to avoid duplicate payments
+ # 2016-06-30 |Bader    |U9P3   |300188692: R_PAYMENTD_: write "A" record for dimensions if discount exists
+ # 2016-08-17 |Bader    |U9P3   |300192246: AFFECT_4: try to find invoice number by reading SIH using NUMREF before extracting it from file
+ # 2017-11-24 |Bader    |2017.R7|X3-65774: VAR_, EXTRACT_INVNUM, AFFECT3_, AFFECT4_: new variable BVRPOS for position of BVR number in file
+ # 2018-05-04 |Bader    |2018.R4|X3-88118: INIT_AXE, R_PAYMENTD_: correct handling for analytical dimensions
+# Issue X3-59028 - 2018-04-18 by CBO : Changes of accounting task for mindo
+######################################################################################################
+
+#*****************************************************************************************************
+#EXECIMP_: Programme qui réalise l'import du fichier BVR dans la table temporaire SWIIMPTMP
+#*****************************************************************************************************
+Subprog EXECIMP_
+Local Integer FOUND
+#----Ouverture des fichiers employés----#
+Gosub OUVRE_
+If FOUND <> 1 : End : Endif  # no valid file found
+#----Déclarations des variables de la tables----#
+Gosub VAR_
+#----Initialisation des variables----#
+Gosub INIT_VAR_
+#---RECHERCHE du numéro d'import----#
+Gosub CALCUL_COMPTEUR_
+#----Lecture du fichier ligne à ligne----#
+Trbegin [SWITMP]   # On commence une transaction afin de s'assurer de la cohérence de l'import
+Repeat
+  Rdseq CHAINE Using [REPS]
+  If CHAINE<>""
+      LIGNE_ +=1
+
+      #----Affectation des variables de fichiers----#
+      If [M:DIA]TYPFIL = 1 Gosub AFFECT3_ : Endif
+      If [M:DIA]TYPFIL = 2 Gosub AFFECT4_ : Endif
+
+      #----On crée le fichier d'import pour le BVR----#
+      If [M:DIA]TYPFIL = 1 Gosub CR_IMPBVR3TMP_ : Endif
+      If [M:DIA]TYPFIL = 2 Gosub CR_IMPBVR4TMP_ : Endif
+
+      #----Test si la lecture et l'écriture de la ligne s'est bien déroulée---# Si non Roll back et exit
+      If SUCCES=0
+        Goto ABANDON_
+        End
+      Endif
+  Endif
+Until fstat <> 0
+If SUCCES=1
+    Commit
+Else
+    Goto ABANDON_
+Endif
+
+#----On  transfert les données de la table temporaire dans la table définitive----#
+Trbegin [SWIIMP]
+#---- Ouverture de la trace ----#
+#---- Ouverture d'une trace afin de mettre à jour les éléments modifiés
+Call OUVRE_TRACE(mess(8,3648,1)) From LECFIC  # Import Swiss ISR file
+Call ECR_TRACE("----------------------------------------------------------------------",0) From GESECRAN
+Call ECR_TRACE(func AFNC.MES1( mess(9,3648,1), GUSER),0) From GESECRAN          # Import executed by user $1$
+Call ECR_TRACE(mess(2,772,1)-format$("D:DD[.]MM[.]YYYY",date$),0) From GESECRAN # Process date
+Call ECR_TRACE(mess(124,121,1)+":"-[M:DIA]NAMIMP,0) From GESECRAN               # Name of Imported file
+Call ECR_TRACE("----------------------------------------------------------------------",0) From GESECRAN
+Call ECR_TRACE("",0) From GESECRAN
+
+Gosub CR_IMPBVR3_
+If SUCCES=1
+    Commit
+Else
+    Goto ABANDON_
+Endif
+
+#----On vide la table temporaire-----#
+Delete [F:SWITMP] Where NUMIMP<>""
+
+
+#---- Fermeture de la trace et lecture si nécessaire ----#
+Call FERME_TRACE From LECFIC
+
+#---- Lecture de la trace ----#
+If GERRTRACE>0
+    Call LEC_TRACE From LECFIC
+Endif
+
+#----Fermeture des fichiers utilisés----#
+Gosub FERME_
+Close Mask [DIA]
+#----On affiche l'objet XTI qui comporte le tableau d'import----#
+Call OBJET("SWIBVR", T1, T2) From GOBJET
+
+
+End
+#**********************************************************************************
+
+#-----------------------------------------------------------------------------------------------------
+#***$OUVRE: Ouverture des fichiers employés
+#-----------------------------------------------------------------------------------------------------
+$OUVRE_
+  #------------------Ouverture des tables-------------------------------#
+  If !clalev([F:SWITMP]) : Local File SWIIMPTMP [SWITMP] : Endif
+  If !clalev([F:TCU])    : Local File TABCUR [TCU]       : Endif
+  If !clalev([F:CDA])    : Local File GACCDENCOD [CDA]   : Endif
+  If !clalev([F:SIH])    : Local File SINVOICE [SIH]     : Endif
+  If !clalev([F:MTB])    : Local File MTCBATCH [MTB]     : Endif     # 06.10.15 Bader
+
+  #----Ouverture du fichier d'import BVR à décrypter----#
+  If [M:DIA]TYPIMP = 1
+    Local Char    IMPORTNAME(GDIMFIC) : IMPORTNAME = ""
+    Local Integer STAT                : STAT = 0
+    [M]NAMIMP = ""
+
+    Call COPSRV( IMPORTNAME, [M]NAMIMP, STAT ) From ORDSYS
+  Endif
+
+  Call EXISTE([M:DIA]NAMIMP, FOUND) From ORDSYS
+  If FOUND = 1         # file chosen
+     Openi [M:DIA]NAMIMP Using [REPS]
+     adxifs = ''
+     adxirs=chr$(13) + chr$(10)
+  Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+#***Déclaration des variables pour BVR type 3  et type 4
+#-----------------------------------------------------------------------------------------------------
+$VAR_
+  #------------------Variables du fichier d'import-------------------------------#
+  Local Char COMPTEUR_(8)     :  #Compteur de fichier
+  Local Date DATIMP_          :  #Date de l'import
+  Local Integer LIGNE_        :  #Compteur de ligne
+  Local Char CODETR_(2)       :  #Code de transaction
+  Local Char GENRETR_(3)      :  #Genre de transaction
+  Local Char ORIGINE_(2)      :  #Origine
+  Local Char GENREREM_(1)     :  #Genre de remise
+  Local Char NUMCLIBVR_(9)    :  #Numéro du client BVR
+  Local Char NUMREF_(27)      :  #Numéro de référence
+  Local Char NUMFAC_(15)      :  #Numéro de facture dans le numéro de référence
+  Local Char CODEMON1_(3)     :  #Code monnaie selon la norme ISO
+  Local Char MONT_ENT_(10)    :  #Montant en-tête
+  Local Char MONT_(10)        :  #Montant
+  Local Char REFDEPOT_(10)    :  #Référence du dépôt
+  Local Char RIF_(35)         :  #Référence de l'institut financier
+  Local Char DATEDEPOT_(6)    :  #Date du dépôt
+  Local Char DATETRT_(6)      :  #Date du traitement
+  Local Char DATEINSC_(6)     :  #Date inscription du crédit
+  Local Char NUMMICRO_(9)     :  #Numéro microfilm
+  Local Char CODEREJ_(1)      :  #Code de rejet
+  Local Char FRAIS_(4)        :  #Prix du versement
+  Local Char FACNUM_(GLONSIH) :  #Facture client
+  Local Decimal SOLDEFAC_     :  #Solde facture
+  Local Decimal DELTA_        :  #Différence
+  Local Integer DEBFAC,FINFAC :  #Positonnement du numéro de facture dans la ligne
+  Local Char BAN(GLONBAN)     :  #Banque de comptabilisation
+  Local Char BPR_(GLONBPR)    :  #Tiers
+  Local Char DEP_ (GLONDEP)   :  #Escompte
+  Local Decimal DEPRAT_       :  #Taux d'escompte
+  Local Char  SAC_ (GLONSAC)  :  #Collectif
+  Local Decimal MONT_ESC_     :  #Montant d'escompte
+  Local Integer OK_           :  #Code couleur erreur
+  Local Char PAM_ (GLONTAM)   :  #Mode de règlement
+  Local Integer DUDNUM_, DUDLIG_ : #Numéro d'échéance
+  Local Integer BVRPOS        :  # position of BVR number in line of file Bader 2017-11-24 new
+
+  #------------------Variables diverses du traitement-----------------------------#
+  Local Char CHAINE(255)
+  Local Char TYPE_DEV_(3)
+  Local Decimal SOMME_MT_, ARD
+  Local Integer DEDANS_, AJOUT_LIGNE_
+  Local Integer NBR_TRANS_
+  Local Decimal SUM_MONT_, MT_MARGE_
+  Local Integer STOP_
+  Local Char T1(20), T2(20)
+  Local Integer SUCCES
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+#Initialisation des variables
+#-----------------------------------------------------------------------------------------------------
+$INIT_VAR_
+  TRA = 1
+  Raz COMPTEUR_
+  DATEIMP_ = date$
+  Raz LIGNE_
+  NBR_TRANS_ = 0
+  SUM_MONT_ = 0
+  MONT_ESC_ = 0
+  STOP_=0
+  SUCCES=1
+  OK_=0
+  SAC_=""
+  BPR_=""
+  DEP_=""
+  PAM_=""
+  DUDNUM_=0
+  DUDLIG_=0
+  MTESC_=0
+
+  DEBFAC= int(val(func AFNC.PARAM("BVRSTRINV", [M:DIA]FCY)))
+  FINFAC= int(val(func AFNC.PARAM("BVRENDINV", [M:DIA]FCY)))
+
+  #----Destinations comptables des escomptes----#
+  Call PARAM("","DENDEP",GDIV(2)) From ADOVAL
+  If GDIV(2)<>""
+      Call LECTURE("CDA",GDIV(2),"") From CONTOBJ
+      If fstat            : GMESSAGE = GDIV(2) : Gosub ERR_CDA : Endif
+      If [F:CDA]ACCTYP<>3 : GMESSAGE = mess(3,612,1) : Gosub ERR_ACCTYP : Endif
+      If  [F:CDA]ACCCOD="" : Gosub ERR_CPT : Endif : # GH 13/9/99 bug 3198
+
+
+      If [F:CDA]IPTDAC=1  : Gosub ERR_IPTDAC : Endif
+  Endif
+
+  #----Destinations comptables des agios----#
+  Call PARAM("","DENCRG",GDIV(5)) From ADOVAL
+  If GDIV(5)<>""
+      Call LECTURE("CDA",GDIV(5),"") From CONTOBJ
+      If fstat            : GMESSAGE = GDIV(5) : Gosub ERR_CDA : Endif
+      If [F:CDA]ACCTYP<>3 : GMESSAGE = mess(3,612,1) : Gosub ERR_ACCTYP : Endif
+       If [F:CDA]ACCCOD="" : Gosub ERR_CPT : Endif : # GH 13/9/99 bug 3198
+
+      If [F:CDA]IPTDAC=1  : Gosub ERR_IPTDAC : Endif
+  Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+# Recherche d'un nouveau numéro de compteur pour constituer le nom du fichier
+#-----------------------------------------------------------------------------------------------------
+$CALCUL_COMPTEUR_
+    Local Char    VALEUR(30)
+    Local Integer STAT
+
+    Call NUMERO("SWIBV","",datesyst,"",VALEUR,STAT) From SUBANM
+    If STAT <> 0
+      Errbox(mess(270,133,1)) # "No sequence number code found"
+      COMPTEUR_ = "poste"
+    Else
+      COMPTEUR_ = VALEUR
+    Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+#***Affectation des variables  BVR Type 3
+#-----------------------------------------------------------------------------------------------------
+$AFFECT3_
+  CODETR_      = ""
+  GENRETR_     = mid$(CHAINE,1,3)                                       :  #Genre de transaction
+  ORIGINE_     = ""
+  GENREREM_    = ""
+  NUMCLIBVR_   = mid$(CHAINE,4,9)                                       :  #Numéro du client BVR
+  BVRPOS       = 13                                                     :  #Bader 2017-11-24 BVR starts at position 13 in file
+  NUMREF_      = mid$(CHAINE,BVRPOS,27)                                 :  #Numéro de référence
+
+  Read [F:SIH]SIH9=NUMREF_
+  If fstat=0
+      NUMFAC_=[F:SIH]NUM
+  Else
+     Gosub EXTRACT_INVNUM
+  Endif
+
+  CODEMON1_    = "CHF"
+  Case GENRETR_
+      When "002", "012", "022", "032", "102", "112", "132"
+          #On est dans le cas d'un montant au crédit
+          MONT_ENT_    = num$(val(mid$(CHAINE,40,8)))+"."+mid$(CHAINE,48,2)     :  #Montant en-tête
+          MONT_        = num$(val(mid$(CHAINE,40,8)))+"."+mid$(CHAINE,48,2)     :  #Montant
+      When "005", "015", "025", "035", "105", "115", "135"
+          #On est dans le cas d'un montant au débit
+          MONT_ENT_    = "-"+num$(val(mid$(CHAINE,40,8)))+"."+mid$(CHAINE,48,2)     :  #Montant en-tête
+          MONT_        = "-"+num$(val(mid$(CHAINE,40,8)))+"."+mid$(CHAINE,48,2)     :  #Montant
+      When "008", "018", "028", "038", "108", "118", "138"
+          #On est dans le cas d'une rectification (positif)
+          MONT_ENT_    = num$(val(mid$(CHAINE,40,8)))+"."+mid$(CHAINE,48,2)     :  #Montant en-tête
+          MONT_        = num$(val(mid$(CHAINE,40,8)))+"."+mid$(CHAINE,48,2)     :  #Montant
+  Endcase
+
+  REFDEPOT_    = mid$(CHAINE,50,10)                                     :  #Référence du dépôt
+  RIF_         = ""
+  DATEDEPOT_   = mid$(CHAINE,60,6)                                      :  #Date du dépôt
+  DATETRT_     = mid$(CHAINE,66,6)                                      :  #Date du traitement
+  DATEINSC_    = mid$(CHAINE,72,6)                                      :  #Date inscription du crédit
+  NUMMICRO_    = mid$(CHAINE,78,9)                                      :  #Numéro microfilm
+  CODEREJ_     = mid$(CHAINE,87,1)                                      :  #Code de rejet
+  FRAIS_       = num$(val(mid$(CHAINE,97,4))/100)                       :  #Prix du versement
+  DEVISE_      = "CHF"                                                  :  # BVR DE type 3 TJS CHF
+  #Infbox "==>GENRETR ="+GENRETR_
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#*** Extract invoice number from line (CHAINE) remove leading zeros
+#-----------------------------------------------------------------------------------------------------
+#*!
+$EXTRACT_INVNUM
+Local Integer I
+   NUMFAC_      = mid$(CHAINE,BVRPOS-1+DEBFAC,FINFAC-DEBFAC+1) # Bader 2017-11-24 use BVRPOS-1 instead of 12 to correctly supperts both types (3 and 4)
+   # delete leading zeros from invoice number
+   Repeat
+     I = instr(1,NUMFAC_,"0")
+     If I = 1                   # first character is "0"
+        If len(NUMFAC_) > 1
+           NUMFAC_ = right$(NUMFAC_,2)
+        Else
+           NUMFAC_ = ""
+        Endif
+     Else
+        I = 0
+     Endif
+   Until I = 0
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#***Affectation des variables  BVR Type 4
+#-----------------------------------------------------------------------------------------------------
+#*!
+$AFFECT4_
+  CODETR_      = mid$(CHAINE,1,2)                                          :  #Code de transaction
+  GENRETR_     = mid$(CHAINE,3,1)                                          :  #Genre de transaction
+  ORIGINE_     = mid$(CHAINE,4,2)                                          :  #Origine
+  GENREREM_    = mid$(CHAINE,6,1)                                          :  #Genre de remise
+  NUMCLI_      = mid$(CHAINE,7,9)                                          :  #Numéro du client
+  BVRPOS       = 16                                                        :  #Bader 2017-11-24 BVR starts at position 16 in file
+  NUMREF_      = mid$(CHAINE,BVRPOS,27)                                    :  #Numéro de référence
+
+  Read [F:SIH]SIH9=NUMREF_
+  If fstat=0
+      NUMFAC_=[F:SIH]NUM
+  Else
+     Gosub EXTRACT_INVNUM
+  Endif
+
+  CODEMON1_    = mid$(CHAINE,43,3)                                         :  #Code monnaie selon la norme ISO
+  Case GENRETR_
+    When "1"
+        #On est dans le cas d'un crédit
+        MONT_ENT_    = num$(val(mid$(CHAINE,46,10)))+"."+mid$(CHAINE,56,2)       :  #Montant en-tête
+        MONT_        = num$(val(mid$(CHAINE,46,10)))+"."+mid$(CHAINE,56,2)       :  #Montant
+    When "2"
+        #on est dans le cas d'un montant au débit
+        MONT_ENT_    = "-"+num$(val(mid$(CHAINE,46,10)))+"."+mid$(CHAINE,56,2)       :  #Montant en-tête
+        MONT_        = "-"+num$(val(mid$(CHAINE,46,10)))+"."+mid$(CHAINE,56,2)       :  #Montant
+    When "3"
+        #On est dans le cas d'un correctif
+        MONT_ENT_    = num$(val(mid$(CHAINE,46,10)))+"."+mid$(CHAINE,56,2)       :  #Montant en-tête
+        MONT_        = num$(val(mid$(CHAINE,46,10)))+"."+mid$(CHAINE,56,2)       :  #Montant
+  Endcase
+  REFDEPOT_    = ""                                                        :  #Référence du dépôt
+  RIF_         = mid$(CHAINE,58,35)                                        :  #Référence de l'institut financier
+  DATEDEPOT_   = mid$(CHAINE,93,8)                                         :  #Date du dépôt
+  DATETRT_     = mid$(CHAINE,101,8)                                        :  #Date du traitement
+  DATEINSC_    = mid$(CHAINE,109,8)                                        :  #Date inscription du crédit
+  NUMMICRO_    = ""                                                        :  #Numéro microfilm
+  CODEREJ_     = mid$(CHAINE,117,1)                                        :  #Code de rejet
+  FRAIS_       = num$(val(mid$(CHAINE,121,6))/100)                         :  #Taxes
+  DEVISE_      = CODEMON1_                                                 :  # Soit CHF, EUR ou eventuellement autre
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+#***On gère une ligne de fichier de type et on le stocke dans la base temp
+#-----------------------------------------------------------------------------------------------------
+$CR_IMPBVR3TMP_
+If GENRETR_ <> ""
+   If GENRETR_ <> "999" and GENRETR_ <>"995"  : #GENRETR_ = "999" et "995" indique qu'on est sur la dernière ligne
+      #----On rempli la table temporaire----#
+      NBR_TRANS_ +=1
+      SUM_MONT_ += val(MONT_)
+      Case GENRETR_
+      When "002", "012", "022", "032", "102", "112", "132"
+          #On est dans le cas d'un montant au crédit
+          Gosub REMPLI_TABLE_TEMP_
+      When "005", "015", "025", "035", "105", "115", "135"
+          #On est dans le cas d'un montant au débit
+          Gosub REMPLI_TABLE_TEMP_
+      When "008", "018", "028", "038", "108", "118", "138"
+          #On est dans le cas d'une correction
+          Gosub UPDATE_TABLE_TEMP_
+      Endcase
+    Else
+       Local Char SUM_LINE(25)
+       #----On vérifie que le nombre de lignes traitées et le montant sont corrects----#
+       #num$(val(mid$(CHAINE,52,12))) ->> NOMBRE DE TRANSACTONS
+       If num$(NBR_TRANS_) <> num$(val(mid$(CHAINE,52,12))) #Ca veut dire que le nbre de transaction ne correspond pas au nbre de ligne
+          SUCCES=0
+          GERR=1 : GMESSAGE=mess(10,3648,1)  # Warning: The number of imported lines is not equal to the total number of defined lines!
+       Endif
+       If GENRETR_ = "999"
+          SUM_LINE = num$(val(mid$(CHAINE,40,10)+"."+mid$(CHAINE,50,2)))
+       Else             # GENRETR_ = 995 -> negative amount
+          SUM_LINE = "-"+num$(val(mid$(CHAINE,40,10)+"."+mid$(CHAINE,50,2)))
+       Endif
+       If num$(SUM_MONT_) <> SUM_LINE #Ca veut dire que le montant de la derniere ligne ne correspond pas à la somme des montants de toute les lignes
+          SUCCES=0
+          GERR=1 : GMESSAGE=mess(11,3648,1)  # The amount of the last line is not the total of the amounts imported!
+       Endif
+    Endif
+Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+#***On gère une ligne du fichier de type 4  et on le stocke dans la base temp
+#-----------------------------------------------------------------------------------------------------
+$CR_IMPBVR4TMP_
+If ORIGINE_ <> ""
+   If ORIGINE_<> "99" and ORIGINE_<> "98" : #ORIGINE_ = "99" oou "98" indique qu'on est sur la dernière ligne
+      #----On rempli la table temporaire----#
+      NBR_TRANS_ += 1
+      SUM_MONT_ += val(MONT_)
+      Case GENRETR_
+      When "1"
+          #On est dans le cas d'un montant au crédit
+          Gosub REMPLI_TABLE_TEMP_
+      When "2"
+          #On est dans le cas d'un montant au débit
+          Gosub REMPLI_TABLE_TEMP_
+      When "3"
+          #On est dans le cas d'un corectif
+          Gosub UPDATE_TABLE_TEMP_
+      Endcase
+   Else
+       #----On vérifie que le nombre de lignes traitées et le montant sont corrects
+       #num$(val(mid$(CHAINE,58,12))) ->> NOMBRE DE TRANSACTONS
+       If num$(NBR_TRANS_) <> num$(val(mid$(CHAINE,58,12))) #Ca veut dire que le nbre de transaction ne correspond pas au nbre de ligne
+          SUCCES = 0
+          GERR=1 : GMESSAGE=mess(10,3648,1)  # Warning: The number of imported lines is not equal to the total number of defined lines!
+       Endif
+       If num$(SUM_MONT_) <> num$(val(mid$(CHAINE,46,10)+"."+mid$(CHAINE,56,2))) #Ca veut dire que le montant de la derniere ligne ne correspond pas à la somme des montants de toute les lignes
+          SUCCES = 0
+          GERR=1 : GMESSAGE=mess(11,3648,1)  # The amount of the last line is not the total of the amounts imported!
+       Endif
+   Endif
+Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#.....................................................................................................
+# On inscrit l'enregistrement dans la table temporaire
+#.....................................................................................................
+$REMPLI_TABLE_TEMP_
+    [F:SWITMP]NUMIMP = COMPTEUR_
+    [F:SWITMP]DATIMP = date$
+    [F:SWITMP]LINE = LIGNE_
+    [F:SWITMP]CODTRS = CODETR_
+    [F:SWITMP]TYPTRS = GENRETR_
+    [F:SWITMP]SRC = ORIGINE_
+    [F:SWITMP]TYPDIS = GENREREM_
+    [F:SWITMP]NUMBPC = NUMCLIBVR_
+    [F:SWITMP]NUMREF = NUMREF_
+    [F:SWITMP]NUMINV = NUMFAC_
+    [F:SWITMP]CUR = CODEMON1_
+    [F:SWITMP]AMOUNT = val(MONT_)
+    [F:SWITMP]REFDEP = REFDEPOT_
+    [F:SWITMP]REFINST = RIF_
+    [F:SWITMP]DATDEP = gdat$(val(mid$(DATEDEPOT_,5,2)),val(mid$(DATEDEPOT_,3,2)),val(mid$(DATEDEPOT_,1,2)))
+    [F:SWITMP]DATTRT = gdat$(val(mid$(DATETRT_,5,2)),val(mid$(DATETRT_,3,2)),val(mid$(DATETRT_,1,2)))
+    [F:SWITMP]DATCRE = gdat$(val(mid$(DATEINSC_,5,2)),val(mid$(DATEINSC_,3,2)),val(mid$(DATEINSC_,1,2)))
+    [F:SWITMP]NUMMICRO = val(NUMMICRO_)
+    [F:SWITMP]CODREJ = val(CODEREJ_)
+    [F:SWITMP]COST = val(FRAIS_)
+    [F:SWITMP]BAN = [M:DIA]BAN
+    [F:SWITMP]FCY = [M:DIA]FCY
+    [F:SWITMP]TYPCUR = TYPE_DEV_
+    Write [F:SWITMP]
+    If fstat<>0
+        SUCCES=0
+        GERR=1
+        GMESSAGE=mess(40,9014,1)+" [F:SWITMP]! fstat="+num$(fstat)  # File writing Error
+    Endif
+Return
+#.....................................................................................................
+
+#.....................................................................................................
+# On met à jour la table temporaire en recherchant un enregistrement en en le mettant à jour
+#.....................................................................................................
+$UPDATE_TABLE_TEMP_
+
+Readlock [F:SWITMP]SWITMP1 = NUMREF_;CODEMON1_;val(NUMMICRO_)
+If fstat=0
+    #C'est ok on la trouvé donc on met à jour le montant simplement
+    [F:SWITMP]AMOUNT = [F:SWITMP]AMOUNT+val(MONT_)
+    [F:SWITMP]COST = [F:SWITMP]COST+val(FRAIS_)
+    Rewrite [F:SWITMP]
+    If fstat<>0
+        SUCCES=0
+        GERR=1: GMESSAGE=mess(40,9014,1)+" [F:SWITMP]! fstat="+num$(fstat)  # File writing Error
+    Endif
+Elsif fstat=5
+    #Aucun enregistrement trouvé on le met en place
+    Gosub $REMPLI_TABLE_TEMP_
+Else
+    #On a rencontré un autre problème donc on ne fais rien
+    SUCCES=0
+    GERR=1
+    GMESSAGE=mess(70,122,1)+" [F:SWITMP]! fstat="+num$(fstat)  # Error reading the file
+Endif
+Return
+#.....................................................................................................
+
+#-----------------------------------------------------------------------------------------------------
+#***On transfert les infos de la table temporaire dans la table d'import en faisant les contrôle de
+#cohérence
+#-----------------------------------------------------------------------------------------------------
+$CR_IMPBVR3_
+#----On exécute une boucle pour chaque ligne de la table temporaire----#
+For [F:SWITMP]SWITMP0
+      Gosub VERIF_COH3_
+Next
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#.....................................................................................................
+#***Vérification de la cohérence des données
+#.....................................................................................................
+$VERIF_COH3_
+#----Vérification dans GACCDUDATE si les montants sont suffisant dans la bonne devise----#
+DEDANS_ = 0
+STOP_ = 0
+SOMME_MT_ = 0
+MT_MARGE_=0
+MONT_ESC_ = 0
+TYPE_DEV_ = ""
+DELTA_=0
+
+Local Char TYPFAC(30)
+Read [F:SIH]SIH0=[F:SWITMP]NUMINV   # 24.04.14 Bader Read invoice header to get document type for access to GACCDUDATE
+If fstat=0
+    TYPFAC=[F:SIH]GTE
+Endif
+If TYPFAC = ""                   # 24.04.14 Bader read parameter for standard SIVTYP only when not found in invoice header
+   # ABO : 04.10.2011 #0026718
+   If clalev([F:TSV])=0 : Local File TABSIVTYP [TSV] : Endif
+   Call PARAM([F:SWITMP]FCY,"TYPINVCUS",TYPFAC) From ADOVAL
+   Read [F:TSV]TSV0=TYPFAC
+   If fstat=0
+      TYPFAC = [F:TSV]GTE
+   Endif
+Endif
+
+#----Calcul du montant en recherchant une facture correspondante dans la table----#
+For [DUD2] Where [DUD2]TYP = TYPFAC and [DUD2]NUM = [F:SWITMP]NUMINV
+    DEDANS_ = 1
+
+    # 06.10.15 Bader Begin
+    Filter [MTB] Where ACCNUM=[F:DUD2]ACCNUM & DUDLIG=[F:DUD2]DUDLIG
+    Look [MTB]MTB0 First
+    Filter [MTB]
+    If !fstat
+        Call ECR_TRACE(mess(70,119,1)-"("+[DUD2]NUM+")",1) From GESECRAN
+        STOP_ = 1
+        Break
+    Endif
+    # 06.10.15 Bader End
+
+    #---On lit la devise et on récupère l'arrondi---#
+    Call LECTURE("TCU",[F:DUD2]CUR,"") From CONTOBJ
+    ARD=[F:TCU]CURRND
+
+    #Note : Il est évident que tous les enregistrements GACCDUDATE sélectionnés ont la même devise
+    #On calcule le solde restant dû selon devise (On stocke la valeur dans SOMME_MT_)
+    If [DUD2]CUR = DEVISE_
+       SOMME_MT_ += [DUD2]AMTCUR-[DUD2]PAYCUR-[DUD2]TMPCUR
+       TYPE_DEV_ = "CUR"
+    Else
+       If [M:DIA]CUR = DEVISE_
+          SOMME_MT_ += [DUD2]AMTLOC-[DUD2]PAYLOC-[DUD2]TMPLOC
+          TYPE_DEV_ = "LOC"
+       Else
+          Call ECR_TRACE(func AFNC.MES2( mess(12,3648,1), NUMFAC_, DEVISE_),1) From GESECRAN  # Invoice $1$ not processed because the currencies do not match.
+          STOP_ = 1
+          Break
+       Endif
+    Endif
+
+    Case [F:SWITMP]TYPTRS
+      When "005", "015", "025", "035", "105", "115", "135"
+        SOMME_MT_ = -SOMME_MT_                          # turn to negative amount in case of debit
+    Endcase
+
+    #---Pour chaque échéance on recherche si un escompte existe dans le cas ou la somme ne correspond pas au montant versé ----#
+    If [F:SWITMP]AMOUNT<>SOMME_MT_
+        Call MONT_ESCOMPTE(SOMME_MT_,[F:SWITMP]DATCRE,MONT_ESC_,DEPRAT_,ARD)
+    Endif
+    DEP_ = [F:DUD2]DEP
+    BPR_ = [F:DUD2]BPR
+    SAC_ = [F:DUD2]SAC
+    PAM_ = [F:DUD2]PAM
+    FACNUM_=[F:DUD2]NUM
+    DUDNUM_=[F:DUD2]ACCNUM
+    DUDLIG_=[F:DUD2]DUDLIG
+    SOLDEFAC_ = SOMME_MT_
+    DELTA_ = [F:SWITMP]AMOUNT - SOMME_MT_ - MONT_ESC_
+Next
+
+#----On test si on a trouvé une échéance au moins----#
+If DEDANS_=1
+#On passe dedans donc on a trouvé une facture
+    Gosub MARGE
+Else DEDANS_ = 0
+    #On a pas trouvé de correspondance alors on stock les information dans la table avec un OK_=3
+    FACNUM_=""
+    SOLDEFAC_=0
+    DELTA_ = [F:SWITMP]AMOUNT
+    DEP_=""
+    DEPRAT_=0
+    MONT_ESC_=0
+    BPR_=""
+    SAC_=""
+    PAM_=""
+    DUDNUM_=0
+    DUDLIG_=0
+    OK_=3
+Endif
+
+#----On test si il y a eu un problème---#
+If STOP_ = 0
+    #----ON rempli la table car tout est OK_----#
+    Gosub REMPLI_TABLE
+Endif
+Return
+#.....................................................................................................
+
+
+#.....................................................................................................
+# MONT_ESCOMPTE : Montant escompte
+#.....................................................................................................
+Subprog MONT_ESCOMPTE(SOMME_MT_,DATECOMP,MONTANT,TXESC,ARD)
+Variable Date DATECOMP
+Variable Decimal SOMME_MT_,ARD
+Variable Decimal MONTANT, TXESC
+Local Integer DELAI_
+Local Decimal MTESC_
+
+# ABO : FIX FROM V6.2 PATCH 13
+If !clalev([F:DUD])   : Local File GACCDUDATE [DUD]      : Endif
+
+#---Pour chaque échéance on recherche si un escompte existe----#
+If [F:DUD2]DEP<>""
+    #On a une zone escompte renseigné donc on recherche le taux
+    Raz DELAI_, TXESC
+    Call ESC_AGIO([F:DUD2]DEP,SOMME_MT_,DATECOMP-GTOLDEP,[F:DUD2]DUDDAT,DELAI_,TXESC,MTESC_,[F:DUD2]ACCNUM,[F:DUD2]DUDLIG) From TRTDIV
+    Call PARAM("","DENDEP",GDIV(2)) From ADOVAL
+    Call PARAM("","DENCRG",GDIV(5)) From ADOVAL
+    If (TXESC<0 & GDIV(2)="") or (TXESC>0 & GDIV(5)="") : TXESC=0 : Endif
+
+    #On vérifie que le taux est différent de 0
+    If TXESC <> 0
+        If TXESC>0 and DELAI_<0 : MTESC_ *= -1 : Endif
+        MTESC_ = arr(MTESC_,ARD)
+        MONTANT += MTESC_
+    Endif
+Endif
+End
+#.....................................................................................................
+
+#.....................................................................................................
+# Marge: Procédure qui contrôle si le montant est en accord avec la marge
+#.....................................................................................................
+$MARGE
+#---On test si le solde du montant de la facture(escompte pris en compte) est égal à celui de la ligne
+    If DELTA_=0
+        #les montants sont égaux donc on stock les infos dans la table
+        OK_=0
+    Else
+        #---On test si le montant est OK_ avec la marge définit
+        #---Calcule de la marge max avec les valeurs paramètres XDEVPRC et XDEVAMT
+        MT_MARGE_=min((SOLDEFAC_*GDEVPRC)/100,GDEVAMT)
+        #On compare à nouveau le delta mais par rapport à la marge cette fois
+        If abs(DELTA_)<=MT_MARGE_
+            #On est dans la marge toléré donc on met que c'est ok
+            OK_=0
+        Else
+            #La différence est trop grande, on met la ligne en erreur
+            OK_=1
+        Endif
+    Endif
+Return
+#.....................................................................................................
+
+#.....................................................................................................
+# On inscrit l'enregistrement dans la table définitive
+#.....................................................................................................
+$REMPLI_TABLE
+    [F:SWIIMP]=[F:SWITMP]
+    [F:SWIIMP]INVNUM = FACNUM_
+    [F:SWIIMP]BALINV= SOLDEFAC_
+    [F:SWIIMP]DELTA = DELTA_
+    [F:SWIIMP]DEP=DEP_
+    [F:SWIIMP]DEPRAT = DEPRAT_
+    [F:SWIIMP]DEPAMT= MONT_ESC_
+    [F:SWIIMP]BPR=BPR_
+    [F:SWIIMP]SAC=SAC_
+    [F:SWIIMP]OK=OK_
+    [F:SWIIMP]PAM=PAM_
+    [F:SWIIMP]DUDNUM= DUDNUM_
+    [F:SWIIMP]DUDLIN=DUDLIG_
+    Write [F:SWIIMP]
+    If fstat<>0
+        SUCCES=0
+        GERR=1
+        If fstat=1
+            GMESSAGE=mess(83,160,1)+"[F:SWIIMP]! "+mess(84,160,1)+" fstat="+num$(fstat)
+        Else
+            GMESSAGE=mess(83,160,1)+"[F:SWIIMP]! "+mess(85,160,1)+" fstat="+num$(fstat)
+        Endif
+    Else
+        Filter [F:SWIIMP] Where NUMREF=[F:SWITMP]NUMREF and NUMIMP=[F:SWITMP]NUMIMP
+        If rowcount([F:SWIIMP])>1
+            #---- Plusieurs fois la même facture, on met la liste dans la trace ----#
+            Call ECR_TRACE(func AFNC.MES2( mess(13,3648,1), [F:SWITMP]NUMREF, [F:SWITMP]NUMIMP), 1) From GESECRAN # The invoice with the reference $1$ exists several times in the import file $2$.
+            For [F:SWIIMP]SWIIMP0
+              Call ECR_TRACE(func AFNC.MES3( mess(14,3648,1), num$([F:SWITMP]LINE), [F:SWITMP]NUMINV, num$([F:SWIIMP]AMOUNT)), 1) From GESECRAN # Line: $1$, Invoice: $2$, Payment amount: $3$
+            Next
+            Call ECR_TRACE("", 0) From GESECRAN
+        Endif
+        Filter [F:SWIIMP]
+    Endif
+Return
+#.....................................................................................................
+
+#-----------------------------------------------------------------------------------------------------
+#***Rollback
+#-----------------------------------------------------------------------------------------------------
+$ABANDON_
+     Rollback : SUCCES = 0 : End
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+#***$FERME Fermeture des fichiers employés                                        *
+#-----------------------------------------------------------------------------------------------------
+$FERME_
+  #------------------Fermeture des tables-------------------------------#
+  If clalev([F:SWITMP]) : Close Local File [SWITMP] : Endif
+  If clalev([F:TCU])    : Close Local File [TCU]    : Endif
+  If clalev([F:CDA])    : Close Local File [CDA]    : Endif
+  If clalev([F:SIH])    : Close Local File [SIH]    : Endif
+  If clalev([F:MTB])    : Close Local File [MTB]    : Endif     # 06.10.15 Bader
+  #----Fermeture du fichier d'import BVR----#
+  Openi Using [REPS]
+Return
+#-----------------------------------------------------------------------------------------------------
+
+
+#*****************************************************************************************************
+#IMPBVR: Programme qui génère les fichiers d'import depuis la table
+#        D'import IMPBVRSWI et qui comptabilise les règlements
+#*****************************************************************************************************
+Subprog IMPBVR_(REUSSI_)
+Variable Integer REUSSI_
+Local Char MONT_(10)
+Local Char REP_(250)
+Local Char    OS(GDIMFIC)(1..3)
+Local Integer STAT_ : STAT_=0
+Local Integer VALID_ : VALID_=0
+Local Integer NBT : NBT=0
+
+# ABO 07.03.2001 : FIX BUG FROM V6 PATCH 11
+Local Integer REPONSE : REPONSE=0
+
+REUSSI_=2
+#***Variables utilisées dans le traitement SWIPAYREMBAN
+Global Char XBAN_REM_(GLONBAN)
+Global Char XFCY_REM_(GLONFCY)
+
+#---- Test si la tâche comptable est lancée... ----#
+# Issue 59028
+#If !clalev([F:ABR]) : Local File "ABATRQT" [ABR] : Endif    : # Table des requêtes de batchs
+#Filter [F:ABR] Where DOSSIER=nomap
+#& and TACHE="ACCBATCH"
+#& and FLAG <=2
+#For [F:ABR]
+#    NBT+=1
+#Next
+#Filter [F:ABR]
+#
+## -- V6 : search ACCBATCH1 si pas trouvé ACCBATCH----
+#If NBT=0
+#Filter [F:ABR] Where DOSSIER=nomap
+#& and TACHE="ACCBATCH1"
+#& and FLAG <=2
+#For [F:ABR]
+#    NBT+=1
+#Next
+#Filter [F:ABR]
+#Endif
+
+Local Integer WTSK_STA_IS_STOPPED
+Call PRESENCE(WTSK_STA_IS_STOPPED) From CPTBATCH
+If WTSK_STA_IS_STOPPED
+  NBT = 0
+Else
+  NBT = 1
+Endif
+# End issue 59028
+
+# -- sinon on pose la question rajouté numéro 162 dans GXERRMESS1
+If NBT=0
+  Call OUINON(mess(113,7778,1),REPONSE) From GESECRAN
+  If REPONSE<>1  # - 1 = Non  2 = oui
+    NBT=1
+  Endif
+Endif
+#-- end rajout ------------------------------------
+If NBT = 0
+    #la tâche comptable n'est pas activée
+    Call ERREUR(mess(15,3648,1)) From GESECRAN   # The accounting batch task is not active! Please activate before posting.
+Else
+    #la tâche comptable est activée.
+
+    #----Ouverture du fichier de trace ----#
+    Call OUVRE_TRACE(mess(8,3648,1)) From LECFIC  # Import Swiss ISR file
+
+    Call ECR_TRACE ("-----------------------------------------------------------------------",0) From GESECRAN
+    Call ECR_TRACE (mess(16,3648,1),0) From GESECRAN   # Creating the import file!
+    Call ECR_TRACE ("-----------------------------------------------------------------------",0) From GESECRAN
+
+    #----Ouverture du fichier d'import----#
+    #-- voir XCHPAY model import/export : fichier data
+    REP_=filpath("tmp","importtmp","txt","","",adxmac(0))
+
+    Openo REP_,0 Using [REPI]
+
+    adxifs=";"
+    adxirs=chr$(13) + chr$(10)
+    adxium=50
+
+    #---- Ouverture du fichier de travail ----#
+    If !clalev([F:XCDA]) : Local File GACCDENCOD [XCDA]   : Endif
+    If !clalev([F:XGAC]) : Local File GACCOUNT [XGAC]     : Endif
+
+    #- V5 only If !clalev([F:XCNA]) : Local File CACNA [XCNA]        : Endif
+
+    If !clalev([F:XTPY]) : Local File TABPAYTYP [XTPY]    : Endif
+    If !clalev([F:XBPC]) : Local File BPCUSTOMER [XBPC]   : Endif
+    If !clalev([F:XBPA]) : Local File BPADDRESS [XBPA]    : Endif
+    If !clalev([F:XSIH]) : Local File SINVOICE [XSIH]     : Endif
+    If clalev([F:TSV])=0 : Local File TABSIVTYP [TSV] : Endif
+
+
+    #---- Déclartion des variables de travail ----#
+    Local Char BPAINV_(GLONADR)
+    Local Char BPANAM_(GLONNAM)
+    Local Char BPADDLIG_0(GLONADL)
+    Local Char BPADDLIG_1(GLONADL)
+    Local Char BPADDLIG_2(GLONADL)
+    Local Char CRY_(GLONCRY)
+    Local Char CRYNAM_(GLONNCY)
+    Local Char CTY_(GLONCTY)
+    Local Char POSCOD_(GLONPOS)
+    Local Char TPY_(GLONTPY)
+    Local Integer FOUND : FOUND = 0
+
+    #---- On lit la table TABPAYTYP afin de savoir si on doit valider les règlements ----#
+    Call PARAM("","SWIBVRTPY",TPY_) From ADOVAL  # read parameter to find out the payment entry type to use
+    If TPY_ = ""                                 # parameter not properly configured
+      Infbox(mess(54,3648,1))                    # The payment entry type for ISR import is not properly configured. Please check parameter SWIBVRTPY.
+    Else
+      Read [F:XTPY]TPY0=TPY_
+      If fstat=0 and [F:XTPY]ENAFLG = 2          # 14.09.15 Bader check if active
+          FOUND = 2
+      Else
+          Infbox(func AFNC.MES1( mess(17,3648,1), TPY_)) # Error reading transaction <TPY_>.
+      Endif
+    Endif
+
+    If FOUND                                     # 14.09.15 Bader
+        If [F:XTPY]STA5<2
+            VALID_=2  #Validation
+        Else
+            VALID_=0  #Pas de validation
+        Endif
+
+        #----On filtre la table temporaire IMPBVRSWI sur les enregistrement OK----#
+        Filter [F:SWIIMP] Where [F:SWIIMP]OK=0 Order By Key CLE=NUMIMP;LINE
+        For [F:SWIIMP]CLE
+            #---- Lecture des informations du tiers ----#
+            Read [F:XBPC]BPC0=[F:SWIIMP]BPR
+            If fstat=0
+                BPAINV_=[F:XBPC]BPAINV
+                BPANAM_=[F:XBPC]BPCNAM
+                Read [F:XBPA]BPA0=1;[F:SWIIMP]BPR;[F:XBPC]BPAINV
+                If fstat=0
+                    BPADDLIG_0    = [F:XBPA]BPAADDLIG(0)
+                    BPADDLIG_1    = [F:XBPA]BPAADDLIG(1)
+                    BPADDLIG_2    = [F:XBPA]BPAADDLIG(2)
+                    CRY_          = [F:XBPA]CRY
+                    CRYNAM_       = [F:XBPA]CRYNAM
+                    CTY_          = [F:XBPA]CTY
+                    POSCOD_       = [F:XBPA]POSCOD
+                Else
+                    BPADDLIG_0    = ""
+                    BPADDLIG_1    = ""
+                    BPADDLIG_2    = ""
+                    CRY_          = ""
+                    CRYNAM_       = ""
+                    CTY_          = ""
+                    POSCOD_       = ""
+                Endif
+            Else
+                BPAINV_=""
+                BPANAM_=""
+                BPADDLIG_0    = ""
+                BPADDLIG_1    = ""
+                BPADDLIG_2    = ""
+                CRY_          = ""
+                CRYNAM_       = ""
+                CTY_          = ""
+                POSCOD_       = ""
+            Endif
+
+            #----Création de l'enregistrement de la table PAYMENTH pour le modèle d'import XCHPAY---#
+            Gosub R_PAYMENTH_
+            #----Création des lignes de PAYMENTD pour le modèle d'import XCHPAY
+            Gosub R_PAYMENTD_
+
+            XBAN_REM_ = [F:SWIIMP]BAN
+            XFCY_REM_ = [F:SWIIMP]FCY
+        Next
+        Filter [F:SWIIMP]  # -- bug V5 :  Rajouter F:SWIIMP]  pour V6 11/2009 --
+    Endif
+
+    #----Fermeture du fichier d'import----#
+    Openo Using [REPI]
+    #---On lance l'import du fichier créé (chemin de ce fichier stocké dans REP_)---#
+    If REUSSI_=2
+
+        Gosub IMPORT_
+        If REUSSI_=2 and VALID_=2
+            #----Comptabilisation en banque-----#
+            Gosub PAY_REM_
+        Endif
+    Else
+        Call ECR_TRACE(mess(184,124,1),1) From GESECRAN  # Impossible to create the file
+    Endif
+    #----Fermeture de la trace----#
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+
+    #---- Fermeture du fichier de tarvail ----#
+    If clalev([F:XCDA]) : Close Local File [XCDA] : Endif
+    If clalev([F:XGAC]) : Close Local File [XGAC] : Endif
+
+    #- V6 Cette table n'existe plus
+    #--If clalev([F:XCNA]) : Close Local File [XCNA] : Endif
+
+    If clalev([F:XTPY]) : Close Local File [XTPY] : Endif
+Endif
+End
+#*****************************************************************************************************
+
+#-----------------------------------------------------------------------------------------------------
+#***On renseigne les éléments de la table PAYMENTH pour le modele d'import XCHPAY
+#-----------------------------------------------------------------------------------------------------
+$R_PAYMENTH_
+  If GBVRDEP=1
+      If [F:SWIIMP]INVNUM<>""
+          Wrseq '"P"';'""';'"'+TPY_+'"';'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"';'"'+[F:SWIIMP]PAM+'"';'"'+[F:SWIIMP]FCY+'"';'"'+
+&    [F:SWIIMP]BAN+'"';"2";'"'+[F:SWIIMP]CUR+'"';[F:SWIIMP]BALINV;[F:SWIIMP]DATCRE;'"'+GUSER+'"';'"'+[F:SWIIMP]NUMIMP+'"';
+&    [F:SWIIMP]LINE; Using [REPI]
+          Wrseq '"'+BPADDLIG_0+'"';'"'+BPADDLIG_1+'"';'"'+BPADDLIG_2+'"';'"'+BPAINV_+'"';'"'+BPANAM_+'"';'"'+CRY_+'"';'"'+CRYNAM_+'"';'"'+
+&    CTY_+'"';'"'+POSCOD_+'"' Using [REPI]
+      Else
+          Wrseq '"P"';'""';'"'+TPY_+'"';'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"';'"'+[F:SWIIMP]PAM+'"';'"'+[F:SWIIMP]FCY+'"';'"'+
+&    [F:SWIIMP]BAN+'"';"2";'"'+[F:SWIIMP]CUR+'"';[F:SWIIMP]DELTA;[F:SWIIMP]DATCRE;'"'+GUSER+'"';'"'+[F:SWIIMP]NUMIMP+'"';
+&    [F:SWIIMP]LINE; Using [REPI]
+          Wrseq '"'+BPADDLIG_0+'"';'"'+BPADDLIG_1+'"';'"'+BPADDLIG_2+'"';'"'+BPAINV_+'"';'"'+BPANAM_+'"';'"'+CRY_+'"';'"'+CRYNAM_+'"';'"'+
+&    CTY_+'"';'"'+POSCOD_+'"' Using [REPI]
+      Endif
+  Else
+      If [F:SWIIMP]INVNUM<>""
+          Wrseq '"P"';'""';'"'+TPY_+'"';'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"';'"'+[F:SWIIMP]PAM+'"';'"'+[F:SWIIMP]FCY+'"';'"'+
+&    [F:SWIIMP]BAN+'"';"2";'"'+[F:SWIIMP]CUR+'"';[F:SWIIMP]AMOUNT;[F:SWIIMP]DATCRE;'"'+GUSER+'"';'"'+
+&    [F:SWIIMP]NUMIMP+'"';[F:SWIIMP]LINE; Using [REPI]
+          Wrseq '"'+BPADDLIG_0+'"';'"'+BPADDLIG_1+'"';'"'+BPADDLIG_2+'"';'"'+BPAINV_+'"';'"'+BPANAM_+'"';'"'+CRY_+'"';'"'+CRYNAM_+'"';'"'+
+&    CTY_+'"';'"'+POSCOD_+'"' Using [REPI]
+      Else
+          Wrseq '"P"';'""';'"'+TPY_+'"';'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"';'"'+[F:SWIIMP]PAM+'"';'"'+[F:SWIIMP]FCY+'"';'"'+[F:SWIIMP]BAN+'"';"2";'"'+
+&    [F:SWIIMP]CUR+'"';[F:SWIIMP]DELTA;[F:SWIIMP]DATCRE;'"'+GUSER+'"';'"'+[F:SWIIMP]NUMIMP+'"';
+&    [F:SWIIMP]LINE; Using [REPI]
+          Wrseq '"'+BPADDLIG_0+'"';'"'+BPADDLIG_1+'"';'"'+BPADDLIG_2+'"';'"'+BPAINV_+'"';'"'+BPANAM_+'"';'"'+CRY_+'"';'"'+CRYNAM_+'"';'"'+
+&    CTY_+'"';'"'+POSCOD_+'"' Using [REPI]
+      Endif
+  Endif
+  If fstat<>0
+        REUSSI_=0
+  Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+$INIT_AXE
+Local Char MAINCOA(GLONCOA) : MAINCOA = ""
+TVA=""
+AXE1=""
+AXE2=""
+AXE3=""
+AXE4=""
+AXE5=""
+DIE1=""
+DIE2=""
+DIE3=""
+DIE4=""
+DIE5=""
+
+# Read account of main legal ledger to get VAT code
+If func FINACC_SYRA.GET_MAICOA(GACTX, 1, [F:SIH]CPY, MAINCOA, GMESSAGE)=[V]CST_AOK
+    Read [F:CAC]CAC0 = 14;[F:XCDA]ACCCOD;MAINCOA  # read payment accounting code
+    If fstat=0
+        Read [F:XGAC]GAC0=MAINCOA;[F:CAC]ACC(1)   # read account
+        If fstat=0
+          TVA=[F:XGAC]VAT(0)
+        Endif
+    Endif
+Endif
+
+#---- Lecture du code comptable si il existe ----#
+# X3-88118 Bader begin
+#Filter [F:LED] Where LEG=[F:XCDA]LEG & ANA=2 & GEN=1
+Filter [F:LED] Where LEG=MYLEG & ANA=2
+# X3-88118 Bader end
+For [F:LED]
+#-- 14 type Règlement pour DRBVR
+#-- 12 type pour Escompte ESBVR
+# ----------------------------------------------
+Filter [F:CAC] Where ACCCOD=[F:XCDA]ACCCOD & COA=[F:LED]COA
+For [F:CAC]
+
+  #-- Attention [F:CAC]COA -- multi legislation
+  Read [F:XGAC]GAC0=[F:CAC]COA;[F:CAC]ACC(1) #-- Nature ana
+  If fstat=0
+    #---- Lecture de la nature analytique si existe ----#
+    AXE1=[F:XGAC]CCEDEF(0)
+    DIE1=[F:XGAC]DIE(0)
+    If dim ([F:XGAC]CCEDEF(1)) >=0
+        AXE2=[F:XGAC]CCEDEF(1)
+        DIE2=[F:XGAC]DIE(1)
+    Endif
+    If dim ([F:XGAC]CCEDEF(2)) >=0
+        AXE3=[F:XGAC]CCEDEF(2)
+        DIE3=[F:XGAC]DIE(2)
+    Endif
+    If dim ([F:XGAC]CCEDEF(3)) >=0
+        AXE4=[F:XGAC]CCEDEF(3)
+        DIE4=[F:XGAC]DIE(3)
+    Endif
+    If dim ([F:XGAC]CCEDEF(4)) >=0
+        AXE5=[F:XGAC]CCEDEF(4)
+        DIE5=[F:XGAC]DIE(4)
+    Endif
+  Endif
+Next
+Filter [F:CAC]
+#- end CAC --
+Next
+Filter [F:LED]
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#***On renseigne les éléments de la table PAYMENTD pour le modele d'import XCHPAY
+#-----------------------------------------------------------------------------------------------------
+$R_PAYMENTD_
+Local Char TVA(GLONVAT)  : TVA=""
+Local Char AXE1(GLONCCE) : AXE1=""
+Local Char AXE2(GLONCCE) : AXE2=""
+Local Char AXE3(GLONCCE) : AXE3=""
+Local Char AXE4(GLONCCE) : AXE4=""
+Local Char AXE5(GLONCCE) : AXE5=""
+Local Char DIE1(GLONDIE) : DIE1=""
+Local Char DIE2(GLONDIE) : DIE2=""
+Local Char DIE3(GLONDIE) : DIE3=""
+Local Char DIE4(GLONDIE) : DIE4=""
+Local Char DIE5(GLONDIE) : DIE5=""
+
+# ABO
+Local Char TYPFAC(GLONGTE)
+# X3-88118 Bader begin
+#Read [F:SIH]SIH0=[F:SWIIMP]NUMINV   # 16.05.14 Bader Read invoice header to get document type for access to GACCDUDATE
+Read [F:SIH]SIH0=[F:SWIIMP]INVNUM   # 16.05.14 Bader Read invoice header to get document type for access to GACCDUDATE
+# X3-88118 Bader end
+If fstat=0
+    TYPFAC=[F:SIH]GTE
+Endif
+If TYPFAC = ""                   # 16.05.14 Bader read parameter for standard SIVTYP only when not found in invoice header
+   Call PARAM([F:SWIIMP]FCY,"TYPINVCUS",TYPFAC) From ADOVAL
+   Read [F:TSV]TSV0=TYPFAC
+   If fstat=0
+      TYPFAC = [F:TSV]GTE
+   Endif
+Endif
+
+# X3-88118 Bader begin
+Local Char MYLEG(GLONADI)
+Call GET_LEG([F:SIH]CPY,MYLEG) From SWIBVRLIB4
+# X3-88118 Bader end
+
+# ABO
+Local Char DENCOD(5)
+Call PARAM([F:SWIIMP]FCY,"DENTAK",DENCOD) From ADOVAL
+
+#ABO
+Local Char DENDEP(5)
+Call PARAM([F:SWIIMP]FCY,"DENDEP",DENDEP) From ADOVAL
+
+#ABO
+Local Char DENCRG(5)
+Call PARAM([F:SWIIMP]FCY,"DENCRG",DENCRG) From ADOVAL
+
+
+#---Création de la ligne principale----#
+If GBVRDEP=1
+    If [F:SWIIMP]INVNUM<>""
+        Wrseq '"D"';'"' + DENCOD + '"';'""';'""';'"'+TYPFAC+'"';'"'+[F:SWIIMP]INVNUM+'"';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+[F:SWIIMP]FCY+'"';'"'+
+&       [F:SWIIMP]CUR+'"';[F:SWIIMP]BALINV;'""';'""';0;'""';
+&       [F:SWIIMP]DUDNUM;[F:SWIIMP]DUDLIN;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&       Using [REPI]
+    Else
+        Wrseq '"D"';'"' + DENCOD + '"';'""';'""';'""';'""';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+[F:SWIIMP]FCY+'"';'"'+[F:SWIIMP]CUR+'"';
+&       [F:SWIIMP]DELTA;'""';'""';0;'""';0;0;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&       Using [REPI]
+    Endif
+Else
+    If [F:SWIIMP]INVNUM<>""
+
+        Wrseq '"D"';'"' + DENCOD + '"';'""';'""';'"'+TYPFAC+'"';'"'+[F:SWIIMP]INVNUM+'"';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+
+&       [F:SWIIMP]FCY+'"';'"'+[F:SWIIMP]CUR+'"';[F:SWIIMP]AMOUNT;'""';'""';0;'""';
+&       [F:SWIIMP]DUDNUM;[F:SWIIMP]DUDLIN;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&       Using [REPI]
+    Else
+        Wrseq '"D"';'"' + DENCOD + '"';'""';'""';'""';'""';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+[F:SWIIMP]FCY+'"';'"'+
+&       [F:SWIIMP]CUR+'"';[F:SWIIMP]DELTA;'""';'""';0;'""';0;0;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&       Using [REPI]
+    Endif
+Endif
+If fstat<>0
+        REUSSI_=0
+Endif
+
+# --- V6 --------------------------------------------------
+If !clalev([F:CAC]) : Local File GACCCODE [CAC]  : Endif
+If !clalev([F:LED]) : Local File GLED [LED]  : Endif
+#----------------------------------------------------------
+
+#---Création de la ligne d'escompte si nécessaire
+If [F:SWIIMP]DEPAMT<>0
+    #---- Recherche code TVA et axe par défault ----#
+# X3-88118 Bader begin
+#    Read [F:XCDA]CDA0=DENDEP
+    Read [F:XCDA]CDA0=DENDEP;MYLEG
+# X3-88118 Bader end
+    If fstat=0
+        Gosub INIT_AXE
+# X3-88118 Bader begin
+    Else                  # not found > try with empty legislation
+        Read [F:XCDA]CDA0=DENDEP;""
+        If fstat=0
+            Gosub INIT_AXE
+        Endif
+# X3-88118 Bader end
+    Endif
+    If GBVRDEP=1
+        If [F:SWIIMP]INVNUM<>""
+            Wrseq '"D"';'"' + DENDEP + '"';'""';'""';'"'+TYPFAC+'"';'"'+[F:SWIIMP]INVNUM+'"';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+
+&           [F:SWIIMP]FCY+'"';'"'+[F:SWIIMP]CUR+'"';[F:SWIIMP]DEPAMT;'"'+TVA+'"';'""';0;'""';
+&           [F:SWIIMP]DUDNUM;[F:SWIIMP]DUDLIN;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&           Using [REPI]
+        Else
+            Wrseq '"D"';'"' + DENDEP + '"';'""';'""';'""';'""';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+[F:SWIIMP]FCY+'"';'"'+
+&           [F:SWIIMP]CUR+'"';[F:SWIIMP]DEPAMT;'"'+TVA+'"';'""';0;'""';0;0;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&           Using [REPI]
+        Endif
+    Else
+        If [F:SWIIMP]INVNUM<>""
+            Wrseq '"D"';'"' + DENDEP + '"';'""';'""';'"'+TYPFAC+'"';'"'+[F:SWIIMP]INVNUM+'"';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+
+&           [F:SWIIMP]FCY+'"';'"'+[F:SWIIMP]CUR+'"';-1*[F:SWIIMP]DEPAMT;'"'+TVA+'"';'""';0;'""';
+&           [F:SWIIMP]DUDNUM;[F:SWIIMP]DUDLIN;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&           Using [REPI]
+        Else
+            Wrseq '"D"';'"' + DENDEP + '"';'""';'""';'""';'""';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+[F:SWIIMP]FCY+'"';'"'+
+&           [F:SWIIMP]CUR+'"';-1*[F:SWIIMP]DEPAMT;'"'+TVA+'"';'""';0;'""';0;0;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&           Using [REPI]
+        Endif
+    Endif
+    If fstat<>0
+        REUSSI_=0
+# begin Bader 2016-06-28
+    Else
+        If GBVRDEP=1
+            Wrseq '"A"';'"'+DIE1+'"';'"'+AXE1+'"';'"'+DIE2+'"';'"'+AXE2+'"';'"'+DIE3+'"';'"'+AXE3+'"';'"'+DIE4+'"';'"'+AXE4+'"';[F:SWIIMP]DEPAMT;0 Using [REPI]
+        Else
+            Wrseq '"A"';'"'+DIE1+'"';'"'+AXE1+'"';'"'+DIE2+'"';'"'+AXE2+'"';'"'+DIE3+'"';'"'+AXE3+'"';'"'+DIE4+'"';'"'+AXE4+'"';-1*[F:SWIIMP]DEPAMT;0 Using [REPI]
+        Endif
+        If fstat<>0
+            REUSSI_=0
+        Endif
+# end Bader 2016-06-28
+    Endif
+Endif
+
+#---Création de la ligne de Delta si nécessaire----#
+If [F:SWIIMP]DELTA<>0 and [F:SWIIMP]INVNUM<>""
+    #---- Recherche code TVA et axe par défault ----#
+# X3-88118 Bader begin
+#    Read [F:XCDA]CDA0=DENCRG
+    Read [F:XCDA]CDA0=DENCRG;MYLEG
+# X3-88118 Bader end
+    If fstat=0
+        Gosub INIT_AXE
+# X3-88118 Bader begin
+    Else                  # not found > try with empty legislation
+        Read [F:XCDA]CDA0=DENCRG;""
+        If fstat=0
+            Gosub INIT_AXE
+        Endif
+# X3-88118 Bader end
+    Endif
+    If GBVRDEP=1
+        If [F:SWIIMP]INVNUM<>""
+            Wrseq '"D"';'"' + DENCRG + '"';'""';'""';'"'+TYPFAC+'"';'"'+[F:SWIIMP]INVNUM+'"';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+
+&           [F:SWIIMP]FCY+'"';'"'+[F:SWIIMP]CUR+'"';[F:SWIIMP]DELTA;'"'+TVA+'"';'""';0;'""';
+&           [F:SWIIMP]DUDNUM;[F:SWIIMP]DUDLIN;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&           Using [REPI]
+        Else
+            Wrseq '"D"';'"' + DENCRG + '"';'""';'""';'""';'""';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+[F:SWIIMP]FCY+'"';'"'+
+&           [F:SWIIMP]CUR+'"';[F:SWIIMP]DELTA;'"'+TVA+'"';'""';0;'""';0;0;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&           Using [REPI]
+        Endif
+    Else
+        If [F:SWIIMP]INVNUM<>""
+            Wrseq '"D"';'"' + DENCRG + '"';'""';'""';'"'+TYPFAC+'"';'"'+[F:SWIIMP]INVNUM+'"';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+
+&           [F:SWIIMP]FCY+'"';'"'+[F:SWIIMP]CUR+'"';-1*[F:SWIIMP]DELTA;'"'+TVA+'"';'""';0;'""';[F:SWIIMP]DUDNUM;[F:SWIIMP]DUDLIN;'"'+
+&           [F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+ '"'
+&           Using [REPI]
+        Else
+            Wrseq '"D"';'"' + DENCRG + '"';'""';'""';'""';'""';'""';'"'+[F:SWIIMP]BPR+'"';'""';'"'+[F:SWIIMP]FCY+'"';'"'+
+&           [F:SWIIMP]CUR+'"';-1*[F:SWIIMP]DELTA;'"'+TVA+'"';'""';0;'""';0;0;'"'+[F:SWIIMP]BPR+'"';'"'+[F:SWIIMP]SAC+'"'
+&           Using [REPI]
+        Endif
+    Endif
+    If fstat<>0
+        REUSSI_=0
+    Endif
+    #----Création des lignes de la table PAYMENTA pour le modèle d'import XCHPAY
+    Gosub R_PAYMENTA_
+Endif
+If clalev([F:LED]) : Close Local File [LED] : Endif
+If clalev([F:CAC]) : Close Local File [CAC] : Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+#***On renseigne les éléments de la table PAYMENTA pour le modele d'import XCHPAY
+#-----------------------------------------------------------------------------------------------------
+$R_PAYMENTA_
+If GBVRDEP=1
+    Wrseq '"A"';'"'+DIE1+'"';'"'+AXE1+'"';'"'+DIE2+'"';'"'+AXE2+'"';'"'+DIE3+'"';'"'+AXE3+'"';'"'+DIE4+'"';'"'+AXE4+'"';[F:SWIIMP]DELTA;0 Using [REPI]
+Else
+    Wrseq '"A"';'"'+DIE1+'"';'"'+AXE1+'"';'"'+DIE2+'"';'"'+AXE2+'"';'"'+DIE3+'"';'"'+AXE3+'"';'"'+DIE4+'"';'"'+AXE4+'"';-1*[F:SWIIMP]DELTA;0 Using [REPI]
+Endif
+If fstat<>0
+    REUSSI_=0
+Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+
+#-----------------------------------------------------------------------------------------------------
+#***On lance l'import du fichier créé (chemin de ce fichier stocké dans REP_)
+#-----------------------------------------------------------------------------------------------------
+$IMPORT_
+#La fonction IMPORTSIL ne fonctionne plus correctement en v140 donc on modifie le procédé
+Gosub OUVRE From GIMPOBJ : # Petites initialisations
+[M:IMP2]MODIMP="IMPBVRSWI" : # Nom du modèle
+
+[M:IMP2]NOMIMP=REP_
+GSERVEUR=1 : # On passe en mode serveur
+Call OUVRE_TRACE("Import paiements") From LECFIC : # Ouverture de la trace
+Gosub EXEC From GIMPOBJ : # Appel de l'import silencieux
+Call FERME_TRACE From LECFIC : # Fermeture de la trace
+GSERVEUR=0 : # On passe en mode interactif
+If GERRTRACE>0
+    GERR=1 : GMESSAGE=mess(18,3648,1)  # Error while importing the payments!
+    Call LEC_TRACE From LECFIC
+Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+#-----------------------------------------------------------------------------------------------------
+#***Génération des remises
+#-----------------------------------------------------------------------------------------------------
+$PAY_REM_
+   Local Char VALEUR(10)
+   Local Char PARAM2(250)(1..20) , SAVACT(10), SAVCURLEG(10)
+   SAVACT = GACTION : GACTION = "SWIREMBAN"
+   SAVCURLEG = GCURLEG : GCURLEG = "SWI"
+   Call TRAITE_CHAR(VALEUR,PARAM2,"","SWIPAYREMBAN","",3,"") From GTRAITE
+   GACTION = SAVACT
+   GCURLEG = SAVCURLEG
+Return
+
+$ERR_CDA
+# ... : Destination comptable non paramétrée
+#Call ECR_TRACE(GMESSAGE-":"-mess(88,117,1),1) From GESECRAN
+GERR=1 : GMESSAGE=mess(88,117,1)
+Return
+
+$ERR_ACCTYP
+# Destination comptable ... : Le schéma de compte doit être
+#Call ECR_TRACE(mess(40,121,1)-[F:CDA]COD+"\"+mess(87,117,1)-GMESSAGE,1) >From GESECRAN
+GERR=1 : GMESSAGE=mess(40,121,1)-[F:CDA]COD+"\"+mess(87,117,1)-GMESSAGE
+
+Return
+
+$ERR_CPT
+# Destination comptable ... : Compte inexistant
+#Call ECR_TRACE(mess(40,121,1)-[F:CDA]COD+"\"+mess(44,102,1),1) From GESECRAN
+GERR=1 : GMESSAGE = mess(40,121,1)-[F:CDA]COD+"\"+mess(44,102,1)
+Return
+
+$ERR_IPTDAC
+# Destination comptable ... : Destination non imputable
+#Call ECR_TRACE(mess(40,121,1)-[F:CDA]COD+"\"+mess(60,117,1),1) From GESECRAN
+GERR=1 : GMESSAGE=mess(40,121,1)-[F:CDA]COD+"\"+mess(60,117,1)
+Return
+#-----------------------------------------------------------------------------------------------------
+

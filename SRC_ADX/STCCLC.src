@@ -1,0 +1,1020 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+########################################################################
+# Traitement STCCLC - Landed Cost - Calculs                         V7 #
+########################################################################
+
+########################################################################
+#  MAJ_CSTPUR_LIG : S/P de calcul prix unitaire de revient
+#  CALC_COSTSTCD  : Calcul des charges de la structure de coût
+#  GES_STCDW      : Chargement de l'écran STCD afin de calculer les
+#                   charges et les stocker dans STCDW
+#                   appelé en APRES_NBLIG des lignes commandes, réception
+#                   et factures
+#  PRORA_STCDW    : Chargement de l'écran STCD afin de proratiser les
+#                   charges et les stocker dans STCDW
+#                   appelé en AM des quantités d'une ligne réception de
+#                   commande ou ligne facture de commande ou réception
+#  MAJ_REACSTPUR  : Mise à jour du coût d'achat réalisé suite à validation
+#                   d'une facture complémentaire ou non, ou d'un avoir
+########################################################################
+
+#############################################################################
+# Issue 84129 - 2012-10-01 by MUARN : landed cost calcul cout achat et cout achat unitaire
+#############################################################################
+# MAJ_CSTPUR_LIG : S/P de calcul prix unitaire de revient  MUARN 21/02/2012 #
+# ------------------------------------------------------------------------- #
+# Subprog MAJ_CSTPUR_LIG(WABMSK,NOL,WDATE,WCUR,WCHGTYP)                     #
+#   WABMSK : abréviation du masque écran contenant les lignes               #
+#   NOL    : indice de la ligne du document  (nolign-1)                     #
+#   WDATE  : date pour la gestion des cours devise                          #
+#   WCUR   : devise                                                         #
+#   WCHGTYP: type de cours de la devise                                     #
+#############################################################################
+Subprog MAJ_CSTPUR_LIG (WABMSK,NOL,WDATE,WCUR,WCHGTYP)
+Value Char     WABMSK
+Value Shortint NOL
+Value Date     WDATE
+Value Char     WCUR
+Value Integer  WCHGTYP
+
+Local Decimal  WCPRAMT, WUOMSTUCOE, WCOURS
+
+# Issue 105027 - 2015-01-02 by MUARN : pour intersite et intersoc
+Local Integer WBETFCY, WBETCPY
+Case WABMSK
+    When "POH2"
+         WBETFCY = [M:POH0]BETFCY
+         WBETCPY = [M:POH0]BETCPY
+    When "PTH1"
+         WBETFCY = [M:PTH0]BETFCY
+         WBETCPY = [M:PTH0]BETCPY
+    When "PIH3"
+         WBETCPY = [M:PIH0]BETCPY
+         If WBETCPY= 2
+           WBETFCY = 2
+         Else
+           WBETFCY = 1
+         Endif
+Endcase
+
+#----- Si composant, pas de calcul prix d'achat -----#
+If evalue("[M:"+WABMSK+"]LINTYP(NOL)>2")
+  Assign "[M:"+WABMSK+"]CSTPUR(NOL)" With 0
+  Assign "[M:"+WABMSK+"]LINCSTPUR(NOL)" With 0 : End
+Endif
+#-----
+Local   Decimal  WPRIPUR, WLINCSTPUR
+Local   Decimal  WBASE, WMT, WNEWCPR, WRND
+Local   Integer  STAT, I, J, WCPRFLG
+#----- Chargement arrondi devise facture -----#
+If WCUR<>[F:TCU]CUR
+  Read [TCU] TCU0=WCUR
+  If !fstat WRND=[F:TCU]CURRND Else WRND=0.01 : Endif
+Else
+  WRND=[F:TCU]CURRND
+Endif
+#-----
+If evalue("[M:"+WABMSK+"]LINTYP(NOL)=2")
+  J=NOL+1
+  While evalue("[M:"+WABMSK+"]LINTYP(J)>2 & J<[M:"+WABMSK+"]NBLIG")
+    If evalue("[M:"+WABMSK+"]QTYUOM(J)<>0")
+      WBASE+=evalue("[M:"+WABMSK+"]NETPRI(J)*[M:"+WABMSK+"]QTYUOM(J)")  : # Mt ligne avec précision maxi
+    Else
+      If WABMSK = "PIH3"
+        WBASE =evalue("[M:"+WABMSK+"]AMTNOTLIN(J)")
+      Else
+        WBASE+=evalue("[M:"+WABMSK+"]LINAMT(J)")                    : # Mt ligne arrondi suivant devise
+      Endif
+    Endif
+    J+=1
+  Wend
+Else
+  If evalue("[M:"+WABMSK+"]QTYUOM(NOL)<>0")
+    WBASE=evalue("[M:"+WABMSK+"]NETPRI(NOL)*[M:"+WABMSK+"]QTYUOM(NOL)") : # Mt ligne avec précision maxi
+  Else
+    If WABMSK = "PIH3"
+      WBASE =evalue("[M:"+WABMSK+"]AMTNOTLIN(NOL)")
+    Else
+      WBASE=evalue("[M:"+WABMSK+"]LINAMT(NOL)")                     : # Mt ligne arrondi suivant devise
+    Endif
+  Endif
+Endif
+
+WPRIPUR = WBASE
+
+#----- Eléments provenant du tarif -----#
+For I=1 To 9
+  If GINVDTALIN(I-1)<>0 & GNPRNOTFLG(I-1)=1
+    Read [PFI] PFI0=GINVDTALIN(I-1) : If fstat Raz [F:PFI] : Endif
+      If evalue("[M:"+WABMSK+"]LINTYP(NOL)=2")
+        J=NOL+1 : Raz WMT
+        While evalue("[M:"+WABMSK+"]LINTYP(J)>2 & J<[M:"+WABMSK+"]NBLIG")
+          #----- C'est un montant -----#
+          If GDISCRGTYP(I-1)=1
+            If GCLCRUL(I-1)=1 : # Par unité
+              WMT+=evalue("[M:"+WABMSK+"]DISCRGVAL"+num$(I)+"(J)*[M:"+WABMSK+"]QTYUOM(J)")
+            Else              : # Par ligne
+              WMT+=evalue("[M:"+WABMSK+"]DISCRGVAL"+num$(I)+"(J)")
+            Endif
+          #----- C'est un pourcentage -----#
+          Else
+            If WABMSK = "PIH3"
+              # Issue 119207 - 2016-10-18 by MUARN : erreur indice
+              WMT+=arr(evalue("[M:"+WABMSK+"]AMTNOTLIN(J)*[M:"+WABMSK+"]DISCRGVAL"+num$(I)+"(J)")/100,WRND)
+            Else
+              WMT+=arr(evalue("[M:"+WABMSK+"]LINAMT(J)*[M:"+WABMSK+"]DISCRGVAL"+num$(I)+"(J)")/100,WRND)
+            Endif
+          Endif
+          J+=1
+        Wend
+      Else
+        #----- C'est un montant -----#
+        If GDISCRGTYP(I-1)=1
+          If GCLCRUL(I-1)=1 : # Par unité
+            WMT=evalue("[M:"+WABMSK+"]DISCRGVAL"+num$(I)+"(NOL)*[M:"+WABMSK+"]QTYUOM(NOL)")
+          Else              : # Par ligne
+            WMT=evalue("[M:"+WABMSK+"]DISCRGVAL"+num$(I)+"(NOL)")
+          Endif
+        #----- C'est un pourcentage -----#
+        Else
+          If WABMSK = "PIH3"
+            # Issue 119207 - 2016-10-18 by MUARN : erreur indice
+            WMT=arr(evalue("[M:"+WABMSK+"]AMTNOTLIN(NOL)*[M:"+WABMSK+"]DISCRGVAL"+num$(I)+"(NOL)")/100,WRND)
+          Else
+            WMT=arr(evalue("[M:"+WABMSK+"]LINAMT(NOL)*[M:"+WABMSK+"]DISCRGVAL"+num$(I)+"(NOL)")/100,WRND)
+          Endif
+        Endif
+      Endif
+      # Issue 118247 - 2016-08-30 by MUARN : remise non intégré prix net
+      If WABMSK = "PIH3"
+        WBASE += WMT
+      Else
+        If GINCDCR(I-1)=2  WBASE-=WMT  Else WBASE+=WMT : Endif
+      Endif
+    Endif
+
+Next I
+# Issue 105027 - 2015-02-09 by MUARN : ne pas les prendre en compte en inter-site
+If WBETFCY=1 | WBETCPY=2
+  #----- Eléments provenant du pied de document -----#
+  For I=1 To 9
+    If evalue("[M:"+WABMSK+"]INVDTALIN2(I-1)<>0")
+        If evalue("[M:"+WABMSK+"]LINTYP(NOL)=2")
+          J=NOL+1
+          While evalue("[M:"+WABMSK+"]LINTYP(J)>2 & J<[M:"+WABMSK+"]NBLIG")
+            WBASE+=evalue("[M:"+WABMSK+"]DISCRGAMT"+num$(I)+"(J)")
+            J+=1
+          Wend
+        Endif
+        WBASE+=evalue("[M:"+WABMSK+"]DISCRGAMT"+num$(I)+"(NOL)")
+    Endif
+  Next I
+Endif
+
+#----- Taxes non déductible -----#
+# Issue 105027 - 2015-01-02 by MUARN : ne pas ajouter en intersite
+If WBETFCY=1
+  WBASE+=evalue("[M:"+WABMSK+"]AMTTAXLIN1(NOL)-[M:"+WABMSK+"]DEDTAXLIN1(NOL)")
+  WBASE+=evalue("[M:"+WABMSK+"]AMTTAXLIN2(NOL)-[M:"+WABMSK+"]DEDTAXLIN2(NOL)")
+  WBASE+=evalue("[M:"+WABMSK+"]AMTTAXLIN3(NOL)-[M:"+WABMSK+"]DEDTAXLIN3(NOL)")
+  If evalue("dim([M:"+WABMSK+"]AMTTAXRCP(NOL))")>0
+    WBASE+=evalue("[M:"+WABMSK+"]AMTTAXRCP(NOL) -[M:"+WABMSK+"]DEDTAXRCP(NOL)")
+    WBASE+=evalue("[M:"+WABMSK+"]AMTTAXISS(NOL) -[M:"+WABMSK+"]DEDTAXISS(NOL)")
+    WBASE+=evalue("[M:"+WABMSK+"]AMTTAXOTH1(NOL)-[M:"+WABMSK+"]DEDTAXOTH1(NOL)")
+    WBASE+=evalue("[M:"+WABMSK+"]AMTTAXOTH2(NOL)-[M:"+WABMSK+"]DEDTAXOTH2(NOL)")
+  Endif
+Endif
+
+#----- Conversion si nécessaire du montant en devise société -----#
+If WCUR<>GLOCALDEV
+  If WABMSK ="PIH3"
+    WMT =WBASE
+    WCOURS=0
+    If [M:PIH1]RAT1<>0  WCOURS=[M:PIH1]RAT2/[M:PIH1]RAT1 : Endif
+    Call COURMNT([M:PIH1]CUR,GLOCALDEV,GLOCALDEV,[M:PIH1]CURTYP,[M:PIH1]RATDAT,0,
+&              WMT,WBASE,WCOURS,STAT) From TRTDEV
+    WBASE=arr(WBASE,10^-GDECPRI)
+
+    WMT=WPRIPUR
+    Call COURMNT([M:PIH1]CUR,GLOCALDEV,GLOCALDEV,[M:PIH1]CURTYP,[M:PIH1]RATDAT,0,
+&              WMT,WPRIPUR,WCOURS,STAT) From TRTDEV
+    WPRIPUR=arr(WPRIPUR,10^-GDECPRI)
+  Else
+    WMT=WBASE
+    Call CONVERT2(WCUR, GLOCALDEV, GLOCALDEV, WCHGTYP,WDATE,
+&                    WMT,WBASE,STAT) From TRTDEV
+    WBASE=arr(WBASE,10^-GDECPRI)
+
+    WMT=WPRIPUR
+    Call CONVERT2(WCUR, GLOCALDEV, GLOCALDEV, WCHGTYP, WDATE,
+&                    WMT, WPRIPUR, STAT) From TRTDEV
+    WPRIPUR=arr(WPRIPUR,10^-GDECPRI)
+  Endif
+Endif
+
+#----- Chargement arrondi devise société -----#
+If GLOCALDEV<>[F:TCU]CUR
+  Read [TCU] TCU0=GLOCALDEV
+  If !fstat WRND=[F:TCU]CURRND Else WRND=0.01 : Endif
+Else
+  WRND=[F:TCU]CURRND
+Endif
+
+WCPRAMT = evalue("[M:"+WABMSK+"]CPRAMT(NOL)*[M:"+WABMSK+"]QTYPUU(NOL)")
+# Issue 105027 - 2014-12-31 by MUARN : cas particulier inter-site
+#Assign "[M:"+WABMSK+"]LINCSTPUR(NOL)" With arr(WBASE-WPRIPUR+(WPRIPUR*evalue("[M:"+WABMSK+"]CPRCOE(NOL)"))+WCPRAMT,10^-GDECPRI)
+If WBETFCY = 2 & WBETCPY=1
+  # part coeff + cout (pas d'élément facturation)
+  Assign "[M:"+WABMSK+"]LINCSTPUR(NOL)" With arr(((WPRIPUR*evalue("[M:"+WABMSK+"]CPRCOE(NOL)"))-WPRIPUR) + WCPRAMT,10^-GDECPRI )
+Else
+  Assign "[M:"+WABMSK+"]LINCSTPUR(NOL)" With arr(WBASE-WPRIPUR+(WPRIPUR*evalue("[M:"+WABMSK+"]CPRCOE(NOL)"))+WCPRAMT,10^-GDECPRI)
+Endif
+If evalue("[M:"+WABMSK+"]STCNUM(NOL)") <> ""
+   Assign "[M:"+WABMSK+"]LINCSTPUR(NOL)" With evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)") + evalue("[M:"+WABMSK+"]FCSCSTPUR(NOL)")
+Endif
+WLINCSTPUR  = arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)"),10^-GDECPRI)
+Assign "[M:"+WABMSK+"]LINCSTPUR(NOL)" With WLINCSTPUR
+If WABMSK ="PIH3"
+  If [M:PIH0]PIHTYP<>2
+    If evalue("[M:"+WABMSK+"]QTYSTU(NOL)<>0")
+      Assign "[M:"+WABMSK+"]CSTPUR(NOL)" With arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)") / evalue("[M:"+WABMSK+"]QTYSTU(NOL)"),10^-GDECPRI)
+    Else
+      # Issue 109089 - 2015-06-26 by MUARN : avoir financier
+      If [M:PIH0]PIHTYP = 3
+        If [M:PIH3]TYPORI(NOL)=4
+          If clalev([F:PIDB])<=0 Local File PINVOICED [PIDB] : Default File [PID] : Endif
+          Read [PIDB] PID0=[M:PIH3]NUMORI(NOL);[M:PIH3]LINORI(NOL) : If fstat  Raz [F:PIDB] : Return : Endif
+          #----- Si facture complémentaire, recherche facture d'origine -----#
+          If [F:PIDB]PIHTYP=2 & [F:PIDB]TYPORI=4 & [F:PIDB]QTYSTU=0
+            Local Char     WNUMORI(GLONVCR) : WNUMORI=[F:PIDB]NUMORI
+            Local Integer  WLINORI          : WLINORI=[F:PIDB]LINORI
+            Read [PIDB] PID0=WNUMORI;WLINORI
+            If fstat  Raz [F:PIDB] : Return : Endif
+          Endif
+        Endif
+        If [M:PIH3]TYPORI(NOL)=4
+          If [F:PIDB]QTYSTU<>0
+            Assign "[M:"+WABMSK+"]CSTPUR(NOL)" With arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)")/[F:PIDB]QTYSTU,10^-GDECPRI)
+          Else
+            Assign "[M:"+WABMSK+"]CSTPUR(NOL)" With arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)"),10^-GDECPRI)
+          Endif
+        Else
+          Assign "[M:"+WABMSK+"]CSTPUR(NOL)" With arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)"),10^-8)
+        Endif
+      Else
+        Assign "[M:"+WABMSK+"]CSTPUR(NOL)" With arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)") ,10^-GDECPRI)
+      Endif
+    Endif
+  Else # gestion des factures complémentaires
+    # facture complémentaires, CSTPUR toujours en montant MUARN 27/03/2013
+    [M:PIH3]CSTPUR(NOL)=arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)"),10^-GDECPRI)
+  Endif
+Else
+  If evalue("[M:"+WABMSK+"]QTYSTU(NOL)<>0")
+     Assign "[M:"+WABMSK+"]CSTPUR(NOL)" With arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)") / evalue("[M:"+WABMSK+"]QTYSTU(NOL)"),10^-GDECPRI)
+  Else
+     Assign "[M:"+WABMSK+"]CSTPUR(NOL)" With arr(evalue("[M:"+WABMSK+"]LINCSTPUR(NOL)") ,10^-GDECPRI)
+  Endif
+Endif
+
+End
+
+#############################################################################
+# CALC_COSTSTCD : Calcul des charges de la structure de coûts    TS 11/2012 #
+# ------------------------------------------------------------------------- #
+# Attention, en aucun cas on ne doit effectuer de recalcul en facturation
+# En réception directe, il y a toujours calcul, en réception de commande
+# celà dépend du paramètre STCPTH (1=calcul, 2=proratisation)
+# ------------------------------------------------------------------------- #
+# L'écran STCD est alimenté
+# ------------------------------------------------------------------------- #
+# Entrée : NOL        = No ligne écran STCD (nolign-1)
+#                       (-1 si calcul pour toute les lignes)
+#          LNETPRI    = Prix net ligne document
+#          LQTYPUU    = Quantité UA ligne document
+#          LQTYVOU    = Volume ligne document
+#          LQTYWEU    = Poids ligne document
+#          LPUU       = Unité achat ligne document
+#          LVOU       = Unité volume ligne document
+#          LWEU       = Unité poids ligne document
+#          LDAT       = Date document
+#          LBPS       = Fournisseur
+#          LFCY       = Site stockage
+#          LORI       = Origine pour alimentation PPRCLINK
+#                       'POH'  = Depuis cdes standards
+#                       'POM'  = Depuis gestion auto cdes standards
+#                       'POC'  = Depuis cdes ouvertes
+#                       'POD'  = Depuis demandes livraison fermes
+#                       'PTH'  = Depuis réceptions directes
+#          LQTYPUUORI = Quantité UA ligne document origine
+#-------------------------------------------------------------------------- #
+# WERR   : 0 = OK
+#          1 = Pas de conversion d'unité
+#          2 = Volume nul
+#          3 = Poids nul
+#          4 = Formule inexistante
+#          5 = Formule incorrecte
+#############################################################################
+Subprog CALC_COSTSTCD (NOL,LNETPRI,LQTYPUU,LQTYVOU,LQTYWEU,LPUU,LVOU,LWEU,LDAT,LBPS,LFCY,LORI,LQTYPUUORI)
+Value Integer NOL
+Value Decimal LNETPRI
+Value Decimal LQTYPUU
+Value Decimal LQTYVOU
+Value Decimal LQTYWEU
+Value Char    LPUU
+Value Char    LVOU
+Value Char    LWEU
+Value Date    LDAT
+Value Char    LBPS
+Value Char    LFCY
+Value Char    LORI
+Value Decimal LQTYPUUORI
+
+Local Integer NOLD, NOLF
+Local Integer STAT, WERR
+Local Decimal WQTY
+Local Decimal WNBT
+Local Decimal WNETAMT
+Local Decimal OLDFCSAMTCLC
+Local Char    WITPPUU
+
+If !clalev([F:FCS])  Local File FRECST    [FCS]  Endif
+If !clalev([F:STCB]) Local File COSTSTCB  [STCB] Endif
+If !clalev([F:TFO])  Local File TABFOR    [TFO]  Endif
+If !clalev([F:PPK])  Local File PPRICLINK [PPK]  Endif
+If !clalev([F:BPR])  Local File BPARTNER  [BPR]  Endif
+
+If [F:ITF]ITMREF<>[M:STCD]ITMREF | [F:ITF]STOFCY<>LFCY
+  Read [ITF]ITF0=[M:STCD]ITMREF;LFCY
+Endif
+
+WITPPUU=""
+If [F:ITP]ITMREF<>[M:STCD]ITMREF | [F:ITP]BPSNUM<>LBPS
+  Read [ITP]ITP0=[M:STCD]ITMREF;LBPS
+  If !fstat & [F:ITP]PUU<>""
+    WITPPUU=[F:ITP]PUU
+  Endif
+Elsif [F:ITP]PUU<>""
+  WITPPUU=[F:ITP]PUU
+Endif
+If [F:ITM]ITMREF<>[M:STCD]ITMREF
+  Read [ITM]ITM0=[M:STCD]ITMREF
+  If fstat
+    Call RSTA("ITM",[M:STCD]ITMREF) From GLOCK : End
+  Endif
+Endif
+
+If [F:BPS]BPSNUM<>LBPS
+  Read [BPS]BPS0=LBPS
+  If fstat
+    Call RSTA("BPS",LBPS) From GLOCK : End
+  Endif
+Endif
+
+If [F:BPR]BPRNUM<>LBPS
+  Read [BPR]BPR0=LBPS
+  If fstat
+    Call RSTA("BPR",LBPS) From GLOCK : End
+  Endif
+Endif
+
+# Toutes les lignes
+If NOL=-1
+  NOLD =0
+  NOLF = [M:STCD]NBLIG-1
+Else
+  NOLD = NOL
+  NOLF = NOL
+Endif
+
+WERR=0
+# Boucle de calcul des lignes
+For NOL=NOLD To NOLF
+  Gosub CALC_FRECST
+Next
+
+End
+
+#############################################################################
+$CALC_FRECST
+
+# Lecture de la charge
+Read [FCS]FCS0=[M:STCD]FCSCOD(NOL)
+If fstat
+  [M:STCD]FCSAMTCLC(NOL) = 0
+  [M:STCD]FCSAMT(NOL)    = 0
+  [M:STCD]FCSAMTSOC(NOL) = 0
+  Call RSTA("FCS",[M:STCD]FCSCOD(NOL)) From GLOCK
+  Return
+Endif
+
+# Pas de calcul si 'à la charge du vendeur'
+If find([M:STCD]CSTPYR(NOL),1,3)
+  [M:STCD]FCSAMTCLC(NOL) = 0
+  [M:STCD]FCSAMT(NOL)    = 0
+  [M:STCD]FCSAMTSOC(NOL) = 0
+  Return
+Endif
+
+# Sauvegarde ancienne charge calculée
+OLDFCSAMTCLC = [M:STCD]FCSAMTCLC(NOL)
+
+# Calcul si 'à la charge de l'acheteur'
+Case [M:STCD]DIRCLCMOD(NOL)
+  When 1 : Gosub PRIX_NET
+  When 2 : Gosub FORFAIT
+  When 3 : Gosub MNT_UNITAIRE
+  When 4 : Gosub MNT_TRANCHE
+  When 5 : Gosub MNT_BAREME
+  When 6 : Gosub MNT_PONDERE
+  When 7 : Gosub FORMULE
+Endcase
+
+# Issue 39638 - 2017-06-20 by MUARN : possibilité de modifié les calculs standards
+[V]GPOINT="CUSFCSAMTCLC" : Gosub ENTREE From EXEFNC
+
+# Prise en compte du pourcentage 'à la charge de l'acheteur'
+[M:STCD]FCSAMTCLC(NOL) = [M:STCD]FCSAMTCLC(NOL)*[M:STCD]PRCBUY(NOL)/100
+
+# Traitement de l'arrondi
+If [F:TCU]CUR<>[M:STCD]CURIMP(NOL)
+  Read [TCU]TCU0=[M:STCD]CURIMP(NOL)
+  If fstat  Raz [F:TCU]  Endif
+Endif
+[M:STCD]FCSAMTCLC(NOL)=arr([M:STCD]FCSAMTCLC(NOL),[F:TCU]CURRND)
+
+# Si le montant saisi était égal à l'ancien montant calculé (donc pas modifié)
+# on alimente le montant saisi avec le nouveau montant calculé
+If [M:STCD]FCSAMT(NOL) = OLDFCSAMTCLC
+  [M:STCD]FCSAMT(NOL) = [M:STCD]FCSAMTCLC(NOL)
+# Sinon si un montant avait été saisi, on proratise celui-ci
+Elsif LQTYPUUORI<>LQTYPUU & LQTYPUUORI<>0
+  [M:STCD]FCSAMT(NOL) = [M:STCD]FCSAMT(NOL)*LQTYPUU/LQTYPUUORI
+Endif
+# Conversion du montant saisi en devise société
+If [M:STCD]CURIMP(NOL) = [M:STCD]CUR
+  [M:STCD]FCSAMTSOC(NOL) = [M:STCD]FCSAMT(NOL)
+Else
+  # Lecture devise société pour traitement de l'arrondi
+  If [F:TCU]CUR<>[M:STCD]CUR
+    Read [TCU]TCU0=[M:STCD]CUR
+    If fstat  Raz [F:TCU]  Endif
+  Endif
+  [M:STCD]FCSAMTSOC(NOL) = arr([M:STCD]FCSAMT(NOL)*[M:STCD]CHGCOE(NOL),[F:TCU]CURRND)
+Endif
+
+Return
+
+#######################################################################
+#--- Montant en pourcentage du prix net
+$PRIX_NET
+# Le prix net est dans la devise de la charge
+If [M:STCD]CURDOC = [M:STCD]CURIMP(NOL)
+  [M:STCD]FCSAMTCLC(NOL) = LNETPRI*LQTYPUU*[M:STCD]PRINETPRC(NOL)/100
+# Dans une autre devise
+Else
+  Call CONVERT([M:STCD]CURDOC,[M:STCD]CURIMP(NOL),[M:STCD]CUR,[M:STCD]CHGTYP(NOL),
+&              LDAT,LNETPRI*LQTYPUU*[M:STCD]PRINETPRC(NOL)/100,
+&              [M:STCD]FCSAMTCLC(NOL),STAT) From TRTDEV
+Endif
+
+Return
+
+#######################################################################
+#--- Montant en forfait
+$FORFAIT
+[M:STCD]FCSAMTCLC(NOL) = [M:STCD]UNTPRI(NOL)
+
+Return
+
+#######################################################################
+#--- Montant unitaire
+$MNT_UNITAIRE
+# Calcul quantité en unité (achat, volume ou poids)
+Gosub CAL_WQTY
+If WERR<>0
+  [M:STCD]FCSAMTCLC(NOL)=0
+  Return
+Endif
+
+[M:STCD]FCSAMTCLC(NOL) = [M:STCD]UNTPRI(NOL)*WQTY
+
+Return
+
+#######################################################################
+#--- Montant par tranche
+$MNT_TRANCHE
+
+# Calcul quantité en unité (achat, volume ou poids)
+Gosub CAL_WQTY
+If WERR<>0
+  [M:STCD]FCSAMTCLC(NOL)=0
+  Return
+Endif
+
+# Calcul du nombre de tranches
+WNBT=int(WQTY/[M:STCD]QTY(NOL))
+# Par tranche supérieure
+If [F:FCS]HGHBKT=2
+  # Uniquement si la tranche est entamée
+  If WNBT<WQTY/[M:STCD]QTY(NOL)
+    WNBT+=1
+  Endif
+Endif
+
+[M:STCD]FCSAMTCLC(NOL) = [M:STCD]UNTPRI(NOL)*WNBT
+
+Return
+
+#######################################################################
+#--- Montant par barème
+$MNT_BAREME
+# Calcul quantité en unité (achat, volume ou poids)
+Gosub CAL_WQTY
+If WERR<>0
+  [M:STCD]FCSAMTCLC(NOL)=0
+  Return
+Endif
+
+[M:STCD]FCSAMTCLC(NOL)=0
+# Lecture du barème
+For [STCB]STCB1 Where STCNUM=[M:STCD]STCNUM & STCLIN=[M:STCD]STCLIN(NOL) &
+&                     MINLIM<=WQTY & MAXLIM>=WQTY
+  If [M:STCD]LIMTYP(NOL)=2
+    [M:STCD]FCSAMTCLC(NOL) = [F:STCB]UNTPRI
+  Else
+    [M:STCD]FCSAMTCLC(NOL) = [F:STCB]UNTPRI*WQTY
+  Endif
+  Break
+Next
+
+Return
+
+#######################################################################
+#--- Montant unitaire pondéré
+$MNT_PONDERE
+# Calcul du montant unitaire
+Gosub MNT_UNITAIRE
+# Application de la pondération
+If [M:STCD]WEIPRC(NOL)<>0
+  [M:STCD]FCSAMTCLC(NOL) = [M:STCD]FCSAMTCLC(NOL)*100/[M:STCD]WEIPRC(NOL)
+Endif
+
+Return
+
+#######################################################################
+$FORMULE
+#--- Issue 110325
+#If LORI ="" Return Endif
+# Lecture de la formule
+Read [TFO] TFO0=56;[M:STCD]FORFCS(NOL)
+If fstat
+  Call RSTA("TFO",[M:STCD]FORFCS(NOL)) From GLOCK
+  WERR=4
+  Return
+Endif
+
+Onerrgo ERR_FORMULE
+
+#--- Issue 110325
+If LORI<>""
+  # Alimentation PPRICLINK
+  Call ALIPLK(LORI) From TRTPRICE
+#--- Issue 110325
+Endif
+
+# Calcul montant à partir de la formule
+[M:STCD]FCSAMTCLC(NOL)=evalue([F:TFO]FORFOR)
+
+Onerrgo
+If WERR>0 Return Endif
+
+Return
+
+$ERR_FORMULE
+Call ERREUR(mess(573,197,1)-[F:TFO]FORCOD-":"-mess(437,194,1)) From GESECRAN
+WERR=5
+Resume
+
+#######################################################################
+#--- Calcul quantité en unité (achat, volume ou poids)
+$CAL_WQTY
+# Calcul selon base unité
+Case [M:STCD]BAS(NOL)
+  When 1 : If LQTYPUU=0
+             WQTY=0
+           Elsif [M:STCD]UOM(NOL)=LPUU
+             WQTY=LQTYPUU
+           # La quantité est en unité d'achat de l'article-fournisseur
+           Elsif LPUU=WITPPUU
+             If [M:STCD]UOM(NOL)=[F:ITM]STU
+               WQTY=LQTYPUU*[F:ITP]PUUSTUCOE
+             Elsif [M:STCD]UOM(NOL)=[F:ITP]PCU
+               WQTY=LQTYPUU/[F:ITP]PCUPUUCOE
+             Else
+               J=find([M:STCD]UOM(NOL),[F:ITM]PCU(0..dim([F:ITM]PCU)-1))
+               If J<>0
+                 WQTY=LQTYPUU*[F:ITM]PUUSTUCOE/[F:ITM]PCUSTUCOE(J-1)
+               Else
+                 # Pas de conversion
+                 WQTY=0 : WERR=1
+               Endif
+             Endif
+           # La quantité est en unité d'achat de l'article
+           Else
+             If [M:STCD]UOM(NOL)=[F:ITM]STU
+               WQTY=LQTYPUU*[F:ITM]PUUSTUCOE
+             Else
+               J=find([M:STCD]UOM(NOL),[F:ITM]PCU(0..dim([F:ITM]PCU)-1))
+               If J<>0
+                 WQTY=LQTYPUU*[F:ITM]PUUSTUCOE/[F:ITM]PCUSTUCOE(J-1)
+               Else
+                 # Pas de conversion
+                 WQTY=0 : WERR=1
+               Endif
+             Endif
+           Endif
+  When 2 : WQTY = LQTYVOU
+           If WQTY=0
+             WERR=2
+           Elsif [M:STCD]UOM(NOL)<>LVOU
+             # Conversion volume ligne document en unité volume charge
+             Call CONVERT_QTY(LVOU,[M:STCD]UOM(NOL),WQTY) From TRTX3
+           Endif
+  When 3 : WQTY = LQTYWEU
+           If WQTY=0
+             WERR=3
+           Elsif [M:STCD]UOM(NOL)<>LWEU
+             # Conversion poids ligne document en unité poids charge
+             Call CONVERT_QTY(LWEU,[M:STCD]UOM(NOL),WQTY) From TRTX3
+           Endif
+Endcase
+
+Return
+
+#########################################################################
+# GES_STCDW : Composant générique de calcul et stockage des charges
+#             - Alimentation de l'écran STCD (pour calcul)
+#             - Calcul des charges (calcul ou proratisation)
+#             - Alimentation de l'écran STCDW (pour stockage)
+############################################################################
+# Prérequis    : Les écrans STCPAR, STCD et STCDW doivent être ouvert
+#                La table ITMMASTER [ITM] soit être ouverte
+#
+############################################################################
+# Paramètres E : LABR    = Abréviation écran
+#                LNOL    = No ligne écran (nolign-1)
+#            S : LRET    = Code retour (0=OK / 1=Erreur)
+########################################################################
+# Entrée       : Ecran STCPAR [STCP]
+#               -----------------------------------------------------------
+#               Zones à alimenter avec la pièce courante
+#               [M:STCP]VCRTYP  = Type pièce (M.701)
+#               [M:STCP]VCRNUM  = Numéro pièce
+#               [M:STCP]VCRLIN  = Ligne pièce
+#               [M:STCP]VCRSEQ  = Séquence pièce
+#               -----------------------------------------------------------
+#               Zones à alimenter avec la pièce origine :
+#               - si réception d'une commande (liv si inter-site)
+#               - si facture d'une commande ou d'une réception
+#               #--- Issue 110325
+#               - si expédition d'une commande
+#               - si réception d'une expédition (pré-réceptionnée ou non)
+#               #--- End Issue 110325
+#               Zones à ne pas alimenter :
+#               - si réception d'une ligne de commande ouverte
+#                 [M:STCP]VCRTYPORI = Type pièce origine (M.701)
+#                 [M:STCP]VCRNUMORI = Numéro pièce origine
+#                 [M:STCP]VCRLINORI = Ligne pièce origine
+#                 [M:STCP]VCRSEQORI = Séquence pièce origine
+#                 [M:STCP]QTYPUUORI = Quantité UA pièce origine : #--- TS
+#               -----------------------------------------------------------
+#               [M:STCP]QTYPUU  = Quantité UA ligne document
+#               [M:STCP]STOFCY  = Site stock
+#               [M:STCP]BPSNUM  = Fournisseur
+#               [M:STCP]DAT     = Date document
+#               [M:STCP]ICT     = Incoterm
+#               [M:STCP]CHGTYP  = Type de cours
+#               [M:STCP]NETPRI  = Prix net ligne document
+#               [M:STCP]QTYVOU  = Volume ligne document
+#               [M:STCP]QTYWEU  = Poids ligne document
+#               [M:STCP]PUU     = Unité achat ligne document
+#               [M:STCP]VOU     = Unité volume ligne document
+#               [M:STCP]WEU     = Unité poids ligne document
+#               [M:STCP]ORIPPK  = Origine pour alimentation PPRCLINK
+#                                 'POH' : Depuis cdes standards
+#                                 'POM' : Depuis gestion auto cdes standards
+#                                 'POC' : Depuis cdes ouvertes
+#                                 'POD' : Depuis demandes livraison fermes
+#                                 'PTH' : Depuis réceptions directes
+#               -----------------------------------------------------------
+#               #--- Issue 110325
+#								A alimenter si [M:STCP]VCRTYP=38 et [M:STCP]VCRTYPORI=14
+#               [M:STCP]SHITYP  = Type enreg (expédition ou cde pré-réceptionnée)
+#               #--- End Issue 110325
+#
+########################################################################
+Subprog GES_STCDW(LABR,LNOL,LRET)
+Value    Char    LABR
+Value    Integer LNOL
+Variable Integer LRET
+Local Integer    I,J
+Local Integer    WNBLIG
+Local Decimal    WQTYPUU : WQTYPUU=0 : #--- TS
+
+Raz LRET
+Raz [M:STCD]
+WNBLIG  = evalue("[M:"+LABR+"]NBLIG")
+
+Call CHARGE_PARAM(LABR,LNOL,LRET,[M:STCP]ICT) From STCLIB
+If LRET : End : Endif
+
+#--- TS
+# Si ligne déjà créée
+If evalue("[M:"+LABR+"]CREFLG(LNOL)") <> 0
+  # Réception
+  If [M:STCP]VCRTYP=6
+    Read [PTD]PTD0=[M:STCP]VCRNUM;[M:STCP]VCRLIN
+    If !fstat WQTYPUU=[F:PTD]QTYPUU Endif
+  # Facture
+  Elsif [M:STCP]VCRTYP=17
+    Read [PID]PID0=[M:STCP]VCRNUM;[M:STCP]VCRLIN
+    If !fstat WQTYPUU=[F:PID]QTYPUU Endif
+  #--- Issue 110325
+  # Expédition
+  Elsif [M:STCP]VCRTYP=38
+    Read [SHH]SHH0=[M:STCP]VCRNUM
+    If !fstat
+      Read [SHD]SHD0=[M:STCP]VCRNUM;[M:STCP]VCRLIN
+      If !fstat
+        WQTYPUU=[F:SHD]SHIQTYPUU
+      Endif
+    Endif
+    #--- End Issue 110325
+  Endif
+Endif
+#---
+
+# Si la structure n'est pas encore chargée dans l'écran de travail
+If evalue("[M:"+LABR+"]WSTCSEQ(LNOL)") = 0
+   Call WSTCSEQ (LABR,LNOL,WNBLIG,LRET) From STCLIB
+   [M:STCD]WSTCSEQ = evalue("[M:"+LABR+"]WSTCSEQ(LNOL)")
+   # Si nouvelle ligne
+   If evalue("[M:"+LABR+"]CREFLG(LNOL)") = 0
+      If [M:STCP]VCRNUMORI <> ""
+         Call STCTRF_STCD(LABR,LNOL,[M:STCP]VCRTYPORI,[M:STCP]VCRNUMORI,
+&                         [M:STCP]VCRLINORI,[M:STCP]VCRSEQORI,[M:STCP]QTYPUU,
+&                         [M:STCP]ICT,[M:STCP]DAT,LRET) From STCLIB
+      Else
+         Call COSTSTCL_STCD(LABR,LNOL,[M:STCP]ICT,[M:STCP]DAT,[M:STCP]CHGTYP,
+&                           LRET) From STCLIB
+      Endif
+   # Ligne déjà existante
+   Else
+      Call COSTSTCD_STCD(LABR,LNOL,[M:STCP]VCRTYP,[M:STCP]VCRNUM,
+&                        [M:STCP]VCRLIN,[M:STCP]VCRSEQ,[M:STCP]ICT,
+&                        [M:STCP]CHGTYP,LRET) From STCLIB
+   Endif
+# La structure est déjà chargée dans l'écran de travail : On charge l'écran de saisie
+Else
+   Call STCDW_STCD(LABR,LNOL,LRET) From STCLIB
+Endif
+If LRET : End : Endif
+
+# avant de (re)lancer le calcul
+# Somme de tous les montants
+[M:STCD]FCSCSTPUR = sum([M:STCD]FCSAMTSOC(0..[M:STCD]NBLIG-1))
+# Somme des montants valorisés
+[M:STCD]FCSCPR = sigma(I=0,[M:STCD]NBLIG-1,[M:STCD]FCSAMTSOC(I)*([M:STCD]STKVLT(I)= 2))
+
+#--- Issue 110325
+# On recalcule si pas de pièce origine ou si réception et paramètre STCPTH=1
+#If [M:STCP]VCRNUMORI="" | ([M:STCP]VCRTYP=6 & GSTCPTH=1)
+# On recalcule si pas de pièce origine
+# ou si expédition d'une commande
+# ou si paramètre STCPTH=1 et réception d'une commande (pré-réceptionnée ou non)
+If [M:STCP]VCRNUMORI=""
+&  |([M:STCP]VCRTYPORI=14 & [M:STCP]VCRTYP=38)
+&  |(GSTCPTH=1 & ([M:STCP]VCRTYPORI=14 & [M:STCP]VCRTYP=6))
+#--- End Issue 110325
+  # Calcul du montant de chaque charge
+  Call CALC_COSTSTCD(-1,[M:STCP]NETPRI,[M:STCP]QTYPUU,[M:STCP]QTYVOU,
+&                    [M:STCP]QTYWEU,[M:STCP]PUU,[M:STCP]VOU,[M:STCP]WEU,
+&                    [M:STCP]DAT,[M:STCP]BPSNUM,[M:STCP]STOFCY,[M:STCP]ORIPPK,
+&                    [M:STCP]QTYPUUORI) From STCCLC
+# Sinon si nouvelle ligne, on proratise par rapport à la pièce origine
+Elsif evalue("[M:"+LABR+"]CREFLG(LNOL)")=0 & [M:STCP]VCRNUMORI<>""
+  Filter [STCD] Where [F:STCD]VCRTYP=[M:STCP]VCRTYPORI & [F:STCD]VCRNUM=[M:STCP]VCRNUMORI &
+&                     [F:STCD]VCRLIN=[M:STCP]VCRLINORI & [F:STCD]VCRSEQ=[M:STCP]VCRSEQORI
+  J=0
+  For [STCD]STCD0
+    #--- Prorata sur les montants calculés et saisis
+    #--- Issue 110325
+    #[M:STCD]FCSAMTCLC(J) = [F:STCD]FCSAMTCLC*evalue("[M:"+LABR+"]QTYPUU(LNOL)")/[M:STCP]QTYPUUORI
+    #[M:STCD]FCSAMT(J)    = [F:STCD]FCSAMT*evalue("[M:"+LABR+"]QTYPUU(LNOL)")/[M:STCP]QTYPUUORI
+    If LABR="SHIP1"
+      [M:STCD]FCSAMTCLC(J) = [F:STCD]FCSAMTCLC*evalue("[M:"+LABR+"]SHIQTYPUU(LNOL)")/[M:STCP]QTYPUUORI
+      [M:STCD]FCSAMT(J)    = [F:STCD]FCSAMT*evalue("[M:"+LABR+"]SHIQTYPUU(LNOL)")/[M:STCP]QTYPUUORI
+    Else
+      [M:STCD]FCSAMTCLC(J) = [F:STCD]FCSAMTCLC*evalue("[M:"+LABR+"]QTYPUU(LNOL)")/[M:STCP]QTYPUUORI
+      [M:STCD]FCSAMT(J)    = [F:STCD]FCSAMT*evalue("[M:"+LABR+"]QTYPUU(LNOL)")/[M:STCP]QTYPUUORI
+    Endif
+    #--- End Issue 110325
+
+    If [M:STCD]CURIMP(J) = [M:STCD]CUR
+      [M:STCD]FCSAMTSOC(J) = [M:STCD]FCSAMT(J)
+    Else
+      # Lecture devise société pour traitement de l'arrondi
+      If [F:TCU]CUR<>[M:STCD]CUR
+        Read [TCU]TCU0=[M:STCD]CUR
+        If fstat  Raz [F:TCU]  Endif
+      Endif
+      [M:STCD]FCSAMTSOC(J) = arr([M:STCD]FCSAMT(J)*[M:STCD]CHGCOE(J),[F:TCU]CURRND)
+    Endif
+    #---
+    J+=1
+  Next
+  Filter [STCD]
+Else
+  # On ne proratise que si la quantité a été modifiée
+  If WQTYPUU<>[M:STCP]QTYPUU
+    Filter [STCD] Where VCRTYP=[M:STCP]VCRTYP & VCRNUM=[M:STCP]VCRNUM &
+&                       VCRLIN=[M:STCP]VCRLIN & VCRSEQ=[M:STCP]VCRSEQ
+    J=0
+    For [STCD]STCD0
+      #--- Prorata sur les montants calculés et saisis
+      [M:STCD]FCSAMTCLC(J) = [F:STCD]FCSAMTCLC*[M:STCP]QTYPUU/WQTYPUU
+      [M:STCD]FCSAMT(J)    = [F:STCD]FCSAMT*[M:STCP]QTYPUU/WQTYPUU
+      [M:STCD]FCSAMTSOC(J) = [F:STCD]FCSAMTSOC*[M:STCP]QTYPUU/WQTYPUU
+      J+=1
+    Next
+    Filter [STCD]
+  Endif
+#---
+Endif
+
+# Stockage dans l'écran [STCDW]
+Call STCD_STCDW(LABR,LNOL,LRET) From STCLIB
+If LRET : End : Endif
+
+# Mise à jour des zones de l'écran appelant
+Gosub MAJ_MSKZON
+Raz [M:STCD]
+End
+
+################################################################################
+$MAJ_MSKZON
+Local Integer I
+
+# après  le calcul
+# Somme de tous les montants
+[M:STCD]FCSCSTPUR    = sum([M:STCD]FCSAMTSOC(0..[M:STCD]NBLIG-1))
+# Somme des montants valorisés
+[M:STCD]FCSCPR = sigma(I=0,[M:STCD]NBLIG-1, [M:STCD]FCSAMTSOC(I) *([M:STCD]STKVLT(I) = 2))
+# Mise à jour des coûts stock et coûts d'achat
+Assign "[M:"+LABR+"]FCSCSTPUR(LNOL)" With [M:STCD]FCSCSTPUR
+Assign "[M:"+LABR+"]FCSCPR(LNOL)"    With [M:STCD]FCSCPR
+
+Assign "[M:"+LABR+"]WSTCUPD(LNOL)" With 0
+
+Return
+
+#########################################################################
+# PRORA_STCDW : Composant générique de proratisation et stockage des charges
+#               appelé en APRES_MODIF des quantités d'une ligne réception de
+#               commande ou ligne facture de commande ou réception
+#--- Issue 110325
+#               ou des quantités d'une ligne d'expé (expédiée ou pré-receptionnée
+#               selon qu'il s'agit d'une expédition ou d'une pré-réception)
+#--- End Issue 110325
+#               Ne concerne que les lignes déjà existantes
+#             - Alimentation de l'écran STCD (pour calcul)
+#             - Proratisation des charges
+#             - Alimentation de l'écran STCDW (pour stockage)
+############################################################################
+# Prérequis    : Les écrans STCPAR, STCD et STCDW doivent être ouvert
+#                La table ITMMASTER [ITM] doit être ouverte
+#
+############################################################################
+# Paramètres E : LABR    = Abréviation écran
+#                LNOL    = No ligne écran (nolign-1)
+#            S : LRET    = Code retour (0=OK / 1=Erreur)
+########################################################################
+# Entrée       : Ecran STCPAR [STCP]
+#               [M:STCP]VCRTYP  = Type pièce (M.701)
+#               [M:STCP]VCRNUM  = Numéro pièce
+#               [M:STCP]VCRLIN  = Ligne pièce
+#               [M:STCP]VCRSEQ  = Séquence pièce
+#               [M:STCP]ICT     = Incoterm
+#               [M:STCP]CHGTYP  = Type de cours
+#               [M:STCP]QTYPUU  = Nouvelle quantité UA saisi
+########################################################################
+Subprog PRORA_STCDW(LABR,LNOL,LRET)
+Value    Char    LABR
+Value    Integer LNOL
+Variable Integer LRET
+Local Integer    I,J
+Local Integer    WNBLIG
+Local Decimal    WQTYPUU : WQTYPUU=0
+
+Raz LRET
+Raz [M:STCD]
+WNBLIG  = evalue("[M:"+LABR+"]NBLIG")
+
+Call CHARGE_PARAM(LABR,LNOL,LRET,[M:STCP]ICT) From STCLIB
+
+# Réception
+If [M:STCP]VCRTYP=6
+  Read [PTD]PTD0=[M:STCP]VCRNUM;[M:STCP]VCRLIN
+  If !fstat WQTYPUU=[F:PTD]QTYPUU Endif
+# Facture
+Elsif [M:STCP]VCRTYP=17
+  Read [PID]PID0=[M:STCP]VCRNUM;[M:STCP]VCRLIN
+  If !fstat WQTYPUU=[F:PID]QTYPUU Endif
+#--- Issue 110325
+# Expédition
+Elsif [M:STCP]VCRTYP=38
+  Read [SHD]SHD0=[M:STCP]VCRNUM;[M:STCP]VCRLIN
+  If !fstat
+    WQTYPUU=[F:SHD]SHIQTYPUU
+  Endif
+#--- End Issue 110325
+Else
+  LRET=1 : End
+Endif
+
+# Si la structure n'est pas encore chargée dans l'écran de travail
+If evalue("[M:"+LABR+"]WSTCSEQ(LNOL)") = 0
+   Call WSTCSEQ (LABR,LNOL,WNBLIG,LRET) From STCLIB
+   [M:STCD]WSTCSEQ = evalue("[M:"+LABR+"]WSTCSEQ(LNOL)")
+   Call COSTSTCD_STCD(LABR,LNOL,[M:STCP]VCRTYP,[M:STCP]VCRNUM,
+&                     [M:STCP]VCRLIN,[M:STCP]VCRSEQ,[M:STCP]ICT,
+&                     [M:STCP]CHGTYP,LRET) From STCLIB
+# La structure est déjà chargée dans l'écran de travail : On charge l'écran de saisie
+Else
+   Call STCDW_STCD(LABR,LNOL,LRET) From STCLIB
+Endif
+If LRET : End : Endif
+
+# On ne proratise que si la quantité a été modifiée
+If WQTYPUU<>[M:STCP]QTYPUU
+  Filter [STCD] Where VCRTYP=[M:STCP]VCRTYP & VCRNUM=[M:STCP]VCRNUM &
+&                     VCRLIN=[M:STCP]VCRLIN & VCRSEQ=[M:STCP]VCRSEQ
+  J=0
+  For [STCD]STCD0
+    #--- Prorata sur les montants calculés et saisis
+    [M:STCD]FCSAMTCLC(J) = [F:STCD]FCSAMTCLC*[M:STCP]QTYPUU/WQTYPUU
+    [M:STCD]FCSAMT(J)    = [F:STCD]FCSAMT*[M:STCP]QTYPUU/WQTYPUU
+    [M:STCD]FCSAMTSOC(J) = [F:STCD]FCSAMTSOC*[M:STCP]QTYPUU/WQTYPUU
+    J+=1
+  Next
+  Filter [STCD]
+Endif
+
+# Stockage dans l'écran [STCDW]
+Call STCD_STCDW(LABR,LNOL,LRET) From STCLIB
+If LRET : End : Endif
+
+# Mise à jour des zones de l'écran appelant
+Gosub MAJ_MSKZON
+Raz [M:STCD]
+End
+
+#########################################################################
+# MAJ_REACSTPUR : Mise à jour du coût d'achat réalisé suite à validation
+#                 d'une facture complémentaire ou non, ou d'un avoir si
+#                 [F:PID]CSTMAJLIN=2 (maj coût si facture complémentaire)
+############################################################################
+# Prérequis     : La table PORDERQ [POQ] doit être ouverte
+#                 Une transaction de maj doit être ouverte
+############################################################################
+# Attention     : Ne doit être appelé que si [F:PID]CSTMAJLIN=2
+############################################################################
+# Paramètres E  : LNUM  = Numéro commande
+#                 LLIN  = Ligne pièce
+#                 LSEQ  = Séquence pièce
+#                 LMNT  = Coût d'achat (en négatif si avoir)
+#             S : LRET  = Code retour (0=OK / 1=Erreur)
+########################################################################
+Subprog MAJ_REACSTPUR(LNUM,LLIN,LSEQ,LMNT,LRET)
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Decimal LMNT
+Variable Integer LRET
+
+LRET=0
+Readlock [POQ]POQ0=LNUM;LLIN;LSEQ
+If !fstat & [F:POQ]POHTYP<>2
+  # Maj du coût d'achat réalisé uniquement si cde classique
+  [F:POQ]REACSTPUR += LMNT
+  Rewrite [POQ]
+  If fstat LRET=1 Endif
+Else
+  If [F:POQ]POHTYP<>2
+    LRET=1
+  Endif
+Endif
+
+End
+

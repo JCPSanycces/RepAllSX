@@ -1,0 +1,3025 @@
+#<AdxTL>@(#)10.0.0.0 $Revision$
+##############################################################################
+##
+## JML 15/03/99 Reprise en main du Debugquoi par Sophia
+## Nouvelles variables adonix :
+##
+##  - [S]adxdpg Nom du TRT du Debugquoi
+##  - [S]adxdbo Nom du Subprog de déclaration INIDBG
+##  - [S]adxdbc Nom du Subprog de commande    INPDBG
+##  - [S]adxdbx Nom du Subprog de fermeture   ENDDBG
+##
+##  - [S]adxkpg Nom du TRT de la calculette
+##
+## JML 15/04/99 Variable GCOULDBG pour ceux qui veulent de la couleur !!
+##
+## JML 12/10/99 Tentative de bufferisation des TRT, n'en vaut pas la peine,
+##  GOBJSUB 1326 ligne temps chargement 1s, Affzo 8s !!
+##
+## JML 24/11/99 [LDB]DBGCCR position du débugger sur la ligne courante
+##   ATTENTION après mot clé adonix. Si la ligne contient :
+##   Dbgaff
+##   Alors [LDB]DBGCCR vaut 7 ème caractère
+##
+## JML 02/05/01 X3DEBUG pour Mode Web, ATTENTION ne pas accéder au poste client
+##    car enmode WEB, c'est le serveur X3Web qui est le client !!
+##
+## MB 13/07/01  Rajout Commande 18 Open Source et empilage des sources (onglets)
+##
+## OG 11/10/01 Modifications :
+##  - distingo du mode d'affichage "debugger Java" de la communication ADAPI, cla
+##    permet d'utiliser le debugger Java même en client serveur
+##  - ouverture et fermeture de la socket dans INIDBG et ENDDBG
+##  - structuration de la trace par la mise en place des sous-programmes TRACE_xxx
+##
+## MB 28.1.3 Pour utiliser le débugger "socket" avec client X3 C/S
+##
+##    Ajouter les lignes suivantes dans le traitement à débugger ou dans trt/MENU
+##    If dim([V]GIAADXCTX)<0 : Global Char GIAADXCTX(250) : Endif
+##    [V]GIAADXCTX = "X3_CS:NA1:"               : # entête "X3_CS:session client X3" + "NA1:session primaire"
+##    Call SET_DEBUG_ON(1) From DEBUGGERJ          : # 0=debugger socket "off"
+##    Call SET_HOST("172.16.16.85") From DEBUGGERJ : # @ip du pc
+##    Call SET_PORT("1789") From DEBUGGERJ         : # Port
+##
+## OG 08/04/2004 Modifications :
+##
+##     - renomage globale de DBG_TRACEON en DBG_TRACON
+##     - renomage  globale de MOD_JAVA en MOD_SOCKET
+##     - creation de SEND_CLOSE et de SEND_ERR_ON_CLOSE
+##     - modification de SEND_OPEN pour passer les infos en paramètre
+##     - modification de READ_ADXCTX pour extraire le "type" de session et son "poids"
+##     - renomage MOD_COMADAPI en MOD_CLIWEB
+##     - modification des messages TEMPON envoyés si MOD_CLIWEB pour piloter le délais
+##       d'attente (cf. timeOut) de la réponse de la réquête courante :
+##       - Timeout d'une heure si "$$DBG_OPE + texte" : debug on
+##       - Timeout standard si "$$DBG_CLO + texte" : debug off
+##     - creation de READ_IN_SOCK
+##     A faire
+##     - reporter le mécanisme de substitution des sources absents mis en place dans la 130
+##
+##############################################################################
+
+##############################################################################
+#**
+#* Get debugger program name
+#*!
+Funprog GET_DBG_PROG()
+  Local Char VALEUR(1)
+  Local Char PROG(30)
+  Local Shortint FIRST_LOG
+  FIRST_LOG = 1
+  [L]PROG = "DEBUGGER"
+  Onerrgo ERROR_GET_DBG_PROG
+  If type(GACTX) = 524
+    VALEUR = num$(fmet GACTX.APARAM.AGETUSERVALNUM("AECLIDBG"))
+  Else
+    Call PARAMUTIL("AECLIDBG", [L]VALEUR, "", "") From SUBAUS
+  Endif
+  If dim(GDBGECLI) > 0
+    VALEUR = GDBGECLI
+  Endif
+  If [L]VALEUR = "2"
+    [L]PROG = "AXDTDBG"
+#    If adxusr="erbou" : [L]PROG = "ZXDTDBG" : Endif
+  # Convergence client or Syracuse client should use Eclipse debugger
+  Elsif dim(GFUSION) > 0 and GFUSION or adxtyp = 33 or adxtyp = 34
+    Raz [L]PROG
+    If FIRST_LOG : Call LOG_CLEAR : Endif
+    FIRST_LOG = 0
+    Call LOG_ERROR("Eclipse debugger is not enabled for current login: " + adxusr + ", adxtyp=" + num$(adxtyp))
+  Endif
+  Onerrgo
+End [L]PROG
+
+$ERROR_GET_DBG_PROG
+  If FIRST_LOG : Call LOG_CLEAR : Endif
+  FIRST_LOG = 0
+  Call LOG_ERROR("Failed to get debugger parameter!" + chr$(10)
+&  + " [" + num$(errn) + " - " + errmes$(errn)-errp+"("+num$(errl)+"): '"+errm+"']")
+Resume
+
+Funprog LOG_NAME()
+End filpath("TRA","X3DEBUG_ERR_" + toupper(ctrans(adxusr,".\/|*@","______")),"tra" ,0)
+
+Subprog LOG_CLEAR()
+  Openo func LOG_NAME,0 Using [TR__]
+  Openo Using [TR__]
+End
+
+Subprog LOG_ERROR(LINE)
+  Openo func LOG_NAME, -1 Using [TR__]
+  Iomode adxifs ""
+  Iomode adxium 50 Using [TR__]
+  Wrseq format$("D:YYYY[-]MM[-]DD", date$) + "T" + time$, " ERROR: ", LINE Using [TR__]
+  Openo Using [TR__]
+End
+
+Subprog FORCE_ECLIDBG
+#  If dim(GDBGTRACE) < 0 : Global Char GDBGTRACE(250) : Endif
+#  Local Char NAME(250)
+#  If dim(GUSER) < 0 | GUSER = ""
+#    NAME = left$(adxmac(-2), instr(1, adxmac(-2), ".")-1)
+#  Else
+#    NAME = GUSER
+#  Endif
+#  GDBGTRACE = filpath("TRA","X3DEBUG_" + toupper(NAME), "tra", 0)
+  If dim(GDBGECLI) < 0 : Global Char GDBGECLI(1) : Endif
+  GDBGECLI="2"
+End
+
+
+##############################################################################
+# Subprog de déclaration dont le nom est stocké dans [S]adxdbo
+##############################################################################
+Subprog INIDBG
+Local Char DBG_PROG_NAME(30)         : # Création dans la classe globale [LDB]
+[LDB]DBG_PROG_NAME = func GET_DBG_PROG()
+If dim([LDB]DBG_PROG_NAME) > 0
+  If [LDB]DBG_PROG_NAME = ""
+    End
+  Elsif [LDB]DBG_PROG_NAME <> "DEBUGGER"
+    Gosub INIDBG_ From =[LDB]DBG_PROG_NAME
+    End
+  Endif
+Endif
+
+If clalev([M:AKL]) : End : Endif
+Local Char    DGNOMPRG(250)         : # Création dans la classe globale [LDB]
+Local Libelle DBG_TRASRC            : # 1 On a les sources, sinon nada
+Local Integer DGNOLIGN              : # No de ligne courant
+Local Integer NB_VAR_MAX            : # Nombre de variables Maximum
+Local Integer NB_BPT_MAX            : # Nombre de Break point maximum
+Local Integer NB_CALL_MAX           : # Nombre de Call imbriqués maximum
+Local Integer NIV_CALL              : # Niveau d'imbrication courant
+Local Char    DBG_DBGSTR(255)       : # Sauvegarde masque par défaut !
+
+Local Integer MOD_SOCKET            : # Mode affichage : 0 debugger Client/Serveur, 1 debugger Socket
+Local Integer DBG_ACT               : # =1 si opsock c'est bien passé
+Local Integer MOD_CLIWEB            : # session avec un client Web : 0 non , 1 oui
+Local Integer DBG_ON                : # flag général de l'activation du mode debugger
+                                      # (valorisé par la READ_ADXCTX)
+Local Char    PIL_DGNOMPRG(250)(0..9) : # Pile de nom de traitement en ligne
+Local Integer NB_DGNOMPRG           : # Nombre de traitements en ligne
+Local Char    DBG_SEPAR(3)          : # Séparateur de données dans une commande du protocole
+Local Char    DBG_HOST(255)         : # Host de la machine où se trouve le debugger socket
+                                      # (valorisé par la READ_ADXCTX)
+Local Char    DBG_PORT(255)         : # Port d'écoute du debugger socket (valorisé par la READ_ADXCTX)
+Local Char    DBG_SESTYP(5)         : # type de la session               (valorisé par la READ_ADXCTX)
+Local Char    DBG_SESWEI(3)         : # poids de la session              (valorisé par la READ_ADXCTX)
+Local Integer DBG_COLOR             : # mode couleur
+Local Integer DBG_TRACON            : # mode débuggage du débuggeur
+Local Char    DBG_TRACE(250)        : # Trace débuggage du débuggeur
+Local Char    DBG_ADXCTX(250)       : # copie de l'adxctx pour ne pas dépendre de la variable moteur
+#-----------------------------------------------------------------------------
+## JML 29/03/00 V130 Suggestion, essayer de préserver l'environnement
+#-----------------------------------------------------------------------------
+Local Libelle  DBG_FSTAT
+Local Shortint DBG_INDICE
+Local Shortint DBG_MKSTAT
+Local Shortint DBG_NOLIGN
+Local Shortint DBG_NOLIGN1
+Local Shortint DBG_PCOLOR
+Local Shortint DBG_STAT1
+Local Shortint DBG_STATUS
+Local Char     DBG_TITRE(255)
+Local Char     DBG_ZONCOU(12)
+Local Char     DBG_ZONSOR(12)
+Local Char     DBG_ZONSUI(255)
+Local Char     DBG_APARAM(255)
+Local Char     DBG_TABZONSVG(7)(0..12) :#attention 7 caractères max !!!
+Local Integer  DBG_NBZONSVG
+[LDB]DBG_NBZONSVG = 13
+[LDB]DBG_TABZONSVG(00) = "fstat"
+[LDB]DBG_TABZONSVG(01) = "indice"
+[LDB]DBG_TABZONSVG(02) = "mkstat"
+[LDB]DBG_TABZONSVG(03) = "nolign"
+[LDB]DBG_TABZONSVG(04) = "nolign1"
+[LDB]DBG_TABZONSVG(05) = "pcolor"
+[LDB]DBG_TABZONSVG(06) = "stat1"
+[LDB]DBG_TABZONSVG(07) = "status"
+[LDB]DBG_TABZONSVG(08) = "titre"
+[LDB]DBG_TABZONSVG(09) = "zoncou"
+[LDB]DBG_TABZONSVG(10) = "zonsor"
+[LDB]DBG_TABZONSVG(11) = "zonsui"
+[LDB]DBG_TABZONSVG(12) = "APARAM"
+
+[LDB]DBG_SEPAR   = "¤¨¤"
+[LDB]DGNOMPRG    = ""
+[LDB]NB_CALL_MAX = 25
+[LDB]NIV_CALL    = 0
+[LDB]MOD_SOCKET    = 0
+[LDB]MOD_CLIWEB= 0
+[LDB]DBG_TRACON = 0
+[LDB]DBG_TRACE   = ""
+[LDB]DBG_COLOR   = 1        :# mode couleur (0 non, 1 oui)
+[LDB]DBG_DBGSTR = dbgstr(1) :# Sauvegarde masque par défaut !
+
+# pour assurer la compatibilité avec le mode client serveur
+If dim([V]GIAADXCTX) < 0
+  Global Char GIAADXCTX(250)
+  # attention au format :
+  # - type de session sur 5 caractère (ex: ADAPI, X3_CS,...)
+  # - poids de la session sur 3 caractères (ex: NAx, PUB,...)
+  If dim(GBROWS)>0 & GBROWS=0
+    [V]GIAADXCTX = "X3_CS:NA1:"
+  Else
+    [V]GIAADXCTX =adxctx
+  Endif
+Endif
+
+# IMPORTANT:
+# copie du contexte dans une variable de la classe [LDB] pour que le debugger
+# ne dépende pas d'autre traitement comme DEBUGGERJ)
+[LDB]DBG_ADXCTX = [V]GIAADXCTX
+
+
+#si type de session "ADAPI" dans ADXCTX  => communication ADAPI
+If toupper(left$([LDB]DBG_ADXCTX,5))="ADAPI" :  [LDB]MOD_CLIWEB = 1 : Endif
+#si "debug.on" dans ADXCTX  => debugger Java
+If instr(1,[LDB]DBG_ADXCTX,"debug.on=on") or (dim(GBROWS)>0 & GBROWS<>0) : [LDB]MOD_SOCKET = 1 : Endif
+#si "debug.trace=on" dans ADXCTX  => trace du debugger
+If instr(1,[LDB]DBG_ADXCTX,"debug.trace=on") : [LDB]DBG_TRACON  = 1 : Endif
+
+If [LDB]DBG_TRACON=1
+  Call TRACE_CLEAR
+  Call TRACE("Subprog INIDBG - start")
+  [LDB]DBG_TRACE = "Parameters:"
+  Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Debugger_Java",num$([LDB]MOD_SOCKET))
+  Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Comm_Adapi",num$([LDB]MOD_CLIWEB))
+  Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Default_Mask",[LDB]DBG_DBGSTR)
+  Call TRACE ([LDB]DBG_TRACE)
+Endif
+
+
+#lecture du parametrage du debugger dans la copie de l'adxctx si debugger Java
+If [LDB]MOD_SOCKET : Call READ_ADXCTX : Endif
+
+
+If ![LDB]MOD_SOCKET
+ # Titre=Utilitaire de débugging Ligne=L Continuer=C Détail=V Abandon=A
+ Gosub HORODAT From WGDEBUGGER
+ Dbgbox "DEBUGGER" From "DEBUGGER" At A_STAMP Mask "DEBUGGER1" [DBG] As [DBG]
+ [LDB]NB_VAR_MAX = dim([M:DBG]TRAEXP)-1
+ [LDB]NB_BPT_MAX = dim([M:DBG]TRABPT)-1
+Else
+ [LDB]NB_VAR_MAX = 15
+ [LDB]NB_BPT_MAX = 10
+Endif
+
+# JML 03/05/01 Il faut apprendre à se passer du masque
+#              On redéfinit les variables et points d'arret
+
+Local Char     DBG_TRAEXP(80)(0..14) : # Expression des variables à suivre
+Local Shortint DBG_TRAVNB            : # Nbre de variables
+Local Char     DBG_TRABPT(80)(0..9)  : # Expression des points d'arrets
+Local Shortint DBG_TRABNB            : # Nbre de points d'arret
+
+# JML 01/10/99 pour avoir valeur variable en mode trace après execution ligne
+
+Local Integer NB_TRATRAEXP
+Local Char    TRATRA_EXP(80)([LDB]NB_VAR_MAX+1) : # mb 4.6.2 bug 14517
+Local Integer NB_ARG([LDB]NB_CALL_MAX+1) : # Nbre max d'argument par niveau d'imbrication
+Local Char    TRA_EXP(80)([LDB]NB_VAR_MAX+1,[LDB]NB_CALL_MAX+1) : # TRA_EXP Valeurs des arguments par niveau
+Local Integer NO_BPT_GOSUB               : # Indice Break Point pour sauter Gosub
+Local Char    DBG_EXCEPT_GOSUB(50)(10)   : # Exception ADONIX pour Gosub
+Local Integer DBG_NB_EXCEPT
+
+#####
+##### ATTENTION seul les 12 premiers DBG_EXCEPT_G sont reconnus !!
+#####
+
+Local Char    DBG_MOTCLED(15)               : # Mot début   en recherche Endif, Endcase
+Local Char    DBG_MOTCLEF(15)               : # Mot fin     en recherche Endif, Endcase
+Local Char    DBG_MOT_CUR(15)               : # Mot courant en recherche Endif, Endcase
+Local Integer DBG_START                     : # Indice de départ recherche Endif...
+Local Integer DBG_STOP                      : # Indice d'arret   recherche Endif...
+Local Integer DBG_NB_MOT
+Local Integer DBG_POSITION
+Local Integer DBG_LIGNE_COU                 : # No ligne courante
+
+Raz [LDB]NB_ARG, [LDB]TRA_EXP, [LDB]NO_BPT_GOSUB, [LDB]DBG_NB_EXCEPT, [LDB]TRATRA_EXP
+Raz [LDB]DBG_MOTCLED, [LDB]DBG_MOTCLEF, [LDB]NB_TRATRAEXP
+Raz [LDB]DBG_START, [LDB]DBG_STOP, [LDB]DBG_NB_MOT
+Raz [LDB]DBG_POSITION
+
+# JML 10/05/99 ATTENTION indice déterminant
+
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "#"
+[LDB]DBG_NB_EXCEPT += 1
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "ELSIF"
+[LDB]DBG_NB_EXCEPT += 1
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "ELSE"
+[LDB]DBG_NB_EXCEPT += 1
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "ENDIF"
+[LDB]DBG_NB_EXCEPT += 1
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "WHEN"
+[LDB]DBG_NB_EXCEPT += 1
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "ENDCASE"
+[LDB]DBG_NB_EXCEPT += 1
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "VALUE"
+[LDB]DBG_NB_EXCEPT += 1
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "VARIABLE"
+[LDB]DBG_NB_EXCEPT += 1
+[LDB]DBG_EXCEPT_GOSUB([LDB]DBG_NB_EXCEPT) = "CONST"
+[LDB]DBG_NB_EXCEPT += 1
+
+#si debugger on et mode debugger java => ouverture de socket
+If [LDB]DBG_ON & [LDB]MOD_SOCKET
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = "Open socket"
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Host",[LDB]DBG_HOST)
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Port",[LDB]DBG_PORT)
+    Call TRACE([LDB]DBG_TRACE)
+  Endif
+  Onerrgo SOCKET_OPEN_ERR
+  # Ouverture Socket pour Debug Intradon sur poste client
+  Opsock [LDB]DBG_HOST,val([LDB]DBG_PORT) Using [OPS]
+  Iomode adxium GUCS2 Using [OPS]
+  Iomode adxirs "" Using  [OPS]
+  Iomode adxifs "" Using  [OPS]
+  Seek 0 Using [OPS]
+  [LDB]DBG_ACT=1
+  Onerrgo :# pour supprimer le débranchement sur erreur
+
+  #envoi de la commande 01 = "open"
+  Call SEND_OPEN ([LDB]DBG_SESTYP,[LDB]DBG_SESWEI,right$([LDB]DBG_ADXCTX,11))
+
+  If [LDB]DBG_TRACON=1 : Call TRACE("Socket opened") : Endif
+  # Pour passer le client ADAPI en mode Debug si communication ADAPI
+  If [LDB]MOD_CLIWEB : Call TEMPON("$$DBG_OPE Debugger on") From GESECRAN : Endif
+Endif
+
+  $SOCKET_OPEN_CONT
+
+If [LDB]DBG_TRACON=1 : Call TRACE("Subprog INIDBG - end") : Endif
+
+End
+##############################################################################
+# Subroutine de traitement d'erreur sur ouverture de la socket
+##############################################################################
+$SOCKET_OPEN_ERR
+  Onerrgo :# pour supprimer le débranchement sur erreur
+
+  [LDB]DBG_ON = 0  :#arret du mode debug!
+
+  If [LDB]DBG_TRACON=1 : Call TRACE("SOCKET_OPEN_ERR=["+errmes$(errn) +"] => cancel debug mode.") : Endif
+
+  If [LDB]MOD_CLIWEB
+     If mess(121,150,1)<>""
+       Infbox(mess(121,150,1))
+     Else
+       Infbox("Debugger not active. Run it first")
+     Endif
+  Endif
+
+Goto SOCKET_OPEN_CONT
+
+
+##############################################################################
+# Subprog de fermeture dont le nom est stocké dans [S]adxdbx
+##############################################################################
+Subprog ENDDBG
+If dim([LDB]DBG_PROG_NAME) > 0
+  If [LDB]DBG_PROG_NAME = ""
+    DBG_OPT = 7
+    End
+  Elsif [LDB]DBG_PROG_NAME <> "DEBUGGER"
+    Gosub ENDDBG_ From =[LDB]DBG_PROG_NAME
+    End
+  Endif
+Endif
+
+If clalev([M:AKL]) : End : Endif
+
+  If [LDB]DBG_TRACON=1 : Call TRACE("Subprog ENDDBG - start") : Endif
+
+  Raz [LDB]NB_DGNOMPRG, [LDB]PIL_DGNOMPRG
+
+  If ![LDB]MOD_SOCKET
+    #Close Inpbox [DBG]
+    #Close Mask [DBG]
+    If clalev([M:DBG])
+     Close Inpbox [DBG]
+     Close Mask [DBG]
+    Endif
+  Else
+    If [LDB]DBG_TRACON=1
+      [LDB]DBG_TRACE = "Close socket"
+      Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Host",[LDB]DBG_HOST)
+      Call TRACE([LDB]DBG_TRACE)
+    Endif
+    Onerrgo SOCKET_CLOSE_ERR
+
+    # fermeture Socket pour Debug Intradon sur poste client
+    If [LDB]DBG_ACT=1
+      #envoi de la commande 02 = "close"
+      Call SEND_CLOSE()
+      Opsock [LDB]DBG_HOST,0 Using [OPS]
+      If [LDB]DBG_TRACON=1 : Call TRACE("Socket closed") : Endif
+    Endif
+    $SOCKET_CLOSE_CONT
+  Endif
+
+  # Pour passer le client ADAPI en mode DebugOff
+  If [LDB]MOD_CLIWEB : Call TEMPON("$$DBG_CLO Debugger off.") From GESECRAN : Endif
+
+  If [LDB]DBG_TRACON=1 : Call TRACE("Subprog ENDDBG - end") : Endif
+End
+
+##############################################################################
+# Subroutine de traitement d'erreur sur fermeture de la socket
+##############################################################################
+$SOCKET_CLOSE_ERR
+  Onerrgo :# pour supprimer le débranchement sur erreur
+
+  If [LDB]DBG_TRACON=1 : Call TRACE("SOCKET_CLOSE_ERR=["+errmes$(errn) +"]") : Endif
+
+  If [LDB]MOD_CLIWEB
+    Call SEND_ERR_ON_CLOSE(1,"Close socket err=["+errmes$(errn) +"]")
+  Endif
+
+Goto SOCKET_CLOSE_CONT
+
+
+
+##############################################################################
+#  Subprog de commande dont le nom est stocké dans [S]adxdbc
+##############################################################################
+Subprog INPDBG( DBG_FICHIER, DBG_NUM_LIG, DBG_DSC, DBG_BNB, DBG_BNF, DBG_OPT )
+
+Value    Char    DBG_FICHIER()   : # Nom du TRT à debugger
+Value    Integer DBG_NUM_LIG     : # No Ligne courante du TRT à debugger
+Value    Char    DBG_DSC()       : # Ligne courante du TRT correpondant à DBG_NUM_LIG
+Variable Integer DBG_BNB         : # Nbre de point d'arrêt
+Variable Char    DBG_BNF()()     : # Valeur des points d'arrêt
+Variable Integer DBG_OPT         : # Status de sortie  du Boxinp
+                                 : # 201 Ligne       : Passe à la ligne
+                                 : # 202 Instruction : Saute les Call
+                                 : # 203 Continuer   : Va au Break Point
+                                 : # 007 Abandon
+
+If dim([LDB]DBG_PROG_NAME) > 0
+  If [LDB]DBG_PROG_NAME = ""
+    DBG_OPT = 7
+    dbgmode(1)=0 :# arrêt du mode debug
+    End
+  Elsif [LDB]DBG_PROG_NAME <> "DEBUGGER"
+    Gosub INPDBG_ From =[LDB]DBG_PROG_NAME
+    End
+  Endif
+Endif
+
+If clalev([M:AKL]) : End : Endif
+
+### JML 02/05/01 Pour tracer les erreurs du debugger
+Onerrgo ERREUR_DBG
+
+#-----------------------------------------------------------------------------
+#  ATTENTION AUX NOMS DE VARIABLES !!!
+#  ===============================
+#  On crée dans la classe [L] du TRT debuggué ...
+#-----------------------------------------------------------------------------
+
+Local Integer DBG_NL
+Local Integer DBG_NL_MAX           : # JML 24/07/00 Nbre lignes Max de l'écran
+Local Integer DBG_I, DBG_J, DBG_K
+Local Integer DBG_NEXT             : # Position prochain ':'
+Local Integer DBG_OK
+Local Char    DBG_SRCFIC(250)      : # Nom du TRT à Débugger
+Local Char    DBG_EXEFIC(250)      : # Nom du TRT$adx à Débugger
+Local Integer DBG_SRCFIC_TAILLE    : # Taille du source pour X3DEBUG
+Local Char    DBG_CHAINEA(250)
+Local Char    DBG_CHAINEB(250)
+Local Char    DBG_SAVIFS(5)
+Local Char    DBG_SAVIRS(5)
+Local Integer DBG_SAVIUM
+Local Char    DBG_NOM_TRT(250)
+Local Char    DBG_OPENI(250)(2)    : # Pour adxcio, 0=openi, 1=openo
+Local Integer DBG_ADXSEEK(2)       : # Pour adxcio
+Local Char    DBG_NOM_MACHINE(250)
+Local Char    DBG_NOM_APPLI(250)
+Local Integer DBG_ERR
+Local Integer DBG_TRATRA
+
+# si le flag DBG_ON false et debugger socket => arrêt du mode debugger
+If ![LDB]DBG_ON & [LDB]MOD_SOCKET
+  If [LDB]DBG_TRACON=1
+    Call TRACE("Stop mode debug!")
+  Else
+    If ![LDB]MOD_CLIWEB : Infbox("Stop mode debug!!!") : Endif
+  Endif
+  DBG_OPT = 7
+  End
+Endif
+
+If [LDB]DBG_TRACON=1
+  [LDB]DBG_TRACE = "Subprog INPDBG - start"
+  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Trt",DBG_FICHIER)
+  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"NumLine",num$(DBG_NUM_LIG))
+  Call TRACE([LDB]DBG_TRACE)
+Endif
+
+If DBG_FICHIER = ""
+  End
+Endif
+
+#récupération de la valeur de TRATRA dans le masque si affichage client/server
+If ![LDB]MOD_SOCKET : [L]DBG_TRATRA = [M:DBG]TRATRA : Else : [L]DBG_TRATRA = 1 : Endif
+
+#-----------------------------------------------------------------------------
+## JML 29/03/00 V130 Suggestion, essayer de préserver l'environnement
+#-----------------------------------------------------------------------------
+
+[LDB]DBG_FSTAT   = [S]fstat
+[LDB]DBG_INDICE  = [S]indice
+[LDB]DBG_MKSTAT  = [S]mkstat
+[LDB]DBG_NOLIGN  = [S]nolign
+[LDB]DBG_NOLIGN1 = [S]nolign1
+[LDB]DBG_PCOLOR  = [S]pcolor
+[LDB]DBG_STAT1   = [S]stat1
+[LDB]DBG_STATUS  = [S]status
+[LDB]DBG_TITRE   = [S]titre
+[LDB]DBG_ZONCOU  = [S]zoncou
+[LDB]DBG_ZONSOR  = [S]zonsor
+[LDB]DBG_ZONSUI  = [S]zonsui
+If dim(APARAM)>-1 : [LDB]DBG_APARAM  = APARAM : Else : [LDB]DBG_APARAM = "undefined" : Endif
+
+[L]DBG_SAVIFS  = [S]adxifs
+[L]DBG_SAVIRS  = [S]adxirs
+[L]DBG_SAVIUM  = [S]adxium
+[S]adxifs = ""
+[S]adxirs = chr$(10)
+
+#-----------------------------------------------------------------------------
+## JML 26/04/01 V130 X3Debug pour Intradon
+#-----------------------------------------------------------------------------
+
+Local Char     DBG_READ_SOCK(250) : # buffer de lecture des données des commande !
+Local Integer  DBG_DATA_SIZE      : # taille des données des commandes
+Local Shortint DBG_UNCAR          : # pour lire un caractère UCS2
+Local Char     DBG_VERSION(1)     : # Structure segment No Version
+Local Char     DBG_TAILLE(6)      : # Structure segment Taille
+Local Char     DBG_COMMANDE(2)    : # Structure segment Identifiant commande
+Local Char     DBG_CIRCUIT(1)     : # Structure segment Identifiant circuit virtuel
+
+#-----------------------------------------------------------------------------
+# niv0 - pour avoir valeur variables après execution ligne
+#-----------------------------------------------------------------------------
+
+If ![LDB]MOD_SOCKET & [L]DBG_TRATRA=2 & [LDB]NB_TRATRAEXP
+ Raz [L]DBG_OPENI, [L]DBG_ADXSEEK
+ If adxcio(1)<>-1 : # Pbl tokenisation pour adxcio, jcd n'a pas envoyé rcptok à MGA
+                    # JML 17/09/99 De plus en 110 ADXCIO renvoi n'importe quoi, dixit JCD
+                    #              Sur Unix ADXNFS(0) renvoi '', sur NT @nomap.Nom_trt.src !!
+                    #              et Boum, mais la vache savait nager...
+  [L]DBG_OPENI(1)   = adxnfs(adxcio(1)) : # Toujours pbl token adxnfs !!
+  [L]DBG_ADXSEEK(1) = adxseek(1)
+ Endif
+
+ adxifs = ""
+ adxirs = chr$(10)
+
+ Openo [M:DBG]TRAFIC , -1 Using [DBG]  : # On conserve l'existant !
+
+ # Maintenant au tour des variables
+ For [L]DBG_OK=1 To [LDB]NB_TRATRAEXP
+  Onerrgo ERREUR
+  # JML/JC 18/10/99 X3 transforme fstat en Ctrl B ) et donc le wrseq est perdu
+  #                 Avec KT tout doit rentrer dans l'ordre
+  Wrseq format$("KT>:35X","(Après)"-[LDB]TRATRA_EXP([L]DBG_OK))-":"; Using [DBG]
+  Wrseq num$(evalue([LDB]TRATRA_EXP([L]DBG_OK))) Using [DBG]
+  Onerrgo
+ Next [L]DBG_OK
+
+ Openo Using [DBG]
+
+ [S]adxifs = [L]DBG_SAVIFS
+ [S]adxirs = [L]DBG_SAVIRS
+ [S]adxium = [L]DBG_SAVIUM
+
+ Raz [LDB]NB_TRATRAEXP, [LDB]TRATRA_EXP
+Endif
+
+[L]DBG_NL      = instr( 1, [L]DBG_FICHIER, '$' )
+[L]DBG_NOM_TRT = left$([L]DBG_FICHIER,[L]DBG_NL-1)
+
+# Maintenant il faut virer nomp.TRT/
+[L]DBG_NL  = instr( 1, [L]DBG_NOM_TRT, 'TRT/' )
+If [L]DBG_NL
+ [L]DBG_NOM_TRT = right$([L]DBG_NOM_TRT,[L]DBG_NL+4)
+Endif
+
+If [L]DBG_TRATRA<>2
+ If ![LDB]MOD_SOCKET
+  Boxact [DBG]
+ Endif
+Endif
+
+[LDB]DGNOLIGN = [L]DBG_NUM_LIG
+
+#-----------------------------------------------------------------------------
+# niv0 - Chargement du source du traitement si rupture sur le nom du source
+#-----------------------------------------------------------------------------
+If [L]DBG_FICHIER<>[LDB]DGNOMPRG
+
+  [LDB]DGNOMPRG = [L]DBG_FICHIER   : # mémo du source courant (Déclaré dans Subprog INIDBG)
+  [L]DBG_NL = instr( 1, [LDB]DGNOMPRG, '$' )
+  [L]DBG_SRCFIC = left$([LDB]DGNOMPRG,[L]DBG_NL-1)+".src"
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = "Rupture source"
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Trt",[L]DBG_FICHIER)
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Src",[L]DBG_SRCFIC)
+    Call TRACE([LDB]DBG_TRACE)
+  Endif
+
+  # JML 15/03/99 A t'on le sources (taille > 0) ?
+  [L]DBG_SRCFIC_TAILLE = filinfo(filpath("",[L]DBG_SRCFIC,""),7)
+  If [L]DBG_SRCFIC_TAILLE>0
+    [LDB]DBG_TRASRC = 1       : # On a les sources
+
+    If ![LDB]MOD_SOCKET :# si on n'est pas en mode debugger socket, on charge sans se poser de question
+      Gosub CHARGE_TRT
+      If [L]DBG_TRATRA<>2
+        If dim(GBROWS)>0 & GBROWS=0 : pcolor = GCOUL(0) : Endif
+        Titcol [M:DBG]TRATNB "",filpath("",[LDB]DGNOMPRG,"")
+        Affzo [DBG] 10
+      Endif
+
+    Else
+      # si on est en mode debugger socket, on ne charge que si le source n'est pas dans la pile des sources
+
+      If !find([L]DBG_FICHIER,[LDB]PIL_DGNOMPRG(0..[LDB]NB_DGNOMPRG-1))
+        Call CHARGE_SOURCE([L]DBG_FICHIER,[L]DBG_SRCFIC,[L]DBG_SRCFIC_TAILLE)
+      Endif
+    Endif
+
+  Else
+    [LDB]DBG_TRASRC = 0   : # On a pas les sources
+
+    If ![LDB]MOD_SOCKET :# si on n'est pas en mode debugger socket,
+      Raz [M:DBG]TRATRT, [LDB]DBG_LIGNE_COU
+
+      If [L]DBG_TRATRA<>2
+        If dim(GBROWS)>0 & GBROWS=0 : pcolor = GCOUL(0) : Endif
+        Titcol [M:DBG]TRATNB "",filpath("",[LDB]DGNOMPRG,"")
+        Affzo [DBG] 10
+      Endif
+    Else :# si on est en mode debugger java on recharge la ligne
+      If [LDB]DBG_TRACON=1
+        [LDB]DBG_TRACE = "Charge Ligne"
+        Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Trt",[L]DBG_FICHIER)
+        Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Src",[L]DBG_SRCFIC)
+        Call TRACE([LDB]DBG_TRACE)
+      Endif
+      For [L]DBG_I=0 To [LDB]NB_DGNOMPRG-1
+        If [LDB]PIL_DGNOMPRG([L]DBG_I)=[LDB]DGNOMPRG
+          # envoi de la commande "SOURCE_REMOVE = 12"
+          Call SEND_MESS1("12",[LDB]PIL_DGNOMPRG([L]DBG_I) )
+          # décalage des sources conservés
+          For [L]DBG_J=[L]DBG_I+1 To [LDB]NB_DGNOMPRG-1
+            [LDB]PIL_DGNOMPRG([L]DBG_J-1)=[LDB]PIL_DGNOMPRG([L]DBG_J)
+          Next [L]DBG_J
+          [LDB]NB_DGNOMPRG -= 1
+          Break
+        Endif
+      Next [L]DBG_I
+      Call CHARGE_SOURCE1([L]DBG_FICHIER,[L]DBG_SRCFIC,[L]DBG_SRCFIC_TAILLE,[L]DBG_DSC)
+    Endif
+  Endif
+Elsif [L]DBG_FICHIER=[LDB]DGNOMPRG & [LDB]MOD_SOCKET  # On recharge la ligne si on n'a pas le source
+  [LDB]DGNOMPRG = [L]DBG_FICHIER   : # mémo du source courant (Déclaré dans Subprog INIDBG)
+  [L]DBG_NL = instr( 1, [LDB]DGNOMPRG, '$' )
+  [L]DBG_SRCFIC = left$([LDB]DGNOMPRG,[L]DBG_NL-1)+".src"
+  [L]DBG_SRCFIC_TAILLE = filinfo(filpath("",[L]DBG_SRCFIC,""),7)
+  If [L]DBG_SRCFIC_TAILLE<0
+      If [LDB]DBG_TRACON=1
+        [LDB]DBG_TRACE = "Charge Ligne"
+        Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Trt",[L]DBG_FICHIER)
+        Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Src",[L]DBG_SRCFIC)
+        Call TRACE([LDB]DBG_TRACE)
+      Endif
+      For [L]DBG_I=0 To [LDB]NB_DGNOMPRG-1
+        If [LDB]PIL_DGNOMPRG([L]DBG_I)=[LDB]DGNOMPRG
+          Break
+        Endif
+      Next [L]DBG_I
+    # envoi de la commande "SOURCE_REMOVE = 12"
+      Call SEND_MESS1("12",[LDB]PIL_DGNOMPRG([L]DBG_I) )
+    # décalage des sources conservés
+      For [L]DBG_J=[L]DBG_I+1 To [LDB]NB_DGNOMPRG-1
+        [LDB]PIL_DGNOMPRG([L]DBG_J-1)=[LDB]PIL_DGNOMPRG([L]DBG_J)
+      Next [L]DBG_J
+      [LDB]NB_DGNOMPRG -= 1
+      Call CHARGE_SOURCE1([L]DBG_FICHIER,[L]DBG_SRCFIC,[L]DBG_SRCFIC_TAILLE,[L]DBG_DSC)
+  Endif
+Endif
+
+#-----------------------------------------------------------------------------
+# niv0 - gestion des couleurs
+#-----------------------------------------------------------------------------
+If ![LDB]MOD_SOCKET
+  # JML 27/06/00 Pas besoin de colorisation pour faire X
+  If [L]DBG_TRATRA<>2
+   [M:DBG]TRACOU([L]DBG_NUM_LIG-1) = "X"
+  Endif
+
+  # JML 16/09/99, pour ceux qui n'ont pas les sources...
+  If  [L]DBG_TRATRA<>2 & ![LDB]DBG_TRASRC
+    If [LDB]DBG_LIGNE_COU<>[L]DBG_NUM_LIG
+      [M:DBG]TRATRT([L]DBG_NUM_LIG-1) = [L]DBG_DSC
+      [LDB]DBG_LIGNE_COU = [L]DBG_NUM_LIG
+    Else
+      [M:DBG]TRATRT([L]DBG_NUM_LIG-1) -= ":"-[L]DBG_DSC
+    Endif
+   [M:DBG]TRATNB = [L]DBG_NUM_LIG
+   Affzo [DBG]TRATRT([L]DBG_NUM_LIG-1)
+  Endif
+Endif
+
+# Recherche de Subprog pour mettre des variables
+# On empile le niveau précédent
+
+Raz [L]DBG_CHAINEA
+
+#-----------------------------------------------------------------------------
+# niv0 - gestion des lignes "Subprog"
+# si on n'est pas en mode d'affichage JAVA
+# si on a un source
+# si la Ligne courante du TRT commence par "SUBPROG"
+#-----------------------------------------------------------------------------
+If ![LDB]MOD_SOCKET & [LDB]DBG_TRASRC & instr(1,toupper([L]DBG_DSC),"SUBPROG")
+
+ If [LDB]NIV_CALL<[LDB]NB_CALL_MAX-1
+  If [LDB]NIV_CALL>0 & [LDB]NB_ARG([LDB]NIV_CALL)>0
+   # On commence par virer les arguments en cours
+   For [L]DBG_I=[M:DBG]TRAVNB-1 To 0 Step -1
+    If [M:DBG]TRANIV([L]DBG_I)=[LDB]NIV_CALL
+     Dela [L]DBG_I, 1 [M:DBG]TRAVNB
+     [M:DBG]TRAVNB -= 1
+    Endif
+   Next [L]DBG_I
+  Endif
+  [LDB]NIV_CALL += 1
+  Raz [LDB]NB_ARG([LDB]NIV_CALL)
+  For [L]DBG_I=0 To [LDB]NB_VAR_MAX-1
+   Raz [LDB]TRA_EXP([L]DBG_I,[LDB]NIV_CALL)
+  Next [L]DBG_I
+  [L]DBG_NL = instr(1,[M:DBG]TRATRT([L]DBG_NUM_LIG-1),"(")
+  If [L]DBG_NL>0
+   [L]DBG_CHAINEA = right$([M:DBG]TRATRT([L]DBG_NUM_LIG-1),[L]DBG_NL+1)
+  Endif
+  While [L]DBG_NL>0
+   [L]DBG_NL = instr(1,[L]DBG_CHAINEA,",")
+   If [L]DBG_NL<=0
+    [L]DBG_NL = instr(1,[L]DBG_CHAINEA,")")
+   Endif
+   If [L]DBG_NL>0 & left$([L]DBG_CHAINEA,[L]DBG_NL-1)<>"(" : # Cas pas d'argument
+    If [M:DBG]TRAVNB<[LDB]NB_VAR_MAX
+     [M:DBG]TRAEXP([M:DBG]TRAVNB) = left$([L]DBG_CHAINEA,[L]DBG_NL-1)
+     [M:DBG]TRANIV([M:DBG]TRAVNB) = [LDB]NIV_CALL
+     [M:DBG]TRAVNB += 1
+
+     [LDB]TRA_EXP([LDB]NB_ARG([LDB]NIV_CALL),[LDB]NIV_CALL) = left$([L]DBG_CHAINEA,[L]DBG_NL-1)
+     [LDB]NB_ARG([LDB]NIV_CALL) += 1
+
+     [L]DBG_CHAINEA = right$([L]DBG_CHAINEA,[L]DBG_NL+1)
+     If [L]DBG_CHAINEA=""
+      [L]DBG_NL = 0 : # On se casse ...
+     Endif
+    Else
+     [L]DBG_NL = 0 : # On se casse...
+    Endif : #     If [M:DBG]TRAVNB<[LDB]NB_VAR_MAX
+   Endif : #    If [L]DBG_NL>0 & left$([L]DBG_CHAINEA,[L]DBG_NL-1)<>"("
+  Wend
+ Endif : # If [LDB]NIV_CALL<[LDB]NB_CALL_MAX
+
+#-----------------------------------------------------------------------------
+# niv0 - gestion des lignes "end"
+# si on n'est pas en mode d'affichage JAVA
+# si on a un source
+# si la Ligne courante du TRT commence par "END"
+#-----------------------------------------------------------------------------
+Elsif ![LDB]MOD_SOCKET & [LDB]DBG_TRASRC & instr(1,toupper([L]DBG_DSC),"END") :
+
+
+ # Il faut dépiler le niveau et recharger les variables
+ If [LDB]NB_ARG([LDB]NIV_CALL)>0
+  # On commence par virer les arguments en cours
+  For [L]DBG_I=[M:DBG]TRAVNB-1 To 0 Step -1
+   If [M:DBG]TRANIV([L]DBG_I)=[LDB]NIV_CALL
+    Dela [L]DBG_I, 1 [M:DBG]TRAVNB
+    [M:DBG]TRAVNB -= 1
+   Endif
+  Next [L]DBG_I
+ Endif
+ If [LDB]NIV_CALL>0
+  [LDB]NIV_CALL -= 1
+  [L]DBG_I = 0
+  While [L]DBG_I<=[LDB]NB_ARG([LDB]NIV_CALL)-1
+   [M:DBG]TRAEXP([M:DBG]TRAVNB) = [LDB]TRA_EXP([L]DBG_I,[LDB]NIV_CALL)
+   [M:DBG]TRANIV([M:DBG]TRAVNB) = [LDB]NIV_CALL
+   [M:DBG]TRAVNB += 1
+   [L]DBG_I += 1
+  Wend
+ Endif
+Endif : # If instr(1,toupper([L]DBG_DSC),"SUBPROG")
+
+# Fin Break point bidon pour sauter Gosub
+If ![LDB]MOD_SOCKET & [LDB]NO_BPT_GOSUB<>0
+ Dela [LDB]NO_BPT_GOSUB-1 , 1 [M:DBG]TRABNB
+ [M:DBG]TRABNB -= 1
+ Raz [LDB]NO_BPT_GOSUB
+Endif
+
+#-----------------------------------------------------------------------------
+## JML 29/03/00 V130 Suggestion, essayer de préserver l'environnement
+#-----------------------------------------------------------------------------
+
+[S]fstat   = [LDB]DBG_FSTAT
+[S]indice  = [LDB]DBG_INDICE
+[S]mkstat  = [LDB]DBG_MKSTAT
+[S]nolign  = [LDB]DBG_NOLIGN
+[S]nolign1 = [LDB]DBG_NOLIGN1
+[S]pcolor  = [LDB]DBG_PCOLOR
+[S]stat1   = [LDB]DBG_STAT1
+[S]status  = [LDB]DBG_STATUS
+[S]titre   = [LDB]DBG_TITRE
+[S]zoncou  = [LDB]DBG_ZONCOU
+[S]zonsor  = [LDB]DBG_ZONSOR
+[S]zonsui  = [LDB]DBG_ZONSUI
+If dim(APARAM)>-1 : APARAM = [LDB]DBG_APARAM : Endif
+[S]adxifs  = [L]DBG_SAVIFS
+[S]adxirs  = [L]DBG_SAVIRS
+[S]adxium  = [L]DBG_SAVIUM
+
+#-----------------------------------------------------------------------------
+# niv0 - Affichage des Expressions
+# si on n'est pas en mode d'affichage JAVA
+# si TRATRA ???
+#-----------------------------------------------------------------------------
+
+If ![LDB]MOD_SOCKET & [L]DBG_TRATRA<>2
+ If [LDB]DBG_COLOR
+  pcolor = GCOUL(1)
+  Affzo [DBG]TRACOU([L]DBG_NUM_LIG-1), TRATRT([L]DBG_NUM_LIG-1), 15
+  pcolor = GCOUL(0)
+ Else
+  Affzo [DBG] 15
+ Endif
+
+ Repeat
+  zonsui = "TRATNB("+num$([L]DBG_NUM_LIG-1)+")"
+
+ $SAI
+  Boxinp [DBG] Using [L]DBG_OPT
+  Case [L]DBG_OPT
+   When 1799,55    : Goto SAI
+   When GSTABOU2+4 : # Attention si vous cliquez sur Ok vous serez déconnecté
+    Wrnbox mess(151,151,1) Titled mess(66,123,1) Using [L]DBG_OK : # Avertissement
+    If [L]DBG_OK=1 : Reb =0 : Endif
+   When GSTABOU2   : Call CLASSE_VARDBG
+  Endcase
+
+  #-----------------------------------------------------------------------------
+  # JML 18/03/99 tentative de fusion Instruction et Continuer
+  # si on a un source
+  # si l'utilisateur à cliquer sur "Continuer"
+  # si la Ligne courante du TRT commence par "GOSUB"
+  #-----------------------------------------------------------------------------
+
+  If [LDB]DBG_TRASRC & [L]DBG_OPT=203 & instr(1,toupper([L]DBG_DSC),"GOSUB")
+
+   # On va essayer de le sauter ...
+   [L]DBG_NL = [L]DBG_NUM_LIG-1  : # On veut l'indice
+   [LDB]DBG_POSITION = instr(1,toupper([M:DBG]TRATRT([L]DBG_NL)),"GOSUB") : # En attendant JCD
+   # JML 29/03/99, y a t'il d'autres instructions sur la même ligne avec : ?
+   [LDB]DBG_POSITION  = instr([LDB]DBG_POSITION,[M:DBG]TRATRT([L]DBG_NL),":")
+
+   If ![LDB]DBG_POSITION
+    [LDB]DBG_POSITION = 0 : # Pour passer à la ligne suivante
+   Else : # JML 17/10/00 Couillonné par Gosub From ="XX"+[F:yyy]TOTO
+    [L]DBG_CHAINEA = toupper(mid$([M:DBG]TRATRT([L]DBG_NL),[LDB]DBG_POSITION-2,3))
+    If find([L]DBG_CHAINEA,"[F:","[M:")
+     [LDB]DBG_POSITION = 0 : # Pour passer à la ligne suivante
+    Endif
+   Endif
+
+   For [L]DBG_NL=[L]DBG_NL To [M:DBG]TRATNB-1
+    # Si le caractère suivant est un commentaire, on saute
+    # Si c'est Else, Endif,etc... on saute aussi
+    If vireblc([M:DBG]TRATRT([L]DBG_NL),4)="" : # Dans toute la chaine
+     [L]DBG_OK = -1 : # Pour arreter While sans faire le Break dans le For...
+    Else
+     [L]DBG_OK = 1
+    Endif
+    While [L]DBG_OK=1 & [LDB]DBG_POSITION
+     For [L]DBG_J=0 To [LDB]DBG_NB_EXCEPT-1
+      If instr(1,toupper(vireblc(right$([M:DBG]TRATRT([L]DBG_NL),[LDB]DBG_POSITION+1),4))
+&               ,[LDB]DBG_EXCEPT_GOSUB([L]DBG_J))=1
+&      | vireblc(right$([M:DBG]TRATRT([L]DBG_NL),[LDB]DBG_POSITION+1),4)=""
+       # Si mot réservé en 1ère position, il faut voir plus loin ...
+       # OU si le reste de la ligne est vide
+       If find([L]DBG_J,1,2)  : # Elsif, Else
+        [LDB]DBG_MOTCLED = "IF"
+        [LDB]DBG_MOTCLEF = "ENDIF"
+        Gosub RECHERCHE_FIN
+       Elsif find([L]DBG_J,4) : # When
+        [LDB]DBG_MOTCLED = "CASE"
+        [LDB]DBG_MOTCLEF = "ENDCASE"
+        Gosub RECHERCHE_FIN
+       Elsif find([L]DBG_J,0) : # '#'
+        # Pas la peine de continuer l'analyse
+        [LDB]DBG_POSITION = len([M:DBG]TRATRT([L]DBG_NL))+1
+       Endif
+       [L]DBG_OK = 0 : Break
+      Endif
+     Next [L]DBG_J
+     If [L]DBG_OK
+      # Ce n'est pas réservé, on s'arrete ici
+      Gosub BPT_GOSUB
+      [L]DBG_OK = 0 : # Pour arreter la boucle infernale...
+     Else
+      # Mot réservé, on regarde si : encore sur même ligne mais après
+      [LDB]DBG_POSITION  = instr([LDB]DBG_POSITION+1,[M:DBG]TRATRT([L]DBG_NL),":")
+      [L]DBG_OK          = 1 : # On repart pour un tour ....
+     Endif
+    Wend : # While [L]DBG_OK & [LDB]DBG_POSITION
+
+    If ![L]DBG_OK
+     # On a notre bonheur ...
+     Break
+    Else
+     [L]DBG_OK         = 1
+     [LDB]DBG_POSITION = -1 : # Pour right$
+    Endif
+   Next [L]DBG_NL
+
+  #-----------------------------------------------------------------------------
+  # si l'utilisateur à cliquer sur "Continuer"
+  # si TRABNB = 0 ???
+  #-----------------------------------------------------------------------------
+
+  Elsif [L]DBG_OPT=203 & [M:DBG]TRABNB=0
+
+   # On met la valeur comme avant, même si on n'a pas les sources !
+   [L]DBG_OPT = 202 : # On simule l'ancien bouton Instruction
+  Endif
+
+  [L]DBG_BNB = [M:DBG]TRABNB
+  For [L]DBG_I = 0 To [L]DBG_BNB-1
+   # JML 15/09/99 Le moteur à besoin de : Machine@nomap.TRT/Nom_trt
+   # Surtout quand on est dans appli fille et que TRT dans la mère ...
+   # mb 23.1.7 il faut renvoyer le nom du trt:no ligne
+
+   [L]DBG_OK     = 0
+   [L]DBG_SRCFIC = [M:DBG]TRABPT([L]DBG_I)
+   # On commence par virer :No_ligne
+   [L]DBG_K      = instr(1,[L]DBG_SRCFIC,":")
+   If [L]DBG_K
+    [L]DBG_CHAINEA  = right$([L]DBG_SRCFIC,[L]DBG_K)  : # On garde :
+    [L]DBG_SRCFIC  = left$([L]DBG_SRCFIC,[L]DBG_K-1)
+    [L]DBG_NOM_TRT = [L]DBG_SRCFIC
+   Else
+    [L]DBG_OK     = 1
+   Endif
+
+   # Maintenant que :No_ligne n'est plus, c'est quoi le chemin absolu ?
+   [L]DBG_SRCFIC = filpath("TRT",[L]DBG_SRCFIC,"adx",-1)
+
+   [L]DBG_K = instr(1,[L]DBG_SRCFIC,nomap) : # Si on est sur nomap, y'a rien à faire !
+   If ![L]DBG_K | !find(mid$([L]DBG_SRCFIC,[L]DBG_K+len(nomap),1),"/","\")
+    # Y'a t'il une machine ?
+    [L]DBG_NOM_MACHINE = ""
+    [L]DBG_K           = instr(1,[L]DBG_SRCFIC,"@")
+    If [L]DBG_K
+     [L]DBG_NOM_MACHINE = left$([L]DBG_SRCFIC,[L]DBG_K-1)
+     [L]DBG_SRCFIC      = right$([L]DBG_SRCFIC,[L]DBG_K+1)
+    Endif
+
+    [L]DBG_J = find([L]DBG_NOM_MACHINE,adxmac(0),adxmac(1),adxmac(2))
+    If [L]DBG_J
+     Case GOS([L]DBG_J-1)
+      When "unix" : [L]DBG_J = 1
+      When "dos"  : [L]DBG_J = 2
+     Endcase
+    Endif
+
+    If [L]DBG_J=2 : # Windows, ton monde impitoyable
+     [L]DBG_K      = instr(1,[L]DBG_SRCFIC,"\TRT\")
+    Else
+     [L]DBG_K      = instr(1,[L]DBG_SRCFIC,"/TRT/")
+    Endif
+
+    If [L]DBG_K
+     [L]DBG_NOM_TRT   = right$([L]DBG_SRCFIC,[L]DBG_K+5)
+     [L]DBG_SRCFIC    = left$([L]DBG_SRCFIC,[L]DBG_K-1)
+     # Maintenant le nom de l'appli ?
+     For [L]DBG_J=len([L]DBG_SRCFIC) To 1 Step-1
+      If find(mid$([L]DBG_SRCFIC,[L]DBG_J,1),"/","\")
+       Break
+      Endif
+     Next [L]DBG_J
+     If [L]DBG_J<1
+      [L]DBG_OK     = 2
+     Else
+      [L]DBG_NOM_APPLI = seg$([L]DBG_SRCFIC,[L]DBG_J+1,[L]DBG_K-1)
+      # Y'a plus qu'a virer le .adx
+      [L]DBG_K         = instr(1,[L]DBG_NOM_TRT,".adx")
+      If [L]DBG_K
+       [L]DBG_NOM_TRT = left$([L]DBG_NOM_TRT,[L]DBG_K-1)
+      Else
+       [L]DBG_OK     = 3
+      Endif
+     Endif
+    Else
+     [L]DBG_OK     = 4
+    Endif
+   Endif
+
+   If [L]DBG_OK
+    [L]DBG_BNF([L]DBG_I) = [M:DBG]TRABPT([L]DBG_I)
+   Else : # On recompose le bon nom pour le moteur !
+    If [L]DBG_NOM_MACHINE="" | [L]DBG_NOM_MACHINE=adxmac(0)
+     If [L]DBG_NOM_APPLI=nomap | [L]DBG_NOM_APPLI=""
+      [L]DBG_BNF([L]DBG_I) = [L]DBG_NOM_TRT+[L]DBG_CHAINEA
+     Else
+      [L]DBG_BNF([L]DBG_I) = [L]DBG_NOM_APPLI+"."+[L]DBG_NOM_TRT+[L]DBG_CHAINEA
+     Endif
+    Else
+     [L]DBG_BNF([L]DBG_I) = [L]DBG_NOM_MACHINE+"@"+[L]DBG_NOM_APPLI+"."+[L]DBG_NOM_TRT+[L]DBG_CHAINEA
+    Endif
+   Endif
+  Next [L]DBG_I
+ Until [L]DBG_OPT<>GSTABOU2
+
+#-----------------------------------------------------------------------------
+# niv0
+# si on est en mode de fonctionnement "SOCKET"
+#-----------------------------------------------------------------------------
+
+Elsif [LDB]MOD_SOCKET
+
+  # Commencer par donner la position
+  Seek 0 Using [OPS]
+
+
+  # On calcule les expression de chacune des variables (cf. variables sauvegardées)
+  Local Char    DBG_VARS(250)(15)    : # table de travail pour les évaluations des variables (au plus 15)
+  Call CALC_EXPVARS([LDB]DBG_TRAEXP,[LDB]DBG_TRAVNB,[LDB]DBG_TABZONSVG,[L]DBG_VARS)
+
+  # On évalue les expression de chacune des variables... (attention: gosub !)
+  Gosub CALC_VALVARS
+
+  # On envoi la valeur de chacune les variables...
+  Call SEND_VALVARS([LDB]DBG_TRAEXP,[LDB]DBG_TRAVNB,[L]DBG_VARS)
+
+  #on libère la table des évaluations !
+  Kill DBG_VARS
+
+  #envoi de la commande "SOURCE_SETL = 13" (set line)
+  Call SEND_MESS2("13",[L]DBG_FICHIER,[L]DBG_NUM_LIG)
+
+ Repeat
+
+  #envoi de la commande "USER = 99" pour rendre la main à l'utilisateur avant d'attendre une commande !
+  Call SEND_MESS0("99")
+
+  # Maintenant on donne la main pour connaitre la suite ...
+  # On attend un caractère BEL
+  Repeat
+   Getseq 1,[L]DBG_UNCAR Using [OPS]
+  Until [L]DBG_UNCAR= 7
+
+  #lecture de l'entête ""
+  Call READ_IN_SOCK(1,[L]DBG_VERSION )
+  Call READ_IN_SOCK(6,[L]DBG_TAILLE)
+  Call READ_IN_SOCK(2,[L]DBG_COMMANDE)
+  Call READ_IN_SOCK(1,[L]DBG_CIRCUIT)
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = "<- Mess"
+    Call TRACE_ADDCMDELIB([LDB]DBG_TRACE,[L]DBG_COMMANDE)
+    Call TRACE([LDB]DBG_TRACE)
+  Endif
+
+  # Lecture des données de n caractères
+  [L]DBG_DATA_SIZE = val([L]DBG_TAILLE)
+  Local Char DBG_READ_SOCK([L]DBG_DATA_SIZE)           :# définition à la bonne taille !
+  Call READ_IN_SOCK([L]DBG_DATA_SIZE,[L]DBG_READ_SOCK)
+
+  If [LDB]DBG_TRACON=1
+   [LDB]DBG_TRACE = "<- Mess data=["+[L]DBG_READ_SOCK+"]" : Call TRACE([LDB]DBG_TRACE)
+  Endif
+
+  ################################################################
+  # [L]DBG_OPT = 7     : # Status de sortie  du Boxinp
+  #                    : # 201 Ligne       : Passe à la ligne
+  #                    : # 202 Instruction : Saute les Call
+  #                    : # 203 Continuer   : Va au Break Point
+  #                    : # 007 Abandon
+  ################################################################
+
+  ##########################
+  # gestion de l'ancienne commandes RUN de la version 1
+  # "17" : SOURCE_RUN
+  # les autres sont gérées par le else final du rateau !
+  ##########################
+  If [L]DBG_COMMANDE="17" : [L]DBG_COMMANDE="44" :  Endif
+
+
+  ##########################
+  If [L]DBG_COMMANDE="41" :# SOURCE_STEP_IN_41
+  ##########################
+
+   [L]DBG_OPT = 201 : # Next ligne
+   If [LDB]DBG_TRACON=1 : [LDB]DBG_TRACE = "201 StepIn" : Call TRACE([LDB]DBG_TRACE) : Endif
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="42" :# SOURCE_STEP_OVER_42
+  ##########################
+
+    [L]DBG_OPT = 202 : #Instruction, Saute les Call
+    If [LDB]DBG_TRACON=1 : [LDB]DBG_TRACE = "202 StepOver" : Call TRACE([LDB]DBG_TRACE) : Endif
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="43" :# SOURCE_STEP_OUT_43
+  ##########################
+
+    [L]DBG_OPT = 204 : #Instruction, arret après le prochain end ou procahin Return
+    If [LDB]DBG_TRACON=1 : [LDB]DBG_TRACE = "204 StepOut" : Call TRACE([LDB]DBG_TRACE) : Endif
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="44" :# SOURCE_NEXTBKP_44
+  ##########################
+   [L]DBG_OPT = 203 : # Next break point
+   If [LDB]DBG_TRACON=1 : [LDB]DBG_TRACE = "203 Next bkp" : Call TRACE([LDB]DBG_TRACE) : Endif
+
+   # Ré-affectons les variables du moteur...
+   Raz [L]DBG_BNF
+   [L]DBG_BNB = [LDB]DBG_TRABNB
+   For [L]DBG_I = 0 To [L]DBG_BNB-1
+
+    [L]DBG_CHAINEA = [LDB]DBG_TRABPT([L]DBG_I)
+
+    If [LDB]DBG_TRACON=1
+       [LDB]DBG_TRACE = "- Def breakpoint("-num$([L]DBG_I)-")=["+[L]DBG_CHAINEA+"]"
+        Call TRACE([LDB]DBG_TRACE)
+    Endif
+
+
+    If left$([L]DBG_CHAINEA,1) = chr$(1)     #si c'est un break point "expression vérifiée"
+
+    Elsif left$([L]DBG_CHAINEA,1) = chr$(2)  #si c'est un break point "modif de variable"
+
+    Elsif left$([L]DBG_CHAINEA,1) = chr$(3)  #si c'est un break point "instruction"
+
+    Else                                     #si c'est un break  point "sur numéro de ligne"
+      # découpage de la définition du break  point par rapport au séparateur du numéro de ligne
+      [L]DBG_J = instr(1,[L]DBG_CHAINEA,":")
+      If [L]DBG_J>0
+        [L]DBG_CHAINEB = left$([L]DBG_CHAINEA,[L]DBG_J-1)
+        [L]DBG_NOM_MACHINE = [L]DBG_CHAINEB
+        Call EXTRACTSRVNAME([L]DBG_NOM_MACHINE)
+        [L]DBG_NOM_APPLI = [L]DBG_CHAINEB
+        Call EXTRACTAPPNAME([L]DBG_NOM_APPLI)
+        [L]DBG_NOM_TRT = [L]DBG_CHAINEB
+        Call EXTRACTTRTNAME([L]DBG_NOM_TRT)
+        #recup numéro de ligne
+        [L]DBG_CHAINEA = right$([L]DBG_CHAINEA,[L]DBG_J)
+         #si il n'y a pas de serveur
+         If [L]DBG_NOM_MACHINE="" | [L]DBG_NOM_MACHINE=adxmac(0)
+           #si l'appli est l'appli courante => NomDuTraitement:numligne
+           If [L]DBG_NOM_APPLI = nomap
+            [L]DBG_CHAINEA = [L]DBG_NOM_TRT + [L]DBG_CHAINEA
+           #sinon => NomAppli.NomDuTraitement:numligne
+           Else
+            [L]DBG_CHAINEA = [L]DBG_NOM_APPLI +"."+ [L]DBG_NOM_TRT + [L]DBG_CHAINEA
+           Endif
+         #sinon => NomMachine@NomAppli.NomDuTraitement:numligne
+         Else
+           [L]DBG_CHAINEA = [L]DBG_NOM_MACHINE +"@"+ [L]DBG_NOM_APPLI +"."+ [L]DBG_NOM_TRT + [L]DBG_CHAINEA
+         Endif
+      Endif
+    Endif
+
+    [L]DBG_BNF([L]DBG_I) = [L]DBG_CHAINEA
+    If [LDB]DBG_TRACON=1
+       [LDB]DBG_TRACE = "- Add breakpoint("-num$([L]DBG_I)-")=["+[L]DBG_CHAINEA+"]"
+       Call TRACE([LDB]DBG_TRACE)
+    Endif
+
+   Next [L]DBG_I
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="45" :# SOURCE_RUN_45
+  ##########################
+
+   # Run (On se casse ...)
+   [L]DBG_OPT = 7
+   If [LDB]DBG_TRACON=1 : [LDB]DBG_TRACE = "7 run" : Call TRACE([LDB]DBG_TRACE) : Endif
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="46" :# SOURCE_RUN_DBGOFF_46
+  ##########################
+
+   # Run (On se casse ...) + on invalide le debugger
+   dbgmode(0)=0
+   [L]DBG_OPT = 7
+   If [LDB]DBG_TRACON=1 : [LDB]DBG_TRACE = "7 run + dbgmode(0)=0" : Call TRACE([LDB]DBG_TRACE) : Endif
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="05" :# CMDE_SAVE_05
+  ##########################
+
+    # récup du nom du mémo
+    [L]DBG_I = instr(1,[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+    [L]DBG_CHAINEA = toupper(left$([L]DBG_READ_SOCK,[L]DBG_I-1))
+    [L]DBG_CHAINEB = [L]DBG_CHAINEA
+    Call BUILD_CTXFILENAME([L]DBG_CHAINEB)
+
+    If [LDB]DBG_TRACON=1
+        [LDB]DBG_TRACE = "Save ctx ["-[L]DBG_CHAINEA -"] file=["+[L]DBG_CHAINEB+"]"
+        Call TRACE([LDB]DBG_TRACE)
+    Endif
+
+    # sauvegarde du contexte en passant
+    # le nom du contexte
+    # le tableaux des breakpoints, le nombre de breakpoint(s)
+    # le tableaux des variables, le nombre de variable(s)
+    # la pile des sources, le nombre de source(s)
+    Call CONTEXT_SAVE([L]DBG_CHAINEB,[LDB]DBG_TRABPT,[LDB]DBG_TRABNB
+&         ,[LDB]DBG_TRAEXP,[LDB]DBG_TRAVNB,[LDB]PIL_DGNOMPRG,[LDB]NB_DGNOMPRG)
+    [L]DBG_OPT = GSTABOU2
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="06" :# CMDE_LOAD_06
+  ##########################
+
+    # récup du nom du mémo
+    [L]DBG_I = instr(1,[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+    [L]DBG_CHAINEA = toupper(left$([L]DBG_READ_SOCK,[L]DBG_I-1))
+    [L]DBG_CHAINEB = [L]DBG_CHAINEA
+    Call BUILD_CTXFILENAME([L]DBG_CHAINEB)
+
+    If [LDB]DBG_TRACON=1
+         [LDB]DBG_TRACE = "Load ctx=["+[L]DBG_CHAINEA+"] file=["+[L]DBG_CHAINEB+"]"
+         Call TRACE([LDB]DBG_TRACE)
+    Endif
+
+    [L]DBG_J  = filinfo(filpath("",[L]DBG_CHAINEB,""),7)
+    If [L]DBG_J>0
+      Call SEND_CLEAN()
+      # rechargement du contexte en passant
+      # le nom du contxte
+      # le tableaux des breakpoints, le nombre de breakpoint(s)
+      # le tableaux des variables, le nombre de variable(s)
+      # la pile des sources, le nombre de source(s)
+      Call CONTEXT_LOAD([L]DBG_CHAINEB,[LDB]DBG_TRABPT,[LDB]DBG_TRABNB
+&          ,[LDB]DBG_TRAEXP,[LDB]DBG_TRAVNB,[LDB]PIL_DGNOMPRG,[LDB]NB_DGNOMPRG)
+      # on redéclare tous les sources
+      Call SEND_ADDSRCS([LDB]PIL_DGNOMPRG,[LDB]NB_DGNOMPRG)
+      # on redéclare toutes les breakpoints
+      Call SEND_ADDBKPS([LDB]DBG_TRABPT,[LDB]DBG_TRABNB)
+      # on redéclare toutes les variables, la valeur de chacunes des variables sera envoyée au prochain Step
+      Call SEND_ADDVARS([LDB]DBG_TRAEXP,[LDB]DBG_TRAVNB)
+      #envoi de la commande "SOURCE_SETL = 13" (set line)
+      Call SEND_MESS2("13",[L]DBG_FICHIER,[L]DBG_NUM_LIG)
+    Else
+      Call SEND_MESS3("04","Info",2,"Context ["+[L]DBG_CHAINEA+"] does not exist.")
+    Endif
+    [L]DBG_OPT = GSTABOU2
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="18" :# SOURCE_OPEN
+  ##########################
+
+   # récup du nom du source et calcul du path
+   [L]DBG_I = instr(1,[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+   [L]DBG_FICHIER = toupper(left$([L]DBG_READ_SOCK,[L]DBG_I-1))
+   [L]DBG_SRCFIC = filpath("TRT",[L]DBG_FICHIER,"src")
+
+   If [LDB]DBG_TRACON=1
+      [LDB]DBG_TRACE = "Source open (18)"
+      Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Name",[L]DBG_FICHIER )
+      Call TRACE_ADDPARAM([LDB]DBG_TRACE,"Path",[L]DBG_SRCFIC )
+      Call TRACE([LDB]DBG_TRACE)
+   Endif
+
+   #A-t-on le source (taille>0) ?
+   [L]DBG_SRCFIC_TAILLE = filinfo([L]DBG_SRCFIC,7)
+   If [L]DBG_SRCFIC_TAILLE>0
+    If ![LDB]MOD_SOCKET
+     [LDB]DBG_TRASRC = 1 : # On a le sources
+    Endif
+    [L]DBG_EXEFIC = filpath("TRT",[L]DBG_FICHIER,"adx",-1)
+    [L]DBG_I = instr(1,[L]DBG_EXEFIC,"@")
+    If [L]DBG_I
+     [L]DBG_NOM_MACHINE = left$([L]DBG_EXEFIC,[L]DBG_K-1)
+     [L]DBG_EXEFIC      = right$([L]DBG_EXEFIC,[L]DBG_K+1)
+    Else
+     [L]DBG_NOM_MACHINE = ""
+    Endif
+    [L]DBG_I = find([L]DBG_NOM_MACHINE,adxmac(0),adxmac(1),adxmac(2))
+    If [L]DBG_I
+     Case GOS([L]DBG_I-1)
+      When "unix" : [L]DBG_I = 1
+      When "dos"  : [L]DBG_I = 2
+     Endcase
+    Endif
+    If [L]DBG_I=2 : # Windows, ton monde impitoyable
+     [L]DBG_K = instr(1,[L]DBG_EXEFIC,"\TRT\")
+    Else
+     [L]DBG_K = instr(1,[L]DBG_EXEFIC,"/TRT/")
+    Endif
+    If [L]DBG_K
+     [L]DBG_NOM_TRT = right$([L]DBG_EXEFIC,[L]DBG_K+5)
+     [L]DBG_EXEFIC  = left$([L]DBG_EXEFIC,[L]DBG_K-1)
+     # Maintenant le nom de l'appli ?
+     For [L]DBG_J=len([L]DBG_EXEFIC) To 1 Step-1
+      If find(mid$([L]DBG_EXEFIC,[L]DBG_J,1),"/","\")
+       Break
+      Endif
+     Next [L]DBG_J
+     If [L]DBG_J
+      [L]DBG_NOM_APPLI = seg$([L]DBG_EXEFIC,[L]DBG_J+1,[L]DBG_K-1)
+      [L]DBG_K = instr(1,[L]DBG_NOM_TRT,".adx")
+      If [L]DBG_K
+       [L]DBG_NOM_TRT = left$([L]DBG_NOM_TRT,[L]DBG_K-1)
+       # On recompose le bon nom pour le moteur !
+       If [L]DBG_I=2 : # Windows
+#        [L]DBG_FICHIER = [L]DBG_NOM_MACHINE+"@"+[L]DBG_NOM_APPLI+".TRT\"+[L]DBG_NOM_TRT+"$adx"
+        [L]DBG_FICHIER = [L]DBG_NOM_MACHINE+"@"+[L]DBG_NOM_APPLI+".TRT/"+[L]DBG_NOM_TRT+"$adx"
+       Else
+        [L]DBG_FICHIER = [L]DBG_NOM_MACHINE+"@"+[L]DBG_NOM_APPLI+".TRT/"+[L]DBG_NOM_TRT+"$adx"
+       Endif
+      Endif
+     Endif
+    Endif
+
+    # si le source n'est pas dans la liste => on le charge
+    If !find([L]DBG_FICHIER,[LDB]PIL_DGNOMPRG(0..[LDB]NB_DGNOMPRG-1))
+
+     Call CHARGE_SOURCE([L]DBG_FICHIER,[L]DBG_SRCFIC,[L]DBG_SRCFIC_TAILLE)
+
+    Else
+      # On envoi un message avec titre boite;code(1=erreur, 2=info, 3=warning);texte
+      Call SEND_MESS3("04","Info",2,"Source already open")
+
+    Endif
+   Else
+     # On envoi un message avec titre boite;code(1=erreur, 2=info, 3=warning);texte
+     Call SEND_MESS3("04","Error",1,"Source not available")
+
+   Endif
+   [L]DBG_OPT = GSTABOU2
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="21" :# BKP_ADD
+  ##########################
+
+   # si il y a encore de la place dans le tableau
+   If [LDB]DBG_TRABNB >= [LDB]NB_BPT_MAX
+      # On envoi un message avec titre boite;code(1=erreur, 2=info, 3=warning);texte
+      Call SEND_MESS3("04","Info",2,"Can't add breakpoint. There are already"
+&        - num$([LDB]DBG_TRABNB) -"breakpoints.")
+   Else
+     [L]DBG_I = instr(1,[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+     If [L]DBG_I
+       [L]DBG_CHAINEA = left$([L]DBG_READ_SOCK,[L]DBG_I-1)
+
+       # On récupère le No de ligne qui est entre [LDB]DBG_SEPAR et [LDB]DBG_SEPAR
+       [L]DBG_J = instr([L]DBG_I+len([LDB]DBG_SEPAR),[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+       [L]DBG_J = val(seg$([L]DBG_READ_SOCK,[L]DBG_I+len([LDB]DBG_SEPAR),[L]DBG_J-1))
+
+       # si numéro de ligne positif => c'est un brek point "sur numéro de ligne"
+       If [L]DBG_J>0
+
+          # si on a pas la forme canonique du type '@X3BUG.TRT/EXEFNC$adx'
+          [L]DBG_K = instr(1,[L]DBG_CHAINEA,"$adx")
+          If [L]DBG_K = 0
+
+            Call ISSOURCEEXIST([L]DBG_CHAINEA,[L]DBG_K)
+            If [L]DBG_K = 0
+             # On envoi un message avec titre boite;code(1=erreur, 2=info, 3=warning);texte
+             Call SEND_MESS3("04","Error",1,"Source not available")
+             [L]DBG_J = 0 : # pour indiquer qu'il y a une erreur
+            Else
+              # s'il y a un point, le dossier est spécifié
+              [L]DBG_K = instr(1,[L]DBG_CHAINEA,".")
+              If [L]DBG_K = 0
+                [L]DBG_CHAINEA = "@"+nomap+".TRT/"+[L]DBG_CHAINEA+"$adx"
+              Else
+                [L]DBG_CHAINEA = "@"+left$([L]DBG_CHAINEA,[L]DBG_K-1)
+                [L]DBG_CHAINEA  += ".TRT/"+right$([L]DBG_CHAINEA,[L]DBG_K+1)+"$adx"
+              Endif
+            Endif
+          Endif
+         # ajout du BKP si on a pas mis le numéro de ligne à zéro (erreur)
+         If [L]DBG_J>0
+           [LDB]DBG_TRABPT([LDB]DBG_TRABNB) = [L]DBG_CHAINEA+":"+num$([L]DBG_J )
+           If [LDB]DBG_TRACON=1
+              [LDB]DBG_TRACE = "Add breakpoint numligne ["-[LDB]DBG_TRABPT([LDB]DBG_TRABNB)-"]"
+              Call TRACE([LDB]DBG_TRACE)
+           Endif
+         Endif
+       # si numéro de ligne = -1  => c'est un brek point "expression vérifiée"
+       Elsif [L]DBG_J = -1
+         [LDB]DBG_TRABPT([LDB]DBG_TRABNB) = chr$(1)+[L]DBG_CHAINEA
+         If [LDB]DBG_TRACON=1
+           [LDB]DBG_TRACE = "Add breakpoint condition ["-[LDB]DBG_TRABPT([LDB]DBG_TRABNB)-"]"
+            Call TRACE([LDB]DBG_TRACE)
+         Endif
+       # si numéro de ligne = -2  => c'est un brek point "modif de variable "
+       Elsif [L]DBG_J = -2
+         [LDB]DBG_TRABPT([LDB]DBG_TRABNB) = chr$(2)+[L]DBG_CHAINEA
+         If [LDB]DBG_TRACON=1
+                [LDB]DBG_TRACE = "Add breakpoint variable ["-[LDB]DBG_TRABPT([LDB]DBG_TRABNB)-"]"
+                Call TRACE([LDB]DBG_TRACE)
+         Endif
+       # si numéro de ligne = -3  => c'est un brek point "instruction "
+       Elsif [L]DBG_J = -3
+         [LDB]DBG_TRABPT([LDB]DBG_TRABNB) = chr$(3)+chr$(val([L]DBG_CHAINEA))
+         If [LDB]DBG_TRACON=1
+             [LDB]DBG_TRACE = "Add breakpoint instruction ["-[LDB]DBG_TRABPT([LDB]DBG_TRABNB)-"]"
+             Call TRACE([LDB]DBG_TRACE)
+         Endif
+       Endif
+
+       # envoi du BKP si on a pas mis le numéro de ligne à zéro (en cas d'erreur)
+       If ![L]DBG_J=0
+         #envoi du breakpoint au debugger Java pour affichage
+
+         Call SEND_MESS2("23",[L]DBG_CHAINEA,[L]DBG_J)
+         [LDB]DBG_TRABNB += 1
+       Endif
+     Endif
+   Endif
+   [L]DBG_OPT = GSTABOU2
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="22" :# BKP_REMOVE
+  ##########################
+
+   # Break point Remove
+   [L]DBG_I = instr(1,[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+   If [L]DBG_I
+    [L]DBG_CHAINEA = left$([L]DBG_READ_SOCK,[L]DBG_I-1)
+
+    # On récupère le No de ligne qui est entre [LDB]DBG_SEPAR et [LDB]DBG_SEPAR
+    [L]DBG_J = instr([L]DBG_I+len([LDB]DBG_SEPAR),[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+    [L]DBG_J = val(seg$([L]DBG_READ_SOCK,[L]DBG_I+len([LDB]DBG_SEPAR),[L]DBG_J-1))
+    # si numéro de ligne positif => c'est un brek point "sur numéro de ligne"
+    If [L]DBG_J>0
+      [L]DBG_CHAINEB = [L]DBG_CHAINEA + ":" + num$([L]DBG_J)
+      If [LDB]DBG_TRACON=1
+         [LDB]DBG_TRACE = "Rm  breakpoint ligne ["-[L]DBG_CHAINEB-"]" : Call TRACE([LDB]DBG_TRACE)
+      Endif
+     # si numéro de ligne = -1  => c'est un brek point "expression vérifiée"
+     Elsif [L]DBG_J = -1
+       [L]DBG_CHAINEB = chr$(1)+[L]DBG_CHAINEA
+       If [LDB]DBG_TRACON=1
+          [LDB]DBG_TRACE = "Rm  breakpoint condition ["-[L]DBG_CHAINEB-"]" : Call TRACE([LDB]DBG_TRACE)
+       Endif
+     # si numéro de ligne = -2  => c'est un brek point "modif de variable "
+     Elsif [L]DBG_J = -2
+       [L]DBG_CHAINEB = chr$(2)+[L]DBG_CHAINEA
+       If [LDB]DBG_TRACON=1
+          [LDB]DBG_TRACE = "Rm  breakpoint variable ["-[L]DBG_CHAINEB-"]" : Call TRACE([LDB]DBG_TRACE)
+       Endif
+     # si numéro de ligne = -3  => c'est un brek point "instruction "
+     Elsif [L]DBG_J = -3
+       [L]DBG_CHAINEB = chr$(3)+chr$(val([L]DBG_CHAINEA))
+       If [LDB]DBG_TRACON=1
+         [LDB]DBG_TRACE = "Rm  breakpoint instruction ["-[L]DBG_CHAINEB-"]" : Call TRACE([LDB]DBG_TRACE)
+       Endif
+     Endif
+    #recherche dans la table des breakpoints
+    [L]DBG_I = find([L]DBG_CHAINEB,[LDB]DBG_TRABPT(0..[LDB]DBG_TRABNB))
+    If [L]DBG_I
+     Dela [L]DBG_I-1, 1 [LDB]DBG_TRABPT
+     [LDB]DBG_TRABNB -= 1
+      #envoi de la suppression du breakpoint au debugger Java
+      Call SEND_MESS2("24",[L]DBG_CHAINEA,[L]DBG_J)
+    Endif
+   Endif
+   If [LDB]DBG_TRACON=1
+     [LDB]DBG_TRACE = "Pile break point="-num$([LDB]DBG_TRABNB) : Call TRACE([LDB]DBG_TRACE)
+   Endif
+   [L]DBG_OPT = GSTABOU2
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="31" :# VAR_ADD
+  ##########################
+
+   # Variable Add
+
+   If [LDB]DBG_TRAVNB >= [LDB]NB_VAR_MAX
+      # On envoi un message avec titre boite;code(1=erreur, 2=info, 3=warning);texte
+      Call SEND_MESS3("04","Info",2,"Can't add variable. There are already"
+&        - num$([LDB]NB_VAR_MAX) -"variables.")
+   Else
+     [L]DBG_I = instr(1,[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+     If [L]DBG_I
+       [LDB]DBG_TRAEXP([LDB]DBG_TRAVNB) = left$([L]DBG_READ_SOCK,[L]DBG_I-1)
+       If [LDB]DBG_TRACON=1
+         [LDB]DBG_TRACE = "Add var="-[LDB]DBG_TRAEXP([LDB]DBG_TRAVNB) : Call TRACE([LDB]DBG_TRACE)
+       Endif
+
+       #envoi de la commande "VAR_VALUE = 33"
+       [L]DBG_I = [LDB]DBG_TRAVNB
+       Onerrgo ERREUR_VAR_VALUE
+       # calcul de l'expression traduite et envoi de la valeur évaluée
+       Call CALC_EXPVAR([LDB]DBG_TRAEXP([L]DBG_I),[LDB]DBG_TABZONSVG,[L]DBG_CHAINEB)
+       Call SEND_MESS3("33",[LDB]DBG_TRAEXP([L]DBG_I),0,num$(evalue( [L]DBG_CHAINEB )))
+       Onerrgo ERREUR_DBG
+
+       [LDB]DBG_TRAVNB += 1
+
+     Endif
+   Endif
+   [L]DBG_OPT = GSTABOU2
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="32" :# VAR_REMOVE
+  ##########################
+
+   # Variable Remove
+   [L]DBG_I = instr(1,[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+   If [L]DBG_I
+     [L]DBG_CHAINEA = left$([L]DBG_READ_SOCK,[L]DBG_I-1)
+     [L]DBG_I=find([L]DBG_CHAINEA,[LDB]DBG_TRAEXP(0..[LDB]DBG_TRAVNB-1))
+     If [L]DBG_I
+      If [LDB]DBG_TRACON=1
+       [LDB]DBG_TRACE = "Remove var="-[LDB]DBG_TRAEXP([L]DBG_I-1) : Call TRACE([LDB]DBG_TRACE)
+      Endif
+      Dela [L]DBG_I-1,1 [LDB]DBG_TRAEXP
+      [LDB]DBG_TRAVNB -= 1
+     Endif
+   Endif
+
+   [L]DBG_OPT = GSTABOU2
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="36" :# VAR_AFFECT
+  ##########################
+
+    # Variable Affect
+    [L]DBG_I = instr(1,[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+    If [L]DBG_I
+      [L]DBG_CHAINEA = left$([L]DBG_READ_SOCK,[L]DBG_I-1)
+
+      # On récupère le la valeur qui est après le deuxième séparateur [LDB]DBG_SEPAR
+      [L]DBG_J = instr([L]DBG_I+len([LDB]DBG_SEPAR),[L]DBG_READ_SOCK,[LDB]DBG_SEPAR)
+      [L]DBG_CHAINEB = right$([L]DBG_READ_SOCK,[L]DBG_J+len([LDB]DBG_SEPAR))
+
+      If [LDB]DBG_TRACON=1
+       [LDB]DBG_TRACE = "Affect var=["+[L]DBG_CHAINEA+"] value=["+[L]DBG_CHAINEB+"]"
+       Call TRACE([LDB]DBG_TRACE)
+      Endif
+
+      [L]DBG_J = 1             :# hypthèse: l'affectation se passe bien
+      Onerrgo ERR_AFFECT_NOTOK :# l'indicateur [L]DBG_J est mis à zéro sil'affectation se passe mal
+      Case evalue("type("+[L]DBG_CHAINEA+")")
+        When 3             : Assign [L]DBG_CHAINEA With evalue("["+[L]DBG_CHAINEB+"]")
+        When 1,2,4,5,6,7,9 : Assign [L]DBG_CHAINEA With val([L]DBG_CHAINEB)
+        When Default       : Assign [L]DBG_CHAINEA With [L]DBG_CHAINEB
+      Endcase
+      Onerrgo ERREUR_DBG
+
+      # si l'affectation s'est mal passée
+      If [L]DBG_J = 0
+        Call SEND_MESS3("04","Err",1,"The variable ["+[L]DBG_CHAINEA
+&        +"] can't be assign with ["+[L]DBG_CHAINEB+"]")
+      Else
+        Onerrgo ERREUR_VAR_VALUE
+        # calcul de l'expression traduite et envoi de la valeur évaluée
+        Call CALC_EXPVAR([L]DBG_CHAINEA,[LDB]DBG_TABZONSVG,[L]DBG_CHAINEB)
+        Call SEND_MESS3("33",[L]DBG_CHAINEA,0,num$(evalue( [L]DBG_CHAINEB )))
+        Onerrgo ERREUR_DBG
+      Endif
+    Endif
+
+    [L]DBG_OPT = GSTABOU2
+
+  ##########################
+  Elsif [L]DBG_COMMANDE="51" :# STATE_ASK
+  ##########################
+
+    # envoi des "file", "mask" et "class" courante
+    Call SEND_MESS3("52","dbgstr",0,dbgstr(0))
+    Call SEND_MESS3("52","dbgstr",1,[LDB]DBG_DBGSTR)
+    Call SEND_MESS0("53")
+    [L]DBG_OPT = GSTABOU
+
+  ##########################
+  Else
+  ##########################
+
+    Call SEND_MESS3("04","Err",1,"Unknown command=["+[L]DBG_COMMANDEA
+&                +"]. Load the last version of the X3 Debugger.")
+
+   [L]DBG_OPT = 7
+  Endif
+
+ Until [L]DBG_OPT<>GSTABOU2
+
+#-----------------------------------------------------------------------------
+# niv0 - Affichage des Expressions
+# si on n'est pas en mode d'affichage JAVA
+# TRATRA=2 Mode trace
+#-----------------------------------------------------------------------------
+
+Elsif ![LDB]MOD_SOCKET
+
+
+ # JML 17/09/99 Débug export, conserver le fichier déjà ouvert
+ Raz [L]DBG_OPENI, [L]DBG_ADXSEEK
+ If adxcio(1)<>-1 : # Pbl tokenisation pour adxcio, jcd n'a pas envoyé rcptok à MGA
+                    # JML 17/09/99 De plus en 110 ADXCIO renvoi n'importe quoi, dixit JCD
+                    #              Sur Unix ADXNFS(0) renvoi '', sur NT @nomap.Nom_trt.src !!
+                    #              et Boum, mais la vache savait nager...
+  [L]DBG_OPENI(1)   = adxnfs(adxcio(1)) : # Toujours pbl token adxnfs !!
+  [L]DBG_ADXSEEK(1) = adxseek(1)
+ Endif
+
+ adxifs = ""
+ adxirs = chr$(10)
+
+ Openo [M:DBG]TRAFIC , -1 Using [DBG]  : # On conserve l'existant !
+
+ Wrseq format$("K:30X",[L]DBG_FICHIER)+"("+format$("N0:4",[L]DBG_NUM_LIG)+"):"; Using [DBG]
+ If [LDB]DBG_TRASRC : # On a les sources
+  Wrseq [M:DBG]TRATRT([L]DBG_NUM_LIG-1) Using [DBG]
+ Else
+  Wrseq [L]DBG_DSC Using [DBG]
+ Endif
+ # Maintenant au tour des variables
+ Raz [LDB]NB_TRATRAEXP, [LDB]TRATRA_EXP
+ For [L]DBG_OK=0 To [M:DBG]TRAVNB-1
+  If instr(1,[M:DBG]TRATRT([L]DBG_NUM_LIG-1),[M:DBG]TRAEXP([L]DBG_OK))
+   Onerrgo ERREUR
+   # JML/JC 18/10/99 X3 transforme fstat en Ctrl B ) et donc le wrseq est perdu
+   #                 Avec KT tout doit rentrer dans l'ordre
+   Wrseq format$("KT>:35X","(Avant)"-num$([M:DBG]TRAEXP([L]DBG_OK)))-":"; Using [DBG]
+   Wrseq num$(evalue([M:DBG]TRAEXP([L]DBG_OK))) Using [DBG]
+   Onerrgo
+   # JML 01/10/99 MAJ des variables pour connaitre valeur après execution de la ligne
+   If [LDB]NB_TRATRAEXP<[LDB]NB_VAR_MAX
+    [LDB]NB_TRATRAEXP += 1
+    [LDB]TRATRA_EXP([LDB]NB_TRATRAEXP) = [M:DBG]TRAEXP([L]DBG_OK)
+   Endif
+  Endif
+ Next [L]DBG_OK
+
+ Openo Using [DBG]
+
+ adxifs = [L]DBG_SAVIFS
+ adxirs = [L]DBG_SAVIRS
+ adxium = [L]DBG_SAVIUM
+
+Endif
+
+If ![LDB]MOD_SOCKET
+ [M:DBG]TRACOU([L]DBG_NUM_LIG-1) = ""
+ # JML 27/06/00 Pas besoin de colorisation pour faire X
+ If [L]DBG_TRATRA<>2
+  Affzo [DBG]TRACOU([L]DBG_NUM_LIG-1),TRATRT([L]DBG_NUM_LIG-1)
+ Endif
+Endif
+
+#-----------------------------------------------------------------------------
+## JML 29/03/00 V130 Suggestion, essayer de préserver l'environnement
+#-----------------------------------------------------------------------------
+
+[S]fstat   = [LDB]DBG_FSTAT
+[S]indice  = [LDB]DBG_INDICE
+[S]mkstat  = [LDB]DBG_MKSTAT
+[S]nolign  = [LDB]DBG_NOLIGN
+[S]nolign1 = [LDB]DBG_NOLIGN1
+[S]pcolor  = [LDB]DBG_PCOLOR
+[S]stat1   = [LDB]DBG_STAT1
+[S]status  = [LDB]DBG_STATUS
+[S]titre   = [LDB]DBG_TITRE
+[S]zoncou  = [LDB]DBG_ZONCOU
+[S]zonsor  = [LDB]DBG_ZONSOR
+[S]zonsui  = [LDB]DBG_ZONSUI
+If dim(APARAM)>-1 : APARAM = [LDB]DBG_APARAM : Endif
+[S]adxifs  = [L]DBG_SAVIFS
+[S]adxirs  = [L]DBG_SAVIRS
+[S]adxium  = [L]DBG_SAVIUM
+
+Onerrgo
+
+End
+
+
+######################################################################
+#
+######################################################################
+
+$CHARGE_TRT
+
+  # JML 24/07/00 Nbre lignes Max de l'écran
+ [L]DBG_NL_MAX = dim([M:DBG]TRATRT)
+
+  # JML 11/05/99 Débug import, conserver le fichier déjà ouvert
+  Raz [L]DBG_OPENI, [L]DBG_ADXSEEK
+  If adxcio(0)<>-1 : # Pbl tokenisation pour adxcio, jcd n'a pas envoyé rcptok à MGA
+                   # JML 17/09/99 De plus en 110 ADXCIO renvoi n'importe quoi, dixit JCD
+                   #              Sur Unix ADXNFS(0) renvoi '', sur NT @nomap.Nom_trt.src !!
+                   #              et Boum, mais la vache savait nager...
+   [L]DBG_OPENI(0)   = adxnfs(adxcio(0)) : # Toujours pbl token adxnfs !!
+   [L]DBG_ADXSEEK(0) = adxseek(0)
+  Endif
+
+  # Ouverture source pour chargement masque
+  Openi [L]DBG_SRCFIC Using [DBG]
+  [L]DBG_NL = 0
+
+  # Chargement du masque Client serveur non Web !
+  Rdseq [M:DBG]TRATRT([L]DBG_NL) Using [DBG]
+  If left$([M:DBG]TRATRT([L]DBG_NL),5) <> "#<Adx"
+    [L]DBG_NL += 1
+  Endif
+
+  Repeat
+    Rdseq [M:DBG]TRATRT([L]DBG_NL) Using [DBG]
+    [L]DBG_NL += 1
+  Until fstat <> 0 | [L]DBG_NL>=[L]DBG_NL_MAX
+
+  If [L]DBG_NL>=[L]DBG_NL_MAX
+    Call ERREUR(mess(26,100,1)) From GESECRAN
+  Endif
+
+  Openi Using [DBG]
+
+
+ [M:DBG]TRATNB = [L]DBG_NL
+
+  adxifs = [L]DBG_SAVIFS
+  adxirs = [L]DBG_SAVIRS
+  adxium  = [L]DBG_SAVIUM
+
+Return
+
+######################################################################
+#
+# extrait le nom de traitement de la forme canonique :
+# serveur@X3BUG.IAEXEC:68 ==> IAEXEC
+#
+######################################################################
+
+Subprog EXTRACTTRTNAME(DBGS_NAME)
+  Variable Char DBGS_NAME()
+  Local Integer WI
+  [L]WI  = instr(1,[L]DBGS_NAME,"$adx")
+  If [L]WI>0
+    [L]DBGS_NAME = left$([L]DBGS_NAME,[L]WI-1)
+    [L]WI  = instr(1,[L]DBGS_NAME,"TRT/")
+    If [L]WI=0
+      [L]WI  = instr(1,[L]DBGS_NAME,"TRT\")
+    Endif
+    If [L]WI>0
+      [L]DBGS_NAME = right$([L]DBGS_NAME,[L]WI+4)
+    Endif
+  Endif
+End
+
+######################################################################
+#
+# extrait le nom du dossier de la forme canonique :
+# serveur@X3BUG.IAEXEC:68 ==> X3BUG
+# s'il n'y a pas de "@", retourne ""
+#
+######################################################################
+
+Subprog EXTRACTAPPNAME(DBGS_NAME)
+  Variable Char DBGS_NAME()
+  Local Integer WI
+  [L]WI  = instr(1,[L]DBGS_NAME,"@")
+  If [L]WI>0
+    [L]DBGS_NAME = right$([L]DBGS_NAME,[L]WI+1)
+    [L]WI  = instr(1,[L]DBGS_NAME,".TRT/")
+    If [L]WI=0
+      [L]WI  = instr(1,[L]DBGS_NAME,".TRT\")
+    Endif
+    If [L]WI>0
+      [L]DBGS_NAME = left$([L]DBGS_NAME,[L]WI-1)
+    Endif
+  Else
+     [L]DBGS_NAME=""
+  Endif
+End
+
+######################################################################
+#
+# extrait le nom du serveur de la forme canonique :
+# serveur@X3BUG.TRT/IAEXEC$adx:68 ==> serveur
+# s'il n'y a pas de "@", retourne ""
+#
+######################################################################
+
+Subprog EXTRACTSRVNAME(DBGS_NAME)
+  Variable Char DBGS_NAME()
+  Local Integer WI
+  [L]WI  = instr(1,[L]DBGS_NAME,"@")
+  If [L]WI>0
+    [L]DBGS_NAME = left$([L]DBGS_NAME,[L]WI-1)
+  Else
+     [L]DBGS_NAME=""
+  Endif
+
+End
+
+######################################################################
+# recomposition d'un nom de traitement complet
+# retourne le nom de traitement complet dans [L]DBG_CHAINEB à partir
+# de [L]DBG_SRCFIC et [L]DBG_K
+######################################################################
+
+$BUILDFULLTRTNAME
+
+      # On commence par virer le No_ligne
+     [L]DBG_CHAINEA  = right$([L]DBG_SRCFIC,[L]DBG_K)  : # On garde le caractère ":"
+     [L]DBG_SRCFIC  = left$([L]DBG_SRCFIC,[L]DBG_K-1) :# qque chose comme "serveur@dossier.TRT/traitement$adx"
+     [L]DBG_NOM_TRT = [L]DBG_SRCFIC
+
+
+      # Maintenant que :No_ligne n'est plus, c'est quoi le chemin absolu ?
+      [L]DBG_SRCFIC = filpath("TRT",[L]DBG_SRCFIC,"adx",-1)
+
+      [L]DBG_K = instr(1,[L]DBG_SRCFIC,nomap) :     # Si on est sur nomap, y'a rien à faire !
+      If ![L]DBG_K | !find(mid$([L]DBG_SRCFIC,[L]DBG_K+len(nomap),1),"/","\")
+       # Y'a t'il une machine ?
+       [L]DBG_NOM_MACHINE = ""
+       [L]DBG_K           = instr(1,[L]DBG_SRCFIC,"@")
+       If [L]DBG_K
+        [L]DBG_NOM_MACHINE = left$([L]DBG_SRCFIC,[L]DBG_K-1)
+        [L]DBG_SRCFIC      = right$([L]DBG_SRCFIC,[L]DBG_K+1)
+       Endif
+
+       [L]DBG_J = find([L]DBG_NOM_MACHINE,adxmac(0),adxmac(1),adxmac(2))
+       If [L]DBG_J
+        Case GOS([L]DBG_J-1)
+         When "unix" : [L]DBG_J = 1
+         When "dos"  : [L]DBG_J = 2
+        Endcase
+       Endif
+
+       If [L]DBG_J=2 : # Windows, ton monde impitoyable
+        [L]DBG_K = instr(1,[L]DBG_SRCFIC,"\TRT\")
+       Else
+        [L]DBG_K = instr(1,[L]DBG_SRCFIC,"/TRT/")
+       Endif
+
+       If [L]DBG_K
+        [L]DBG_NOM_TRT = right$([L]DBG_SRCFIC,[L]DBG_K+5)
+        [L]DBG_SRCFIC  = left$([L]DBG_SRCFIC,[L]DBG_K-1)
+        # Maintenant le nom de l'appli ?
+        For [L]DBG_J=len([L]DBG_SRCFIC) To 1 Step-1
+         If find(mid$([L]DBG_SRCFIC,[L]DBG_J,1),"/","\")
+          Break
+         Endif
+        Next [L]DBG_J
+        If [L]DBG_J<1
+         [L]DBG_OK = 2
+        Else
+         [L]DBG_NOM_APPLI = seg$([L]DBG_SRCFIC,[L]DBG_J+1,[L]DBG_K-1)
+         # Y'a plus qu'a virer le .adx
+         [L]DBG_K = instr(1,[L]DBG_NOM_TRT,".adx")
+         If [L]DBG_K
+          [L]DBG_NOM_TRT = left$([L]DBG_NOM_TRT,[L]DBG_K-1)
+         Else
+          [L]DBG_OK = 3
+         Endif
+        Endif
+       Else
+        [L]DBG_OK = 4
+       Endif
+      Endif : # If ![L]DBG_K | !find(mid$([L]DBG_SRCFIC,[L]DBG_K+len(nomap),1),"/","\")
+
+      # On recompose le bon nom pour le moteur !
+       If [L]DBG_NOM_MACHINE="" | [L]DBG_NOM_MACHINE=adxmac(0)
+        If [L]DBG_NOM_APPLI=nomap | [L]DBG_NOM_APPLI=""
+         [L]DBG_CHAINEB = [L]DBG_NOM_TRT+[L]DBG_CHAINEA
+        Else
+         [L]DBG_CHAINEB  = [L]DBG_NOM_APPLI+"."+[L]DBG_NOM_TRT+[L]DBG_CHAINEA
+        Endif
+       Else
+        [L]DBG_CHAINEB  = [L]DBG_NOM_MACHINE+"@"+[L]DBG_NOM_APPLI+"."+[L]DBG_NOM_TRT+[L]DBG_CHAINEA
+       Endif
+
+Return
+
+######################################################################
+# gestion de la liste des source ouverts
+######################################################################
+
+Subprog CHARGE_SOURCE(DBGS_FICHIER,DBGS_SRCFIC,DBGS_SRCFIC_SIZE)
+  Value Char DBGS_FICHIER()
+  Value Char DBGS_SRCFIC()
+  Value Integer DBGS_SRCFIC_SIZE
+  Local Integer DBG_I,DBG_J
+
+  If [LDB]NB_DGNOMPRG >= dim([LDB]PIL_DGNOMPRG) : # Si plus de place, on vire le premier si pas courant
+    For [L]DBG_I=0 To [LDB]NB_DGNOMPRG-1
+      If [LDB]PIL_DGNOMPRG([L]DBG_I)<>[LDB]DGNOMPRG
+        Break
+      Endif
+    Next [L]DBG_I
+    # envoi de la commande "SOURCE_REMOVE = 12"
+    Call SEND_MESS1("12",[LDB]PIL_DGNOMPRG([L]DBG_I) )
+    # décalage des sources conservés
+    For [L]DBG_J=[L]DBG_I+1 To [LDB]NB_DGNOMPRG-1
+      [LDB]PIL_DGNOMPRG([L]DBG_J-1)=[LDB]PIL_DGNOMPRG([L]DBG_J)
+    Next [L]DBG_J
+    [LDB]NB_DGNOMPRG -= 1
+  Endif
+
+  [LDB]NB_DGNOMPRG += 1
+  [LDB]PIL_DGNOMPRG([LDB]NB_DGNOMPRG-1) = [L]DBGS_FICHIER
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = "Subprog  CHARGE_SOURCE"
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"NB_DGNOMPRG",num$([LDB]NB_DGNOMPRG))
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"DGNOMPRG",[LDB]PIL_DGNOMPRG([LDB]NB_DGNOMPRG-1))
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"SRCFIC",[L]DBGS_SRCFIC)
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"size",num$([L]DBGS_SRCFIC_SIZE))
+    Call TRACE([LDB]DBG_TRACE)
+  Endif
+
+  Call SEND_SOURCE([L]DBGS_FICHIER,[L]DBGS_SRCFIC,[L]DBGS_SRCFIC_SIZE)
+
+End
+
+
+Subprog CHARGE_SOURCE1(DBGS_FICHIER,DBGS_SRCFIC,DBGS_SRCFIC_SIZE,DBG_DSC)
+  Value Char DBGS_FICHIER(),DBG_DSC()
+  Variable Char DBGS_SRCFIC()
+  Variable Integer DBGS_SRCFIC_SIZE
+  Local Integer DBG_I,DBG_J
+
+
+  If [LDB]NB_DGNOMPRG >= dim([LDB]PIL_DGNOMPRG) : # Si plus de place, on vire le premier si pas courant
+    For [L]DBG_I=0 To [LDB]NB_DGNOMPRG-1
+      If [LDB]PIL_DGNOMPRG([L]DBG_I)<>[LDB]DGNOMPRG
+        Break
+      Endif
+    Next [L]DBG_I
+    # envoi de la commande "SOURCE_REMOVE = 12"
+    Call SEND_MESS1("12",[LDB]PIL_DGNOMPRG([L]DBG_I) )
+    # décalage des sources conservés
+    For [L]DBG_J=[L]DBG_I+1 To [LDB]NB_DGNOMPRG-1
+      [LDB]PIL_DGNOMPRG([L]DBG_J-1)=[LDB]PIL_DGNOMPRG([L]DBG_J)
+    Next [L]DBG_J
+    [LDB]NB_DGNOMPRG -= 1
+  Endif
+
+  [LDB]NB_DGNOMPRG += 1
+  [LDB]PIL_DGNOMPRG([LDB]NB_DGNOMPRG-1) = [L]DBGS_FICHIER
+
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = "Subprog  CHARGE_SOURCE NOT AVAILABLE"
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"NB_DGNOMPRG",num$([LDB]NB_DGNOMPRG))
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"DGNOMPRG",[LDB]PIL_DGNOMPRG([LDB]NB_DGNOMPRG-1))
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"SRCFIC",[L]DBGS_SRCFIC)
+ #   Call TRACE_ADDPARAM([LDB]DBG_TRACE,"size",num$([L]DBGS_SRCFIC_SIZE))
+    Call TRACE([LDB]DBG_TRACE)
+  Endif
+   [L]DBGS_SRCFIC = "@X3.TRT/DEBUGABS.src"
+#   [L]DBGS_SRCFIC_TAILLE = filinfo(filpath("",[L]DBGS_SRCFIC,""),7)
+   [L]DBGS_SRCFIC_SIZE = filinfo(filpath("",[L]DBGS_SRCFIC,""),7)
+   Call SEND_SOURCE1([L]DBGS_FICHIER,[L]DBGS_SRCFIC,[L]DBGS_SRCFIC_SIZE,[L]DBG_DSC)
+End
+
+######################################################################
+#
+######################################################################
+
+$BPT_GOSUB
+If [M:DBG]TRABNB<[LDB]NB_BPT_MAX
+ [M:DBG]TRABPT([M:DBG]TRABNB) = [L]DBG_NOM_TRT+":"+num$([L]DBG_NL+1)
+ # JML 04/11/99 on l'officialise
+
+ If [LDB]DBG_TRACON=1
+  Infbox "Break Point "-[M:DBG]TRABPT([M:DBG]TRABNB)
+ Endif
+
+ [M:DBG]TRABNB += 1
+ [LDB]NO_BPT_GOSUB = [M:DBG]TRABNB
+Endif
+Return
+
+######################################################################
+#
+######################################################################
+
+$RECHERCHE_FIN
+# Après notre fabuleux Gosub, on tombe sur Elsif, When...
+# Il faut trouver le Endif, Endcase... correspondant
+[LDB]DBG_START = [L]DBG_NL
+[LDB]DBG_STOP  = 0
+Raz [LDB]DBG_NB_MOT, [LDB]DBG_MOT_CUR
+If [LDB]DBG_POSITION<1
+ [LDB]DBG_POSITION = 1
+Endif
+
+For [LDB]DBG_STOP=[LDB]DBG_START To [M:DBG]TRATNB-1
+ # Il faut analyser toute la ligne
+ # Surtout pas de vireblc(,5) car la position ne veut plus rien dire...
+ For [L]DBG_K=[LDB]DBG_POSITION To len([M:DBG]TRATRT([LDB]DBG_STOP))+1
+  If find(mid$([M:DBG]TRATRT([LDB]DBG_STOP),[L]DBG_K,1)," ",":","","#")
+   Case toupper([LDB]DBG_MOT_CUR)
+    When [LDB]DBG_MOTCLED
+     [LDB]DBG_NB_MOT   += 1
+    When [LDB]DBG_MOTCLEF
+     If [LDB]DBG_NB_MOT=0
+      # C'est bon, on s'arrete ici
+      Break(2)
+     Else
+      # On le décompte et on repart pour un tour
+      [LDB]DBG_NB_MOT   -= 1
+     Endif
+   Endcase
+   Raz [LDB]DBG_MOT_CUR
+   If mid$([M:DBG]TRATRT([LDB]DBG_STOP),[L]DBG_K,1)="#"
+    [L]DBG_K = len([M:DBG]TRATRT([LDB]DBG_STOP))+1
+    Break : # On arrete l'analyse, on passe à la ligne suivante
+   Endif
+  Else
+   [LDB]DBG_MOT_CUR += mid$([M:DBG]TRATRT([LDB]DBG_STOP),[L]DBG_K,1)
+  Endif
+ Next [L]DBG_K
+ Raz [LDB]DBG_MOT_CUR
+ [LDB]DBG_POSITION = 1 : # On repart du début de ligne
+Next [LDB]DBG_STOP
+
+[LDB]DBG_POSITION = [L]DBG_K      : # pour repartir du bon pied ...
+[L]DBG_NL         = [LDB]DBG_STOP : # pour 'sauter' les lignes
+Return
+
+######################################################################
+# Appel depuis le debugger
+######################################################################
+
+Subprog CLASSE_VARDBG
+Local Integer DBG_I
+Local Integer DBG_J
+Local Integer DBG_K
+Local Integer DBG_ERR
+Local Char    SAVPROG(GLONADC) , SAVCLAS(255)
+Local Integer REPONSE
+SAVPROG = GPROGRAMME
+SAVCLAS = dbgstr(1)
+GPROGRAMME = ""
+Gosub OUVRE_BOITE From WGDEBUGGERV
+If SAVCLAS<>"" : Default Mask SAVCLAS : Endif
+Gosub INIT_MSK From DEBUGGERSUB
+Affzo [DBG2]
+Affzo [DBG3]
+Affzo [DBG4]
+Affzo [DBG5]
+Affzo [DBG6]
+Affzo [DBG7]
+Affzo [DBG8]
+For DBG_I=2 To 8
+ Gosub TITRES From ="W1DEBUGGER"+num$(DBG_I)
+Next DBG_I
+$SAICLA
+Gosub SAISIE_BOITE From WGDEBUGGERV
+If find(REPONSE,1799,55) : Goto SAICLA : Endif
+Gosub FERME_BOITE From WGDEBUGGERV
+Gosub FERME_MASK From WGDEBUGGERV
+GPROGRAMME = SAVPROG
+End
+
+######################################################################
+# Appel depuis la calculette
+######################################################################
+
+Subprog CLASSE_VARCAL
+Local Integer DBG_I
+Local Integer DBG_J
+Local Integer DBG_K
+Local Integer DBG_ERR
+Local Char    SAVPROG(GLONADC) , SAVCLAS(255)
+Local Integer REPONSE
+SAVPROG = GPROGRAMME
+SAVCLAS = dbgstr(1)
+GPROGRAMME = ""
+Gosub OUVRE_BOITE From WGDEBUGGERC
+If SAVCLAS<>"" : Default Mask SAVCLAS : Endif
+Gosub INIT_MSK From DEBUGGERSUB
+Affzo [DBG2]
+Affzo [DBG3]
+Affzo [DBG4]
+Affzo [DBG5]
+Affzo [DBG6]
+Affzo [DBG7]
+Affzo [DBG8]
+For DBG_I=2 To 8
+ Gosub TITRES From ="W1DEBUGGER"+num$(DBG_I)
+Next DBG_I
+$SAIVAR
+Gosub SAISIE_BOITE From WGDEBUGGERC
+If find(REPONSE,1799,55) : Goto SAIVAR : Endif
+Gosub FERME_BOITE From WGDEBUGGERC
+Gosub FERME_MASK From WGDEBUGGERC
+GPROGRAMME = SAVPROG
+End
+
+######################################################################
+# Erreurs
+######################################################################
+
+$ERREUR
+  [L]DBG_ERR = errn
+Resume
+
+######################################################################
+# Appelé sur onkey à partir de EXEFNC
+######################################################################
+
+Subprog ON_KEY
+If clalev([M:DBG]) : # Le debugger est actif
+ [M:DBG]TRATRA = 1
+Else
+ Dbgaff : #CHECK IGNORE_LINE - Voulu pour la bascule du mode trace
+Endif
+End
+
+######################################################################
+# teste l'existence d'un fichier
+# prend en compte un nom de fichier simple "TRTNAME"
+# ou un nom de fichier avec un un dossier "APPLI.TRTNAME"
+######################################################################
+Subprog ISSOURCEEXIST(DBGS_FILENAME,DBGS_EXIST)
+  Value Char DBGS_FILENAME()
+  Variable Integer DBGS_EXIST
+  Local Integer WI
+  [L]DBGS_EXIST = 0
+
+  [L]WI  = instr(1,[L]DBGS_FILENAME,".")
+  # s'il y a un point, le dossier est spécifié
+  If [L]WI >0
+    [L]DBGS_FILENAME= filpath("TRT",right$([L]DBGS_FILENAME,[L]WI+1),"src",left$([L]DBGS_FILENAME,[L]WI-1))
+  Else
+    [L]DBGS_FILENAME= filpath("TRT",[L]DBGS_FILENAME,"src")
+  Endif
+
+  #A-t-on le source (taille>0) ?
+  [L]WI   = filinfo([L]DBGS_FILENAME,7)
+  If [L]WI > 0 : [L]DBGS_EXIST = 1 : Endif
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = ".ISSOURCEEXIST"
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"exist",num$([L]DBGS_EXIST) )
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"file",[L]DBGS_FILENAME)
+    Call TRACE([LDB]DBG_TRACE)
+  Endif
+
+End
+
+##############################################################################
+# Subroutine de lecture
+##############################################################################
+Subprog READ_IN_SOCK (ALENGTH,ADATA)
+  Value Integer ALENGTH
+  Variable Char ADATA()
+  Local Shortint WBUFFER
+
+  [L]ADATA = ""
+  Local Integer WI
+  For [L]WI= 1 To [L]ALENGTH
+    Getseq 1,[L]WBUFFER Using [OPS]
+    [L]ADATA += chr$( WBUFFER )
+  Next [L]WI
+End
+######################################################################
+# Envoi d'un message de commande clean
+######################################################################
+Subprog SEND_CLEAN
+  Call SEND_MESS0("03")
+End
+
+######################################################################
+# Envoi d'un message de commande open
+# constitution des infos en prenant le contenu de la copie de ADXCTX
+######################################################################
+Subprog SEND_OPEN (DBGS_TYPE,DBGS_WEIGHT,DBGS_PARAMS)
+  Value Char DBGS_TYPE
+  Value Char DBGS_WEIGHT
+  Value Char DBGS_PARAMS
+  Local Char WINFOS(250)
+  [L]WINFOS += "protocol=v2;"
+  [L]WINFOS += "session.type=" + [L]DBGS_TYPE +";"
+  [L]WINFOS += "session.weight=" + [L]DBGS_WEIGHT +";"
+  [L]WINFOS += "adxusr="+adxusr+";"
+  [L]WINFOS += "adxpid="+num$(adxpid)+";"
+  Call SEND_MESS4("01","Adonix.exe",0,[L]WINFOS,[L]DBGS_PARAMS)
+End
+
+######################################################################
+# Envoi d'un message de commande close
+######################################################################
+Subprog SEND_CLOSE
+  Call SEND_MESS1("02","Adonix.exe")
+End
+
+##############################################
+## Envoi du segment "erreur sur fermeture"
+##############################################
+Subprog SEND_ERR_ON_CLOSE(IAERR,MESSAG)
+  Value Integer IAERR
+  Value Char MESSAG
+
+  Local Integer LG
+  Local Char CHAINE (255)
+  If dim(GIAVERS)<0 : Local Char GIAVERS : Endif
+  If IAERR<>0
+    CHAINE = GIAVERS+":"+num$(IAERR)+":"+MESSAG
+  Else
+    CHAINE = GIAVERS+"::"+MESSAG
+  Endif
+
+  Call SEND_MESS1("07",[L]CHAINE)
+End
+
+######################################################################
+# Envoi du rafraichisement des valeurs de toutes les variables (n commande 33)...
+######################################################################
+Subprog SEND_VALVARS(DBGS_VARS,DBGS_NBVAR,DBGS_VALVARS)
+  Value Char DBGS_VARS()()
+  Value Integer DBGS_NBVAR
+  Value Char DBGS_VALVARS()()
+  Local Integer WI
+  [L]WI=0
+  # On rafraichit les variables...
+  While [L]WI < [L]DBGS_NBVAR
+    #envoi de la commande "VAR_VALUE = 33"
+    Call SEND_MESS3("33",[L]DBGS_VARS([L]WI),0,[L]DBGS_VALVARS([L]WI))
+    [L]WI+=1
+  Wend
+End
+######################################################################
+# Evaluation de l'expression de chacune des variable
+######################################################################
+$CALC_VALVARS
+  [L]DBG_I = 0
+  While [L]DBG_I < [LDB]DBG_TRAVNB
+      Onerrgo ERREUR_EVALUE
+      [L]DBG_CHAINEA = [L]DBG_VARS([L]DBG_I)
+      [L]DBG_VARS([L]DBG_I)  = num$(evalue( [L]DBG_CHAINEA ))
+      Onerrgo ERREUR_DBG
+      #If [LDB]DBG_TRACON=1
+      #  [LDB]DBG_TRACE = ".CALC_VALVARS"
+      #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"idx",num$([L]DBG_I) )
+      #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"exp",[L]DBG_CHAINEA )
+      #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"val",[L]DBG_VARS([L]DBG_I) )
+      #  Call TRACE([LDB]DBG_TRACE)
+      #Endif
+      [L]DBG_I+=1
+  Wend
+Return
+######################################################################
+#
+######################################################################
+$ERREUR_EVALUE
+  [L]DBG_VARS([L]DBG_I) = "Can't evaluate. ("-errmes$(errn)-")"
+Resume
+######################################################################
+# Calcul de l'expression de chacune des variable en tenant compte de
+# l'utilisation des variables sauvegardées...
+######################################################################
+Subprog CALC_EXPVARS(DBGS_VARS,DBGS_NBVAR,DBGS_TABZONSVG,DBGS_EXPVARS)
+  Value Char DBGS_VARS()()
+  Value Integer DBGS_NBVAR
+  Value Char DBGS_TABZONSVG()()
+  Variable Char DBGS_EXPVARS()()
+  Local Integer WI
+  [L]WI=0
+  # On rafraichit les variables...
+  While [L]WI < [L]DBGS_NBVAR
+      #If [LDB]DBG_TRACON=1
+      #  [LDB]DBG_TRACE = ".CALC_EXPVARS"
+      #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"idx",num$([L]WI) )
+      #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"exp",[L]DBGS_VARS([L]WI) )
+      #  Call TRACE([LDB]DBG_TRACE)
+      #Endif
+      Call CALC_EXPVAR([L]DBGS_VARS([L]WI),[L]DBGS_TABZONSVG,[L]DBGS_EXPVARS([L]WI) )
+      #If [LDB]DBG_TRACON=1
+      #  [LDB]DBG_TRACE = ".CALC_EXPVARS"
+      #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"idx",num$([L]WI) )
+      #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"new",[L]DBGS_EXPVARS([L]WI) )
+      #  Call TRACE([LDB]DBG_TRACE)
+      #Endif
+      [L]WI+=1
+  Wend
+End
+######################################################################
+# Calcul d'une expression en tenant compte de l'utilisation
+# des variable système sauvegardé...
+######################################################################
+Subprog CALC_EXPVAR(DBGS_VAR,DBGS_TABZONSVG,DBGS_EXP)
+  Value Char DBGS_VAR()
+  Value Char DBGS_TABZONSVG()()
+  Variable Char DBGS_EXP()
+  Local Char WZONSVG(7)
+  Local Char WZONLOC(20)
+  Local Integer WI
+  Local Integer WJ
+  Local Integer WK
+  Local Integer WFOUND
+  [L]WI=0
+  [L]WK=1
+  # boucle sur les noms des variables système sauvegardées
+  While [L]WI < [LDB]DBG_NBZONSVG
+    [L]WZONSVG = [L]DBGS_TABZONSVG([L]WI)
+    [L]WJ = instr([L]WK,[L]DBGS_VAR,[L]WZONSVG)
+    If [L]WJ
+      [L]WFOUND= 1
+      If [L]WFOUND & [L]WJ >1
+        Call ISNOTCHARIDENT ( seg$([L]DBGS_VAR,[L]WJ-1,[L]WJ-1) , [L]WFOUND )
+      Endif
+      If [L]WFOUND & [L]WJ + len([L]WZONSVG) < len([L]DBGS_VAR)
+        Call ISNOTCHARIDENT ( seg$([L]DBGS_VAR,[L]WJ+len([L]WZONSVG),[L]WJ+len([L]WZONSVG) ) , [L]WFOUND )
+      Endif
+      If [L]WFOUND
+        [L]WZONLOC = "[LDB]DBG_"+toupper([L]WZONSVG)
+        #If [LDB]DBG_TRACON=1
+        #  [LDB]DBG_TRACE = ".CALC_EXPVAR"
+        #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"found",[L]WZONSVG )
+        #  Call TRACE_ADDPARAM([LDB]DBG_TRACE,"replace",[L]WZONLOC )
+        #  Call TRACE([LDB]DBG_TRACE)
+        #Endif
+        Call REPLACEINSTR([L]DBGS_VAR,[L]WJ-1,[L]WJ+len([L]WZONSVG),[L]WZONLOC  )
+        [L]WK = [L]WJ + len([L]WZONLOC) :# pour chercher après le remplacement
+      Else
+        [L]WK = [L]WJ + len([L]WZONSVG)
+        # pour chercher après la sequence de car correspondant au nom de la variable svg
+      Endif
+    Else
+      [L]WI +=1
+      [L]WK = 1 :# pour recommencer à chercher à partir du début
+    Endif
+  Wend
+  [L]DBGS_EXP = [L]DBGS_VAR
+End
+######################################################################
+# retourne faux (0) si le caractère peut faire partie d'un identifiant de variable
+######################################################################
+Subprog ISNOTCHARIDENT ( DBGS_CHAR,DBGS_MATCH)
+  Value Char DBGS_CHAR()
+  Variable Integer DBGS_MATCH
+  [L]DBGS_MATCH = 1
+  If [L]DBGS_MATCH & pat(left$(DBGS_CHAR,1) , "#")
+    [L]DBGS_MATCH = 0
+  Endif
+  If [L]DBGS_MATCH & pat(left$(DBGS_CHAR,1) , "!")
+    [L]DBGS_MATCH = 0
+  Endif
+  If [L]DBGS_MATCH & left$(DBGS_CHAR,1) = "_"
+    [L]DBGS_MATCH = 0
+  Endif
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = ".TESTCHAR"
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"char",left$([L]DBGS_CHAR,1) )
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"ascii",num$( ascii(left$(DBGS_CHAR,1))) )
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"match",num$([L]DBGS_MATCH) )
+    Call TRACE([LDB]DBG_TRACE)
+  Endif
+End
+######################################################################
+# REPLACE_IN_STRING
+# remplace une portion d'une chaine par une autre
+######################################################################
+Subprog REPLACEINSTR(IACTX_STR,IACTX_START,IACTX_END,IACTX_VALUE)
+  Variable Char    IACTX_STR()
+  Value    Integer IACTX_START
+  Value    Integer IACTX_END
+  Value    Char    IACTX_VALUE()
+
+  Local Char WSTR(250)
+  WSTR =  left$([L]IACTX_STR,[L]IACTX_START)
+  WSTR += [L]IACTX_VALUE
+  WSTR += right$([L]IACTX_STR,[L]IACTX_END)
+  [L]IACTX_STR = WSTR
+End
+######################################################################
+# Envoi de la déclaration de toutes les variables (n commande 31) ...
+# cf. utilisé suite à un load contexte.
+######################################################################
+Subprog SEND_ADDVARS(DBGS_VARS,DBGS_NBVAR)
+  Value Char DBGS_VARS()()
+  Value Integer DBGS_NBVAR
+  Local Integer WI
+  [L]WI=0
+  # On déclare les variables...
+  While [L]WI < [L]DBGS_NBVAR
+    #envoi de la commande "VAR_ADD = 31"
+    Call SEND_MESS1("34",[L]DBGS_VARS([L]WI) )
+    [L]WI+=1
+  Wend
+End
+######################################################################
+# Envoi de la déclaration de touts les break points (n commande 21) ...
+# cf. utilisé suite à un load contexte.
+######################################################################
+Subprog SEND_ADDBKPS(DBGS_BKPS,DBGS_NBBKP)
+  Value Char DBGS_BKPS()()
+  Value Integer DBGS_NBBKP
+  Local Char WBUFF1(250)
+  Local Integer WNUMLINE
+  Local Integer WI
+  [L]WI=0
+  # On déclare les variables...
+  While [L]WI < [L]DBGS_NBBKP
+    #envoi de la commande "BKP_ADD = 21"
+    [L]WBUFF1 =[L]DBGS_BKPS([L]WI)
+    If left$([L]WBUFF1 ,1)=chr$(1)
+      [L]WNUMLINE = -1
+      [L]WBUFF1 = right$([L]WBUFF1,2)
+    Elsif left$([L]WBUFF1 ,1)=chr$(2)
+      [L]WNUMLINE = -2
+      [L]WBUFF1 = right$([L]WBUFF1,2)
+    Elsif left$([L]WBUFF1 ,1)=chr$(3)
+      [L]WNUMLINE = -3
+      [L]WBUFF1 = right$([L]WBUFF1,2)
+    Else
+      Local Integer WJ
+      [L]WJ= instr(1,[L]WBUFF1,":")
+      If [L]WJ
+       [L]WNUMLINE = val(right$([L]WBUFF1,[L]WJ+1))
+       [L]WBUFF1 = left$([L]WBUFF1,[L]WJ-1)
+      Else
+      Endif
+    Endif
+
+    Call SEND_MESS2("23",[L]WBUFF1,[L]WNUMLINE )
+
+    [L]WI+=1
+  Wend
+End
+######################################################################
+# Envoi de la déclaration de tous les sources (n commande 11) ...
+# cf. utilisé suite à un load contexte.
+######################################################################
+Subprog SEND_ADDSRCS(DBGS_SRCS,DBGS_NBSRC)
+  Value Char DBGS_SRCS()()
+  Value Integer DBGS_NBSRC
+  Local Char WAPPLI(10)
+  Local Char WSRCNAME(10)
+  Local Char WSRCFIC(250)
+  Local Integer WI
+  Local Integer WJ
+  Local Integer WK
+  Local Integer WSRCSIZE
+  [L]WI=0
+  # On déclare les variables...
+  While [L]WI < [L]DBGS_NBSRC
+    [L]WSRCFIC = [L]DBGS_SRCS([L]WI)
+    [L]WJ = instr( 1, [L]WSRCFIC , ".TRT/" )
+    If  [L]WJ =0 : [L]WJ = instr( 1, [L]WSRCFIC , ".TRT\" ) : Endif
+    [L]WAPPLI = seg$([L]WSRCFIC,2,[L]WJ-1) :# après le '@' et avant ".TRT/" ou ".TRT\"
+    [L]WK = instr( 1, [L]WSRCFIC, '$' )
+    [L]WSRCNAME= seg$([L]WSRCFIC ,[L]WJ+5,[L]WK-1):# après le  ".TRT/" ou ".TRT\" et avant le '$'
+    [L]WSRCFIC = filpath("TRT",[L]WSRCNAME,"src")
+    [L]WSRCSIZE  = filinfo([L]WSRCFIC,7)
+    If [LDB]DBG_TRACON=1
+      [LDB]DBG_TRACE = ".SEND_ADDSRCS"
+      Call TRACE_ADDPARAM([LDB]DBG_TRACE,"prg",[L]DBGS_SRCS([L]WI) )
+      Call TRACE_ADDPARAM([LDB]DBG_TRACE,"file",[L]WSRCFIC )
+      Call TRACE_ADDPARAM([LDB]DBG_TRACE,"size",num$([L]WSRCSIZE ))
+      Call TRACE([LDB]DBG_TRACE)
+    Endif
+    #envoi de la commande "SRC_ADD = 11"
+    Call SEND_SOURCE([L]DBGS_SRCS([L]WI),[L]WSRCFIC ,[L]WSRCSIZE )
+    [L]WI+=1
+  Wend
+End
+######################################################################
+# Envoi d'un source (commande 11)
+######################################################################
+Subprog SEND_SOURCE1(DBGS_FICHIER,DBGS_SRCFIC,DBGS_SRCFIC_SIZE,DBG_DSC)
+  Value Char DBGS_FICHIER()
+  Value Char DBGS_SRCFIC(),DBG_DSC()
+  Value Integer DBGS_SRCFIC_SIZE
+Goto SEND_SOURCE_S
+
+Subprog SEND_SOURCE(DBGS_FICHIER,DBGS_SRCFIC,DBGS_SRCFIC_SIZE)
+
+  Value Char DBGS_FICHIER()
+  Value Char DBGS_SRCFIC()
+  Value Integer DBGS_SRCFIC_SIZE
+
+$SEND_SOURCE_S:
+  Local Char WCHAINE (250)
+  Local Char WABS(100)
+  Local Integer WNUM,SIZE,WFSTAT,SABS
+  #Local Clbfile WCLOB(9)
+
+  # calcul flag dispo du source
+  [L]SABS=instr(1,[L]DBGS_SRCFIC,"DEBUGABS")
+
+  # si "source absent" ?
+  If [L]SABS<>0
+    [L]WABS="Source code not available"+chr$(10)
+    [L]DBGS_SRCFIC_SIZE=len(WABS)
+    [L]SIZE=len(WABS)+len([L]DBG_DSC)+5
+
+  # sinon, si "source présent"
+  Else
+    [L]WABS=""
+    [L]SIZE=DBGS_SRCFIC_SIZE
+  Endif
+
+  # Envoi de la commande Add source
+  [L]WCHAINE = [L]DBGS_FICHIER+ [LDB]DBG_SEPAR + num$([L]DBGS_SRCFIC_SIZE) + [LDB]DBG_SEPAR
+  [L]WNUM = len([L]WCHAINE ) + [L]SIZE
+  [L]WCHAINE   = chr$(7)+"A"+format$("N0:6#",[L]WNUM )+ "110"+ [L]WCHAINE
+
+  Local Char    WBUFFER(len([L]WCHAINE))     : # Pour envoyer une chaine taillée sur mesure dans la socket !
+  [L]WBUFFER = [L]WCHAINE
+  Wrseq [L]WBUFFER Using [OPS]
+
+  # si "source présent" => ouverture source pour chargement
+  If [L]SABS=0
+    Openi [L]DBGS_SRCFIC Using [SRC]
+    Iomode adxium GUTF8 Using [SRC]
+#    Iomode adxirs "" Using  [SRC]
+    Iomode adxirs chr$(10) Using  [SRC]
+    Iomode adxifs "" Using  [SRC]
+
+    [L]WNUM = 0
+
+    Local Schar WLINE(250)
+    Local Integer WLENOFLINE
+
+    Repeat
+      Rdseq [L]WLINE Using [SRC]
+      [L]WFSTAT  = fstat : # fstat = 1 si la fin de fichier est atteinte !
+      [L]WLENOFLINE= len([L]WLINE)
+#      If ([L]WLENOFLINE>0)
+        Local Char    WBUFFER([L]WLENOFLINE+1) : # Pour envoyer une chaine taillée sur mesure dans la socket !
+        [L]WBUFFER = [L]WLINE+chr$(10)
+        Wrseq [L]WBUFFER Using [OPS]
+        [L]WNUM += [L]WLENOFLINE+1 :# cumul des caractères envoyés
+#      Endif
+    Until [L]WFSTAT <> 0 : # si la fin de fichier est atteinte !
+
+# protection: si on a envoyé moins de caractère que la longueur du fichier envoyée dans l'entête (1ere passe)
+    If [L]WNUM< [L]DBGS_SRCFIC_SIZE
+      Local Integer WTOSEND
+      [L]WTOSEND = [L]DBGS_SRCFIC_SIZE- [L]WNUM :# calcul de la longueur manquante  à envoyer
+      If ([L]WTOSEND >250)
+        Local Char    WBUFFER(250)          :# Pour envoyer une chaine de 250 caractères dans la socket !
+        [L]WBUFFER = space$(250)            :# valorisation avec 250 espaces
+        Local Integer WSENT
+        [L]WSENT = 0
+        Repeat
+          Wrseq [L]WBUFFER  Using [OPS]
+          WSENT +=250
+        Until WSENT > [L]WTOSEND - 250
+        [L]WNUM += WSENT
+      Endif
+    Endif
+# protection: si on a envoyé moins de caractère que la longueur du fichier envoyée dans l'entête (2eme passe)
+    If [L]WNUM< [L]DBGS_SRCFIC_SIZE
+      [L]WNUM = [L]DBGS_SRCFIC_SIZE- [L]WNUM :# calcul de la longueur manquante à envoyer
+      Local Char    WBUFFER([L]WNUM)          :# Pour envoyer une chaine taillée sur mesure dans la socket !
+      [L]WBUFFER = space$([L]WNUM)            :# valorisation avec n espace(s)
+      Wrseq [L]WBUFFER  Using [OPS]
+     Endif
+    Seek 0 Using [OPS] : # C'est le flush final...
+
+
+    Openi Using [SRC] :# fermeture du fichier
+
+  Else     : # on n'a pas le source
+     Local Char    WBUFFER(len([L]WABS))     : # Pour envoyer une chaine taillée sur mesure dans la socket !
+     [L]WBUFFER = WABS
+     Wrseq [L]WBUFFER  Using [OPS]
+     [L]WNUM += len([L]WBUFFER) :# cumul des caractères envoyés
+     Local Char    WBUFFER(len([L]DBG_DSC)+5)
+     [L]WBUFFER = format$("NO:####",[LDB]DGNOLIGN)+":"+[L]DBG_DSC
+     Wrseq [L]WBUFFER  Using [OPS]
+     [L]WNUM += len([L]WBUFFER) :# cumul des caractères envoyés
+  Endif
+
+  Seek 0 Using [OPS] : # C'est le flush final...
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = "=>"
+    Call TRACE_ADDCMDELIB([LDB]DBG_TRACE,"11")
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"id",[L]DBGS_SRCFIC)
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"num",num$([L]DBGS_SRCFIC_SIZE))
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"data","src...")
+    Call TRACE ([LDB]DBG_TRACE)
+  Endif
+End
+######################################################################
+# Envoi d'un message de commande au debugger Java sans paramètre
+######################################################################
+Subprog SEND_MESS0(DBGM_CMDE)
+  Value    Char    DBGM_CMDE()
+  Call SEND_MESS4(DBGM_CMDE,"",0,"","")
+End
+######################################################################
+# Envoi d'un message de commande au debugger Java avec un paramètre
+######################################################################
+Subprog SEND_MESS1(DBGM_CMDE,DBGM_ID)
+  Value    Char    DBGM_CMDE()
+  Value    Char    DBGM_ID()
+  Call SEND_MESS4(DBGM_CMDE,[L]DBGM_ID,0,"","")
+End
+######################################################################
+# Envoi d'un message de commande au debugger Java avec deux paramètres
+######################################################################
+Subprog SEND_MESS2(DBGM_CMDE,DBGM_ID,DBGM_NUM)
+  Value    Char    DBGM_CMDE()
+  Value    Char    DBGM_ID()
+  Value    Integer DBGM_NUM
+  Call SEND_MESS4(DBGM_CMDE,[L]DBGM_ID,[L]DBGM_NUM,"","")
+End
+######################################################################
+# Envoi d'un message de commande au debugger Java avec trois paramètres
+######################################################################
+Subprog SEND_MESS3(DBGM_CMDE,DBGM_ID,DBGM_NUM,DBGM_DATA)
+  Value    Char    DBGM_CMDE()
+  Value    Char    DBGM_ID()
+  Value    Integer DBGM_NUM
+  Value    Char    DBGM_DATA()
+  Call SEND_MESS4(DBGM_CMDE,[L]DBGM_ID,[L]DBGM_NUM,DBGM_DATA,"")
+End
+######################################################################
+# Envoi d'un message de commande au debugger socket avec quatres paramètres
+# exemple:
+# (1)[(#BEL)](10)[A000017020](17)[Adonix.exe¤¨¤0¤¨¤]
+#
+######################################################################
+Subprog SEND_MESS4(DBGM_CMDE,DBGM_ID,DBGM_NUM,DBGM_DATA1,DBGM_DATA2)
+  Value    Char    DBGM_CMDE()
+  Value    Char    DBGM_ID()
+  Value    Integer DBGM_NUM
+  Value    Char    DBGM_DATA1()
+  Value    Char    DBGM_DATA2()
+
+  Local Integer WLONG
+  Local Char WMESS(250)
+  Local Char WNUM(20)
+
+  [L]DBGM_CMDE = left$([L]DBGM_CMDE,2) :# protection !
+  [L]WNUM = num$([L]DBGM_NUM)
+  # longueur utile
+  [L]WLONG = len([L]DBGM_ID) + len([LDB]DBG_SEPAR) + len([L]WNUM)+ len([LDB]DBG_SEPAR)
+  [L]WLONG += len([L]DBGM_DATA1) + len([L]DBGM_DATA2)
+
+  # envoi de l'entête ID , NUM et des deux séparateurs ( < 250 caractères !)
+  [L]WMESS  = chr$(7) + "A" + format$("N0:6#",[L]WLONG ) + [L]DBGM_CMDE  + "0"
+  [L]WMESS  += [L]DBGM_ID +[LDB]DBG_SEPAR + [L]WNUM + [LDB]DBG_SEPAR
+  Call SEND_BUFFER([L]WMESS)
+
+  # envoi des valeurs
+  If len([L]DBGM_DATA1)>0 : Call SEND_BUFFER([L]DBGM_DATA1) : Endif
+  If len([L]DBGM_DATA2)>0 : Call SEND_BUFFER([L]DBGM_DATA2) : Endif
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = "=>"
+    Call TRACE_ADDCMDELIB([LDB]DBG_TRACE,DBGM_CMDE)
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"id",DBGM_ID)
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"num",[L]WNUM)
+    Call TRACE_ADDPARAM([LDB]DBG_TRACE,"data",DBGM_DATA1)
+    Call TRACE ([LDB]DBG_TRACE)
+  Endif
+
+End
+######################################################################
+#
+######################################################################
+Subprog SEND_BUFFER(DBGM_DATA)
+  Value    Char    DBGM_DATA()
+  Wrseq [L]DBGM_DATA  Using [OPS]
+  Seek 0 Using [OPS]
+End
+######################################################################
+#
+######################################################################
+$ERREUR_VAR_VALUE
+  Call SEND_MESS3("33",[LDB]DBG_TRAEXP([L]DBG_I),0,"Can't evaluate. ("-errmes$(errn)-")" )
+Resume
+######################################################################
+#
+######################################################################
+$ERR_AFFECT_NOTOK
+  [L]DBG_J = 0 :#indicateur comme quoi l'affectation s'est mal passé
+Resume
+
+######################################################################
+#Extraction des paramètres Host,Port,trt,sub et line de la copie de l'adxctx
+#ADAPI:NA1:debug.on=on;debug.trt=;debug.sub=;debug.line=tata;
+#debug.host=;debug.port=1789;trace.on=off;trace.filepath=%24HOME%2Ftmp;trace.dbglong=200;
+######################################################################
+Subprog READ_ADXCTX
+  Local Integer WI
+  Local Integer WJ
+
+  #trace entrée spgm
+  If [LDB]DBG_TRACON=1 : Call TRACE(".READ_ADXCTX Start") : Endif
+
+  Raz [LDB]DBG_ON
+  Raz [LDB]DBG_HOST
+  Raz [LDB]DBG_PORT
+  Raz [LDB]DBG_SESTYP
+  Raz [LDB]DBG_SESWEI
+
+  WI = instr(1,[LDB]DBG_ADXCTX,"debug.on=on")
+  If WI
+   [LDB]DBG_ON = 1
+  Endif
+
+  WI = instr(1,[LDB]DBG_ADXCTX,"debug.host=")
+  If WI
+   WJ = instr(WI,[LDB]DBG_ADXCTX,";")
+   If WJ
+    [LDB]DBG_HOST = seg$([LDB]DBG_ADXCTX,WI+11,WJ-1)
+   Endif
+  Endif
+
+  WI = instr(1,[LDB]DBG_ADXCTX,"debug.port=")
+  If WI
+   WJ = instr(WI,[LDB]DBG_ADXCTX,";")
+   If WJ
+    [LDB]DBG_PORT = seg$([LDB]DBG_ADXCTX,WI+11,WJ-1)
+   Endif
+  Endif
+
+  If [LDB]DBG_HOST=""
+    WI = instr(1,[LDB]DBG_ADXCTX,"address=")
+    If WI
+      WJ = instr(WI,[LDB]DBG_ADXCTX,";")
+      If WJ
+       [LDB]DBG_HOST = seg$([LDB]DBG_ADXCTX,WI+8,WJ-1)
+       [LDB]DBG_PORT = "1789"
+      Endif
+    Endif
+  Endif
+
+  If [LDB]DBG_HOST<>"" and [LDB]DBG_PORT<>"" : [LDB]DBG_ON = 1 : Endif
+
+
+  [LDB]DBG_SESTYP = left$([LDB]DBG_ADXCTX,5)
+  [LDB]DBG_SESWEI = mid$([LDB]DBG_ADXCTX,7,3)
+
+
+  #trace sortie spgm
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = ".READ_ADXCTX parametres:"
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Debugger_On",num$([LDB]DBG_ON))
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Host",[LDB]DBG_HOST)
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Port",[LDB]DBG_PORT)
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Type",[LDB]DBG_SESTYP )
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"Poids",[LDB]DBG_SESWEI )
+    Call TRACE ([LDB]DBG_TRACE)
+    Call TRACE (".READ_ADXCTX - end")
+  Endif
+
+End
+
+######################################################################
+#
+######################################################################
+$ERREUR_DBG
+  If [LDB]DBG_TRACON=1
+   [LDB]DBG_TRACE = ".ERREUR_DBG "-errmes$(errn)-errp+"("+num$(errl)+")"
+    Call TRACE([LDB]DBG_TRACE)
+  Endif
+  dbgmode(1)=0 :# arrêt du mode debug
+  End
+Resume
+
+
+######################################################################
+# Ajoute Cmde=[XXX_Y] dans la ligne de trace en fonction du numéro de commande
+######################################################################
+Subprog TRACE_ADDCMDELIB(DBGT_LINE,DBGT_CMDEID)
+  Variable Char    DBGT_LINE()
+  Value    Char    DBGT_CMDEID()
+  Case toupper([L]DBGT_CMDEID)
+    When "01" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","OPEN_1")
+    When "02" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","CLOSE_2")
+    When "03" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","CLEAN_3")
+    When "04" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","MESSAGE_4")
+    When "05" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SAVE_5")
+    When "06" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","LOAD_6")
+    When "07" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","CANTCLOSE_7")
+
+    When "99" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","USER_99")
+
+    When "11" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_ADD_11")
+    When "12" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_REMOVE_12")
+    When "13" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_SETL_13")
+    When "15" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_NEXTL_15")
+    When "16" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_NEXTBKP_16")
+    When "17" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_RUN_17")
+    When "18" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_OPEN_18")
+
+    When "41" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_STEP_IN_41")
+    When "42" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_STEP_OVER_42")
+    When "43" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_STEP_OUT_43")
+    When "44" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_NEXTBKP_44")
+    When "45" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_RUN_45")
+    When "46" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","SOURCE_RUN_DBGOFF_46")
+
+    When "21" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","BKP_ADD_21")
+    When "22" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","BKP_REMOVE_22")
+    When "23" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","BKP_CLIENT_ADD_23")
+              : # Ajout d'un point d'arrêt par le client
+    When "24" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","BKP_CLIENT_REMOVE_24")
+              : # Suppression d'un point d'arrêt par le client
+
+    When "31" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","VAR_ADD_31")
+    When "32" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","VAR_REMOVE_32")
+    When "33" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","VAR_VALUE_33")
+    When "34" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","VAR_CLIENT_ADD_34")
+              : # Ajout d'une variable par le client
+    When "35" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","VAR_CLIENT_REMOVE_35")
+              : # Suppression d'une variable par le client
+    When "36" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","VAR_AFFECT_36")
+
+    When "51" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","STATE_ASK_51")
+    When "52" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","STATE_VAL_52")
+    When "53" : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","STATE_SHOW_53")
+
+
+
+    When Default : Call TRACE_ADDPARAM([L]DBGT_LINE,"Cmde","Unknown_"+DBGT_CMDEID)
+  Endcase
+End
+
+######################################################################
+# Ajoute " lib=[value]" à la fin d'une line
+######################################################################
+Subprog TRACE_ADDPARAM( DBGT_LINE,DBGT_LIB, DBGT_VALUE )
+  Variable    Char    DBGT_LINE()
+  Value    Char    DBGT_LIB()
+  Value    Char    DBGT_VALUE()
+  DBGT_LINE += " " + DBGT_LIB + "=[" + DBGT_VALUE +"]"
+End
+
+######################################################################
+# Ajoute une ligne "lib=[value]" à la fin du fichier de trace TRA/X3DEBUG_"adxusr".tra
+######################################################################
+Subprog TRACE_ONEPARAM( DBGT_LIB, DBGT_VALUE )
+  Value    Char    DBG_LIB()
+  Value    Char    DBG_VALUE()
+  Call TRACE (DBGT_LIB + "=[" + DBGT_VALUE +"]" )
+End
+######################################################################
+# Ajoute une ligne à la fin du fichier de trace TRA/X3DEBUG_"adxusr".tra
+######################################################################
+Subprog TRACE(DBGT_LINE)
+  Value    Char    DBGT_LINE()
+  Openo filpath("TRA","X3DEBUG_"+ctrans(adxusr,".\/|*@","______"),"tra",0),-1 Using [TEST]
+  Wrseq DBGT_LINE+chr$(13) Using [TEST]
+  Openo Using [TEST]
+End
+######################################################################
+# vide le fichier de trace  TRA/X3DEBUG_"adxusr".tra
+######################################################################
+Subprog TRACE_CLEAR
+ Openo filpath("TRA","X3DEBUG_"+adxusr,"tra",0),0 Using [TEST]
+ Openo Using [TEST]
+End
+
+######################################################################
+# sauvegarde du contexte de debug dans un fichier
+# ...DOSSIER/tmp/DBG_user_NAME.ctx
+######################################################################
+Subprog CONTEXT_SAVE (DBGC_NAME,DBGC_BKPS,DBGC_NBBKP,DBGC_VARS,DBGC_NBVAR,DBGC_SRCS,DBGC_NBSRC)
+  Value Char DBGC_NAME()
+  Value Char DBGC_BKPS()()
+  Value Integer DBGC_NBBKP
+  Value Char DBGC_VARS()()
+  Value Integer DBGC_NBVAR
+  Value Char DBGC_SRCS()()
+  Value Integer DBGC_NBSRC
+  Local Integer WI
+  Local Char WLINE(250)
+
+
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = ".CONTEXT_SAVE Parameters:"
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"FileName",[L]DBGC_NAME)
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"NbBkps",num$([L]DBGC_NBBKP))
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"NbVars",num$([L]DBGC_NBVAR))
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"NbSrcs",num$([L]DBGC_NBSRC))
+    Call TRACE ([LDB]DBG_TRACE)
+  Endif
+
+  Local Char    WSAVIRS(10), WSAVIFS(10)
+  Local Integer WSAVIUM
+  [L]WSAVIRS=adxirs  : [L]WSAVIFS=adxifs : [L]WSAVIUM=adxium
+  adxifs=","         :  adxirs=chr$(10)
+
+  Openo [L]DBGC_NAME,0 Using [DBGX]
+  Wrseq "NBBKP";[L]DBGC_NBBKP Using [DBGX]
+  [L]WI=0
+  While [L]WI < [L]DBGC_NBBKP
+    Wrseq  [L]DBGC_BKPS([L]WI) Using [DBGX]
+    [L]WI += 1
+  Wend
+  Wrseq "NBVAR";[L]DBGC_NBVAR Using [DBGX]
+  [L]WI=0
+  While [L]WI < [L]DBGC_NBVAR
+    Wrseq [L]DBGC_VARS([L]WI) Using [DBGX]
+    [L]WI += 1
+  Wend
+  Wrseq "NBSRC";[L]DBGC_NBSRC Using [DBGX]
+  [L]WI=0
+  While [L]WI < [L]DBGC_NBSRC
+    Wrseq [L]DBGC_SRCS([L]WI) Using [DBGX]
+    [L]WI += 1
+  Wend
+  Openo  Using [DBGX]
+  adxifs=[L]WSAVIFS  :  adxirs=[L]WSAVIRS : adxium=[L]WSAVIUM
+End
+######################################################################
+# lecture du contexte de debug dans un fichier
+# ...DOSSIER/tmp/DBG_user_NAME.ctx
+# rechargement du contexte en passant
+# le nom du contxte
+# le tableaux des breakpoints, le nombre de breakpoint(s)
+# le tableaux des variables, le nombre de variable(s)
+# la pile des sources, le nombre de source(s)
+######################################################################
+Subprog CONTEXT_LOAD (DBGC_NAME,DBGC_BKPS,DBGC_NBBKP,DBGC_VARS,DBGC_NBVAR,DBGC_SRCS,DBGC_NBSRC)
+  Value Char DBGC_NAME()
+  Value Char DBGC_BKPS()()
+  Value Integer DBGC_NBBKP
+  Value Char DBGC_VARS()()
+  Value Integer DBGC_NBVAR
+  Value Char DBGC_SRCS()()
+  Value Integer DBGC_NBSRC
+  #Raz [L]DBGC_BKPS,[L]DBGC_NBBKP,[L]DBGC_VARS,[L]DBGC_NBVAR,[L]DBGC_SRCS,[L]DBGC_NBSRC
+  #Raz directe des variables LDB a cause du bug !!
+  Raz [LDB]DBG_TRABPT,[LDB]DBG_TRABNB,[LDB]DBG_TRAEXP,[LDB]DBG_TRAVNB,[LDB]PIL_DGNOMPRG,[LDB]NB_DGNOMPRG
+  Local Integer WI
+  Local Char WBUFF1(10)
+  Local Char WBUFF2(250)
+
+  Local Char    WSAVIRS(10), WSAVIFS(10)
+  Local Integer WSAVIUM
+  [L]WSAVIRS=adxirs  : [L]WSAVIFS=adxifs : [L]SAVIUM=adxium
+  adxifs=","         :  adxirs=chr$(10)
+
+  Openi [L]DBGC_NAME Using [DBGX]
+  Rdseq [L]WBUFF1,[L]WBUFF2 Using [DBGX] :# lecture du nombre de break dans une ligne "NBBKP,2"
+  [L]DBGC_NBBKP = val([L]WBUFF2)
+  [LDB]DBG_TRABNB = [L]DBGC_NBBKP :# a cause du bug !!
+  [L]WI=0
+  While [L]WI < [L]DBGC_NBBKP
+    #Rdseq [L]DBGC_BKPS([L]WI )  Using [DBGX]
+    Rdseq [LDB]DBG_TRABPT([L]WI) Using [DBGX]:# a cause du bug !!
+    [L]WI += 1
+  Wend
+  Rdseq [L]WBUFF1,[L]WBUFF2 Using [DBGX] :# lecture du nombre de variable dans une ligne "NBVAR,2"
+  [L]DBGC_NBVAR = val([L]WBUFF2)
+  [LDB]DBG_TRAVNB = [L]DBGC_NBVAR :# a cause du bug !!
+  [L]WI=0
+  While [L]WI < [L]DBGC_NBVAR
+    #Rdseq [L]DBGC_VARS([L]WI )   Using [DBGX]
+    Rdseq [LDB]DBG_TRAEXP([L]WI) Using [DBGX] :# a cause du bug !!
+    [L]WI += 1
+  Wend
+  Rdseq [L]WBUFF1,[L]WBUFF2 Using [DBGX]:# lecture du nombre de source dans une ligne "NBSRC,2"
+  [L]DBGC_NBSRC = val([L]WBUFF2)
+  [LDB]NB_DGNOMPRG = [L]DBGC_NBSRC :# a cause du bug !!
+  [L]WI=0
+  While [L]WI < [L]DBGC_NBSRC
+    #Rdseq [L]DBGC_SRCS([L]WI ) Using [DBGX]
+    Rdseq  [LDB]PIL_DGNOMPRG([L]WI) Using [DBGX] :# a cause du bug !!
+    [L]WI += 1
+  Wend
+  Openi  Using [DBGX]
+  adxifs=[L]WSAVIFS  :  adxirs=[L]WSAVIRS : adxium=[L]WSAVIUM
+  If [LDB]DBG_TRACON=1
+    [LDB]DBG_TRACE = ".CONTEXT_LOAD Parameters:"
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"FileName",[L]DBGC_NAME)
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"NbBkps",num$([L]DBGC_NBBKP))
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"NbVars",num$([L]DBGC_NBVAR))
+    Call TRACE_ADDPARAM ([LDB]DBG_TRACE,"NbSrcs",num$([L]DBGC_NBSRC))
+    Call TRACE ([LDB]DBG_TRACE)
+  Endif
+End
+######################################################################
+# lecture du contexte de debug dans un fichier
+# ...DOSSIER/tmp/DBG_user_NAME.ctx
+######################################################################
+Subprog BUILD_CTXFILENAME (DBGC_NAME)
+  Variable Char DBGC_NAME()
+
+  [L]DBGC_NAME= filpath("tmp","DBG_"+adxusr+"_"+[L]DBGC_NAME,"ctx")
+End

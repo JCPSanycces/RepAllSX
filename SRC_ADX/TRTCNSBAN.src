@@ -1,0 +1,583 @@
+#<AdxTL>@(#)5.0.0.0 $Revision$
+
+# Sprint 21 - Scrum Team FINANCE - Février 2014
+#
+#################################################################################################
+# Remplissage du table temporaire qui contient les informations de PYH/HAE/DAE
+#
+# Boucle numéro 1 : Boucle Historique sur PYH
+#    Filtre les règlement sur le code Banque avec recherche de la dernière étape de comptabilisation
+#    Si règlement n'a aucune pièce comptabilisée, X3 affiche le règlement en mode Saisi
+#                                                        (utile pour le Solde virtuel)
+#    Nouveauté Février 2014 :
+#     => Filtre sur la date comptable de la pièce de comptabilisation.
+#     => Gestion revue des pièces associés à la pièce de comptabilisation (OD-Devise, OD Frais séparée)
+#
+# Boucle numéro 2 : Nouvelle Boucle - Parcourt de TCB (Février 2014)
+#     X3 souhaite affiche tous les règlements liés à une pièce comptable.
+#     Parcourt à nouveau les enregistrements de la Boucle numéro 1.
+#     Cas de x règlements de date <>, regroupé sous un seul bordereau de remise
+#
+# Boucle numéro 3 : Transfert Bancaire (Evolution en P23 - Janvier 2013)
+#     Filtre les règlements sur le compte de Trésorerie rattachée au code banque
+#     Nouveauté Février 2014
+#      => Tous les règlements qui ne sont pas comptabilisés (revu la condition via TPY)
+#
+# Boucle numéro 4 : Historique sur DAE
+#     Filtre les pièces comptables qui mouvemente le compte de Trésorerie rattaché au code Banque.
+#     Nouveauté Février 2014 :
+#         Avant il y avait un Filtre sur ORIMOD=2 (Saisie dans le module Comptabilité) + Cas Frais non séparé
+#         Maintenant, ce sont toutes les pièces :
+#              - Filtre sur ACCDAT qui permet d'afficher une pièce de comptabilisation issue d'un bordereau
+#              - Accès au règlement si possible.
+#              - Cas particulier des destination Compte <=> Banque sur pièce non séparée
+#
+# 4 boucles <=> 4 sous programmes mais 2 traitement d'écritures sous la table temporaire
+#  - AFFECTE_PYH (boucle 1, 2 et 3)  avec Transclass HAE + PYH
+#  - AFFECTE_DAE (boucle 4)          avec Transclass PYH + HAE
+#
+#     Nouveauté Février 2014 : Revu le contenu des colonnes MONTANT
+#
+######################################
+Subprog REMPLIT_TBC (SOLDEV, OLDCRIT, PROGSPE)
+Variable Decimal SOLDEV
+Variable Char OLDCRIT()
+Value Char PROGSPE()
+
+Gosub OUVRE
+Gosub CRITPYH
+Gosub CRITDAE
+If PROGSPE<>"" :  ACTION = "FILTRE" : Gosub ACTION From =PROGSPE : Endif
+
+
+# Optimisation sur GTE
+Gosub SVG_GTE
+
+If OLDCRIT<>PYHCRIT+num$([M:CBAN]FLGSTA)
+ SOLDEV=0
+ Call DEBTRANS From GLOCK
+ Call TR_ANNUL
+ If GOK<1 : End : Endif
+ Call VALFIL_TBL
+
+ GOK = 1
+ Trbegin [TCB]
+ Gosub RECUPPYH
+ Gosub RECUPPYH_ALL
+ If [M:CBAN]FLGSTA=1 # Tous règlements
+  Gosub RECUPPYH_STA2
+ Endif
+ If [M:CBAN]PAYTYP="" & [M:CBAN]PAM=""
+  Gosub RECUPDAE
+ Endif
+ If GOK
+  Commit
+ Else
+  Rollback
+ Endif
+
+ OLDCRIT=PYHCRIT+num$([M:CBAN]FLGSTA)
+Endif
+End
+
+######################################
+$OUVRE
+If clalev ([F:TCB]) =0 : Local File TMPCNSBAN  [TCB]  : Endif
+If clalev ([F:PYH]) =0 : Local File PAYMENTH   [PYH]  : Endif
+If clalev ([F:PAN]) =0 : Local File PAYACCNUM  [PAN]  : Endif
+If clalev ([F:HAE]) =0 : Local File GACCENTRY  [HAE]  : Endif
+If clalev ([F:DAE]) =0 : Local File GACCENTRYD [DAE]  : Endif
+If clalev ([F:BAN]) =0 : Local File BANK       [BAN]  : Endif
+If clalev ([F:GTE]) =0 : Local File GTYPACCENT [GTE]  : Endif
+If clalev ([F:SIH]) =0 : Local File SINVOICE   [SIH]  : Endif
+If clalev ([F:TPY]) =0 : Local File TABPAYTYP  [TPY]  : Endif
+If clalev ([F:TCB2])=0 : Local File TMPCNSBAN  [TCB2] : Endif
+If clalev ([F:TCB3])=0 : Local File TMPCNSBAN  [TCB3] : Endif
+If clalev ([F:PMD]) =0 : Local File PAYACCNUMD [PMD]  : Endif
+If clalev ([F:DAE2])=0 : Local File GACCENTRYD [DAE2] : Endif
+If clalev ([F:GTE2])=0 : Local File GTYPACCENT [GTE2] : Endif
+
+Local Char PYHCRIT  (250)
+Local Char PYHCRIT2 (255)
+Local Char DAECRIT  (250)
+Local Integer NBPAN, LASTETP, IMPAYE, TMPSTA
+Local Char BANCPT(GLONGAC)
+Local Char BANBPR(GLONBPR)
+#Gestion du multi-devise
+Local Decimal MTTBAN
+#Gestion du sens (transfert bancaire)
+Local Integer SIGN
+# Gestion date comptable (date PYH<>date HAE)
+Local Integer FLGDAT
+Local Char    TMPTYPVCR(2)
+
+Read[BAN]BAN0=[M:CBA1]BAN
+If fstat |[F:BAN]BANACC="" : End : Endif
+BANCPT=[F:BAN]BANACC
+BANBPR=[F:BAN]BANBPR
+Call SETMAINREF([M:CBA1]CPY,GTYPGEN,GTYPANA) From CPTDIV
+Return
+
+############################################
+#Affectation des critères pour le filtre sur PYH
+$CRITPYH
+PYHCRIT="1=1"
+If [M:CBA1]BAN<>""
+ PYHCRIT -= '&[F:PYH]BAN="'+[M:CBA1]BAN+'"'
+Endif
+If [M:CBA1]CPY<>""
+ PYHCRIT -= '&[F:PYH]CPY="'+[M:CBA1]CPY+'"'
+Endif
+If [M:CBA1]FCY<>""
+ PYHCRIT -= '&[F:PYH]FCY="'+[M:CBA1]FCY+'"'
+Endif
+If [M:CBA1]DATDEB<>[0/0/0]
+ PYHCRIT -= '&[F:PYH]ACCDAT>=['+format$(GFMD,[M:CBA1]DATDEB)+']'
+Endif
+If [M:CBA1]DATFIN<>[0/0/0]
+ PYHCRIT -= '&[F:PYH]ACCDAT<=['+format$(GFMD,[M:CBA1]DATFIN)+']'
+Endif
+If [M:CBAN]PAYTYP<>""
+ PYHCRIT -= '&[F:PYH]PAYTYP="'+[M:CBAN]PAYTYP+'"'
+Endif
+If [M:CBAN]PAM<>""
+ PYHCRIT -= '&[F:PYH]PAM="'+[M:CBAN]PAM+'"'
+Endif
+If [M:CBAN]FLGSTA=3    :#règlements en banque
+ PYHCRIT -= '&[F:PYH]STA>8'
+Endif
+Return
+
+#####################################################################################
+#[PYH]
+#####################################################################################
+
+######################################
+$RECUPPYH
+SIGN=1
+For [PYH]PYH0 Where evalue(PYHCRIT)
+
+ #Recherche dernière étape du règlement
+ Gosub LAST_ETAPE
+
+ NBPAN =0
+ IMPAYE=0
+
+ #Recherche de toutes les pièces comptables générées
+ #durant la dernière étape du règlement
+ For [PAN] Where NUM=[F:PYH]NUM & ACCSTA=LASTETP & CPTBAN=2 & TYPNUM=3 & RVSACCNUM=0
+  Read[DAE]DAE2=[F:PAN]ACCNUM
+  If !fstat
+   If [F:DAE]ACC=[L]BANCPT
+    Gosub LIGNE_DAE
+   Else
+#     If GUSER="CP"
+#      Call ECR_TRACE("PASSE OD_TRESO",1) From GESECRAN
+#     Endif
+
+      # Gestion de la pièce comptable venant d'une étape de comptabilisation de règlements.
+      #  Pièce OD-Devise Trésorerie (TYPVCR="A2") - ACCNUM ne pointe pas sur le compte de banque
+      #  A tort cette ligne s'affichait en Boucle 4
+      Gosub OD_TRESO
+   Endif
+  Endif
+ Next
+
+ #Impayé
+ If [F:PYH]STAFLG(10)=2
+  IMPAYE=1
+  For [PAN] Where NUM=[F:PYH]NUM & STA=11 & CPTBAN=2 & TYPNUM=3 & RVSACCNUM=0
+   Read[DAE]DAE2=[F:PAN]ACCNUM
+   If !fstat
+    Gosub LIGNE_DAE
+   Endif
+  Next
+ Endif
+
+ #Pièce comptable inexistante mais on veut tous les règlements
+ #(pas uniquement les règlements validés ou rapprochés)...
+ If NBPAN=0
+  If [M:CBAN]FLGSTA<>4 & [M:CBAN]FLGSTA<>2
+   Raz [F:HAE]
+   Raz [F:DAE]
+   Raz [F:PAN]
+   TMPSTA=[F:PYH]STA
+   Raz TMPTYPVCR
+
+   Gosub AFFECTE_PYH
+  Endif
+ Endif
+
+Next
+Return
+
+$OD_TRESO
+#If GUSER="CP" : Dbgaff :Endif
+SVG_PYHNUM = [F:PYH]NUM
+For [DAE2] Where [F:DAE2]TYP=[F:DAE]TYP & [F:DAE2]NUM=[F:DAE]NUM & [F:DAE2]LEDTYP=GTYPGEN & [F:DAE2]ACC=[L]BANCPT
+ Read [DAE]DAE2=[F:DAE2]ACCNUM
+ If !fstat
+  Filter [F:TCB2] Where [F:TCB2]ACCNUM=[F:DAE]ACCNUM & [F:TCB2]USRCRE=GUSER & [F:TCB2]ADXNUM=adxuid(2)
+  Read [TCB2] First
+  If fstat
+   Filter [PMD] Where ACCNUM=[F:DAE]ACCNUM
+   If rowcount([PMD])<=1
+    Read [PMD]PMD0 First
+    If !fstat
+     Read [PYH]PYH0 = [F:PMD]NUM
+     If !fstat
+      Gosub LIGNE_DAE
+     Else
+      # Une ligne PMD = Une ligne de PYH
+      [F:PYH]NUM=SVG_PYHNUM : Gosub LIGNE_DAE
+     Endif
+    Else
+     # Aucune ligne sous PMD... une ligne de PYH
+     [F:PYH]NUM = SVG_PYHNUM : Gosub LIGNE_DAE
+    Endif
+   Else
+    # Plusieurs lignes sous PMD
+    Raz [F:PYH]NUM : Gosub LIGNE_DAE
+   Endif
+   Filter [PMD]
+  Endif
+ Endif
+Next
+[F:PYH]NUM = SVG_PYHNUM
+Return
+
+$LIGNE_DAE
+If [M:CBAN]FLGSTA<>4 |([M:CBAN]FLGSTA=4 & [F:DAE]CHK<>"")
+ Read [HAE]HAE0=[F:DAE]TYP;[F:DAE]NUM
+ If fstat : Raz [F:HAE] : Endif
+ TMPSTA=[F:PAN]ACCSTA
+ TMPTYPVCR=[F:PAN]TYPVCR
+ FLGDAT=1 : Gosub CTL_ACCDAT
+ If FLGDAT : Gosub AFFECTE_PYH : Endif
+ NBPAN+=1
+Endif
+Return
+
+$CTL_ACCDAT
+If  [F:PYH]STAFLG(8)=2
+ If [M:CBA1]DATDEB<>[0/0/0] & [F:HAE]ACCDAT<[M:CBA1]DATDEB
+  Raz FLGDAT
+ Endif
+ If FLGDAT & [M:CBA1]DATFIN<>[0/0/0] & [F:HAE]ACCDAT>[M:CBA1]DATFIN
+   Raz FLGDAT
+ Endif
+Endif
+Return
+
+
+######################################
+$RECUPPYH_ALL
+Filter [F:TCB2] Where [F:TCB2]USRCRE=GUSER & [F:TCB2]ADXNUM=adxuid(2)
+For [F:TCB2]TCB2(1)
+ For [PAN] Where ACCNUM=[F:TCB2]ACCNUM & ACCSTA=9 & CPTBAN=2 & TYPNUM=3 & RVSACCNUM=0
+  Filter [F:TCB3] Where [F:TCB3]NUMPAY=[F:PAN]NUM & [F:TCB3]USRCRE=GUSER & [F:TCB3]ADXNUM=adxuid(2)
+  If rowcount([F:TCB3])=0
+   Read[DAE]DAE2=[F:PAN]ACCNUM
+   If !fstat & [F:DAE]ACC=[L]BANCPT
+    #Si on veut tous règlements ou uniquement les règlements rapprochés
+    If [M:CBAN]FLGSTA<>4 |([M:CBAN]FLGSTA=4 & [F:DAE]CHK<>"")
+     Read [HAE]HAE0 = [F:DAE]TYP;[F:DAE]NUM
+     If fstat : Raz [F:HAE]: Endif
+     TMPSTA    = [F:PAN]ACCSTA
+     TMPTYPVCR = [F:PAN]TYPVCR
+     Read [PYH]PYH0 = [F:PAN]NUM
+     Gosub AFFECTE_PYH
+    Endif
+   Endif
+  Endif
+  Filter [F:TCB3]
+ Next
+Next
+Filter [TCB2]
+Return
+
+######################################
+$RECUPPYH_STA2
+PYHCRIT2 = '(STAFLG(2)<>2 & STAFLG(7)<>2 & STAFLG(8)<>2)'
+If [M:CBA1]BAN<>""
+ PYHCRIT2 -= '&(BAN<>"'+[M:CBA1]BAN+'"'+'& ACC="'+BANCPT+'")'
+Endif
+If [M:CBA1]CPY<>""
+ PYHCRIT2 -= '&CPY="'+[M:CBA1]CPY+'"'
+Endif
+If [M:CBA1]FCY<>""
+ PYHCRIT2 -= '&FCY="'+[M:CBA1]FCY+'"'
+Endif
+If [M:CBA1]DATDEB<>[0/0/0]
+ PYHCRIT2 -= '&ACCDAT>=['+format$(GFMD,[M:CBA1]DATDEB)+']'
+Endif
+If [M:CBA1]DATFIN<>[0/0/0]
+ PYHCRIT2 -= '&ACCDAT<=['+format$(GFMD,[M:CBA1]DATFIN)+']'
+Endif
+If [M:CBAN]PAYTYP<>""
+ PYHCRIT2 -= '&PAYTYP="'+[M:CBAN]PAYTYP+'"'
+Endif
+If [M:CBAN]PAM<>""
+ PYHCRIT2 -= '&PAM="'+[M:CBAN]PAM+'"'
+Endif
+
+Raz [F:HAE]
+Raz [F:DAE]
+SIGN=-1
+For [PYH]PYH0 Where evalue(PYHCRIT2)
+ TMPSTA=[F:PYH]STA
+ Raz TMPTYPVCR
+ Gosub AFFECTE_PYH
+Next
+Return
+
+############################################
+#Recherche dernière étape du règlement (excepté l'impayé)
+# 3; 8; 9; 10; (11= impayé)
+$LAST_ETAPE
+ LASTETP=-1
+ If [F:PYH]STAFLG(9)=2 : LASTETP=10 : Return : Endif
+ If [F:PYH]STAFLG(8)=2 : LASTETP=9  : Return : Endif
+ If [F:PYH]STAFLG(7)=2 : LASTETP=8  : Return : Endif
+ If [F:PYH]STAFLG(2)=2 : LASTETP=3  : Return : Endif
+Return
+
+############################################
+#Affectation des lignes du tableau DAE
+$AFFECTE_PYH
+Raz [F:TCB]
+[F:TCB]TCBNUM=uniqid([TCB])
+[F:TCB]ADXNUM=adxuid(2)
+[F:TCB]=[F:HAE]
+[F:TCB]=[F:PYH]
+[F:TCB]NUMPAY=[F:PYH]NUM
+[F:TCB]USRCRE=GUSER
+[F:TCB]STA=TMPSTA
+
+# Calcul du Montant Banque
+If [F:PYH]BAN=[M:CBA1]BAN
+ MTTBAN=abs([F:PYH]BANPAYTPY)
+Elsif [F:PYH]CUR=[M:CBA1]CUR
+ MTTBAN=abs([F:PYH]AMTCUR)
+Else
+ MTTBAN=0
+Endif
+
+If [F:PYH]SNS=1 : #Dépense
+ [F:TCB]AMTBAN=MTTBAN*-1*SIGN
+ [F:TCB]AMTCUR=[F:PYH]AMTCUR*-1*SIGN
+Else               :#Recette
+ [F:TCB]AMTBAN=MTTBAN*SIGN
+ [F:TCB]AMTCUR=[F:PYH]AMTCUR*SIGN
+Endif
+
+# Réaffectation car le transclasse peut écraser les bonnes valeurs
+[F:TCB]NUM    = [F:HAE]NUM
+[F:TCB]TYP    = [F:HAE]TYP
+If [F:HAE]NUM<>""
+ [F:TCB]VALDAT = [F:HAE]VALDAT  #
+ [F:TCB]ACCDAT = [F:HAE]ACCDAT  # ACCDAT est la clé de TMPCNSBAN, il faut une valeur pour la pagination
+ [F:TCB]REF    = [F:HAE]REF
+ [F:TCB]DUDDAT = [F:HAE]DUDDAT
+
+ [F:TCB]DES    = [F:DAE]DES
+ [F:TCB]FCY    = [F:DAE]FCYLIN
+
+ [F:TCB]AMTCUR = [F:DAE]AMTCUR*[F:DAE]SNS
+ [F:TCB]CUR    = [F:DAE]CUR
+Endif
+
+
+# Calcul du Montant Banque
+If IMPAYE=1
+ [F:TCB]AMTBAN=[F:DAE]AMTCUR*[F:DAE]SNS
+Elsif [L]TMPTYPVCR<>"" & [L]TMPTYPVCR<>"A" & [L]TMPTYPVCR<>"T" & [L]TMPTYPVCR<>"9" & [L]TMPTYPVCR<>"B"
+ # Pièce principale & Transfet de Compte (plusieurs étapes de comptabilisation)
+ Raz [F:TCB]AMTBAN
+Endif
+
+# Colorisation & solde virtuel
+If [F:PYH]STA<9
+ [F:TCB]COLOR=0
+ SOLDEV+= [F:TCB]AMTBAN
+Else
+ [F:TCB]COLOR=1
+Endif
+If dim([F:TCB]ACCNUM)>0
+ [F:TCB]ACCNUM = [F:DAE]ACCNUM
+Endif
+Write [F:TCB]
+If fstat
+ GOK = 0 : Call FSTA("TCB") From GLOCK
+Endif
+#If GUSER="CP"
+#Call ECR_TRACE("write TCB / PYH"-num$([F:DAE]ACCNUM)-[F:DAE]NUM-[F:PYH]NUM-"("+[F:TCB]USRCRE+num$([F:TCB]ADXNUM)+")"-num$([TCB]AMTBAN)-"/"-TMPTYPVCR-"//CUR"-num$([TCB]AMTCUR),0) From GESECRAN
+#Endif
+Return
+
+#####################################################################################
+#[DAE]
+#####################################################################################
+
+$RECUPDAE
+For [DAE]DAE1 Where evalue(DAECRIT)
+ If !find([F:DAE]TYP,TGTE(1..NBRGTE))
+  If [M:CBAN]FLGSTA<>4 |([M:CBAN]FLGSTA=4 & [F:DAE]CHK<>"")
+   Read [HAE]HAE0=[F:DAE]TYP;[F:DAE]NUM
+   If fstat : Raz [F:HAE]: Endif
+   If [F:HAE]CAT<5
+    If [F:HAE]ORIMOD=2
+     Raz [PYH] : Gosub AFFECTE_DAE
+    Elsif dim([F:TCB2]ACCNUM)>0
+     Filter [F:TCB2] Where [F:TCB2]ACCNUM=[F:DAE]ACCNUM & [F:TCB2]USRCRE=GUSER & [F:TCB2]ADXNUM=adxuid(2)
+     Read [TCB2] First
+     If fstat
+      # Gestion de la pièce comptable venant d'une étape de comptabilisation de règlements.
+      #  Destination Banque<=>Compte qui n'est pas "compensé" par le paramètrage de la pièce automatique
+      #  Cas concret : Frais bancaire sur pièce non séparée (dont compensation Débit/Crédit non actif)
+      #  FEVRIER 2014 : une seule ligne dans la consultation MAIS il faut cumuler l'information pour le montant devise
+      Filter [TCB2] Where ACCNUM<>[F:DAE]ACCNUM and TYP=[F:DAE]TYP and NUM=[F:DAE]NUM and USRCRE=GUSER and ADXNUM=adxuid(2)
+      Read [TCB2] First
+      Filter [TCB2]
+      If !fstat
+       Update [TCB2] Where ACCNUM<>[F:DAE]ACCNUM and TYP=[F:DAE]TYP and NUM=[F:DAE]NUM and USRCRE=GUSER and ADXNUM=adxuid(2)
+&                     With [F:TCB2]AMTCUR=[F:TCB2]AMTCUR+([F:DAE]AMTCUR*[F:DAE]SNS)
+      Else
+       Read [PYH]PYH0 = vireblc(right$([F:HAE]REFINT,4),2)
+       If !fstat
+        Gosub AFFECTE_DAE
+       Else
+         Raz [PYH] : Gosub AFFECTE_DAE
+        Endif
+      Endif
+     Endif
+     Filter [F:TCB2]
+    Endif
+   Endif
+  Endif
+ Endif
+Next
+Return
+
+############################################
+#Affectation des critères pour le filtre sur DAE
+$CRITDAE
+DAECRIT='[F:DAE]LEDTYP='+num$(GTYPGEN)
+If [M:CBA1]BAN<>""
+ DAECRIT -= '&[F:DAE]ACC="'+BANCPT+'"'
+Endif
+If BANBPR<>""
+ DAECRIT -= '&[F:DAE]BPR="'+BANBPR+'"'
+Endif
+If [M:CBA1]CPY<>""
+ DAECRIT -= '& [F:DAE]CPY="'+[M:CBA1]CPY+'"'
+Endif
+If [M:CBA1]FCY<>""
+ DAECRIT -= '& [F:DAE]FCYLIN="'+[M:CBA1]FCY+'"'
+Endif
+If [M:CBA1]DATDEB<>[0/0/0]
+ DAECRIT -= '& [F:DAE]ACCDAT>=['+format$(GFMD,[M:CBA1]DATDEB)+']'
+Endif
+If [M:CBA1]DATFIN<>[0/0/0]
+ DAECRIT -= '& [F:DAE]ACCDAT<=['+format$(GFMD,[M:CBA1]DATFIN)+']'
+Endif
+Return
+
+############################################
+#Affectation des lignes du tableau DAE
+$AFFECTE_DAE
+Raz [F:TCB]
+[F:TCB]TCBNUM=uniqid([TCB])
+[F:TCB]ADXNUM=adxuid(2)
+
+If [F:PYH]NUM<>""
+ [F:TCB]=[F:PYH]
+ [F:TCB]NUMPAY=[F:PYH]NUM
+ [F:TCB]=[F:HAE]
+Else
+ [F:TCB]=[F:HAE]
+Endif
+
+# Calcul du Montant Banque
+If [F:DAE]CUR<>[M:CBA1]CUR
+ MTTBAN=[F:DAE]AMTLED
+Else
+ MTTBAN=[F:DAE]AMTCUR
+Endif
+
+If [F:DAE]SNS*[F:DAE]AMTCUR>0
+ [F:TCB]SNS=2 # Recette
+Else
+ [F:TCB]SNS=1 # Dépense
+Endif
+
+[F:TCB]FCY = [F:DAE]FCYLIN
+[F:TCB]DES = [F:DAE]DES
+
+[F:TCB]AMTBAN = MTTBAN*[F:DAE]SNS
+[F:TCB]AMTCUR = [F:DAE]AMTCUR*[F:DAE]SNS
+
+[F:TCB]COLOR=1
+[F:TCB]STA=9
+[F:TCB]USRCRE=GUSER
+Write [F:TCB]
+If fstat
+  GOK = 0 : Call FSTA("TCB") From GLOCK
+Endif
+#If GUSER="CP"
+# Call ECR_TRACE("write TCB / DAE"-num$([F:DAE]ACCNUM)-[F:DAE]NUM-"("+[F:TCB]USRCRE+num$([F:TCB]ADXNUM)+") BAN"-num$([TCB]AMTBAN)-"DEV"-num$([TCB]AMTCUR),0) From GESECRAN
+#Endif
+Return
+
+
+Subprog TR_ANNUL
+Call DEBTRANS From GLOCK
+Gosub TR_ANNU
+End
+
+$TR_ANNU
+GOK = 1
+Trbegin [TCB]
+ Delete [TCB] Where USRCRE=GUSER & ADXNUM=adxuid(2)
+ If fstat=1 | fstat>5
+  GOK=0 : Call RSTA("TCB","") From GLOCK : Goto AB_TR_ANNUL
+ Endif
+Commit
+Return
+
+$AB_TR_ANNUL
+Rollback
+End
+
+$ROLL_TR_ANNUL
+Rollback
+Call ROLL From GLOCK
+If GROLL : End : Else : Goto TR_ANNU : Endif
+End
+
+Subprog VALFIL_TBL
+Local Integer OK
+Filter [TCB] Where USRCRE=GUSER or ADXNUM<>adxuid(2)
+Read [TCB]TCB0 First
+Filter [TCB]
+If fstat
+ Call SYSTEME(adxmac(0),"valfil -z"-nomap-"TMPCNSBAN","",OK) From ORDSYS
+Endif
+End
+
+$SVG_GTE
+Local Integer NBRGTE
+Filter [GTE] Where PER = 3
+NBRGTE = rowcount([F:GTE])
+Filter [GTE]
+Local Char  TGTE(GLONGTE)(1..NBRGTE+1)
+
+Filter [GTE2] Where LEG=[F:CPY]LEG | LEG="" Order By Key CLE=TYP Asc ; LEG Desc
+Raz NBRGTE, TGTE
+For [GTE2]CLE(1)
+ If [F:GTE2]PER = 3
+  NBRGTE += 1
+  TGTE(NBRGTE) = [F:GTE2]TYP
+ Endif
+Next
+Return

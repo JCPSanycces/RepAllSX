@@ -1,0 +1,1393 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+######################################################################################################
+# Project       : Bank statement import (MT940)
+# File          : BSILIBPAY
+# Version       : 1.0
+# Authors       : U. Bader
+# Creation Date : 2016-07-11
+######################################################################################################
+# Module        : Finance
+# Description   : Library for bank statement import: payment creation
+######################################################################################################
+# Updates       :
+# Date          | Author | Version | Description
+# 2016-07-12    | Angre  | U11     | write discountlines to file
+# 2016-07-14    | DNE    | U11     | Management for B and C type hits
+# 2016-07-18    | Bader  | U11     | Check if original open item paid in between, add error messages for PSTA = 4
+# 2016-07-19    | Bader  | U11     | insert validation of payments using REMBAN function
+# 2016-07-21    | Bader  | U11     | new Subprog BSI_PAYMENT_VALIDATION, remove validation from BSI_PAYMENT_CREATION
+# 2016-07-29    | DNE    | U11     | x3-2384 - Remove nonmatched open items from BSIDUD after transaction having been validated
+# 2016-08-03    | Bader  | U11     | CREATE_IMPORT_FILE: handle manual entries (LET = "AD")
+# 2016-08-03    | Angre  | U11     | write analytical lines to file
+# 2016-08-11    | Angre  | U11     | write analytical lines to file (updated)
+# 2016-08-16    | Bader  | U11     | write temporary import file to "BQE" instead of "EXPORT"
+# 2016-08-18    | Bader  | U11     | WRITE_HEADER_BC: don't write [F.BSIIMPD]BPRPAY but ""
+# 2016-08-22    | Angre  | U11     | use payment attribute for suspense account for B/C detail line
+# 2016-08-31    | Angre  | U11     | payment term and accounting code from BPEXCEPT
+# 2016-09-15    | DNE    | U11     | X3-3883 Create additional payment line for overpayments
+# 2016-09-16    | Angre  | U11     | X3-3883 Create additional payment line for overpayments
+# 2016-10-25    | Bader  | U11     | WRITE_HEADER_*: write additional fields SUP1 and DES (with statement/transaction)
+# 2016-11-04    | Bader  | U11     | OPEN_DB_TABLE, GETDISCAMOUNT: open database tables only if not yet opened
+# 2016-11-11    | Bader  | U11_01  | X3-1501: Implementation of search term list
+# 2017-01-10    | Bader  | U11_02  | 120665: payments were created more than once if a previous transaction of
+#               |        |         | the same statement had an error (FLGCRE wasn't set)
+# 2017-04-12    | Bader  | 2017.R3 | 122520: write an empty string in detail lines at the end (GIMP(5) after GIMP(4)) to avoid bug
+# 2017-04-13    | Bader  | 2017.R3 | X3-31186: CH ISO: modify payment generation: multiple headers if BP changes
+# 2017-05-12    | Bader  | 2017.R3 | X3-35653: support FLGCRE = 3/4 (partially validated, manually closed > new local menu 3690)
+# 2017-05-12    | Bader  | 2017.R3 | X3-35653: new function BSI_CLOSE_TRANSACTION
+# 2017-05-16    | DNE    | 2017.R3 | Row separator set to CHR$(10) (LF) on file export.
+# 2017-05-16    | Bader  | 2017.R3 | Row separator set to record separator defined in BSIPAY template
+# 2017-05-17    | Bader  | 2017.R3 | 122520: remove empty string in detail lines at the end (GIMP(5) after GIMP(4)) as bug fixed
+# 2017-05-17    | Bader  | 2017.R3 | X3-35694: CREATE_IMP_FILE_AD: write correct header amount (taking from manual entry line)
+# 2017-08-14    | angre  | 2017.R4 | X3-42421: BSI payments in currency - Verify payment generation
+# 2017-08-15    | Bader  | 2017.R4 | X3-42421: BSI payments in currency - write AMTLIN2 and GIMP(5)= "NOCALC"
+# 2017-08-17    | DNE    | 2017.R5 | X3-52272: BSIIMPPAR.FLGCLS: React on this flag in the configuration
+# 2017-09-11    | DNE    | 2017.R5 | X3-54319: Handling of credit memos and credit notes with correct sign in payments.
+# 2017-10-10    | Bader  | 2017.R6 | X3-54319: use [F:BSIDUD]BSISNS instead of [F:BSIDUD]SNS to handle supplier invoices correctly
+# 2017-10-11    | Bader  | 2017.R6 | X3-56107: GETDISCOUNTACCOUNT: index in accounting codes zero based; use 26,27 instead of 13/14
+# 2018-08-31    | Bader  | 2018.R? | X3-106034: Manual entry - Transfer description field entry to payment header
+# Issue X3-59028 - 2018-04-18 by CBO : Changes of accounting task for mindo
+# 2018-09-27    | Bader  | 2018.R? | X3-110474: BSI_PAYMENT_CREATION: add entry point "BSIPAYCRE" after import of file
+######################################################################################################
+
+Local Char TESTSTMCOD(30), TESTMSG(250)
+Local Integer TESTLIN, TESTSTA
+TESTSTMCOD = "00002153"
+TESTLIN    = 1
+TESTSTA    = 0
+TESTMSG    = ""
+Call BSI_PAYMENT_CREATION(TESTSTMCOD,TESTLIN,TESTSTA,TESTMSG)
+End
+
+
+#**
+#* Purpose: Payment creation for one transaction within a bank file import statement
+#*
+#* @param PSTMCOD      primary key for reading record in table BSIIMP.
+#* @param PLIN         second part of primary key for reading record in table BSIIMPD (PSTMCOD+PLIN).
+#* @param PSTA         status of payment creation 0:OK, 1:payments already created, 2:transaction/statement not found, 3:error during payment import, 4:various
+#* @param PMSG         Message corresponding to status.
+#*!
+Subprog BSI_PAYMENT_CREATION(PSTMCOD,PLIN,PSTA,PMSG)
+Value Char PSTMCOD     # identifier of statement, part of key to table BSIIMP/BSIIMPD
+Value Integer PLIN     # line number within statement (transaction), part of key to table BSIIMPD
+Variable Integer PSTA  # status of payment creation 0:OK, 1:payments already created, 2:transaction/statement not found, 3:error during payment import, 4:various
+Variable Char PMSG     # Message corresponding to status
+
+PSTA = 0
+Gosub INIT
+Read [F:BSIIMP]BSIIMP0 = PSTMCOD  # read statement (import header)
+If !fstat
+  Read [F:BSIIMPD]BSIIMPD0 = PSTMCOD;PLIN # read transaction PLIN of statement
+  If !fstat
+    If find ([F:BSIIMPD]FLGCRE,2,4)    # Validated or manually closed
+      PSTA = 1
+      PMSG = PSTMCOD - mess(46,7703,1) # "Payment already created"
+    Elsif [F:BSIIMPD]LET = ""
+      PSTA = 2
+      PMSG = func AFNC.MES1( mess(47,7703,1), PSTMCOD+"~"+num$(PLIN)) # "Transaction $1$ not matched."
+    Else
+      Read [F:BSIIP]BSIIP0 = [F:BSIIMP]CODIMPPAR
+      If !fstat
+          Gosub CHECK_ACCOUNTING_TASK
+          If NBT = 0 : End : Endif         # accounting tasks not running > end
+
+          # Open trace file
+          If FLGTRACE
+              Call OUVRE_TRACE(mess(40,7703,1)) From LECFIC  # Bank statement import: payment creation
+              Call ECR_TRACE ("-----------------------------------------------------------------------",0) From GESECRAN
+          Endif
+
+# 2017-08-17 DNE INSERT BEGIN (X3-52272)
+          # Note: In case "Intermediate posting" is active there will be no payments generated for a
+          #       non-A-match (i. e. B- and C-match) but the flag "Manually completed" set.
+          #
+          If ( [F:BSIIP]FLGCLS = 2 ) and ( left$([F:BSIIMPD]LET, 1 ) <> "A" )
+              [F:BSIIMPD]FLGCRE = 4                       # Set to "Manually completed".
+              Rewrite [F:BSIIMPD]
+
+              # Remove open items that are not matched against the transaction from BSIDUD table.
+              Delete [F:BSIDUD] Where STMCOD = [F:BSIIMPD]STMCOD and LIN = [F:BSIIMPD]LIN and DUDSEL <> 2
+          Else
+# 2017-08-17 DNE INSERT END
+              Call ECR_TRACE( [F:BSIIMPD]STMCOD + "~" + num$( [F:BSIIMPD]LIN ) - mess(41,7703,1),0 ) From GESECRAN   # Creating the payment import file!
+              Gosub CREATE_IMPORT_FILE                    # create temporary import file
+              If PSTA <> 0
+                  Call ECR_TRACE(mess(184,124,1),1) From GESECRAN  # 'Impossible to create the file'
+              Else
+                  Gosub IMPORT
+
+                  GPOINT="BSIPAYCRE" : Gosub ENTREE From EXEFNC  # X3-110474: entry point to do changes on the created payments before they are validated
+
+                  If PSTA = 0                             # No error during import
+                      [F:BSIIMPD]FLGCRE = 2               # Set "Validated".
+                  Else                                    # Error during import > check if at least 1 payment has been created
+                      Filter [F:PYH1] Where [F:PYH1]BSITRS = [F:BSIIMPD]STMCOD + "/" + num$([F:BSIIMPD]LIN)
+                      Read [F:PYH1] First
+                      If !fstat                           # at least 1 payment found
+                          [F:BSIIMPD]FLGCRE = 3           # Set "Partially validated".
+                      Endif
+                  Endif
+                  If [F:BSIIMPD]FLGCRE > 1                # payment status no longer "Not validated" > update record in database
+                      Rewrite [F:BSIIMPD]
+                      If fstat
+                          PSTA = 4
+                          PMSG = [F:BSIIMPD]STMCOD + "~" + num$( [F:BSIIMPD]LIN ) - mess(27,125,1)
+                          Call ECR_TRACE( [F:BSIIMPD]STMCOD + "~" + num$( [F:BSIIMPD]LIN ) - mess(27,125,1),1 ) From GESECRAN #  'Re-write Error'
+                      Endif
+                  Endif
+
+                  # Remove open items that are not matched against the transaction from BSIDUD table.
+                  Delete [F:BSIDUD] Where STMCOD = [F:BSIIMPD]STMCOD and LIN = [F:BSIIMPD]LIN and DUDSEL <> 2
+              Endif
+# 2017-08-17 DNE INSERT BEGIN (X3-52272)
+          Endif
+# 2017-08-17 DNE INSERT END
+
+          # Close trace file
+          If FLGTRACE
+              Call FERME_TRACE From LECFIC
+              Call LEC_TRACE From LECFIC
+          Endif
+      Else
+         PSTA = 2
+         PMSG = [F:BSIIMP]CODIMPPAR - mess(6,7703,1) # "Import settings not found"
+      Endif
+    Endif
+  Else
+     PSTA = 2
+     PMSG = PSTMCOD + "~" + num$(PLIN) - mess(7,7703,1) # 'Transaction does not exist'
+  Endif
+Else
+   PSTA = 2
+   PMSG = PSTMCOD - mess(1,7703,1) # 'Statement does not exist'
+Endif
+End
+
+
+#**
+#* Purpose: Payment validation for a bank file import payment entry type (either one statement or all statements)
+#*
+#* @param PCODIMPPAR   identifier of payment import settings
+#* @param PSTMCOD      primary key for reading record in table BSIIMP. If empty, do validation for all statements
+#* @param PSTA         status of payment validation 0:OK, 1:payments already created, 2:transaction/statement not found, 3:error during payment import, 4:various
+#* @param PMSG         Message corresponding to status.
+#*!
+Subprog BSI_PAYMENT_VALIDATION(PCODIMPPAR,PSTMCOD,PSTA,PMSG)
+Value Char PCODIMPPAR  # identifier of payment import settings
+Value Char PSTMCOD     # primary key for reading record in table BSIIMP. If empty, do validation for all statements
+Variable Integer PSTA  # status of payment validation 0:OK, 1:payments already created, 2:transaction/statement not found, 3:error during payment import, 4:various
+Variable Char PMSG     # Message corresponding to status
+
+PSTA = 0
+Gosub INIT_VAL
+Raz [F:BSIIMP]
+Read [F:BSIIP]BSIIP0 = PCODIMPPAR  # read payment import settings
+If fstat
+    PSTA = 2
+    PMSG = PCODIMPPAR - mess(6,7703,1) # "Import settings not found"
+    End
+Endif
+Read [F:BSIIMP]BSIIMP0 = PSTMCOD  # read statement (import header)
+If fstat
+   PSTA = 2
+   PMSG = PSTMCOD - mess(1,7703,1) # 'Statement does not exist'
+   End
+Endif
+# Open trace file
+If FLGTRACE
+    Call OUVRE_TRACE(mess(56,7703,1)) From LECFIC  # Bank statement import: payment validation
+Endif
+Call LEC_TPY_LEG([F:BSIIP]LEG,[F:BSIIP]PAYTYP) From CPTLEC # read payment entry type
+If fstat=0 and [F:TPY]ENAFLG = 2           # check if active
+    If [F:TPY]STA5<2                       # not a remittance
+        VALIDATE=2                         # Validation (REMBAN)
+    Else
+        VALIDATE=0                         # No validation (REMBAN)
+    Endif
+Else
+    PSTA = 4
+    PMSG = func AFNC.MES1( mess(43,7703,1), [F:BSIIP]PAYTYP) # Error reading payment entry type $1$ or payment entry type is inactive.
+    End
+Endif
+
+If VALIDATE = 2                # validate payment using REMBAN?
+    Gosub VALIDATE_PAYMENT
+Endif
+# Close trace file
+If FLGTRACE
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+Endif
+End
+
+
+############################################################################################
+$INIT
+If !clalev ([F:BSIIMP])     Local File BSIIMP      [BSIIMP]  Endif # header import
+If !clalev ([F:BSIIMPD])    Local File BSIIMPD     [BSIIMPD] Endif # details import
+If !clalev ([F:BSIIP])      Local File BSIIMPPAR   [BSIIP]   Endif # import parameters
+If !clalev ([F:BSIDUD])     Local File BSIDUD      [BSIDUD]  Endif # Open items for one transaction
+If !clalev ([F:BSIDUD1])    Local File BSIDUD      [BSIDUD1] Endif # second cursor on open items
+If !clalev ([F:BSIMAN])     Local File BSIMANENT   [BSIMAN]  Endif # Manual entries
+If !clalev([F:CAC])         Local File GACCCODE    [CAC]     Endif # Accounting codes
+If !clalev([F:TPY])         Local File TABPAYTYP   [TPY]     Endif # Payment entry types
+If !clalev([F:BPR])         Local File BPARTNER    [BPR]     Endif # Business partners
+If !clalev([F:BPC])         Local File BPCUSTOMER  [BPC]     Endif # Customers
+If !clalev([F:BPS])         Local File BPSUPPLIER  [BPS]     Endif # Suppliers
+If !clalev([F:TPT])         Local File TABPAYTERM  [TPT]     Endif # Payment terms
+If !clalev([F:BAN])         Local File BANK        [BAN]     Endif # Bank
+If !clalev([F:CPY])         Local File COMPANY     [CPY]     Endif # Company
+If !clalev([F:BPA])         Local File BPADDRESS   [BPA]     Endif # (Account's) Address
+If !clalev ([F:DUD])        Local File GACCDUDATE  [DUD]     Endif # open items
+If !clalev([F:GAC1])        Local File GACCOUNT    [GAC1]    Endif # Accounts
+If func ASYRFNC.ACTIV("MUL") >0 : # Issue 56229 - 2017-11-15 by MWA
+  If !clalev([F:BPE])         Local File BPEXCEPT    [BPE]     Endif # BPEXCEPT
+Endif
+If !clalev([F:CDA])         Local File GACCDENCOD  [CDA]     Endif # Payment attribute
+If !clalev([F:PYH1])        Local File PAYMENTH    [PYH1]    Endif # Payment header
+If !clalev([F:AOE1])        Local File AOBJEXT     [AOE1]    Endif # Import/Export templates
+
+Local Char TMPF(250)
+Local Integer NBT                : Raz NBT
+Local Char TPY_(GLONTPY)
+Local Integer FOUND              : Raz FOUND
+Local Char FCY(GLONFCY)          : Raz FCY
+Local Integer FLGTRACE           : If GTRACE = "" : FLGTRACE = 1 : Else : FLGTRACE = 0 : Endif
+Local Decimal BSIAMTPAYCUR
+Return
+
+
+# Issue X3-59028 - 2018-04-18 by CBO : Changes of accounting task for mindo
+#
+############################################################################################
+$INIT_VAL
+If !clalev ([F:BSIIMP])     Local File BSIIMP      [BSIIMP]   Endif # header import
+If !clalev ([F:BSIIP])      Local File BSIIMPPAR   [BSIIP]    Endif # import parameters
+If !clalev([F:TPY])         Local File TABPAYTYP   [TPY]      Endif # Payment entry types
+
+Local Integer FLGTRACE      : If GTRACE = "" : FLGTRACE = 1 : Else : FLGTRACE = 0 : Endif
+Local Integer VALIDATE
+Return
+
+
+############################################################################################
+$CHECK_ACCOUNTING_TASK
+#---- Test if accounting tasks are active and running ----#
+
+# Issue 59028
+#If !clalev([F:ABR]) : Local File "ABATRQT" [ABR] : Endif    : # batch task table
+#Filter [F:ABR] Where DOSSIER=nomap
+#& and TACHE="ACCBATCH"
+#& and FLAG <=2
+#For [F:ABR]
+#    NBT+=1
+#Next
+#Filter [F:ABR]
+#
+## -- search for ACCBATCH1 if ACCBATCH not found ----
+#If NBT=0
+#Filter [F:ABR] Where DOSSIER=nomap
+#& and TACHE="ACCBATCH1"
+#& and FLAG <=2
+#For [F:ABR]
+#    NBT+=1
+#Next
+#Filter [F:ABR]
+#Endif
+
+Local Integer WTSK_STA_IS_STOPPED
+Call PRESENCE(WTSK_STA_IS_STOPPED) From CPTBATCH
+If WTSK_STA_IS_STOPPED
+  NBT = 0
+Else
+  NBT = 1
+Endif
+# End issue 59028
+
+If NBT=0              # not running
+  Local Integer REPONSE
+  Call OUINON(mess(113,7778,1),REPONSE) From GESECRAN
+  If REPONSE<>1  # - 1 = No  2 = yes
+    NBT=1
+  Endif
+Endif
+
+If NBT = 0
+    # accounting tasks not running
+    Call ERREUR(mess(42,7703,1)) From GESECRAN   # The accounting batch task is not active! Please activate before posting.
+Endif
+Return
+
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Create temporary import file
+#-----------------------------------------------------------------------------------------------------
+$CREATE_IMPORT_FILE
+Local Char PTE(GLONPTE)
+Local Integer ACCTYP
+Local Char ACCCOD(GLONCAC)
+Local Char ADR(GLONADR)
+Local Char DENCOD(GLONCDA)
+Local Integer SNS, I
+Local Char ACC_HDR(GLONGAC)
+Local Char PAM(GLONTAM)
+Local Char BPRPAY(GLONBPR)
+Local Decimal BSIAMTPAYCURDIFF, BSIAMTPAYCUR
+Local Char DENCODDIFF(GLONCDA)
+Local Char OPTYP(GLONTPY)
+Local Char OPNUM(GLONVCR)
+Local Decimal HEADERAMTCUR # ... in open item currrency
+Local Decimal HEADERAMTBAN # ... in statement/bank currrency
+Local Char SEPREC(10) : [L]SEPREC = chr$(10)
+Local Char PAYDES(GLONDES)          # X3-106034
+
+# Open import file
+TMPF=filpath("BQE","bsiimport","txt","","",adxmac(0))
+
+Openo TMPF,0 Using [TF]
+
+If [F:AOE1]EXT <> "BSIPAY"
+  Read [F:AOE1]AOE0 = "BSIPAY"
+  If !fstat
+      [L]SEPREC = [F:AOE1]SEPREC
+      I = 1
+      While (I > 0)
+          I = instr(1,SEPREC,"\")
+          If I
+            SEPREC = left$(SEPREC,I-1)+chr$(val(mid$(SEPREC,I+1,3)))+right$(SEPREC,I+4)
+            I += 1
+          Endif
+      Wend
+  Endif
+Endif
+
+adxifs=";"
+adxirs=[L]SEPREC
+adxium=50
+
+Call LEC_TPY_LEG([F:BSIIP]LEG,[F:BSIIP]PAYTYP) From CPTLEC # read payment entry type
+If fstat=0 and [F:TPY]ENAFLG = 2           # check if active
+    FOUND = 2
+    DENCOD = [F:TPY]DENDEF                 # default payment attribute
+    If DENCOD = ""                         # not found > read parameter
+        Call PARAM([F:BSIIMPD]FCYLIN,"DENTAK",DENCOD) From ADOVAL
+    Endif
+Else
+    PSTA = 4
+    PMSG = func AFNC.MES1( mess(43,7703,1), [F:BSIIP]PAYTYP) # Error reading payment entry type $1$ or payment entry type is inactive.
+    Return
+Endif
+
+HEADERAMTBAN = [F:BSIIMPD]AMTCUR
+If [F:BSIIMPD]OVERPAY > 0
+    [L]BSIAMTPAYCURDIFF = [F:BSIIMPD]OVERPAY #[F:BSIDUD]BSIPAYCUR - [L]BSIAMTPAYCUR
+    DENCODDIFF = [F:BSIIP]CDAEXCPAY
+    Filter [F:CDA] Where [F:CDA]COD = DENCODDIFF
+    Read [F:CDA] First
+    If [F:CDA]ACCTYP = 3                     # Account<=>BP > not allowed for overpayments
+        PSTA = 4
+        PMSG = func AFNC.MES1( mess(77,7703,1), DENCODDIFF) # Account structure "Account <=> BP" is not allowed for overpayment payment attribute $1$.
+    Elsif [F:CDA]ACCTYP = 2                  # Bank<=>Account
+          HEADERAMTBAN = [F:BSIIMPD]AMTCUR - [F:BSIIMPD]OVERPAY
+    Endif
+    Filter [F:CDA]
+Endif
+
+If FOUND and PSTA = 0
+    PAYDES = GUSER+'/'+[F:BSIIMPD]STMCOD+'/'+num$([F:BSIIMPD]LIN)         # X3-106034
+    If [F:BSIIMPD]SNS="C" | [F:BSIIMPD]SNS="RD"
+       SNS = 2
+    Else #  D or RC
+       SNS = 1
+    Endif
+    If left$([F:BSIIMPD]LET,1) = "A" and !find([F:BSIIMPD]LET,"AD","AS") # only for "A" hits but not for manual entries / search term list
+       [F:BSIIMP]FCY = [F:BSIIMPD]FCYLIN
+       BPRPAY = ""                      # init BPRPAY empty
+       Filter [F:BSIDUD] Where STMCOD = [F:BSIIMPD]STMCOD and LIN = [F:BSIIMPD]LIN and DUDSEL = 2 Order By BPRPAY
+       For [F:BSIDUD]
+          Read [F:DUD]DUD8=[F:BSIDUD]NUMDUD        # read corresponding record in GACCDUDATE to check if paid in between
+          If !fstat and [F:DUD]AMTCUR-[F:DUD]PAYCUR-[F:DUD]TMPCUR >= [F:BSIDUD]BSIPAYCUR   # remaining amount > amount to be paid
+              If BPRPAY <> [F:BSIDUD]BPRPAY             # change of business partner?
+                  Gosub CALC_HEADERAMOUNT               # calculate the header amount for the new business partner
+                  BPRPAY = [F:BSIDUD]BPRPAY
+                  Gosub READ_BP_INFOS                   # read BPR/BPC/BPS and corresponding CAC, TPY ...
+                  If PSTA : Return : Endif
+                  ACC_HDR = [F:CAC]ACC(0)
+                  Gosub WRITE_HEADER
+              Endif
+
+              Gosub WRITE_DETAIL
+          Else
+              Call ECR_TRACE(func AFNC.MES1(mess(52,7703,1), [F:BSIDUD]NUM),0) From GESECRAN  # The open item $1$ has been paid or partially paid in between.
+          Endif
+       Next
+       Filter [F:BSIDUD]
+    Elsif find([F:BSIIMPD]LET,"AD","AS")          # for manual entries ("AD" hit) / search term list ("AS")
+        Gosub CREATE_IMP_FILE_AD                  # create a payment for each line of the manual entries
+    Else                                          # for "B" and "C" hits create payments on suspense account
+        # Get the site from bank otherwise from company's main site.
+        Read [F:BAN]BAN0 = [F:BSIIMPD]BAN
+        If fstat : PSTA = 4 : PMSG = func AFNC.MES1(mess(53,7703,1), [F:BSIIMPD]BAN) : Goto ENDFILE : Endif # error > message 'Error reading the bank $1$.' > end
+        FCY = [F:BAN]FCY
+        If FCY = ""
+            Call LEC_CPY( [F:BSIIMPD]CPY ) From CPTLEC
+            If !fstat
+                FCY = [F:CPY]MAIFCY
+            Endif
+        Endif
+        If FCY = "" : PSTA = 4 : PMSG = mess(54,7703,1) : Goto ENDFILE : Endif # No site could be determined.
+        [F:BSIIMP]FCY = FCY                # write FCY into header of statement > needed in screen initialization for REMBAN validation
+
+        # Get the account's main address
+        Filter [F:BPA] Where BPATYP = 5 and BPANUM = [F:BSIIP]COA + [F:BSIIP]ACCSUSPENSE and BPAADDFLG = 2
+        Read [F:BPA]BPA0 First
+        If fstat :  Filter [F:BPA] : PSTA = 4 : PMSG = func AFNC.MES1(mess(55,7703,1), [F:BSIIP]ACCSUSPENSE) : Goto ENDFILE : Endif # error > message 'Error reading the address for account $1$.' > end
+        Filter [F:BPA]
+        ADR = [F:BPA]BPAADD
+
+        Gosub WRITE_HEADER_BC
+        Gosub WRITE_DETAIL_BC
+    Endif
+
+    #write overpayment line
+    If [F:BSIIMPD]OVERPAY > 0
+      Gosub WRITE_DETAIL_DIFF
+      Call ECR_TRACE( func AFNC.MES2( mess(76,7703,1), num$(BSIAMTPAYCURDIFF), [F:BSIDUD]CUR),0 ) From GESECRAN   # Overpayment of "amount" "currency" created.
+    Endif
+Endif
+
+$ENDFILE
+# Close import file
+Openo Using [TF]
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Calculate the header amount for the business partner [F:BSIDUD]BPRPAY
+#-----------------------------------------------------------------------------------------------------
+$CALC_HEADERAMOUNT
+    Filter [F:BSIDUD1] Where STMCOD = [F:BSIIMPD]STMCOD and LIN = [F:BSIIMPD]LIN and DUDSEL = 2 and BPRPAY = [F:BSIDUD]BPRPAY
+    Raz HEADERAMTCUR, HEADERAMTBAN
+    For [F:BSIDUD1]
+# 2017-09-11 DNE MODIF BEGIN (X3-54319)
+        HEADERAMTCUR += [F:BSIDUD1]BSIPAYCUR * [F:BSIDUD1]BSISNS
+        HEADERAMTBAN += [F:BSIDUD1]BSIPAYSTM * [F:BSIDUD1]BSISNS
+# 2017-09-11 DNE MODIF ORIG
+#        HEADERAMTCUR += [F:BSIDUD1]BSIPAYCUR
+#        HEADERAMTBAN += [F:BSIDUD1]BSIPAYSTM
+# 2017-09-11 DNE MODIF END
+    Next
+    If [F:CDA]ACCTYP <> 2
+        HEADERAMTBAN += [F:BSIIMPD]OVERPAY
+    Endif # add overpayment to header amount if payment attribute for overpayment not "Bank <> Account"
+    Filter [F:BSIDUD1]
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** read BPR/BPC/BPS and corresponding CAC, TPY ...
+#-----------------------------------------------------------------------------------------------------
+$READ_BP_INFOS
+Local Tinyint  CUSTFLG : CUSTFLG = 0
+Read [F:BPR]BPR0 = BPRPAY                  # Read business partner
+If fstat : PSTA = 4 : PMSG = func AFNC.MES1(mess(49,7703,1), BPRPAY) : Return : Endif # error > message 'Error reading the business partner $1$' > end
+
+If [F:BPR]BPCFLG = 2 and [F:BPR]BPSFLG = 2
+  If SNS = 2 : CUSTFLG = 2 : Endif #if BP is customer and supplier set flag according to the sign of transaction
+Elsif [F:BPR]BPCFLG = 2
+  CUSTFLG = 2
+Endif
+
+#first look in bpexcept for payment term and accounting code
+If func ASYRFNC.ACTIV("MUL") >0 : # Issue 56229 - 2017-11-15 by MWA
+  Read [BPE]BPE0 = BPRPAY; [F:BSIIMPD]CPY
+  If !fstat
+      If CUSTFLG = 2
+        PTE =  [F:BPE]PTEBPC
+        ACCCOD = [F:BPE]ACCBPC
+      Else
+        PTE = [F:BPE]PTEBPS
+        ACCCOD = [F:BPE]ACCBPS
+      Endif
+  Endif
+Endif
+
+If  CUSTFLG = 2                            # Customer?
+    Read [F:BPC]BPC0 = BPRPAY              # read customer
+    If fstat : PSTA = 4 : PMSG = mess(317,177,1) : Return : Endif # error > message 'Error reading the customer' > end
+    If PTE = ""
+      PTE = [F:BPC]PTE                     # payment term
+    Endif
+    If ACCCOD = ""
+      ACCCOD = [F:BPC]ACCCOD               # accounting code
+    Endif
+    ACCTYP = 2                             # customer
+    ADR = [F:BPC]BPAPYR                    # address
+Else
+    Read [F:BPS]BPS0 = BPRPAY              # read supplier
+    If fstat : PSTA = 4 : PMSG = func AFNC.MES1(mess(48,7703,1), BPRPAY) : Return : Endif # error > message 'Error reading the supplier $1$' > end
+    If PTE = ""
+      PTE = [F:BPS]PTE                     # payment term
+    Endif
+    If ACCCOD = ""
+      ACCCOD = [F:BPS]ACCCOD               # accounting code
+    Endif
+    ACCTYP = 3                             # supplier
+    ADR = [F:BPS]BPAPAY                    # address
+Endif
+Read [F:CAC]CAC0 = ACCTYP;ACCCOD;[F:BSIIP]COA # read accounting code to get account
+If fstat : PSTA = 4 : PMSG = func AFNC.MES1(mess(50,7703,1), num$(ACCTYP)-"~"-ACCCOD-"~"-[F:BSIIP]COA) : Return : Endif # error > message 'Error reading the accounting code $1$' > end
+Read [F:TPT]TPT0 = PTE; [F:BSIIP]LEG; 1    # read payment term to get PAM
+If fstat
+   Read [F:TPT]TPT0 = PTE; ""; 1
+   If fstat
+     PSTA = 4 : PMSG = func AFNC.MES1(mess(51,7703,1), PTE-"~"-[F:BSIIP]LEG-"~1") : Return
+   Endif
+Endif # error > message 'Error reading the payment term $1$' > end
+PAM = [F:TPT]PAM
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Create temporary import file for manual entries
+#-----------------------------------------------------------------------------------------------------
+$CREATE_IMP_FILE_AD
+    Filter [F:BSIMAN] Where STMCOD = [F:BSIIMPD]STMCOD and LIN = [F:BSIIMPD]LIN   # Filter all manual entries of transaction
+    For [F:BSIMAN]                         # loop over all manual entries of transaction
+        If [F:BSIMAN]FCY = "" : PSTA = 4 : PMSG = mess(54,7703,1) : Return : Endif # No site could be determined.
+        [F:BSIIMP]FCY = [F:BSIMAN]FCY      # write FCY into header of statement > needed in screen initialization for REMBAN validation
+
+        If [F:BSIMAN]ACC <> ""             # manual entry for an account
+            ACC_HDR = [F:BSIMAN]ACC
+            PAM = [F:TPY]PAM(0)
+            BPRPAY = ""
+        Else                               # manual entry for a business partner
+            BPRPAY = [F:BSIMAN]BPR
+            Gosub READ_BP_INFOS
+            If PSTA : Return : Endif
+            Read [F:GAC1]GAC1 = [F:BSIIP]COA;[F:BSIMAN]BPRSAC
+            If !fstat and [F:GAC1]SAC=2
+                ACC_HDR = [F:GAC1]ACC
+            Else
+                # Nonexistent account
+                PSTA = 4 : PMSG = mess(9,106,1) : Return
+            Endif
+        Endif
+        ADR = [F:BSIMAN]BPAINV
+
+        HEADERAMTBAN = [F:BSIMAN]AMT
+        HEADERAMTCUR = [F:BSIMAN]AMT
+
+        # X3-106034 Begin If description is filled use it instead of GUSER/Statement/Transaction
+        If [F:BSIMAN]DES <> ""
+            PAYDES = [F:BSIMAN]DES
+        Else
+            PAYDES = GUSER+'/'+[F:BSIIMPD]STMCOD+'/'+num$([F:BSIIMPD]LIN)
+        Endif
+        # X3-106034 End
+
+        Gosub WRITE_HEADER_AD
+        Gosub WRITE_DETAIL_AD
+    Next
+    Filter [F:BSIMAN]
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Write payment header of "AD" type hits (manual entry) to file
+#-----------------------------------------------------------------------------------------------------
+$WRITE_HEADER_AD
+#angre     X3-42421
+    Wrseq '"P"';'""';'"'+[F:BSIIP]PAYTYP+'"';'"'+BPRPAY+'"';'"'+[F:BSIIP]COA+'"';'"'+ ACC_HDR +'"';'"'+ PAM +'"';'"'+[F:BSIMAN]FCY+'"';
+&         '"'+[F:BSIIMPD]BAN+'"';SNS;'"'+[F:BSIIMPD]CUR+'"';HEADERAMTBAN;HEADERAMTBAN;[F:BSIIMPD]VALDAT;'"'+ ADR +'"';
+&         '"'+ [F:BSIIMPD]STMCOD + '/' + num$([F:BSIIMPD]LIN) +'"';PAYDES Using [TF]
+
+#old version (delete after testing)
+#    Wrseq '"P"';'""';'"'+[F:BSIIP]PAYTYP+'"';'"'+BPRPAY+'"';'"'+[F:BSIIP]COA+'"';'"'+ ACC_HDR +'"';'"'+ PAM +'"';'"'+[F:BSIMAN]FCY+'"';
+#&         '"'+[F:BSIIMPD]BAN+'"';SNS;'"'+[F:BSIIMPD]CUR+'"';HEADERAMTCUR;HEADERAMTBAN;[F:BSIIMPD]VALDAT;'"'+ ADR +'"';
+#&         '"'+ [F:BSIIMPD]STMCOD + '/' + num$([F:BSIIMPD]LIN) +'"';'"'+GUSER+'/'+[F:BSIIMPD]STMCOD+'/'+num$([F:BSIIMPD]LIN) +'"' Using [TF]
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Write payment detail line of "AD" type hits (manual entry) to file
+#-----------------------------------------------------------------------------------------------------
+$WRITE_DETAIL_AD
+    Wrseq '"D"';'"'+[F:BSIMAN]DENCOD+'"';'"'+[F:BSIIP]COA+'"';'"'+ ACC_HDR +'"';'""';'""';'""';'"'+
+&         [F:BSIIMPD]CUR+'"';abs([F:BSIMAN]AMT);0;'"'+[F:BSIMAN]VAT+'"';0;'"'+[F:BSIMAN]DSP+'"';'""';'""';'""';'""';'""' Using [TF]
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Write payment header of B and C type hits to file
+#-----------------------------------------------------------------------------------------------------
+$WRITE_HEADER_BC
+      Wrseq '"P"';'""';'"'+[F:BSIIP]PAYTYP+'"';'""';'"'+[F:BSIIP]COA+'"';'"'+ [F:BSIIP]ACCSUSPENSE +'"';'"'+ [F:TPY]PAM(0) +'"';'"'+FCY+'"';'"'+
+&         [F:BSIIMPD]BAN+'"';SNS;'"'+[F:BSIIMPD]CUR+'"';HEADERAMTCUR;HEADERAMTBAN;[F:BSIIMPD]VALDAT;'"'+ ADR +'"';
+&         '"'+ [F:BSIIMPD]STMCOD + '/' + num$([F:BSIIMPD]LIN) +'"';PAYDES Using [TF]
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Write payment detail line into file
+#-----------------------------------------------------------------------------------------------------
+$WRITE_DETAIL_BC
+    Wrseq '"D"';'"'+[F:BSIIP]CDAACCSUSP+'"';'"'+[F:BSIIP]COA+'"';'"'+ [F:BSIIP]ACCSUSPENSE +'"';'""';'""';'""';'"'+
+&         [F:BSIIMPD]CUR+'"';abs([F:BSIIMPD]AMTCUR);0;'""';0;'""';'""';'""';'""';'""';'""' Using [TF]
+Return
+
+#-----------------------------------------------------------------------------------------------------
+#*** Write payment header into file
+#-----------------------------------------------------------------------------------------------------
+$WRITE_HEADER
+#angre X3-42421
+Wrseq '"P"';'""';'"'+[F:BSIIP]PAYTYP+'"';'"'+BPRPAY+'"';'"'+[F:BSIIP]COA+'"';'"'+ACC_HDR+'"';'"'+ PAM + '"';'"'+[F:BSIIMPD]FCYLIN+'"';'"'+
+&    [F:BSIIMPD]BAN+'"';SNS;'"'+[F:BSIIMPD]CUR+'"';HEADERAMTBAN;HEADERAMTBAN;[F:BSIIMPD]VALDAT;'"'+ADR+'"';
+&    '"'+ [F:BSIIMPD]STMCOD + '/' + num$([F:BSIIMPD]LIN) +'"';PAYDES Using [TF]
+
+#old version (delete after testing)
+#Wrseq '"P"';'""';'"'+[F:BSIIP]PAYTYP+'"';'"'+BPRPAY+'"';'"'+[F:BSIIP]COA+'"';'"'+ACC_HDR+'"';'"'+ PAM + '"';'"'+[F:BSIIMPD]FCYLIN+'"';'"'+
+#&    [F:BSIIMPD]BAN+'"';SNS;'"'+[F:BSIDUD]CUR+'"';HEADERAMTCUR;HEADERAMTBAN;[F:BSIIMPD]VALDAT;'"'+ADR+'"';
+#&    '"'+ [F:BSIIMPD]STMCOD + '/' + num$([F:BSIIMPD]LIN) +'"';'"'+GUSER+'/'+[F:BSIIMPD]STMCOD+'/'+num$([F:BSIIMPD]LIN)+'"' Using [TF]
+Return
+
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Write payment detail line into file
+#-----------------------------------------------------------------------------------------------------
+$WRITE_DETAIL
+Local Char ACC(GLONGAC)
+Read [GAC1]GAC1=[F:BSIIP]COA;[F:BSIDUD]SAC
+If fstat : ACC = [F:GAC1]ACC : Endif       # Account
+
+# 2017-09-11 DNE MODIF BEGIN (X3-54319)
+Wrseq '"D"';'"'+DENCOD+'"';'"'+[F:BSIIP]COA+'"';'"'+ACC_HDR+'"';'"'+BPRPAY+'"';'"'+[F:BSIDUD]TYP+'"';'"'+[F:BSIDUD]NUM+'"';'"'+
+&    [F:BSIDUD]CUR+'"';abs([F:BSIDUD]BSIPAYCUR);abs([F:BSIDUD]BSIPAYSTM) * [F:BSIDUD]BSISNS;'""';0;'""';'"'+ACC+'"';'"'+[F:BSIDUD]BPR+'"';'"'+
+&    format$("D:YYYYMMDD",[F:BSIDUD]DUDDAT)+'"';'"'+[F:BSIDUD]FCY+'"';'"NOCALC"' Using [TF]
+# 2017-09-11 DNE MODIF ORIG
+#Wrseq '"D"';'"'+DENCOD+'"';'"'+[F:BSIIP]COA+'"';'"'+ACC_HDR+'"';'"'+BPRPAY+'"';'"'+[F:BSIDUD]TYP+'"';'"'+[F:BSIDUD]NUM+'"';'"'+
+#&    [F:BSIDUD]CUR+'"';abs([F:BSIDUD]BSIPAYCUR);abs([F:BSIDUD]BSIPAYSTM);'""';0;'""';'"'+ACC+'"';'"'+[F:BSIDUD]BPR+'"';'"'+
+#&    format$("D:YYYYMMDD",[F:BSIDUD]DUDDAT)+'"';'"'+[F:BSIDUD]FCY+'"';'"NOCALC"' Using [TF]
+# 2017-09-11 DNE MODIF END
+
+#calculate discount and write lines to file
+If [F:BSIDUD]BSIDEPCUR > 0                 # only if discount was calculated
+    Gosub WRITE_DISCOUNT_LINES
+Endif
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Write payment detail line for over/underpayment
+#-----------------------------------------------------------------------------------------------------
+$WRITE_DETAIL_DIFF
+Local Char ACC(GLONGAC)
+Read [GAC1]GAC1=[F:BSIIP]COA;[F:BSIDUD]SAC
+If fstat : ACC = [F:GAC1]ACC : Endif       # Account
+
+Wrseq '"D"';'"'+DENCODDIFF+'"';'"'+[F:BSIIP]COA+'"';'"'+ACC_HDR+'"';'"'+BPRPAY+'"';'"'+OPTYP+'"';'"'+OPNUM+'"';'"'+
+&    [F:BSIIMPD]CUR+'"';abs(BSIAMTPAYCURDIFF);0;'""';0;'""';'"'+ACC+'"';'"'+[F:BSIDUD]BPR+'"';'"'+
+&    format$("D:YYYYMMDD",[F:BSIDUD]DUDDAT)+'"';'"'+[F:BSIDUD]FCY+'"';'""' Using [TF]
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Get needed information for discount line creation
+#-----------------------------------------------------------------------------------------------------
+$WRITE_DISCOUNT_LINES
+  Local Char DENDEP(10)
+  Local Char DISCMNGMODE(1)
+  Local Decimal AMOUNT
+  Local Decimal TOTALAMOUNT
+  Local Char TAX(10), TEMPTAX(10) : TEMPTAX = "-1"
+  If !clalev([F:DAE])  : Local File GACCENTRYD [DAE]  : Endif
+  If !clalev([F:BPR])  : Local File BPARTNER   [BPR]  : Endif
+
+  Call PARAM([F:BSIDUD]FCY,"DENDEP",DENDEP) From ADOVAL
+  Call PARAM([F:BSIDUD]FCY,"DEPMGTMOD",DISCMNGMODE) From ADOVAL
+  TOTALAMOUNT = [F:BSIDUD]AMTCUR
+
+  Case DISCMNGMODE
+    When "2"
+      Gosub HANDLE_DISC_MODE_2
+    When "3"
+      Gosub HANDLE_DISC_MODE_3
+    When "4"
+      Gosub HANDLE_DISC_MODE_4
+    When Default
+      Gosub HANDLE_DISC_MODE_3
+  Endcase
+Return
+
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Handling if DEPMGTMOD = 2
+#-----------------------------------------------------------------------------------------------------
+$HANDLE_DISC_MODE_2
+
+  Gosub OPEN_DB_TABLE
+  If HANDLEMANUAL = 0
+    For [INVLIG]
+      If [INVLIG]FLGDEP = 2
+        TAX = [INVLIG]VAT
+        If TAX <> TEMPTAX and TEMPTAX <> "-1"
+          Gosub WRITE_DISCOUNT_LINE_TO_FILE
+          Gosub WRITE_ANALYTICAL_LINES
+          AMOUNT = 0
+        Endif
+        TEMPTAX = TAX
+        AMOUNT = AMOUNT + [INVLIG]AMTATILIN
+      Else
+        TOTALAMOUNT = TOTALAMOUNT - [INVLIG]AMTATILIN
+      Endif
+    Next
+    If AMOUNT <> 0
+      Gosub WRITE_DISCOUNT_LINE_TO_FILE
+      Gosub WRITE_ANALYTICAL_LINES
+   Endif
+ Endif
+
+Return
+
+#-----------------------------------------------------------------------------------------------------
+#*** Handling if DEPMGTMOD = 4
+#-----------------------------------------------------------------------------------------------------
+$HANDLE_DISC_MODE_4
+  Local Char TAX(10), TEMPTAX(10) : TEMPTAX = "-1"
+  TOTALAMOUNT = [F:BSIDUD]AMTCUR
+
+  Gosub OPEN_DB_TABLE
+  If HANDLEMANUAL = 0
+    For [INVLIG]
+      If func GETACCOUNTINFO([F:BSIIP]COA, [INVLIG]ACC, 1) = 2
+        TAX = [INVLIG]VAT
+        If TAX <> TEMPTAX and TEMPTAX <> "-1"
+          Gosub WRITE_DISCOUNT_LINE_TO_FILE
+          Gosub WRITE_ANALYTICAL_LINES
+          AMOUNT = 0
+        Endif
+        TEMPTAX = TAX
+        AMOUNT = AMOUNT + [INVLIG]AMTATILIN
+     Else
+        TOTALAMOUNT = TOTALAMOUNT - [INVLIG]AMTATILIN
+     Endif
+    Next
+    If AMOUNT <> 0
+      Gosub WRITE_DISCOUNT_LINE_TO_FILE
+      Gosub WRITE_ANALYTICAL_LINES
+   Endif
+  Endif
+Return
+
+#-----------------------------------------------------------------------------------------------------
+#*** Handling if DEPMGTMOD = 3
+#-----------------------------------------------------------------------------------------------------
+$HANDLE_DISC_MODE_3
+  TEMPTAX = ""                      # 2016-07-27 Bader > otherwise "-1" which cannot be imported
+  AMOUNT = [L]TOTALAMOUNT
+  Gosub WRITE_DISCOUNT_LINE_TO_FILE
+  Gosub WRITE_ANALYTICAL_LINES
+Return
+
+#-----------------------------------------------------------------------------------------------------
+#*** Open BPCINVLIG or BPSINVLIG or do manual handling
+#-----------------------------------------------------------------------------------------------------
+$OPEN_DB_TABLE
+  Local Integer HANDLEMANUAL : HANDLEMANUAL = 0
+  If [F:BSIDUD]BPRTYP = 1
+    If !clalev([F:INVLIG]) Local File BPCINVLIG   [INVLIG] Endif
+  Else
+    If !clalev([F:INVLIG]) Local File BPSINVLIG   [INVLIG] Endif
+  Endif
+  Filter [INVLIG] Where NUM = [F:BSIDUD]NUM Order By VAT
+  If fstat
+    Gosub HANDLE_MANUAL_ENTRIES
+    HANDLEMANUAL = 1
+  Endif
+Return
+
+#-----------------------------------------------------------------------------------------------------
+#*** Handling of manual entries which are not stored in BPCINVLIG or BPSINVLIG
+#-----------------------------------------------------------------------------------------------------
+$HANDLE_MANUAL_ENTRIES
+  Local Decimal TAXTOREDUCE, TOTALTAXTOREDUCE
+  Filter [F:DAE] Where [F:DAE]NUM = [F:BSIDUD]BPRVCR and [F:DAE]TYP = [F:BSIDUD]TYP Order By [F:DAE]TAX
+
+  For [F:DAE]
+    If func GETACCOUNTINFO([F:DAE]COA,[F:DAE]ACC, 2) <> 2
+      TAX = [F:DAE]TAX
+      If TAX <> TEMPTAX and TEMPTAX <> "-1"
+        AMOUNT = AMOUNT - TOTALTAXTOREDUCE
+        TOTALTAXTOREDUCE = 0
+        If AMOUNT > 0
+          Gosub WRITE_DISCOUNT_LINE_TO_FILE
+        Endif
+        AMOUNT = 0
+      Endif
+      TEMPTAX = TAX
+      If func GETACCOUNTINFO([F:DAE]COA, [F:DAE]ACC, 1) = 2 or func GETACCOUNTINFO([F:DAE]COA, [F:DAE]ACC, 2) = 1
+        AMOUNT = AMOUNT + [F:DAE]AMTCUR
+      Else
+        TAXTOREDUCE = [F:DAE]AMTCUR / 100 * func GET_VAT_RAT([F:DAE]TAX, [F:BSIDUD]CPY, [F:DAE]ACCDAT)
+        TOTALAMOUNT = TOTALAMOUNT - [F:DAE]AMTCUR - TAXTOREDUCE
+        TOTALTAXTOREDUCE += TAXTOREDUCE
+      Endif
+    Endif
+  Next
+  If AMOUNT > 0
+    Gosub WRITE_DISCOUNT_LINE_TO_FILE
+  Endif
+Return
+
+#** #############################################################################################
+#*  Determines the VAT rate for a given taxcode
+#*  @param TAXCODE   Variable char -> taxcode
+#*  @param COMP      Variable char -> company
+#*  @param ACCDATE   Value date    -> accounting date
+#*  @return RESULT   Local decimal    -> VAT rate
+#*! #############################################################################################
+Funprog GET_VAT_RAT(TAXCODE,COMP,ACCDATE)
+  Variable Char TAXCODE
+  Variable Char COMP
+  Variable Date ACCDATE
+  Local Decimal VATRAT
+
+  If !clalev([F:TRA1])  : Local File TABRATVAT [TRA1]  : Endif
+  Filter [F:TRA1] Where [F:TRA1]VAT=TAXCODE  & [F:TRA1]CPY=COMP & [F:TRA1]STRDAT<=ACCDATE Order By [F:TRA1]STRDAT Desc
+  Read [F:TRA1] First
+  If fstat
+    Filter [F:TRA1]
+    Filter [F:TRA1] Where [F:TRA1]VAT=TAXCODE & [F:TRA1]CPY="" & [F:TRA1]STRDAT<=ACCDATE Order By [F:TRA1]STRDAT Desc
+    Read [F:TRA1] First
+    If !fstat
+       VATRAT = [F:TRA1]VATRAT
+    Endif
+  Else
+    VATRAT = [F:TRA1]VATRAT
+  Endif
+  Filter [F:TRA1]
+End VATRAT
+
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** write discount line to file
+#-----------------------------------------------------------------------------------------------------
+$WRITE_DISCOUNT_LINE_TO_FILE
+  Wrseq '"D"';'"' + DENDEP + '"';'"' + [F:BSIIP]COA + '"';'""';'""';'"' + [F:BSIDUD]TYP + '"';'"'+[F:BSIDUD]NUM+'"';'"' + [F:BSIDUD]CUR + '"'
+& ;func GETDISCAMOUNT(AMOUNT, TOTALAMOUNT, [F:BSIDUD]BSIDEPCUR);0;'"' + TEMPTAX + '"';[F:DAE]QTY;'"'+[F:DAE]DSP+'"';'"'+ACC+'"';'"'+[F:BSIDUD]BPR+'"';'"'+
+&    format$("D:YYYYMMDD",[F:BSIDUD]DUDDAT)+'"';'"'+[F:BSIDUD]FCY+'"';'"NOCALC"' Using [TF]
+Return
+
+#** #############################################################################################
+#*  Calculate discount amount in relation to tax amount and total amount of an invoice
+#*  @param AMOUNT    Value decimal    -> tax amount
+#*  @param TOTAMT    Value decimal    -> total amount
+#*  @param DISCAMT   Value decimal    -> total discount amount
+#*  @return RESULT   Local decimal    -> discount amount
+#*! #############################################################################################
+Funprog GETDISCAMOUNT(AMOUNT, TOTAMT, DISCAMT)
+  Value Decimal AMOUNT, TOTAMT, DISCAMT
+  If !clalev([F:TCU]) Local File TABCUR [F:TCU] Endif
+  Call LECTURE("TCU",[F:BSIDUD]CUR,"") From CONTOBJ  # read currency table
+End arr(AMOUNT / TOTAMT * DISCAMT,[F:TCU]CURRND)
+
+#** #############################################################################################
+#*  Check if an account is either a tax account or a collective account
+#*  @param MAINCOA   Value char       -> chart of account
+#*  @param ACCOUNT   Value char       -> account
+#*  @param INFOTYPE  Value integer    -> 1 = returns if a account is discountable; 2 returns 1 if tax account and 2 if collectiv account
+#*! #############################################################################################
+Funprog GETACCOUNTINFO(MAINCOA, ACCOUNT, INFOTYPE)
+  Value Char ACCOUNT
+  Value Char MAINCOA
+  Value Integer INFOTYPE
+  Local Integer RESULT : RESULT = 0
+  If !clalev([F:GAC])  : Local File GACCOUNT   [GAC]  : Endif
+  Filter [F:GAC] Where [F:GAC]COA = MAINCOA and [F:GAC]ACC = ACCOUNT
+  Read [F:GAC] First
+  If !fstat
+    If INFOTYPE = 1
+      RESULT = [F:GAC]FLGDEP
+    Elsif INFOTYPE = 2
+      If [F:GAC]FLGVAT = 3 or [F:GAC]FLGVAT = 4
+          RESULT = 1
+      Elsif [F:GAC]SAC = 2
+        RESULT = 2
+      Endif
+    Endif
+  Endif
+End RESULT
+
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Silent import of created temporary import file
+#-----------------------------------------------------------------------------------------------------
+$IMPORT
+Gosub OUVRE From GIMPOBJ       # initialisations
+[M:IMP2]MODIMP="BSIPAY"        # name of import template
+
+[M:IMP2]NOMIMP=TMPF
+# Bader: 2017-01-10 120665
+GERRTRACE=0                    # reset error
+# Bader: 2017-01-10 120665 end
+GSERVEUR=1                     # server mode
+Gosub EXEC From GIMPOBJ        # silent import
+GSERVEUR=0                     # client mode
+If GERRTRACE>0                 # error?
+    PSTA=4 : PMSG=mess(44,7703,1)  # Error while importing the payments!
+Endif
+Return
+#-----------------------------------------------------------------------------------------------------
+
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Validate created payment using REMBAN function in background
+#-----------------------------------------------------------------------------------------------------
+$VALIDATE_PAYMENT
+   Local Char VALEUR(10)
+   Local Char PARAM2(250)(1..20) , SAVACT(10), SAVCURLEG(10), SAVFONCTION(20)
+#   Local Integer SAVSERVEUR : SAVSERVEUR = GSERVEUR
+#   GSERVEUR=1                     # server mode
+   SAVFONCTION = GFONCTION
+   GFONCTION="REMBAN" : Call AUTORIS From EXEFNC
+   SAVACT = GACTION : GACTION = "BSIREMBAN"
+   SAVCURLEG = GCURLEG : GCURLEG = [F:BSIIP]LEG
+   Call TRAITE_CHAR(VALEUR,PARAM2,"","BSIPAYREMBAN","",3,"") From GTRAITE
+   GACTION = SAVACT
+   GCURLEG = SAVCURLEG
+   If SAVFONCTION<>GFONCTION
+     GFONCTION=SAVFONCTION : Call AUTORIS From EXEFNC
+   Endif
+#   GSERVEUR=SAVSERVEUR           # restore mode
+Return
+
+
+######################################################################################################
+
+#**
+#* Purpose: Generate payments for a whole statement.
+#*
+#* @param PSTMCOD      primary key for reading record in table BSIIMP.
+#* @param PSTA         Status coming from BSI_PAYMENT_CREATION (0 = OK, other values see there)
+#* @param PMSG         Message corresponding to status.
+#*!
+Subprog BSI_PAYMENT_CREATION_STATEMENT( PSTMCOD, PSTA, PMSG )
+Value Char PSTMCOD      # Statement identifier
+Variable Integer PSTA   # Status of payment creation (see ...)
+Variable Char PMSG      # Message corresponding to the status
+
+    Raz PSTA, PMSG
+
+    # Open necessary tables.
+    If !clalev ([F:BSIIMPD]) Local File BSIIMPD  [BSIIMPD] Endif # Details import (transactions).
+
+    # Check for an existing log file (FLGTRACE = 1, 0 otherwise).
+    Local Integer FLGTRACE : If GTRACE = "" : FLGTRACE = 1 : Else : FLGTRACE = 0 : Endif
+
+    # Open trace file.
+    If FLGTRACE
+        Call OUVRE_TRACE( mess(40,7703,1) ) From LECFIC
+    Endif
+
+    Read [F:BSIIMP]BSIIMP0 = PSTMCOD  # Read statement (import header)
+    If fstat # Not found?
+        PMSG =  PSTMCOD - mess(1,7703,1) # 'Statement does not exist'
+        PSTA = 2
+    Elsif [F:BSIIMP]FLGMTC >= 3 # Already validated?
+        PMSG = PSTMCOD - mess(2,7703,1) # 'Statement already validated'
+        PSTA = 1
+    Else
+        # Loop over set of transactions.
+        For [F:BSIIMPD]BSIIMPD0 Where [F:BSIIMPD]STMCOD = PSTMCOD and [F:BSIIMPD]FLGCRE <> 2 and [F:BSIIMPD]FLGCRE <> 4 # not validated or manually closed
+            Call BSI_PAYMENT_CREATION( PSTMCOD, [F:BSIIMPD]LIN, PSTA, PMSG )
+            If PSTA
+                Call ECR_TRACE( PMSG, 1 ) From GESECRAN
+            Endif
+        Next
+    Endif
+
+    # Close and show trace file.
+    If FLGTRACE
+        Call FERME_TRACE From LECFIC
+        Call LEC_TRACE From LECFIC
+    Endif
+End
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Get needed information for discount line creation
+#-----------------------------------------------------------------------------------------------------
+$WRITE_ANALYTICAL_LINES
+Local Integer COUNTER, COUNTER1
+Local Char ERRMES(255)
+Local Char LEDC(10) : LEDC = ""
+Local Char ACCC(10) : ACCC = ""
+Local Instance PBDGROUP Using C_PBDGEND
+  [L]PBDGROUP = NewInstance C_PBDGEND AllocGroup null
+
+Local Integer  NBRDIE           : # Number of Dimension Types (max 20)
+Local Char     DIE(GLONDIE)(20)       : # Dimension types (DIE)
+Local Char     DIEFMT(10)(1..)    : # Dimension Types Formats
+Local Char     DIECOLHEA(10)(1..) : # Dimension Types Column Header
+Local Integer  DIEOBYFLG(1..)   : # Obligatory Flags (Y/N)
+Local Char INDARR(10)(25)
+Local Char CCE(GLONCCE)(20)
+Local Char TMPCCE(GLONCCE)
+Local Char ANACOA(10)
+Local Integer CCEFOUND : CCEFOUND = 0
+Local Integer  USEDACDIE
+Local Integer  NBRLED
+Local Tinyint  LEDTYP(20)
+Local Char     LEDCOD(20)(20)
+Local Char     LEDCUR(20)(20)    : # Ledger Currencies
+Local Char     COA(10)(20)       : # Chart of accounts
+Local Char     COAFMT(10)(1..)    : # Chart of accounts Formats
+Local Char     COACOLHEA(10)(1..) : # Chart of account Column Header
+
+
+#get acounting structure for the company
+ASTATUS = func FINACM_SYRA.GET_FINSTC(GACTX,[F:BSIIMPD]CPY,1,NBRLED,LEDTYP,LEDCOD,LEDCUR,COA,COAFMT,COACOLHEA,NBRDIE,DIE,DIEFMT,DIECOLHEA,DIEOBYFLG,ERRMES)
+
+#return if no dimensiontype
+  If NBRDIE = 0 : Return : Endif
+
+  For COUNTER = 0 To NBRDIE - 1 #loop through dimension
+    For COUNTER1 = 0 To dim(COA)-1 #loop throug coa's
+
+      If func LEDGER_IS_ANALYTICAL(LEDCOD(COUNTER1)) = 2 and COA(COUNTER1) <> "" # if the ledger is anylyical
+        #Infbox "Ledger " + LEDCOD(COUNTER1) + " is analyitical and coa is " + COA(COUNTER1)
+        ANACOA = COA(COUNTER1) # set analyitcal coa
+        Gosub SETINDARR        # set index array
+        If INDARR(13) = "" : Break : Endif #if no discount account -> break
+        ASTATUS = func BSILIBANA.INI_CCE(GACTX,PBDGROUP,[F:BSIIMPD]CPY,"PAYMENTD",LEDC,ANACOA,ACCC,DIE(COUNTER),TMPCCE,INDARR,ERRMES) #Get the associated CCEs for the dimensions and coa
+        If TMPCCE <> "" : CCEFOUND = 1 : Endif
+          CCE(COUNTER) = TMPCCE
+      Endif
+    Next
+  Next
+  If CCEFOUND = 0 : Return : Endif
+  #write analytical line to the file
+  Gosub WRITE_ANALYTICAL_LINE_TO_FILE
+
+######### outcommented while testing new version ######################
+
+#Local Integer COUNTER
+#Local Char ERRMES(255)
+#Local Char LEDC(10) : LEDC = ""
+#Local Char ACCC(10) : ACCC = ""
+#Local Instance PBDGROUP Using C_PBDGEND
+#  [L]PBDGROUP = NewInstance C_PBDGEND AllocGroup null
+#
+#Local Integer  NBRDIE           : # Number of Dimension Types (max 20)
+#Local Char     DIE(GLONDIE)(20)       : # Dimension types (DIE)
+#Local Char     DIEFMT(10)(1..)    : # Dimension Types Formats
+#Local Char     DIECOLHEA(10)(1..) : # Dimension Types Column Header
+#Local Integer  DIEOBYFLG(1..)   : # Obligatory Flags (Y/N)
+#Local Char INDARR(10)(25)
+#Local Char CCE(GLONCCE)(20)
+#Local Char TMPCCE(GLONCCE)
+#Local Char ANACOA(10)
+#Local Integer CCEFOUND : CCEFOUND = 0
+#
+#
+## get analyitcal chart of account
+#ANACOA = func GET_ANALYTICAL_COA([F:BSIIMPD]CPY)
+## no analytica coa => no analytical line
+#If ANACOA = "" : Return : Endif
+#
+## Set the index array of dimension types
+#Gosub SETINDARR
+#
+## no discountaccount (INDAAR(13) => no analaytical line
+#If INDARR(13) = "" : Return : Endif
+#
+#  #get analyitcal structure for the company
+#  ASTATUS = func FINACM_SYRA.GET_ANASTC(GACTX,[F:BSIIMPD]CPY,1,NBRDIE,DIE,DIEFMT,DIECOLHEA,DIEOBYFLG,ERRMES)
+#
+#  #return if no dimensiontype
+#  If NBRDIE = 0 : Return : Endif
+#  #loop through all dimensions of company
+#  For COUNTER = 0 To NBRDIE - 1
+#    #Get the associated CCEs for the dimensions
+#    ASTATUS = func BSILIBANA.INI_CCE(GACTX,PBDGROUP,[F:BSIIMPD]CPY,"PAYMENTD",LEDC,ANACOA,ACCC,DIE(COUNTER),TMPCCE,INDARR,ERRMES)
+#    If TMPCCE <> "" : CCEFOUND = 1 : Endif
+#    CCE(COUNTER) = TMPCCE
+#  Next
+#  # no dimension found => no analyitical line
+#  If CCEFOUND = 0 : Return : Endif
+#  #write analytical line to the file
+#  Gosub WRITE_ANALYTICAL_LINE_TO_FILE
+Return
+
+#-----------------------------------------------------------------------------------------------------
+#*** write analytical line to file
+#-----------------------------------------------------------------------------------------------------
+$WRITE_ANALYTICAL_LINE_TO_FILE
+
+  Wrseq '"A"';'"'+DIE(0)+'"';'"'+CCE(0)+'"';'"'+DIE(1)+'"';'"'+CCE(1)+'"';'"'+DIE(2)+'"';'"'+CCE(2)+'"';'"'+DIE(3)+'"';'"'+CCE(3)+'"';'"'+DIE(4)+'"';'"'+CCE(4)+'"';'"'+DIE(5)+'"';'"'+CCE(5)+'"';'"'+
+& DIE(6)+'"';'"'+CCE(6)+'"';'"'+DIE(7)+'"';'"'+CCE(7)+'"';'"'+DIE(8)+'"';'"'+CCE(8)+'"';'"'+DIE(9)+'"';'"'+CCE(9)+'"';'"'+DIE(10)+'"';'"'+CCE(10)+'"';'"'+DIE(11)+'"';'"'+CCE(11)+'"';'"'+DIE(12)+'"';
+& '"'+
+& CCE(12)+'"';'"'+DIE(13)+'"';'"'+CCE(13)+'"';'"'+DIE(14)+'"';'"'+CCE(14)+'"';'"'+DIE(15)+'"';'"'+CCE(15)+'"';'"'+DIE(16)+'"';'"'+CCE(16)+'"';'"'+DIE(17)+'"';'"'+CCE(17)+'"';'"'+DIE(18)+'"';'"'+CCE(18
+& )+
+& '"';'"'+DIE(19)+'"';'"'+CCE(19)+'"';func GETDISCAMOUNT(AMOUNT, TOTALAMOUNT, [F:BSIDUD]BSIDEPCUR);0 Using [TF]
+
+Return
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** initalyze dimension arrays
+#-----------------------------------------------------------------------------------------------------
+$INIT_DIE_CCE
+Local Integer I
+  For I = 0 To dim(DIE)-1
+    DIE(I) = ""
+    CCE(I) = ""
+  Next
+Return
+
+#-----------------------------------------------------------------------------------------------------
+#*** set index array of dimension types
+#-----------------------------------------------------------------------------------------------------
+$SETINDARR
+
+   #INDARR
+# 1  = Product
+# 2  = Customer
+# 3  = Supplier
+# 4  = Sales rep
+# 5  = Buyer
+# 6  = Document
+# 7  = Company
+# 8  = Site
+# 9  = Currency
+# 10 = Tax
+# 11 = Sales footer
+# 12 = Discount
+# 13 = Bank
+# 14 = Account
+# 15 = Fixed asset
+# 16 = Purchase footer
+# 17 = Miscellaneous business partner
+# 18 = Costing dimensions
+# 19 = Overhead costs
+# 20 = Origin document
+# 21 = Previous dimensions
+# 22 = Requester
+# 23 = Purchase costs
+# 24 = None
+
+   If !clalev([F:BPR])  : Local File BPARTNER   [BPR]  : Endif
+#[F:BSIIMP]FCY = [F:BSIIMPD]FCYLIN
+   Read [F:BPR]BPR0 = [F:BSIIMPD]BPRPAY
+   If !fstat
+     If [F:BPR]BPCFLG = 2
+      INDARR(1) = [F:BPR]BPRNUM
+     Else
+# 2016-09-22 DNE MODIF BEGIN
+      INDARR(2) = [F:BPR]BPRNUM
+# 2016-09-22 DNE MODIF ORIG
+#      INDAAR(2) = [F:BPR]BPRNUM
+# 2016-09-22 DNE MODIF END
+     Endif
+   Endif
+   INDARR(6) = [F:BSIIMPD]CPY
+   INDARR(7) = [F:BSIIMP]FCY
+   INDARR(8) = [F:BSIIMP]CUR
+   INDARR(9) = [F:BSIIMPD]VAT
+   INDARR(12)= [F:BSIIMP]BAN
+   INDARR(13)= func GETDISCOUNTACCOUNT([F:BSIIMPD]CPY,[F:BSIIP]LEG,ANACOA,TEMPTAX,[F:BSIDUD]SNS,DENDEP)
+
+Return
+
+#-----------------------------------------------------------------------------------------------------
+#*** Determine discount account
+#*  @param COMPANY   value char     -> company
+#*  @param LEG       value char     -> Legislation
+#*  @param ACOA      value Char     -> chart of account (in our case analytical)#
+#*  @param VATCODE   value Char     -> VAT code
+#*  @param SIGN      value Integer  -> Debit-Credit Sign (1-> Debit; -1 -> Credit)
+#*  @param DENDEP    value Char     ->
+#*  @return RESULT   Local char     -> analytical chart of account
+#-----------------------------------------------------------------------------------------------------
+#*!
+Funprog GETDISCOUNTACCOUNT(COMPANY, LEG ,ACOA,VATCODE, SIGN, DENDEP)
+  Value Char COMPANY
+  Value Char LEG
+  Value Char ACOA
+  Value Char VATCODE
+  Value Integer SIGN
+  Value Char DENDEP
+  Local Char ACCCOD(30)
+  Local Char DISCACC(30)
+
+  If !clalev([F:CDA])  : Local File GACCDENCOD [CDA]  : Endif
+  If !clalev([F:TVT])  : Local File TABVAT [TVT]  : Endif
+
+  If DENDEP <> ""
+    Filter [F:CDA] Where [F:CDA]COD = DENDEP
+    Read [F:CDA] First
+    ACCCOD = [F:CDA]ACCCOD
+    Filter [F:CDA]
+  Endif
+  If ACCCOD <> ""
+    If SIGN = 1
+      DISCACC = func READ_DISCACC_FROM_ACCCOD(14, 1, ACOA, ACCCOD)
+    Else
+# 2017-10-11 X3-56107 Bader MODIF BEGIN
+      DISCACC = func READ_DISCACC_FROM_ACCCOD(14, 0, ACOA, ACCCOD)
+# 2017-10-11 X3-56107 Bader MODIF ORIG
+#      DISCACC = func READ_DISCACC_FROM_ACCCOD(14, 2, ACOA, ACCCOD)
+# 2017-10-11 X3-56107 Bader MODIF END
+    Endif
+  Endif
+  If DISCACC = ""
+    #Read [F:TVT]TVT0 = VATCODE;LEG
+    Filter [F:TVT] Where [F:TVT]VAT = VATCODE and [F:TVT]LEG = LEG
+    Read [F:TVT] First
+    ACCCOD = [F:TVT]ACCCOD
+    Filter [F:TVT]
+    If ACCCOD <> ""
+      If SIGN = 1
+# 2017-10-11 X3-56107 Bader MODIF BEGIN moved from 14 (-1) to 27 (-1)
+        DISCACC = func READ_DISCACC_FROM_ACCCOD(10, 26, ACOA, ACCCOD)
+# 2017-10-11 X3-56107 Bader MODIF ORIG
+#        DISCACC = func READ_DISCACC_FROM_ACCCOD(10, 13, ACOA, ACCCOD)
+# 2017-10-11 X3-56107 Bader MODIF END
+      Else
+# 2017-10-11 X3-56107 Bader MODIF BEGIN moved from 13 (-1) to 26 (-1)
+        DISCACC = func READ_DISCACC_FROM_ACCCOD(10, 25, ACOA, ACCCOD)
+# 2017-10-11 X3-56107 Bader MODIF ORIG
+#        DISCACC = func READ_DISCACC_FROM_ACCCOD(10, 14, ACOA, ACCCOD) # bug!! should be 12 instead
+# 2017-10-11 X3-56107 Bader MODIF END
+      Endif
+    Endif
+  Endif
+End DISCACC
+
+#-----------------------------------------------------------------------------------------------------
+#*** Read the discount account from accounting code
+#*  @param VTYP      value Integer -> Typ of accounting code
+#*  @param INDEX     value Integer -> Index of account in accounting code
+#*  @param ACOA      value Char    -> chart of account (in our case analytical)#
+#*  @param ACCCODE   value Char    -> accounting code
+#*  @return RESULT   Local char    -> analytical chart of account
+#-----------------------------------------------------------------------------------------------------
+#*!
+Funprog READ_DISCACC_FROM_ACCCOD(VTYP, INDEX, ACOA, ACCCODE)
+  Value Integer VTYP
+  Value Integer INDEX
+  Value Char ACOA
+  Value Char ACCCODE
+  Local Char ACCOUNT(30)
+  If !clalev([F:CAC])  : Local File GACCCODE [CAC]  : Endif
+  Filter [F:CAC] Where [F:CAC]TYP = VTYP and  [F:CAC]ACCCOD = ACCCODE and [F:CAC]COA = ACOA
+  Read [F:CAC] First
+  ACCOUNT = [F:CAC]ACC(INDEX)
+  Filter [F:CAC]
+End ACCOUNT
+
+#-----------------------------------------------------------------------------------------------------
+#*** Get analytical chart of account for a given company
+#*  @param COMP   Variable char -> company
+#*  @return RESULT   Local char    -> analytical chart of account
+#-----------------------------------------------------------------------------------------------------
+#*!
+Funprog GET_ANALYTICAL_COA(COMP)
+  Value Char COMP
+  Local Char ANACOA(10)
+  If !clalev([F:CPY]) : Local File COMPANY [CPY] : Endif
+  If !clalev([F:GCM]) : Local File GACM [GCM] : Endif
+  If !clalev([F:LED]) : Local File GLED [LED] : Endif
+
+  Read [CPY]CPY0 = [F:BSIIMPD]CPY
+  If !fstat
+    #this.LEG = [F:CPY]LEG  # assign legislation
+    Read [GCM]GCM0 = [CPY]ACM
+    If !fstat
+      Read [LED]LED0 = [GCM]LED( [GCM]ANALEDTYP - 1 )
+      If !fstat
+        ANACOA = [LED]COA # assign coa
+      Endif
+    Endif
+  Endif
+End ANACOA
+
+
+#-----------------------------------------------------------------------------------------------------
+#*** Check if a ledger is analytical
+#*  @param LEDGER   Variable char -> Ledger
+#*  @return RESULT  Local Integer -> if analytical -> true
+#-----------------------------------------------------------------------------------------------------
+#*!
+Funprog LEDGER_IS_ANALYTICAL(LEDGER)
+Value Char LEDGER
+Local Tinyint RESULT
+  If !clalev([F:LED]) : Local File GLED [LED] : Endif
+  Read [F:LED]LED0 = LEDGER
+  If !fstat
+    RESULT = [F:LED]ANA
+  Endif
+End RESULT
+
+
+#**
+#* Purpose: Closing of one transaction manually within a bank file import statement
+#*
+#* @param PSTMCOD      primary key for reading record in table BSIIMP.
+#* @param PLIN         second part of primary key for reading record in table BSIIMPD (PSTMCOD+PLIN).
+#* @param PSTA         status of closing 0:OK, 1:payments already created, 2:transaction/statement not found, 3:various
+#* @param PMSG         Message corresponding to status.
+#*!
+Subprog BSI_CLOSE_TRANSACTION(PSTMCOD,PLIN,PSTA,PMSG)
+Value Char PSTMCOD     # file number of statement, part of key to table BSIIMP/BSIIMPD
+Value Integer PLIN     # line number of statement, part of key to table BSIIMPD
+Variable Integer PSTA  # status of closing 0:OK, 1:payments already created, 2:transaction/statement not found, 3:various
+Variable Clbfile PMSG  # Message corresponding to status
+
+If !clalev ([F:BSIIMP])     Local File BSIIMP      [BSIIMP]  Endif # header import
+If !clalev ([F:BSIIMPD])    Local File BSIIMPD     [BSIIMPD] Endif # details import
+
+PSTA = 0
+
+Read [F:BSIIMP]BSIIMP0 = PSTMCOD  # read statement (import header)
+If !fstat
+  Read [F:BSIIMPD]BSIIMPD0 = PSTMCOD;PLIN # read transaction PLIN of statement
+  If !fstat
+    If find ([F:BSIIMPD]FLGCRE,2,4)    # Validated or manually closed
+      PSTA = 1
+      PMSG = PSTMCOD - mess(46,7703,1) # "Payment already created"
+    Elsif [F:BSIIMPD]LET = ""
+      PSTA = 3
+      PMSG = func AFNC.MES1( mess(47,7703,1), PSTMCOD+"~"+num$(PLIN)) # "Transaction $1$ not matched."
+    Else
+      [F:BSIIMPD]FLGCRE = 4               # Set "manually closed".
+      Rewrite [F:BSIIMPD]
+      If fstat
+          PSTA = 3
+          PMSG = [F:BSIIMPD]STMCOD + "~" + num$( [F:BSIIMPD]LIN ) - mess(27,125,1)
+      Else
+          [F:BSIIMP]FLGMTC = 3               # Set "Validated".
+          Rewrite [F:BSIIMP]
+          If fstat
+              PSTA = 3
+              PMSG = [F:BSIIMP]STMCOD - mess(27,125,1)
+          Endif
+      Endif
+    Endif
+  Else
+     PSTA = 2
+     PMSG = PSTMCOD + "~" + num$(PLIN) - mess(7,7703,1) # 'Transaction does not exist'
+  Endif
+Else
+   PSTA = 2
+   PMSG = PSTMCOD - mess(1,7703,1) # 'Statement does not exist'
+Endif
+End
+

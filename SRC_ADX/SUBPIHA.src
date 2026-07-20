@@ -1,0 +1,3862 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ Gestion contrôle factures
+#########################################################################
+# SUBPIHA : Gestion des factures d'achat                   MBT 15/09/98 #
+# --------------------------------------------------------------------- #
+# Traitement des actions "Gosub" de l'objet "PIH"                       #
+# Les traitements sur champ "Call" se trouvent dans le SUBPIH           #
+#########################################################################
+
+# Issue X3-107197 - 2018-09-11 by CBO : PARAMETER AND ACTIVITY CODE
+
+$DEFTRANS
+#--------------------------------------------------------#
+# Avant lecture des transactions de saisie disponibles : #
+# Si GFLAG est renseigné la transaction est déja choisie #
+# par le menu. Vérifier si elle est valide               #
+#--------------------------------------------------------#
+Local Shortint OUVFICFLG
+If !clalev([F:PTR])  Local File PURTRS [PTR] : Endif
+If GFLAG<>""
+  Read [PTR] PTR0=8;GFLAG
+  If fstat | [F:PTR]ENAFLG=1 Raz GFLAG : Goto FIN_DEFTRANS : Endif
+  If [F:PTR]ACSCOD<>"" & GPROFIL<>GSUPER
+    If !clalev([F:ACC])  Local File ACCES  [ACC] : OUVFICFLG=1 : Endif
+    Read [ACC] CODACC=GUSER;[F:PTR]ACSCOD
+    If fstat | [F:ACC]EXEC<>2 Raz GFLAG : Goto FIN_DEFTRANS : Endif
+  Endif
+Endif
+$FIN_DEFTRANS
+If OUVFICFLG=1  Close Local File [ACC] : Raz OUVFICFLG : Endif
+Return
+
+$VARIANTE
+#---------------------------------------#
+# Après lecture de chaque transaction : #
+# La transaction est-elle valide ?      #
+# VARCOD contient le code transaction.  #
+# Mettre OK à zéro si non valide.       #
+#---------------------------------------#
+Read [PTR] PTR0=8;VARCOD
+If fstat | [F:PTR]ENAFLG=1 OK=0 : Endif
+Return
+
+$SETTRANS
+#-------------------------------------#
+# Après sélection de la transaction : #
+# GFLAG = code transaction choisie    #
+#-------------------------------------#
+If clalev ([F:PTR])=0 Local File PURTRS [PTR] : Endif
+Read [PTR] PTR0=8;GFLAG : If fstat Raz [F:PTR] : Endif
+
+#MAE, le 30/01/08, GRP_SITE
+GGRPFCY = [F:PTR]GFY
+Return
+
+$FILTRE
+#---------------------------------------------------#
+# Ne traiter que les factures créées par les achats #
+#---------------------------------------------------#
+Default File [PIH]
+FILTSUP="ORIMOD=6"
+Return
+
+$AV_IMPRIME
+#-----------------------------------------------#
+# Avant impression : Chargement nom du document #
+#-----------------------------------------------#
+If [F:PTR]PTRTYP<>8 | [F:PTR]PTRNUM<>GPTRNUM  : # Relecture transaction si nécessaire
+   Read [PTR] PTR0=8;GPTRNUM : If fstat Raz [F:PTR] : Endif
+Endif
+#----- Si document renseigné dans la transaction, prendre celui-la -----#
+If [F:PTR]DOCNAM<>"" [L]REPORT1=[F:PTR]DOCNAM : Endif
+Return
+
+$OUVRE
+Raz GSOC_ACTIVE
+#---------------------------------------------------------------------#
+# Dans EXEFNC si pas de site par défaut pour le module concerné       #
+# GFCYDEF(0) = premier site de la table sites (modif Beinat 15/12/99) #
+# FAUX, il faut toujours avoir GFCYDEF(0) = site par défaut du module #
+# même si ce site par défaut est vide !                               #
+#---------------------------------------------------------------------#
+GFCYDEF(0)=GFCYDEF(6)
+#----- Si on revient une deuxième fois par tunnel alors message et retour -----#
+If GTUNCPT(10)=1 GMESSAGE=mess(247,199,1) : OK=0 : Return Else GTUNCPT(10)=1 : Endif
+#----- Sauvegarde variables globales -----#
+Gosub SAUV_GLOB From TRTX3GLOB
+#-----
+GCONSDIA=0 : # Rend saisissable les écrans avec abréviation [DIA]
+GPTRNUM=[F:PTR]PTRNUM
+#-----------------------------------------------------#
+# Contrôle existence de la structure tarif par défaut #
+# et chargement des libellés colonnes par défaut      #
+#-----------------------------------------------------#
+Raz GPLISTC, GCOEUOM
+Local  Decimal  MONTMIN, MONTPRO : # Informations échéances (Call INFOECHE)
+Local  Char     CODE(3), VALC1(3), VALC2(20), VALC3(20), NUMERO(GLONVCR), SECTION(GLONCCE)
+Local  Char     WMSG(120)
+Local  Shortint OUVFICFLG
+Local  Integer  WRET,  MAJFAC,  WNBRCP,  MODDAT, WLIGNE
+Local  Integer  OKIMMO, NOLI
+Local  Decimal  EXE, WCOURS
+Local Integer   RET
+#MAE, bg 77405
+Local Char      SYMBHAE(35)
+#-----
+Global Char     GPIH_SYMBOL2(30), GPIH_CPYCRY(GLONCPY)
+Global Libelle  GPIH_FLGPAZ, GPIH_EECFLG, GPIH_INDTAX, GPIH_PICK
+Global Libelle  GPIH_INDBASTAX(max(func AFNC.ACTIV("PVA"),20))
+Global Decimal  GPIH_QTEMAX, GPIH_QTE
+Global Integer  GPIH_VERROU
+Global Char     GPIH_FMTPER(20)(6)
+# Issue 71253 - 2012-05-10 by SR : Localisation espagnole et portugaise
+Global Char     GPIH_FMTKSP(20)(4)
+Global Char     GPIH_FMTKPO(20)
+#--- Issue 107856
+Global Decimal WQTE_NONFAC
+
+# Issue 71069 - 2016-06-20 by MUARN : simuler multi-affaire
+Global Integer GUPDPJTSNGDOC
+GUPDPJTSNGDOC = 6
+
+# Issue X3-70158 - 2018-01-09 by MUARN : TRTLIG à la place de GREP
+Global Char GPIH_TRTLIG
+
+# Issue 84130 - 2013-03-26 by SR
+Local  Integer  WCREOUVSTC : WCREOUVSTC = 0
+If dim(GOUVSTC)<1 : Global Integer  GOUVSTC :WCREOUVSTC = 1 : Endif# Issue 84130 - 2013-03-22 by SR :Landed cost
+
+#----- Défini dans le WWAGLOBTC -----#
+#Global Libelle  GLOCARGNUM        : # Indicateur Numérotation Argentine
+#Global Libelle  GLOCITAPRE        : # Indicateur Etalement des prestations
+#Global Libelle  GLOCBRIDSC        : # Indicateur Settlement discount
+#----- Variables locales pour gestion picking liste de gauche -----#
+Local  Char     WNUM(GLONVCR), WVCRNUMORI(GLONVCR), WPOQLNK(16), SYMBOL2(30)
+Local  Integer  WLIN, I, J, K, WVCRTYPORI
+Local  Shortint NOL, WPICK, SAVNBLIG, SAVGCONSULT
+# Issue 87705 - 2013-02-15 by SR
+# Issue 88312 - 2013-02-28 by SR
+Local Integer   WMODADR1,SAVNOLIGN
+Local Char ANMCOMP(5) #85785
+# Issue X3-69477 - 2017-12-28 by SR :
+Local Char WCRITERE(240)
+#-----
+Call CTLSTRUCT (2,WRET) From TRTPRICE
+If WRET<>0 OK=0 : Return : Endif
+Call COLREM("C",2,"") From TRTPRICE : GPLISTC=""
+Call TARIFCHGT(6)     From TRTPRICE
+#--------------------------------------------------------------------------------#
+# Ouverture masque des critères de sélection du préchargement des lignes facture #
+#           masque des informations douanières                                   #
+#--------------------------------------------------------------------------------#
+If !clalev ([M:SCL])    Local Mask SAICURLED [SCL]  : Endif
+If !clalev ([M:PCIW])   Local Mask PCRITINV  [PCIW] : Endif
+If !clalev ([M:AD66])   Local Mask ADRBPR    [AD66] : Endif
+If !clalev ([M:AD67])   Local Mask ADRBPR    [AD67] : Endif
+If !clalev ([M:PCEZ])   Local Mask PCEE      [PCEZ] : Endif
+If !clalev ([F:TRA])    Local File TABRATVAT  [TRA] : Endif
+If !clalev ([F:PTD1])   Local File PRECEIPTD [PTD1] : Endif : #VPO 20/01/11 70923
+If !clalev ([F:PTDB])   Local File PRECEIPTD [PTDB] : Endif
+If !clalev ([F:PIHB])   Local File PINVOICE  [PIHB] : Endif
+If !clalev ([F:PIDB])   Local File PINVOICED [PIDB] : Endif
+If !clalev ([F:TCA])    Local File TABCOUAFF  [TCA] : Endif
+If !clalev ([F:TCY])    Local File TABCOUNTRY [TCY] : Endif
+If !clalev ([F:POS])    Local File POSCOD     [POS] : Endif
+If !clalev ([F:STJ])    Local File STOJOU     [STJ] : Endif
+If !clalev ([F:STO])    Local File STOCK      [STO] : Endif
+If !clalev ([F:GCM])    Local File GACM       [GCM] : Endif
+If !clalev ([F:MAT])    Local File MATCHTOL   [MAT] : Endif   # Three way matching GRNA
+
+# Issue 84130 - 2013-02-14 by MUARN : landed cosr
+If !clalev([F:STCH])   Local File COSTSTCH   [STCH] : Endif
+If !clalev([F:STCD])   Local File COSTSTCD   [STCD] : Endif
+If !clalev([F:STCL])   Local File COSTSTCL   [STCL] : Endif
+If !clalev([F:FCS])    Local File FRECST     [FCS]  : Endif
+If !clalev([F:ICTD])   Local File INCOTERMD  [ICTD] : Endif
+If !clalev([F:PID])    Local File PINVOICED  [PID]  : Endif
+# Issue 89349 - 2013-10-29 by SR : Rapprochement
+If !clalev([F:STCR])   Local File COSTSTCR   [STCR] : Endif
+# Issue 110325 - 2016-01-05 by SR : FCC sur expé
+If !clalev([F:SHH])    Local File SHIPMENT   [SHH]  : Endif
+If !clalev([F:SHD])    Local File SHIPMENTD  [SHD]  : Endif
+If !clalev([F:TRNP])   Local File TRANSPORT [TRNP]  : Endif
+# Issue X3-25003 - 2017-05-23 by SR : Valorisation des réceptions
+If !clalev([F:PSV])    Local File PTDSTKVAL  [PSV]  : Endif
+
+
+#-----
+If !clalev ([F:PIX])
+  Link [PIDB] With [PIHB] PIH0=[F:PIDB]NUM As [PIX]
+Endif
+#-----
+If GMODU(5)=2 : # Si module ventes actif
+  If !clalev([F:SIH])   Local File SINVOICE   [SIH] : Endif
+  If !clalev([F:SIV])   Local File SINVOICEV  [SIV] : Endif
+  If !clalev([F:SID])   Local File SINVOICED  [SID] : Endif
+  Raz [F:SID] : # à cause de l'INISEC "PID"
+Endif
+#-----------------------------------------------#
+# Récupération des paramètres achats et budget  #
+# Chargement GITMFLG : 1=réf.art  2=réf.art/fou #
+#-----------------------------------------------#
+Call GETSOC(GFCYDEF(6)) From DEVSUB : GFCY=GFINRSP
+Call GETFCYDEF(GFCY,"[F:FCY]FINFLG=2 & [F:FCY]LEGCPY=GSOCIETE") From TRTX3
+If GFCY<>""
+  Gosub CHARG_PARAM : If OK=0  Return : Endif
+Endif
+#-----
+Read [TCU] TCU0=GLOCALDEV : If fstat Raz [F:TCU] : Endif
+#-----
+GCUR=GLOCALDEV
+GORITITCOL=1
+#-----------------------------------------------#
+# Déclaration des variables pour tableau lignes #
+#-----------------------------------------------#
+
+Gosub DECLARE From TABLEAUX
+Gosub OUVRE From TEN99LIB          #1099.n Open BOX1099 table & set GS1099
+
+# SAM 101378: Localization Switzerland, 2016-01-19 Bader
+If func AFNC.ACTIV("KSW")>0
+  Gosub OUVRE_PIH From SWIBVRLIB4
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#  Gosub OUVRE_QRC From SWIQRCLIB2 # angre X3-90379 QR-Code Swiss
+Endif
+# SAM 101378 END
+
+Return
+
+$OUVRE_BOITE
+#-------------------------------#
+# Après ouverture de la fenêtre #
+#-------------------------------#
+#----- Chargement des noms des Currbox de chaque tiroir -----#
+Global Char GBOXPI2(10), GBOXPO1(10), GBOXPT1(10), GBOXPI1(10), GBOXPN1(10), GBOXSI2(10), GBOXLO1(10)
+GBOXPI2="GAU_CHE"+num$(find("PI2",OBJLIS(1..8))) : # Liste des factures par fournisseur
+GBOXPO1="GAU_CHE"+num$(find("PO1",OBJLIS(1..8))) : # Picking des commandes
+GBOXPT1="GAU_CHE"+num$(find("PT1",OBJLIS(1..8))) : # Picking des réceptions
+GBOXPI1="GAU_CHE"+num$(find("PI1",OBJLIS(1..8))) : # Picking des factures
+GBOXPN1="GAU_CHE"+num$(find("PN1",OBJLIS(1..8))) : # Picking des retours
+GBOXSI2="GAU_CHE"+num$(find("SI2",OBJLIS(1..8))) : # Picking des factures ventes
+GBOXLO1="GAU_CHE"+num$(find("LO1",OBJLIS(1..8))) : # dépense liées
+Return
+
+$SETBOUT
+#-------------------------------------------------------------------------#
+# Activation / désactivation des menus (ToolBar) et boutons (bas d'écran) #
+#-------------------------------------------------------------------------#
+GPIH_VERROU=VERROU
+#----- Menus "Texte entête" et "Texte pied" dans la ToolBar -----#
+If GREP="C" | GREP="D" | [M:PIH0]NUM<>""
+  CHMEN+="FG"
+Endif
+#----- Menus "Adresse facture"  et "Adresse règlement"  dans la ToolBar -----#
+If GREP<>"" | CLECUR
+  CHMEN+="HI"
+Endif
+#----- Menu "Critères picking" -----#
+If [M:PIH0]PIHTYP>0 & [M:PIH0]PIHTYP<>2 & [M:PIH0]BPR<>"" & [M:PIH1]CUR<>""
+&                   & [M:PIH1]STA<3     & [M:PIH0]BETCPY<>2
+  #----- Si modif non autorisée, désactivation du préchargement -----#
+  If GREP<>"C"
+    GBIDC2="M" : Gosub AUTORIS_OPT From CONTX3
+    If GBIDI2 & VERROU  CHMEN+="J" : Endif
+  Else
+    CHMEN+="J"
+  Endif
+Endif
+#----- Menu "Informations douanières" -----#
+#If CLECUR
+  CHMEN+="K"
+#Endif
+#----- Menu "Consultation factures" dans la ToolBar -----#
+If GREP="" & CLECUR & clalev([M:CPI2])=0
+  CHMEN+="L"
+Endif
+#----- Menu "Transaction" -----#
+CHMEN+="M"
+#----- Menu "Pièce comptable" -----#
+If [M:PIH1]STA>2 & GMODU(2)=2
+  CHMEN+="N"
+Endif
+#----- Menu "Pièce analytique" -----#
+If [M:PIH1]STA>2 & GLOCITAPRE
+  CHMEN+="O"
+Endif
+#----- Menu "Annulation comptable" -----#
+If !GIMPORT & !GHISTO
+  If find("N",XMEN(1..NBRMEN))
+    #RMA * 103303
+    #If [M:PIH1]STA>2 & func AFNC.PARAM("POSTINVSUP",[M]FCY)="2" : # (ajout BY 07/08/08 pour suppression codes activité)
+    If [M:PIH1]STA>2 & func AFNC.PARAM("POSTINVSUP",[M]FCY)="2" & func PORLEGLIB.DIGSIGNPIH([M]FCY, "",[M]PIVTYP) = 0 : # (ajout BY 07/08/08 pour suppression codes activité)
+      CHMEN+="P"
+    Endif
+  Endif
+Endif
+#----- Menu "Traçabilité pièces" -----#
+# SYMEU 10/12/2008 : branchement traçabilité pièces
+#If !find(GREP,"C","D") and !find("CONSPIA",GNAVIG(1..GPILNAV)) and [M:PIH0]INVTYP<=2 Then CHMEN += "Q" Endif
+If !find(GREP,"C","D") and !find("CONSPIA",GNAVIG(1..GPILNAV)) Then CHMEN += "Q" Endif : # MBT 29/12/08 en attendant modif SYMEU !
+#----------------------------------------------------------#
+# Suppression des boutons # CODE                           #
+#                         D DUPLICATION                    #
+#                         A ANNULATION  si facture validée #
+#                                       ou si GSIVSUP=1    #
+#----------------------------------------------------------#
+Call VIREBOUT(CHAINE,"H") From GOBJET
+If CLECUR
+  Call VIREBOUT(CHAINE,"D") From GOBJET
+  # Issue 114426 - 2016-03-18 by RICAR : SIVSUP parameter to split in PIVSUP and GASSUP
+  # Issue 114426
+  If [M:PIH1]STA=3 | GPIVSUP=1 Call VIREBOUT(CHAINE,"A") From GOBJET : Endif #85785
+  # End issue 114426
+Endif
+#----- Suppression des boutons "Echéances" et "Validation" si nécessaire -----#
+If GREP<>""
+  Call VIREBOUT(CHAINE,"12") From GOBJET
+Else
+  If !CLECUR           Call VIREBOUT(CHAINE,"1")  From GOBJET : Endif
+  If !CLECUR        |
+&    [M:PIH1]STA<>2 |
+&    !VERROU           Call VIREBOUT(CHAINE,"2")  From GOBJET : Endif
+Endif
+#----- Suppression du bouton "Immo" si nécessaire -----#
+OKIMMO = 1
+If GREP<>"" or CLECUR=0 or [M:PIH3]NBLIG<1 or !find("",[M:PIH3]FASREF(0..[M:PIH3]NBLIG-1))
+&           or !find(2,[M:PIH3]LINPURTYP(0..[M:PIH3]NBLIG-1))
+&           or [M:PIH1]STA<3
+  OKIMMO = 0
+Elsif [M:PIH3]NBLIG>1 & find("",[M:PIH3]FASREF(0..[M:PIH3]NBLIG-1))
+  NOL = 0
+  While NOL<[M:PIH3]NBLIG & find("",[M:PIH3]FASREF(NOL..[M:PIH3]NBLIG-1))
+    NOLI = find("",[M:PIH3]FASREF(NOL..[M:PIH3]NBLIG-1))-1+NOL
+    If [M:PIH3]LINPURTYP(NOLI) = 2
+      OKIMMO = 1 : Break
+    Else
+      OKIMMO = 0 : NOL += 1
+    Endif
+  Wend
+Else
+  Call GETEXE([F:FCY]LEGCPY,GTYPGEN,[M:PIH0]ACCDAT,EXE) From CPTSUB
+# DBA le 17/03/03 : Sugg 15007
+# If [F:FIY]FIYSTA = 3
+  If [F:FIY]FIYSTA >2
+    OKIMMO = 0
+  Endif
+Endif
+If !OKIMMO
+  Call VIREBOUT(CHAINE,"3") From GOBJET
+Endif
+#----- Après touche f5 réactualisation de la liste de picking -----#
+#-------------------------------------------------------------------------#
+# N'est plus nécessaire car effectué par l'appel de l'action AP_FILGAUCHE #
+#-------------------------------------------------------------------------#
+# If !GIMPORT
+#   If num$(REPONSE)="1799" WPICK=2 : Gosub ACTUALIS_MARQUAGE : Endif
+# Endif
+
+#RBA 110811/US2
+If func AFNC.ACTIV("EDIX3") <> 0
+  If func CNSEDKSTD.GET_EDI_CATACT([M]NUM, 1) <> 0
+    CHMEN += "V" #Historic
+  Endif
+  #CJ 110811/US9
+  GFCY=[M:PIH0]FCY : GBIDC2="I" : Gosub AUTORIS_OPT From CONTX3
+  If GBIDI2 and ([M:PIH1]STA <> 1 and [M:PIH1]STA <> 2)
+  #RBA 112138/US2
+    CHMEN += "Y" #Run EDI Issue
+  Else
+    Call VIREBOUT(CHMEN,"Y") From GOBJET # No EDI Issue
+  Endif
+  #/CJ 110811/US9
+Endif
+#/RBA 112138/US2
+
+# GRNA 15/09/2011 - Three way matching
+Gosub PIH_SETBOUT From TWMLIB
+
+# SAM 101378: Localization Switzerland, 2016-01-19 Bader
+If func AFNC.ACTIV("KSW")>0
+  Gosub SETBOUT_PIH From SWIBVRLIB4
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#  Gosub SETBOUT_PIH From SWIQRCLIB2 # angre X3-90379 QR-Code Swiss
+Endif
+# SAM 101378 END
+Return
+
+$AVANTBOUT
+#-----------------------------------#
+# Avant exécution des boutons       #
+# --------------------------------- #
+# 1 = Echéances                     #
+# 2 = Validation (Comptabilisation) #
+# 3 = Immo                          #
+#                                   #
+# F = Texte entête                  #
+# G = Texte pied                    #
+# H = Adresse facture               #
+# I = Adresse règlement             #
+# J = Critères picking              #
+# K = Informations douanières       #
+# L = Consultation des factures     #
+# M = Visu transaction de saisie    #
+# N = Pièce comptable               #
+# O = Pièce analytique              #
+# P = Annulation comptable          #
+#-----------------------------------#
+Local  Libelle  WTYPADR
+Local  Char     WABREV(5)
+GPIH_VERROU=VERROU : Raz SYMBOL2
+If [M:PIH0]NUM<>"" & GPIH_VERROU=0 & find(BOUT,"1","2","3","H","I","N")
+  SYMBOL2="PIH"+[M:PIH0]NUM : Lock=SYMBOL2
+  If !fstat  GPIH_VERROU=1  Else  Raz SYMBOL2 : Endif
+Endif
+#-----
+Local  Char     SAV_ZONCOU(GLONAVA)
+If GREP<>"" SAV_ZONCOU=COUZON Else SAV_ZONCOU="" : Endif
+Case BOUT
+  When "1" : GBIDI1=0
+             GBIDC2="E" : Gosub AUTORIS_OPT From CONTX3
+             If !GBIDI2
+               GMESSAGE=mess(39,117,1)-":"-mess(17,137,1)  : GERR=1 : OK=0 : Goto FIN_AVANTBOUT
+             Endif
+  When "2" : Filter [GAC]
+             If !GPIH_VERROU
+               GMESSAGE=mess(10,100,1) : GERR=1 : OK=0 : Goto FIN_AVANTBOUT
+             Endif
+             GFCY=[M:PIH0]FCY : GBIDC2="V" : Gosub AUTORIS_OPT From CONTX3
+             If !GBIDI2
+               GMESSAGE=mess(360,194,1)  : GERR=1 : OK=0 : Goto FIN_AVANTBOUT
+             Endif
+             OK=1 : Call AVERTIR(mess(156,196,1),OK) From GESECRAN
+             If OK=1  OK=0 : Goto FIN_AVANTBOUT : Endif
+             #---- Relecture enr. facture (peut être perdu à cause du picking) ----#
+             If [F:PIH]NUM<>[M:PIH0]NUM | [F:PIH]INVTYP=0
+               Read [PIH] PIH0=[M:PIH0]NUM
+               If fstat
+                 Raz [F:PIH]
+                 GMESSAGE=mess(12,100,1)-"PINVOICE"-[M:PIH0]NUM : GERR=1
+                 Goto FIN_AVANTBOUT
+               Endif
+             Endif
+             #---- Problème à la validation des factures trop de table ouvertes ----#
+             If clalev([F:TCA])    Close Local File [TCA]  : Endif
+             If clalev([F:PTR])    Close Local File [PTR]  : Endif
+             # Issue 85800 - 2013-01-17 by MUARN : table voulue dans objet PT1
+             #If clalev([F:POC])    Close Local File [POC]  : Endif
+             If clalev([F:BPA])    Close Local File [BPA]  : Endif
+             If clalev([F:MVS])    Close Local File [MVS]  : Endif
+             If clalev([F:PIX])    Close Local File [PIX]  : Endif
+             If clalev([F:PIHB])   Close Local File [PIHB] : Endif
+             If clalev([F:PIDB])   Close Local File [PIDB] : Endif
+             If clalev([F:PTDB])   Close Local File [PTDB] : Endif
+             If clalev([F:TCY])    Close Local File [TCY]  : Endif
+             If clalev([F:TVT])    Close Local File [TVT]  : Endif
+             If clalev([F:TPV])    Close Local File [TPV]  : Endif
+             #-----
+             #############################################################################
+             ##INICIO: MODIFICACIONES PARA LOCALIZACIONES COMPRAS ARGENTINA             ##
+             ##ARGENTINA: 27.07.2005 - Juan Pablo Mansilla                              ##
+             ##Funcionalidad agregada para gestion de retenciones e impuestos internos  ##
+             ##en la factura de proveedor                                               ##
+             #############################################################################
+             GPOINT="XPIHTAXINT" : Gosub ENTREE From EXEFNC
+             #############################################################################
+             ##FIN: MODIFICACIONES PARA LOCALIZACIONES COMPRAS ARGENTINA                ##
+             ##ARGENTINA: 27.07.2005                                                    ##
+             #############################################################################
+             #-----
+  When "F","G" : If GREP="" & dim(ACTMOD)>0 & !ACTMOD  GCONSDIA=2 : Endif
+  When "H" : If GREP="" & (!ACTMOD | !VERROU)  GCONSULT=1 : Endif
+  When "I" : If GREP="" & (!ACTMOD | !VERROU)  GCONSULT=1 : Endif
+  When "K" : Local  Integer WEXEFLG : WEXEFLG=5
+  When "N" : Gosub AVANTBOUT_GAS
+  When "O" : SAVGCONSULT=GCONSULT
+  When "P" : If clalev([F:CPY])=0 Local File COMPANY [CPY] : OUVFICFLG=1 : Endif
+  When "5" : # SAM 101378: Localization Switzerland, 2016-01-19 Bader
+             If func AFNC.ACTIV("KSW")>0
+                Gosub AVANTBOUT_PIH From SWIBVRLIB4
+             Endif
+             # SAM 101378 END
+Endcase
+$FIN_AVANTBOUT
+If !OK & SYMBOL2<>""  Unlock=SYMBOL2 : Raz SYMBOL2 : Endif
+Return
+
+$AVANTBOUT_GAS
+#-----------------#
+# Pièce comptable #
+#-----------------#
+SAVGCONSULT=GCONSULT
+If clalev([F:HAE])=0 : Local File GACCENTRY [HAE] : OUVFICFLG=1 : Endif
+Read [HAE] HAE0=[M:PIH0]GTE;[M:PIH0]NUM
+If !fstat
+  GFLAG   =[F:HAE]DACDIA
+  GBIDC2  =[M:PIH0]NUM
+  GBIDC3  =[M:PIH0]GTE
+  GCONSULT=1
+Else
+  OK=0
+  If OUVFICFLG=1 Close Local File [HAE] : Raz OUVFICFLG : Endif
+Endif
+Return
+
+$AVANT_SUITE
+#---------------------------------------------------------------------#
+# Après exécution d'une action et avant l'exécution de l'action suite #
+#---------------------------------------------------------------------#
+Case BOUT
+  When "N" :  # Pièces comptables
+    Gosub AVANT_SUITE From GASTRC
+  When "O" :  # Pièce analytique
+    I=instr(1,VALBOUT," ")
+    If !I
+      OK=0
+    Else
+      [L]VALC1="GAS"
+      [L]VALC3=left$(VALBOUT,I-1)
+      [L]VALC2=right$(VALBOUT,I+1)
+      GCONSULT=1
+    Endif
+  When "3"
+    If GOKIMMO
+      OK = 1
+    Else
+      OK = 0
+    Endif
+Endcase
+Return
+
+$EXEBOUT
+#------------------------------------#
+# Après exécution des boutons du bas #
+# 1 = Echéances                      #
+# 2 = Validation (Comptabilisation)  #
+# 3 = Immo                           #
+#------------------------------------#
+If SYMBOL2<>""  Unlock=SYMBOL2 : Raz SYMBOL2 : Endif
+Case BOUT
+  When "1" : #GBIDI2=[M:PIH0]PAZ                                        : # Bug 17191
+             Call FIRST_DUD(1) From SUBPIHC
+             #Trbegin [PIH]                                             : # Bug 17191
+             #  Update [PIH] Where NUM=[M:PIH0]NUM With PAZ=[M:PIH0]PAZ : # Bug 17191
+             #Commit                                                    : # Bug 17191
+             #If currbox="GAU_CHE" & GBIDI2<>[M:PIH0]PAZ                : # Bug 17191
+             #  Gosub REMPLIT_ From WGOPIH                              : # Bug 17191
+             #Endif                                                     : # Bug 17191
+  When "2" : If !clalev([F:TCA])  Local File TABCOUAFF  [TCA]  : Endif
+             If !clalev([F:PTR])  Local File PURTRS     [PTR]  : Endif
+             If !clalev([F:POC])  Local File PORDERC    [POC]  : Endif
+             If !clalev([F:BPA])  Local File BPADDRESS  [BPA]  : Endif
+             If !clalev([F:MVS])  Local File BPSUPPMVT  [MVS]  : Endif
+             If !clalev([F:TCY])  Local File TABCOUNTRY [TCY]  : Endif
+             If !clalev([F:TVT])  Local File TABVAT     [TVT]  : Endif
+             If !clalev([F:TPV])  Local File TABPIVTYP  [TPV]  : Endif
+             If !clalev([F:PTDB]) Local File PRECEIPTD  [PTDB] : Endif
+             If !clalev([F:PIHB]) Local File PINVOICE   [PIHB] : Endif
+             If !clalev([F:PIDB]) Local File PINVOICED  [PIDB] : Endif
+             If !clalev([F:PIX])
+               Link [PIDB] With [PIHB] PIH0=[F:PIDB]NUM As [PIX]
+             Endif
+             Default File [PIH]
+             #----- Relecture affectation compteurs et transaction de saisie -----#
+             Call LECTCA(6,OK) From SUBTCA
+             If fstat | !OK  Raz [F:TCA], GMESSAGE, GERR : Endif
+             Read [PTR] PTR0=8;GPTRNUM  : If fstat Raz [F:PTR]  : Endif
+             #--------------------------------------------------------------------#
+             Gosub RELIT From GOBJSUB
+  When "3" : Gosub RELIT From GOBJSUB
+Endcase
+GFCY=[M:PIH0]FCY
+Return
+
+$STATUT
+#-------------------------------------------#
+# Après exécution des boutons de la ToolBar #
+# F = Texte entête                          #
+# G = Texte pied                            #
+# H = Adresse facture                       #
+# I = Adresse règlement                     #
+# J = Critères picking                      #
+# K = Informations douanières               #
+# L = Consultation des factures             #
+# M = Visu transaction de saisie            #
+# N = Pièce comptable                       #
+# O = Pièce analytique                      #
+# P = Annulation comptable                  #
+# Q = Traçabilité pièces                    #
+#-------------------------------------------#
+If SYMBOL2<>""  Unlock=SYMBOL2 : Raz SYMBOL2 : Endif
+Case BOUT
+  When "F" : Gosub APRESBOUT_TEXTE
+  When "G" : Gosub APRESBOUT_TEXTE
+  When "J" : Gosub TIROIR
+  When "H" : If !GCONSULT & GREP=""
+               WTYPADR=1 : WABREV="AD66" : Gosub MAJ_ADRESSE From TRTACHFAC1
+             Elsif !GIMPORT
+               [M:PIH0]BPRNAM1=[M:AD66]BPRNAM(0)
+               Affzo [PIH0]BPRNAM1
+             Endif
+             #----- Recopie adresse fournisseur facturant divers pour fournisseur payé -----#
+             If [M:PIH1]BPRPAY=[M:PIH0]BPR & [M:AD67]ADBFLG<>2
+               If [F:BPS]BPSNUM<>[M:PIH0]BPR
+                 Read [BPS] BPS0=[M:PIH0]BPR : If fstat  Raz [F:BPS] : Endif
+               Endif
+               If [F:BPS]BPSTYP=3  [M:AD67]=[M:AD66] : Endif
+             Endif
+  When "I" : If !GCONSULT & GREP=""
+                # Issue 87705 - 2013-02-15 by SR
+                WMODADR = 1
+                If [M:AD67]BPAADD <> [M:PIH1]BPAPAY : WMODADR = 2 : Endif
+                WTYPADR=2 : WABREV="AD67" : Gosub MAJ_ADRESSE From TRTACHFAC1
+                If WMODADR = 2
+                   [M:PIH1]MODADR = 2
+                   Gosub ENTRE_MODIF From GOBJSUB
+                Endif
+             Endif
+  When "K" : Gosub ACTIV_GSTAENR
+  When "N" : GCONSULT=SAVGCONSULT : GFLAG=GPTRNUM
+             If OUVFICFLG>0
+               Close Local File [HAE] : Raz OUVFICFLG : Default File [PIH]
+             Endif
+  When "O" : GCONSULT=SAVGCONSULT
+  When "P" : If OUVFICFLG>0
+               Close Local File [CPY] : Raz OUVFICFLG : Default File [PIH]
+             Endif
+             Gosub RELIT From GOBJSUB
+  When "Q" : Call GETDEV(GFCY)  From DEVSUB # Issue 83475 - 2012-07-19 by MUARN : conversion devise
+  When "U" : Gosub RELIT From GOBJSUB
+Endcase
+#VPO 14/03/11 72298 ajout test dim(SAV_ZONCOU)
+If dim(SAV_ZONCOU)>0 & SAV_ZONCOU<>"" & !GIMPORT  SUIZON=SAV_ZONCOU : Endif
+Return
+#----- Activation du bouton enregistrer -----#
+$ACTIV_GSTAENR
+If GREP="" & WEXEFLG=9
+  Gosub ENTRE_MODIF From GOBJSUB
+Endif
+Return
+
+$APRESBOUT_TEXTE
+#---------------------------------#
+# Texte entête et pied de facture #
+#---------------------------------#
+If mkstat=4 & GREP="" : # Texte modifié
+  Gosub ENTRE_MODIF From GOBJSUB
+Endif
+#----- Affichage icone texte -----#
+If !GIMPORT
+  If GREP="" & ([M:PIH0]TEX1<>"" | [M:PIH0]TEX2<>"")
+    Call SET_IMAGE(4)   From GESECRAN
+  Else
+    Call RESET_IMAGE(4) From GESECRAN
+  Endif
+Endif
+Return
+
+$HINTCLE
+#-----------------------------------------------------------#
+# Clé pour optimisation du remplissage des listes de gauche #
+#-----------------------------------------------------------#
+Case currbox
+  When GBOXPO1 : HINTLIS(val(right$(GBOXPO1,8)))="POQ1"
+  When GBOXPT1 : HINTLIS(val(right$(GBOXPT1,8)))="PTD1"
+  When GBOXPI1 : HINTLIS(val(right$(GBOXPI1,8)))="PID3"
+  When GBOXPN1 : HINTLIS(val(right$(GBOXPN1,8)))="PND2"
+  When GBOXSI2 : HINTLIS(val(right$(GBOXSI2,8)))="SIH1"
+  When GBOXLO1 : HINTLIS(val(right$(GBOXLO1,8)))="LOF0"
+Endcase
+Return
+
+$CLE_GAUCHE
+#----------------------------------------------------------------------------#
+# Ajout du numéro de facture pour le tiroir des factures/avoirs fournisseurs #
+#----------------------------------------------------------------------------#
+If currbox=GBOXPI2
+  LENLIS+=1
+  CLELISTE+=";NUM"
+Endif
+Return
+
+$FILGAUCHE
+# Issue X3-69477 - 2017-12-28 by SR : Section complètement revue pour :
+#Remplissage de FILGAUSUP via ADDCRIT
+#Utilisation de CRMUTIL150 pour récupérer les rôles
+#----------------------------------------------#
+# Filtrer les enregistrements listes de gauche #
+#----------------------------------------------#
+Raz FILGAUSUP, IFILGAUSUP
+If currbox=GBOXPI2    : # Liste des factures par fournisseur
+  WCRITERE ="[F:PIH]ORIMOD=6"
+  # Issue 114584 - 2016-02-22 by SR
+  WCRITERE+= "& find([F:PIH]FCY,GUSRFCY(1..GNBAUZ))"
+  Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+  Call AJOUTE_CONDITION_ROLE(FILGAUSUP,IFILGAUSUP,"PIH") From CRMUTIL150
+  Return
+Elsif currbox=GBOXSI2 : # Picking des factures ventes
+  If [M:PIH0]BETCPY=2 & [M:PIH0]BPCINV<>"" & [M:PIH1]STA<3 &
+&   ([M:PIH0]SIHNUM<>"" | [M:PIH3]NBLIG=0) & GREP="C"
+    WCRITERE ="[F:SIH]BPR=[M:PIH0]BPCINV"
+    Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    If GCTLDATORI=2
+      WCRITERE=" [F:SIH]ACCDAT<=[M:PIH0]ACCDAT"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    Endif
+    WCRITERE=" [F:SIH]ORIMOD=5 & [F:SIV]BETCPY=2 & [F:SIV]PIHNUM=''"
+    Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    WCRITERE="[F:SIV]INVTYP<3 & [F:SIH]STA=3"
+    Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    WCRITERE="[F:SIV]ORIFCY<>[F:SIV]SALFCY"
+    Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    Call AJOUTE_CONDITION_ROLE(FILGAUSUP,IFILGAUSUP,"SIH") From CRMUTIL150
+  Else
+    WCRITERE="[F:SIH]BPR='' & [F:SIH]INVTYP=9"
+    Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+  Endif
+  Return
+Elsif currbox=GBOXLO1 : # Dépenses liées
+  WCRITERE="CODLOF=[M:PIH0]NUM"
+  Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+Endif
+If [M:PIH0]PIHTYP<>0 & [M:PIH0]BPR<>"" & [M:PIH1]CUR<>"" & [M:PIH1]STA<3 &
+&  ([M:PIH0]BETCPY<>2 | [M:PIH0]SIHNUM="")
+  If currbox=GBOXPO1    : # Picking des commandes
+    If [M:PIH0]PIHTYP<>1
+      WCRITERE ="[F:POQ]LININVFLG=9"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      # Issue 71069 - 2013-08-23 by MUARN : PJT
+      If ([M:PIH3]NBLIG > 0 | ([M:PIH3]NBLIG = 0 & [M:PIH1]PJTH <> "")) & GPJTSNGDOC = G_OUI
+        WCRITERE='[F:POP]PJT=[M:PIH1]PJTH'
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+    Else
+      WCRITERE ="[F:POQ]LININVFLG=1 & [F:POQ]WIPSTA<2 & [F:POQ]BPSINV=[M:PIH0]BPR"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      If [M:PCIW]WITMREF<>""
+         WCRITERE="pat([F:POQ]ITMREF,[M:PCIW]WITMREF)<>0"
+         Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      If [M:PCIW]WNUMCDE<>""
+         WCRITERE="pat([F:POQ]POHNUM,[M:PCIW]WNUMCDE)<>0"
+         Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      WCRITERE="([F:POQ]LINCLEFLG<2 | [F:POQ]RCPQTYPUU>[F:POQ]INVQTYPUU | [F:POQ]RCPQTYSTU>[F:POQ]INVQTYSTU)"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      WCRITERE="[F:POQ]LINTYP<3 & [F:POH]APPFLG>2"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      If GCTLDATORI=2
+         WCRITERE="[F:POH]ORDDAT<=[M:PIH0]ACCDAT"
+         Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      WCRITERE="[F:FCY]LEGCPY=GSOCIETE"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      WCRITERE="([F:POH]BETFCY<>2 | ([F:POH]BETCPY=2 & [F:POH]SALFCY=''))"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      # Issue 71069 - 2013-08-23 by MUARN : PJT
+      If ([M:PIH3]NBLIG > 0 | ([M:PIH3]NBLIG = 0 & [M:PIH1]PJTH <> "")) & GPJTSNGDOC = G_OUI
+        WCRITERE='[F:POP]PJT=[M:PIH1]PJTH'
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      Call AJOUTE_CONDITION_ROLE(FILGAUSUP,IFILGAUSUP,"POH") From CRMUTIL150
+    Endif
+  Elsif currbox=GBOXPT1 : # Picking des réceptions
+    If [M:PIH0]PIHTYP<>1
+      WCRITERE ="[F:PTD]LININVFLG=9"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      # Issue 71069 - 2013-08-23 by MUARN : PJT
+      If ([M:PIH3]NBLIG > 0 | ([M:PIH3]NBLIG = 0 & [M:PIH1]PJTH <> "")) & GPJTSNGDOC = G_OUI
+        WCRITERE='[F:PTD]PJT=[M:PIH1]PJTH'
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+    Else
+      WCRITERE ="[F:PTD]LININVFLG=1 & [F:PTD]BPSINV=[M:PIH0]BPR"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      If [M:PCIW]WITMREF<>""
+        WCRITERE="pat([F:PTD]ITMREF,[M:PCIW]WITMREF)<>0"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      If [M:PCIW]WNUMRCP<>""
+        WCRITERE="pat([F:PTD]PTHNUM,[M:PCIW]WNUMRCP)<>0"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      If [M:PCIW]WNUMCDE<>""
+        WCRITERE="pat([F:PTD]POHNUM,[M:PCIW]WNUMCDE)<>0"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+     #FILGAUSUP(0)-="& ([F:PTD]QTYPUU>[F:PTD]INVQTYPUU | [F:PTD]QTYSTU>[F:PTD]INVQTYSTU)"
+      WCRITERE="[F:PTD]LINTYP<3"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      If [M:PCIW]WBPSNDE<>""
+        WCRITERE="pat([F:PTH]BPSNDE,[M:PCIW]WBPSNDE)<>0"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      WCRITERE="[F:FCY]LEGCPY=GSOCIETE"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      #VPO 21/04/11 73382 ajout ctl DATORI aussi avec date BL
+      #If GCTLDATORI=2  FILGAUSUP(1)-="& [F:PTH]RCPDAT<=[M:PIH0]ACCDAT" : Endif
+      If GCTLDATORI=2
+        WCRITERE="(([F:PTH]NDEDAT=[0/0/0] & [F:PTH]RCPDAT<=[M:PIH0]ACCDAT)|([F:PTH]NDEDAT<>[0/0/0] & min([F:PTH]NDEDAT,[F:PTH]RCPDAT)<=[M:PIH0]ACCDAT))"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      # Issue 120453 - 2016-12-16 by SR : Retour arrière sur cette correction
+      # Issue 95534 - 2013-12-31 by SR : Réceptions Inter société sont toujours facurables
+  #    FILGAUSUP(1)-="& ([F:PTH]BETFCY<>2  | [F:PTH]BETCPY=2)"
+      WCRITERE="([F:PTH]BETFCY<>2 | ([F:PTH]BETCPY=2 & ([F:PTD]VERFLG=2 | [F:PTD]SDHNUM='')))"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      # Issue 70507 - 2012-01-18 by MUARN : qté facturable non nulle
+      If GPIHQTYRET = 1
+        WCRITERE="[F:PTD]RTNQTYPUU<[F:PTD]QTYPUU"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      # Issue 71069 - 2013-08-23 by MUARN : PJT
+      If ([M:PIH3]NBLIG > 0 | ([M:PIH3]NBLIG = 0 & [M:PIH1]PJTH <> "")) & GPJTSNGDOC = G_OUI
+        WCRITERE='[F:PTD]PJT=[M:PIH1]PJTH'
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      Call AJOUTE_CONDITION_ROLE(FILGAUSUP,IFILGAUSUP,"PTH") From CRMUTIL150
+    Endif
+  Elsif currbox=GBOXPI1 : # Picking des lignes d'une facture
+    If [M:PIH0]PIHTYP<>3
+      WCRITERE="[F:PID]BPR='' & [F:PID]INVTYP=9"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      # Issue 71069 - 2013-08-23 by MUARN : PJT
+      If ([M:PIH3]NBLIG > 0 | ([M:PIH3]NBLIG = 0 & [M:PIH1]PJTH <> "")) & GPJTSNGDOC = G_OUI
+        WCRITERE='[F:PID]PJT=[M:PIH1]PJTH'
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+    Else
+      WCRITERE="[F:PID]BPR=[M:PIH0]BPR"
+      If [M:PIH1]INVNUM<>""
+        WCRITERE+="& [F:PID]NUM=[M:PIH1]INVNUM"
+      Else
+        WCRITERE+=" & [F:PID]INVTYP=1"
+      Endif
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      If [M:PCIW]WITMREF<>""
+        WCRITERE="pat([F:PID]ITMREF,[M:PCIW]WITMREF)<>0"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      WCRITERE="[F:PID]LINTYP<3"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      WCRITERE="[F:PIH]CPY=GSOCIETE & [F:PIH]STA=3"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      If GCTLDATORI=2
+         WCRITERE="[F:PIH]ACCDAT<=[M:PIH0]ACCDAT"
+         Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      # Issue 71069 - 2013-08-23 by MUARN : PJT
+      If ([M:PIH3]NBLIG > 0 | ([M:PIH3]NBLIG = 0 & [M:PIH1]PJTH <> "")) & GPJTSNGDOC = G_OUI
+        WCRITERE='[F:PID]PJT=[M:PIH1]PJTH'
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      Call AJOUTE_CONDITION_ROLE(FILGAUSUP,IFILGAUSUP,"PIH") From CRMUTIL150
+    Endif
+  Elsif currbox=GBOXPN1 : # Picking des retours
+    If [M:PIH0]PIHTYP<>4
+      WCRITERE ="[F:PND]LININVFLG=9" : FILGAUSUP(1)=""
+      # Issue 71069 - 2013-08-26 by MUARN : PJT
+      If ([M:PIH3]NBLIG > 0 | ([M:PIH3]NBLIG = 0 & [M:PIH1]PJTH <> "")) & GPJTSNGDOC = G_OUI
+        WCRITERE+='&[F:PND]PJT=[M:PIH1]PJTH'
+      Endif
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    Else
+      WCRITERE="[F:PND]LININVFLG=1 & [F:PND]BPSINV=[M:PIH0]BPR & [F:PND]LINAUTFLG<>2"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      If [M:PCIW]WNUMRET<>""
+        WCRITERE="pat([F:PND]PNHNUM,[M:PCIW]WNUMRET)<>0"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      If [M:PCIW]WITMREF<>""
+        WCRITERE="pat([F:PND]ITMREF,[M:PCIW]WITMREF)<>0"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      WCRITERE="([F:PND]QTYPUU>[F:PND]INVQTYPUU | [F:PND]QTYSTU>[F:PND]INVQTYSTU)"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      WCRITERE="[F:PND]LINTYP<3"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      WCRITERE ="[F:PNH]CFMFLG>1 & ([F:PNH]BETFCY<>2 | [F:PNH]BETCPY=2)"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      WCRITERE="([F:PNH]BETCPY<>2 | [F:PND]PTHNUM<>'')"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      If GCTLDATORI=2
+        WCRITERE="[F:PNH]RTNDAT<=[M:PIH0]ACCDAT"
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      WCRITERE="[F:FCY]LEGCPY=GSOCIETE"
+      Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      # Issue 71069 - 2013-08-26 by MUARN : PJT
+      If ([M:PIH3]NBLIG > 0 | ([M:PIH3]NBLIG = 0 & [M:PIH1]PJTH <> "")) & GPJTSNGDOC = G_OUI
+        WCRITERE='[F:PND]PJT=[M:PIH1]PJTH'
+        Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+      Endif
+      Call AJOUTE_CONDITION_ROLE(FILGAUSUP,IFILGAUSUP,"PNH") From CRMUTIL150
+    Endif
+  Endif
+Elsif find(currbox,GBOXPO1,GBOXPT1,GBOXPI1,GBOXPN1)
+  Case currbox
+    When GBOXPO1 : WCRITERE="[F:POQ]LININVFLG=9"
+                   Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    When GBOXPT1 : WCRITERE="[F:PTD]LININVFLG=9"
+                   Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    When GBOXPI1 : WCRITERE="[F:PID]BPR='' & [F:PID]INVTYP=9"
+                   Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+    When GBOXPN1 : WCRITERE="[F:PND]LININVFLG=9"
+                   Call ADDCRIT(FILGAUSUP, IFILGAUSUP, "FILGAUSUP", WCRITERE, "&") From GOBJSUB
+  Endcase
+Endif
+Return
+
+$AP_FILGAUCHE
+#---------------------------------------------------------#
+# Après pagination avant ou arrière d'une liste de gauche #
+#---------------------------------------------------------#
+If !find(currbox,GBOXPO1,GBOXPT1,GBOXPI1,GBOXPN1,GBOXSI2) Return : Endif
+WPICK=2 : Gosub ACTUALIS_MARQUAGE
+Return
+
+$TIROIR
+#---------------------------------------------------#
+# Click sur un tiroir                               #
+# Désormais entièrement géré par l'objet :          #
+# - le remplissage                                  #
+# - et l'actualisation (boules bleues)              #
+#   par l'appel à la suite de l'action AP_FILGAUCHE #
+# ------------------------------------------------- #
+# Autres appels par l'applicatif dans les cas       #
+# d'abandon, d'après création, d'après modif ...etc #
+#---------------------------------------------------#
+If !find(currbox,GBOXPO1,GBOXPT1,GBOXPI1,GBOXPN1,GBOXSI2)  Return : Endif
+#-----
+ILIS=val(right$(currbox,8))
+Gosub REMP_LISGAU From GOBJSUB
+Return
+
+$DEB_PICK
+#---------------#
+# Début picking #
+#---------------#
+If !find(currbox,GBOXPO1,GBOXPT1,GBOXPI1,GBOXPN1,GBOXSI2) Return : Endif
+SAVNBLIG=[M:PIH3]NBLIG : WRET=0 : WMSG=""
+GPIH_PICK=1
+Local Integer XMESS #1099.n
+Return
+
+$PICKE
+#----------------------#
+# Nouvel élément pické #
+#----------------------#
+If !find(currbox,GBOXPO1,GBOXPT1,GBOXPI1,GBOXPN1,GBOXSI2) Return : Endif
+Local Char SWPJTMSG(250)  # Issue 71069 - 2013-08-27 by MUARN : PJT
+If REP=""
+  If !CLECUR | !VERROU | !ACTMOD | GCONSULT  OK=0 : Return : Endif
+  Gosub AVANT_MOD : If !OK  Return : Endif
+Endif
+If WRET=1  OK=0 : Return : Endif
+Case currbox
+  When GBOXPO1 : Gosub PICKE_CDE  From SUBPIHD
+  When GBOXPT1 : Gosub PICKE_RCP  From SUBPIHD
+  When GBOXPI1 : Gosub PICKE_FAC2 From SUBPIHD
+  When GBOXPN1 : Gosub PICKE_RET  From SUBPIHD
+  When GBOXSI2 : Gosub PICKE_SIH  From SUBPIHD
+Endcase
+Gosub PICKE From TEN99LIB # 1099.n
+Return
+
+$DEPICK
+#------------------------#
+# Nouvel élément dépické #
+#------------------------#
+If !find(currbox,GBOXPO1,GBOXPT1,GBOXPI1,GBOXPN1,GBOXSI2) Return : Endif
+Case currbox
+  When GBOXPO1 : Gosub DEPICK_CDE  From SUBPIHD
+  When GBOXPT1 : Gosub DEPICK_RCP  From SUBPIHD
+  When GBOXPI1 : Gosub DEPICK_FAC2 From SUBPIHD
+  When GBOXPN1 : Gosub DEPICK_RET  From SUBPIHD
+  When GBOXSI2 : Gosub DEPICK_SIH  From SUBPIHD
+Endcase
+Gosub PICKE From TEN99LIB # 1099.n
+Return
+
+$FIN_PICK
+#-------------#
+# Fin picking #
+#-------------#
+GPIH_PICK=0
+If REP=""
+  If !VERROU
+    GMESSAGE=mess(10,100,1) : GERR=1 : OK=0 : Return
+  Elsif !CLECUR | !ACTMOD | GCONSULT
+    GMESSAGE=mess(9,123,1)  : GERR=1 : OK=0 : Return
+  Endif
+Endif
+Affzo [PIH3]1-99
+Gosub TEST_VALID From SUBPIH : # Màj bases taxables et calcul taxes éléments facturation
+zonsui="[M:PIH3]NBLIG(max(0,nolign-1))" : # Dommage, il empêche le contrôle de l'onglet 1
+Setmok [PIH1] With 0             : # Ne sert à rien (Bug superviseur 23196)
+Return
+
+$GRISAGE
+#-----------------------------------------------------#
+# Traitement du grisage et dégrisage des champs écran #
+#-----------------------------------------------------#
+If [M:PIH3]NBLIG=0 & GREP="C"
+  Actzo [PIH0]FCY, PIVTYP, BPR
+  Actzo [PIH1]CUR
+Else
+  Diszo [PIH0]FCY, PIVTYP, BPR
+  #VPO 09/11/10 68969 la devise ne doit pas être modifiable sur facture validée
+  If [M:PIH1]STA=3
+     Diszo [PIH1]CUR
+  Else
+     Actzo [PIH1]CUR
+  Endif
+Endif
+If [F:BPS]BPSNUM<>[M:PIH0]BPR
+  Read [BPS] BPS0=[M:PIH0]BPR : If fstat Raz [F:BPS] : Endif
+Endif
+If [F:BPS]DUDCLC=1 & [M:PIH3]NBLIG=0
+  Diszo [PIH1]STRDUDDAT
+Elsif [M:PIH1]STA<>3
+  Actzo [PIH1]STRDUDDAT
+Endif
+If [M:PIH0]PIHTYP=3 & [M:PIH3]NBLIG=0 & GREP="C"
+  Actzo [PIH1]INVNUM
+Elsif [M:PIH0]PIHTYP=3
+  Diszo [PIH1]INVNUM
+Endif
+If [M:PIH3]NBLIG=0 Diszo [PIH4]AMTTAX Else Actzo [PIH4]AMTTAX : Endif
+
+Return
+
+$ACTUALIS_MARQUAGE
+#---------------------------------------------------------------#
+# Actualisation des éléments "pickés" dans les listes de gauche #
+# WPICK : 0 = On ne fait rien                                   #
+#         1 = Enlever le marquage des éléments "pickés"         #
+#         2 = Marquer les éléments "pickés"                     #
+#---------------------------------------------------------------#
+If [M:PIH0]BETCPY=2 & [M:PIH0]SIHNUM<>"" & currbox=GBOXSI2
+  Read [SIH] SIH0=[M:PIH0]SIHNUM : If fstat  Raz [F:SIH] : Endif
+  Read [SIV] SIV0=[M:PIH0]SIHNUM : If fstat  Raz [F:SIV] : Endif
+  If [F:SIH]NUM<>"" & [F:SIV]NUM<>""
+    Case WPICK
+      When 1 : Gosub DEPICK From GOBJSUB : # Actualisation marquage facture vente
+      When 2 : Gosub REPICK From GOBJSUB : # Actualisation marquage facture vente
+    Endcase
+  Endif
+  Return
+Endif
+#-----
+If [M:PIH3]NBLIG>0
+  For I=0 To [M:PIH3]NBLIG-1
+    Gosub MARQUAGE_LIGNE From SUBPIHD
+  Next I
+Endif
+Return
+
+$APRES_MODIF
+#------------------------------------#
+# Après modification de chaque champ #
+#------------------------------------#
+# Issue 84130 - 2013-02-07 by MUARN landed cose  Si modification de zones impactantes
+If [M:PIH3]NUMORI(nolign-1) <> ""
+    # Positionnement du flag, uniquemement si nouvelle ligne
+    If COUZON = "QTYUOM" & [M:PIH3]CREFLG(nolign-1)=0
+       [M:PIH3]WSTCUPD(nolign-1) = 2
+    Endif
+Else
+   If find(COUZON,"TYPORI","NUMORI","LINORI","ITMREF","GROPRI","QTYUOM","QTYVOU","QTYWEU","UOM","ACCDAT")
+         [M:PIH3]WSTCUPD(nolign-1) = 2
+   Endif
+Endif
+
+# SAM 101378: Localization Switzerland, 2016-01-25 Bader
+If func AFNC.ACTIV("KSW")>0
+  Gosub APRES_MODIF_PIH From SWIBVRLIB4
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#  Gosub APRES_MODIF_PIH From SWIQRCLIB2 # angre X3-90379 QR-Code Swiss
+
+Endif
+# SAM 101378 END
+
+If find(COUZON,"FCY","PIVTYP","BPR","VAC")
+  Call FLD4041DIS([M:PIH1]VAC, [M:PIH0]PIVTYP) From SUBPIHD
+Endif
+
+If [M:PIH0]PIHTYP<>0 & [M:PIH0]BPR<>"" & [M:PIH1]CUR<>"" & [M:PIH1]STA<3
+  Gosub SETBOUT From GOBJSUB
+Endif
+If !find(currbox,GBOXPO1,GBOXPT1,GBOXPI1,GBOXPN1,GBOXSI2) Return : Endif
+# Issue 71069 - 2016-01-28 by SR : Gestion du PJT
+If !find(COUZON,"FCY","PIVTYP","BPR","ACCDAT","INVNUM","PJTH") | GIMPORT      Return : Endif
+If COUZON="INVNUM" [M:PIH1]INVNUM=CZ : Endif
+If COUZON="ACCDAT" [M:PIH0]ACCDAT=CZ : Endif
+Gosub TIROIR
+Return
+
+$DEFLIG
+#----------------------------------#
+# Définition du fichier des lignes #
+# -------------------------------- #
+# Critère lecture     (CRIT)       #
+# Nom du fichier      (FICLIG)     #
+# Abréviation fichier (ABLIG)      #
+# Zone numéro ligne   (ZONLIG)     #
+#----------------------------------#
+Default Mask [PIH3]
+Default File [PID]
+CRIT   = 'NUM="'+[M:PIH0]NUM+'"'
+FICLIG = "PINVOICED"
+ABLIG  = "PID"
+ZONLIG = "PIDLIN"
+Return
+
+$LIENS_LIG
+#-----------------------------#
+# Après lecture ligne [F:PID] #
+#-----------------------------#
+Local Shortint NOL : NOL=nolign-1
+If dim([M:PIH3]TSICOD1(NOL))>0 [M:PIH3]TSICOD1(NOL)=[F:PID]TSICOD(0) : Endif
+If dim([M:PIH3]TSICOD2(NOL))>0 [M:PIH3]TSICOD2(NOL)=[F:PID]TSICOD(1) : Endif
+If dim([M:PIH3]TSICOD3(NOL))>0 [M:PIH3]TSICOD3(NOL)=[F:PID]TSICOD(2) : Endif
+If dim([M:PIH3]TSICOD4(NOL))>0 [M:PIH3]TSICOD4(NOL)=[F:PID]TSICOD(3) : Endif
+If dim([M:PIH3]TSICOD5(NOL))>0 [M:PIH3]TSICOD5(NOL)=[F:PID]TSICOD(4) : Endif
+[M:PIH3]VAT1(NOL)=[F:PID]VAT(0)
+[M:PIH3]VAT2(NOL)=[F:PID]VAT(1)
+[M:PIH3]VAT3(NOL)=[F:PID]VAT(2)
+[M:PIH3]CUMLINAMT1+=[M:PIH3]AMTNOTLIN(NOL)
+#----- Chargement comptes et sections analytiques -----#
+Call CHARG_ACCCCE(NOL,"[M:PIH3]LINACC","[M:PIH3]LINDSP","[M:PIH3]CCE",
+&                "PID",0,[F:PID]NUM,[F:PID]PIDLIN,0,"") From TRTX3CPT
+#----- Mise à jour indicateur ligne (0=en cours de création, 1=créée) -----#
+[M:PIH3]LINFLG(NOL)=1
+#-----
+[M:PIH3]PREQTYPUU(NOL)=[M:PIH3]QTYPUU(NOL)
+# Issue 96640 - 2014-03-04 by SR
+[M:PIH3]WOLDQTYPUU(NOL)=[M:PIH3]QTYPUU(NOL)
+# End issue 96640
+#VPO 03/02/11 71185 ajout lecture POHNUMORI ssi TYPORI=2
+Gosub LECT_CDE_PTD From SUBPIHC
+
+Gosub PIH_LIENS From TWMLIB  # Three way matching
+# Issue 82703 - 2013-02-11 by SR
+If [M:PIH3]CSTMAJLIN(NOL) = 0
+  If [M:PIH0]PIHTYP = 2 : [M:PIH3]CSTMAJLIN(NOL) = 2 : Else : [M:PIH3]CSTMAJLIN(NOL) = 1 :  Endif
+Endif
+Actzo [M:PIH3]CSTMAJLIN(NOL)
+If ([M:PIH1]STA = 3 | [M:PIH0]PIHTYP <> 2) : Grizo [M:PIH3]CSTMAJLIN(NOL) : Endif
+
+# Issue 84130 - 2013-02-13 by MUARN Landed cost
+[M:PIH3]WSTCUPD(NOL)=0
+[M:PIH3]WSTCSEQ(NOL)=0
+
+Return
+
+$INICRE_LIG
+#----------------------------#
+# Avant le Write de la ligne #
+#----------------------------#
+[F:PID]NUM=[M:PIH0]NUM
+[F:PID]BPR=[M:PIH0]BPR
+[F:PID]PIVTYP=[F:PIH]PIVTYP : [F:PID]PIHTYP=[F:PIH]PIHTYP : [F:PID]INVTYP=[F:PIH]INVTYP
+If GIMPORT & ([F:PID]NUMORI="" | [F:PID]LINORI=0) [F:PID]TYPORI=5 : Endif
+# Issue 110325 - 2016-01-11 by SR : FCC sur expé
+Case [F:PID]TYPORI
+  When 1 : [F:PID]POHNUM=[F:PID]NUMORI : [F:PID]POPLIN=[F:PID]LINORI
+           [F:PID]POQSEQ=[F:PID]SEQORI
+  When 2 : [F:PID]PTHNUM=[F:PID]NUMORI : [F:PID]PTDLIN=[F:PID]LINORI
+           Read [PTD] PTD0=[F:PID]PTHNUM;[F:PID]PTDLIN
+           If fstat  Raz [F:PTD] : Endif
+           [F:PID]POHNUM=[F:PTD]POHNUM : [F:PID]POPLIN=[F:PTD]POPLIN
+           [F:PID]POQSEQ=[F:PTD]POQSEQ
+  When 3 : [F:PID]PNHNUM=[F:PID]NUMORI : [F:PID]PNDLIN=[F:PID]LINORI
+           Read [PND] PND0=[F:PID]PNHNUM;[F:PID]PNDLIN
+           If fstat  Raz [F:PND] : Endif
+           [F:PID]PTHNUM=[F:PND]PTHNUM : [F:PID]PTDLIN=[F:PND]PTDLIN
+           [F:PID]POHNUM=[F:PND]POHNUM : [F:PID]POPLIN=[F:PND]POPLIN
+           [F:PID]POQSEQ=[F:PND]POQSEQ
+  When 4 : [F:PID]INVNUM=[F:PID]NUMORI : [F:PID]INVLIN=[F:PID]LINORI
+  When 6 : [F:PID]SHIPNUM=[F:PID]NUMORI : [F:PID]SHIPLIN=[F:PID]LINORI
+           Read [SHD] SHD0=[F:PID]SHIPNUM;[F:PID]SHIPLIN
+           If fstat  Raz [F:SHD] : Endif
+           [F:PID]POHNUM=[F:SHD]POHNUM : [F:PID]POPLIN=[F:SHD]POPLIN
+           [F:PID]POQSEQ=[F:SHD]POQSEQ
+Endcase
+[F:PID]CPRCUR=GLOCALDEV
+#----- Lecture si nécessaire de l'article -----#
+If [F:ITM]ITMREF<>[F:PID]ITMREF
+  Read [ITM] ITM0=[F:PID]ITMREF : If fstat Raz [F:ITM] : Endif
+Endif
+#-----
+# Issue 89349- 2013-10-29 by SR : Déplacé dans SUBPIHD
+Gosub CHARGLIGNE From SUBPIHD
+#----- Création ou duplication du texte ligne -----#
+Gosub CHARG_TEXT_LIGNE
+Gosub PIH_INICRE_LIG From TWMLIB  # Three way matching # 95938.n
+Return
+
+$INIMOD_LIG
+#------------------------------#
+# Avant le Rewrite de la ligne #
+#------------------------------#
+# Issue 89349- 2013-10-29 by SR : Déplacé dans SUBPIHD
+Gosub CHARGLIGNE From SUBPIHD
+#----- Création ou duplication du texte ligne -----#
+Gosub CHARG_TEXT_LIGNE
+Gosub PIH_INIMOD_LIG From TWMLIB  # Three way matching # 95938.n
+Return
+
+$VALLIG
+#----------------------------------------------------------------------#
+# Traitements complémentaires ligne facture                            #
+# SIGN vaut +1 en création ou modification                             #
+#      vaut -1 en annulation (TRTLIG="A") ou avant modif. (TRTLIG="M") #
+#----------------------------------------------------------------------#
+Local Integer STAT
+Gosub LECT_FICLIG From SUBPIHB : # Lecture fichiers ligne pour MAJ
+# Issue X3-70158 - 2018-01-09 by MUARN : TRTLIG à la place de GREP
+GPIH_TRTLIG = TRTLIG
+Case SIGN
+  When  1 : Gosub CRELIG
+  When -1 : Gosub SUPLIG
+  When Default
+Endcase
+Return
+
+$CRELIG
+#----------------------------------------#
+# Après Write de la ligne de facture PID #
+#----------------------------------------#
+#----- Ecriture des comptes et sections de la ligne de facture -----#
+Call ENREG_ACCCCE(nolign-1,"[M:PIH3]LINACC","[M:PIH3]LINDSP","[M:PIH3]CCE","PID",
+&                 0,[F:PID]NUM,[F:PID]PIDLIN,0,"",TRTLIG) From TRTX3CPT
+If GOK<1  Return : Endif
+#-----
+
+# Issue 98190 - 2014-03-21 by MUARN : pb PIDLIN si dépick ligne
+[M:PIH3]PIDLIN(nolign-1)= [F:PID]PIDLIN
+
+If [M:PIH3]CREFLG(nolign-1)<>0  Goto MODLIG  : Endif
+
+#----- Mise à jour fichiers à la ligne (Commande, Réception, Retour) -----#
+# Issue 100651 - 2014-06-06 by MUARN : Déplacement de SUBPIHA à SUBPIHD
+Gosub MAJ_FICHIERS_LIGNE From SUBPIHD             : If GOK<1 Return : Endif
+#----- Màj ligne facture vente si inter-société -----#
+If GMODU(5)=2 & [M:PIH0]BETCPY=2 & [M:PIH0]SIHNUM<>"" & [M:PIH3]SIDLIN(nolign-1)<>0
+  Update [SID] Where NUM=[M:PIH0]SIHNUM & SIDLIN=[M:PIH3]SIDLIN(nolign-1)
+&              With  PIDLIN=[F:PID]PIDLIN
+  If fstat  GOK=0 : Call FSTA("SID") From GLOCK : Return : Endif
+Endif
+#----- Mise à jour statistiques ligne facture -----#
+Call VALSTA("PID",SIGN) From SUBPS2  : If GOK<1 Return : Endif
+Return
+
+$MODLIG
+#------------------------------------------#
+# Après Rewrite de la ligne de facture PID #
+#------------------------------------------#
+#----- Mise à jour fichiers à la ligne (Commande, Réception, Retour) -----#
+# Issue 100651 - 2014-06-06 by MUARN : Déplacement de SUBPIHA à SUBPIHD
+Gosub MAJ_FICHIERS_LIGNE From SUBPIHD             : If GOK<1 Return : Endif
+#----- Mise à jour statistiques ligne facture -----#
+Call VALSTA("PID",SIGN) From SUBPS2  : If GOK<1 Return : Endif
+Return
+
+$SUPLIG
+#----------------------------------------------------#
+# Avant Delete ou Rewrite de la ligne de facture PID #
+# Soustraction statistiques ligne facture            #
+#----------------------------------------------------#
+Local Shortint I  : I=999
+If GREP<>"A" I=nolign : Endif
+#----- Mise à jour fichiers à la ligne (Commande, Réception, Retour) -----#
+# Issue 100651 - 2014-06-06 by MUARN : Déplacement de SUBPIHA à SUBPIHD
+Gosub MAJ_FICHIERS_LIGNE From SUBPIHD             : If GOK<1 Return : Endif
+#----- Mise à jour statistiques ligne facture -----#
+Call VALSTA("PID",SIGN) From SUBPS2  : If GOK<1 Return : Endif
+If TRTLIG="M"
+  #----- Cas particulier où l'on modifie le texte en le supprimant -----#
+  If [M:PIH3]LINTEX(nolign-1)="" & left$([F:PID]LINTEX,3)="PID"
+    Call SUP_CLOB([F:PID]LINTEX,GBIDI1) From TRTX3TEX
+  Endif
+  Return : # Si modif c'est fini !
+Endif
+#----- Avant Delete de la ligne de facture PID : Suppression texte ligne -----#
+If left$([F:PID]LINTEX,3)="PID"
+  Call SUP_CLOB([F:PID]LINTEX,GBIDI1) From TRTX3TEX
+Endif
+#----- Suppression comptes et sections de la ligne de facture -----#
+Call ENREG_ACCCCE(0,"","","","PID",0,[F:PID]NUM,[F:PID]PIDLIN,0,"","A") From TRTX3CPT
+If GOK<1  Return : Endif
+#----- Màj ligne facture vente si inter-société -----#
+If GMODU(5)=2 & [M:PIH0]BETCPY=2 & [M:PIH0]SIHNUM<>"" & [F:PID]SIDLIN<>0
+  Update [SID] Where NUM=[M:PIH0]SIHNUM & SIDLIN=[F:PID]SIDLIN
+&              With  PIDLIN=0
+  If fstat  GOK=0 : Call FSTA("SID") From GLOCK : Return : Endif
+Endif
+Return
+
+$RAZCRE
+#------------------------------------------------------#
+# Valeurs par défaut et initialisations avant création #
+#------------------------------------------------------#
+GCUR=GLOCALDEV
+Raz GPIH_QTEMAX
+Call GETSOC(GFCYDEF(6)) From DEVSUB : [M:PIH0]FCY=GFINRSP
+Call GETFCYDEF([M:PIH0]FCY,"[F:FCY]FINFLG=2 & [F:FCY]LEGCPY=GSOCIETE") From TRTX3
+If GFCY<>[M:PIH0]FCY & [M:PIH0]FCY<>""
+  GFCY=[M:PIH0]FCY : Gosub CHARG_PARAM : If OK=0  Return : Endif
+Endif
+
+# Issue 71069 - 2013-08-26 by MUARN : pjt
+If GPJTSNGDOC = G_NON Then
+ Call PJT_MODFCY([M:PIH0]FCY,"[M:PIH3]PJT") From TRTPJT
+Endif
+
+#----- Affichage entêtes de colonne variables -----#
+Gosub AFF_TITCOL
+#----- Ecran PIH0 -----#
+Actzo [PIH0]1-99
+If GNBAUZ=1 & [M:PIH0]FCY<>""
+  Diszo [PIH0]FCY  : # Saisie inutile si un seul site permis
+Endif
+[M:PIH0]ACCDAT=datesyst
+[M:PIH0]CPYLAN=GLANGUE
+Call AM_FCY([M:PIH0]FCY) From SUBPIH : # Chargement des paramètres
+Default File [PIH]
+Raz mkstat, GERR, GMESSAGE
+Actzo [PIH0]PIVTYP, BPR, BPRSAC
+If GPIH_FLGPAZ<>2
+  [M:PIH0]PAZ=len(mess(0,510,1)) : Diszo [PIH0]PAZ
+Else
+  [M:PIH0]PAZ=1 : Actzo [PIH0]PAZ
+Endif
+If GPIHACCDAT=2 Actzo [PIH0]ACCDAT Else Diszo [PIH0]ACCDAT : Endif
+Affzo [PIH0]1-99
+If [M:PIH0]PIVTYP<>""
+  #MAE, ajout LEG
+  Call LEC_TPV_LEG(GCURLEG,[M:PIH0]PIVTYP,RET) From TRTLECLEG
+  #Read [TPV] TPV0=[M:PIH0]PIVTYP
+  If !RET Call AM_PIVTYP([M:PIH0]PIVTYP) From SUBPIH : Endif
+Endif
+#----- Ecran PIH1 -----#
+Actzo [PIH1]1-99
+[M:PIH1]BPRDAT=[M:PIH0]ACCDAT
+#----- Ecran PIH3 -----#
+Actzo [PIH3]1-99
+[M:PIH3]PCLFLG=2 : # Indicateur préchargement à "OUI"
+If !GIMPORT
+ Affzo [PIH3]CUMLINAMT1
+Endif
+#-----
+Gosub GRIZO_ARG
+#----- Ecran PIH4 -----#
+Actzo [PIH4]1-99
+Actzo [PIH4]TOTTAXAMT, DIFTAXAMT : Diszo [PIH4]AMTTAX
+[M:PIH4]DSPWEU=GSALDSPWEU
+[M:PIH4]DSPVOU=GSALDSPVOU
+#----- Effacement du total HT ... etc -----#
+Raz [M:PIH3]CUMLINAMT1, MONTMIN, MONTPRO
+Raz [M:PCIW], [M:PCEZ]
+Raz [M:AD66], [M:AD67] : # Effacement des masques adresses facture et règlement
+#----- Gestion des textes -----#
+Call RAZ_CLOB From ACLOB : GCONSDIA=0 : # Rend saisissable le texte
+Raz [M:PIH0]TEX1, [M:PIH0]TEX2, [M:PIH3]LINTEX
+If !GIMPORT  Call RESET_IMAGE(4) From GESECRAN : Endif
+#----- affectation des infos du fournisseur ------#
+If [M:PIH0]BPR <> ""
+    VALEUR = [M:PIH0]BPR
+    Read [F:BPR]BPR0 = VALEUR
+    Call AM_BPR(VALEUR) From SUBPIH
+Endif
+#----- Mise à jour des listes de gauche picking -----#
+If !GIMPORT Gosub TIROIR : Endif
+
+#Enable 1099 controls depending on record                                      #1099.n
+If GS1099 Call SUB_GRIZE_LIENS("PIH1") From TEN99LIB : Endif #1099.n pass screen if one
+
+# Issue 71069 - 2013-08-26 by MUARN : PJT
+# A faire apres tout le reste
+If GPJTSNGDOC = G_OUI Then
+ Call PJT_MODFCY([M:PIH0]FCY,"[M:PIH3]PJT") From TRTPJT
+Endif
+
+#RMA * 85785
+If dim([M:PIH0]ORIDOCNUM) > 0
+  Chgfmt [M:PIH0]ORIDOCNUM With "-K:30X"
+Endif
+
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#If func AFNC.ACTIV("KSW")>0
+#  Gosub RAZCRE_PIH From SWIQRCLIB2 # angre X3-90379 QR-Code Swiss
+#Endif
+Return
+
+$RAZDUP
+#----------- Duplication désactivée !! -----------#
+# Effacement entête : No FAC, indicateurs à "NON" #
+# Effacement champs ligne : Indicateurs           #
+#-------------------------------------------------#
+Local Shortint I
+# Issue 71069 - 2013-08-26 by MUARN : pjt
+If GPJTSNGDOC = G_NON Then
+ Call PJT_MODFCY([M:PIH0]FCY,"[M:PIH3]PJT") From TRTPJT
+Endif
+
+# Issue 71069 - 2013-08-26 by MUARN :PJT
+# Code affaire à la ligne (Partie : rajout paramètre société pour contrôle documents mono-affaire)
+#--Duplication avec paramètre à OUI => si le code affaire de la ligne est <> de celui de l'en-tête, on reprend l'en-tête
+Call TRAITE_DUPLICATION("[M:PIH1]PJTH") From TRTPJT
+
+Raz [M:PIH0]NUM, [M:PIH0]LIBPAZ, MONTMIN, MONTPRO
+If GPIH_FLGPAZ<>2
+  [M:PIH0]PAZ=len(mess(0,510,1)) : Diszo [PIH0]PAZ
+Else
+  [M:PIH0]PAZ=1 : Actzo [PIH0]PAZ
+Endif
+[M:PIH1]STA=1
+#----- Gestion des textes entête et pied -----#
+Call RAZ_CLOB From ACLOB : GCONSDIA=0 : # Rend saisissable le texte
+If left$([M:PIH0]TEX1,3)="PIV"
+  Call DUP_CLOB("PIV",[M:PIH0]TEX1,WRET) From TRTX3TEX
+  If WRET<1  Raz [M:PIH0]TEX1 : Endif
+Endif
+If left$([M:PIH0]TEX2,3)="PIV"
+  Call DUP_CLOB("PIV",[M:PIH0]TEX2,WRET) From TRTX3TEX
+  If WRET<1  Raz [M:PIH0]TEX2 : Endif
+Endif
+#-----
+For I=0 To [M:PIH3]NBLIG-1
+    Raz [M:PIH3]CREFLG(I), [M:PIH3]UPDFLG(I)
+    Raz [M:PIH3]FASREF(I)
+    #----- Gestion des textes ligne -----#
+    If left$([M:PIH3]LINTEX(I),3)="PID"
+      Call DUP_CLOB("PID",[M:PIH3]LINTEX(I),WRET) From TRTX3TEX
+      If WRET<1  Raz [M:PIH3]LINTEX(I) : Endif
+    Endif
+Next I
+Actzo [PIH1]BPRPAY, STRDUDDAT, INVNUM, TOTTAXAMT1
+Actzo [PIH4]TOTTAXAMT, DIFTAXAMT
+Raz [M:PCIW]
+#----- Mise à jour des listes de gauche picking -----#
+If !GIMPORT Gosub TIROIR : Endif
+
+#Enable 1099 controls depending on record                                      #1099.n
+If GS1099 Call SUB_GRIZE_LIENS("PIH1") From TEN99LIB : Endif #1099.n pass screen if one
+
+Call NTSDUP([M:PIH0]BPR,"BPSNUM") From TRTNTSCTL   # supplier notes
+
+# Issue 71069 - 2013-08-26 by MUARN : PJT
+# A faire apres tout le reste
+If GPJTSNGDOC = G_OUI Then
+ Call PJT_MODFCY([M:PIH0]FCY,"[M:PIH3]PJT") From TRTPJT
+Endif
+
+# SAM 101378: Localization Switzerland, 2016-01-19 Bader
+If func AFNC.ACTIV("KSW")>0
+  Gosub RAZDUP_PIH From SWIBVRLIB4
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#  Gosub RAZDUP_PIH From SWIQRCLIB2 # angre X3-90379 QR-Code Swiss
+Endif
+# SAM 101378 END
+Return
+
+$LIENS
+#--------------------------------------------#
+# Chargement GFCY : Site de la facture       #
+#            GCUR : Devise facture           #
+# Récupération des paramètres ACHATS, BUDGET #
+#--------------------------------------------#
+# Issue 89573 - 2013-04-24 by MUARN : apres création d'une facture raz des tables
+Raz [F:PTH], [F:PTD], [F:POH], [F:POQ], [F:POP], [F:PIHB]
+# Issue 71253 - 2012-05-15 by SR : Localisation portugaise et espagnole
+#----- Relecture transaction si nécessaire -----#
+If [F:PTR]PTRTYP<>8 | [F:PTR]PTRNUM<>GPTRNUM
+      Read [PTR] PTR0=8;GPTRNUM : If fstat Raz [F:PTR] : Endif
+Endif
+If GFCY<>[F:PIH]FCY GFCY=[F:PIH]FCY
+   Gosub CHARG_PARAM
+Else
+   If dim([M:PIH3]DCLEECNUM) > 0
+      Gosub CHARG_FMTPOR From SUBPIHC
+   Endif
+Endif
+GCUR=[F:PIH]CUR
+[M:PIH3]WCUR =GCUR
+[M:PIH4]CUR2 =GCUR
+#----- Chargement des sections analytiques entête -----#
+If dim([M:PIH1]NBAXE)>0
+  Call CHARG_CCEH("PIH1","NBAXE","PIH") From TRTX3CPT
+Endif
+#--------------------------------------------------------------------#
+# Lecture PINVOICEV  complément entête facture et chargement écran   #
+# Lecture BPSUPPLIER avec chargement libellés/formats colonnes tarif #
+# Lecture BPARTNER et chargement 1ère date d'échéance                #
+#--------------------------------------------------------------------#
+If GIMPORT
+  If clalev([F:PIVZ])=0 Local File PINVOICEV [PIVZ] : Endif
+  [F:PIVZ]=[F:PIV] : # Sauvegarde buffer PIV en import
+Endif
+Read [PIV] PIV0=[M:PIH0]NUM
+If fstat Raz [F:PIV]
+         GOK=0 :  Call RSTA("PIV",[M:PIH0]NUM) From GLOCK   : Return
+Endif
+[M:PIH0]=[F:PIV] : [M:PIH1]=[F:PIV] : [M:PIH3]=[F:PIV] : [M:PIH4]=[F:PIV]
+# Issue 71253 - 2012-05-11 by SR : Localisation Espagnole avant la lecure du fournisseur
+If dim([M:PIH1]SPACUSNAM) > 0 :
+  Read [F:BPS]BPS0 = [M:PIH1]SPACUSBPR
+  If !fstat :  [M:PIH1]SPACUSNAM = [F:BPS]BPSSHO : Endif
+Endif
+If [F:BPS]BPSNUM<>[M:PIH0]BPR
+   Read [BPS] BPS0=[M:PIH0]BPR
+   If fstat Raz [F:BPS]
+            GOK=0 : Call RSTA("BPS",[M:PIH0]BPR) From GLOCK : Return
+   Endif
+   Call COLREM("C",2,[F:BPS]PLISTC) From TRTPRICE
+   Call TYPREM(2,[F:BPS]PLISTC)     From TRTPRICE
+Endif
+If GPLISTC<>[F:BPS]PLISTC
+   GPLISTC=[F:BPS]PLISTC : Call TARIFCHGT(6) From TRTPRICE  : Endif
+Call FMTREM("PIH3",GCUR)            From TRTPRICE
+If [F:BPR]BPRNUM<>[M:PIH0]BPR
+   Read [BPR] BPR0=[M:PIH0]BPR
+   If fstat Raz [F:BPR]
+            GOK=0 : Call RSTA("BPR",[M:PIH0]BPR) From GLOCK : Return
+   Endif
+Endif
+If GACTDEB=2
+  If [F:TCY]CRY<>[F:BPR]CRY
+    Read [TCY] TCY0=[F:BPR]CRY : If fstat Raz [F:TCY] : Endif
+  Endif
+  If GPIH_CPYCRY<>[F:BPR]CRY & [F:TCY]EECFLG=2
+    GPIH_EECFLG=2
+  Else
+    GPIH_EECFLG=1
+  Endif
+Else
+  GPIH_EECFLG=0
+Endif
+# Issue 82113 - 2012-05-25 by MUARN : mise à jour champ bon à payer pour tous types facture
+#If [F:PIH]PIHTYP<3 Call FIRST_DUD(0) From SUBPIHC : Endif
+Call FIRST_DUD(0) From SUBPIHC
+#--------------------------------------------------------------------------#
+# Chargement zones à partir des fichiers PINVOICE [PIH] et PINVOICEV [PIV] #
+#--------------------------------------------------------------------------#
+[M:PIH0]BPRNAM1   =[F:PIH]BPRNAM(0) : [M:PIH4]NBTAX     =[F:PIH]NBRTAX
+[M:PIH1]TOTLINAMT1=[F:PIV]TOTLINAMT : [M:PIH1]TOTTAXAMT1=[F:PIV]TOTTAXAMT
+#----- Chargement du type de régime taxe -----#
+# 71937 : Multilégislation
+#If [F:ADI]NUMTAB<>1 | [F:ADI]CODE<>[F:PIH]VAC
+#  Read [ADI] CODE=1;[F:PIH]VAC : If fstat Raz [F:ADI] : Endif
+#Endif
+#[M:PIH1]VACTYP=[F:ADI]N1
+If !clalev([F:TVB]) Local File TABVACBPR [TVB] Endif
+Local Integer GRET
+Call LEC_TVB_LEG(GCURLEG,[M:PIH1]VAC,GRET) From TRTLECLEG
+If GRET Raz [F:TVB] : Endif
+[M:PIH1]VACTYP=[F:TVB]REGVAC
+# 71937 : Multilégislation
+#-----
+If [M:PIH4]NBTAX>0
+  Local Shortint I
+  For I=0 To [M:PIH4]NBTAX-1
+  #--CPO 71937 TVT et multi-lèg
+    #Read [TVT] TVT0=[M:PIH4]TAX(I) : If fstat Raz [F:TVT] : Endif
+    Call LEC_TVT_LEG(GCURLEG,[M:PIH4]TAX(I),GRET) From TRTLECLEG
+    If GRET : Raz [F:TVT] Endif
+    #--/CPO
+    Call GET_ATEXTRA("TABVAT","SHOAXX",GLANGUE,[M:PIH4]LIBTAX(I)) From TRTX3TEX
+  Next I
+Endif
+#----- Chargement des éléments de facturation et des taxes -----#
+Call CHARG_ELEMENTS (8,[M:PIH0]NUM,"PIH4") From TRTACHELT1
+Call CHARG_TAXES    (8,[M:PIH0]NUM,"PIH4") From TRTACHELT1
+#----- Affichage entêtes de colonne variables -----#
+If !clalev([F:ADL])  Gosub AFF_TITCOL : Endif
+#----- Activation ou désactivation de certains champs -----#
+If [M:PIH1]STA=3
+  Diszo [PIH0]FCY, PIVTYP, ACCDAT, BPR, BPRSAC, PAZ
+  Diszo [PIH1]1-99
+  If dim([M:PIH1]STRDATSVC)>0 & !GLOCITAPRE  Actzo [PIH1]STRDATSVC, ENDDATSVC : Endif
+  Actzo [PIH1]DES
+  # Issue 71253 - 2012-05-15 by SR : Localisation portugaise et espagnole
+  If [F:PTR]SPTVACOD = 1
+     If func AFNC.ACTIV("KSP")
+       Actzo [M:PIH1]SPACUSDAT,SPACUS,SPACUSBPR
+     Endif
+  Endif
+  If dim([M:PIH1]STRDATSVC)>0 & !GLOCITAPRE
+    Actzo [PIH3]1-99
+  Else
+    Diszo [PIH3]1-99
+  Endif
+  Diszo [PIH4]5-10, TOTTAXAMT, TOTLINAMT
+Else
+  Actzo [PIH0]BPRSAC
+  Actzo [PIH1]1-99
+  If [M:PIH0]SIHNUM<>""
+    Diszo [PIH1]BPRVCR
+    If GLOCARGNUM & dim([M:PIH1]TYPVCR)>0
+      Diszo [PIH1]TYPVCR, CLSVCR, SCUVCR, SEQVCR
+    Endif
+  Else
+    Actzo [PIH1]BPRVCR
+    If dim([M:PIH1]TYPVCR)>0
+      If GLOCARGNUM
+        If [M:PIH1]TYPVCR+[M:PIH1]CLSVCR+[M:PIH1]SCUVCR+[M:PIH1]SEQVCR<>""
+          Diszo [PIH1]BPRVCR
+        Endif
+      Else
+        Grizo [PIH1]TYPVCR, CLSVCR, SCUVCR, SEQVCR
+      Endif
+    Endif
+  Endif
+  Actzo [PIH1]BPRDAT, INVREF, DES
+  Actzo [PIH1]STRDUDDAT, DEP, INVDTA1, INVDTAAMT1, TOTLINAMT1, STA
+  If dim([M:PIH1]STRDATSVC)>0 & !GLOCITAPRE  Actzo [PIH1]STRDATSVC, ENDDATSVC : Endif
+  If dim([M:PIH1]DAS2)>0
+    If [F:BPS]DADFLG=2
+      Actzo [PIH1]DAS2
+    Else
+      Diszo [PIH1]DAS2
+    Endif
+  Endif
+  Diszo [PIH0]FCY, PIVTYP, BPR
+  Actzo [PIH1]CUR
+  If [M:PIH1]CUR<>GLOCALDEV
+    Actzo [PIH1]CURTYP
+  Else
+    Diszo [PIH1]CURTYP
+  Endif
+  Actzo [PIH1]VAC
+  #-----
+  If dim([M:PIH3]CAI)>0
+    If GLOCARGNUM
+      Actzo [PIH3]2
+    Else
+      Grizo [PIH3]2
+    Endif
+  Endif
+  # Issue 82703 - 2013-02-04 by SR : FCC
+  Actzo [PIH3]3-99
+  #-----
+  Actzo [PIH4]5-10, TOTTAXAMT, TOTLINAMT
+  If GPIH_FLGPAZ<>2
+    Diszo [PIH0]PAZ
+  Else
+    If [M:PIH0]PIHTYP<3
+      If clalev([F:AUS])<=0 Local File AUTILIS [AUS] : Endif
+      If [F:AUS]USR<>GUSER
+        Read [AUS]CODUSR=GUSER :  If fstat Raz [F:AUS] : Endif
+      Endif
+      #----- Pas de saisie si une seule valeur possible -----#
+      Call PARAMUTIL("NIVBONPAYE",GBIDC3,"",GFCY) From SUBAUS
+      If val(GBIDC3)<1  GBIDC3="1" : Endif
+      If val(GBIDC3)=1  Diszo [PIH0]PAZ Else Actzo [PIH0]PAZ : Endif
+    Else
+      #----- Si avoir toutes les valeurs sont permises -----#
+      Actzo [PIH0]PAZ
+    Endif
+  Endif
+  If GPIHACCDAT=2 Actzo [PIH0]ACCDAT Else Diszo [PIH0]ACCDAT : Endif
+  If [F:PIH]PIHTYP=3 Diszo [PIH1]INVNUM Else Grizo [PIH1]INVNUM : Endif
+  Actzo [PIH1]PTE
+  If dim([M:PIH1]ZPTE)>0 Actzo [PIH1]ZPTE : Endif
+Endif
+If [M:PIH1]VACTYP=4
+  Raz [M:PIH1]TOTTAXAMT1, [M:PIH4]TOTTAXAMT, [M:PIH4]DIFTAXAMT
+  Grizo [PIH1]TOTTAXAMT1 : Grizo [PIH4]TOTTAXAMT, DIFTAXAMT
+Elsif [M:PIH1]STA<3
+  Actzo [PIH1]TOTTAXAMT1 : Actzo [PIH4]TOTTAXAMT, DIFTAXAMT
+Endif
+#----- Lectures des échéances et chargement de MONTMIN et MONTPRO -----#
+Call INFOECHE(2,[F:PIH]NUM,MONTMIN,MONTPRO) From SUBBIH
+If [M:PIH1]STA<3
+  If MONTPRO=0 Actzo [PIH1]BPRPAY Else Diszo [PIH1]BPRPAY : Endif
+Endif
+#----- Effacement des critères de sélection (filtre picking) -----#
+Raz [M:PCIW]
+#----- Chargement des informations douanières -----#
+[M:PCEZ]=[F:PIH]
+[M:PCEZ]WPOSCOD=[F:PIH]POSCOD
+[M:PCEZ]WBPSNUM=[F:PIH]BPR
+[M:PCEZ]WBPAADD=[F:PIH]BPAINV
+[M:PCEZ]WCRY   =[F:PIH]CRY
+#-----
+[M:PIH1]EECICT2=[F:PIH]EECICT
+[M:PIH1]ICTCTY2=[F:PIH]ICTCTY
+#----- Chargement des zones cours devise -----#
+If [F:PIH]RATDAT=[0/0/0]
+  If GPIHCURDAT<>2
+    [F:PIH]RATDAT=[F:PIH]ACCDAT : [M:PIH1]RATDAT=[M:PIH0]ACCDAT
+  Else
+    [F:PIH]RATDAT=[F:PIH]BPRDAT : [M:PIH1]RATDAT=[M:PIH1]BPRDAT
+  Endif
+Endif
+Call CHARG_RATCUR("PIH1","PIH") From TRTX3CPT
+#-----
+If [M:PIH1]STA=3
+  Diszo [PIH1]RAT1, RAT2
+Endif
+#----- Chargement de la classe [M:AD66] zones adresse fournisseur facturant -----#
+If [F:PIH]CRY<>"" | [F:PIH]CTY<>""
+  [M:AD66]       = [F:PIH]
+  [M:AD66]ADBBPR = [F:PIH]BPR
+  [M:AD66]BPAADD = [F:PIH]BPAINV
+  [M:AD66]ADBFLG = 2
+Else
+  Raz [M:AD66]
+  [M:AD66]BPAADD = [F:PIH]BPAINV
+  [M:AD66]ADBBPR = [F:PIH]BPR
+Endif
+#----- Chargement de la classe [M:AD67] zones adresse fournisseur payé -----#
+If [F:PIH]BPYCRY<>"" | [F:PIH]BPYCTY<>""
+  [M:AD67]BPAADD      = [F:PIH]BPAPAY
+  [M:AD67]BPRNAM(0)   = [F:PIH]BPYNAM(0)
+  [M:AD67]BPRNAM(1)   = [F:PIH]BPYNAM(1)
+  [M:AD67]BPAADDLIG(0)= [F:PIH]BPYADDLIG(0)
+  [M:AD67]BPAADDLIG(1)= [F:PIH]BPYADDLIG(1)
+  [M:AD67]BPAADDLIG(2)= [F:PIH]BPYADDLIG(2)
+  [M:AD67]CRY         = [F:PIH]BPYCRY
+  [M:AD67]CRYNAM      = [F:PIH]BPYCRYNAM
+  [M:AD67]SAT         = [F:PIH]BPYSAT
+  [M:AD67]POSCOD      = [F:PIH]BPYPOSCOD
+  [M:AD67]CTY         = [F:PIH]BPYCTY
+  [M:AD67]ADBBPR      = [F:PIH]BPRPAY
+  [M:AD67]ADBFLG      = 2
+Else
+  Raz [M:AD67]
+  [M:AD67]BPAADD = [F:PIH]BPAPAY
+  [M:AD67]ADBBPR = [F:PIH]BPRPAY
+Endif
+# Issue 87705 - 2013-02-15 by SR
+[M:PIH1]MODADR = 1
+#-----------------------#
+# Chargement des lignes #
+#-----------------------#
+Raz [M:PIH3]CUMLINAMT1
+
+
+Gosub LIENS From TABLEAUX
+
+# Issue 71069 - 2013-08-26 by MUARN : pjt
+If GPJTSNGDOC = G_NON Then
+ Call PJT_MODFCY([M:PIH0]FCY,"[M:PIH3]PJT") From TRTPJT
+Endif
+
+#-----
+If GFONC1="GESPIH"  Call RAZ_CLOB From ACLOB : Endif
+If [M:PIH1]STA=3  GCONSDIA=2 Else GCONSDIA=0 : Endif
+#----- Affichage icone texte -----#
+If !GIMPORT
+  If ([M:PIH0]TEX1<>"" | [M:PIH0]TEX2<>"")
+    Call SET_IMAGE(4)   From GESECRAN
+  Else
+    Call RESET_IMAGE(4) From GESECRAN
+  Endif
+Endif
+#----- Restitution du buffer PIV en import -----#
+If GIMPORT
+  [F:PIV]=[F:PIVZ] : Close Local File [PIVZ]
+Elsif !clalev([F:ADL])
+  #----- Mise à jour des listes de gauche picking -----#
+  Gosub TIROIR
+Endif
+
+#1099.sn
+#Display 1099 fields depending on Site>company
+If func AFNC.ACTIV("FEE") Call SHOWHIDE_DAS1099("PIH1")  From TEN99LIB : Endif
+
+#Enable 1099 controls depending on record
+If GS1099 Call SUB_GRIZE_LIENS("PIH1") From TEN99LIB : Endif
+#1099.en
+
+#Localisation Belge --str
+If  func AFNC.ACTIV("KBE")
+  Call LEC_TPV_LEG(GCURLEG,[F:PIH]PIVTYP,RET) From TRTLECLEG
+  #Read [TPV]TPV0=[F:PIH]PIVTYP : If fstat : Raz [F:TPV] : Endif
+  #if fstat=0
+  If RET=0
+    If !GIMPORT
+      If [F:TPV]INVTYP=5
+        Call DISPLAY_VCS("PIH1","",3,-1)  From INVVCSLIB :#--hide VCS field
+      Else
+        Call DISPLAY_VCS("PIH1",[F:BPR]CRY,[F:PIH]STA,0)  From INVVCSLIB
+      Endif
+    Else
+      If ([F:TPV]INVTYP=5) or ([F:BPR]CRY<>"BE")
+          Diszo [M:PIH1]BELVCS
+      Else
+          Actzo [M:PIH1]BELVCS
+      Endif
+    Endif
+  Else
+    Call DISPLAY_VCS("PIH1","",3,1)  From INVVCSLIB
+    Diszo [M:PIH1]BELVCS
+  Endif
+Endif
+#Localisation Belge --end
+
+# Issue 83026 - 2012-08-02 by MUARN : early discount
+Call DISPLAY_BASDEP From SUBPIHC
+
+# Issue 84130 - 2013-01-21 by MUARN : landed cost - onglet cout du document
+If GFONCTION = "GESPIH" & [M:PIH0]PIHTYP=1 & !GIMPORT
+  Local Decimal WCOURS : WCOURS = 1
+  If [M:PIH1]RAT1<>0  WCOURS=[M:PIH1]RAT2/[M:PIH1]RAT1 : Endif
+  Call CSTDOC("PIH3","PIH4", [M:PIH0]NUM, 17, WCOURS) From STCLIB
+Endif
+
+# Issue 71069 - 2013-08-26 by MUARN : PJT
+# A faire apres tout le reste
+If GPJTSNGDOC = G_OUI Then
+ Call PJT_MODFCY([M:PIH0]FCY,"[M:PIH3]PJT") From TRTPJT
+Endif
+
+Call FLD4041DIS([M:PIH1]VAC, [M:PIH0]PIVTYP) From SUBPIHD
+
+If dim([M:PIH0]ORIDOCNUM) > 0
+  Call SHOW_HIDE_PORIDOCNUM([M:PIH0]FCY,[M:PIH0]PIVTYP,"PIH0") From PORLEGLIB
+Endif
+
+If func AFNC.ACTIV("KSW")>0
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#  Gosub LIENS_QRC From SWIQRCLIB2 # Bader X3-90379 QR-Code Swiss
+Endif
+Return
+
+$VERIF_CRE
+#--------------------------#
+# Vérification en création #
+#--------------------------#
+Gosub VERIF
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+#----- Saisie adresse fournisseur divers si nécessaire -----#
+If OK=1 & BOUT="C" & [M:AD66]ADBFLG<>2
+  If [F:BPS]BPSNUM<>[M:PIH0]BPR
+    Read [BPS] BPS0=[M:PIH0]BPR : If fstat  Raz [F:BPS] : Endif
+  Endif
+  If [F:BPS]BPSTYP=3
+    Local Char SAVACT(GLONACT) : SAVACT=GACTION
+    Local Char VALBOUT(250) , PARBOUT(250)(1..20)
+    PARBOUT(1) = [M:PIH0]BPR
+    PARBOUT(2) = "AD66"
+    PARBOUT(3) = "0"
+    PARBOUT(4) = "248"
+    PARBOUT(5) = "195"
+    GACTION = "SAIADRBPR"
+    Call SAISIE_CHAR(VALBOUT,PARBOUT,"IADB","TRTX3","XWIADB") From GSAISIE
+    [M:PIH0]BPRNAM1=[M:AD66]BPRNAM(0)
+    If !GIMPORT  Affzo [PIH0]BPRNAM1 : Endif
+    Raz mkstat
+    #----- Recopie adresse fournisseur facturant divers pour fournisseur payé -----#
+    If [M:PIH1]BPRPAY=[M:PIH0]BPR & [M:AD67]ADBFLG<>2
+      [M:AD67]=[M:AD66]
+    Endif
+    GACTION=SAVACT
+  Endif
+Endif
+Gosub PIH_VERIF_CRE From TWMLIB  # Three way matching
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+Gosub VERIF From TEN99LIB    # 1099.n
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+
+#RMA 85785
+If func PORLEGLIB.DIGSIGNPIH([M:PIH0]FCY, "", [M:PIH0]PIVTYP)
+  If !clalev([F:BPS]) : Local File BPSUPPLIER [BPS] : Endif
+  If [F:BPS]BPSNUM <> [M:PIH0]BPR
+      Read [F:BPS]BPS0=VALEUR
+      If fstat : Raz [F:BPS] : Endif
+  Endif
+  If [F:BPS]AUTINVCOD = ""
+    GMESSAGE = mess(82,7711,1)
+    GERR = 1 : OK = 0
+  Endif
+Endif
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+
+If func AFNC.ACTIV("KPO")>0
+  If func PORLEGLIB.CTLDOCTYP([M:PIH0]PIVTYP,"PIV",GMESSAGE) = 1
+    OK = 0 : GERR = 1 : Return
+  Endif
+Endif
+
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+
+Return
+
+$INICRE
+#---------------------------#
+# Chargement avant le Write #
+#---------------------------#
+Raz [F:PIV] : # Effacement entête complément avant le chargement
+#-----
+Local Shortint OUVFICFLG
+Local Integer  STAT,RET
+Local Char     PIECE(GLONGTE), TRANSAC(max(GLONGAU,10)), JOURNAL(GLONJOU), CLEFIC(GLONGTE)
+[F:PIH]ORIMOD=6 : [F:PIH]CPY=GSOCIETE
+# Issue 109608 - 2015-07-23 by SR : ajouter l'abréviation table devant SNS
+If [M:PIH0]PIHTYP<3 [F:PIH]INVTYP=1 : [F:PIH]SNS=+1
+               Else [F:PIH]INVTYP=2 : [F:PIH]SNS=-1 : Endif
+
+# Issue 89349- 2013-10-29 by SR : Déplacé dans SUBPIHD
+Gosub CHARGENTETE From SUBPIHD : Gosub CHARGENTBIS From SUBPIHD
+#----- Initialisation des régimes et natures CEE -----#
+#----- si un type de flux est défini pour les facts/avoirs achats, il donnera le Régime et la Nature CEE
+#----- sinon ces informations seront reprises des pièces d'origine
+If GACTDEB=2 & GPIH_EECFLG=2 & [F:PIH]EECNAT="" & [F:PIH]EECSCH=""
+  Call INICRE_EEC("PIH",GBIDI2,[F:PIH]EECNAT,[F:PIH]EECSCH,GBIDI3,GBIDC2,GBIDC3) From FUNDEBA
+Endif
+#----- Ouverture des fichiers si nécessaire -----#
+If clalev([F:GAU]) =0  Local File GAUTACE   [GAU]  : OUVFICFLG+=1  : Endif
+If clalev([F:GAG]) =0  Local File GAUTACEF  [GAG]  : OUVFICFLG+=2  : Endif
+If clalev([F:PIHB])=0  Local File PINVOICE  [PIHB] : OUVFICFLG+=4  : Endif
+If clalev([F:ANM]) =0  Local File ACODNUM   [ANM]  : OUVFICFLG+=8  : Endif
+If GMODU(2)=2 : # Si le module compta est présent !
+  If clalev([F:JOU])=0 Local File GJOURNAL  [JOU]  : OUVFICFLG+=16 : Endif
+Endif
+#--- Récupération code pièce auto dans le paramétrage type facture utilisateur ---#
+#MAE, ajout LEG
+Call LEC_TPV_LEG(GCURLEG,[F:PIH]PIVTYP,RET) From TRTLECLEG
+#Read [TPV]TPV0=[F:PIH]PIVTYP :
+If RET Raz [F:TPV] : Endif
+If [F:TPV]COD<>""
+  TRANSAC=[F:TPV]COD
+  Read [GAU] GAU0=TRANSAC
+  If fstat Raz TRANSAC : Endif
+Endif
+#--- Chargement code pièce auto si pas renseigné dans type facture utilisateur ---#
+If TRANSAC=""
+  Case [F:PIH]INVTYP
+    When 1 : TRANSAC="PIHI"   : # Facture (Invoice)
+    When 2 : TRANSAC="PIHC"   : # Avoir (Credit note)
+             Read [GAU] GAU0=TRANSAC
+             If fstat TRANSAC="PIHI" : Endif
+  Endcase
+Endif
+#----- Evaluation du type de pièce comptable à partir de la pièce auto -----#
+If [F:PIH]GTE=""
+  Call EVALAUTO(TRANSAC,"GTE",PIECE) From SUBPIHA
+Else
+  Raz PIECE
+Endif
+#----- Contrôle si le type de pièce existe et est actif -----#
+SUIZON="PIVTYP"
+If PIECE<>"" CLEFIC=PIECE Else CLEFIC=[F:PIH]GTE : Endif
+#VPO 07/02/11 71149 message un peu brutal
+If CLEFIC=""
+  GOK=0 : Raz [F:GTE] : GMESSAGE=mess(27,110,1) : GERR=1 : Goto FIN_INICRE
+Else
+#MAE, ajout LEG
+Call LEC_GTE_LEG(GCURLEG,CLEFIC,RET) From TRTLECLEG
+#Read [GTE] GTE0=CLEFIC
+Endif
+If RET=5
+  GOK=0 : Raz [F:GTE] : GMESSAGE=CLEFIC-mess(17,114,1) : GERR=1 : Goto FIN_INICRE
+Elsif RET
+  GOK=0 : Raz [F:GTE] : Call RSTA("GTE",CLEFIC) From GLOCK : Goto FIN_INICRE
+Elsif [F:GTE]ENAFLG=1
+  GOK=0
+  Raz [F:GTE] : GMESSAGE=CLEFIC-mess(274,199,1) : GERR=1 : Goto FIN_INICRE
+Endif
+#----- Contrôle si le type de pièce est réel -----#
+If [F:GTE]VCRREA<>2
+  GOK=0 : GMESSAGE=[M:PIH0]GTE-mess(59,119,1) : GERR=1 : Goto FIN_INICRE
+Endif
+#----- Contrôle si les droits d'exécution existent -----#
+If [F:GTE]ACS<>""
+  Call CONTEXE([F:GTE]ACS) From CPTSUB
+  If mkstat
+    GOK=0 : GMESSAGE=[F:GTE]ACS-GMESSAGE : GERR=1 : Goto FIN_INICRE
+  Endif
+Endif
+#----- Contrôle date comptable par rapport aux dates bornes du type de pièce -----#
+If CLEFIC<>[F:PIH]GTE
+  Call CTLVLYDAT([F:PIH]ACCDAT,[F:GTE]VLYSTR,[F:GTE]VLYEND) From CPTSUB
+  If mkstat
+    GOK=0 : GMESSAGE=[F:GTE]TYP-GMESSAGE : GERR=1 : Raz GMESSAGE
+    SUIZON="ACCDAT" : Goto FIN_INICRE
+  Endif
+  [F:PIH]GTE=CLEFIC : [M:PIH0]GTE=CLEFIC
+Endif
+#----- Récupération du compteur et code manuel à partir du type de pièce -----#
+If [F:GTE]COU<>""
+  GMANCOU=[F:GTE]MANNUM
+  GCODNUM=[F:GTE]COU
+Endif
+#----- Récupération du numéro interne -----#
+Call ACCNUM([F:PIH]ACCNUM) From SUBGAS
+#----- Le numéro de facture doit-il être saisi ? -----#
+If GMANCOU=2 & GCODNUM=""
+  GMESSAGE=mess(100,121,1) : GERR=1 : GOK=0 : Goto FIN_INICRE
+Endif
+#----- Evaluation code journal à partir de la pièce auto -----#
+JOURNAL=[F:PIH]JOU
+If JOURNAL=""
+  Call EVALAUTO(TRANSAC,"JOU",JOURNAL) From SUBPIHA
+  If JOURNAL="" JOURNAL=[F:GTE]DEFJOU : Endif
+  [F:PIH]JOU=JOURNAL : [M:PIH0]JOU=JOURNAL
+Endif
+#----- Si la table GJOURNAL est ouverte (module compta présent) -----#
+If clalev([F:JOU])
+  #----- Contrôle si le journal existe et est actif -----#
+  If JOURNAL<>[F:JOU]JOU
+    #MAE, ajout LEG
+    Call LEC_JOU_LEG(GCURLEG,JOURNAL,RET) From TRTLECLEG
+    If RET
+    #Read [JOU] JOU0=JOURNAL
+    #If fstat
+      Raz [F:JOU] : GOK=0 : Call RSTA("JOU",JOURNAL) From GLOCK : Goto FIN_INICRE
+    Elsif [F:JOU]ENAFLG=1
+      Raz [F:JOU]
+      GOK=0 : GMESSAGE=JOURNAL-mess(281,199,1) : GERR=1 : Goto FIN_INICRE
+    Endif
+  Endif
+  #----- Test si aucun journal trouvé -----#
+  If [F:JOU]JOU=""
+    GOK=0 : GMESSAGE=JOURNAL-mess(53,141,1) : GERR=1 : Goto FIN_INICRE
+  Endif
+  #----- Contrôle si les droits d'exécution existent pour le journal -----#
+  If [F:JOU]ACS<>""
+    Call CONTEXE([F:JOU]ACS) From CPTSUB
+    If mkstat
+      GOK=0 : GMESSAGE=[F:JOU]ACS-GMESSAGE : GERR=1 : Goto FIN_INICRE
+    Endif
+  Endif
+  #----- Contrôle journal sur société-site -----#
+  If [F:JOU]FCY<>""
+    Call VERSOC([F:JOU]FCY,[F:PIH]CPY,[F:PIH]FCY,[F:JOU]JOU) From CFYSUB
+    If mkstat
+      GOK=0 : SUIZON="FCY" : GERR=1 : GMESSAGE=mess(13,105,1)-GMESSAGE : Goto FIN_INICRE
+    Endif
+  Endif
+  #----- Contrôle si journal autorisé sur le type de pièce
+  If [F:GTE]AUZJOU([F:JOU]TYP-1)<>2
+    GOK=0 : GMESSAGE=[F:JOU]JOU-mess(8,106,1)-[F:GTE]TYP : GERR=1
+    Goto FIN_INICRE
+  Endif
+Endif
+
+#90370 Cash VAT SPA
+Gosub CASH_VAT
+
+#85785
+If func PORLEGLIB.DIGSIGNPIH([M:PIH0]FCY, "",[M:PIH0]PIVTYP)
+  If !clalev([F:BPS]) : Local File BPSUPPLIER [BPS] : Endif
+  If [F:BPS]BPSNUM <> [M:PIH0]BPR
+    Read [F:BPS]BPSNUM = [M:PIH0]BPR
+    If fstat : Raz [F:BPS] : Endif
+  Endif
+  [L]ANMCOMP = [F:BPS]AUTINVCOD
+Else
+  [L]ANMCOMP = JOURNAL
+Endif
+
+#----- Récupération du compteur -----#
+If GMANCOU<>2 | vireblc([M:PIH0]NUM,2)=""
+  #85785
+  #Call NUMERO(GCODNUM,GFCY,[M:PIH0]ACCDAT,JOURNAL,[M:PIH0]NUM,STAT) From SUBANM
+  Call NUMERO(GCODNUM,GFCY,[M:PIH0]ACCDAT,ANMCOMP,[M:PIH0]NUM,STAT) From SUBANM
+  If GOK<0
+    Goto FIN_INICRE
+  Elsif GOK<1 | STAT<>0
+    #--CPO  68322/59141
+    #GOK=0 : GERR=1 : GMESSAGE=GCODNUM-mess(60,199,1)
+    Local Char MESSA(80)
+    GMESSAGE=mess(60,199,1)-"("+GCODNUM+") : "
+    Gosub MESSAGE From SUBANM
+    GMESSAGE-=MESSA : GOK=0 : GERR=1
+    #--/CPO 68322/59141
+    Goto FIN_INICRE
+  Endif
+  [F:PIH]NUM=[M:PIH0]NUM
+
+  #85785
+  If func PORLEGLIB.DIGSIGNPIH("", [F:PIH]CPY,[M:PIH0]PIVTYP)
+    # ----------------------------------------------------------- #
+    # Digital signature                                           #
+    # ----------------------------------------------------------- #
+    If func AFNC.ACTIV("DKS")
+      Local Char DKSORIG(4) : DKSORIG = "PIH0"
+      Local Integer DKSRET : DKSRET  = 1
+      Gosub DKS_INICRE_TRIGGER From DKSLIB
+      If DKSRET = 0 | !GOK
+        Call MESSAGE(GMESSAGE) From GESECRAN
+        GOK = 0
+        Return
+      Endif
+    Endif
+    # ----------------------------------------------------------- #
+  Endif
+
+Endif
+SUIZON=""
+#----- Lecture compteur pour test si chronologie activée -----#
+If [F:ANM]CODNUM<>GCODNUM
+  Read [ANM] ANM0=GCODNUM
+  If fstat Call RSTA("ANM",GCODNUM) From GLOCK : GOK=0 : Goto FIN_INICRE : Endif
+Endif
+If [F:ANM]CTLCHR=2 Gosub CTRL_CHRONOLOGIE : Endif
+If GOK<>1  Raz [M:PIH0]NUM : Endif
+
+#--- Issue 84130 by TS : Landed cost
+# Alimentation des totaux charges achat et stock d'une ligne facture
+Gosub ALI_FCS
+#---
+
+# Issue 84130 - 2013-02-13 by MUARN : Calculer le CPR,etc... sur toutes les lignes
+Call MAJ_REPART_LIG From SUBPIHC
+
+#----- Fermeture des fichiers si nécessaire -----#
+$FIN_INICRE
+If OUVFICFLG>15 Close Local File [JOU]  : OUVFICFLG-=16 : Endif
+If OUVFICFLG>7  Close Local File [ANM]  : OUVFICFLG-=8  : Endif
+If OUVFICFLG>3  Close Local File [PIHB] : OUVFICFLG-=4  : Endif
+If OUVFICFLG>1  Close Local File [GAG]  : OUVFICFLG-=2  : Endif
+If OUVFICFLG>0  Close Local File [GAU]  : OUVFICFLG-=1  : Endif
+Default File [PIH]
+Return
+
+#------------------------------------#
+# Evaluation de la pièce automatique #
+#------------------------------------#
+Subprog EVALAUTO(TRANSAC,ZONE,VALEUR)
+Value    Char TRANSAC
+Value    Char ZONE
+Variable Char VALEUR
+Raz VALEUR
+[F:PIHB]=[F:PIH]
+Read [GAG] GAG0=TRANSAC;0;ZONE
+If !fstat
+  Local Char PROG(GLONADC)
+  PROG="WMGAU"+TRANSAC
+  Onerrgo RIEN
+  If clalev([F:TB0])=0 Local File PINVOICEV [TB0] : Endif
+  [F:TB0]=[F:PIV]
+  Gosub OUVRE From =PROG
+  Gosub LIENS From =PROG
+  [F:PIH]=[F:PIHB]
+  VALEUR=evalue([F:GAG]FORCLC)
+  Onerrgo
+Endif
+End
+$RIEN
+Resume
+
+$CTRL_CHRONOLOGIE
+#-------------------------------------------------------------------------#
+# Contrôle de la chronologie des numéros de facture par rapport aux dates #
+#-------------------------------------------------------------------------#
+Local Integer SEQ
+Local Char    NUMFAC(GLONPIH) : NUMFAC=[F:PIH]NUM
+Repeat
+  #85785
+  #Call NUMERO_PREC(GCODNUM,GFCY,[F:PIH]ACCDAT,JOURNAL,NUMFAC,SEQ,STAT) From SUBANM
+  Call NUMERO_PREC(GCODNUM,GFCY,[F:PIH]ACCDAT,[L]ANMCOMP,NUMFAC,SEQ,STAT) From SUBANM
+  If GOK<0
+    Break
+  Elsif GOK<1 | STAT<>0
+    #--CPO  68322/59141
+    #GOK=0 : GERR=1 : GMESSAGE=GCODNUM-NUMFAC-mess(60,199,1)
+    Local Char MESSA(80)
+    GMESSAGE=mess(60,199,1)-"("+GCODNUM-NUMFAC+") : "
+    Gosub MESSAGE From SUBANM
+    GMESSAGE-=MESSA : GOK=0 : GERR=1
+    #--/CPO 68322/59141
+    Break
+  Endif
+  If NUMFAC=[F:PIH]NUM  Break : Endif
+  If SEQ>=1
+    Read [PIHB] PIH0=NUMFAC
+    If !fstat
+      If [F:PIHB]ACCDAT>[F:PIH]ACCDAT
+        GOK=0 : GMESSAGE=mess(101,121,1) : GERR=1
+        SUIZON="ACCDAT"
+      Endif
+      SEQ=0
+    Endif
+  Endif
+Until SEQ<=1
+Return
+
+$CREATION
+#---------------------------------#
+# Après Write de l'entête facture #
+#---------------------------------#
+Local Decimal  WQTE, WMT, WQTEUOM, WQTE2
+#----- Ecriture du complément d'entête facture PINVOICEV [PIV] -----#
+# Issue 89349- 2013-10-29 by SR : Déplacé dans SUBPIHD
+Gosub CHARGENTBIS From SUBPIHD
+#----- Création ou duplication des textes entête et pied -----#
+Gosub CHARG_TEXT_ENTETE
+#-----
+If dim([F:PIV]CREDAT)>0 [F:PIV]CREDAT=date$  : Endif
+If dim([F:PIV]CREUSR)>0 [F:PIV]CREUSR=GUSER  : Endif
+Write [PIV]
+If fstat GOK=0 : Call FSTA("PIV") From GLOCK : Goto ERR_CREATION : Endif
+#----- Ecriture des éléments de facturation avec comptes et sections -----#
+Call ENREG_ELEMENTS(8,[M:PIH0]NUM,"PIH4","C") From TRTACHELT1
+If GOK<1  Goto ERR_CREATION : Endif
+#----- Ecriture du tableau des taxes -----#
+Call ENREG_TAXES   (8,[M:PIH0]NUM,"PIH4","C") From TRTACHELT1
+If GOK<1  Goto ERR_CREATION : Endif
+#----- Création des lignes facture -----#
+Gosub CREATION From TABLEAUX : If GOK<1 Goto ERR_CREATION : Endif
+#---------------------------------------------------------------------------#
+# Mises à jour : * Fichier "Mvts fournisseurs" BPSUPPMVT [MVS] (Facturant)  #
+#                  "Facturé non comptabilisé" et "Date dernière facture"    #
+#                * Fichier "Entête commande"   PORDER    [POH]              #
+#                  "Mts facturés des éléments de facturation"               #
+#---------------------------------------------------------------------------#
+SIGN=1 : Call MAJ_MVS_INVDTA(SIGN,0) From SUBPIHC : If GOK<1 Goto ERR_CREATION : Endif
+#----- Mise à jour statistiques entête facture -----#
+SIGN=1 : Call VALSTA("PIH",SIGN)     From SUBPS2  : If GOK<1 Goto ERR_CREATION : Endif
+#----- Création des échéances initiales de la facture -----#
+If [F:PIH]STA<3
+  Call CREECHE(2,1,1,[F:PIH]PAZ) From SUBBIH : If GOK<1 Goto ERR_CREATION : Endif
+  #----- Point d'entrée CALECHE, permet d'intervenir sur les échéances créées -----#
+  GPOINT="CALECHE" : Gosub ENTREE From EXEFNC
+  If GOK<1  Goto ERR_CREATION : Endif
+  #-----
+  If [F:PIH]PIHTYP=1
+    Call TRT_ACOMPTES(1,1,[F:PIH]AMTATI) From SUBPIHC : # Affectation des acomptes
+    If GOK<1 Goto ERR_CREATION : Endif
+  Endif
+  If [F:PIH]PIHTYP<3
+    Call FIRST_DUD(1) From SUBPIHC
+  Endif
+Endif
+
+#----- Màj entête facture vente si inter-société -----#
+If GMODU(5)=2 & [M:PIH0]BETCPY=2 & [M:PIH0]SIHNUM<>""
+  Unlock="SIV"+[M:PIH0]SIHNUM
+  Update [SIV] Where NUM=[M:PIH0]SIHNUM
+&              With  PIHNUM=[F:PIH]NUM
+  If fstat  GOK=0 : Call FSTA("SIV") From GLOCK : Goto ERR_CREATION : Endif
+Endif
+#----- Autres mise à jour ? -----#
+
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#If func AFNC.ACTIV("KSW")>0
+#  Gosub CREATION_PIH_QRC From SWIQRCLIB2 # Bader X3-90379 QR-Code Swiss
+#Endif
+Return
+$ERR_CREATION
+Raz [M:PIH0]NUM : Return
+
+$APRES_CRE
+#-----------------------------#
+# Affichage numéro de facture #
+#-----------------------------#
+# GMESSAGE=mess(40,107,1)-[M:PIH0]NUM : GERR=2
+If !GIMPORT  Affzo [PIH0]NUM : Endif
+#----- Impression contrôle facture -----#
+If [F:PTR]PTRTYP<>8 | [F:PTR]PTRNUM<>GPTRNUM : # Relecture transaction si nécessaire
+   Read [PTR] PTR0=8;GPTRNUM : If fstat Raz [F:PTR] : Endif
+Endif
+
+If [F:PTR]DOCFLG=2
+   Local Char TBPAR(10)(1..50),TBVAL(30)(1..50)
+   Gosub SET_CLE From GOBJSUB : CLECUR=1 : # SET_CLE parce que création
+   Call ETAT([F:PTR]DOCNAM,"GESPIH",TBPAR,TBVAL) From ETAT
+   #----- Relecture pour maj flag imprimé -----#
+   If !GIMPORT
+     Gosub RELIT  From GOBJSUB
+   Else
+     Gosub LIENS  From SUBPIHA
+   Endif
+   Return
+#-------- Affichage icone texte --------#
+Elsif !GIMPORT
+  If ([M:PIH0]TEX1<>"" | [M:PIH0]TEX2<>"")
+    Call SET_IMAGE(4)   From GESECRAN
+  Else
+    Call RESET_IMAGE(4) From GESECRAN
+  Endif
+Endif
+#---------------------------------------#
+Raz [M:PIH3]CUMLINAMT1
+
+# Issue 84130 - 2013-04-25 by MUARN : liens de SUBPIHA au lieu de TABLEAUX
+Gosub LIENS From SUBPIHA
+
+# Issue 70985 - 2012-06-13 by MUARN : landed cost
+If !GIMPORT Affzo [M:PIH3]CPR, CPRCOE, CPRAMT, LINAMTCPR, STCNUM, CSTPUR, LINCSTPUR : Endif
+
+#----- Mise à jour des listes de gauche picking -----#
+If !GIMPORT  Gosub TIROIR : Endif
+Return
+
+$AB_CREATION
+#---------------------------------------#
+# Abandon création après erreur système #
+#---------------------------------------#
+Return
+
+$AVANT_MOD
+#-----------------------------------#
+# Après appui sur le bouton "Modif" #
+#-----------------------------------#
+If [F:PIH]NUM<>[M:PIH0]NUM
+  Read [PIH] PIH0=[M:PIH0]NUM : If fstat Raz [F:PIH] : Endif
+Endif
+#----- Il faut permettre de modifier la période de prestation -----#
+If find(COUZON,"STRDATSVC","ENDDATSVC","NBLIG","STRDAT","ENDDAT")
+  Return
+Endif
+#----- Il faut toujours permettre la modification de l'adresse et des commentaires -----#
+If find(COUZON,"BPRNAM","BPAINV","BPAADDLIG","CRY","CRYNAM","SAT","POSCOD","CTY","DES")
+  Return
+Endif
+# Issue 71253 - 2012-05-10 by SR : Localisation espagnole
+#----- Relecture transaction si nécessaire -----#
+If [F:PTR]PTRTYP<>8 | [F:PTR]PTRNUM<>GPTRNUM
+    Read [PTR] PTR0=8;GPTRNUM : If fstat Raz [F:PTR] : Endif
+Endif
+If [F:PTR]SPTVACOD = 1
+   If func AFNC.ACTIV("KSP")
+       If find(COUZON,"SPACUSDAT","SPACUS","SPACUSBPR")
+        Return
+       Endif
+   Endif
+Endif
+#----- Facture validée, modification ou suppression interdite !
+If [F:PIH]STA=3
+  #----- Ne pas sortir le message après un tunnel sur le champ grisé du fournisseur -----#
+  If COUZON="NBFAC1" & status=75  OK=0 : Return : Endif
+  GMESSAGE=mess(155,194,1) : GERR=1 : OK=0 : Return
+Endif
+Return
+
+$VERIF_MOD
+#------------------------------#
+# Vérification en modification #
+#------------------------------#
+Gosub VERIF
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+Gosub PIH_VERIF_MOD From TWMLIB  # Three way matching
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+Gosub VERIF From TEN99LIB    # 1099.n
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+
+# Issue 110704 US5 - 2016-01-08 by BRBAN
+If func AFNC.ACTIV("KPO")>0
+  If func PORLEGLIB.CTLDOCTYP([M:PIH0]PIVTYP,"PIV",GMESSAGE) = 1
+    OK = 0 : GERR = 1 : Return
+  Endif
+Endif
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If OK=0 : Return : Endif
+
+Return
+
+$AVANT_MODFIC
+#--------------------------------------------------------------------------#
+# Avant chargement des nouvelles valeurs dans la classe [F:PIH]            #
+# Mises à jour : * Fichier "Mvts fournisseurs" BPSUPPMVT [MVS] (Facturant) #
+#                  "Facturé non comptabilisé"                              #
+#                * Fichier "Entête commande"   PORDER    [POH]             #
+#                  "Mts facturés des éléments de facturation"              #
+# Soustraction statistiques entête facture avant modification              #
+# Positionnement de l'indicateur MAJFAC pour la maj des échéances          #
+#--------------------------------------------------------------------------#
+Local Integer SIGN
+SIGN=-1 : Call MAJ_MVS_INVDTA(SIGN,1)   From SUBPIHC : If GOK<1 Return : Endif
+SIGN=-1 : Call VALSTA("PIH",SIGN)       From SUBPS2  : If GOK<1 Return : Endif
+#----- Test des modifications effectuées pour positionnement de MAJFAC ----#
+# Issue 87705 - 2013-02-15 by SR : Ajouter le test sur MODADR
+If [M:PIH1]STA>2
+  MAJFAC=9 : # Ne rien faire si la facture est validée !
+Elsif [M:PIH0]BPR<>[F:PIH]BPR    | [M:PIH1]BPRPAY   <>[F:PIH]BPRPAY    |
+&  [M:PIH0]BPRSAC<>[F:PIH]BPRSAC | [M:PIH1]CUR      <>[F:PIH]CUR       |
+&  [M:PIH1]PTE   <>[F:PIH]PTE    | [M:PIH1]STRDUDDAT<>[F:PIH]STRDUDDAT |
+&  [M:PIH0]FCY   <>[F:PIH]FCY    | [M:PIH0]PAZ      <>[F:PIH]PAZ       |
+&  [M:PIH1]DEP   <>[F:PIH]DEP    | [M:PIH4]AMTATI   <>[F:PIH]AMTATI    |
+&  ([M:PIH4]AMTATI<0 & [M:PIH0]PIHTYP<3) | [F:PIH]AMTATI=0 |
+&  [M:PIH1]RATMLT(0)<>[F:PIH]RATMLT(0) | [M:PIH1]RATDIV(0)<>[F:PIH]RATDIV(0) |
+&  [M:PIH1]MODADR=2
+  MAJFAC=1
+Elsif sum([M:PIH4]BASTAX)<>sum([F:PIH]BASTAX)  |
+&   find(0,[M:PIH3]CREFLG(0..[M:PIH3]NBLIG-1))
+  MAJFAC=0
+Else
+  MAJFAC=9
+Endif
+#----- Positionnement indicateur si date modifiée -----#
+If [M:PIH0]ACCDAT<>[F:PIH]ACCDAT MODDAT=1 Else MODDAT=0 : Endif
+#----- Suppression des affectations d'acompte -----#
+If [F:PIH]PIHTYP=1 & MAJFAC<>9
+  Call TRT_ACOMPTES(-1,2,[F:PIH]AMTATI) From SUBPIHC : If GOK<1 Return : Endif
+Endif
+#----- Suppression des échéances de la facture si modif rubrique majeure -----#
+If MAJFAC=1
+  If clalev([F:DUD])<=0 Local File GACCDUDATE [DUD] : Endif
+  #----- ##DBA le 23/01/03 : Historisation des échéances supprimées
+  Local Char CRITSUPPR (250)
+  CRITSUPPR="TYP='"+[F:PIH]GTE+"' & NUM='"+[F:PIH]NUM+"'"
+  Call HISTOSUPPR (CRITSUPPR) From MODECHE : If GOK<1  Return : Endif
+  Delete [DUD] Where TYP=[F:PIH]GTE & NUM=[F:PIH]NUM
+  If fstat=1  GOK=-1 : GLOCK="$GACCDUDATE"-[F:PIH]GTE-[F:PIH]NUM : Return : Endif
+Endif
+#----- Cas particulier où l'on modifie le texte en le supprimant -----#
+If [M:PIH0]TEX1="" & left$([F:PIV]TEX1,3)="PIV"
+  Call SUP_CLOB([F:PIV]TEX1,WRET) From TRTX3TEX
+Endif
+If [M:PIH0]TEX2="" & left$([F:PIV]TEX2,3)="PIV"
+  Call SUP_CLOB([F:PIV]TEX2,WRET) From TRTX3TEX
+Endif
+Return
+
+$INIMOD
+#-----------------------------#
+# Chargement avant le Rewrite #
+#-----------------------------#
+Local Shortint OUVFICFLG
+Local Char     TRANSAC(max(GLONGAU,10)), JOURNAL(GLONJOU)
+Local Integer RET
+
+# Issue 89349- 2013-10-29 by SR : Déplacé dans SUBPIHD
+Gosub CHARGENTETE From SUBPIHD
+
+#--- Issue 84130 by TS : Landed cost
+# Alimentation des totaux charges achat et stock d'une ligne facture
+Gosub ALI_FCS
+#---
+
+# Issue 84130 - 2013-02-13 by MUARN : Calculer le CPR,etc... sur toutes les lignes
+Call MAJ_REPART_LIG From SUBPIHC
+# Issue X3-39273 - 2017-08-10 by MUARN : gestion erreur
+If GOK=0 : Goto FIN_INIMOD : Endif
+
+#----- Si la date n'a pas été modifiée alors c'est fini (pas de ctrl chrono) -----#
+If MODDAT=0 Return : Endif
+#----- Ouverture des fichiers si nécessaire -----#
+If clalev([F:GAU])=0  Local File GAUTACE   [GAU]  : OUVFICFLG+=1 : Endif
+If clalev([F:GAG])=0  Local File GAUTACEF  [GAG]  : OUVFICFLG+=2 : Endif
+If clalev([F:PIHB])=0 Local File PINVOICE  [PIHB] : OUVFICFLG+=4 : Endif
+If clalev([F:ANM]) =0 Local File ACODNUM   [ANM]  : OUVFICFLG+=8 : Endif
+#----- Récupération code compteur -----#
+If [F:TCA]MODULE<>6 | [F:TCA]CPY<>GSOCIETE
+  Call LECTCA(6,OK) From SUBTCA
+  If fstat | !OK
+    Raz [F:TCA] : GOK=0 : Call RSTA("TCA","6") From GLOCK : Goto FIN_INIMOD
+  Endif
+Endif
+GMANCOU=[F:TCA]MANCOU([F:PIH]PIHTYP+6) : GCODNUM=[F:TCA]CODNUM([F:PIH]PIHTYP+6)
+If [F:GTE]TYP<>[F:PIH]GTE
+  #MAE, ajout LEG
+  Call LEC_GTE_LEG(GCURLEG,[F:PIH]GTE,RET) From TRTLECLEG
+  #Read [GTE] GTE0=[F:PIH]GTE :
+  If RET Raz [F:GTE] : Endif
+Endif
+If [F:GTE]COU<>""
+  GMANCOU=[F:GTE]MANNUM : GCODNUM=[F:GTE]COU
+Endif
+#----- Lecture compteur pour test si chronologie activée -----#
+If [F:ANM]CODNUM<>GCODNUM
+  Read [ANM] ANM0=GCODNUM
+  If fstat Call RSTA("ANM",GCODNUM) From GLOCK : GOK=0 : Goto FIN_INIMOD : Endif
+Endif
+#----- Si chronologie active, récupération code pièce auto et code journal -----#
+If [F:ANM]CTLCHR=2
+  If [F:TPV]PIVTYP<>[F:PIH]PIVTYP
+    #MAE, ajout LEG
+    Call LEC_TPV_LEG(GCURLEG,[F:PIH]PIVTYP,RET) From TRTLECLEG
+    #Read [TPV] TPV0=[F:PIH]PIVTYP :
+    If RET Raz [F:TPV] : Endif
+  Endif
+  If [F:TPV]COD<>""
+    TRANSAC=[F:TPV]COD
+    Read [GAU] GAU0=TRANSAC
+    If fstat Raz TRANSAC : Endif
+  Endif
+  If TRANSAC=""
+    Case [F:PIH]INVTYP
+      When 1 : TRANSAC="PIHI"   : # Facture (Invoice)
+      When 2 : TRANSAC="PIHC"   : # Avoir (Credit note)
+               Read [GAU] GAU0=TRANSAC
+               If fstat TRANSAC="PIHI" : Endif
+    Endcase
+  Endif
+  JOURNAL=[F:PIH]JOU
+  If JOURNAL=""
+    Call EVALAUTO(TRANSAC,"JOU",JOURNAL) From SUBPIHA
+    If JOURNAL="" JOURNAL=[F:GTE]DEFJOU : Endif
+    [F:PIH]JOU=JOURNAL : [M:PIH0]JOU=JOURNAL
+  Endif
+
+  #85785
+  If func PORLEGLIB.DIGSIGNPIH([M:PIH0]FCY, "",[M:PIH0]PIVTYP)
+    If !clalev([F:BPS]) : Local File BPSUPPLIER [BPS] : Endif
+    If [F:BPS]BPSNUM <> [M:PIH0]BPR
+      Read [F:BPS]BPSNUM = [M:PIH0]BPR
+      If fstat : Raz [F:BPS] : Endif
+    Endif
+    [L]ANMCOMP = [F:BPS]AUTINVCOD
+  Else
+    [L]ANMCOMP = JOURNAL
+  Endif
+  Gosub CTRL_CHRONOLOGIE
+Endif
+#----- Fermeture des fichiers si nécessaire -----#
+$FIN_INIMOD
+If OUVFICFLG>7 Close Local File [ANM]  : OUVFICFLG-=8 : Endif
+If OUVFICFLG>3 Close Local File [PIHB] : OUVFICFLG-=4 : Endif
+If OUVFICFLG>1 Close Local File [GAG]  : OUVFICFLG-=2 : Endif
+If OUVFICFLG>0 Close Local File [GAU]  : OUVFICFLG-=1 : Endif
+Default File [PIH]
+Return
+
+$MODIF
+#-----------------------------------#
+# Après Rewrite de l'entête facture #
+#-----------------------------------#
+Local Decimal  WQTE, WMT, WQTEUOM, WQTE2
+#----- Réécriture du complément d'entête facture PINVOICEV [PIV] -----#
+Readlock [PIV] PIV0=[M:PIH0]NUM
+If fstat=1  GOK=-1 : GLOCK="$PINVOICEV"-[M:PIH0]NUM : Return
+Elsif fstat GOK=0  : Call RSTA("PIV",[M:PIH0]NUM) From GLOCK : Return : Endif
+# Issue 89349- 2013-10-29 by SR : Déplacé dans SUBPIHD
+Gosub CHARGENTBIS From SUBPIHD
+#----- Création ou duplication des textes entête et pied -----#
+Gosub CHARG_TEXT_ENTETE
+#-----
+If dim([F:PIV]UPDDAT)>0 [F:PIV]UPDDAT=date$  : Endif
+If dim([F:PIV]UPDUSR)>0 [F:PIV]UPDUSR=GUSER  : Endif
+Rewrite [PIV] : If fstat GOK=0 : Call FSTA("PIV") From GLOCK : Return : Endif
+#----- Ecriture des éléments de facturation avec comptes et sections -----#
+Call ENREG_ELEMENTS(8,[M:PIH0]NUM,"PIH4","M") From TRTACHELT1
+If GOK<1  Return : Endif
+#----- Ecriture du tableau des taxes -----#
+Call ENREG_TAXES   (8,[M:PIH0]NUM,"PIH4","M") From TRTACHELT1
+If GOK<1  Return : Endif
+#----- Modification des lignes facture -----#
+Gosub MODIF From TABLEAUX  : If GOK<1 Return : Endif
+#---------------------------------------------------------------------------#
+# Mises à jour : * Fichier "Mvts fournisseurs" BPSUPPMVT [MVS] (Facturant)  #
+#                  "Facturé non comptabilisé" et "Date dernière facture"    #
+#                * Fichier "Entête commande"   PORDER    [POH]              #
+#                  "Mts facturés des éléments de facturation"               #
+#---------------------------------------------------------------------------#
+SIGN=1 : Call MAJ_MVS_INVDTA(SIGN,0) From SUBPIHC : If GOK<1 Return : Endif
+#----- Mise à jour statistiques entête facture -----#
+SIGN=1 : Call VALSTA("PIH",SIGN)     From SUBPS2  : If GOK<1 Return : Endif
+#----- Ajustement des échéances en fonction des modifications effectuées -----#
+If MAJFAC<>9
+  If clalev([F:DUD])<=0 Local File GACCDUDATE [DUD] : Endif
+  Filter [DUD] Where TYP=[M:PIH0]GTE & NUM=[M:PIH0]NUM
+  Read [DUD] DUD0 First : If fstat Raz [F:DUD] : Endif
+  Filter [DUD]
+  If [F:DUD]TYP="" & [F:DUD]NUM=""
+    Call CREECHE(2,1,1,[F:PIH]PAZ) From SUBBIH : If GOK<1 Goto ERR_CREATION : Endif
+    #----- Point d'entrée CALECHE, permet d'intervenir sur les échéances créées -----#
+    GPOINT="CALECHE" : Gosub ENTREE From EXEFNC
+    If GOK<1  Goto ERR_CREATION : Endif
+    #-----
+    If [F:PIH]PIHTYP=1
+      Call TRT_ACOMPTES(1,1,[F:PIH]AMTATI) From SUBPIHC : # Affectation des acomptes
+      If GOK<1 Return : Endif
+    Endif
+  Else
+    Call MODECHE(2,[F:PIH]NUM,[F:PIH]AMTATI,MAJFAC,OK) From SUBBIH
+    If GOK<1 Return : Endif
+    If [F:PIH]PIHTYP=1
+      Call TRT_ACOMPTES(1,2,[F:PIH]AMTATI) From SUBPIHC : # Réaffectation des acomptes
+      If GOK<1 Return : Endif
+    Endif
+  Endif
+  If [F:PIH]PIHTYP<3
+    Call FIRST_DUD(1) From SUBPIHC
+  Endif
+Endif
+#----- Réajustement date comptable sur les lignes si nécessaire -----#
+If MODDAT<>0
+  Update [PID] Where NUM=[F:PIH]NUM With ACCDAT=[F:PIH]ACCDAT
+  If fstat  GOK=0 : Call FSTA("PID") From GLOCK : Endif
+Endif
+
+#90370 Cash VAT SPA
+Gosub CASH_VAT
+
+Gosub PIH_TWMSTA_CHK From TWMLIB
+#----- Autres mise à jour ? -----#
+
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#If func AFNC.ACTIV("KSW")>0
+#  Gosub MODIF_PIH_QRC From SWIQRCLIB2 # Bader X3-90379 QR-Code Swiss
+#Endif
+
+#############################################################################
+##INICIO: MODIFICACIONES PARA LOCALIZACIONES COMPRAS ARGENTINA             ##
+##ARGENTINA: 27.07.2005 - Juan Pablo Mansilla                              ##
+##Funcionalidad agregada para gestion de retenciones e impuestos internos  ##
+##en la factura de proveedor                                               ##
+#############################################################################
+GPOINT="XPIHTAXARG" : Gosub ENTREE From EXEFNC
+#############################################################################
+##FIN: MODIFICACIONES PARA LOCALIZACIONES COMPRAS ARGENTINA                ##
+##ARGENTINA: 27.07.2005                                                    ##
+#############################################################################
+#-----
+Return
+
+$APRES_MOD
+#MAE, bg 77405
+Gosub VERROU_HAE
+#--------------------------------------------------------------------------#
+# Après modification : affichage indicateurs entête et rechargement lignes #
+#--------------------------------------------------------------------------#
+[M:PIH1]=[F:PIH] : If !GIMPORT Affzo [PIH1] : Endif
+Raz [M:PIH3]CUMLINAMT1
+
+# Issue 84130 - 2013-02-28 by MUARN : liens de SUBPIHA au lieu de TABLEAUX
+Gosub LIENS From SUBPIHA
+
+#----- Mise à jour des listes de gauche picking -----#
+If !GIMPORT  Gosub TIROIR : Endif
+Return
+
+$AB_MODIF
+#------------------------------------#
+# Abandon modif après erreur système #
+#------------------------------------#
+Return
+
+$ABANDON
+#----------------------------------------------------#
+# Abandon création et modification par l'utilisateur #
+#----------------------------------------------------#
+Gosub DEVERROU_FAC From SUBPIHC
+Gosub SUPPRESS_TEX From SUBPIHC
+#MAE, bg 77405
+Gosub DEVERROU_HAE
+#----- Mise à jour des listes de gauche picking -----#
+If GREP="C" & !GIMPORT & BOUT="A" Raz [M:PIH0] : Gosub TIROIR : Endif
+Return
+
+$VERF_ANU
+#-----------------------------------#
+# Contrôles de suppression :        #
+# Interdit si facture comptabilisée #
+#          si facture avec avoir ou #
+#             fact. complémentaire  #
+#-----------------------------------#
+If [F:PIH]STA=3
+  GMESSAGE=mess(155,194,1) : GERR=1 : OK=0 : Return
+Endif
+# Issue X3-39273 - 2017-08-11 by MUARN : contrôler aussi pour les FCC
+#If [F:PIH]PIHTYP=1
+If [F:PIH]PIHTYP < 3
+  Look [PID] PID1(2)=4;[F:PIH]NUM
+  [G:PID]currind=1 : [G:PID]currlen=0 : # Réinitialisation clé par défaut
+  #-- Des avoirs ou factures complémentaires existent, suppression interdite ! --#
+  If !fstat     GMESSAGE=mess(156,194,1) : GERR=1 : OK=0 : Return : Endif
+Endif
+#----- Lectures échéances et contrôle MONTMIN pour autorisation suppression -----#
+If [F:PIH]PIHTYP<3
+  Local  Decimal  MONTMIN, MONTPRO
+  Call INFOECHE(2,[F:PIH]NUM,MONTMIN,MONTPRO) From SUBBIH
+# If MONTMIN<>0 GMESSAGE=mess(157,194,1) : GERR=1 : OK=0 : Return : Endif
+  If MONTMIN<>0
+     OK=2 : Call AVERTIR (mess(171,194,1),OK) From GESECRAN
+     If OK=1 OK=0 Else OK=1 : Endif
+  Endif
+Endif
+Return
+
+$ANNULE
+#---------------------------------------#
+# Avant suppression de l'entête facture #
+#---------------------------------------#
+Local Decimal  WQTE, WMT, WQTEUOM, WQTE2
+#---------------------------------------------------------------------------#
+# Mises à jour : * Fichier "Mvts fournisseurs" BPSUPPMVT [MVS] (Facturant)  #
+#                  "Facturé non comptabilisé" et "Date dernière facture"    #
+#                * Fichier "Entête commande"   PORDER    [POH]              #
+#                  "Mts facturés des éléments de facturation"               #
+#---------------------------------------------------------------------------#
+SIGN=-1 : Call MAJ_MVS_INVDTA(SIGN,0) From SUBPIHC : If GOK<1 Return : Endif
+#----- Soustraction statistiques entête facture -----#
+SIGN=-1 : Call VALSTA("PIH",SIGN)     From SUBPS2  : If GOK<1 Return : Endif
+#----- Suppression des affectations d'acompte -----#
+If [F:PIH]PIHTYP=1
+  Call TRT_ACOMPTES(-1,3,[F:PIH]AMTATI) From SUBPIHC
+  If GOK<1 Return : Endif
+Endif
+#----- Suppression du complément d'entête facture PINVOICEV [PIV] -----#
+Readlock [PIV] PIV0=[M:PIH0]NUM
+If fstat=1  GOK=-1 : GLOCK="$PINVOICEV"-[M:PIH0]NUM : Return
+Elsif fstat GOK=0  : Call RSTA("PIV",[M:PIH0]NUM) From GLOCK : Return : Endif
+Delete [PIV]
+If fstat=1  GOK=-1 : GLOCK="$PINVOICEV"-[M:PIH0]NUM : Return : Endif
+#----- Suppression éléments de facturation avec comptes et sections -----#
+Call ENREG_ELEMENTS(8,[M:PIH0]NUM,"PIH4","A") From TRTACHELT1
+If GOK<1  Return : Endif
+#----- Suppression du tableau des taxes -----#
+Call ENREG_TAXES   (8,[M:PIH0]NUM,"PIH4","A") From TRTACHELT1
+If GOK<1  Return : Endif
+#-- Annulation lignes facture (Action VALLIG appelée à chaque ligne avec SIGN=-1) --#
+Gosub ANNULE From TABLEAUX : If GOK<1 Return : Endif
+#----- Suppression des échéances de la facture -----#
+If clalev([F:DUD])<=0 Local File GACCDUDATE [DUD] : Endif
+#----- ##DBA le 23/01/03 : Historisation des échéances supprimées
+Local Char CRITSUPPR (250)
+CRITSUPPR="TYP='"+[M:PIH0]GTE+"' & NUM='"+[M:PIH0]NUM+"'"
+Call HISTOSUPPR (CRITSUPPR) From MODECHE : If GOK<1  Return : Endif
+Delete [DUD] Where TYP=[M:PIH0]GTE & NUM=[M:PIH0]NUM
+If fstat=1  GOK=-1 : GLOCK="$GACCDUDATE"-[M:PIH0]GTE-[M:PIH0]NUM : Return : Endif
+#----- Suppression des textes entête et pied -----#
+If left$([F:PIV]TEX1,3)="PIV"
+  Call SUP_CLOB([F:PIV]TEX1,GBIDI1) From TRTX3TEX
+Endif
+If left$([F:PIV]TEX2,3)="PIV"
+  Call SUP_CLOB([F:PIV]TEX2,GBIDI1) From TRTX3TEX
+Endif
+#----- Màj ligne facture vente si inter-société -----#
+If GMODU(5)=2 & [M:PIH0]BETCPY=2 & [M:PIH0]SIHNUM<>""
+  Update [SIV] Where NUM=[M:PIH0]SIHNUM
+&              With  PIHNUM=""
+  If fstat  GOK=0 : Call FSTA("SIV") From GLOCK : Return : Endif
+Endif
+
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#If func AFNC.ACTIV("KSW")>0
+#  Gosub ANNULE_PIH_QRC From SWIQRCLIB2 # Bader X3-90379 QR-Code Swiss
+#Endif
+Return
+
+$AP_ANNULE
+#-----------------------------------------#
+# Après annulation complète d'une facture #
+#-----------------------------------------#
+#----- Mise à jour des listes de gauche picking (reporté en FIN_ACTION) -----#
+#If !GIMPORT  Raz [M:PIH0] : Endif
+Return
+
+$FIN_ACTION
+#--------------------#
+# Après toute action #
+#--------------------#
+If REPONSE=GSTAANU
+  #----- Mise à jour des listes de gauche picking après une annulation -----#
+  If !GIMPORT & [M:PIH0]FCY=""  Raz CRITERE : Gosub TIROIR : Endif
+Endif
+
+Case BOUT
+ When "5" : # SAM 101378: Localization Switzerland, 2016-01-19 Bader
+            If func AFNC.ACTIV("KSW")>0
+              Gosub FIN_ACTION_PIH From SWIBVRLIB4
+            Endif
+            # SAM 101378 END
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+# When "6" : # X3-90379 : Localization Switzerland, 2018-05-25 Bader
+#            If func AFNC.ACTIV("KSW")>0
+#               Gosub FIN_ACTION_PIH From SWIQRCLIB2
+#            Endif
+#            # X3-90379 END
+Endcase
+Return
+
+$FERME
+#------------------------------------#
+# Restitution des variables globales #
+#------------------------------------#
+Raz GORITITCOL
+#-----
+Gosub REST_GLOB From TRTX3GLOB
+#-----
+If clalev([M:AD66])  Close Local Mask [AD66] : Endif
+If clalev([M:AD67])  Close Local Mask [AD67] : Endif
+If clalev([M:PCEZ])  Close Local Mask [PCEZ] : Endif
+#-----
+If GFONC1="GESPIH"
+  Raz GMENBOUT, GCONSDIA
+Endif
+#----- Effacement icone texte -----#
+If !GIMPORT  Call RESET_IMAGE(4) From GESECRAN : Endif
+GTUNCPT(10)=0 : # Effacement indicateur tunnel facture d'achats
+#----- Suppression variables globales "noms des currbox" -----#
+If dim(GBOXPI2)>0
+  Kill GBOXPI2, GBOXPO1, GBOXPT1, GBOXPI1, GBOXPN1
+Endif
+
+# Issue 71253 - 2012-05-10 by SR : Localisation espagnole et portugaise
+If dim(GPIH_SYMBOL2)>0
+  Kill GPIH_SYMBOL2, GPIH_FLGPAZ, GPIH_CPYCRY, GPIH_EECFLG, GPIH_INDTAX, GPIH_PICK,
+&      GPIH_QTEMAX,  GPIH_QTE,    GPIH_VERROU, GPIH_INDBASTAX, GPIH_FMTPER,GPIH_FMTKSP,
+&      GPIH_FMTKPO
+Endif
+# Exigence 82615 : Législation belge --str
+# FQ122815  Ajout d'un suffixe aux variables globales GDCLFEES, GACVDAS, GACVBE281
+If dim(GDCLFEES_PIH) >0 Then Kill GDCLFEES_PIH  : Endif
+If dim(GACVDAS_PIH)  >0 Then Kill GACVDAS_PIH   : Endif
+If dim(GACVBE281_PIH)>0 Then Kill GACVBE281_PIH : Endif
+# Exigence 82615 : Législation belge --end
+# Issue 84130 - 2013-03-22 by SR : Landed cost
+If dim(GOUVSTC)>0 & WCREOUVSTC = 1  Kill GOUVSTC  : Endif
+
+  GCREFONC = 0 # FGR 18/02/2014 : X3SUIVI96940 on remet une valeur normale.
+
+# Issue 71069 - 2016-06-20 by MUARN : simuler multi-affaire
+Kill GUPDPJTSNGDOC
+
+# Issue X3-70158 - 2018-01-09 by MUARN : TRTLIG à la place de GREP
+Kill GPIH_TRTLIG
+
+Return
+
+$VERIF
+# Issue 85961 - 2012-11-22 by SR
+Local Char WVAL
+# Issue 92978 - 2013-09-30 by SR
+Local Char  WFCY(GLONFCY)
+#-----------------------------------------------#
+# Vérifications : Au moins une ligne, ...etc... #
+#-----------------------------------------------#
+Local Shortint RES
+# VPO 07/12/10 69066 verifier valeur Condition de paiement, Code escompte, Regime de taxe
+# VPO 01/03/11 71999 ameliorer message d'erreur
+If [M:PIH1]PTE<>""
+    #Call CONTROLE("TPT","",[M:PIH1]PTE,"",RES) From CONTOBJ
+    #If RES : GERR=1 : OK=0 : GMESSAGE=mess(32,126,1)-'"'+func AFNC.INTCLE("AMZ","PIH1~PTE")+'"\'+GMESSAGE : Return : Endif
+    #-- X3Suivi 71937 : Données par législation pour le Conditions de paiement
+    #--CPO 71937 01/08/2013 Suite dev review
+    Call CONTTPT([M:PIH1]PTE,GCURLEG,'','',[M:PIH0]FCY,'','') From SUBTPT
+    If mkstat : GERR=1 : OK=0 : GMESSAGE=mess(32,126,1)-'"'+func AFNC.INTCLE("AMZ","PIH1~PTE")+'"\'+GMESSAGE : Return : Endif
+Endif
+If [M:PIH1]DEP<>""
+#--CPO 71937 TABDEPAGIO
+mkstat=0
+    #Call CONTROLE("TDA","!",[M:PIH1]DEP,"",RES) From CONTOBJ
+    #If RES : GERR=1 : OK=0 : GMESSAGE=mess(32,126,1)-'"'+func AFNC.INTCLE("AMZ","PIH1~DEP")+'"\'+GMESSAGE : Return : Endif
+    Call CONTTDA([M:PIH1]DEP,GCURLEG,"PIH1","DEP",[M:PIH0]FCY,"","") From SUBTDA
+    If mkstat : GERR=1 : OK=0 : GMESSAGE=mess(32,126,1)-'"'+func AFNC.INTCLE("AMZ","PIH1~DEP")+'"\'+GMESSAGE : Return : Endif
+    #--/CPO
+Endif
+If [M:PIH1]VAC<>""
+    mkstat=0
+    # 71937 : Multilégislation
+    #Call CONTADI([M:PIH1]VAC,"1","") From SUBADI
+    #If mkstat : GERR=1 : OK=0 : GMESSAGE=mess(32,126,1)-'"'+func AFNC.INTCLE("AMZ","PIH1~VAC")+'"\'+GMESSAGE : Return : Endif
+    #Call CONTROLE("ADI","",[M:PIH1]VAC,"1",RES) From CONTOBJ
+    #If RES : GERR=1 : OK=0 : GMESSAGE=mess(32,126,1)-'"'+func AFNC.INTCLE("AMZ","PIH1~VAC")+'"\'+GMESSAGE : Return : Endif
+    Call CONTTVB([M:PIH1]VAC,GCURLEG,"PIH1","VAC",[M:PIH0]FCY,"","") From SUBTVB
+    If mkstat : GERR=1 : OK=0 : GMESSAGE=mess(32,126,1)-'"'+func AFNC.INTCLE("AMZ","PIH1~VAC")+'"\'+GMESSAGE : Return : Endif
+    # 71937 : Multilégislation
+Endif
+#---------
+Call C_BPRVCR([M:PIH1]BPRVCR) From SUBPIH
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If mkstat :  GERR=1 : OK=0 : Return : Endif
+# Issue 86043 - 2013-04-24 by MUARN : rendre cours devise obligatoire si inexistant dans la table cours devise
+Call C_RAT2([M:PIH1]RAT2) From SUBPIH
+# Issue 113936 - 2016-01-22 by SR : Tester le code retour
+If mkstat :  GERR=1 : OK=0 : Return : Endif
+
+# Issue 104316 - 2014-12-01 by MUARN : contrôle nombre éléments facturation répartis
+Local Integer WNBFAC
+Local Char    TRANSAC(max(GLONGAU,10))
+Local Integer WRET
+WNBFAC = sigma(I=0,[M:PIH4]NBFAC-1,([M:PIH4]INVLINFLG(I)>1 & [M:PIH4]INVLINFLG(I)<6 ) & [M:PIH4]INVDTAAMT(I)<>0)
+Call LEC_TPV_LEG(GCURLEG,[F:PIH]PIVTYP,WRET) From TRTLECLEG
+If WRET Raz [F:TPV] : Endif
+TRANSAC=[F:TPV]COD
+If WNBFAC>9 & (TRANSAC = "PIHI2" | TRANSAC = "PIHI3")
+  GMESSAGE=mess(478,194,1)-mess(479,194,1)
+  GERR=1 : OK=0 : Return
+Elsif WNBFAC>9
+  GMESSAGE = mess(478,194,1)
+  If !GIMPORT GMESSAGE -= '\' + mess(205,100,1) : Endif
+  WRET=2 : Call AVERTIR(GMESSAGE,WRET) From GESECRAN
+  If WRET<>2
+    WRET=3 : OK=0 : Return
+  Else
+    Raz GMESSAGE
+  Endif
+Endif
+
+If mkstat  OK=0 : Return : Endif
+If dim(I)<0  Local Shortint I : Endif
+If GIMPORT
+  # Issue 111573 - 2015-11-16 by SR : Initialiser NBFAC
+  [M:PIH4]NBFAC=[M:PIH1]NBFAC1
+  #---- Si import : Màj bases taxables et calcul taxes éléments facturation -----#
+  If [M:PIH3]CLCFLG=2
+    For I=0 To [M:PIH1]NBFAC1-1
+      Call MAJ_ELEMENT (I,0,-1) From SUBPIHB
+      Call MAJ_ELEMENT (I,0,+1) From SUBPIHB
+    Next I
+    If GPIHCALTAX=2
+      For GPIH_INDTAX=1 To [M:PIH4]NBTAX
+        Gosub CAL_TAXE_GLOB From SUBPIHB
+      Next GPIH_INDTAX
+    Endif
+  Endif
+  If [F:BPS]BPSNUM<>[M:PIH0]BPR
+    Read [BPS] BPS0=[M:PIH0]BPR : If fstat Raz [F:BPS] : Endif
+  Endif
+  If [M:PIH3]NBLIG>0 & [F:BPS]DUDCLC=1 & ([M:PIH3]CLCFLG=2 | [M:PIH1]STRDUDDAT=[0/0/0])
+    For I=0 To [M:PIH3]NBLIG-1
+      If [M:PIH3]TYPORI(I)=2 &
+&       ([M:PIH1]STRDUDDAT=[0/0/0] | [M:PIH1]STRDUDDAT>[M:PIH3]RCPDAT(I))
+        [M:PIH1]STRDUDDAT=[M:PIH3]RCPDAT(I)
+      Endif
+    Next I
+    If [M:PIH1]STRDUDDAT=[0/0/0] [M:PIH1]STRDUDDAT=[M:PIH0]ACCDAT : Endif
+  Endif
+  Raz [M:PIH3]CLCFLG
+  [M:PIH4]AMTATI=sum([M:PIH4]INVDTAAMT)+[M:PIH4]TOTLINAMT+[M:PIH4]TOTTAXAMT
+Else
+  Gosub TEST_VALID From SUBPIH
+Endif
+# Issue 88312 - 2013-02-28 by SR
+SAVNOLIGN = nolign
+#----- Test au moins une ligne -----#
+If [M:PIH3]NBLIG=0
+   GMESSAGE=mess(61,199,1)  : GERR=1 : OK=0 : Goto RETOURNBLIG
+# Issue 85961 - 2012-11-22 by SR
+Else
+  For I=0 To [M:PIH3]NBLIG-1
+    # Issue 88312 - 2013-02-28 by SR
+    nolign = I+1
+    # Issue 92978 - 2013-09-30 by SR : PE permettant de choisir le site à utiliser
+    WFCY = GFINRSP :    GPOINT = "CHGACCFCY" : Gosub ENTREE From EXEFNC
+    # Issue 87812 - 2013-02-08 by SR : Utiliser GNBDIE et pas GOPTCANA et vérifier si les axes sont saisissables
+    For J = 1 To GNBDIE
+      WVAL = evalue("[M:PIH3]CCE"+num$(J)+"("+num$(I) +")")
+      Call SAIS_CCE(WVAL,J,"[M:PIH3]LINACC","[M:PIH3]LINDSP") From TRTX3CPT
+      If !mkstat
+        # Issue 92978 - 2013-09-30 by SR : Passer WFCY au lieu de GFINRSP
+        Call CTRL_CCE(WVAL,J,"[M:PIH3]LINACC",WFCY,[M:PIH0]ACCDAT) From TRTX3CPT
+        If GIMPORT & mkstat
+          GMESSAGE-="-"-mess(18,197,1)-num$(nolign)-mess(80,197,1)-[M:PIH3]ITMREF(nolign-1)
+          #----- Simple warning si migration Intégrale -----#
+          If clalev([F:XEPA]) & clalev([F:XLPA])
+            Call ECR_TRACE(GMESSAGE,-1) From GESECRAN : Raz GMESSAGE, mkstat
+          Else
+            GERR = 1
+            GMESSAGE -= mess(18,197,1) - num$(I+1)
+            OK = 0
+            Break 2
+          Endif
+        Else
+          If GMESSAGE <> ""
+            GERR = 1
+            GMESSAGE -= mess(18,197,1) - num$(I+1)
+            OK = 0
+            Break 2
+          Endif
+        Endif
+      Endif
+      # Issue 95966 - 2014-01-20 by SR
+      Raz mkstat
+      # Issue 106269 - 2015-02-13 by MUARN : contrôle axes invisibles et duplication
+      Call CTLCCE(WVAL,GDIE(J),GFINRSP,[M:PIH0]ACCDAT,nolign-1,
+&         "GDIE(1","[M:PIH3]CCE#","GCOA(1","[M:PIH3]LINACC#") From SELCCE
+      If mkstat : Raz mkstat : OK=0 : GERR=1 : Break 2 : Endif
+    Next
+  Next
+  #-----
+Endif
+# Issue 88312 - 2013-02-28 by SR
+nolign = SAVNOLIGN
+If OK = 0 : Goto RETOURNBLIG : Endif
+#----- Si SIVNULL=2 (interdiction création pièce à zéro) -----#
+If !GIMPORT & GSIVNULL=2 & [M:PIH4]AMTATI=0 & [M:PIH4]DIFAMTATI=0
+   GMESSAGE=mess(277,199,1) : GERR=1 : OK=0 : Goto RETOURNBLIG
+Endif
+#----- Mise à jour et affichage statut de la facture par sécurité -----#
+If (!GIMPORT | dim(GPIH_WCOD)>0) & [M:PIH1]STA<>3
+  If [M:PIH4]DIFTAXAMT<>0 | [M:PIH4]DIFLINAMT<>0 |
+&    [M:PIH4]DIFAMTATI<>0 | sum([M:PIH4]INVDIFAMT)<>0 [M:PIH1]STA=1
+                                                 Else [M:PIH1]STA=2 : Endif
+  If !GIMPORT  Affzo [PIH1]STA : Endif
+Endif
+#----- Contrôle périodes de prestation des lignes -----#
+If dim([M:PIH1]STRDATSVC)>0
+  For I=0 To [M:PIH3]NBLIG-1
+    If [M:PIH3]ENDDAT(I)<[M:PIH3]STRDAT(I)
+      GMESSAGE =mess(18,197,1)-num$(I+1)-":"-mess(178,107,1)
+      GMESSAGE-="("+mess(2,132,1) -format$(GFMD,[M:PIH3]STRDAT(I))
+      GMESSAGE-=mess(95,100,1)-format$(GFMD,[M:PIH3]ENDDAT(I))+")"
+      GERR=1 : OK=0 : Break
+    Endif
+  Next
+  If GERR=1 & OK=0  Goto RETOURNBLIG : Endif
+Endif
+#----- Autres contrôles -----#
+
+# Issue 71069 - 2013-08-26 by MUARN : PJT
+Call PJT_CONTROLE_HEAD_DETAIL("[M:PIH1]PJTH", "[M:PIH3]PJT") From TRTPJT
+If GERR <> 0
+  OK = 0
+  Return
+Endif
+
+#97101 RICAR 2014/07/03 - 50001 Law decret - BEGIN
+If func AFNC.ACTIV("KPO")
+
+  #85785 * RMA * document amount cannot be negative
+  If func PORLEGLIB.DIGSIGNPIH([M:PIH0]FCY, "", [M:PIH0]PIVTYP) & ([M:PIH4]AMTATI<0)
+    GERR = 1: GMESSAGE = mess(216,191,1) : OK = 0 : Return
+  Endif
+
+  If func PORLEGLIB.PORLEG([M:PIH0]FCY,"")=1 #& func PORLEGLIB.DIGSIGNPIH([M:PIH0]FCY, "", [M:PIH0]PIVTYP)
+    Local Integer WRET
+    Call LEC_TPV_LEG([F:CPY]LEG,[M:PIH0]PIVTYP,WRET) From TRTLECLEG
+    If find([F:TPV]RECTYP, 2, 3)
+      WRET = 1
+      Filter [F:PIHB] Where [F:PIHB]ORIDOCNUM <> "" & [F:PIHB]ORIDOCNUM = [M:PIH0]ORIDOCNUM & [F:PIHB]NUM <> [M:PIH0]NUM &
+&                           [F:PIHB]PIVTYP = [M:PIH0]PIVTYP & year([F:PIHB]ACCDAT) = year([M:PIH0]ACCDAT)
+      Read [F:PIHB] First
+      If !fstat : WRET = 0 : Endif
+      Filter [F:PIHB]
+      If WRET = 0
+        Call ERREUR (func AFNC.MES1(mess(89,7711,1),[F:PIHB]NUM)) From GESECRAN
+        OK = 0
+        Return
+      Endif
+    Endif
+  Endif
+Endif
+#97101 RICAR 2014/07/03 - 50001 Law decret - END
+
+# SAM 101378: Localization Switzerland, 2016-01-19 Bader
+If func AFNC.ACTIV("KSW")>0
+  Gosub VERIF_PIH From SWIBVRLIB4
+  If OK = 0 : Return : Endif
+# X3-107116 2018-09-25 Bader commented until final release of QR support for Switzerland
+#  Gosub VERIF_PIH From SWIQRCLIB2    # X3-90417 CH QR bill - Suppl inv - Implement QR bill payment method 2018-06-06 Bader
+Endif
+# SAM 101378 END
+Return
+#----- Retour à la saisie (des lignes) -----#
+$RETOURNBLIG
+# If MA<>2 MA=2 : Gosub AFFMASK From GOBJET : If !GIMPORT Affzo [M] : Endif : Endif
+# If !GIMPORT SUIZON="NBLIG" : Endif
+OK=0
+Return
+
+#--- Issue 84130 by TS : Landed cost
+# Alimentation des totaux charges achat et stock d'une ligne facture
+$ALI_FCS
+Local Integer NOL
+Local Decimal WQTYPUU
+For NOL=0 To [M:PIH3]NBLIG-1
+  If [M:PIH0]PIHTYP=1
+    Case [M:PIH3]TYPORI(NOL)
+      When 1 : Gosub ORI_POQ
+      When 2 : Gosub ORI_PTD
+    Endcase
+    # Alimentation de [M:PIH3] car le $MAJ_REPART_LIG travaille en classe [M]
+    If [M:PIH3]TYPORI(NOL)<3
+      [M:PIH3]FCSCSTPUR(NOL) = [F:PID]FCSCSTPUR
+      [M:PIH3]FCSCPR(NOL)    = [F:PID]FCSCPR
+    Endif
+    If GOK=0 Return Endif
+  Endif
+Next NOL
+Return
+
+#--- Issue 84130 by TS : Landed cost
+# L'origine de la facture est une commande
+$ORI_POQ
+If [F:POQ]POHNUM<>[M:PIH3]NUMORI(NOL)|[F:POQ]POPLIN<>[M:PIH3]LINORI(NOL)|
+&  [F:POQ]POQSEQ<>[M:PIH3]SEQORI(NOL)
+  Read [POQ]POQ0=[M:PIH3]NUMORI(NOL);[M:PIH3]LINORI(NOL);[M:PIH3]SEQORI(NOL)
+  If fstat
+    Call RSTA("POQ",[M:PIH3]NUMORI(NOL)+num$([M:PIH3]LINORI(NOL))+num$([M:PIH3]SEQORI(NOL))) From GLOCK
+    GOK=0 : Return
+  Elsif [F:POQ]STCNUM=""
+    [F:PID]FCSCSTPUR = 0
+    [F:PID]FCSCPR    = 0
+    Return
+  Endif
+Endif
+
+#--- Issue 97487
+If ACTION="INIMOD"
+  # Qté facturée de la réception à déduire de la qté rcp pour calcul CA réalisé
+  Local Decimal WINVQTY
+  # Quantité facturée de la commande à déduire des réceptions
+  Local Decimal WQTYADED
+
+ # Calcul de la quantité facturée de la commande à déduire des réceptions
+  WQTYADED = [F:POQ]INVQTYPUU-[F:PID]QTYPUU
+
+  # Recherche des réceptions de la commande
+  Filter [PTD] Where POHNUM=[F:POQ]POHNUM & POPLIN=[F:POQ]POPLIN &
+&                    POQSEQ=[F:POQ]POQSEQ
+&              Order By Key PTD2
+  [F:PID]FCSCSTPUR = 0
+  [F:PID]FCSCPR    = 0
+  # La qté à traiter est le min des quantités commandées et facturées
+  WQTYPUU = min([M:PIH3]QTYPUU(NOL),[F:POQ]QTYPUU)
+
+  For [PTD]
+    # La qté facturée sur la réception est nulle
+    If [F:PTD]INVQTYPUU = 0
+      WINVQTY   = 0
+    # La qté à déduire est > à la qté facturée sur la réception
+    # on déduira cette qté facturée
+    Elsif WQTYADED > [F:PTD]INVQTYPUU
+      WINVQTY   = [F:PTD]INVQTYPUU
+      WQTYADED -= [F:PTD]INVQTYPUU
+    # La qté facturée sur la réception est > à la qté à déduire
+    # on déduira cette la qté à déduire
+    Else
+      WINVQTY   = WQTYADED
+      WQTYADED  = 0
+    Endif
+
+    # Si la quantité à traiter est > à la quantité restant à facturer
+    If WQTYPUU>[F:PTD]QTYPUU-WINVQTY
+      [F:PID]FCSCSTPUR += [F:PTD]FCSCSTPUR*([F:PTD]QTYPUU-WINVQTY)/[F:PTD]QTYPUU
+      [F:PID]FCSCPR    += [F:PTD]FCSCPR   *([F:PTD]QTYPUU-WINVQTY)/[F:PTD]QTYPUU
+      WQTYPUU -= [F:PTD]QTYPUU-WINVQTY
+    Else
+      [F:PID]FCSCSTPUR += [F:PTD]FCSCSTPUR*WQTYPUU/[F:PTD]QTYPUU
+      [F:PID]FCSCPR    += [F:PTD]FCSCPR*WQTYPUU/[F:PTD]QTYPUU
+      WQTYPUU = 0
+      Break
+    Endif
+  Next
+  Filter [PTD]
+Else
+#---
+
+  # Recherche des réceptions non facturées de la commande
+  Filter [PTD] Where POHNUM=[F:POQ]POHNUM & POPLIN=[F:POQ]POPLIN &
+&                    POQSEQ=[F:POQ]POQSEQ & LININVFLG<>2
+&              Order By Key PTD2
+  [F:PID]FCSCSTPUR = 0
+  [F:PID]FCSCPR    = 0
+  # La quantité à traiter est le min des quantités commandées et facturées
+  WQTYPUU = min([M:PIH3]QTYPUU(NOL),[F:POQ]QTYPUU)
+  For [PTD]
+  #--- Issue 95710
+    # Si la quantité à traiter est > à la quantité restant à facturer
+    If WQTYPUU>[F:PTD]QTYPUU-[F:PTD]INVQTYPUU
+      [F:PID]FCSCSTPUR += [F:PTD]FCSCSTPUR*([F:PTD]QTYPUU-[F:PTD]INVQTYPUU)/[F:PTD]QTYPUU
+      [F:PID]FCSCPR    += [F:PTD]FCSCPR*([F:PTD]QTYPUU-[F:PTD]INVQTYPUU)/[F:PTD]QTYPUU
+      WQTYPUU -= [F:PTD]QTYPUU-[F:PTD]INVQTYPUU
+    Else
+      [F:PID]FCSCSTPUR += [F:PTD]FCSCSTPUR*WQTYPUU/[F:PTD]QTYPUU
+      [F:PID]FCSCPR    += [F:PTD]FCSCPR*WQTYPUU/[F:PTD]QTYPUU
+      WQTYPUU = 0
+      Break
+    Endif
+  #---
+  Next
+  Filter [PTD]
+
+#--- Issue 97487
+Endif
+
+# Il reste de la quantité à traiter, on récupère les charges de la commande
+If WQTYPUU>0
+  If WQTYPUU>=[F:POQ]QTYPUU
+    [F:PID]FCSCSTPUR += [F:POQ]FCSCSTPUR
+    [F:PID]FCSCPR    += [F:POQ]FCSCPR
+  Else
+    [F:PID]FCSCSTPUR += [F:POQ]FCSCSTPUR*WQTYPUU/[F:POQ]QTYPUU
+    [F:PID]FCSCPR    += [F:POQ]FCSCPR*WQTYPUU/[F:POQ]QTYPUU
+  Endif
+Endif
+Return
+#---
+
+#--- Issue 84130 by TS : Landed cost
+# L'origine de la facture est une réception
+$ORI_PTD
+If [F:PTD]PTHNUM<>[M:PIH3]NUMORI(NOL)|[F:PTD]PTDLIN<>[M:PIH3]LINORI(NOL)
+  Read [PTD]PTD0=[M:PIH3]NUMORI(NOL);[M:PIH3]LINORI(NOL)
+  If fstat
+    Call RSTA("PTD",[M:PIH3]NUMORI(NOL)+num$([M:PIH3]LINORI(NOL))) From GLOCK
+    GOK=0 : Return
+  Elsif [F:PTD]STCNUM=""
+    [F:PID]FCSCSTPUR = 0
+    [F:PID]FCSCPR    = 0
+    Return
+  Endif
+Endif
+If [M:PIH3]QTYPUU(NOL)>=[F:PTD]QTYPUU
+  [F:PID]FCSCSTPUR = [F:PTD]FCSCSTPUR
+  [F:PID]FCSCPR    = [F:PTD]FCSCPR
+Else
+  [F:PID]FCSCSTPUR = [F:PTD]FCSCSTPUR*[M:PIH3]QTYPUU(NOL)/[F:PTD]QTYPUU
+  [F:PID]FCSCPR    = [F:PTD]FCSCPR*[M:PIH3]QTYPUU(NOL)/[F:PTD]QTYPUU
+Endif
+Return
+#---
+
+
+$CHARG_PARAM
+#----------------------------------------------------------------------------#
+# Chargement des paramètres avec GFCY = Site de la facture                   #
+# -------------------------------------------------------------------------- #
+# Chargement GSOCIETE   : Société juridique                                  #
+#            GLOCALDEV  : Devise société juridique                           #
+#            GFINRSP    : Site financier                                     #
+#            GSALDSPWEU : Unité de poids  pour répartition                   #
+#            GSALDSPVOU : Unité de volume pour répartition                   #
+#            GANASAI1-9 : Options de saisie des axes analytiques             #
+#            GPIH_CPYCRY: Pays de la société courante (GSOCIETE)             #
+# Récupération des paramètres ACHATS                                         #
+# Récupération des paramètres BUDGET                                         #
+#            GPIHACCDAT : Modification date comptable                        #
+#            GPIHCPR    : Régularisation prix facture (2=Avec coef approche) #
+#            GPIHCURDAT : Date cours devise (1=Comptable 2=Fourniss.)        #
+#            GPIHQTYAQR : Quantité facturable (A, A+Q, A+Q+R)                #
+#            GPURCMM    : Mise à jour des engagements  (1=NON 2=OUI)         #
+#            GPURCMMDAT : Date engagement (1=Date cde  2=Date Récept)        #
+#            GSIVNULL   : Facture à zéro interdite (1=NON 2=OUI)             #
+#            GPIVSUP    : Bouton suppression (1=NON 2=OUI)                   #
+#            GPIHQTYRET : Facturation quantités retournées                   #
+#----------------------------------------------------------------------------#
+# Issue 114426
+Raz GPURCMM, GPURCMMDAT, GPIHACCDAT, GPIHCURDAT, GPIHQTYAQR, GSIVNULL, GPIVSUP #85785
+# End issue 114426
+Raz GPIHQTYRET # Issue 70507 - 2012-01-18 by MUARN : facturation quantités retournées
+Local  Char     PARAM2(10)
+#----- Chargement des globales référenciels, comptes et sections de la société -----#
+Call GETCPY(GFCY,"PTR",8,GPTRNUM) From TRTX3CPT
+If GFINRSP=""  GFINRSP=GFCY : Endif
+#----- Si changement société -----#
+If GSOC_UPDFLG
+  #----- Forcer le contrôle sur le type de facture ! -----#
+  If GREP<>"" & [M:PIH0]PIVTYP<>""
+    Setmok [PIH0] With 0
+  Endif
+  #----- Lecture des affectations compteur (factures) -----#
+  If dim(OK)<1  Local Integer OK : Endif
+  Call LECTCA(6,OK) From SUBTCA
+  If fstat | !OK
+    GMESSAGE=mess(64,199,1) : GERR=1 : OK=0 : Return
+  Endif
+  GMANCOU=[F:TCA]MANCOU(7) : GCODNUM=[F:TCA]CODNUM(7)
+  #----- Chargement indicateur Numérotation Argentine -----#
+  If func AFNC.ACTIV("KAG")
+    Call PARAM(GFCY,"ARGNUM",PARAM2) From ADOVAL
+    GLOCARGNUM=val(PARAM2)
+    If GLOCARGNUM>0  GLOCARGNUM-=1 : Endif
+  Else
+    Raz GLOCARGNUM
+  Endif
+  Gosub GRIZO_ARG
+  #----- Chargement indicateur Etalement des prestations -----#
+  If func AFNC.ACTIV("KIT")
+    Call PARAM(GFCY,"ITAPRE",PARAM2) From ADOVAL
+    GLOCITAPRE=val(PARAM2)
+    If GLOCITAPRE>0  GLOCITAPRE-=1 : Endif
+  Else
+    Raz GLOCITAPRE
+  Endif
+  #-----
+  If func AFNC.ACTIV("SVC") | GLOCITAPRE
+    #----- Relecture transaction si nécessaire -----#
+    If [F:PTR]PTRTYP<>8 | [F:PTR]PTRNUM<>GPTRNUM
+      Read [PTR] PTR0=8;GPTRNUM : If fstat Raz [F:PTR] : Endif
+    Endif
+    #----- Dates et période prestation ligne -----#
+    If [F:PTR]SVCDATCOD(1)=1
+      #----- Saisi -----#
+      If GLOCITAPRE
+        If [M:PIH1]STA=3
+          GPIH_FMTPER(0)="DZzP:"+GFMDAT
+          GPIH_FMTPER(1)="DZzP:"+GFMDAT
+          GPIH_FMTPER(2)="NP+:4#"
+          GPIH_FMTPER(3)="NP:1#"
+        Else
+          GPIH_FMTPER(0)="DZz:"+GFMDAT
+          GPIH_FMTPER(1)="DZz:"+GFMDAT
+          GPIH_FMTPER(2)="N+:4#"
+          GPIH_FMTPER(3)="N:1#"
+        Endif
+      Else
+        GPIH_FMTPER(0)="DZz:"+GFMDAT
+        GPIH_FMTPER(1)="DZz:"+GFMDAT
+        GPIH_FMTPER(2)="-N+:4#"
+        GPIH_FMTPER(3)="-N:1#"
+      Endif
+    Elsif [F:PTR]SVCDATCOD(1)=2
+      #----- Affiché -----#
+      GPIH_FMTPER(0)="DZzP:"+GFMDAT
+      GPIH_FMTPER(1)="DZzP:"+GFMDAT
+      #-----
+      If GLOCITAPRE
+        GPIH_FMTPER(2)="NP+:4#"
+        GPIH_FMTPER(3)="NP:1#"
+      Else
+        GPIH_FMTPER(2)="-N+:4#"
+        GPIH_FMTPER(3)="-N:1#"
+      Endif
+    Else
+      #----- Invisible -----#
+      GPIH_FMTPER(0)="-DZz:"+GFMDAT
+      GPIH_FMTPER(1)="-DZz:"+GFMDAT
+      GPIH_FMTPER(2)="-N+:4#"
+      GPIH_FMTPER(3)="-N:1#"
+    Endif
+    #----- Dates prestation entête -----#
+    If dim([M:PIH1]STRDATSVC)>0
+      #----- Saisi -----#
+      If !GLOCITAPRE & [F:PTR]SVCDATCOD(0)=1
+        GPIH_FMTPER(4)="DZz:"+GFMDAT
+        GPIH_FMTPER(5)="DZz:"+GFMDAT
+      #----- Affiché -----#
+      Elsif !GLOCITAPRE & [F:PTR]SVCDATCOD(0)=2
+        GPIH_FMTPER(4)="DZzP:"+GFMDAT
+        GPIH_FMTPER(5)="DZzP:"+GFMDAT
+      #----- Invisible -----#
+      Else
+        GPIH_FMTPER(4)="-DZz:"+GFMDAT
+        GPIH_FMTPER(5)="-DZz:"+GFMDAT
+      Endif
+      Affzo [PIH1]STRDATSVC, ENDDATSVC
+    Endif
+  Else
+    GPIH_FMTPER(0)="-DZz:"+GFMDAT
+    GPIH_FMTPER(1)="-DZz:"+GFMDAT
+    GPIH_FMTPER(2)="-N+:4#"
+    GPIH_FMTPER(3)="-N:1#"
+    #-----
+    If dim([M:PIH1]STRDATSVC)>0
+      GPIH_FMTPER(4)="-DZz:"+GFMDAT
+      GPIH_FMTPER(5)="-DZz:"+GFMDAT
+      Affzo [PIH1]STRDATSVC, ENDDATSVC
+    Endif
+ Endif
+   # Issue 71253 - 2012-05-10 by SR : Localisation espagnole
+  If func AFNC.ACTIV("KSP")
+     #----- Relecture transaction si nécessaire -----#
+     If [F:PTR]PTRTYP<>8 | [F:PTR]PTRNUM<>GPTRNUM
+         Read [PTR] PTR0=8;GPTRNUM : If fstat Raz [F:PTR] : Endif
+     Endif
+    If func AFNC.PARAM("SPAVAT",GFCY) = "2"
+    #----- Localisation Espagnole -----#
+      If find([F:PTR]SPTVACOD,0,1)
+        #----- Saisi -----#
+        GPIH_FMTKSP(0)="DZz:"+GFMDAT
+        GPIH_FMTKSP(1)="K:40X"
+        GPIH_FMTKSP(2)="K:"+num$(GLONBPS)+"g" # cf DBOPP (SUIVIPRD 83393)
+        GPIH_FMTKSP(3)="KP:"+num$(GLONSHO)+"X"
+      Elsif [F:PTR]SPTVACOD=2
+        #----- Affiché -----#
+        GPIH_FMTKSP(0)="DZzP:"+GFMDAT
+        GPIH_FMTKSP(1)="KP:40X"
+        GPIH_FMTKSP(2)="KP:"+num$(GLONBPS)+"X"
+        GPIH_FMTKSP(3)="KP:"+num$(GLONSHO)+"X"
+      Else
+        #----- Invisible -----#
+        GPIH_FMTKSP(0)="-DZz:"+GFMDAT
+        GPIH_FMTKSP(1)="-K:40X"
+        GPIH_FMTKSP(2)="-K:"+num$(GLONBPS)+"X"
+        GPIH_FMTKSP(3)="-KP:"+num$(GLONSHO)+"X"
+      Endif
+     Else
+      #----- Invisible -----#
+      GPIH_FMTKSP(0)="-DZz:"+GFMDAT
+      GPIH_FMTKSP(1)="-K:40X"
+      GPIH_FMTKSP(2)="-K:"+num$(GLONBPS)+"X"
+      GPIH_FMTKSP(3)="-KP:"+num$(GLONSHO)+"X"
+    Endif
+  Endif
+  # Issue 71253 - 2012-05-10 by SR : Localisation portugaise
+  If func AFNC.ACTIV("KPO")
+    Gosub CHARG_FMTPOR From SUBPIHC
+  Endif
+
+  # Issue 71069 - 2013-08-26 by MUARN : PJT
+  GPJTSNGDOC = func TRTPJT.GET_PARAM_PJTSNGDOC(GFCY)
+
+  # Issue 117554 - 2016-08-12 by MUARN : type arrondi TVA
+  Call PARAML(GFCY,"VATRND",GBIDC3) From ADOVAL
+  GVATRND=val(GBIDC3)
+
+Endif
+
+#----- Chargement des globales unité poids et volume pour répartition -----#
+Call PARAM(GFCY,"SALDSPWEU",GSALDSPWEU) From ADOVAL
+Call PARAM(GFCY,"SALDSPVOU",GSALDSPVOU) From ADOVAL
+#----- Chargement du pays de la société GPIH_CPYCRY -----#
+Raz GBIDI1
+If clalev([F:CPY])<=0 Local File COMPANY [CPY] : GBIDI1=1 : Endif
+Read [CPY] CPY0=GSOCIETE : If fstat Raz [F:CPY] : Endif
+GPIH_CPYCRY=[F:CPY]CRY
+If GBIDI1=1 Close Local File [CPY] : Raz GBIDI1 : Endif
+#-----
+Call DEFRCPFCY(GFCY)  From TRTACHDEF1
+Call GLOBVAR(GFCY)    From WWGLOBACH
+Call GLOBVAR(GFINRSP) From WWGLOBBUD
+Call PARAM(GFCY,"PIHACCDAT",PARAM2)    From ADOVAL
+GPIHACCDAT=val(PARAM2)
+Call PARAM(GFCY,"PIHCURDAT",PARAM2)    From ADOVAL
+GPIHCURDAT=val(PARAM2)
+Call PARAM(GFCY,"PIHQTYAQR",PARAM2)    From ADOVAL
+GPIHQTYAQR=val(PARAM2)
+Call PARAM(GFCY,"PURCMM",PARAM2)       From ADOVAL
+GPURCMM=val(PARAM2)
+Call PARAM(GFCY,"PURCMMDAT",PARAM2)    From ADOVAL
+GPURCMMDAT=val(PARAM2)
+Call PARAM(GFCY,"SIVNULL",PARAM2)      From ADOVAL
+GSIVNULL=val(PARAM2)
+#85785 * new PIVSUP param
+# Issue 114426
+Call PARAM(GFCY,"PIVSUP",PARAM2)       From ADOVAL
+GPIVSUP=val(PARAM2)
+# End issue 114426
+Call PARAM(GFCY,"FLGPAZ",PARAM2)       From ADOVAL
+GPIH_FLGPAZ=val(PARAM2) : If GPIH_FLGPAZ=0  GPIH_FLGPAZ=2 : Endif
+Call PARAM(GFCY,"CTLDATORI",PARAM2)    From ADOVAL
+GCTLDATORI=val(PARAM2)  : If GCTLDATORI=0   GCTLDATORI=2  : Endif
+# Issue 70507 - 2012-01-18 by MUARN : facturation quantité retournée
+Call PARAM(GFCY,"PIHQTYRET",PARAM2)    From ADOVAL
+GPIHQTYRET=val(PARAM2)  : If GPIHQTYRET=0   GPIHQTYRET=2 : Endif
+# Issue 83026 - 2012-07-11 by MUARN : early discount
+Call PARAM(GFCY,"DEPMGTMOD",PARAM2) From ADOVAL
+GDEPMGTMOD=val(PARAM2)
+# Exigence 82615 : Législation belge --str
+# FQ122815  Ajout d'un suffixe aux variables globales GDCLFEES, GACVDAS, GACVBE281
+Global Char GDCLFEES_PIH
+If  func AFNC.ACTIV("FEE")  # Issue X3-107197
+  GDCLFEES_PIH = func AFNC.PARAM("DCLFEES", GSOCIETE)
+Endif  # End Issue X3-107197
+Global Integer GACVDAS_PIH, GACVBE281_PIH
+If func AFNC.ACTIV("DAS")   Then GACVDAS_PIH  =1 Else GACVDAS_PIH  =0 : Endif
+If func AFNC.ACTIV("BE281") Then GACVBE281_PIH=1 Else GACVBE281_PIH=0 : Endif
+# Exigence 82615 : Législation belge --str
+# Issue 84130 - 2012-12-17 by MAE : Landed cost
+Call PARAM(GSOCIETE,"NODVATSTO",PARAM2) From ADOVAL
+  GNODVATSTO=val(PARAM2)
+Return
+
+
+#---------------------------------------------------------
+# Activation/désactivation champs Numérotation Argentine #
+#--------------------------------------------------------#
+$GRIZO_ARG
+If dim([M:PIH1]TYPVCR)>0
+  If GLOCARGNUM
+    Actzo [PIH1]TYPVCR, CLSVCR, SCUVCR, SEQVCR
+  Else
+    Grizo [PIH1]TYPVCR, CLSVCR, SCUVCR, SEQVCR
+  Endif
+Endif
+If dim([M:PIH3]CAI)>0
+  If GLOCARGNUM
+    Actzo [PIH3]CAI, DATVLYCAI
+  Else
+    Grizo [PIH3]CAI, DATVLYCAI
+  Endif
+Endif
+
+Return
+
+# Issue 100651 - 2014-06-06 by MUARN : Déplacement de SUBPIHA à SUBPIHD
+# MAJ_FICHIERS_LIGNE et des étiquettes appelées
+# subprog MAJ_CDE
+# Subprog MAJ_DESENGAGE
+# Subprog MAJ_RCP
+
+# Issue number - 2011-09-20 by VPO : ajout PE pour permettant de ne pas
+# imputer la quantité sur-facturée sur des réceptions existantes.
+########################################################################
+# MAJ_EXTRA_QTE_PTD : Si sur-facturation (qté facturée supérieure      #
+#                 à la qté réceptionnée) réajustement des quantités    #
+#                 facturées de la réception (PRECEIPTD)                #
+########################################################################
+$MAJ_EXTRA_QTE_PTD
+NUMERO=[F:PTD]PTHNUM
+WLIGNE=[F:PTD]PTDLIN
+If [F:PID]UOM=[F:PTD]STU
+  GBIDD1=WQTEUOM
+Else
+  Call PCAL_QTY(WQTE,[F:PID]PUU,GBIDD1,[F:PTD]STU,
+&               [F:PID]ITMREF,[F:PTH]BPSNUM,1,GBIDD2) From TRTACHQTE1
+Endif
+If SIGN=-1
+  Update [PTD] Where PTHNUM=NUMERO & PTDLIN=WLIGNE
+&              With INVQTYPUU-=WQTE*(3-(2*[F:PIH]INVTYP)),
+&                   INVQTYSTU-=GBIDD1*(3-(2*[F:PIH]INVTYP))
+  [F:PTD]INVQTYPUU-=WQTE*(3-(2*[F:PIH]INVTYP))
+  [F:PTD]INVQTYSTU-=GBIDD1*(3-(2*[F:PIH]INVTYP))
+Else
+  Update [PTD] Where PTHNUM=NUMERO & PTDLIN=WLIGNE
+&              With INVQTYPUU+=WQTE*(3-(2*[F:PIH]INVTYP)),
+&                   INVQTYSTU+=GBIDD1*(3-(2*[F:PIH]INVTYP))
+  [F:PTD]INVQTYPUU+=WQTE*(3-(2*[F:PIH]INVTYP))
+  [F:PTD]INVQTYSTU+=GBIDD1*(3-(2*[F:PIH]INVTYP))
+Endif
+If fstat GOK=0 : Call FSTA("PTD") From GLOCK : Endif
+Return
+
+########################################################################
+# MAJ_EXTRA_QTE : Si excédent de facturation (qté facturée supérieure  #
+#                 à la qté réceptionnée) réajustement des quantités    #
+#                 facturées de la réception (PRECEIPTD)                #
+# -------------------------------------------------------------------- #
+#   SIGN     : Sens de la mise à jour (+1=Cumul, -1=Soustraction)      #
+#   WQTE     : Excédent de quantité facturée en UA                     #
+#   WQTEUOM  : Excédent de quantité facturée en UOM                    #
+#   [F:PTD]PTHNUM : Numéro de la réception à mettre à jour             #
+#   [F:PTD]PTDLIN : Ligne  de la réception à mettre à jour             #
+########################################################################
+$MAJ_EXTRA_QTE
+If [F:PTD]PTHNUM="" | [F:PTD]PTDLIN=0  : Return : Endif
+# Issue 113975 - 2016-01-28 by SR : dans certains cas :
+# Type de document d'origine n'est pas réception ou facture
+# Réception directe
+# Intersoc (car on l'a déjà fait)
+# Avoir  sur autre chose qu'une facture sur réception,
+# on ne disatche pas donc on remet tout sur la réception
+#Gosub MAJ_EXTRA_QTE_PTD : # Issue number - 2011-09-20 by VPO
+If !find([F:PID]TYPORI,2,4) | [F:PTD]POHNUM="" | [M:PIH0]BETCPY=2
+&  | ([F:PID]TYPORI=4 & [F:PIDB]TYPORI<>2)
+    Gosub MAJ_EXTRA_QTE_PTD : # Issue number - 2011-09-20 by VPO
+Endif
+NUMERO=[F:PTD]PTHNUM
+WLIGNE=[F:PTD]PTDLIN
+# End issue 113975
+
+If !find([F:PID]TYPORI,2,4) | [F:PTD]POHNUM="" | [M:PIH0]BETCPY=2 :  Return : Endif
+If [F:PID]TYPORI=4 & [F:PIDB]TYPORI<>2  Return : Endif
+# Issue X3-25003 - 2018-01-12 by SR : Se positionner sur la commande si besoin
+If [F:POH]POHNUM <> [F:PTD]POHNUM
+  Read [F:POH]POH0 = [F:PTD]POHNUM
+  If fstat : Raz [F:POH] : Endif
+Endif
+#----- Si origine réception, mettre sur-facturation sur réception non facturée -----#
+If dim(WPOHNUM)<1 Local Char    WPOHNUM(GLONPOH) : Endif
+If dim(WPOPLIN)<1 Local Integer WPOPLIN          : Endif
+If dim(WPOQSEQ)<1 Local Integer WPOQSEQ          : Endif
+If dim(WPRTFLG)<1 Local Integer WPRTFLG          : Endif
+If dim(WQTESUP)<1 Local Decimal WQTESUP          : Endif
+WPOHNUM=[F:PTD]POHNUM
+WPOPLIN=[F:PTD]POPLIN
+WPOQSEQ=[F:PTD]POQSEQ
+WPRTFLG=[F:PID]PRTFLG : [F:PID]PRTFLG=2 : # Pour le Call MAJ_RCP
+If SIGN*(3-(2*[F:PIH]INVTYP))=-1
+  GBIDC3="INVQTYPUU>0"
+  If clalev([F:PIDB])<=0 Local File PINVOICED [PIDB] : Default File [PID] : Endif
+  If clalev([F:PIDC])<=0 Local File PINVOICED [PIDC] : Default File [PID] : Endif
+Else
+  GBIDC3="LININVFLG<2"
+Endif
+If clalev([F:PTDB])<=0 Local File PRECEIPTD [PTDB] : Default File [PID] : Endif
+For [PTDB] PTD2 Where POHNUM=WPOHNUM
+&                   & POPLIN=WPOPLIN
+&                   & POQSEQ=WPOQSEQ
+&                   & evalue(GBIDC3)
+&                   & (PTHNUM<>NUMERO | PTDLIN<>WLIGNE)
+  #----- Annulation facture ou avoir sur réception -----#
+  If SIGN*(3-(2*[F:PIH]INVTYP))=-1
+    Raz GBIDD3
+    For [PIDB] PID1 Where TYPORI=2 & NUMORI=[F:PTDB]PTHNUM & LINORI=[F:PTDB]PTDLIN
+      GBIDD3+=[F:PIDB]QTYPUU
+      #----- Tenir compte d'éventuels avoirs sur facture -----#
+      For [PIDC] PID1 Where TYPORI=4 & NUMORI=[F:PIDB]NUM & LINORI=[F:PIDB]PIDLIN
+        If [F:PIDB]NETPRI=[F:PIDC]NETPRI  GBIDD3-=[F:PIDC]QTYPUU : Endif
+      Next
+    Next
+    #-----
+    If [F:PTDB]INVQTYPUU-GBIDD3>0
+      WQTESUP=[F:PTDB]INVQTYPUU-GBIDD3
+      If WQTESUP>=WQTE
+         WQTESUP=WQTE : Raz WQTE
+      Else
+         WQTE-=WQTESUP
+      Endif
+      Call PCAL_QTY(WQTESUP,[F:PID]PUU,WQTEUOM,[F:PID]UOM,
+&                   [F:PID]ITMREF,[F:PTH]BPSNUM,1,GBIDD2) From TRTACHQTE1
+      WQTEMESS=WQTESUP : # Issue number - 2011-09-20 by VPO
+      # Issue 100651 - 2014-06-06 by MUARN : Déplacement de SUBPIHA à SUBPIHD
+      Call MAJ_RCP(SIGN,[F:PTDB]PTHNUM,[F:PTDB]PTDLIN,WQTESUP,WQTEUOM,WQTE2,WNBRCP) From SUBPIHD
+      # Issue number - 2011-09-20 by VPO : ajout message pour avertir qte prise sur reception
+      If GOK
+         Call MESSAGE(func AFNC.MES2(mess(423,194,1),[F:PTDB]PTHNUM-'/'-num$([F:PTDB]PTDLIN),num$(WQTEMESS-WQTESUP))) From GESECRAN
+      Endif
+    Endif
+  #----- Facture ou annulation d'avoir sur réception -----#
+  Else
+    WQTEMESS=WQTE : # Issue number - 2011-09-20 by VPO
+    # Issue 100651 - 2014-06-06 by MUARN : Déplacement de SUBPIHA à SUBPIHD
+    Call MAJ_RCP(SIGN,[F:PTDB]PTHNUM,[F:PTDB]PTDLIN,WQTE,WQTEUOM,WQTE2,WNBRCP) From SUBPIHD
+    # Issue number - 2011-09-20 by VPO : ajout message pour avertir qte prise sur reception
+    If GOK
+       Call MESSAGE(func AFNC.MES2(mess(423,194,1),[F:PTDB]PTHNUM-'/'-num$([F:PTDB]PTDLIN),num$(WQTEMESS-WQTE))) From GESECRAN
+    Endif
+  Endif
+  If GOK<1  Break : Endif
+  If WQTE=0 Break : Endif
+Next
+[F:PID]PRTFLG=WPRTFLG
+# Issue 113975 - 2016-01-28 by SR : Si tout n'a pas été dispatché , on met à jour la réception concernée par la facture
+If GOK<1 Return : Endif
+Read [PTD] PTD0=NUMERO;WLIGNE
+# Issue X3-25003 - 2018-01-12 by SR : Pas si nouvelle méthode
+If GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT : Return : Endif
+If !fstat &  WQTE<>0
+    Gosub MAJ_EXTRA_QTE_PTD : # Màj qtés facturées de la réception en cours si excédent de facturation
+Endif
+# End issue 113975
+Return
+
+###########################################################################
+# MAJ_EXTRA_INTSOC : Si excédent de facturation (qté facturée supérieure  #
+#                    à la qté réceptionnée) réajustement des quantités    #
+#                    facturées sur les autres réceptions inter-sociétés   #
+#                    portant sur la même ligne de livraison ou par défaut #
+#                    sur la réception venant d'être traitée               #
+# ----------------------------------------------------------------------- #
+#   SIGN     : Sens de la mise à jour (+1=Cumul, -1=Soustraction)         #
+#   WQTE     : Excédent de quantité facturée en UA                        #
+#   WQTEUOM  : Excédent de quantité facturée en UOM                       #
+#   [F:PTD]PTHNUM : Numéro de la réception venant d'être traitée          #
+#   [F:PTD]PTDLIN : Ligne  de la réception venant d'être traitée          #
+###########################################################################
+$MAJ_EXTRA_INTSOC
+If [F:PTD]PTHNUM="" | [F:PTD]PTDLIN=0 Return : Endif
+NUMERO=[F:PTD]PTHNUM
+WLIGNE=[F:PTD]PTDLIN
+If dim(WSDHNUM)<1 Local Char    WSDHNUM(GLONSDH) : Endif
+If dim(WSDDLIN)<1 Local Integer WSDDLIN          : Endif
+If dim(WPRTFLG)<1 Local Integer WPRTFLG          : Endif
+WSDHNUM=[F:PTD]SDHNUM
+WSDDLIN=[F:PTD]SDDLIN
+WPRTFLG=[F:PID]PRTFLG : [F:PID]PRTFLG=2 : # Pour le Call MAJ_RCP
+If SIGN*(3-(2*[F:PIH]INVTYP))=-1  GBIDC3="LININVFLG=2"  Else  GBIDC3="LININVFLG=1" : Endif
+If clalev([F:PTDB])<=0 Local File PRECEIPTD [PTDB] : Default File [PID] : Endif
+For [PTDB] PTD1 Where evalue(GBIDC3)
+&                   & BPSNUM  =[M:PIH0]BPR
+&                   & ITMREF  =[F:PID]ITMREF
+&                   & SDHNUM  =WSDHNUM
+&                   & SDDLIN  =WSDDLIN
+&                   & (PTHNUM<>NUMERO | PTDLIN<>WLIGNE)
+  # Issue 100651 - 2014-06-06 by MUARN : Déplacement de SUBPIHA à SUBPIHD
+  Call MAJ_RCP(SIGN,[F:PTDB]PTHNUM,[F:PTDB]PTDLIN,WQTE,WQTEUOM,WQTE2,WNBRCP) From SUBPIHD
+  If GOK<1  Break : Endif
+  If WQTE=0 Break : Endif
+Next
+If SIGN*(3-(2*[F:PIH]INVTYP))=-1 & GOK=1 & WQTE<>0
+  For [PTDB] PTD1 Where LININVFLG=1
+&                     & BPSNUM   =[M:PIH0]BPR
+&                     & ITMREF   =[F:PID]ITMREF
+&                     & SDHNUM   =WSDHNUM
+&                     & SDDLIN   =WSDDLIN
+&                     & INVQTYPUU>0 & INVQTYPUU<=QTYPUU
+&                     & (PTHNUM <>NUMERO | PTDLIN<>WLIGNE)
+    # Issue 100651 - 2014-06-06 by MUARN : Déplacement de SUBPIHA à SUBPIHD
+    Call MAJ_RCP(SIGN,[F:PTDB]PTHNUM,[F:PTDB]PTDLIN,WQTE,WQTEUOM,WQTE2,WNBRCP) From SUBPIHD
+    If GOK<1  Break : Endif
+    If WQTE=0 Break : Endif
+  Next
+Endif
+[F:PID]PRTFLG=WPRTFLG
+If GOK<1 Return : Endif
+If WQTE<>0
+  Read [PTD] PTD0=NUMERO;WLIGNE
+  If !fstat
+    Gosub MAJ_EXTRA_QTE : # Màj qtés facturées réception si excédent de facturation
+  Endif
+Endif
+Return
+
+
+########################################################################
+# EXISTE_GTE_NUM : S/P de contrôle de l'existence de la clé dans les   #
+#                  pièces comptables et les échéances                  #
+# -------------------------------------------------------------------- #
+# Subprog EXISTE_GTE_NUM(TYP,NUM)                                      #
+#   TYP     : Type de pièce comptable (GTE)                            #
+#   NUM     : Numéro de la facture                                     #
+########################################################################
+Subprog EXISTE_GTE_NUM(TYP,NUM)
+Value    Char     TYP
+Value    Char     NUM
+If clalev([F:DUD])<=0 Local File GACCDUDATE [DUD] : Endif
+If clalev([F:HAT])<=0 Local File GACCTMP    [HAT] : Endif
+Look [DUD] DUD0(2)=TYP;NUM
+If !fstat
+  GMESSAGE=mess(57,119,1)   : # Une échéance existe déjà avec ce numéro
+  mkstat=2 : End
+Endif
+Look [HAT] HAT0=TYP;NUM
+If !fstat
+  GMESSAGE=mess(58,119,1)   : # Une écriture existe déjà avec ce numéro
+  mkstat=2 : End
+Endif
+If GMODU(2)=2
+  If clalev([F:HAE])<=0 Local File GACCENTRY  [HAE] : Endif
+  Look [HAE] HAE0=TYP;NUM
+  If !fstat
+    GMESSAGE=mess(58,119,1) : # Une écriture existe déjà avec ce numéro
+    mkstat=2 : End
+  Endif
+Endif
+End
+
+#################################################################
+# Mises à jour complémentaires suite à une annulation comptable #
+# ------------------------------------------------------------- #
+#       - L'appel est fait depuis le traitement ANUBIS          #
+#       - Une transaction est en cours                          #
+#################################################################
+$MAJ_ANUBIS
+Call REGPRIX("!#DEVALIDE") From TRTACHFAC1          : # Régularisation inverse des prix
+If GOK<1  Return : Endif
+# Issue X3-25002 - 2017-05-23 by SR : Valorisation des réceptions
+Delete [F:PSV] Where NUM = [F:PIH]NUM
+If fstat : GOK = 0 : Return : Endif
+# End issue X3-25003
+Call BUDGET ("!#DEVALIDE",GMESSAGE) From TRTACHFAC1 : # Ré-engagement budgétaire
+If GOK<1  Return : Endif
+Call VALSTA("PIH",-1) From SUBPS2                   : # Màj statistiques entête facture
+If GOK<1  Return : Endif
+For [PID] Where NUM=[F:PIH]NUM
+  Call VALSTA("PID",-1) From SUBPS2                 : # Màj statistiques lignes facture
+  If GOK<1  Break : Endif
+Next
+If GOK<1  Return : Endif
+#----- Autres màj ?  Pas pour l'instant ! -----#
+Return
+
+#--------------------------------------#
+# Chargement des textes entête et pied #
+#--------------------------------------#
+$CHARG_TEXT_ENTETE
+If [M:PIH0]TEX1<>""
+  If left$([M:PIH0]TEX1,3)="PIV"
+    Call CRE_CLOB([M:PIH0]TEX1,GOK) From TRTX3TEX
+    If GOK<1  Return : Endif
+  Elsif left$([M:PIH0]TEX1,3)<>"BPS"
+    Call DUP_CLOB("PIV",[M:PIH0]TEX1,GOK) From TRTX3TEX
+    If GOK<1  Return : Endif
+  Endif
+  [F:PIV]TEX1=[M:PIH0]TEX1
+Endif
+If [M:PIH0]TEX2<>""
+  If left$([M:PIH0]TEX2,3)="PIV"
+    Call CRE_CLOB([M:PIH0]TEX2,GOK) From TRTX3TEX
+    If GOK<1  Return : Endif
+  Elsif left$([M:PIH0]TEX2,3)<>"BPS"
+    Call DUP_CLOB("PIV",[M:PIH0]TEX2,GOK) From TRTX3TEX
+    If GOK<1  Return : Endif
+  Endif
+  [F:PIV]TEX2=[M:PIH0]TEX2
+Endif
+Return
+
+#---------------------------------#
+# Chargement du texte de la ligne #
+#---------------------------------#
+$CHARG_TEXT_LIGNE
+If [M:PIH3]LINTEX(nolign-1)<>""
+  If left$([M:PIH3]LINTEX(nolign-1),3)="PID"
+    Call CRE_CLOB([M:PIH3]LINTEX(nolign-1),GOK) From TRTX3TEX
+    If GOK<1  Return : Endif
+  Elsif !find(left$([M:PIH3]LINTEX(nolign-1),3),"ITM","ITP")
+    Call DUP_CLOB("PID",[M:PIH3]LINTEX(nolign-1),GOK) From TRTX3TEX
+    If GOK<1  Return : Endif
+  Endif
+  [F:PID]LINTEX=[M:PIH3]LINTEX(nolign-1)
+Endif
+Return
+
+#------------------------------------------------------------------------#
+# Affichage entêtes colonnes variables (comptes et sections analytiques) #
+#------------------------------------------------------------------------#
+$AFF_TITCOL
+If GSOC_UPDFLG & !GIMPORT & (dim([M:PIH3]LINACC1)>0 | dim([M:PIH3]CCE1)>0)
+  Local Char BASPAG(10)
+  BASPAG="NBLIG" : Gosub TIT_COL From ="W1WE8"+GPTRNUM+"3"
+  BASPAG="NBFAC" : Gosub TIT_COL From ="W1WE8"+GPTRNUM+"4"
+  #----- Pour forcer l'utilisation des formats évalués si tableau vide -----#
+  If [M:PIH3]NBLIG=0
+    [M:PIH3]NBLIG=1 : Affzo [PIH3]5 : Effzo [PIH3]5
+    [M:PIH3]NBLIG=0 # Issue 84942 - 2012-10-04 by MUARN : erreur zone obligatoire
+  Endif
+  If [M:PIH4]NBFAC=0
+    [M:PIH4]NBFAC=1 : Affzo [PIH4]5 : Effzo [PIH4]5
+    [M:PIH4]NBFAC=0 # Issue 84942 - 2012-10-04 by MUARN : erreur zone obligatoire
+  Endif
+  #-----
+Endif
+# Issue 84130 - 2013-01-24 by MUARN : landed cost
+If GFONCTION = "GESPIH" & !GIMPORT
+  Titcol [M:CSTI]NBCST mess(796,197,1) + " (" + GCUR + ")" For TOTDOC
+  Titcol [M:CSTI]NBCST mess(797,197,1) + " (" + GLOCALDEV + ")" For TOTSOC
+Endif
+
+Raz GSOC_UPDFLG
+Return
+
+$AVANT_CHOI    #----MAE, le 19/02/08----#
+#------------------------------------------------------------------------#
+# facture en création, alimentée par le fournisseur via les navigations  #
+#------------------------------------------------------------------------#
+If GCREFONC=1
+   REPONSE=GSTANEW
+   Gosub NOUVEAU From GOBJSUB
+   Gosub SETBOUT From GOBJSUB
+   #MAE, le 28/10/08, on autorise pas la modification du fournisseur quand on vient de l'acran des fournisseurs
+   # FGR 18/02/2014 : X3SUIVI96940 ne pas faire le diszo : ça désactive les actions sur champ (contrôle, AM...)
+   #   If [M:PIH0]BPR <> ""
+   #    Diszo [M:PIH0]BPR
+   #   Endif
+   # FGR 18/02/2014 : X3SUIVI96940 empêche l'exécution du AM_BPCORD
+   #GCREFONC = 0
+   GCREFONC = 2
+Endif
+Return
+
+$APRES_CHOI
+If currbox = GBOXLO1 Then
+  # Si on est sur le tiroir des dépenses liées
+  Case REPONSE
+    When GSTALFT
+      # L'écran des dépenses n'est pas ouvert : on peut repartir dessus
+      Local Char BIDON(1)
+      Call OBJET("LOF", BIDON, [F:LOF]CODLOF+"@"+num$([F:LOF]LINLOF)) From GOBJET
+  Endcase
+Endif
+Return
+
+#MAE, bg 77405
+$VERROU_HAE
+If [F:PIH]INVTYP<>5
+ [L]SYMBHAE = "HAE"+[F:PIH]NUM+"\"+[F:PIH]GTE
+ Lock =SYMBHAE With lockwait=0
+ If fstat
+  Unlock =SYMBOLE
+  [L]OK=0
+ Endif
+Endif
+Return
+
+$DEVERROU_HAE
+If SYMBHAE<>""
+ Unlock =SYMBHAE
+Endif
+Return
+
+$CASH_VAT   #90370 Cash VAT SPA
+If func AFNC.ACTIV("KSP")
+  Call LEC_BPS([F:PIH]BPR) From CPTLEC
+  If [F:BPS]CSHVAT=2 or func AFNC.PARAM("SPACSHVAT",[F:PIH]CPY)="2"
+    Local Integer CSHVAT
+    Call CSHVATBPS([F:PIH]ACCDAT,[F:PIH]CRY,[F:PIH]VAC,[F:PIH]CPY, [F:PIH]TAX(),[F:BPS]CSHDAT,
+&   [F:BPS]CSHVAT,CSHVAT) From DCLVATSPA
+    [F:PIH]CSHVAT=CSHVAT
+  Endif
+Endif
+Return
+

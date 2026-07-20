@@ -1,0 +1,2446 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Class SFTTXN
+####################################################################################
+
+#**
+#* Label for coding event of CRUD
+#* @param CURPTH Local Char(250), contains the class path
+#* @param AEVENT Local Char(20), contains the event code
+#* @return ASTATUS Local Integer
+#*!
+$EVENTS
+Case [L]CURPTH
+   When ""
+    Case [L]AEVENT
+      When "AINSERT_BEFORE"  : Gosub AINSERT_BEFORE
+      When "AUPDATE_BEFORE"  : Gosub AUPDATE_BEFORE
+    Endcase
+Endcase
+Return
+
+#**
+#* Label for coding action on INIT, GET, CONTROL and PROPAGATE
+#* @param CURPRO Local Char(50), contains the property code
+#* @param ARULE Local Char(20), contains the action code requested
+#* @return ASTATUS Local Integer
+#*!
+$PROPERTIES
+#Case [L]CURPRO
+#   Case [L]ARULE
+#   Endcase
+#Endcase
+Return
+
+#**
+#* Label for coding your methods
+#* @param AMETHOD Local Char(20), contains the method code
+#* @return ARET_VALUE (the type of the return value is declared in the method)
+#*!
+$METHODS
+Case [L]AMETHOD
+  When "EMPLOYEE_CLOCKIN"         : Gosub EMPLOYEE_CLOCKIN
+  When "EMPLOYEE_CLOCKOUT"        : Gosub EMPLOYEE_CLOCKOUT
+  When "OPERATION_START"          : Gosub OPERATION_START
+  When "OPERATION_STOP"           : Gosub OPERATION_STOP
+  When "BREAK_START"              : Gosub BREAK_START
+  When "BREAK_STOP"               : Gosub BREAK_STOP
+  When "BREAK_STOP_NO_RESTART"    : Gosub BREAK_STOP_NO_RESTART
+  When "TIME_TRACKING"            : Gosub TIME_TRACKING
+  When "SFTAUTOBREAK"             : Gosub SFTAUTOBREAK
+Endcase
+Return
+
+#**
+#* Label for coding your operations
+#* @param AOPERATION Local Char(20), contains the operation code
+#* @return ARET_VALUE (the type of the return value is declared in the method)
+#*!
+$OPERATIONS
+#Case [L]AOPERATION
+#Endcase
+Return
+
+###################################################################################
+# Data CRUD Events
+###################################################################################
+$AINSERT_BEFORE
+  Call UPDATEACTUALTIMES(this)
+
+  # Verify that NUMJOBs is at least 1 unless Time Clock
+  If this.NUMJOBS=0 & this.SFTTYP<>1
+    this.NUMJOBS=1
+  Endif
+
+  If this.SHIFTDAT=[0/0/0]
+      # Set the shift date for the record
+      Call UPDATESHIFTDATE(this)
+  Endif
+
+Return
+
+$AUPDATE_BEFORE
+  Call UPDATEACTUALTIMES(this)
+Return
+
+###################################################################################
+# Data class methods
+###################################################################################
+
+###################################################################################
+#Perform an Employee Clock In function
+###################################################################################
+$EMPLOYEE_CLOCKIN
+#Value  Integer EMPNUM
+#Value  Char    FCY
+
+  Local Integer LOCAL_STATUS
+
+  If func SFTLIB.ISTEAM(EMPNUM) = [V]CST_AYES #Teams can't clock in
+    LOCAL_STATUS = fmet this.ASETERROR ("", mess(15,2422,1), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+    Return
+  Endif
+
+  If func SFTLIB.EMPLOYEE_CLOCKED_IN(EMPNUM) = [V]CST_AYES #This should never happen but just in case
+    #LOCAL_STATUS = fmet this.ASETERROR ("", mess(14,2422,1), [V]CST_AERROR)
+    LOCAL_STATUS = fmet this.ASETERROR ("", func AFNC.MES1(mess(14,2422,1),num$(EMPNUM)), [V]CST_AERROR) #CT-1797
+    [L]ARET_VALUE = [V]CST_AERROR
+    Return
+  Endif
+
+  If func SFTLIB.EMPLOYEEACTIVE(EMPNUM) = [V]CST_ANO
+    Local Char EMPID : Call TEXTE(10793,EMPID) From OBJDIV
+    GERR=1 : GMESSAGE =  EMPID - ":" - num$(EMPNUM) - " \" + mess(2,126,1)
+    mkstat = 2
+    Return
+  Endif
+
+  this.EMPNUM = EMPNUM
+
+  If func SFTLIB.EMPTYP(EMPNUM) = 3 #Summary team
+    this.TEAMNUM = EMPNUM
+  Endif
+
+  this.SFTTYP = 1
+  this.SFTSEQ = func NEXT_SEQ(EMPNUM, 1, "")
+  this.FCY    = FCY
+
+  this.UTCSTRDATTIM = datetime$
+  this.UTCOFFSET    = fmet this.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, FCY, "SFTOFFSET")
+
+  # TODAN - 119641. Default value for the checkbox fields. These fields should only have the value 1-No or 2-Yes.
+  If this.CLEFLG = 0 : this.CLEFLG = [V]CST_ANO : Endif
+  If this.MACFLG = 0 : this.MACFLG = [V]CST_ANO : Endif
+  If this.NUMMAC = 0 : this.NUMMAC = [V]CST_ANO : Endif
+
+  LOCAL_STATUS = fmet this.AINSERT
+  If [L]LOCAL_STATUS <> CST_AOK
+    [L]ARET_VALUE = [L]LOCAL_STATUS
+    ASTATUS = fmet this.ASETERROR ("", func AFNC.MES1(mess(13,2422,1),mess(1,2416,1)), [V]CST_AERROR)
+    Return
+  Endif
+
+  [L]ARET_VALUE = [V]CST_AOK
+
+Return
+
+####################################################################################
+#Perform an Employee Clock Out function
+####################################################################################
+$EMPLOYEE_CLOCKOUT
+#Value  Integer EMPNUM
+#Value  Char    FCY
+#Requires the correct record to be active in the class
+
+  Local Datetime  CLOCKOUTTIME
+  Local Decimal   DURATION
+  Local Char      ERRMSG(125)
+  Local Integer   ERRNUM
+  # TTD-2536.sn
+  Local Integer   EMPTEAMNUM : EMPTEAMNUM = 0
+  Local Integer   EMPONTEAMTASKS : EMP_ON_TEAM_TASKS = [V]CST_ANO
+  # TTD-2536.en
+
+  [L]CLOCKOUTTIME = datetime$
+
+  If this.UTCSTRDATTIM=AVOID.ADATTIM
+    [L]ASTATUS = fmet this.ASETERROR ("", mess(81,75,1), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+    Return
+  Endif
+
+  If this.UTCENDDATTIM <> AVOID.ADATTIM
+    [L]ASTATUS = fmet this.ASETERROR ("", mess(16,2422,1), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+    Return
+  Endif
+
+  #Before an employee can clock out - all operations need to be stopped.
+  Local File SFTTXN [SFTXN]
+  Local Instance SFTTXN_TEMP Using C_SFTTXN
+
+  SFTTXN_TEMP = NewInstance C_SFTTXN AllocGroup null
+
+  # TTD-2536. Check if employee is on the team
+  Call EMP_TEAM_NUM(EMPNUM, EMPTEAMNUM) From SFTLIB
+
+  #First we need to stop any breaks or exclusive indirect since they may restart other operations
+  Filter [SFTXN] Where EMPNUM=this.EMPNUM & find(SFTTYP,2,3) & UTCENDDATTIM=AVOID.ADATTIM
+  For [SFTXN]
+    If [F:SFTXN]SFTTYP=2 & [F:SFTXN]INDTYP=3
+      # This is a non-exclusive indirect - don't stop it here
+      Goto SKIP
+    Endif
+
+    # Read the correct record
+    If fmet SFTTXN_TEMP.AREAD([F:SFTXN]EMPNUM, [F:SFTXN]SFTTYP, [F:SFTXN]VCRNUM, [F:SFTXN]SFTSEQ) <> [V]CST_AOK
+      [L]ASTATUS = fmet this.ASETERROR ("", mess(81,75,1), [V]CST_AERROR)
+      [L]ARET_VALUE = [V]CST_AERROR
+      Break
+    Endif
+
+    # Call Break stop for this transaction - We dont want restarted operations
+    [L]ASTATUS = fmet SFTTXN_TEMP.BREAK_STOP_NO_RESTART([L]CLOCKOUTTIME,[F:SFTXN]SFTTYP)
+    If [L]ASTATUS <> [V]CST_AOK
+      [L]ASTATUS = fmet this.ASETERROR ("", SFTTXN_CLOCKOUT.AERROR.MES, [V]CST_AERROR)
+      [L]ARET_VALUE = [V]CST_AERROR
+      Break
+    Endif
+
+    #TT-1461.s
+    # Scenario: Team break and team member clocked out team break.
+    # Search employee machine record when "Run during break" is ON
+    Local File SFTTXN [SFTXNM]
+    Filter [SFTXNM] Where EMPNUM = [F:SFTXN]EMPNUM & SFTTYP <> 1 & UTCENDDATTIM=AVOID.ADATTIM
+    For [SFTXNM]
+      Call MACHINE_STOP([SFTXNM]EMPNUM, [SFTXNM]TEAMNUM, [SFTXNM]SFTTYP, [SFTXNM]VCRNUM,
+&                       [SFTXNM]SFTSEQ, [L]CLOCKOUTTIME, ERRNUM, ERRMSG) From SFTLIB
+
+      # TTD-2129. Stop Team machine record...
+      If [SFTXNM]TXNUUID <> AVOID.AUUID
+        Call STOP_TEAM_RECORDS([SFTXNM]EMPNUM, [SFTXNM]TEAMNUM, [SFTXNM]TXNUUID, [L]CLOCKOUTTIME) From SFTLIB
+      Endif
+
+    Next
+    Filter [SFTXNM]
+    LogicClose File [SFTXNM]
+    #TT-1461.e
+SKIP:
+  Next
+  Filter [SFTXN]
+
+  # If we encountered an error - stop now.
+  If [L]ARET_VALUE = [V]CST_AERROR : Goto EXIT : Endif
+
+  #Now close all remaining open jobs using STOP_OPERATIONS to correctly handle associated machine records
+  Filter [SFTXN] Where EMPNUM=this.EMPNUM & SFTTYP<>1 & SFTTYP<>3 & UTCENDDATTIM=AVOID.ADATTIM &
+&                      (MACFLG <> [V]CST_AYES | TEAMNUM <> 0 & TEAMNUM <> EMPNUM | TXNUUID = AVOID.AUUID)
+
+  For [SFTXN]
+      # TTD-2536. Check if employee is on the team task(s)
+      If EMPTEAMNUM <> 0 & [F:SFTXN]TEAMNUM <> 0 & EMP_ON_TEAM_TASKS = [V]CST_ANO
+        EMP_ON_TEAM_TASKS = [V]CST_AYES
+      Endif
+
+      Local  Integer  SFTTYP(0..), SFTSEQ(0..), OPENUM(0..), INDTYP(0..), CPLQTY(0..), REJQTY(0..), SCANUM(0..), CLEFLG(0..)
+      Local  Char     VCRNUM(20)(0..)
+      SFTTYP(0) = [F:SFTXN]SFTTYP
+      SFTSEQ(0) = [F:SFTXN]SFTSEQ
+      OPENUM(0) = [F:SFTXN]OPENUM
+      INDTYP(0) = [F:SFTXN]INDTYP
+      CPLQTY(0) = 0
+      REJQTY(0) = 0
+      SCANUM(0) = 0
+      CLEFLG(0) = [V]CST_ANO    # TODAN-119641.n
+#      CLEFLG(0) = 0            # TODAN-119641.o
+      CLEFLG(1) = -1 #this is used to tell stop operation we are coming from clockout and dont need to restart
+      VCRNUM(0) = [F:SFTXN]VCRNUM
+      Call STOP_OPERATIONS([F:SFTXN]EMPNUM, [F:SFTXN]FCY, SFTTYP, VCRNUM, OPENUM, SFTSEQ, INDTYP, CPLQTY, REJQTY, SCANUM, CLEFLG, 1) From SFTLIB #TTD-1447
+  Next
+
+  # Finally - perform the actual clockout
+  this.UTCENDDATTIM = [L]CLOCKOUTTIME
+  this.DURATION = func SFTLIB.CALC_DURATION(this.UTCSTRDATTIM,this.UTCENDDATTIM, this.NUMJOBS, this.SUMEMP)
+
+  If fmet this.AUPDATE <> [V]CST_AOK
+    [L]ASTATUS = fmet this.ASETERROR ("", func AFNC.MES1(mess(13,2422,1),mess(1,2416,1)), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+    Goto EXIT
+  Endif
+
+  # The clock out was a success.  Now process any autobreaks
+  SFTTXN_TEMP = NewInstance C_SFTTXN AllocGroup null   # Get a new instance to use for the auto break method
+
+  If fmet SFTTXN_TEMP.SFTAUTOBREAK(EMPNUM, FCY) <> [V]CST_AOK
+    [L]ASTATUS = fmet this.ASETERROR ("", mess(17,2422,1), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+  Endif
+
+  # TTD-2536. Check if employee was on a team task and is the last team member that work on the team task
+  If EMP_ON_TEAM_TASKS = [V]CST_AYES & func SFTLIB.LAST_TEAM_MEMBER_ON_TEAM_TASK(EMPNUM, EMPTEAMNUM) = [V]CST_AYES
+    If fmet SFTTXN_TEMP.SFTAUTOBREAK(EMPTEAMNUM, FCY) <> [V]CST_AOK
+      [L]ASTATUS = fmet this.ASETERROR ("", mess(17,2422,1), [V]CST_AERROR)
+      [L]ARET_VALUE = [V]CST_AERROR
+    Endif
+  Endif
+
+  FreeGroup SFTTXN_TEMP
+
+EXIT:
+  # Clean up my objects here before we return
+  LogicClose File [SFTXN]
+  Kill SFTTXN_TEMP
+
+Return
+####################################################################################
+$BREAK_START
+#Value  Integer EMPNUM
+#Value  Char    FCY
+#Value  Integer SFTTYP
+#Value  Char    INDREF
+#Value  Integer INDTYP
+
+  Local Integer   LOCAL_STATUS
+  Local Datetime  BREAKSTART
+  Local Uuident   BREAKTXN
+  Local Decimal   DURATION
+  Local Char      ERRMSG(125)
+  Local Integer   ERRNUM
+  Local Integer   SFTEMPCLK
+  Local Integer   EMPTYP #CT-1797
+
+  SFTEMPCLK = fmet this.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, FCY, "SFTEMPCLK")
+
+  Local Integer EMP_LIST(1..)
+  Local Integer TEAMNUM
+  Local Uuident TXNUUID
+  EMP_LIST(1) = EMPNUM
+  EMPTYP = func SFTLIB.EMPTYP(EMPNUM) #CT-1797
+
+  Case func SFTLIB.EMPTYP(EMPNUM)
+    When 2    # Detailed team
+      Call TEAM_LIST (EMPNUM, 'A', EMP_LIST) From SFTLIB
+      TEAMNUM = EMPNUM
+      TXNUUID = getUuid
+      #We need to add the TEAMNUM to correctly stop Machine records if needed
+      EMP_LIST(maxtab(EMP_LIST)+1) = TEAMNUM
+    When 3    # Summary team
+      TEAMNUM = EMPNUM
+  Endcase
+
+  # Break TXN is a GUID that identifies all of the transactions stopped by this break.
+  # Needed to re-start them all at the end of the break
+  BREAKTXN = getUuid
+
+  # Get the break start time - will be used for starting this and ending all of the rest
+  BREAKSTART  = datetime$
+
+  #Loop through all employees
+  For X = 1 To maxtab(EMP_LIST)
+
+    #Detailed Team machine only will fail the next few checks but we still need to process the break
+    If TEAMNUM = EMP_LIST(X) and TXNUUID <> AVOID.AUUID
+      Goto SKIP_CHECKS
+    Endif
+
+    If SFTEMPCLK = [V]CST_AYES & func SFTLIB.EMPLOYEE_CLOCKED_IN(EMP_LIST(X)) = [V]CST_ANO
+      #LOCAL_STATUS = fmet this.ASETERROR ("", mess(12,2422,1), [V]CST_AERROR)
+      LOCAL_STATUS = fmet this.ASETERROR ("", func AFNC.MES1(mess(12,2422,1),num$(EMP_LIST(X))), [V]CST_AERROR) #CT-1797
+      [L]ARET_VALUE = [V]CST_AERROR
+      Break
+    Endif
+
+    If func SFTLIB.EMPLOYEE_ON_BREAK(EMP_LIST(X)) = [V]CST_AYES
+      #LOCAL_STATUS = fmet this.ASETERROR ("", mess(18,2422,1), [V]CST_AERROR)
+      #CT-1797.sn
+      Case EMPTYP
+        When 1  # Employee
+          LOCAL_STATUS = fmet this.ASETERROR ("", mess(18,2422,1), [V]CST_AERROR)
+        When 2  # Detailed Team
+          LOCAL_STATUS = fmet this.ASETERROR ("", mess(122,2422,1), [V]CST_AERROR)
+        When 3  # Summary team
+          LOCAL_STATUS = fmet this.ASETERROR ("", mess(121,2422,1), [V]CST_AERROR)
+      Endcase
+      #CT-1797.en
+
+      [L]ARET_VALUE = [V]CST_AERROR
+      Break
+    Endif
+
+    If func SFTLIB.EMPLOYEEACTIVE(EMP_LIST(X)) = [V]CST_ANO
+      Local Char EMPID : Call TEXTE(10793,EMPID) From OBJDIV
+      GERR=1 : GMESSAGE =  EMPID - ":" - num$(EMP_LIST(X)) - " \" + mess(2,126,1)
+      mkstat = 2
+      Break
+    Endif
+
+    #Detailed Team machine only
+    SKIP_CHECKS:
+
+    # Close out all other operations that are going currently.
+    # We will do this as a loop through the table
+    Local File SFTTXN [SFTXN]
+
+    Trbegin [SFTXN]
+    Filter [SFTXN] Where EMPNUM=EMP_LIST(X) & SFTTYP<>1 & SFTTYP<>3 & UTCENDDATTIM=AVOID.ADATTIM
+
+    For [SFTXN]
+
+      [F:SFTXN]BRKTXN       = [L]BREAKTXN
+      [F:SFTXN]UTCENDDATTIM = [L]BREAKSTART
+      [F:SFTXN]ACTENDDATTIM = [L]BREAKSTART
+
+      #Check if the Machine record needs to continue during breaks
+      If [F:SFTXN]MACFLG = [V]CST_AYES
+        If !clalev([MWS]) : Local File WORKSTATIO [MWS] : Endif
+        Read [MWS]WST0  = [SFTXN]WCENTER;[SFTXN]FCY
+        #TTD-2129. When the team member on an individual break we want to
+        # stop the machine only task that belong to the team member.
+        # Skip the Machine record when it is individual/Team member on
+        # individual tasks or summary team OR
+        # When it is a team member that is working on a individual task.
+        # Else, stop the machine task.
+        If [MWS]RUNBRKFLG = [V]CST_AYES & ((TEAMNUM = 0 & [F:SFTXN]TEAMNUM = 0) | (TEAMNUM <> 0 & [F:SFTXN]TEAMNUM <> 0))
+#          If [MWS]RUNBRKFLG = [V]CST_AYES
+          Goto SKIP_MACHINE
+        Endif
+
+        #Detailed team Machine only records have 0 duration for team members
+        If [F:SFTXN]TEAMNUM <> 0 and [F:SFTXN]EMPNUM <> [F:SFTXN]TEAMNUM
+          [F:SFTXN]UTCENDDATTIM = [F:SFTXN]UTCSTRDATTIM
+        Endif
+      Endif
+
+      [F:SFTXN]DURATION = func SFTLIB.CALC_DURATION([F:SFTXN]UTCSTRDATTIM, [L]BREAKSTART, [F:SFTXN]NUMJOBS, [F:SFTXN]SUMEMP)
+
+      #MJH 2282.
+      #If we arent starting the break as a team but we found a team record to stop,
+      # we need to seperate our tasks from the teams. That means removing
+      # the transaction ID.
+      If TEAMNUM = 0 & [F:SFTXN]TEAMNUM <> 0
+        [F:SFTXN]TXNUUID = AVOID.AUUID
+      Endif
+
+      Rewrite [SFTXN]
+      If fstat
+        ERRMSG = func AFNC.MES1(mess(13,2422,1),mess([F:SFTXN]SFTTYP,2416,1))
+        ERRNUM = [V]CST_AERROR
+        Break
+      Endif
+
+      SKIP_MACHINE:
+    Next
+
+    If ERRNUM = [V]CST_AOK
+      Commit
+      LogicClose File [SFTXN]
+    Else
+      [L]ASTATUS = fmet this.ASETERROR ("", ERRMSG, [V]CST_AERROR)
+      [L]ARET_VALUE = [V]CST_AERROR
+      Rollback
+      LogicClose File [SFTXN]
+      Return
+    Endif
+
+    # Assuming we were able to close out all of other transactions, let's create this break
+    this.EMPNUM       = EMP_LIST(X)
+    this.TEAMNUM      = TEAMNUM
+    this.TXNUUID      = [L]TXNUUID
+    this.SUMEMP       = func SFTLIB.SUMEMP(EMPNUM)
+    this.SFTTYP       = [L]SFTTYP
+    this.SFTSEQ       = func NEXT_SEQ(EMP_LIST(X), [L]SFTTYP, "")
+    this.INDREF       = [L]INDREF
+    this.INDTYP       = [L]INDTYP
+    this.BRKTXN       = [L]BREAKTXN
+    this.UTCSTRDATTIM = [L]BREAKSTART
+    this.UTCOFFSET    = fmet this.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, FCY, "SFTOFFSET")
+    this.FCY          = FCY
+
+    # TODAN - 119641. Default value for the checkbox fields. These fields should only have the value 1-No or 2-Yes.
+    If this.CLEFLG = 0 : this.CLEFLG = [V]CST_ANO : Endif
+    If this.MACFLG = 0 : this.MACFLG = [V]CST_ANO : Endif
+    If this.NUMMAC = 0 : this.NUMMAC = [V]CST_ANO : Endif
+
+    #For detailed team machine only. We don't want the team record to have a break on it, only the employees
+    If TEAMNUM <> EMP_LIST(X) or TXNUUID = AVOID.AUUID
+      LOCAL_STATUS = fmet this.AINSERT
+    Endif
+
+    If [L]LOCAL_STATUS <> [V]CST_AOK
+      [L]ARET_VALUE = [L]LOCAL_STATUS
+      ERRMSG = func AFNC.MES1(mess(13,2422,1),mess([L]SFTTYP,2416,1))
+      ASTATUS = fmet this.ASETERROR ("", ERRMSG, [V]CST_AERROR)
+      Return
+    Endif
+
+    [L]ARET_VALUE = [V]CST_AOK
+
+
+  Next
+
+Return
+####################################################################################
+$BREAK_STOP
+#Value Datetime STOPTIME
+#Value Integer  SFTTYP
+
+  # Re-start all of the transactions we stopped at the start of the break
+  # We will do this as a loop through the table
+  If this.BRKTXN <> AVOID.AUUIDENT
+
+    Local File SFTTXN [SFTXN]
+    Local Instance SFTTXN_BREAK Using C_SFTTXN
+
+    #We want to stop any break with our given break transaction.
+    Filter [SFTXN] Where BRKTXN=this.BRKTXN
+
+    For [SFTXN]
+      # TTD-1206/1452/1548. Skip other team member break record.
+      # when it not a team break stop
+      If [F:SFTXN]TEAMNUM = this.TEAMNUM & [F:SFTXN]EMPNUM <> this.EMPNUM
+        Goto NEXT_BREAK_REC
+      Endif
+
+      #Don't try to reopen the record we are closing.
+      If !([F:SFTXN]SFTTYP=this.SFTTYP & [F:SFTXN]SFTSEQ=this.SFTSEQ)
+        SFTTXN_BREAK = NewInstance C_SFTTXN AllocGroup null
+
+        SFTTXN_BREAK.EMPNUM       = [F:SFTXN]EMPNUM
+        SFTTXN_BREAK.TEAMNUM      = [F:SFTXN]TEAMNUM
+        SFTTXN_BREAK.SFTTYP       = [F:SFTXN]SFTTYP
+        SFTTXN_BREAK.VCRNUM       = [F:SFTXN]VCRNUM
+        SFTTXN_BREAK.SUMEMP       = [F:SFTXN]SUMEMP
+        SFTTXN_BREAK.SFTSEQ       = func NEXT_SEQ([F:SFTXN]EMPNUM, [F:SFTXN]SFTTYP, [F:SFTXN]VCRNUM)
+        SFTTXN_BREAK.UTCSTRDATTIM = [L]STOPTIME
+        SFTTXN_BREAK.UTCOFFSET    = [F:SFTXN]UTCOFFSET
+        SFTTXN_BREAK.INDREF       = [F:SFTXN]INDREF
+        SFTTXN_BREAK.NUMJOBS      = [F:SFTXN]NUMJOBS
+        SFTTXN_BREAK.OPENUM       = [F:SFTXN]OPENUM
+        SFTTXN_BREAK.NUMMAC       = [F:SFTXN]NUMMAC
+        SFTTXN_BREAK.WCENTER      = [F:SFTXN]WCENTER
+        SFTTXN_BREAK.LCENTER      = [F:SFTXN]LCENTER
+        SFTTXN_BREAK.OPEUOM       = [F:SFTXN]OPEUOM
+        SFTTXN_BREAK.INDTYP       = [F:SFTXN]INDTYP
+        SFTTXN_BREAK.FCY          = [F:SFTXN]FCY
+        SFTTXN_BREAK.SHIFT        = [F:SFTXN]SHIFT
+        SFTTXN_BREAK.SHIFTDAT     = [F:SFTXN]SHIFTDAT
+        SFTTXN_BREAK.TXNUUID      = [F:SFTXN]TXNUUID
+        SFTTXN_BREAK.STRTXNUUID   = [F:SFTXN]STRTXNUUID    #Jira 46517.n 07/06/17 by CATUA Set value for STRTXNUUID
+        SFTTXN_BREAK.MACFLG       = [F:SFTXN]MACFLG
+        SFTTXN_BREAK.CLEFLG       = [F:SFTXN]CLEFLG       # TODAN-119641.n
+
+        # TTD-2129. Do not restart when team member stop the individual break
+        # while on a team tasks.
+        If [F:SFTXN]TEAMNUM <> 0 & this.TEAMNUM = 0
+          Goto SKIP_INSERT
+        Endif
+
+        # Insert new record when:
+        # individual employee, summary team or
+        # Details team with open activities...
+        #   1. Employee is part of the team and on individual break
+        #   2. Team break
+        If fmet SFTTXN_BREAK.AINSERT <> [V]CST_AOK
+          [L]ASTATUS = fmet this.ASETERROR ("", mess(5,2422,1), [V]CST_AERROR)
+          [L]ARET_VALUE = [V]CST_AERROR
+          FreeGroup SFTTXN_BREAK
+          Break
+        Endif
+
+        SKIP_INSERT:
+        FreeGroup SFTTXN_BREAK
+
+        # Remove the Break transaction GUID from this record
+        [F:SFTXN]BRKTXN  = AVOID.AUUIDENT
+
+        Rewrite [SFTXN]
+        If fstat
+          [L]ASTATUS = fmet this.ASETERROR ("", mess(250,177,1), [V]CST_AERROR)
+          [L]ARET_VALUE = [V]CST_AERROR
+          Break
+        Endif
+      Endif
+NEXT_BREAK_REC:
+    Next
+
+    LogicClose File [SFTXN]
+
+    If ARET_VALUE <> [V]CST_AOK : Return : Endif
+
+  Endif
+
+  # Stop this break transaction
+  this.UTCENDDATTIM = [L]STOPTIME
+  this.DURATION = func SFTLIB.CALC_DURATION(this.UTCSTRDATTIM,this.UTCENDDATTIM, this.NUMJOBS, this.SUMEMP)
+  this.BRKTXN = AVOID.AUUIDENT
+
+  If fmet this.AUPDATE <> [V]CST_AOK
+    [L]ASTATUS = fmet this.ASETERROR ("", func AFNC.MES1(mess(13,2422,1),mess([L]SFTTYP,2416,1)), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+    Return
+  Endif
+
+  [L]ARET_VALUE = [V]CST_AOK
+
+Return
+####################################################################################
+$BREAK_STOP_NO_RESTART
+#Value Datetime STOPTIME
+#Value Integer  SFTTYP
+
+#  Local Integer IEMPNUM, ITEAMNUM, ISFTTYP, ISFTSEQ
+#  Local Char    IVCRNUM(20), ERRMSG
+#  Local Integer END_TEAM_RECORD, ERR
+  #TTD-1973.s
+  Local Char    ERRMSG(250)
+  Local Integer I, LAST_TEAM_MEMBER, ERRNUM
+  Local Uuident TEMP_TXNUUID(1..)
+  Local Integer ITEAMNUM
+  Local Integer TEAM_REC_ONLY
+
+  LAST_TEAM_MEMBER = [V]CST_ANO
+  TEAM_REC_ONLY = [V]CST_AYES
+  If this.TEAMNUM <> 0 : ITEAMNUM = this.TEAMNUM : Endif
+  #TTD-1973.e
+
+  Local File SFTTXN [SFTXNBS]
+
+  # Stop the break record and clear out break code from other records that have the same break code
+  # We will do this as a loop through the table
+  If this.BRKTXN <> AVOID.AUUIDENT
+    #TTD-1973.s
+    # Check if this is a team break and team member stop/clockout the team break
+    If this.TEAMNUM <> 0 & this.EMPNUM <> this.TEAMNUM
+      Filter [SFTXNBS] Where [SFTXNBS]BRKTXN = this.BRKTXN & [SFTXNBS]EMPNUM <> this.EMPNUM & [SFTXNBS]EMPNUM <> this.TEAMNUM
+      Look [SFTXNBS] First
+      Filter [SFTXNBS]
+      If fstat  # Not found
+        LAST_TEAM_MEMBER = [V]CST_AYES
+      Endif
+    Endif
+    #TTD-1973.e
+
+    Filter [SFTXNBS] Where EMPNUM=this.EMPNUM & BRKTXN=this.BRKTXN
+    For [SFTXNBS]
+
+      # Skip the Break record and clear out the break code from other stop tasks
+      If !([F:SFTXNBS]SFTTYP=this.SFTTYP & [F:SFTXNBS]SFTSEQ=this.SFTSEQ)
+        # Remove the Break transaction GUID from this record
+        [F:SFTXNBS]BRKTXN = AVOID.AUUIDENT
+        Rewrite [SFTXNBS]
+        If fstat
+          [L]ASTATUS = fmet this.ASETERROR ("", mess(250,177,1), [V]CST_AERROR)
+          [L]ARET_VALUE = [V]CST_AERROR
+          Break
+        Endif
+        # TTD-2129. This is a scenario that the team member take individual break/indirect exclusive
+        # We need to find out if this is a last team member. Only need to loop once.
+        If [L]ITEAMNUM = 0 & [F:SFTXNBS]TEAMNUM <> 0
+          Local File SFTTXN [SFTXNLTM]
+          # Check if there is another break/indirect exclusive
+          Filter [SFTXNLTM] Where EMPNUM <> this.EMPNUM & TEAMNUM = [F:SFTXNBS]TEAMNUM & BRKTXN <> AVOID.AUUIDENT
+          Look [SFTXNLTM] First
+          Filter [SFTXNLTM]
+          If fstat  # Not found
+            # Look for open records that is not a team records
+            Filter [SFTXNLTM] Where EMPNUM <> this.EMPNUM & TEAMNUM = [F:SFTXNBS]TEAMNUM & SFTTYP<>1 & UTCENDDATTIM=AVOID.ADATTIM
+            For [SFTXNLTM]
+              If [SFTXNLTM]EMPNUM <> [F:SFTXNBS]TEAMNUM
+                TEAM_REC_ONLY = [V]CST_ANO
+                Break
+              Endif
+            Next
+            Filter [SFTXNLTM]
+          Else
+            TEAM_REC_ONLY = [V]CST_ANO
+          Endif
+          ITEAMNUM = [F:SFTXNBS]TEAMNUM
+          If TEAM_REC_ONLY = [V]CST_AYES
+            LAST_TEAM_MEMBER = [V]CST_AYES
+          Endif
+          LogicClose File [SFTXNLTM]
+        Endif
+
+        # TTD-1973. If this is a last team member then collect the transaction ids to close out the
+        # team records later
+        If LAST_TEAM_MEMBER = [V]CST_AYES
+          If !find([F:SFTXNBS]TXNUUID, TEMP_TXNUUID)
+            I += 1
+            TEMP_TXNUUID(I) = [F:SFTXNBS]TXNUUID
+          Endif
+        Endif
+      Endif
+    Next
+    Filter [SFTXNBS]
+    LogicClose File [SFTXNBS]
+
+  Endif
+
+  # Stop this break transaction
+  this.UTCENDDATTIM = [L]STOPTIME
+  this.DURATION = func SFTLIB.CALC_DURATION(this.UTCSTRDATTIM,this.UTCENDDATTIM, this.NUMJOBS, this.SUMEMP)
+  this.BRKTXN = AVOID.AUUIDENT
+
+  If fmet this.AUPDATE <> [V]CST_AOK
+    [L]ASTATUS = fmet this.ASETERROR ("", func AFNC.MES1(mess(13,2422,1),mess([L]SFTTYP,2416,1)), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+    Return
+  Endif
+
+  If ARET_VALUE <> [V]CST_AOK : Return : Endif
+  #TTD-1973.s
+  If maxtab(TEMP_TXNUUID) > 0
+    Local File SFTTXN [SFTXNMS]
+    Trbegin [SFTXNMS]
+    # If get to here mean...close out the team machine record(s), if exists, because this is the last team member.
+    For I = 1 To maxtab(TEMP_TXNUUID)
+      # Use transaction id to look for the team machine record(s)
+      Filter [SFTXNMS] Where [SFTXNMS]TXNUUID = TEMP_TXNUUID(I) &
+&                            [SFTXNMS]EMPNUM = [L]ITEAMNUM & [SFTXNMS]TEAMNUM = [L]ITEAMNUM &
+&                            MACFLG = [V]CST_AYES
+        Read [SFTXNMS] First
+        If fstat : Goto NEXT_TRANS_REC : Endif
+        For [SFTXNMS]
+          # Run during break is OFF. only need to clear out the break code
+          If [SFTXNMS]BRKTXN <> AVOID.AUUIDENT
+            [SFTXNMS]BRKTXN = AVOID.AUUIDENT
+          Else  # Run during break is ON
+            # Stop and transfer the machine, if needed, on the run operation.
+            If [SFTXNMS]SFTTYP = 5
+              Call MACHINE_STOP([SFTXNMS]EMPNUM, [SFTXNMS]TEAMNUM, [SFTXNMS]SFTTYP, [SFTXNMS]VCRNUM,
+&                               [SFTXNMS]SFTSEQ, [L]STOPTIME, ERRNUM, ERRMSG) From SFTLIB
+              Goto NEXT_TEAM_MAC_REC
+            Else    # Setup operation only need to stop
+                [SFTXNMS]UTCENDDATTIM = [L]STOPTIME
+                [SFTXNMS]DURATION     = func SFTLIB.CALC_DURATION([SFTXNMS]UTCSTRDATTIM,
+&                                           [SFTXNMS]UTCENDDATTIM, [SFTXNMS]NUMJOBS, [SFTXNMS]SUMEMP)
+            Endif
+          Endif
+
+          Rewrite [SFTXNMS]
+          If fstat
+            ERRMSG = func AFNC.MES1(mess(13,2422,1),mess([F:SFTXNMS]SFTTYP,2416,1))
+            ERRNUM = [V]CST_AERROR
+            Break
+          Endif
+        NEXT_TEAM_MAC_REC:
+        Next
+    NEXT_TRANS_REC:
+    Next
+    LogicClose File [SFTXNMS]
+
+    If ERRNUM = [V]CST_AOK
+      Commit
+      LogicClose File [SFTXNMS]
+    Else
+      [L]ASTATUS = fmet this.ASETERROR ("", mess(250,177,1), [V]CST_AERROR)
+      [L]ARET_VALUE = [V]CST_AERROR
+      Rollback
+      LogicClose File [SFTXNMS]
+      Return
+    Endif
+  Endif #If maxtab(TEMP_TXNUUID) > 0
+  #TTD-1973.e
+  [L]ARET_VALUE = [V]CST_AOK
+Return
+####################################################################################
+$SFTAUTOBREAK
+#Value  Integer EMPNUM
+#Value  Char    FCY
+
+  Local Date      CURDATE, TXNSTRDATE, TXNENDDATE
+  Local Char      CURTIME(6), TXNSTRTIME(6), TXNENDTIME(6)
+  Local Integer   NEXTDAY
+  Local Char      CRIT(255)
+  Local Integer   TEAM, I
+  Local Char      TXNYEAR(4), TXNMONTH(2), TXNDAY(2), TXNHOUR(2), TXNMIN(2)
+  Local Datetime  SAVEENDDATETIME, BREAKSTART, BREAKEND
+  Local Decimal   SAVCPLQTY, SAVREJCPLQTY
+  Local Integer   SAVSCANUM, SAVCLOSEFLG
+  Local Integer   MACHINE_ONLY, RUN_DURING_BREAK    # TTD-2397/2412
+
+  # Verify auto breaks are turned on
+  If fmet this.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, FCY, "SFTAUTOBRK") <> [V]CST_AYES
+    Return
+  Endif
+
+  # Read the employee record
+  Local File TABMAT   [TMA]
+  Read [TMA]TMA0=EMPNUM
+  If fstat
+    ASTATUS = fmet this.ASETERROR ("", mess(3,76,1)-mess(81,75,1), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+    LogicClose File [TMA]
+    Return
+  Endif
+
+  # If no shift defined, then exit
+  If [F:TMA]SHIFT=""
+    LogicClose File [TMA]
+    Return
+  Endif
+
+  # Read the shift record
+  Local File SFTSHIFT [SFTS]
+  Read [SFTS]SHF0=[F:TMA]SHIFT
+  If fstat
+    ASTATUS = fmet this.ASETERROR ("", mess(185,195,1)-mess(81,75,1), [V]CST_AERROR)
+    [L]ARET_VALUE = [V]CST_AERROR
+    LogicClose File [TMA], [SFTS]
+    Return
+  Endif
+
+  # Get the current local time based on the site
+  Call TIMESTAMP([L]FCY, [L]CURDATE, [L]CURTIME) From SFTLIB
+
+  # Check if the shift spans over two days
+  If [F:SFTS]SHFSTR<[F:SFTS]SHFEND
+    NEXTDAY = [V]CST_ANO
+  Else
+    # check if in first or second half of the shift
+    If CURTIME>="0000" & CURTIME<[F:SFTS]SHFEND
+      NEXTDAY = [V]CST_AYES # in second half of shift
+    Else
+      NEXTDAY = [V]CST_ANO
+    Endif
+  Endif
+
+  # Set CRIT to filter either by employee or team
+  If func SFTLIB.EMPTYP(EMPNUM) <> 1      # not employee type
+    CRIT = "TEAMNUM = [L]EMPNUM"
+    TEAM = EMPNUM
+  Else
+    CRIT = "EMPNUM = [L]EMPNUM"
+    Raz TEAM
+  Endif
+
+  # Filter the records to only retreive run/setup job or indirect labor
+  CRIT -= '& (SFTTYP=1 | SFTTYP>3 | (SFTTYP=2 & (INDTYP=3 | INDTYP=4)))'
+
+  # Filter out elapsed entries
+  CRIT -= '& UTCSTRDATTIM<>AVOID.ADATTIM'
+
+  # Open the transaction table
+  Local File SFTTXN [SFTX]
+  Local Instance SFTTXN_AUTOBRK Using C_SFTTXN
+
+  Local File SFTTXN [SFTXML]   # TTD-2397/2412
+
+  # Loop through all of the possible breaks based on the shift
+  For I = 0 To dim([F:SFTS]BRKCOD)-1
+
+    If [F:SFTS]BRKCOD(I)="" : Break : Endif
+
+    # Check if the break should now be occuring, if not skip
+    # If shift is in a single day, do not apply breaks that have not yet occured
+    If [F:SFTS]SHFSTR<[F:SFTS]SHFEND
+      If [F:SFTS]BRKSTR(I)>CURTIME
+        Goto NEXT_BREAK
+      Endif
+    Else
+
+      # Handle two day shifts
+      If NEXTDAY = [V]CST_AYES
+        # Second half of shift
+        # Skip if the start time is in second half of shift and has not occured yet
+        If [F:SFTS]BRKSTR(I)>="0000" & [F:SFTS]BRKSTR(I)<=[F:SFTS]SHFEND & [F:SFTS]BRKSTR(I)>CURTIME
+          Goto NEXT_BREAK
+        Endif
+      Else
+
+        # First half of the shift
+        # If break is for the next day, skip it
+        If [F:SFTS]BRKSTR(I)>="000000" & [F:SFTS]BRKSTR(I)<=[F:SFTS]SHFEND
+          Goto NEXT_BREAK
+        Endif
+
+        # If break is not for next day, check if the time has passed for it to be applied
+        If [F:SFTS]BRKSTR(I)>CURTIME
+          Goto NEXT_BREAK
+        Endif
+      Endif
+    Endif
+
+    # Read all of the open transactions that we need to apply breaks to
+    Filter [SFTX] Where evalue(CRIT) Order By SFTTYP Desc
+    For [SFTX]
+      # TTD-2397/2412.so
+#      # Check if it is a machine record and if it continues to run during breaks
+#      If [F:SFTX]MACFLG = [V]CST_AYES
+#        If !clalev([MWS]) : Local File WORKSTATIO [MWS] : Endif
+#        Read [MWS]WST0  = [SFTX]WCENTER;[SFTX]FCY
+#        If [MWS]RUNBRKFLG = [V]CST_AYES
+#          Goto NEXT_OPERATION
+#        Endif
+#      Endif
+      # TTD-2397/2412.eo
+
+      MACHINE_ONLY = [V]CST_ANO
+      RUN_DURING_BREAK = [V]CST_ANO
+
+      SFTTXN_AUTOBRK = NewInstance C_SFTTXN AllocGroup null
+      # Read the correct record
+      If fmet SFTTXN_AUTOBRK.AREAD([F:SFTX]EMPNUM, [F:SFTX]SFTTYP, [F:SFTX]VCRNUM, [F:SFTX]SFTSEQ) <> [V]CST_AOK
+        [L]ASTATUS = fmet this.ASETERROR ("", mess(81,75,1), [V]CST_AERROR)
+        [L]ARET_VALUE = [V]CST_AERROR
+        Break
+      Endif
+
+      # Get the start date and time of the transaction in local time
+      Call PARSEDATETIME (SFTTXN_AUTOBRK.UTCSTRDATTIM, SFTTXN_AUTOBRK.UTCOFFSET, TXNYEAR, TXNMONTH, TXNDAY, TXNHOUR, TXNMIN) From SFTLIB
+      [L]TXNSTRDATE = [L]TXNYEAR+[L]TXNMONTH+[L]TXNDAY
+      [L]TXNSTRTIME = [L]TXNHOUR+[L]TXNMIN+"00"
+
+      If SFTTXN_AUTOBRK.UTCENDDATTIM <> AVOID.ADATTIM
+        Call PARSEDATETIME (SFTTXN_AUTOBRK.UTCENDDATTIM, SFTTXN_AUTOBRK.UTCOFFSET, TXNYEAR, TXNMONTH, TXNDAY, TXNHOUR, TXNMIN) From SFTLIB
+        [L]TXNENDDATE = [L]TXNYEAR+[L]TXNMONTH+[L]TXNDAY
+        [L]TXNENDTIME = [L]TXNHOUR+[L]TXNMIN+"00"
+      Else
+        #MJH-2292 Would produce autobreak records without end times.
+        #Now we skip making the autobreak. If necessary we will create it on clock out
+        #[L]TXNENDDATE = [0/0/0]
+        #[L]TXNENDTIME = "000000"
+        Goto NEXT_OPERATION
+      Endif
+
+      # TTD-2397/2412.sn
+      # Check if it is a machine record and if it continues to run during breaks
+      If [F:SFTX]MACFLG = [V]CST_AYES
+        # See if this is a machine/labor operation
+        Filter [SFTXML] Where EMPNUM = [F:SFTX]EMPNUM & VCRNUM = [F:SFTX]VCRNUM & OPENUM = [F:SFTX]OPENUM &
+&                               SFTTYP = [F:SFTX]SFTTYP & MACFLG <> [V]CST_AYES
+        Look [SFTXML] First
+        Filter [SFTXML]
+        If fstat    # Not found. This mean this is a machine only...
+          MACHINE_ONLY = [V]CST_AYES
+        Endif
+
+        # Continues to run during breaks?
+        If !clalev([MWS]) : Local File WORKSTATIO [MWS] : Endif
+        Read [MWS]WST0  = [SFTX]WCENTER;[SFTX]FCY
+        If [MWS]RUNBRKFLG = [V]CST_AYES   # Run during break is ON
+          RUN_DURING_BREAK = [V]CST_AYES
+          If MACHINE_ONLY = [V]CST_ANO : Goto NEXT_OPERATION : Endif
+          # Check if this is a team machine only operation.
+          # If yes, get the break start/end time and go direct to create break record since the end time
+          # of the team member records will be the same as the start time so it will fail all of the condition
+          # below.
+          If [F:SFTX]TEAMNUM <> 0 & [F:SFTX]TEAMNUM <> [F:SFTX]EMPNUM
+            # When machine only, the start and stop time are the same
+            If [L]TXNSTRTIME<[F:SFTS]BRKSTR(I) & [L]TXNSTRTIME<[F:SFTS]BRKEND(I)
+              [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+              [L]BREAKEND = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+            Endif
+
+            # Create break recod
+            Goto AUTOB
+          Endif
+        Else  # Run during break is OFF
+          RUN_DURING_BREAK = [V]CST_ANO
+          If MACHINE_ONLY = [V]CST_AYES
+            If [F:SFTX]TEAMNUM <> 0 & [F:SFTX]TEAMNUM <> [F:SFTX]EMPNUM
+              # When machine only, the start and stop time are the same
+              If [L]TXNSTRTIME<[F:SFTS]BRKSTR(I) & [L]TXNSTRTIME<[F:SFTS]BRKEND(I)
+                [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+                [L]BREAKEND = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+              Endif
+
+              # Create break recod
+              Goto AUTOB
+            Endif
+          Endif
+        Endif # [MWS]RUNBRKFLG = [V]CST_AYES
+      Endif   # End of ...[F:SFTX]MACFLG = [V]CST_AYES
+      # TTD-2397/2412.en
+
+      # If this is a clockin - skip past all of these cases, verify at least break created at end if needed
+      If SFTTXN_AUTOBRK.SFTTYP <> 1
+
+        # possible cases:
+        # 1. job spanned entire autobreak
+        # 2. job started during an autobreak
+        # 3. job stopped during an autobreak
+        # 4. job started and stopped during an autobreak
+        #
+        # Once a case if found, the other cases must not be called. A goto is used after each case
+        # since the class reference will change allowing the other cases to incorrectly run
+
+        # Case 1 - job spans autobreak.
+        # For example, job starts at 8am and stops at 4 pm. autobreak goes from 9 - 9:15
+        # Insert the break into the middle of the job and start and stop the job as needed.
+        If [L]TXNSTRTIME<[F:SFTS]BRKSTR(I) &
+&          ((([L]TXNENDTIME>[F:SFTS]BRKEND(I) & [L]TXNENDDATE=[L]TXNSTRDATE)   |
+&            ([L]TXNENDTIME<[F:SFTS]BRKEND(I) & [L]TXNENDDATE>[L]TXNSTRDATE))  |
+&          ([L]TXNENDDATE=[0/0/0] & [L]NEXTDAY = [V]CST_ANO))
+
+          # TTD - 2397/2412.sn
+          If MACHINE_ONLY = [V]CST_AYES & RUN_DURING_BREAK = [V]CST_AYES
+            # Save the end time to use as the start of the break
+            # Get the new end time (need to convert Break start time to a UTC date)
+            If [L]TXNENDTIME<[F:SFTS]BRKEND(I)
+              [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+              [L]BREAKEND = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+            Else
+              [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+              [L]BREAKEND = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+            Endif
+
+            # Create break recod
+            Goto AUTOB
+          Endif
+          # TTD - 2397/2412.en
+
+          # Save off the current End date/time to put into the new record
+          SAVEENDDATETIME = SFTTXN_AUTOBRK.UTCENDDATTIM
+
+          # Get the new end time (need to convert Break start time to a UTC date)
+          If [L]TXNENDTIME<[F:SFTS]BRKEND(I)
+            SFTTXN_AUTOBRK.UTCENDDATTIM = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+          Else
+            SFTTXN_AUTOBRK.UTCENDDATTIM = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+          Endif
+
+          # Update the actual end time (the inserted record below will reflect the correct actual)
+          SFTTXN_AUTOBRK.ACTENDDATTIM = SFTTXN_AUTOBRK.UTCENDDATTIM
+
+          # Save the end time to use as the start of the break
+          [L]BREAKSTART = SFTTXN_AUTOBRK.UTCENDDATTIM
+
+          # Set the duration
+          SFTTXN_AUTOBRK.DURATION = func SFTLIB.CALC_DURATION(SFTTXN_AUTOBRK.UTCSTRDATTIM, SFTTXN_AUTOBRK.UTCENDDATTIM, SFTTXN_AUTOBRK.NUMJOBS, SFTTXN_AUTOBRK.SUMEMP)
+
+          # Clear quantities and closed flag in pre-break - set back in post break.
+          SAVCPLQTY     = SFTTXN_AUTOBRK.CPLQTY
+          SAVREJCPLQTY  = SFTTXN_AUTOBRK.REJCPLQTY
+          SAVSCANUM     = SFTTXN_AUTOBRK.SCANUM
+          SAVCLOSEFLG   = SFTTXN_AUTOBRK.CLEFLG
+
+          SFTTXN_AUTOBRK.CPLQTY     = 0
+          SFTTXN_AUTOBRK.REJCPLQTY  = 0
+          SFTTXN_AUTOBRK.SCANUM     = 0
+          SFTTXN_AUTOBRK.CLEFLG     = [V]CST_ANO    # TODAN-119641.n
+#          SFTTXN_AUTOBRK.CLEFLG     = 0            # TODAN-119641.o
+
+          If fmet SFTTXN_AUTOBRK.AUPDATE <> [V]CST_AOK
+            [L]ASTATUS = fmet this.ASETERROR ("", mess(250,177,1), [V]CST_AERROR)
+            [L]ARET_VALUE = [V]CST_AERROR
+          Endif
+
+          # Use this same class value, update and do an insert for the time after the break
+          SFTTXN_AUTOBRK.UTCENDDATTIM = [L]SAVEENDDATETIME  # Use the existing end time
+
+          If [L]TXNENDTIME<[F:SFTS]BRKEND(I)
+            SFTTXN_AUTOBRK.UTCSTRDATTIM = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+          Else
+            SFTTXN_AUTOBRK.UTCSTRDATTIM = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+          Endif
+
+          # Set the actual to this new start time, clear actual end - will get updated in AUPDATE if needed.
+          SFTTXN_AUTOBRK.ACTSTRDATTIM = SFTTXN_AUTOBRK.UTCSTRDATTIM
+          SFTTXN_AUTOBRK.ACTENDDATTIM = AVOID.ADATTIM
+
+          # Set the duration
+          SFTTXN_AUTOBRK.DURATION = func SFTLIB.CALC_DURATION(SFTTXN_AUTOBRK.UTCSTRDATTIM, SFTTXN_AUTOBRK.UTCENDDATTIM, SFTTXN_AUTOBRK.NUMJOBS, SFTTXN_AUTOBRK.SUMEMP)
+
+          # Get the sequence number for the new transaction post break
+          SFTTXN_AUTOBRK.SFTSEQ = func NEXT_SEQ(SFTTXN_AUTOBRK.EMPNUM, SFTTXN_AUTOBRK.SFTTYP, SFTTXN_AUTOBRK.VCRNUM)
+
+          # Clear quantities and closed flag in pre-break - set back in post break.
+          SFTTXN_AUTOBRK.CPLQTY     = SAVCPLQTY
+          SFTTXN_AUTOBRK.REJCPLQTY  = SAVREJCPLQTY
+          SFTTXN_AUTOBRK.SCANUM     = SAVSCANUM
+          SFTTXN_AUTOBRK.CLEFLG     = SAVCLOSEFLG
+
+          # Save the start time to use as the end of the break
+          [L]BREAKEND = SFTTXN_AUTOBRK.UTCSTRDATTIM
+
+          If fmet SFTTXN_AUTOBRK.AINSERT <> [V]CST_AOK
+            [L]ASTATUS = fmet this.ASETERROR ("", func AFNC.MES1(mess(10,2422,1),mess(SFTTXN_AUTOBRK.SFTTYP,2416,1)), [V]CST_AERROR)
+            [L]ARET_VALUE = [V]CST_AERROR
+          Endif
+
+          Goto AUTOB
+        Endif
+
+        # Case 2 - job started during an autobreak, set the start time to the break end time.
+        # For exmaple, break goes from 9 - 9:15. User clock into a job at 9:05.
+        # They will lose 10 min and the job will really start at 9:15.
+        If [L]TXNSTRTIME>=[F:SFTS]BRKSTR(I)  & [L]TXNSTRTIME<=[F:SFTS]BRKEND(I) & (
+&         (([L]TXNENDTIME>[F:SFTS]BRKEND(I) & [L]TXNENDDATE=[L]TXNSTRDATE)     |
+&         ([L]TXNENDTIME<[F:SFTS]BRKEND(I)  & [L]TXNENDDATE>[L]TXNSTRDATE))    |
+&         [L]TXNENDDATE=[0/0/0])
+
+          # TTD - 2397/2412.sn
+          If MACHINE_ONLY = [V]CST_AYES & RUN_DURING_BREAK = [V]CST_AYES
+            # Set the times for the break transaction
+            [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+
+            # Adjust the start time to be the break end time
+            If [L]TXNENDTIME<[F:SFTS]BRKEND(I)
+              [L]BREAKEND = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+            Else
+              [L]BREAKEND = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+            Endif
+
+            # Create break record
+            Goto AUTOB
+          Endif
+          # TTD - 2397/2412.en
+
+          # Adjust the start time to be the break end time
+          If [L]TXNENDTIME<[F:SFTS]BRKEND(I)
+            SFTTXN_AUTOBRK.UTCSTRDATTIM = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+          Else
+            SFTTXN_AUTOBRK.UTCSTRDATTIM = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+          Endif
+
+          # Set the duration
+          SFTTXN_AUTOBRK.DURATION = func SFTLIB.CALC_DURATION(SFTTXN_AUTOBRK.UTCSTRDATTIM, SFTTXN_AUTOBRK.UTCENDDATTIM, SFTTXN_AUTOBRK.NUMJOBS, SFTTXN_AUTOBRK.SUMEMP)
+
+          # Update our transaction
+          If fmet SFTTXN_AUTOBRK.AUPDATE <> [V]CST_AOK
+            [L]ASTATUS = fmet this.ASETERROR ("", mess(250,177,1), [V]CST_AERROR)
+            [L]ARET_VALUE = [V]CST_AERROR
+          Endif
+
+          # Set the times for the break transaction
+          [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+          [L]BREAKEND   = SFTTXN_AUTOBRK.UTCSTRDATTIM
+
+          Goto AUTOB
+        Endif
+
+        # Case 3 - job stopped during an autobreak, set the end time to the break start time.
+        # For example, break goes from 9 - 9:15. User clocks off a job at 9:05.
+        # They will lose 5 min and the job will really stop at 9.
+        If [L]TXNSTRTIME<[F:SFTS]BRKSTR(I) & [L]TXNENDTIME>[F:SFTS]BRKSTR(I) & [L]TXNENDTIME<=[F:SFTS]BRKEND(I)
+
+          # TTD - 2397/2412.sn
+          If MACHINE_ONLY = [V]CST_AYES & RUN_DURING_BREAK = [V]CST_AYES
+            # Set the times for the break transaction
+            [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+            [L]BREAKEND   = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+            # Create break record
+            Goto AUTOB
+          Endif
+          # TTD - 2397/2412.en
+
+          # Adjust the start time to be the break end time
+          SFTTXN_AUTOBRK.UTCENDDATTIM = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+
+          # Set the duration
+          SFTTXN_AUTOBRK.DURATION = func SFTLIB.CALC_DURATION(SFTTXN_AUTOBRK.UTCSTRDATTIM, SFTTXN_AUTOBRK.UTCENDDATTIM, SFTTXN_AUTOBRK.NUMJOBS, SFTTXN_AUTOBRK.SUMEMP)
+
+          # Update our transaction
+          If fmet SFTTXN_AUTOBRK.AUPDATE <> [V]CST_AOK
+            [L]ASTATUS = fmet this.ASETERROR ("", mess(250,177,1), [V]CST_AERROR)
+            [L]ARET_VALUE = [V]CST_AERROR
+          Endif
+
+          # Set the times for the break transaction
+          [L]BREAKSTART = SFTTXN_AUTOBRK.UTCENDDATTIM
+          [L]BREAKEND   = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+
+          Goto AUTOB
+        Endif
+
+        # Case 4 - job stopped and started during an autobreak, set the start and end time to the break end time.
+        # For exmaple, break goes from 9 - 9:15. User clocks on and off a job at during the break.
+        # Since they are not supposed to be working at the time, they will not get an labor time for what they did.
+        If [L]TXNSTRTIME>=[F:SFTS]BRKSTR(I) & [L]TXNENDTIME<=[F:SFTS]BRKEND(I) & [L]TXNENDDATE<>[0/0/0]
+
+          # TTD - 2397/2412.sn
+          If MACHINE_ONLY = [V]CST_AYES & RUN_DURING_BREAK = [V]CST_AYES
+            # Set the times for the break transaction
+            [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+            [L]BREAKEND   = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+            # Create break record
+            Goto AUTOB
+          Endif
+          # TTD - 2397/2412.en
+
+          # Adjust the start and end time to be the break end time
+          SFTTXN_AUTOBRK.UTCSTRDATTIM = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+          SFTTXN_AUTOBRK.UTCENDDATTIM = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+
+          # Set the duration
+          SFTTXN_AUTOBRK.DURATION = 0
+
+          # Change to 1-No since no time to calculate
+          SFTTXN_AUTOBRK.NUMMAC = [V]CST_ANO  # TODAN-119090.n
+#          # If number of machines is set - change to 0 since no time to calculate
+#          SFTTXN_AUTOBRK.NUMMAC = 0          # TODAN-119090.o
+
+          # Update our transaction
+          If fmet SFTTXN_AUTOBRK.AUPDATE <> [V]CST_AOK
+            [L]ASTATUS = fmet this.ASETERROR ("", mess(250,177,1), [V]CST_AERROR)
+            [L]ARET_VALUE = [V]CST_AERROR
+          Endif
+
+          # Set the times for the break transaction
+          [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+          [L]BREAKEND   = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+
+          Goto AUTOB
+        Endif
+      Else
+        # If this is a clockin and it spans a break, verify the break gets created.
+        # Do not adjust the time clock entry
+        If [L]TXNSTRTIME<[F:SFTS]BRKSTR(I) &
+&          ((([L]TXNENDTIME>[F:SFTS]BRKEND(I) & [L]TXNENDDATE=[L]TXNSTRDATE)   |
+&            ([L]TXNENDTIME<[F:SFTS]BRKEND(I) & [L]TXNENDDATE>[L]TXNSTRDATE))  |
+&            ([L]TXNENDDATE=[0/0/0] & [L]NEXTDAY = [V]CST_ANO))
+
+          # Set the times for the break transaction
+          [L]BREAKSTART = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKSTR(I))
+          If TXNENDDATE=[0/0/0]
+            [L]BREAKEND = func SFTLIB.CALCBREAKTIME(TXNENDDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+          Else
+            [L]BREAKEND = func SFTLIB.CALCBREAKTIME(TXNSTRDATE, SFTTXN_AUTOBRK.UTCOFFSET, [F:SFTS]BRKEND(I))
+          Endif
+        Endif
+      Endif  #End if for IF SFTTYP=1 at top
+AUTOB:
+#      FreeGroup SFTTXN_AUTOBRK   # TTD-2585.o Move to after the NEXT_OPERATION make sure the instance is cleared.
+
+      # If BREAKSTART is populated, we found a break and need to create the auto break
+      If [L]BREAKSTART<>AVOID.ADATTIM
+
+        Call CREATE_AUTOBREAK([F:SFTX]EMPNUM, [F:SFTX]TEAMNUM, [L]FCY, [F:SFTS]BRKCOD(I),[L]BREAKSTART, [L]BREAKEND, GERR, GMESSAGE)
+
+        If GERR <> [V]CST_AOK
+          ASTATUS = fmet this.ASETERROR ("", GMESSAGE, [V]CST_AERROR)
+          [L]ARET_VALUE = [V]CST_AERROR
+          Raz GERR, GMESSAGE
+          Break
+        Endif
+        [L]BREAKSTART = AVOID.ADATTIM
+        [L]BREAKEND   = AVOID.ADATTIM
+      Endif
+   NEXT_OPERATION:
+      # TTD-2585.n
+      FreeGroup SFTTXN_AUTOBRK
+    Next
+    Filter [SFTX]
+
+    NEXT_BREAK:
+
+  Next I
+
+  LogicClose File [SFTXML]    # TTD-2397/2412
+  Kill SFTTXN_AUTOBRK
+
+Return
+####################################################################################
+# Operation Start for setup and run.
+####################################################################################
+$OPERATION_START
+
+# value   Integer   EMPNUM
+# value   Char      FCY
+# value   Integer   EMPTYP
+# value   Integer   SFTTYP
+# value   Datetime  STARTTIME
+# value   Char      REFERENCE(1..)  VCRNUM or INDREF
+# value   Integer   OPENUM(1..)     WO Operation Number or Indirect Type
+# value   Integer   NUMMAC(1..)
+# value   Char      WCENTER(1..)
+# value   Char      LCENTER(1..)
+# value   Char      OPEUOM(1..)
+# value   Char      SETUP_STOP
+# value   Integer   COUNT
+# value   Integer   RESTARTED
+
+  Local Integer EMP_LIST(1..)
+  Local Integer TEAMNUM
+  Local Integer MY_STATUS
+  Local Uuident TXNUUID(1..)
+
+  For N = 1 To COUNT
+    TXNUUID(N) = AVOID.AUUID
+  Next
+
+  EMP_LIST(1) = EMPNUM
+
+  Case EMPTYP
+    When 1  # Employee
+      TEAMNUM = 0
+    When 2  # Detailed Team
+      TEAMNUM = EMPNUM
+      Call TEAM_LIST (TEAMNUM, 'A', EMP_LIST) From SFTLIB
+      #Each record has a unique Transaction ID
+      For N = 1 To COUNT
+        TXNUUID(N) = getUuid
+      Next
+    When 3 # Summary team
+      TEAMNUM = EMPNUM
+  Endcase
+
+For X = 1 To maxtab(EMP_LIST)
+  EMPNUM = EMP_LIST(X)
+  #Previous
+
+  Local Integer I, NUMJOBS
+  Local Integer LOCAL_STATUS
+  Local Integer SFTEMPCLK
+  Local Integer MACHINE_ONLY
+  Local Integer SUMEMP
+
+  SFTEMPCLK = fmet this.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, FCY, "SFTEMPCLK")
+
+  If func SFTLIB.EMPLOYEEACTIVE(EMPNUM) = [V]CST_ANO
+    Local Char EMPID : Call TEXTE(10793,EMPID) From OBJDIV
+    GERR=1 : GMESSAGE =  EMPID - ":" - num$(EMPNUM) - " \" + mess(2,126,1)
+    mkstat = 2
+    Return
+  Endif
+
+  If SFTEMPCLK = [V]CST_AYES & func SFTLIB.EMPLOYEE_CLOCKED_IN(EMPNUM) = [V]CST_ANO
+    #LOCAL_STATUS = fmet this.ASETERROR ("", mess(12,2422,1), [V]CST_AERROR)
+    LOCAL_STATUS = fmet this.ASETERROR ("", func AFNC.MES1(mess(12,2422,1),num$(EMPNUM)), [V]CST_AERROR) #CT-1797
+    [L]ARET_VALUE = [V]CST_AERROR
+    Return
+  Endif
+
+  If func SFTLIB.EMPLOYEE_ON_BREAK(EMPNUM) = [V]CST_AYES
+    #LOCAL_STATUS = fmet this.ASETERROR ("", mess(18,2422,1), [V]CST_AERROR)
+    #CT-1797.sn
+    Case EMPTYP
+      When 1  # Employee
+        LOCAL_STATUS = fmet this.ASETERROR ("", mess(18,2422,1), [V]CST_AERROR)
+      When 2  # Detailed Team
+        LOCAL_STATUS = fmet this.ASETERROR ("", mess(122,2422,1), [V]CST_AERROR)
+      When 3  # Summary team
+        LOCAL_STATUS = fmet this.ASETERROR ("", mess(121,2422,1), [V]CST_AERROR)
+    Endcase
+    #CT-1797.en
+    [L]ARET_VALUE = [V]CST_AERROR
+    Return
+  Endif
+
+  # Get # of employees when Employee type is Summary team
+  If EMPTYP = 3
+    SUMEMP = func SFTLIB.SUMEMP(EMPNUM)
+  Else
+    SUMEMP = 0
+  Endif
+
+
+  # Assign the pass in values to the table fields
+  this.EMPNUM     = EMPNUM        # Employee ID
+  this.TEAMNUM    = TEAMNUM       # Team
+  this.FCY        = FCY           # Site
+  this.SFTTYP     = SFTTYP        # Type
+  NUMJOBS         = RESTARTED     # Number of starting jobs
+
+  # Close and restart the existing operations
+  Call RESTART_OPERATIONS(NUMJOBS, STARTTIME, EMPNUM, FCY, "START", SETUP_STOP)
+
+  #Restart operations also stops setups when starting a run
+  #We need to make sure the machine record gets restarted too
+  If TEAMNUM <> 0 & EMPTYP = 2
+    Local Integer TEAM_NUMJOBS : TEAM_NUMJOBS = 1
+    Call RESTART_OPERATIONS(TEAM_NUMJOBS, STARTTIME, TEAMNUM, FCY, "START", SETUP_STOP)
+  Endif
+
+  this.UTCSTRDATTIM = STARTTIME
+  this.UTCOFFSET    = fmet this.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, FCY, "SFTOFFSET")
+
+  For I = 1 To COUNT
+
+    this.TXNUUID  = TXNUUID(I)       # Transaction ID
+    this.STRTXNUUID = TXNUUID(I)     #Jira 46517.n 07/06/17 by CATUA Set value for STRTXNUUID
+
+    # Machine only operation?
+    If func SFTLIB.ISMACHINE(WCENTER(I), FCY) = [V]CST_AYES & LCENTER(I) = AVOID.ACHAR
+      MACHINE_ONLY = [V]CST_AYES
+    Else
+      MACHINE_ONLY = [V]CST_ANO
+    Endif
+
+    # We need to create an individual transaction number for each operation
+    If this.SFTTYP <> 2   # 2-Indirect
+
+      this.VCRNUM   = REFERENCE(I)  # Work order
+	    this.OPENUM   = OPENUM(I)     # Operation number
+	    this.OPEUOM   = OPEUOM(I)     # UOM
+      this.WCENTER  = WCENTER(I)    # Work center
+      this.LCENTER  = LCENTER(I)    # Labor center
+
+      If MACHINE_ONLY = [V]CST_AYES & find(EMPTYP, 1,3)
+        this.MACFLG = [V]CST_AYES
+        this.NUMMAC = NUMMAC(I)
+      Else
+        [L]LOCAL_STATUS = func MACHINE_START(EMPNUM, TEAMNUM, FCY, SFTTYP, AVOID.ADATE, STARTTIME, AVOID.ADATTIM, this.UTCOFFSET, this.VCRNUM,
+&                                            this.OPENUM, this.OPEUOM, NUMMAC(I), AVOID.ADEC, this.WCENTER, this.LCENTER, this.TXNUUID)
+        If [L]LOCAL_STATUS >= [V]CST_AERROR : Goto MAC_ERR : Endif
+
+        If [L]LOCAL_STATUS >= 0   # Not a machine operation...
+          this.NUMMAC = [V]CST_ANO    # TODAN-119090
+#          this.NUMMAC = 0
+          this.MACFLG = [V]CST_ANO
+        Else #Machine only workcenter
+          this.MACFLG = [V]CST_AYES
+          this.NUMMAC = NUMMAC(I)
+        Endif
+      Endif
+    Else
+      this.INDREF   = REFERENCE(I)  # Indirect reference code
+      this.INDTYP   = OPENUM(I)     # Indirect reference type
+    Endif
+
+    # Default # of activities to 1 if this is machine only operation
+    If MACHINE_ONLY = [V]CST_AYES
+      this.NUMJOBS  = 1
+      this.SUMEMP   = 0
+    Else
+      this.NUMJOBS  = NUMJOBS         # Number of jobs
+      this.SUMEMP   = SUMEMP       # Number of employees
+    Endif
+
+    # Get the next sequence number
+    this.SFTSEQ = func NEXT_SEQ(this.EMPNUM, this.SFTTYP, this.VCRNUM)
+
+    # TODAN - 119641. Default value for the checkbox fields. These fields should only have the value 1-No or 2-Yes.
+    If this.CLEFLG = 0 : this.CLEFLG = [V]CST_ANO : Endif
+    If this.MACFLG = 0 : this.MACFLG = [V]CST_ANO : Endif
+    If this.NUMMAC = 0 : this.NUMMAC = [V]CST_ANO : Endif
+
+    [L]LOCAL_STATUS   = fmet this.AINSERT
+    MAC_ERR:
+    If [L]LOCAL_STATUS >= [V]CST_AERROR
+      [L]LOCAL_STATUS = fmet this.ASETERROR ("OPERATION_START", mess(4,2422,1), [V]CST_AERROR)    # Operation start failed.
+      [L]ARET_VALUE = [V]CST_AERROR
+      Return
+    Endif
+  Next
+
+  #new
+  If X = 1 #Only do this the first pass through, no need to repeat a FOR loop
+    For J = 1 To COUNT
+      If LCENTER(J) <> "" #We want machine only workcenters to behave differently
+        NUMMAC(J) = [V]CST_ANO    # TODAN-119090
+#        NUMMAC(J) = 0
+      Endif
+    Next
+  Endif
+
+Next #Next EMP_LIST
+
+  # Update transaction id
+  Call UPDATE_TRANSACTION_ID(TXNUUID, COUNT, EMPNUM, TEAMNUM)
+
+Return
+
+####################################################################################
+# splitting a Machine and Labor record
+####################################################################################
+Funprog MACHINE_START(EMPNUM, TEAMNUM, FCY, SFTTYP, SHIFTDAT, STARTTIME, ENDTIME, UTCOFFSET, VCRNUM, OPENUM, OPEUOM, NUMMAC, DURATION, WCENTER, LCENTER, TXNUUID)
+  Value Integer     EMPNUM
+  Value Integer     TEAMNUM
+  Value Char        FCY
+  Value Integer     SFTTYP
+  Value Date        SHIFTDAT
+  Value Datetime    STARTTIME
+  Value Datetime    ENDTIME
+  Value Integer     UTCOFFSET
+  Value Char        VCRNUM
+  Value Integer     OPENUM
+  Value Char        OPEUOM
+  Value Integer     NUMMAC
+  Value Decimal     DURATION
+  Variable Char     WCENTER
+  Variable Char     LCENTER
+  Variable Uuident  TXNUUID
+
+  Local Uuident     STRTXNUUID
+
+  Local Integer LERROR : LERROR = 0
+  # Exclude elapsed labor record
+  If DURATION = 0 & STARTTIME <> AVOID.ADATTIM
+    If TEAMNUM <> 0
+
+      EMPNUM = TEAMNUM
+      Local File SFTTXN [SFTX]
+      Local Integer SEQ : SEQ = func NEXT_SEQ(EMPNUM, SFTTYP, VCRNUM)-1
+      Filter [SFTX] Where EMPNUM = [L]EMPNUM and SFTTYP = [L]SFTTYP and VCRNUM = [L]VCRNUM and SFTSEQ = [L]SEQ and OPENUM = [L]OPENUM
+#      Read [SFTX]SFT0 = EMPNUM;SFTTYP;VCRNUM;SEQ
+      Read [SFTX] First
+      If !fstat
+        TXNUUID = [SFTX]TXNUUID
+      Endif
+
+      #Detailed team Machine only
+      #We need to see if there are any open team records for this WO/Operation, we dont want to create duplicates
+#      Filter [SFTX] Where EMPNUM = [L]TEAMNUM and SFTTYP = [L]SFTTYP and VCRNUM = [L]VCRNUM and OPENUM = [L]OPENUM and SFTTYP = [L]SFTTYP and UTCENDDATTIM = AVOID.ADATTIM
+      Filter [SFTX] Where EMPNUM = [L]TEAMNUM and TXNUUID = [L]TXNUUID and TXNUUID <> AVOID.AUUID and UTCENDDATTIM = AVOID.ADATTIM
+      Look [SFTX] First
+      If !fstat #We found something
+        #We are doing machine only
+        If LCENTER = AVOID.ACHAR and NUMMAC = [V]CST_AYES  # TODAN-119090
+#        If LCENTER = "" and NUMMAC > 0
+          End -1
+        Endif
+      Endif
+      LogicClose File [SFTX]
+    Endif
+  Endif
+
+  #Get out if there isnt any machines or there isnt a labor center
+  If !clalev([MWS]) : Local File WORKSTATIO [MWS]: Endif
+  Read [MWS]WST0  = WCENTER;FCY
+  # Machine only workcenter
+  If LCENTER = AVOID.ACHAR and NUMMAC = [V]CST_AYES  # TODAN-119090
+#  If LCENTER = "" and NUMMAC > 0
+    If [MWS]WSTTYP = 1 and TEAMNUM = AVOID.AINT #This line probably wont work for summary team
+      LERROR = -1
+      End LERROR #Return machine only flag
+    Endif
+  #No machines
+  Elsif NUMMAC <> [V]CST_AYES # TODAN-119090
+#  Elsif NUMMAC < 1
+    If [MWS]WSTTYP = 1 # But its a machine WC
+      If LCENTER <> "" #Labor Center exists
+        #We are doing associated labor
+        WCENTER= LCENTER
+        LCENTER = ""
+      Else #This is a dummy record for detailed teams, treat it as a machine, this gets handled uniqely
+        LERROR = -1
+      Endif
+    Endif
+    End LERROR
+  Endif
+  LogicClose File [MWS]
+
+  Local Instance SFTTXN_MACHINE Using C_SFTTXN
+  SFTTXN_MACHINE = NewInstance C_SFTTXN AllocGroup null
+
+  If SHIFTDAT <> AVOID.ADATE
+    SFTTXN_MACHINE.SHIFTDAT = SHIFTDAT
+    #Get the employee's shift
+    If !clalev([TMA]) : Local File TABMAT [TMA]: Endif
+    Read [TMA]TMA0=EMPNUM
+    #Set the employee's shift to the transaction record
+    If !fstat : SFTTXN_MACHINE.SHIFT = [F:TMA]SHIFT : Endif
+    LogicClose File [TMA]
+  Endif
+
+  SFTTXN_MACHINE.EMPNUM       = EMPNUM
+  SFTTXN_MACHINE.TEAMNUM      = TEAMNUM
+  SFTTXN_MACHINE.FCY          = FCY
+  SFTTXN_MACHINE.SFTTYP       = SFTTYP
+  SFTTXN_MACHINE.UTCSTRDATTIM = STARTTIME
+  SFTTXN_MACHINE.UTCENDDATTIM = ENDTIME
+  SFTTXN_MACHINE.UTCOFFSET    = UTCOFFSET
+  SFTTXN_MACHINE.VCRNUM       = VCRNUM
+  SFTTXN_MACHINE.OPENUM       = OPENUM
+  SFTTXN_MACHINE.OPEUOM       = OPEUOM
+  SFTTXN_MACHINE.NUMMAC       = NUMMAC
+  SFTTXN_MACHINE.DURATION     = DURATION
+  SFTTXN_MACHINE.WCENTER      = WCENTER
+  SFTTXN_MACHINE.NUMJOBS      = 1
+  SFTTXN_MACHINE.SFTSEQ       = func NEXT_SEQ(EMPNUM, SFTTYP, VCRNUM)
+
+  If TXNUUID = AVOID.AUUID : TXNUUID = getUuid : Endif
+
+  SFTTXN_MACHINE.TXNUUID      = TXNUUID
+  SFTTXN_MACHINE.STRTXNUUID   = TXNUUID     #Jira 46517.n 07/06/17 by CATUA Set value for STRTXNUUID
+
+  SFTTXN_MACHINE.MACFLG       = [V]CST_AYES
+
+  # TODAN - 119641. Default value for the checkbox fields. These fields should only have the value 1-No or 2-Yes.
+  If SFTTXN_MACHINE.CLEFLG = 0 : SFTTXN_MACHINE.CLEFLG = [V]CST_ANO : Endif
+  If SFTTXN_MACHINE.MACFLG = 0 : SFTTXN_MACHINE.MACFLG = [V]CST_ANO : Endif
+  If SFTTXN_MACHINE.NUMMAC = 0 : SFTTXN_MACHINE.NUMMAC = [V]CST_ANO : Endif
+
+  LERROR = fmet SFTTXN_MACHINE.AINSERT
+
+  FreeGroup SFTTXN_MACHINE
+  Kill SFTTXN_MACHINE
+
+  #After we create the machine record, we need to have the labor become the primary for when it gets created
+  If LCENTER <> "" #Used for Detailed team and Machine only WC. We will be creating dummy records for the employee's
+    WCENTER= LCENTER
+    LCENTER = ""
+  Else
+    LERROR = -1 #We want to treat the remaining records as machine only
+  Endif
+
+End LERROR
+####################################################################################
+# Operation Stop for setup and run.
+####################################################################################
+$OPERATION_STOP
+#[L]STOPTIME  : Operation stop time
+#[L]FCY       : Operation Site
+#[L]CPLQTY    : Operation Completed Quantity
+#[L]REJQTY    : Operation Rejected Quantity
+#[L]SCANUM    : Operation Rejection Code
+#[L]CLEFLG    : Activity Completed
+
+  Local Integer LOCAL_STATUS
+
+  If this.SFTTYP    = 5 Then   # Run
+    this.CPLQTY     = CPLQTY
+    this.REJCPLQTY  = REJQTY
+    this.SCANUM     = SCANUM
+    this.CLEFLG     = CLEFLG
+  Endif
+
+  this.UTCENDDATTIM = [L]STOPTIME
+  this.DURATION     = func SFTLIB.CALC_DURATION(this.UTCSTRDATTIM,this.UTCENDDATTIM, this.NUMJOBS, this.SUMEMP)
+
+  If fmet this.AUPDATE <> [V]CST_AOK
+    [L]LOCAL_STATUS = fmet this.ASETERROR ("OPERATION_STOP", mess(3,2422,1), [V]CST_AERROR)   # Operation stop failed.
+    [L]ARET_VALUE   = [V]CST_AERROR
+    Return
+  Endif
+Return
+
+####################################################################################
+# When a new operation is started or stoped, all others need to be
+# restarted with an increment/decrement NUMJOBS value
+####################################################################################
+Subprog RESTART_OPERATIONS(COUNT, IDATETIM, IEMPNUM, ISITE, ITYPE, ISETUPSTOP)
+
+  Variable  Integer   COUNT, ISETUPSTOP
+  Value     Integer   IEMPNUM
+  Value     Char      ISITE, ITYPE
+  Value     Datetime  IDATETIM
+
+  Local     Integer   NUM_OF_JOBS
+  Local     Integer   LOCAL_STATUS
+
+  #Needed for Detailed team machine only records
+  Local     Datetime  W_DATETIM
+
+  [L]NUM_OF_JOBS  = 0
+  If COUNT < 0 : End : Endif  #TTD-2142
+
+  # Open tables
+  Local File SFTTXN [SFTXN]
+  Local Instance SFTTXN_RESTART Using C_SFTTXN
+
+  Trbegin [F:SFTXN]
+
+  # The below conditions are applied to the Setup transactions that is currently running...
+  # 1. When the SETUPSTOP = 0,
+  #    a. Stop and restart setup operations. User run the setup operation on a WO that does not have the setup running or
+  #    b. User run the Run start operation on a WO that "does" have the setup running but does not want to stop the Setup operation.
+  # 2. When the SETUPSTOP = 1, do not stop and restart the Setup operations. This scenario only apply when user run the setup on the WO that the setup already running
+  # 3. when the SETUPSTOP = 2, stop the setup operations but do not restart. That mean, stop but no insert a setup records.
+  #     This scenario when user run the Run start on the WO that already has the Setup running and want the Setup operation stop
+  #     before start the Run operation.
+
+  #Find all open operations for current user and stop/restart them
+  Filter [F:SFTXN] Where EMPNUM = IEMPNUM  and SFTTYP <> 1 and UTCENDDATTIM = AVOID.ADATTIM
+
+  For [F:SFTXN]
+    W_DATETIM = IDATETIM
+    If [F:SFTXN]MACFLG = [V]CST_AYES and [F:SFTXN]SETUPSTOP <> [V]CST_AYES
+      Goto NEXT_RECORD
+    Endif
+
+    #For Detailed team Machine only records we want the employee machine records to have a 0 duration.
+    If [F:SFTXN]EMPNUM <> [F:SFTXN]TEAMNUM and [F:SFTXN]TEAMNUM <> 0 and [F:SFTXN]MACFLG = [V]CST_AYES
+      W_DATETIM = [F:SFTXN]UTCSTRDATTIM
+    Endif
+
+    #End each operation and update table
+    [F:SFTXN]UTCENDDATTIM = W_DATETIM
+    [F:SFTXN]ACTENDDATTIM = W_DATETIM
+    [F:SFTXN]DURATION = func SFTLIB.CALC_DURATION([F:SFTXN]UTCSTRDATTIM, [F:SFTXN]UTCENDDATTIM, [F:SFTXN]NUMJOBS, [F:SFTXN]SUMEMP)
+
+    # Update the record
+    Rewrite [F:SFTXN]
+
+    # Fail update
+    If fstat <> 0
+      [V]GOK=-1
+      Break
+    Endif
+
+    If [F:SFTXN]MACFLG = [V]CST_AYES : Goto NEXT_RECORD : Endif
+    #====================================================================
+    # Restart the operation...
+    #
+    # First scenario, the restart apply to the stop operation or when the setup stop is no
+    # that mean go ahead and reinsert the records.
+    If ITYPE = "STOP" | ISETUPSTOP = [V]CST_ANO
+      # get the number of jobs, only need to get it once.
+      If [L]NUM_OF_JOBS = 0
+        [L]NUM_OF_JOBS  += [F:SFTXN]NUMJOBS
+        Case ITYPE
+          When "START"
+            COUNT += [L]NUM_OF_JOBS
+          When "STOP"
+            COUNT = [L]NUM_OF_JOBS - COUNT
+        Endcase
+      Endif
+    Endif
+
+    If [F:SFTXN]SETUPSTOP <> 2       # Don't insert when the SETUPSTOP is yes meaning don't restart this setup.
+      # Restart the operation...
+      SFTTXN_RESTART = NewInstance C_SFTTXN AllocGroup null
+
+      # Assign the pass in values to the table fields
+      SFTTXN_RESTART.EMPNUM       = [F:SFTXN]EMPNUM        # Employee ID
+      #Added TEAMNUM and TXNUUID to restart
+      SFTTXN_RESTART.TEAMNUM      = [F:SFTXN]TEAMNUM       # Team ID
+      SFTTXN_RESTART.TXNUUID      = [F:SFTXN]TXNUUID       # Transaction ID
+      SFTTXN_RESTART.STRTXNUUID   = [F:SFTXN]STRTXNUUID    ##Jira 46517.n 07/06/17 by CATUA Set value for STRTXNUUID
+      SFTTXN_RESTART.SUMEMP       = [F:SFTXN]SUMEMP
+      SFTTXN_RESTART.MACFLG       = [F:SFTXN]MACFLG        # Machine Flag
+      SFTTXN_RESTART.FCY          = [F:SFTXN]FCY           # Site
+      SFTTXN_RESTART.SFTTYP       = [F:SFTXN]SFTTYP        # Type
+      SFTTXN_RESTART.VCRNUM       = [F:SFTXN]VCRNUM        # Work order
+      SFTTXN_RESTART.SFTSEQ       = func NEXT_SEQ([F:SFTXN]EMPNUM, [F:SFTXN]SFTTYP, [F:SFTXN]VCRNUM)        # Sequence
+      SFTTXN_RESTART.UTCSTRDATTIM = IDATETIM               # Start date/time
+      SFTTXN_RESTART.UTCOFFSET    = [F:SFTXN]UTCOFFSET     # Time zone difference
+      SFTTXN_RESTART.OPENUM       = [F:SFTXN]OPENUM        # Operation number
+      SFTTXN_RESTART.OPEUOM       = [F:SFTXN]OPEUOM        # UOM
+      SFTTXN_RESTART.NUMMAC       = [F:SFTXN]NUMMAC        # machine included
+      SFTTXN_RESTART.WCENTER      = [F:SFTXN]WCENTER       # Work center
+      SFTTXN_RESTART.LCENTER      = [F:SFTXN]LCENTER       # Labor center
+      SFTTXN_RESTART.INDREF       = [F:SFTXN]INDREF        # Indirect reference code
+      SFTTXN_RESTART.INDTYP       = [F:SFTXN]INDTYP        # Indirect reference type
+      SFTTXN_RESTART.NUMJOBS      = COUNT                  # Number of jobs
+      SFTTXN_RESTART.CLEFLG       = [F:SFTXN]CLEFLG        # TODAN-119641. Closed
+
+      [L]LOCAL_STATUS   = fmet SFTTXN_RESTART.AINSERT
+      If [L]LOCAL_STATUS >= [V]CST_AERROR
+        [V]GOK=-1
+        [L]LOCAL_STATUS = fmet SFTTXN_RESTART.ASETERROR ("RESTART_OPERATIONS", mess(5,2422,1), [V]CST_AERROR)    # Restart operation(s) failed.
+        [L]ARET_VALUE = [V]CST_AERROR
+        Return
+      Else
+        FreeGroup SFTTXN_RESTART
+      Endif
+      [L]NUM_OF_JOBS += 1
+    Endif
+    NEXT_RECORD:
+  Next
+
+  If ITYPE = "START" & ISETUPSTOP = [V]CST_AYES
+    COUNT = COUNT + [L]NUM_OF_JOBS
+    Update [F:SFTXN] Where EMPNUM = IEMPNUM and SFTTYP<>1 and UTCENDDATTIM = AVOID.ADATTIM With NUMJOBS = COUNT
+  Endif
+
+  # Clear out the Setupstop field
+  Update [F:SFTXN] Where EMPNUM = IEMPNUM and SFTTYP<>1 and SETUPSTOP <> 0 With SETUPSTOP = 0
+
+  Filter [F:SFTXN]
+
+  # check if update/insert record fail then display message
+  If [V]GOK = -1
+    Rollback
+    ERRMSG = mess(5,2422,1)   # Restart operation(s) failed.
+    ERRNUM = [V]CST_AERROR
+  Else
+    Commit
+  Endif
+
+  LogicClose File [F:SFTXN]
+  Kill SFTTXN_RESTART
+End
+####################################################################################
+# After restart operations need to get new transaction Id
+####################################################################################
+Subprog UPDATE_TRANSACTION_ID(ITXNUUID, ICOUNT, IEMPNUM, ITEAMNUM)
+Value Uuident ITXNUUID(1..)
+Value Integer ICOUNT
+Value Integer IEMPNUM
+Value Integer ITEAMNUM
+
+  Local     Uuident   OLD_TXNUUID
+  Local     Uuident   NEW_TXNUUID
+  Local     Integer   UPDATE_STRTXNUUID
+
+  OLD_TXNUUID = AVOID.AUUID
+  NEW_TXNUUID = AVOID.AUUID
+
+  # Open tables
+  Local File SFTTXN [SFTXN]
+  Trbegin [F:SFTXN]
+
+  If ITEAMNUM <> 0 & ITEAMNUM <> IEMPNUM   # Detail team
+    # Find all open operations for current user/team and update transaction ID
+    Filter [F:SFTXN]  Where TEAMNUM = ITEAMNUM &
+&                           TXNUUID <> AVOID.AUUID &
+&                           UTCENDDATTIM = AVOID.ADATTIM
+&                     Order By TXNUUID
+  Else
+    # Find all open operations for current user/team and update transaction ID
+    Filter [F:SFTXN]  Where EMPNUM = IEMPNUM  &
+&                           TXNUUID <> AVOID.AUUID &
+&                           UTCENDDATTIM = AVOID.ADATTIM
+&                     Order By TXNUUID
+  Endif
+
+  For [F:SFTXN]
+    # There are two calls to this subprogram, one from the stop operation(s)
+    # which including break and exclusive indirect and one from start operation(s).
+    # We are passing the empty id and 0 count when it is a stop operation(s) because
+    # we don't have new transaction(s), only restart transaction(s).
+    # The check was to skip assign new transaction ID to a new transactions that
+    # just get created.
+    If ITXNUUID <> AVOID.AUUID and ICOUNT > 0
+      If find([F:SFTXN]TXNUUID, ITXNUUID(1..ICOUNT)) : Goto NEXT_TRANS : Endif
+    Endif
+
+    # TTD-1206/1452/1548. Check the machine record to make sure it was not
+    # a part of team break. We don't want to update the trans id of the
+    # machine record if the team is current on break and the machine is
+    # "Run during break".
+    If [F:SFTXN]MACFLG = [V]CST_AYES & [F:SFTXN]TEAMNUM = [F:SFTXN]EMPNUM
+      Local File SFTTXN [SFTXNM]
+      Filter [SFTXNM] Where [F:SFTXNM]TXNUUID = [F:SFTXN]TXNUUID and [F:SFTXNM]BRKTXN <> AVOID.AUUIDENT
+      Look [F:SFTXNM] First
+      LogicClose File [F:SFTXNM]
+      If !fstat   # Found
+        Goto NEXT_TRANS
+      Endif
+    Endif
+
+    # Create new TXNUUID for new transactions
+    If OLD_TXNUUID <> [F:SFTXN]TXNUUID
+      OLD_TXNUUID = [F:SFTXN]TXNUUID
+      NEW_TXNUUID = getUuid
+    Endif
+
+    #Jira 46517.sn 07/06/17 by CATUA Update STRTXNUUID field
+    UPDATE_STRTXNUUID = [V]CST_AYES
+
+    If [F:SFTXN]STRTXNUUID <> AVOID.AUUIDENT & [SFTXN]UTCSTRDATTIM <> AVOID.ADATTIM
+      Local File SFTTXN [SFTXU]
+      Local File SFTTXNH [SFTXHU]
+
+      If ITEAMNUM <> 0 & ITEAMNUM <> IEMPNUM   # Detail team
+        # Check for any closed operation that uses the same STRTXNUUID in SFT transaction table for current team
+        Filter [F:SFTXU]  Where TEAMNUM = ITEAMNUM &
+&                           STRTXNUUID = [F:SFTXN]STRTXNUUID &
+&                           UTCENDDATTIM <> AVOID.ADATTIM
+        Look [F:SFTXU] First
+        If !fstat
+          UPDATE_STRTXNUUID = [V]CST_ANO
+        #Jira 53701.sn CATUA 08/25/17 Apply labor coefficient for Employee only (search for history table not needed)
+#        Else
+#          # Check for any closed operation that uses the same STRTXNUUID in SFT transaction history table for current team
+#          Filter [F:SFTXHU]  Where TEAMNUM = ITEAMNUM &
+#&                           STRTXNUUID = [F:SFTXN]STRTXNUUID
+#          Look [F:SFTXHU] First
+#          If !fstat : UPDATE_STRTXNUUID = [V]CST_ANO : Endif
+        #Jira 53701.en
+        Endif
+      Else
+        # Check for any closed operation that uses the same STRTXNUUID in SFT transaction table for current employee
+        Filter [F:SFTXU]  Where EMPNUM = IEMPNUM  &
+&                           STRTXNUUID = [F:SFTXN]STRTXNUUID &
+&                           UTCENDDATTIM <> AVOID.ADATTIM
+        Look [F:SFTXU] First
+        If !fstat
+          UPDATE_STRTXNUUID = [V]CST_ANO
+        #Jira 53701.sn CATUA 08/25/17 Apply labor coefficient for Employee only (search for history table not needed)
+#        Else
+#          # Check for any closed operation that uses the same STRTXNUUID in SFT transaction history table for current employee
+#          Filter [F:SFTXHU]  Where EMPNUM = IEMPNUM &
+#&                           STRTXNUUID = [F:SFTXN]STRTXNUUID
+#          Look [F:SFTXHU] First
+#          If !fstat : UPDATE_STRTXNUUID = [V]CST_ANO : Endif
+        #Jira 53701.en
+        Endif
+      Endif
+      LogicClose File [SFTXU],[SFTXHU]
+    Endif
+
+    If UPDATE_STRTXNUUID = [V]CST_AYES : [F:SFTXN]STRTXNUUID = NEW_TXNUUID : Endif
+    #Jira 46517.en
+
+    [F:SFTXN]TXNUUID = NEW_TXNUUID
+
+    # Update the record
+    Rewrite [F:SFTXN]
+    # Fail update
+    If fstat <> 0
+      [V]GOK=-1
+      Break
+    Endif
+NEXT_TRANS:
+  Next
+
+  Filter [F:SFTXN]
+  # check if update/insert record fail then display message
+  If [V]GOK = -1
+    Rollback
+    ERRMSG = mess(5,2422,1)   # Update transaction id failed.
+    ERRNUM = [V]CST_AERROR
+  Else
+    Commit
+  Endif
+
+  LogicClose File [F:SFTXN]
+End
+####################################################################################
+# Time tracking confirmation.
+####################################################################################
+$TIME_TRACKING
+
+# Value EMPNUM        Integer      # Employee ID
+# Value FCY           Char         # Site
+# Value MFGNUM        Char         # Work order() or Break code()
+# Value OPENUM        Integer      # Operation number() or Indirect type()
+# Value NUMMAC        Integer      # machine included
+# Value NUMJOBS       Integer      # Number of jobs()
+# Value WCENTER       Char         # Work center()
+# Value LCENTER       Char         # Labor center()
+# Value SETUDURATION  Decimal      # Setup duration()
+# Value RUNDURATION   Decimal      # Run duration()
+# Value CPLQTY        Decimal      # Complete quantity()
+# Value OPEUOM        Char         # UOM() / Elapsed Indirect or Break
+# Value REJCPLQTY     Decimal      # Rejected quantity()
+# Value SCANUM        Integer      # Rejected code()
+# Value CLEFLG        Integer      # complete/not complete task()
+# Value COUNT         Integer      # Number of records
+
+  Local Integer I, J, LOCAL_STATUS
+  Local Integer EMP_LIST(1..)
+  Local Integer MACHINE_ONLY
+  Local Integer EMPLOYEE_TYPE
+  Local Integer SUMEMP
+
+  If func SFTLIB.EMPLOYEEACTIVE(EMPNUM) = [V]CST_ANO
+    #CT-1797.sn
+    #GERR=1 : GMESSAGE = mess(54,2422,1)
+    Local Char EMPID(100) : Call TEXTE(10793,EMPID) From OBJDIV
+    GERR=1 : GMESSAGE =  EMPID - ":" - num$(EMPNUM) - " \" + mess(2,126,1)
+    #CT-1797.en
+    mkstat = 2
+    Return
+  Endif
+
+  # Initial default # of employees
+  [L]SUMEMP = 1
+
+  # Based on employee type...set the team num, emp num and get # of employees
+  [L]EMPLOYEE_TYPE = func SFTLIB.EMPTYP(EMPNUM)
+  Case [L]EMPLOYEE_TYPE
+    When 1  # Employee
+      this.TEAMNUM = AVOID.AINT
+      EMP_LIST(1)   = EMPNUM
+    When 2  # Detail team
+        this.TEAMNUM  = EMPNUM
+    When 3  # Summary team
+      [L]SUMEMP = func SFTLIB.SUMEMP(EMPNUM)
+      this.TEAMNUM = EMPNUM
+      EMP_LIST(1)   = EMPNUM
+    When Default
+  Endcase
+
+  # Assign values
+  this.FCY            = FCY
+  this.UTCENDDATTIM   = datetime$
+  this.UTCOFFSET      = fmet this.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, FCY, "SFTOFFSET")
+
+  For I = 1 To COUNT
+
+    # Initial default # of employees
+    this.SUMEMP = 0
+
+    # Machine only?
+    If func SFTLIB.ISMACHINE(WCENTER(I), FCY) = [V]CST_AYES & LCENTER(I) = AVOID.ACHAR
+       MACHINE_ONLY = [V]CST_AYES
+       this.MACFLG  = [V]CST_AYES
+       If [L]EMPLOYEE_TYPE = 2    # Detail team
+          Raz EMP_LIST()
+          EMP_LIST(1) = EMPNUM
+       Endif
+    Else
+       MACHINE_ONLY = [V]CST_ANO
+       this.MACFLG  = [V]CST_ANO
+       Case [L]EMPLOYEE_TYPE
+          When 2    # Detailed team
+            # Get a list of team members
+            Raz EMP_LIST()
+            Call TEAM_LIST (EMPNUM, 'E', EMP_LIST) From SFTLIB
+            If maxtab(EMP_LIST) = 0   # No team member found
+              [L]ARET_VALUE   = [V]CST_AERROR
+              Break
+            Endif
+          When 3    # Summary team
+            this.SUMEMP  = [L]SUMEMP
+       Endcase
+    Endif
+
+    # Assign the passing values to the table fields
+    # Skip if it is Elapsed indirect or elapsed breaks
+    If OPEUOM(I) <> "EBK" & OPEUOM(I) <> "EIR"
+      this.VCRNUM   = MFGNUM(I)         # Work order
+      this.OPENUM   = OPENUM(I)         # Operation number
+    Endif
+    If MACHINE_ONLY = [V]CST_AYES
+      this.NUMJOBS  = 1
+    Else
+      this.NUMJOBS  = NUMJOBS(I)        # Number of activities
+    Endif
+
+    # Do nothing if the employee list is empty
+    If maxtab(EMP_LIST) = 0
+      Break
+    Endif
+    #################################################
+    # Insert the Setup/Indirect and break operation #
+    #################################################
+    If SETUDURATION(I) > 0
+
+      # Detail team. Create transaction ID for the Setup operation
+      If [L]EMPLOYEE_TYPE = 2 & MACHINE_ONLY = [V]CST_ANO
+        this.TXNUUID = getUuid
+      Endif
+
+      # loop through employee list
+      For J = 1 To maxtab(EMP_LIST)
+        this.EMPNUM = EMP_LIST(J)
+        If J = 1      # Only first employee should have # of machine
+          this.NUMMAC   = NUMMAC(I)         # machine included
+          this.WCENTER  = WCENTER(I)        # Work center
+          this.LCENTER  = LCENTER(I)        # Labor center
+        Else
+          this.NUMMAC   = [V]CST_ANO    # TODAN-119090
+#          this.NUMMAC   = 0
+        Endif
+        # Check for the Elapsed labor indirect and breaks
+        If OPEUOM(I)    = "EBK" | OPEUOM(I) = "EIR"
+          this.INDREF   = MFGNUM(I)     # Indirect reference code
+          this.INDTYP   = OPENUM(I)     # Indirect reference type
+          If OPEUOM     = "EBK" : this.SFTTYP = 3 : Endif
+          If OPEUOM     = "EIR" : this.SFTTYP = 2 : Endif
+        Else
+          this.SFTTYP   = 4           # Setup Type
+          this.OPEUOM   = OPEUOM(I)   # TTD-1964. UOM
+        Endif
+
+        # Do not multiply # of employees if it is machine only. Job is alway 1 for machine record
+        If MACHINE_ONLY = [V]CST_AYES
+          this.DURATION = SETUDURATION(I)
+        Else
+          this.DURATION = (SETUDURATION(I)*[L]SUMEMP)/this.NUMJOBS
+        Endif
+
+        # Create machine record. No need if it is machine only
+        If MACHINE_ONLY = [V]CST_ANO
+          # Create machine record if qualify. This apply to individual and summary team
+          If find(func SFTLIB.EMPTYP(EMPNUM),1,3) & this.NUMMAC = [V]CST_AYES # TODAN-119090
+#          If find(func SFTLIB.EMPTYP(EMPNUM),1,3) & this.NUMMAC > 0
+            # Machine record will have a # of activity = 1 so no calculation needed. Pass in the entered duration
+            # TTD-1964
+            [L]LOCAL_STATUS = func MACHINE_START(this.EMPNUM, this.TEAMNUM, this.FCY, this.SFTTYP, AVOID.ADATE, AVOID.ADATTIM, this.UTCENDDATTIM,
+&                                              this.UTCOFFSET, this.VCRNUM, this.OPENUM, this.OPEUOM, this.NUMMAC,
+&                                              SETUDURATION(I), this.WCENTER, this.LCENTER, this.TXNUUID)
+            If [L]LOCAL_STATUS >= [V]CST_AERROR
+              Goto TIM_TRK_ERR
+            Else
+              # set the # of machine to 1-No for the labor record
+              this.NUMMAC = [V]CST_ANO # TODAN-119090
+#              this.NUMMAC = 0
+            Endif
+          Else    # Detail team
+            # For machine record duration alway have # of activity = 1 so no duration calculation needed
+            If func SFTLIB.ISMACHINE(this.WCENTER, this.FCY) = [V]CST_AYES & this.NUMMAC = [V]CST_AYES  # TODAN-119090
+#            If func SFTLIB.ISMACHINE(this.WCENTER, this.FCY) = [V]CST_AYES & this.NUMMAC > 0
+              # TTD-1964
+              [L]LOCAL_STATUS = func MACHINE_START(this.TEAMNUM, this.TEAMNUM, this.FCY, this.SFTTYP, AVOID.ADATE, AVOID.ADATTIM,
+&                                                  this.UTCENDDATTIM, this.UTCOFFSET, this.VCRNUM, this.OPENUM, this.OPEUOM,
+&                                                  this.NUMMAC, SETUDURATION(I), this.WCENTER, this.LCENTER, this.TXNUUID)
+              If [L]LOCAL_STATUS >= [V]CST_AERROR
+                Goto TIM_TRK_ERR
+              Else
+                # set the # of machine to 1-No for labor record
+                this.NUMMAC = [V]CST_ANO # TODAN-119090
+#                this.NUMMAC = 0
+              Endif
+            Endif
+          Endif
+        Endif
+
+        # TODAN - 119641. Default value for the checkbox fields. These fields should only have the value 1-No or 2-Yes.
+        If this.CLEFLG = 0 : this.CLEFLG = [V]CST_ANO : Endif
+        If this.NUMMAC = 0 : this.NUMMAC = [V]CST_ANO : Endif
+
+        # Get the next sequence number
+        this.SFTSEQ         = func NEXT_SEQ(this.EMPNUM, this.SFTTYP, this.VCRNUM)
+        [L]LOCAL_STATUS     = fmet this.AINSERT
+        If [L]LOCAL_STATUS >= [V]CST_AERROR : Goto TIM_TRK_ERR : Endif
+      Next
+    Endif
+
+    ############################
+    # Insert the Run operation #
+    ############################
+    If RUNDURATION(I) > 0 | CPLQTY(I) > 0
+
+      # Reset for the Run operation
+      this.TXNUUID = AVOID.AUUID
+      # Detail team. Create new transaction ID for the Run operation
+      If [L]EMPLOYEE_TYPE = 2 & MACHINE_ONLY = [V]CST_ANO
+        this.TXNUUID = getUuid
+      Endif
+
+      # loop through employee list
+      For J = 1 To maxtab(EMP_LIST)
+        this.EMPNUM = EMP_LIST(J)
+        # Only first employee should have # of machine, qty...etc.
+        If J = 1
+          this.NUMMAC     = NUMMAC(I)         # machine included
+          this.WCENTER    = WCENTER(I)        # Reassign again since the Machine start above set this field
+          this.LCENTER    = LCENTER(I)        # Reassign again since the Machine start above set this field
+          this.CPLQTY     = CPLQTY(I)
+          this.REJCPLQTY  = REJCPLQTY(I)
+          this.SCANUM     = SCANUM(I)
+#          this.OPEUOM     = OPEUOM(I) # TTD-1964.o
+        Else
+          this.NUMMAC     = [V]CST_ANO  # TODAN-119090
+#          this.NUMMAC     = 0
+          this.CPLQTY     = AVOID.AINT
+          this.REJCPLQTY  = AVOID.AINT
+          this.SCANUM     = AVOID.AINT
+#          this.OPEUOM     = AVOID.ACHAR  # TTD-1964.o
+        Endif
+
+        this.OPEUOM       = OPEUOM(I)   # TTD-1964.n
+        this.SFTTYP       = 5         # Run type
+        this.CLEFLG       = CLEFLG(I) # Close
+
+        # Do not multiply # of employees if it is machine only. Job is alway 1 for machine record
+        If MACHINE_ONLY = [V]CST_AYES
+          this.DURATION = RUNDURATION(I)
+        Else
+          this.DURATION = (RUNDURATION(I)*[L]SUMEMP)/this.NUMJOBS
+        Endif
+
+        # Create machine record. No need if it is machine only
+        If MACHINE_ONLY = [V]CST_ANO
+          # Create machine record if qualify. Employee and summary team...
+          # Also, for machine record duration alway have # of activity = 1 so no duration calculation needed
+          If find(func SFTLIB.EMPTYP(EMPNUM),1,3) & this.NUMMAC = [V]CST_AYES & this.DURATION > 0 # TODAN-119090.n
+#          If find(func SFTLIB.EMPTYP(EMPNUM),1,3) & this.NUMMAC > 0 & this.DURATION > 0          # TODAN-119090.o
+            # TTD-1964
+            [L]LOCAL_STATUS = func MACHINE_START(this.EMPNUM, this.TEAMNUM, this.FCY, this.SFTTYP, AVOID.ADATE, AVOID.ADATTIM, this.UTCENDDATTIM,
+&                                              this.UTCOFFSET, this.VCRNUM, this.OPENUM, this.OPEUOM, this.NUMMAC,
+&                                              RUNDURATION(I), this.WCENTER, this.LCENTER, this.TXNUUID)
+            If [L]LOCAL_STATUS >= [V]CST_AERROR
+              Goto TIM_TRK_ERR
+            Else
+              # set the # of machine to 1-No for the labor record
+              this.NUMMAC = [V]CST_ANO  # TODAN-119090.n
+#              this.NUMMAC = 0          # TODAN-119090.o
+            Endif
+          Else    # Detail team
+            # For machine record duration alway have # of activity = 1 so no duration calculation needed
+            If func SFTLIB.ISMACHINE(this.WCENTER, this.FCY) = [V]CST_AYES & this.NUMMAC = [V]CST_AYES & this.DURATION > 0  # TODAN-119090.n
+#            If func SFTLIB.ISMACHINE(this.WCENTER, this.FCY) = [V]CST_AYES & this.NUMMAC > 0 & this.DURATION > 0           # TODAN-119090.o
+              #TTD-1964
+              [L]LOCAL_STATUS = func MACHINE_START(this.TEAMNUM, this.TEAMNUM, FCY, this.SFTTYP, AVOID.ADATE, AVOID.ADATTIM, this.UTCENDDATTIM,
+&                                              this.UTCOFFSET, this.VCRNUM, this.OPENUM, this.OPEUOM, this.NUMMAC,
+&                                              RUNDURATION(I), this.WCENTER, this.LCENTER, this.TXNUUID)
+              If [L]LOCAL_STATUS >= [V]CST_AERROR
+                Goto TIM_TRK_ERR
+              Else
+                # set the # of machine to zero for the labor record
+                this.NUMMAC = [V]CST_ANO  # TODAN-119090.n
+#                this.NUMMAC = 0          # TODAN-119090.o
+              Endif
+            Endif
+          Endif
+        Endif
+
+        # TODAN - 119641. Default value for the Closed checkbox field. This field should only have the value 1-No or 2-Yes.
+        If this.CLEFLG = 0 : this.CLEFLG = [V]CST_ANO : Endif
+        If this.NUMMAC = 0 : this.NUMMAC = [V]CST_ANO : Endif
+
+        # Get the next sequence number
+        this.SFTSEQ       = func NEXT_SEQ(this.EMPNUM, this.SFTTYP, this.VCRNUM)
+        [L]LOCAL_STATUS   = fmet this.AINSERT
+        If [L]LOCAL_STATUS >= [V]CST_AERROR : Goto TIM_TRK_ERR  Endif
+
+        # Clear qty fields so the next member don't show
+        this.CPLQTY     = AVOID.ADEC        # Complete qty
+        this.REJCPLQTY  = AVOID.ADEC        # Rejected qty
+        this.SCANUM     = AVOID.AINT        # Reason code
+#        this.OPEUOM     = AVOID.ACHAR       # UOM TTD-1964
+      Next
+    Endif
+    # Clear fields
+    this.VCRNUM     = AVOID.ACHAR       # Work order
+    this.OPENUM     = AVOID.AINT        # Operation number
+    this.OPEUOM     = AVOID.ACHAR       # UOM TTD-1964
+    this.NUMMAC     = [V]CST_ANO        # machine included      # TODAN-119090.n
+#    this.NUMMAC     = AVOID.AINT        # Number of machine(s) # TODAN-119090.o
+    this.WCENTER    = AVOID.ACHAR       # Work center
+    this.LCENTER    = AVOID.ACHAR       # Labor center
+    this.CLEFLG     = [V]CST_ANO        # Close flag            # TODAN-119641.n
+#    this.CLEFLG     = AVOID.AINT        # Close flag           # TODAN-119641.o
+    this.MACFLG     = [V]CST_ANO        # Machine flag
+    this.TXNUUID    = AVOID.AUUID       # Transaction ID
+  Next
+
+TIM_TRK_ERR:
+
+  If [L]LOCAL_STATUS >= [V]CST_AERROR
+    ASTATUS = fmet this.ASETERROR ("TIME_TRACKING", func AFNC.MES1(mess(10,2422,1),tolower(mess(870,197,1))), [V]CST_AERROR)
+    [L]ARET_VALUE   = [V]CST_AERROR
+    Return
+  Endif
+
+Return
+####################################################################################
+# Create the break record to go with the auto break
+# only to be called from AUTOBREAKS method
+####################################################################################
+
+Subprog CREATE_AUTOBREAK(IEMPNUM, ITEAMNUM, IFCY, IBRKCOD, ISTARTDATE, IENDDATE, OERRNUM, OERRMSG)
+Value    Integer  IEMPNUM
+Value    Integer  ITEAMNUM
+Value    Char     IFCY
+Value    Char     IBRKCOD
+Value    Datetime ISTARTDATE
+Value    Datetime IENDDATE
+Variable Integer  OERRNUM
+Variable Char     OERRMSG
+
+  #Check if this is a team record before doing a table check
+  If ITEAMNUM = IEMPNUM
+    #We want to not create the record for detailed teams but we do for summary teams
+    If func SFTLIB.EMPTYP(IEMPNUM) = 2
+      #Get out if its the detailed team
+      End
+    Endif
+  Endif
+
+  # If this break already exists - exit.
+  Local File SFTTXN [SFTX]
+  Filter [SFTX] Where EMPNUM=IEMPNUM & SFTTYP=3 & UTCSTRDATTIM = ISTARTDATE & INDREF = IBRKCOD
+  Read [SFTX] First
+  Filter [SFTX]
+  If !fstat
+    LogicClose File [SFTX]
+    OERRNUM = [V]CST_AOK
+    End
+  Endif
+  LogicClose File [SFTX]
+
+  Local Instance SFTTXN_BRKTXN Using C_SFTTXN
+  SFTTXN_BRKTXN = NewInstance C_SFTTXN AllocGroup null
+
+  # Create the break that goes along with the auto breaks we setup
+  SFTTXN_BRKTXN.EMPNUM        = IEMPNUM
+  SFTTXN_BRKTXN.TEAMNUM       = ITEAMNUM
+  SFTTXN_BRKTXN.SFTTYP        = 3
+  SFTTXN_BRKTXN.SFTSEQ        = func NEXT_SEQ(IEMPNUM, 3, "")
+  SFTTXN_BRKTXN.INDREF        = IBRKCOD
+  SFTTXN_BRKTXN.UTCSTRDATTIM  = ISTARTDATE
+  SFTTXN_BRKTXN.UTCENDDATTIM  = IENDDATE
+  SFTTXN_BRKTXN.UTCOFFSET     = fmet SFTTXN_BRKTXN.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, IFCY, "SFTOFFSET")
+  SFTTXN_BRKTXN.DURATION      = func SFTLIB.CALC_DURATION(ISTARTDATE, IENDDATE, 1, 1)
+  SFTTXN_BRKTXN.FCY           = IFCY
+
+  # TODAN - 119641. Default value for the checkbox fields. These fields should only have the value 1-No or 2-Yes.
+  If SFTTXN_BRKTXN.CLEFLG = 0 : SFTTXN_BRKTXN.CLEFLG = [V]CST_ANO : Endif
+  If SFTTXN_BRKTXN.MACFLG = 0 : SFTTXN_BRKTXN.MACFLG = [V]CST_ANO : Endif
+  If SFTTXN_BRKTXN.NUMMAC = 0 : SFTTXN_BRKTXN.NUMMAC = [V]CST_ANO : Endif
+
+  If fmet SFTTXN_BRKTXN.AINSERT <> [V]CST_AOK
+    OERRNUM = [V]CST_AERROR
+    OERRMSG = func AFNC.MES1(mess(10,2422,1),mess(3,2416,1))
+    FreeGroup SFTTXN_BRKTXN
+    Kill SFTTXN_BRKTXN
+    End
+  Endif
+
+  FreeGroup SFTTXN_BRKTXN
+  Kill SFTTXN_BRKTXN
+
+  OERRNUM = [V]CST_AOK
+End
+
+####################################################################################
+# Get the next sequence number for this key combination
+####################################################################################
+Funprog NEXT_SEQ(IEMPNUM,ISFTTYP,IVCRNUM)
+Value    Integer  IEMPNUM
+Value    Integer  ISFTTYP
+Value    Char     IVCRNUM
+
+Local Integer OSEQ
+Local File SFTTXN [SFTX]
+
+  Filter [SFTX] Where EMPNUM=IEMPNUM & SFTTYP=ISFTTYP & VCRNUM=IVCRNUM Order By SFTSEQ
+  Read [SFTX] Last
+  Filter [SFTX]
+  If fstat
+      OSEQ = 1
+  Else
+      OSEQ = [F:SFTX]SFTSEQ + 1
+  Endif
+
+LogicClose File [SFTX]
+
+End OSEQ
+
+####################################################################################
+# Record actual start and stop times in case they need to changed later (AutoBreaks)
+####################################################################################
+Subprog UPDATEACTUALTIMES(SFTTXN_ACTUAL)
+Variable Instance SFTTXN_ACTUAL Using C_SFTTXN
+
+  If SFTTXN_ACTUAL.UTCSTRDATTIM<>AVOID.ADATTIM & SFTTXN_ACTUAL.ACTSTRDATTIM=AVOID.ADATTIM
+    SFTTXN_ACTUAL.ACTSTRDATTIM = SFTTXN_ACTUAL.UTCSTRDATTIM
+  Endif
+
+  If SFTTXN_ACTUAL.UTCENDDATTIM<>AVOID.ADATTIM & SFTTXN_ACTUAL.ACTENDDATTIM=AVOID.ADATTIM
+    SFTTXN_ACTUAL.ACTENDDATTIM = SFTTXN_ACTUAL.UTCENDDATTIM
+  Endif
+
+End
+
+####################################################################################
+# Set the shift date and the employee shift
+####################################################################################
+Subprog UPDATESHIFTDATE(SFTTXN_SHIFT)
+Variable Instance SFTTXN_SHIFT Using C_SFTTXN
+
+  Local Integer SFTEMPCLK
+  Local Date    CURDATE
+  Local Char    CURTIME(6)
+
+  Local File TABMAT   [TMA]
+  Local File SFTSHIFT [SFTS]
+  Local File SFTTXN   [SFTX]
+
+  # Get the employee's shift
+  Read [TMA]TMA0=SFTTXN_SHIFT.EMPNUM
+  # Set the employee's shift to the transaction record
+  If !fstat : SFTTXN_SHIFT.SHIFT = [F:TMA]SHIFT : Endif
+
+  # Get today's date in local time
+  Call TIMESTAMP(SFTTXN_SHIFT.FCY, [L]CURDATE, [L]CURTIME) From SFTLIB
+
+  # 1 - If Time and attendance is turned on and this isn't a clockin - get shift date from clockin
+  If SFTTXN_SHIFT.SFTTYP <> 1 &
+&     fmet SFTTXN_SHIFT.ACTX.APARAM.AGETVALNUM([V]CST_ALEVFCY, SFTTXN_SHIFT.FCY, "SFTEMPCLK") = [V]CST_AYES
+
+    Filter [SFTX] Where EMPNUM=SFTTXN_SHIFT.EMPNUM & SFTTYP=1 & UTCENDDATTIM=AVOID.ADATTIM Order By SFTSEQ
+    Read [SFTX] Last
+    Filter [SFTX]
+    If !fstat
+      SFTTXN_SHIFT.SHIFT    = [F:SFTX]SHIFT
+      SFTTXN_SHIFT.SHIFTDAT = [F:SFTX]SHIFTDAT
+    Endif
+  Endif
+
+  # 2 - If no T&A or this is a clockin, check for a shift being defined - use date based on shift
+  If SFTTXN_SHIFT.SHIFT<>"" & SFTTXN_SHIFT.SHIFTDAT=[0/0/0]
+    # Read the shift record
+    Read [SFTS]SHF0=SFTTXN_SHIFT.SHIFT
+    If !fstat
+      # Check if the shift spans over two days
+      If [F:SFTS]SHFSTR<[F:SFTS]SHFEND
+        # Single day shift - use today's date
+        SFTTXN_SHIFT.SHIFTDAT = [L]CURDATE
+      Else
+        # Shift started yesterday - so use Date - 1
+        # Don't care when you actually clocked in, go by when your shift is
+        SFTTXN_SHIFT.SHIFTDAT = [L]CURDATE-1
+      Endif
+    Endif
+  Endif
+
+  # 3 - If no T&A and no shift, just use today's date (already set up above)
+  If SFTTXN_SHIFT.SHIFTDAT=[0/0/0] : SFTTXN_SHIFT.SHIFTDAT=[L]CURDATE : Endif
+
+  LogicClose File [TMA], [SFTS], [SFTX]
+
+End
+######################################################################################
+#TTD-2105.s
+Subprog RESTART_TEAM_BREAK(ITEAMNUM,STOPTIME)
+  Value    Integer  ITEAMNUM
+  Value Datetime    STOPTIME
+
+  Local File SFTTXN [SFTXNTB]
+  Local Instance SFTTXN_TB Using C_SFTTXN
+
+  #Looking for a team break records
+  Filter [SFTXNTB] Where EMPNUM = [L]ITEAMNUM & TEAMNUM = [L]ITEAMNUM &
+&                        MACFLG = [V]CST_AYES & BRKTXN <> AVOID.AUUIDENT
+
+  # Not found...get out
+  Read [SFTXNTB] First
+  If fstat : Goto NO_REC_FOUND : Endif
+
+  Trbegin [F:SFTXNTB]
+
+  For [SFTXNTB]
+      # Remove the Break transaction GUID from this record
+      [F:SFTXNTB]BRKTXN  = AVOID.AUUIDENT
+
+      Rewrite [F:SFTXNTB]
+
+      # Fail update
+      If fstat <> 0
+        [V]GOK=-1
+        Break
+      Endif
+
+      SFTTXN_TB = NewInstance C_SFTTXN AllocGroup null
+
+      SFTTXN_TB.EMPNUM       = [F:SFTXNTB]EMPNUM
+      SFTTXN_TB.TEAMNUM      = [F:SFTXNTB]TEAMNUM
+      SFTTXN_TB.SFTTYP       = [F:SFTXNTB]SFTTYP
+      SFTTXN_TB.VCRNUM       = [F:SFTXNTB]VCRNUM
+      SFTTXN_TB.SUMEMP       = [F:SFTXNTB]SUMEMP
+      SFTTXN_TB.SFTSEQ       = func NEXT_SEQ([F:SFTXNTB]EMPNUM, [F:SFTXNTB]SFTTYP, [F:SFTXNTB]VCRNUM)
+      SFTTXN_TB.UTCSTRDATTIM = [L]STOPTIME
+      SFTTXN_TB.UTCOFFSET    = [F:SFTXNTB]UTCOFFSET
+      SFTTXN_TB.INDREF       = [F:SFTXNTB]INDREF
+      SFTTXN_TB.NUMJOBS      = [F:SFTXNTB]NUMJOBS
+      SFTTXN_TB.OPENUM       = [F:SFTXNTB]OPENUM
+      SFTTXN_TB.NUMMAC       = [F:SFTXNTB]NUMMAC
+      SFTTXN_TB.WCENTER      = [F:SFTXNTB]WCENTER
+      SFTTXN_TB.LCENTER      = [F:SFTXNTB]LCENTER
+      SFTTXN_TB.OPEUOM       = [F:SFTXNTB]OPEUOM
+      SFTTXN_TB.INDTYP       = [F:SFTXNTB]INDTYP
+      SFTTXN_TB.FCY          = [F:SFTXNTB]FCY
+      SFTTXN_TB.SHIFT        = [F:SFTXNTB]SHIFT
+      SFTTXN_TB.SHIFTDAT     = [F:SFTXNTB]SHIFTDAT
+      SFTTXN_TB.TXNUUID      = [F:SFTXNTB]TXNUUID
+      SFTTXN_TB.STRTXNUUID   = [F:SFTXNTB]STRTXNUUID  ##Jira 46517.n 07/06/17 by CATUA Set value for STRTXNUUID
+      SFTTXN_TB.MACFLG       = [F:SFTXNTB]MACFLG
+      SFTTXN_TB.CLEFLG       = [F:SFTXNTB]CLEFLG      # TODAN-119641.n
+
+      If fmet SFTTXN_TB.AINSERT <> [V]CST_AOK
+        [L]ASTATUS = fmet this.ASETERROR ("", mess(5,2422,1), [V]CST_AERROR)
+        [L]ARET_VALUE = [V]CST_AERROR
+        FreeGroup SFTTXN_TB
+        Break
+      Endif
+
+      FreeGroup SFTTXN_TB
+
+  Next
+
+  # check if update/insert record fail then display message
+  If [V]GOK = -1
+    Rollback
+    ERRMSG = mess(5,2422,1)   # Restart operation(s) failed.
+    ERRNUM = [V]CST_AERROR
+    LogicClose File [F:SFTXNTB]
+  Else
+    Commit
+  Endif
+NO_REC_FOUND:
+  LogicClose File [F:SFTXNTB]
+
+End
+#TTD-2105.s
+######################################################################################
+

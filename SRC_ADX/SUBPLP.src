@@ -1,0 +1,1193 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+#*******************************************************************************
+#
+#                    GESTION DES PLANS DE PRODUCTION
+#
+#*******************************************************************************
+#    Création
+#    MWA - 06.05.2007
+#
+#**********************************************************************************
+#    Modification
+# MWA 12.10.2016 FQ118932   : Valeur saisie dans le champ UO prévues disparait ou non pris en compte
+# MWA 03.07.2015 FQ109277   : Mode UO dotation pér. erronée lorsque fin exercice > à fin du plan de production
+# MWA 17.06.2015 FQ109187   : complément fiche FQ107896
+# MWA 17.06.2015 FQ107896   : Les UO prévues de la période dans laquelle se situe la fin du plan de prod. ne doivent pas ête saisissables
+# MWA 11.02.2015 FQ105600   : Ajout de l'unité dans laquelle sont gérées les UO du plan de production
+# CBO 28.05.2013 FQ93592    : Import : besoin de la bonne abrev de PROPLN = PLP et non PPL
+# MWA 11.07.2013 FQ91098    : En création, périodes du plan différentes de celles du contexte
+# GLE 22.02.2013 FQ87713    : Erreur FIYQTY(-1) lorsqu'on modifie les UO prévues sur un plan dont la date de fin
+#                             ne correspond pas à une date de fin d'exercice
+# MDJ 12.06.2013 FQ82871    : Adaptations pour Convergence (pcolor)
+# MWA 31.10.2012 FQ85464    : Prise en compte de la legislation dans la numérotation automatique
+# CBO 12.03.2012 FQ80246    : GFMDAT4 au lieu de DD[/]MM[/]YYYY
+# MWA 01.09.2011 FQ59941    : Gestion des modes russes
+# MWA 28.01.2010 FQ61963    : En mise à jour, positionner à calculer les biens l'utilisant
+#
+#**********************************************************************************
+
+######################################################################################
+
+#
+Raz GPILOBJ
+Call DEFVAR From GLOBIMM
+Call INIVAR From GLOBIMM
+Call OBJET("PLP",GBIDC1,GBIDC2) From GOBJET
+End
+
+$ACTION
+  #Infbox ACTION
+  Case ACTION
+    When "OUVRE"           : Gosub OUVRE
+    When "RAZCRE"          : Gosub RAZCRE
+    When "RAZDUP"          : Gosub RAZDUP
+    When "LIENS"           : Gosub LIENS
+
+    When "SETBOUT"         : Gosub SETBOUT
+
+    When "INICRE"          : Gosub INICRE
+    When "CREATION"        : Gosub CREATION
+
+    When "AVANT_MOD"       : Gosub AVANT_MOD
+    When "VERIF_MOD"       : Gosub VERIF_MOD
+    When "MODIF"           : Gosub MODIF
+
+    When "VERF_ANU"        : Gosub VERF_ANU
+
+    When "ABANDON"         : Gosub ABANDON
+    When "FERME"           : Gosub FERME
+
+    When Default
+  Endcase
+Return
+
+#
+#*****************************
+#
+$OUVRE
+
+# Gestion tables
+If clalev([F:PPH]) =0    : Local File PROPLNH     [PPH]    : Endif
+#FQ93592
+If clalev([F:PLP]) =0    : Local File PROPLN      [PLP]    : Endif
+If clalev([F:FAS]) =0    : Local File FXDASSETS   [FAS]    : Endif
+If clalev([F:DEP]) =0    : Local File DEPREC      [DEP]    : Endif
+If clalev([F:FASW])=0    : Local File FXDASSETS   [FASW]   : Endif
+If clalev([F:FIS]) =0    : Local File FISCYEAR    [FIS]    : Endif
+If clalev([F:CNX]) =0    : Local File CONTEXT     [CNX]    : Endif
+
+# Si on vient par tunnel il faut sauvegarder les variables globales
+# pour les restaurer à la fin dans $FERME
+If TUNNEL : Gosub SAUVE_GLOBAL_SV From GLOBIMM : Endif
+If TUNNEL : Gosub SAUVE_GLOB_TUNNEL From TRUPROACT : Endif
+
+# Initialisation de la gestion des globales d'environnement
+Call INIT_FCY () From GLOFCYCPY
+
+# Variables globales au traitement
+Global Integer G_DSP        : # Booleen En mode affichage d'information
+Global Integer G_CURLIG     : # Positionnement initial dans le plan de production
+G_DSP = 0
+
+Global Integer G_CNXUO      : # Contexte gérant les UO
+Global Integer G_PPLMOD     : # Indicateur plan de production modifié
+Global Integer G_LOCK       : # Indicateur de lock des biens rattachés au plan de production
+Global Integer G_MODOK      : # Utilisé lors de la modification pour traiter les lock en cas d'échec
+                              #    =0     : Pas de modification
+                              #    =G_NON : Echec modification
+                              #    =G_OUI : Modification  Ok
+
+G_MODOK  = 0 : # Pas de modification
+G_PPLMOD = G_NON
+
+Return
+
+#*****************************
+#
+$LIENS
+  Local Decimal LCUMUO
+  Local Integer I_LGN
+
+  # FQ105600 Récupération de l'unité du plan de production utilisée en paramètre du type de données QTY ou QT1
+  Read [F:PPH]PPH0=[M:PPL0]PROPLN
+  [M:PPL0]UOM = [F:PPH]UOM
+  Diszo [M:PPL0]UOM
+
+
+  G_PPLMOD = G_NON
+
+  If (G_DSP) Then : Infbox "GREP ="-num$(GREP) : Endif
+  GREP = ""
+
+  # La modification a échoué dans le $MODIF
+  If ( G_MODOK = G_NON ) Then
+    # L'indicateur passe à "Pas de modification"
+    G_MODOK = 0
+    # Unlock des biens du plan de production
+    Gosub UNLOCK_BIENS_DU_PLAN_DE_PRODUCTION
+  Endif
+
+  # *-- Conditionnement de champ (Actzo ou Diszo)                         --*
+  # *-- lorsque l'on est en modification selon valeur d'autres champs     --*
+  Diszo [M:PPL0]FCY
+
+  # *-- Chargement des informations autres que celles de l'objet lui-même --*
+  # Chargement des lignes du tableau plan de production (PROPLN)
+  Effzo [M:PPL1]
+  nolign = 1
+  For [PLP]PPL0 Where PROPLN = [M:PPL0]PROPLN
+    [M:PPL1]=[F:PLP]
+    [M:PPL1]PERENDDATC (nolign-1) = format$("D:" + GFMDAT4, [F:PLP]PERENDDAT)
+    nolign += 1
+  Next
+  [M:PPL1]NBLIG = nolign - 1
+  Affzo [M:PPL1]
+
+  # Récupération du contexte pilotant les UO
+  Filter [CNX] Where CPY=[M:PPL0]CPY  and FLGCNXUO=G_OUI
+  Read [CNX] First
+  Filter [CNX]
+  If !(fstat) Then
+    G_CNXUO = [F:CNX]CNX
+  Endif
+
+  # Récupération de la date de début de l'exercice courant
+  # et de la date de fin de la période courante du contexte pilote pour les UO
+  # utilisées pour le positionnement à l'affichage
+  [M:PPL0]CURFIYSTR = [0/0/0]
+  [M:PPL0]CURPEREND = [0/0/0]
+  Filter [FIS] Where CPY=[M:PPL0]CPY and CNX= G_CNXUO and STAFIY= GVML_TECOURA
+  Read [FIS] First
+  Filter [FIS]
+  If !(fstat) Then
+    [M:PPL0]CURFIYSTR =[F:FIS]DATSTRFIY
+    [M:PPL0]CURPEREND =[F:FIS]DATENDPER([F:FIS]INDCURPER-1)
+  Endif
+  [M:PPL0]CURPERLIG = find ([M:PPL0]CURPEREND, [M:PPL1]PERENDDAT)
+
+  # Positionnement initial dans le Plan de production
+  G_CURLIG = find([M:PPL0]CURFIYSTR, [M:PPL1]FIYSTRDAT) - 1
+  If ( G_CURLIG < 0 and [M:PPL1]NBLIG > 0) Then
+    G_CURLIG = 0
+  Endif
+  # Récupération de la date de fin du plan de production et du total des UO sur la période courante
+  # pour alimenter le masque d'en-tête.
+  If  ([M:PPL1]PPLENDDAT([M:PPL1]NBLIG-1) <> [0/0/0])
+& and ([M:PPL1]PPLENDDAT([M:PPL1]NBLIG-1) <  [F:FIS]DATSTRPER([F:FIS]INDCURPER-1)) : # FQ87713
+    # Lorsque le plan de production a une date de fin antérieure à l'exercice courant, on prend
+    # les informations sur la dernière période du plan de production, c'est à dire sur
+    # la dernière ligne du tableau
+
+    # Date de fin du plan (précisée sur la dernière période)
+    [M:PPL0]PPLENDDAT0 = [M:PPL1]PPLENDDAT([M:PPL1]NBLIG-1)
+    # Total des UO du plan (précisée sur la dernière période)
+    [M:PPL0]PLNQTY0    = [M:PPL1]PLNQTY   ([M:PPL1]NBLIG-1)
+  Else
+    # Date de fin du plan (précisée sur la période courante)
+    [M:PPL0]PPLENDDAT0 = [M:PPL1]PPLENDDAT( find([M:PPL0]CURPEREND, [M:PPL1]PERENDDAT) - 1 )
+    # Total des UO du plan (précisée sur la période courante)
+    [M:PPL0]PLNQTY0    = [M:PPL1]PLNQTY   ( find([M:PPL0]CURPEREND, [M:PPL1]PERENDDAT) - 1 )
+  Endif
+
+
+  # Conditionnement des lignes du tableau plan de production (PROPLN)
+  # Remarque : Le conditionnement de la saisie d'une ligne de tableau nécessite de conditionner chaque champ
+  #            si beaucoup de champs à conditionner, il vaut mieux faire comme dans AFFICHE_LIGNE de SUBMAS
+  LCUMUO = 0
+
+  For nolign = 1 To [M:PPL1]NBLIG
+    Actzo [M:PPL1]EXTQTY(nolign -1)
+    Actzo [M:PPL1]CPLQTY(nolign -1)
+    If ( [M:PPL1]PERENDDAT(nolign -1) < [M:PPL0]CURPEREND ) Then
+      Diszo [M:PPL1]EXTQTY(nolign -1)
+      Diszo [M:PPL1]CPLQTY(nolign -1)
+    Elsif ( [M:PPL1]PERENDDAT(nolign -1) > [M:PPL0]CURPEREND ) Then
+      Diszo [M:PPL1]CPLQTY(nolign -1)
+    Endif
+    If ( [M:PPL1]CPLQTY(nolign -1) <> 0 ) Then
+      LCUMUO += [M:PPL1]CPLQTY(nolign -1)
+    Else
+      LCUMUO += [M:PPL1]EXTQTY(nolign -1)
+    Endif
+    [M:PPL1]CUMQTY(nolign -1) = LCUMUO
+
+    # FQ107896
+    If ( [M:PPL0]PPLENDDAT0 <> [0/0/0] and
+&        [M:PPL0]PPLENDDAT0 >= [M:PPL1]PERSTRDAT(nolign -1) and
+&        [M:PPL0]PPLENDDAT0 <= [M:PPL1]PERENDDAT(nolign -1) ) Then
+      Diszo [M:PPL1]EXTQTY([M:PPL1]NBLIG -1)
+    Endif
+
+  Next nolign
+
+  # Biens rattachés au plan de production
+  # Chargement du tableau contenant les Biens rattachés au contrat
+  Local Integer I_LIG
+  I_LIG=1
+  For [FAS]FAS0 Where PROPLN = [M:PPL0]PROPLN
+    If ( I_LIG < dim([M:PPL2]AASREF) ) Then
+      nolign = I_LIG
+      [M:PPL2] = [F:FAS]
+      I_LIG += 1
+    Else
+      nolign = I_LIG
+      [M:PPL2]AASREF(I_LIG-1)    = "...."
+      [M:PPL2]AASDES1(I_LIG-1)   = "........................"
+      I_LIG+= 1
+      Break
+    Endif
+  Next
+  [M:PPL2]NBLIG2 = I_LIG-1
+
+ # Si on vient par tunnel il faut sauvegarder les variables globales
+ # pour les restaurer à la fin dans $FERME
+ If TUNNEL : Gosub SAUVE_GLOB_TUNNEL From TRUPROACT : Endif
+
+
+Return
+
+#*****************************
+#
+
+$SETBOUT
+
+  # Désactivation de l'action  Changer de clé
+  Call VIREBOUT(CHAINE,"H") From GOBJET
+
+  # Positionnement initial dans le plan de production
+  If ( [M:PPL1]NBLIG > 0 and GREP <> "C" ) Then
+    zonsui="[M:PPL1]NBLIG("+num$(G_CURLIG)+")"
+  Endif
+
+Return
+
+#-------------------------------------------------------------------------------
+$AVANT_MOD
+
+  # Modification impossible si la date de fin du plan de production est < à la période courante
+  If ( [M:PPL0]PPLENDDAT0 <> [0/0/0] and [M:PPL0]PPLENDDAT0 < [M:PPL1]PERSTRDAT ([M:PPL0]CURPERLIG-1) ) Then
+    GERR=1 : GMESSAGE = mess(582,7773,1) :  OK=0 : Return
+  Endif
+
+
+Return
+
+#*****************************
+#
+$RAZCRE
+  #  Affichage des valeurs par défaut
+
+  # Récupération Société à partir de l'établissement
+  Call ACTION_FCY ([M:PPL0]FCY, [M:PPL0]CPY) From GLOFCYCPY
+
+  # Affichage société & intitulé société
+  Affzo [M:PPL0]CPY
+  Affzo [M:PPL0]ZCPY
+
+  # Rémanence sur Site
+  If ( GREMAFCY = G_NON ) Then
+    zonsui = "[M:PPL0]FCY"
+  Else
+    zonsui = "[M:PPL0]PROPLN"
+  Endif
+
+  # FQ105600
+  #[F:PPH]UOM = "Un"
+
+Return
+
+
+
+
+#*****************************
+#
+$RAZDUP
+
+  Local Decimal LPLNQTY
+
+  # Si la 1ère ligne du tableau correspond à la période courante rien à faire de particulier
+  # Dans le cas contraire, suppression des lignes du plan antérieures à la période courante
+  # Actualisation du total UO par déduction des UO des lignes supprimées.
+
+  If ( [M:PPL0]CURPERLIG <> 1 ) Then
+    # Détermination & affichage du nouveau total UO déduction faite des UO des P antérieures à la Pc
+    LPLNQTY = [M:PPL0]PLNQTY0 - [M:PPL1]CUMQTY( [M:PPL0]CURPERLIG-2 )
+    # FQ109277
+    #Call AM_PLNQTY0(LPLNQTY)
+    [M:PPL0]PLNQTY0 = LPLNQTY
+    Affzo [M:PPL0]PLNQTY0
+    # Suppression des lignes UO des P antérieures à la Pc
+    Dela 0,[M:PPL0]CURPERLIG-1 [M:PPL1]NBLIG
+    [M:PPL1]NBLIG = [M:PPL1]NBLIG - ([M:PPL0]CURPERLIG-1)
+    [M:PPL0]CURPERLIG = 1
+    # Affichage du plan de production après actualisation
+    Affzo [M:PPL1]
+
+    # FQ109277
+    [M:PPL1]RSDQTY([M:PPL0]CURPERLIG-1) = LPLNQTY
+    Call AM_PLNQTY0(LPLNQTY)
+
+    # FQ109277
+    # Conditionnement des champs
+    For nolign = 1 To [M:PPL1]NBLIG
+      Actzo [M:PPL1]EXTQTY(nolign -1)
+      Actzo [M:PPL1]CPLQTY(nolign -1)
+      If ( [M:PPL1]PERENDDAT(nolign -1) < [M:PPL0]CURPEREND ) Then
+        Diszo [M:PPL1]EXTQTY(nolign -1)
+        Diszo [M:PPL1]CPLQTY(nolign -1)
+      Elsif ( [M:PPL1]PERENDDAT(nolign -1) > [M:PPL0]CURPEREND ) Then
+        Diszo [M:PPL1]CPLQTY(nolign -1)
+      Endif
+    Next nolign
+  Endif
+
+
+
+  # Réinitialisation du tableau des biens rattachés
+  Effzo [M:PPL2]
+
+  # FQ109277
+  #[F:PLH]UOM = "Un"
+
+Return
+
+#*****************************
+#
+$CREATION
+#
+  #-- Création des lignes du  plan de production
+  Gosub INSERT_PPL
+
+  # FQ105600
+  Diszo [M:PPL0]UOM
+Return
+
+#=====================================================================
+$VERIF_MOD
+
+  # Si une des informations dont la modification nécessite un recacul des biens rattachés a été modifié
+  # Lock des biens rattachés au plan de production
+  G_LOCK = G_NON
+  If (G_PPLMOD = G_OUI ) Then
+    # Lock des biens "du plan de production"
+    G_LOCK = G_OUI
+    Gosub LOCK_BIENS_DU_PLAN_DE_PRODUCTION
+    If (OK = 0) Then
+      # Unlock tout ce qui a été verrouillé
+      G_LOCK = G_NON
+      Call UNLOCK_SYMBOLE ("FAS", "", "") From GLOBIENS
+      GERR=1 : OK = 0
+      GMESSAGE = mess(632,7773,1)
+      Return
+    Endif
+  Endif
+
+Return
+
+
+#*****************************
+#
+$MODIF
+
+  #  Par défaut : "Modification réussie"
+  G_MODOK =  G_OUI
+
+  # Si les biens rattachés au plan de production ont été lockés
+  # c'est qu'il faut les recalculer
+  # Mise à jour du DEPSTA à "Non calculé" pour les DEPREC exercice période courante du contexte gérant les UO.
+  #- 1 --------------------------
+  If ( G_LOCK = G_OUI) Then
+    # >>>>>>>>>>>>>>>>
+    For [FASW]FAS0 Hint Key FAS4 Where PROPLN =[M:PPL0]PROPLN
+    # Pour chaque bien rattaché au plan de production
+
+      # Passage à "non calculé" des deprec période courante du bien pour le contexte gérant les UO
+      # si ceux-ci sont en mode "UO" sur la période courante
+      # FQ59941
+      Update [DEP]
+&     Where ( DPM = G_DPMUO or DPM = G_DPMUR ) and AASREF = [F:FASW]AASREF and CNX = G_CNXUO and PERENDDAT = [M:PPL0]CURPEREND
+&     With  DEPSTA = GVML_SCNOCAL
+      If (fstat) Then
+        GOK = 0 : G_MODOK = G_NON
+        Return  #CHECK IGNORE_LINE
+      Endif
+
+      # FQ61963
+      [F:FASW]FLGCLC               = G_OUI
+      [F:FASW]FLGCNXCLC(G_CNXUO-1) = G_OUI
+      Rewrite [FASW]
+      If ( fstat ) Then
+        GOK = 0 : G_MODOK = G_NON
+        Return  #CHECK IGNORE_LINE
+      Endif
+
+    Next
+    # <<<<<<<<<<<<<<<<<
+  Endif
+  #- 1 --------------------------
+
+
+  #-- Création des lignes du  plan de production
+  Delete[F:PLP] Where PROPLN= [M:PPL0]PROPLN
+  If (fstat) Then
+    GOK = 0
+    Call RSTA("PLP",CLECUR1) From GLOCK
+    Return
+  Endif
+
+  #-- Création des lignes du  plan de production
+  Gosub INSERT_PPL
+
+  # Unlock sur les biens rattachés au plan de production
+  Gosub UNLOCK_BIENS_DU_PLAN_DE_PRODUCTION
+
+Return
+
+#*****************************
+#
+$INICRE
+
+  [F:PLH]ENAFLG   = G_OUI
+  # Numérotation automatique
+  If ( GPPLAUTNUM = 2 or (GPPLAUTNUM = 3 and [M:PPL0]PROPLN = "") ) Then
+    Local Integer STAT
+    # Appel du compteur de document FQ85464
+    Call GET_NUMERO("PLP",GVML_NUMPPL-1,1,[M:PPL0]CPY,[M:PPL0]FCY,date$,[F:PLH]PROPLN,STAT) From GLOBIENS
+    If ( STAT ) Then : GOK = 0 : Return : Endif
+    [M:PPL0]PROPLN = [F:PLH]PROPLN : Affzo [M:PPL0]PROPLN
+  Endif
+
+Return
+
+#
+#=====================================================================
+#
+$INSERT_PPL
+Local Integer NOL
+#                         * Création de l'échéancier
+
+  [F:PLH]ENAFLG   = G_OUI
+  [F:PLH]UOM      = "Un"
+
+  # >>>>>>>>>>>>>>>>>>
+  For nolign = 1 To [M:PPL1]NBLIG
+    Raz  [F:PLP]
+    [F:PLP]         = [M:PPL1]
+    [F:PLP]PROPLN   = [M:PPL0]PROPLN
+
+    Write [F:PLP]
+    If ( fstat ) Then
+      GOK = 0
+      Call FSTA("PLP") From GLOCK
+      Break
+    Endif
+  Next nolign
+  # <<<<<<<<<<<<<<<<<<
+  If !(GOK) Then : Return : Endif
+  #
+Return
+
+#=====================================================================
+#
+$VERF_ANU
+
+  # La suppression d'un plan de production est interdite tant qu'au moins un bien comptable
+  # lui est rattaché.
+  If ( [M:PPL2]NBLIG2 > 0  ) Then
+    GERR= 1 : GMESSAGE= mess(579,7773,1) :  OK = 0
+    zonsui = "[M:PPL0]PROPLN"
+    Return
+  Endif
+
+Return
+
+#=====================================================================
+$ABANDON
+
+  If ( G_MODOK = G_NON and G_LOCK = G_OUI) Then
+    # Unlock sur les biens rattachés au plan de production
+    Gosub UNLOCK_BIENS_DU_PLAN_DE_PRODUCTION
+  Endif
+
+# Local Integer TRTOBJ : Gosub ACTION From TRUPROACT : kill TRTOBJ #=> Modèle action unitaire V2
+
+Return
+
+
+#*****************************
+#
+$FERME
+
+  Kill G_DSP
+  Kill G_CURLIG
+  Kill G_CNXUO
+  Kill G_MODOK
+  Kill G_LOCK
+
+
+  # Si on vient par tunnel il faut restaurer les variables globales
+  # ayant été sauvegardées soit dans $OUVRE soit dans $LIENS
+  If TUNNEL : Gosub RESTAURE_GLOBAL_SV From GLOBIMM     : Endif
+  If TUNNEL : Gosub RESTAURE_GLOB_TUNNEL From TRUPROACT : Endif
+
+Return
+
+######################################################################################
+##                     ECRAN  :   PPL0
+######################################################################################
+
+######################################################################################
+
+##############################
+Subprog AV_FCY(VALEUR)
+Variable Char    VALEUR()
+
+  # Affichage de l'intitulé société (non pris en compte par le type de donnée BFC)
+  Affzo [M:PPL0]ZCPY
+
+
+End
+
+##############################
+Subprog C_FCY(VALEUR)
+Variable Char    VALEUR()
+
+Local Integer ISITE
+Local Char    SOCIETE (GLONCPY)
+
+Local Integer LCNXUO
+
+
+  If ( G_DSP) Then : Infbox "C_FCY" : Endif
+
+  # Recherche de la société du site
+  ISITE = find(VALEUR,GSITE(1..GNBSITE))
+  If ( ISITE ) Then
+    SOCIETE = GSOCSITE(ISITE)
+  Else
+    GMESSAGE = mess(15,104,1) : # Site inexistant
+    mkstat = 2 : End
+  Endif
+
+  # La duplication ne peut avoir lieu que sur un site financier appartenant à la même société
+  # A conserver au cas où il devenait nécessaire de mettre en oeuvre la duplication
+  If (1 = 0 and GREP = "D" and VALEUR <> [M:PPL0]FCY) Then
+    If ( GCOUSOC <> SOCIETE ) Then
+      # Site financier invalide
+      GERR= 1: GMESSAGE = mess(19,7773,1)
+      mkstat = 2 : End
+    Endif
+  Endif
+
+  # Récupération du contexte pilotant les UO
+  Filter [CNX] Where CPY=SOCIETE  and FLGCNXUO=G_OUI
+  Read [CNX] First
+  Filter [CNX]
+  If !(fstat) Then
+    LCNXUO = [F:CNX]CNX
+  Endif
+
+  If !(LCNXUO) Then
+    # Opération impossible :  Aucun contexte de la société n'a été désigné comme gérant les unités d'oeuvre
+    GMESSAGE = mess(576,7773,1)
+    mkstat = 2 : End
+  Else
+    [M:PPL0]CNX = LCNXUO
+    G_CNXUO     = LCNXUO
+  Endif
+
+End
+
+##############################
+Subprog AP_FCY(VALEUR)
+Variable Char    VALEUR()
+
+Local Char LSOC(GLONCPY)
+
+  If ( G_DSP) Then : Infbox "AP_FCY" : Endif
+
+  # Un contrôle est réalisé sur l'existence du contexte pilotant les UO pour la société du site.
+  # S'il n'existe pas, la création d'un plan de production est refusé sur cette société.
+  # Mais la classe du site a déjà trouvé et affiché la société.
+  # Si on remet le site d'origine, on ne passe plus en AM_FCY, et la société affichée
+  # n'est pas celle du site. Il faut forcer le passage dans ACTION_FCY.
+  # la fonction ne fera rien si le site est identique à GCOUSIT.
+  LSOC = [M:PPL0]CPY
+  Call ACTION_FCY (VALEUR, [M:PPL0]CPY) From GLOFCYCPY
+  If ( [M:PPL0]CPY <> LSOC ) Then
+    Affzo [M:PPL0]CPY
+  Endif
+
+
+End
+
+##############################
+Subprog AM_FCY(VALEUR)
+Variable Char    VALEUR()
+
+  If ( G_DSP) Then : Infbox "AM_FCY" : Endif
+
+  # Affichage de l'intitulé société (non pris en compte par le type de donnée BFC)
+  If ( dim([M:PPL0]ZCPY) > 0 ) Then
+    Affzo [M:PPL0]ZCPY
+  Endif
+
+  # Affichage des valeurs par defaut dépendant de l'établissement
+  [M:PPL0]FCY = VALEUR
+
+  # Chargement des lignes du plan de production selon découpage période du contexte pilotant les UO
+  [M:PPL0]PLNQTY0 = 0 : Affzo [M:PPL0]PLNQTY0
+  # Chargement des lignes du tableau plan de production (PROPLN)
+  Call PLAN_PROD_SELON_FIN_PLAN ( 1, [0/0/0] )
+
+  Affzo [M:PPL1]
+
+  # Conditionnement des champs
+  For nolign = 1 To [M:PPL1]NBLIG
+    Actzo [M:PPL1]EXTQTY(nolign -1)
+    Actzo [M:PPL1]CPLQTY(nolign -1)
+    If ( [M:PPL1]PERENDDAT(nolign -1) < [M:PPL0]CURPEREND ) Then
+      Diszo [M:PPL1]EXTQTY(nolign -1)
+      Diszo [M:PPL1]CPLQTY(nolign -1)
+    Elsif ( [M:PPL1]PERENDDAT(nolign -1) > [M:PPL0]CURPEREND ) Then
+      Diszo [M:PPL1]CPLQTY(nolign -1)
+    Endif
+  Next nolign
+
+
+End
+
+
+######################################################################################
+##############################
+Subprog C_PROPLN(VALEUR)
+Variable Char    VALEUR()
+
+  If ( GPPLAUTNUM = 1 and VALEUR= "" ) Then
+    GERR= 1: GMESSAGE = mess(3,7773, 1)
+    mkstat = 2
+  Elsif ( VALEUR = "" and !GIMPORT ) Then
+    # Création forcée
+    mkstat = 4
+  Endif
+End
+######################################################################################
+
+##############################
+Subprog AM_PPLENDDAT0(VALEUR)
+Variable Date    VALEUR
+  If ( VALEUR <> [0/0/0] and VALEUR <= [M:PPL0]CURPEREND ) Then
+    # Lorsqu'elle est renseignée,
+    # la date de fin du plan de production doit être > à la date de fin de la période courante
+    GERR= 1: GMESSAGE = mess(580,7773,1)
+    mkstat = 2 : End
+  Endif
+
+  # FQ107896 si l'ancienne date de fin du plan de production  était située sur une ligne du plan, le champ "UO prévues" doit redevenir saisissable
+  #          c'est PLAN_PROD_SELON_FIN_PLAN qui ira le cas échéant rendre le champ "UO prévues" non saisissable sur la ligne du plan
+  #          sur laquelle se situe la nouvelle de fin de plan de production
+  Local Integer ILIGN
+  For ILIGN = 1 To [M:PPL1]NBLIG
+    If ( [M:PPL0]PPLENDDAT0 <> [0/0/0] and
+&      [M:PPL0]PPLENDDAT0 >= [M:PPL1]PERSTRDAT(ILIGN -1) and
+&      [M:PPL0]PPLENDDAT0 <= [M:PPL1]PERENDDAT(ILIGN -1) ) Then
+      Actzo [M:PPL1]EXTQTY(ILIGN -1)
+      Break
+    Endif
+  Next
+
+  Call PLAN_PROD_SELON_FIN_PLAN ( [M:PPL1]NBLIG, VALEUR)
+  Call DUREE_RESIDUELLE ([M:PPL0]CURPERLIG,  VALEUR)
+  Call UO_EXERCICE(VALEUR, [M:PPL0]PLNQTY0)
+  Affzo [M:PPL1]
+
+
+  # FQ107896
+  For ILIGN = 1 To [M:PPL1]NBLIG
+    If ( [M:PPL1]PERENDDAT(ILIGN -1) < [M:PPL0]CURPEREND ) Then
+      Diszo [M:PPL1]EXTQTY(ILIGN -1)
+      Diszo [M:PPL1]CPLQTY(ILIGN -1)
+    Elsif ( [M:PPL1]PERENDDAT(ILIGN -1) > [M:PPL0]CURPEREND ) Then
+      Diszo [M:PPL1]CPLQTY(ILIGN -1)
+    Endif
+  Next
+
+  G_PPLMOD = G_OUI
+End
+
+
+######################################################################################
+
+##############################
+Subprog AM_PLNQTY0(VALEUR)
+Variable Decimal VALEUR
+
+
+  If (  [M:PPL0]CURPERLIG <> 1 and VALEUR <= [M:PPL1]CUMQTY( [M:PPL0]CURPERLIG-2 ) ) Then
+    # Le total UO du plan de production doit être > au nombre d'UO déjà amorti
+    GERR= 1: GMESSAGE = mess(581,7773,1)
+    mkstat = 2 : End
+  Endif
+
+  [M:PPL1]RSDQTY([M:PPL0]CURPERLIG-1) += VALEUR - [M:PPL0]PLNQTY0
+  Call DUREE_RESIDUELLE ([M:PPL0]CURPERLIG, [M:PPL0]PPLENDDAT0)
+  Call UO_EXERCICE([M:PPL0]PPLENDDAT0, VALEUR)
+  Affzo [M:PPL1]
+
+  If ( [M:PPL0]PPLENDDAT0 <> [0/0/0] ) Then : G_PPLMOD = G_OUI : Endif
+End
+
+
+######################################################################################
+##                     ECRAN  :   PPL1
+######################################################################################
+
+######################################################################################
+
+##############################
+Subprog AVANT_NBLIG
+
+  #If ( nolign = [M:PPL0]CURPERLIG-1 ) Then
+  #*Fq-82871
+  #* - on garde les pcolor pour l'appli. C/S
+  #* - on ajoute un chgstl pour Convergence
+  If ( nolign = [M:PPL0]CURPERLIG ) Then
+    Chgstl NBLIG(nolign-1)  With "AWARNLOW"
+    pcolor = GCOUL(3) : # Bleu
+  Else
+    Chgstl NBLIG(nolign-1)  With ""
+    pcolor = GCOUL(0) : # Normal
+  Endif
+
+End
+
+##############################
+Subprog AV_PERSTRDAT(VALEUR)
+Variable Date    VALEUR
+
+  #*Fq-82871
+  #* - on garde les pcolor pour l'appli. C/S
+  #* - on ajoute un chgstl pour Convergence
+  If ( nolign = [M:PPL0]CURPERLIG ) Then
+    Chgstl NBLIG(nolign-1)  With "AWARNLOW"
+    pcolor = GCOUL(3) : # Bleu
+  Else
+    Chgstl NBLIG(nolign-1)  With ""
+    pcolor = GCOUL(0) : # Normal
+  Endif
+End
+
+##############################
+Subprog C_EXTQTY(VALEUR)
+Variable Decimal VALEUR
+
+  Local Integer LOK
+  Local Decimal LPLNQTY
+
+  If ( [M:PPL1]CPLQTY(nolign-1) = 0 ) Then
+    LPLNQTY = [M:PPL1]CUMQTY(nolign-1)+(VALEUR-[M:PPL1]EXTQTY(nolign-1))
+    If ( [M:PPL1]CPLQTY(nolign-1) = 0 and LPLNQTY  > [M:PPL0]PLNQTY0 ) Then
+      Call OUINON(mess(577,7773,1)-num$(LPLNQTY)-mess(578,7773,1), LOK) From GESECRAN
+      If ( LOK = G_OUI) Then
+        Call AM_PLNQTY0(LPLNQTY)
+        [M:PPL0]PLNQTY0 = LPLNQTY
+        Affzo [M:PPL0]PLNQTY0
+      Else
+        mkstat = 2
+        End
+      Endif
+    Endif
+  Endif
+
+End
+
+##############################
+Subprog AM_EXTQTY(VALEUR)
+Variable Decimal VALEUR
+
+  # FQ118932
+  [M:PPL1]EXTQTY(nolign-1) = VALEUR
+  #- 1 --------------
+  If ( [M:PPL1]CPLQTY(nolign-1) = 0  ) Then
+    #[M:PPL1]EXTQTY(nolign-1) = VALEUR FQ118932
+    Call DUREE_RESIDUELLE (nolign, [M:PPL0]PPLENDDAT0)
+    Call UO_EXERCICE([M:PPL0]PPLENDDAT0, [M:PPL0]PLNQTY0)
+  Endif
+  #- 1 --------------
+  Affzo [M:PPL1]
+
+
+  G_PPLMOD = G_OUI
+End
+
+
+######################################################################################
+
+##############################
+Subprog AM_CPLQTY(VALEUR)
+Variable Decimal VALEUR
+
+
+  [M:PPL1]CPLQTY(nolign-1) = VALEUR
+  Call DUREE_RESIDUELLE (nolign, [M:PPL0]PPLENDDAT0)
+  Call UO_EXERCICE([M:PPL0]PPLENDDAT0, [M:PPL0]PLNQTY0)
+  Affzo [M:PPL1]
+
+  G_PPLMOD = G_OUI
+End
+
+##############################
+Subprog C_CPLQTY(VALEUR)
+Variable Decimal VALEUR
+
+
+  Local Integer LOK
+  Local Decimal LPLNQTY
+
+  If ( VALEUR <> 0 ) Then
+    LPLNQTY = [M:PPL1]CUMQTY(nolign-1)+(VALEUR-[M:PPL1]CPLQTY(nolign-1))
+    If ( LPLNQTY  > [M:PPL0]PLNQTY0 ) Then
+      Call OUINON(mess(577,7773,1)-num$(LPLNQTY)-mess(578,7773,1), LOK) From GESECRAN
+      If ( LOK = G_OUI) Then
+        Call AM_PLNQTY0(LPLNQTY)
+        [M:PPL0]PLNQTY0 = LPLNQTY
+        Affzo [M:PPL0]PLNQTY0
+      Else
+        mkstat = 2
+        End
+      Endif
+    Endif
+  Else
+    LPLNQTY = [M:PPL1]CUMQTY(nolign-1)+(VALEUR-[M:PPL1]EXTQTY(nolign-1))
+    If ( [M:PPL1]CPLQTY(nolign-1) = 0 and LPLNQTY  > [M:PPL0]PLNQTY0 ) Then
+      Call OUINON(mess(577,7773,1)-num$(LPLNQTY)-mess(578,7773,1), LOK) From GESECRAN
+      If ( LOK = G_OUI) Then
+        Call AM_PLNQTY0(LPLNQTY)
+        [M:PPL0]PLNQTY0 = LPLNQTY
+        Affzo [M:PPL0]PLNQTY0
+      Else
+        mkstat = 2
+        End
+      Endif
+  Endif
+
+  Endif
+
+End
+
+######################################################################################
+##                     ECRAN  :   PPL2
+######################################################################################
+
+Subprog AS_NBLIG2
+  If ( nolign = dim([M:PPL2]AASREF) ) Then
+    # Pas de tunnel possible sur la dernière ligne du tableau (contenant ....)
+    GBOUT1=""
+  Endif
+End
+
+
+######################################################################################
+######################################################################################
+#                 F O N C T I O N S      D I V E R S E S
+######################################################################################
+######################################################################################
+
+
+#*************************************************
+Subprog PLAN_PROD_SELON_FIN_PLAN ( PLIG, PDTFNPLN )
+#
+#    Le découpage du plan de production est calqué sur le découpage en périodes
+#    Si le plan n'est pas encore chargé (PLIG = 1)
+#        le plan est défini depuis la période courante du contexte gérant les UO
+#        jusqu'à la dernière période du dernier exercice défini
+#    Si la date de fin du plan n'est pas ou plus précisée
+#       le plan est défini jusqu'à la dernière période du dernier exercice défini
+#    Si la date de fin du plan est précisée
+#       le plan est défini jusqu'à la période contenant la date de fin du plan de production
+#       à défaut le plan est défini jusqu'à la dernière période du dernier exercice défini
+
+Value Integer PLIG
+Value Date    PDTFNPLN
+
+Local Integer IPER
+Local Char    CRITERE
+
+  #- 1-------------------------
+  If ( PLIG = 1 and PDTFNPLN = [0/0/0]) Then
+
+    # Chargement des lignes du tableau plan de production (PROPLN)
+    # Tout le plan de production à partir de la Pc jusqu'à la dernière période définie dans FIY
+    [M:PPL0]CURPERLIG = 1
+    nolign = PLIG
+
+    Effzo [M:PPL1]
+    [M:PPL0]CURFIYSTR = [0/0/0]
+    [M:PPL0]CURPEREND = [0/0/0]
+
+    For [FIS]FIY0 Where CPY=[M:PPL0]CPY and CNX= G_CNXUO and STAFIY <> GVML_TEPREC
+      If ( [F:FIS]STAFIY = GVML_TECOURA ) Then
+        [M:PPL0]CURFIYSTR =[F:FIS]DATSTRFIY
+        [M:PPL0]CURPEREND =[F:FIS]DATENDPER([F:FIS]INDCURPER-1)
+      Endif
+      # Boucle sur les périodes
+      For IPER = 1 To [F:FIS]NBRPER
+        # FQ91098 If ( IPER  >= [F:FIS]INDCURPER ) Then
+        If ( IPER  >= [F:FIS]INDCURPER or [F:FIS]STAFIY <> GVML_TECOURA ) Then
+          [M:PPL1]FIYSTRDAT (nolign-1) =[F:FIS]DATSTRFIY
+          [M:PPL1]FIYENDDAT (nolign-1) =[F:FIS]DATENDFIY
+          [M:PPL1]PERSTRDAT (nolign-1) =[F:FIS]DATSTRPER(IPER -1)
+          [M:PPL1]PERENDDAT (nolign-1) =[F:FIS]DATENDPER(IPER -1)
+          [M:PPL1]PERENDDATC (nolign-1) = format$("D:" + GFMDAT4, [M:PPL1]PERENDDAT (nolign-1))
+          nolign += 1
+        Endif
+      Next IPER
+    Next
+    [M:PPL1]NBLIG = nolign - 1
+
+  #- 1-------------------------
+  Else
+    #- 2-------------------------
+    If ( PDTFNPLN > [M:PPL1]PERENDDAT([M:PPL1]NBLIG-1) ) Then
+      # Chargement des lignes du tableau plan de production (PROPLN)
+      # On charge la partie du plan de production
+      # à partir de la ligne suivant la ligne fin actuelle du tableau
+      # jusquà la période dans laquelle se situe la date de fin du plan de production
+
+      nolign = [M:PPL1]NBLIG+1
+      For [FIS]FIY0 Where CPY=[M:PPL0]CPY and CNX= G_CNXUO and
+&                         DATSTRFIY >= [M:PPL1]FIYSTRDAT ([M:PPL1]NBLIG-1) and
+&                         DATSTRFIY <=  PDTFNPLN
+        # Boucle sur les périodes
+        For IPER = 1 To [F:FIS]NBRPER
+          If ( [F:FIS]DATSTRPER(IPER -1) > PDTFNPLN  ) Then : Break : Endif
+          If ( [F:FIS]DATSTRPER(IPER -1) > [M:PPL1]PERSTRDAT ([M:PPL1]NBLIG-1) ) Then
+            [M:PPL1]FIYSTRDAT (nolign-1) =[F:FIS]DATSTRFIY
+            [M:PPL1]FIYENDDAT (nolign-1) =[F:FIS]DATENDFIY
+            [M:PPL1]PERSTRDAT (nolign-1) =[F:FIS]DATSTRPER(IPER -1)
+            [M:PPL1]PERENDDAT (nolign-1) =[F:FIS]DATENDPER(IPER -1)
+            [M:PPL1]PERENDDATC (nolign-1) = format$("D:" + GFMDAT4, [F:FIS]DATENDPER(IPER -1)) : # FQ107896
+            [M:PPL1]EXTQTY (nolign-1) = 0 : # FQ107896
+            nolign += 1
+          Endif
+        Next IPER
+      Next
+      [M:PPL1]NBLIG = nolign - 1
+    #- 2-------------------------
+    Elsif( PDTFNPLN = [0/0/0] ) Then
+      # On charge la partie du plan de production
+      # à partir de la ligne suivant la ligne fin actuelle du tableau
+      # jusqu'à la dernière période définie dans FIY
+
+      nolign = [M:PPL1]NBLIG+1
+      For [FIS]FIY0 Where CPY=[M:PPL0]CPY and CNX= G_CNXUO and
+&                         DATSTRFIY >= [M:PPL1]FIYSTRDAT ([M:PPL1]NBLIG-1)
+
+        # Boucle sur les périodes
+        For IPER = 1 To [F:FIS]NBRPER
+          If ( [F:FIS]DATSTRPER(IPER -1) > [M:PPL1]PERSTRDAT ([M:PPL1]NBLIG-1) ) Then
+            [M:PPL1]FIYSTRDAT (nolign-1) =[F:FIS]DATSTRFIY
+            [M:PPL1]FIYENDDAT (nolign-1) =[F:FIS]DATENDFIY
+            [M:PPL1]PERSTRDAT (nolign-1) =[F:FIS]DATSTRPER(IPER -1)
+            [M:PPL1]PERENDDAT (nolign-1) =[F:FIS]DATENDPER(IPER -1)
+            [M:PPL1]PERENDDATC (nolign-1) = format$("D:" + GFMDAT4, [F:FIS]DATENDPER(IPER -1)) : # FQ107896
+            [M:PPL1]EXTQTY (nolign-1) = 0 : # FQ107896
+            nolign += 1
+          Endif
+        Next IPER
+        LPER = 1
+      Next
+      [M:PPL1]NBLIG = nolign - 1
+
+    #- 2-------------------------
+    Elsif( PDTFNPLN <> [0/0/0] and PDTFNPLN < [M:PPL1]PERENDDAT([M:PPL1]NBLIG-1) ) Then
+
+      # On positionne le pointeur fin de tableau sur la période
+      # dans laquelle se situe la date de fin du plan de production
+
+      For IPER = 1 To [M:PPL1]NBLIG
+        If ( PDTFNPLN >= [M:PPL1]PERSTRDAT(IPER-1) and PDTFNPLN <= [M:PPL1]PERENDDAT(IPER-1) ) Then
+          Break
+        Endif
+      Next IPER
+      [M:PPL1]NBLIG = IPER
+      nolign        = IPER
+
+    Endif
+    #- 2-------------------------
+
+  Endif
+  #- 1-------------------------
+
+  # FQ107896 Si la fin du plan de production est précisée et qu'elle appartient au découpage Exercices/périodes du contexte gérant les UO
+  #          il ne pourra s'agir que de la dernière ligne du tableau affichée. Le champ "UO prévues" de cette ligne doit être rendu non saisissable.
+  If ( PDTFNPLN <> [0/0/0] and
+&      PDTFNPLN >= [M:PPL1]PERSTRDAT([M:PPL1]NBLIG -1) and
+&      PDTFNPLN <= [M:PPL1]PERENDDAT([M:PPL1]NBLIG -1) ) Then
+    Affzo [M:PPL1] : # FQ109187
+    Diszo [M:PPL1]EXTQTY([M:PPL1]NBLIG -1)
+  Endif
+
+End
+
+
+#*************************************************
+Subprog DUREE_RESIDUELLE ( PLIG,  PDTFNPPL )
+
+Value Integer PLIG
+Value Date    PDTFNPPL
+
+Local Integer IPPL
+Local Decimal LQTY  : # FQ105600
+
+    #>>>>>>>>>>>
+    For IPLL = PLIG To [M:PPL1]NBLIG
+      If ([M:PPL1]CPLQTY(IPLL-1) <> 0 ) Then
+        LQTY = [M:PPL1]CPLQTY(IPLL-1)
+      Else
+        LQTY = [M:PPL1]EXTQTY(IPLL-1)
+      Endif
+      If ( IPLL <> [M:PPL1]NBLIG ) Then
+        If ( [M:PPL1]RSDQTY(IPLL-1) - LQTY > 0 ) Then
+          [M:PPL1]RSDQTY(IPLL) = [M:PPL1]RSDQTY(IPLL-1) - LQTY
+        Else
+          [M:PPL1]RSDQTY(IPLL)     = 0
+          [M:PPL1]EXTQTY(IPLL-1)   = [M:PPL1]RSDQTY(IPLL-1)
+          If ( [M:PPL1]CPLQTY(IPLL-1) <> 0 ) Then
+            [M:PPL1]CPLQTY(IPLL-1) = [M:PPL1]RSDQTY(IPLL-1)
+          Endif
+        Endif
+      Endif
+      If ( PDTFNPPL <> [0/0/0] ) Then
+        If ( PDTFNPPL >= [M:PPL1]PERSTRDAT(IPLL-1) and
+&            PDTFNPPL <= [M:PPL1]PERENDDAT(IPLL-1) ) Then
+          [M:PPL1]EXTQTY(IPLL-1) = [M:PPL1]RSDQTY(IPLL-1)
+          If ( IPPL = [M:PPL0]CURPERLIG ) Then
+            [M:PPL1]CPLQTY(IPLL-1) = [M:PPL1]EXTQTY(IPLL-1)
+          Endif
+        Endif
+      Endif
+    Next IPPL
+    #>>>>>>>>>>>
+
+
+End
+
+
+#*************************************************
+Subprog UO_EXERCICE ( PDTFNPLN, PUOPLN )
+
+Value Date    PDTFNPLN
+Value Decimal PUOPLN
+
+
+Local Integer IPPL
+Local Decimal LUOEXE : # FQ105600
+Local Decimal LCUM   : # FQ105600
+
+    LUOEXE = 0
+    LCUM   = 0
+    #>>>>>>>>>>>
+    # On commence par calculer le cumul des UO par exercice et on met ce cumul sur la ligne du tableau
+    # correspondant à la dernière période de l'exercice ou à la dernière période du plan si une
+    # date de fin est précisée
+    For IPLL = 1 To [M:PPL1]NBLIG
+      If ([M:PPL1]CPLQTY(IPLL-1) <> 0 ) Then
+        LUOEXE += [M:PPL1]CPLQTY(IPLL-1)
+        LCUM   += [M:PPL1]CPLQTY(IPLL-1)
+      Else
+        LUOEXE += [M:PPL1]EXTQTY(IPLL-1)
+        LCUM   += [M:PPL1]EXTQTY(IPLL-1)
+      Endif
+      [M:PPL1]CUMQTY(IPLL-1) = LCUM
+      #If ( [M:PPL1]PERENDDAT(IPLL-1) = [M:PPL1]FIYENDDAT(IPLL-1) ) Then : # FQ87713
+      If ( [M:PPL1]PERENDDAT(IPLL-1) = [M:PPL1]FIYENDDAT(IPLL-1) )
+&     or ( (PDTFNPLN <> [0/0/0]) and ([M:PPL1]PERENDDAT(IPLL-1) >= PDTFNPLN) ) Then
+         [M:PPL1]FIYQTY(IPLL-1) = LUOEXE
+         LUOEXE = 0
+      Endif
+    Next IPPL
+    #>>>>>>>>>>>
+
+    LUOEXE = 0
+    #>>>>>>>>>>>
+    # A présent le cumul des UO par exercice est alimenté sur toutes les lignes à partir de la valeur
+    # stockée sur la ligne de la dernière période de l'exercice ou à la dernière période du plan si une
+    # date de fin est précisée
+    For IPLL = [M:PPL0]CURPERLIG To [M:PPL1]NBLIG
+      [M:PPL1]PPLENDDAT(IPLL-1) = PDTFNPLN
+      [M:PPL1]PLNQTY(IPLL-1)    = PUOPLN
+      If ( LUOEXE = 0 ) Then
+        # Récupération du cumul des UO de l'exercice sur la ligne correspondant à la dernière période de celui-ci
+        If (PDTFNPLN <> [0/0/0]) and ([M:PPL1]FIYENDDAT(IPLL-1) >= PDTFNPLN) : # FQ87713
+          # S'il existe une date de fin dans l'exercice on récupère le cumul des UO sur la dernière ligne du tableau
+          LUOEXE = [M:PPL1]FIYQTY([M:PPL1]NBLIG -1)
+        Else
+          LUOEXE = [M:PPL1]FIYQTY(find([M:PPL1]FIYENDDAT(IPLL-1), [M:PPL1]PERENDDAT) -1)
+        Endif
+      Endif
+      [M:PPL1]FIYQTY(IPLL-1) = LUOEXE
+      #If ( [M:PPL1]PERENDDAT(IPLL-1) = [M:PPL1]FIYENDDAT(IPLL-1) ) Then : # FQ87713
+      If ( [M:PPL1]PERENDDAT(IPLL-1) = [M:PPL1]FIYENDDAT(IPLL-1) )
+&     or ( (PDTFNPLN <> [0/0/0]) and ([M:PPL1]PERENDDAT(IPLL-1) >= PDTFNPLN) ) Then
+        LUOEXE = 0
+      Endif
+    Next IPPL
+    #>>>>>>>>>>>
+
+
+End
+
+
+#*************************************************
+Funprog UO_CUMUL ( NOLIG )
+
+Value Integer NOLIG
+Local Decimal LCUM
+
+
+Local Integer IPPL
+
+    If ( NOLIG < 2 ) Then
+      LCUM = 0
+    Else
+      LCUM = [M:PPL1]CUMQTY (NOLIG - 2)
+    Endif
+
+    #>>>>>>>>>>>
+    For IPLL = NOLIG To [M:PPL1]NBLIG
+      If ([M:PPL1]CPLQTY(IPLL-1) <> 0 ) Then
+        LCUM   += [M:PPL1]CPLQTY(IPLL-1)
+      Else
+        LCUM   += [M:PPL1]EXTQTY(IPLL-1)
+      Endif
+    Next IPPL
+    #>>>>>>>>>>>
+
+End LCUM
+
+
+#===================
+$LOCK_BIENS_DU_PLAN_DE_PRODUCTION
+  Local Char LLOCK(200)
+  # Lock des biens rattachés au plan de production
+  For [FASW]FAS0 Hint Key FAS4 Where PROPLN = [M:PPL0]PROPLN
+    LLOCK = func GLOBIENS.GET_KEY_FXDASSETS ([F:FASW]AASREF)
+    If func GLOBIENS.LOCK_SYMBOLE ("FAS", [F:FASW]CPY, LLOCK, 0) = 0 Then
+      # l'enregistrement est locké ailleurs : on ne peut pas le choisir
+      OK=0 : Break
+    Endif
+  Next
+Return
+
+#=====================================================================
+$UNLOCK_BIENS_DU_PLAN_DE_PRODUCTION
+  Local Char LLOCK(200)
+  # Unlock des biens rattachés au plan de production
+  For [FASW]FAS0 Hint Key FAS4 Where PROPLN =[M:PPL0]PROPLN
+    #------------------------------
+    LLOCK = func GLOBIENS.GET_KEY_FXDASSETS ([F:FASW]AASREF)
+    Call UNLOCK_SYMBOLE ("FAS", [F:FASW]CPY, LLOCK) From GLOBIENS
+  Next
+Return
+

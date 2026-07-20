@@ -1,0 +1,700 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+###############################################################################
+# REGAUTO: Alimentation du masque de paramètre
+#          Aiguille la régularisation selon ce qu'il faut régulariser
+#          ( Allocation d'OF ou de commande de vente, allocation de sortie
+#            ou mouvement de sortie )
+###############################################################################
+# Paramètres E : Masque STKSHTSEL[SHTS] renseigné
+#                Numéro de ligne (nolign-1) à traiter
+#
+#            S : PRET    = Code retour (0=OK, 1=Erreur)
+#
+# Prérequis :
+#        Masques ouverts : ALLPAR   [ALP]
+#                          STKSHTREG[SHTR]
+###############################################################################
+Subprog REGAUTO( PNOL, PRET )
+Value    Integer PNOL
+Variable Integer PRET
+
+Local    Integer LMODALL    # Mode d'allocation (1=globale, 2=détaillée)
+Local    Integer LTRACE_OPEN
+#--- Bug 73027
+Local    Char    WACT(1)
+
+Raz PRET
+Raz LTRACE_OPEN
+Raz [M:SHTR]
+Raz [M:ALP]
+
+#-----  Alimentation du masque ALP, pour composants de recherche  ----------------#
+#--- Bug 72943
+#Call ALIM_ALP( PNOL, LMODALL ) From TRTSHTCOM
+Call ALIM_ALP( PNOL, LMODALL, PRET ) From TRTSHTCOM
+If PRET : End : Endif
+#---
+
+If [F:ITM]ITMREF <> [M:ALP]ITMREF
+    Read [F:ITM]ITM0=[M:ALP]ITMREF
+    If fstat : End : Endif
+Endif
+If [F:ITF]ITMREF <> [M:ALP]ITMREF & [F:ITF]STOFCY <> [M:ALP]STOFCY
+    Read [F:ITF]ITF0=[M:ALP]ITMREF;[M:ALP]STOFCY
+    If fstat : End : Endif
+Endif
+
+#--- On ouvre la trace si elle n'est pas ouverte et qu'elle est demandée
+If GTRACE="" & [M:SSC]ERRFLG=2
+    LTRACE_OPEN = 1
+    Call OUVRE_TRACE( mess( 4, 180, 1) ) From LECFIC
+Endif
+If [M:SHTS]TYPREG(PNOL) = 2
+    Trbegin [STJ]
+    GOK = 1
+    Gosub REGSTJ_AUTO
+    #--- Bug 73027
+    GPE=0
+Elsif find([M:SHTS]TYPREG(PNOL),3,4)
+    Trbegin [STA]
+    GOK = 1
+    Gosub REGALL_AUTO
+    #--- Bug 73027
+    GPE=0
+    WACT="F"
+    GPOINT="MODTRACE" : Gosub ENTREE From EXEFNC
+    #---
+Else
+    GOK = 0
+Endif
+
+If PRET | GOK=0
+    Rollback
+    #--- Bug 73027
+    #Call SHTTRACE( mess(15, 180, 1), 1 ) From TRTSHTCOM
+    If GPE=0 Call SHTTRACE( mess(15, 180, 1), 1 ) From TRTSHTCOM Endif
+    #---
+Else
+    #--- Bug 73027
+    #Call SHTTRACE( mess(16, 180, 1), 1 ) From TRTSHTCOM
+    #--- Bug 74174
+    #If GPE=0 Call SHTTRACE( mess(16, 180, 1), 1 ) From TRTSHTCOM Endif
+    If GPE=0 Call SHTTRACE( mess(16, 180, 1), 0 ) From TRTSHTCOM Endif
+    #---
+    #---
+    Commit
+Endif
+
+If LTRACE_OPEN
+    Call LEC_TRACE From LECFIC
+    Call FERME_TRACE From LECFIC
+Endif
+
+End
+
+###############################################################################
+# REGALL_AUTO : Régularisation automatique d'une allocation
+#               ( Suppression puis création )
+###############################################################################
+# Paramètres E : Masque ALLPAR [ALP] (bloc 1)
+#                LMODALL = mode d'allocation (1=globale, 2=détaillée)
+#
+###############################################################################
+$REGALL_AUTO
+
+Local Decimal WQTYSTU, WQTYARR, WQTY, WQTA, WQT1, WQT2
+#--- Bug 73027
+#Local Char    WACT(1)
+    #-----  Création des allocations ------------------------------------------#
+    # avec l'option "Alloc. partielle autorisée"
+    Call GENSTOALL("C",LMODALL,0,0,PRET) From STKALL
+    GPE=0
+    WACT="A"
+    GPOINT="MODTRACE" : Gosub ENTREE From EXEFNC
+    If GPE=0
+      Call SHTTRACE(mess(8,180,1),0) From TRTSHTCOM
+      Call SHTTRACE("  "+mess(18,7,1)-[M:SHTS]ITMREF(PNOL)-"/"-num$([M:ALP]ALLQTY)-[M:SHTS]STU(PNOL),0) From TRTSHTCOM
+      Call SHTTRACE("  "+mess(11,105,1)-[M:ALP]VCRNUM,0)      From TRTSHTCOM
+      Call SHTTRACE("  "+mess(3,176,1)-num$([M:ALP]VCRLIN),0) From TRTSHTCOM
+    Endif
+    #------- Vérification de ce qui a été généré ---------------------------------#
+    If PRET
+       Call SHTTRACE(mess(96,197,1),1) From TRTSHTCOM : GOK=0 : Return
+    Endif
+
+    #--- Régularisation cdes, préparations, livraisons, factures
+    If find([M:ALP]VCRTYP,2,3,4,5)
+        # Réajustement qté allouée en unité vente entière
+        If [M:ALP]ALLQTY<>0
+           WQTYSTU = [M:ALP]ALLQTY
+           Gosub REAJUSTE_QTY
+           # Si qté réajustée, diminution des allocations en conséquence
+           If WQTYSTU < [M:ALP]ALLQTY
+              WQTA = [M:ALP]ALLQTY-WQTYSTU
+              Call DIMALL([M:ALP]VCRTYP,[M:ALP]VCRNUM,[M:ALP]VCRLIN,[M:ALP]VCRSEQ,
+&                         [M:ALP]ITMREF,1,WQTA,WQT1,WQT2,PRET) From STKALL
+              If PRET<>0
+                 GOK=0 : Return
+              Endif
+              # Quantité allouée
+              [M:ALP]ALLQTY = WQTYSTU
+           Endif
+        Endif
+    Endif
+
+    If [M:ALP]ALLQTY>=[M:SHTS]QTYSTUACT(PNOL)
+      #-----  Suppression des enregistrements d'allocations ------#
+      GPE=0
+      WACT="D"
+      GPOINT="MODTRACE" : Gosub ENTREE From EXEFNC
+      If GPE=0
+        Call SHTTRACE(mess(7,180,1),0) From TRTSHTCOM
+        Call SHTTRACE("  "+mess(18,7,1)-[M:SHTS]ITMREF(PNOL),0)    From TRTSHTCOM
+        Call SHTTRACE("  "+mess(8,47,1)-num$([M:SHTS]SEQ(PNOL)),0) From TRTSHTCOM
+      Endif
+      Call SUPALL([M:SHTS]STOFCY,[M:SHTS]ITMREF(PNOL),0,[M:SHTS]SEQ(PNOL),PRET) From STKALL
+    Elsif [M:ALP]ALLQTY<>0
+      #-----  Diminution des enregistrements d'allocations ------#
+      GPE=0
+      WACT="M"
+      GPOINT="MODTRACE" : Gosub ENTREE From EXEFNC
+      If GPE=0
+        Call SHTTRACE(mess(23,180,1),0) From TRTSHTCOM
+        Call SHTTRACE("  "+mess(18,7,1)-[M:SHTS]ITMREF(PNOL),0)    From TRTSHTCOM
+        Call SHTTRACE("  "+mess(8,47,1)-num$([M:SHTS]SEQ(PNOL)),0) From TRTSHTCOM
+        Call SHTTRACE("  "+mess(154,184,1)-num$([M:SHTS]QTYSTUACT(PNOL)-[M:ALP]ALLQTY),0) From TRTSHTCOM
+      Endif
+      Call MODALL([M:SHTS]STOFCY,[M:SHTS]ITMREF(PNOL),0,[M:SHTS]SEQ(PNOL),[M:ALP]ALLQTY*-1,PRET) From STKALL
+    Endif
+    If PRET
+      GOK=0 : Return
+    Endif
+    Local Char CRITSTA(250)     # hcb 80891
+    CRITSTA = "1=1"
+    GPOINT="CRITSTASPE" : Gosub ENTREE From EXEFNC
+
+    Filter [STA] Where ITMREF=[M:SHTS]ITMREF(PNOL)
+&                    & VCRTYP=[M:SHTS]VCRTYP(PNOL)
+&                    & VCRNUM=[M:SHTS]VCRNUM(PNOL)
+&                    & VCRLIN=[M:SHTS]VCRLIN(PNOL)
+&                    & evalue(CRITSTA)
+&                    & find(ALLTYP,4,5)
+    Read [STA]STA2 First
+    If !fstat
+      GPE=0
+      WACT="S"
+      GPOINT="MODTRACE" : Gosub ENTREE From EXEFNC
+      If GPE=0
+        If [F:STA]QTYSTUACT = [M:SHTS]QTYSTUACT(PNOL)
+          # "Rien n'a pu être alloué"
+          Call SHTTRACE( mess(12,180, 1), 0) From TRTSHTCOM
+        Else
+          # "X STU n'ont pas pu être allouées"
+          Call SHTTRACE( num$([F:STA]QTYSTUACT) - [M:SHTS]STU(PNOL) - mess(13,180, 1), 0) From TRTSHTCOM
+        Endif
+      Endif
+    Endif
+    Filter [STA]
+    Gosub MAJ_DOC From TRTSHTCOM
+Return
+
+########################################################################
+$REAJUSTE_QTY
+#---------------------------------------------
+# TS : réajustement qté en unité vente entière
+#---------------------------------------------
+
+#--- Issue 110327
+# Pas de réajustement si série en E/S global car pb avec qté série
+If find([M:ALP]VCRTYP,3,4,5) & [F:ITM]SERMGTCOD=4 : Return : Endif
+#---
+GPOINT = "NO_REAJUST" : Gosub ENTREE From EXEFNC
+If GOK=0 : GOK=1 :  Return : Endif
+
+If [M:ALP]PCU<>[F:ITM]STU
+   Call CTRQTYPCU([M:ALP]PCU,[M:ALP]PCUSTUCOE,WQTYSTU,WQTYARR) From STKLIB
+   #--- Issue 104664
+   Call QTEARR(WQTYARR,[F:ITM]STU) From TRTDIV
+   If WQTYARR<>WQTYSTU
+      WQTYSTU = WQTYARR
+      WQTY    = WQTYSTU/[M:ALP]PCUSTUCOE
+      #--- Issue 104664
+      Call QTEARR(WQTY,[M:ALP]PCU) From TRTDIV
+   Endif
+Endif
+Return
+
+###############################################################################
+# REGSTJ_AUTO : Régularisation d'un mouvement en attente
+###############################################################################
+$REGSTJ_AUTO
+    Call ALIM_SHTR(PNOL, PRET) From TRTSHTRA
+    If PRET
+        Call SHTTRACE( GMESSAGE, 1 ) From TRTSHTCOM
+        Raz GMESSAGE
+        Return
+    Endif
+    Call SHTTRACE( mess(14,180,1), 0) From TRTSHTCOM
+    Call SHTTRACE( "  "+num$([M:SHTS]QTYSTUACT(PNOL)) - [M:SHTS]STU(PNOL),0 ) From TRTSHTCOM
+    Call SHTTRACE( "  "+mess(18,7, 1)-[M:SHTS]ITMREF(PNOL), 0) From TRTSHTCOM
+    Call SHTTRACE( "  "+mess(11,105, 1)-[M:ALP]VCRNUM, 0) From TRTSHTCOM
+    Call SHTTRACE( "  "+mess(3,176, 1)-num$([M:ALP]VCRLIN), 0) From TRTSHTCOM
+    Gosub RECH_STOCK
+    If [M:SHTR]NBLIG>0
+        Call SAVE_REGSTJ From TRTSHTCOM
+        If GMESSAGE <> ""
+            Call SHTTRACE( GMESSAGE, 1 ) From TRTSHTCOM
+            Raz GMESSAGE
+        Endif
+    Else
+        Call SHTTRACE( mess(12,180, 1), 0) From TRTSHTCOM
+    Endif
+Return
+
+###############################################################################
+# RECH_STOCK : Recherche des lignes de stock pour régulariser un mouvement
+#              La régularisation se fait pour 1 ligne de SHTS,
+#              qui peut correspondre à une suite de n° de série.
+###############################################################################
+# Paramètres E : Masque ALLPAR    [ALP]
+#                Masque STKSHTSEL [SHTS]
+#            S : Masque STKSHTREG [SHTR]
+#
+# Pré-requis : Table STOCK[STO] ouverte
+#
+###############################################################################
+$RECH_STOCK
+Local Integer WRET
+Local Char    WCRIT(250),WCRITSTO(250),WCRITLOT(250)
+Local Integer I
+Local Decimal WQTY,WQTYSTUACT,WQTYSTU, WTRTQTY
+Local Char    WSERNUM(GLONSER), WSERNUMF(GLONSER)
+Local Decimal WPCUDIS,WSTUDIS,WSTUACTDIS
+Local Date    WDAT
+Local Char    WTRUCOD(GLONTRU)
+Local Char    WLOCTYP(GLONTLO)
+Local Integer WLOTOPT
+
+If clalev([F:TRU])=0  Local File TABALLRUL  [TRU]   Endif
+
+# Seules les info de statut et d'emplacement peuvent ne pas être renseignées
+#If ([M:ALP]STA="" | [F:ITF]LOCMGTCOD=2 & [M:ALP]LOC="") & [M:SSC]CARFLG<>2
+#    WRET=1
+#    Return
+#Endif
+# le statut  peut ne pas être renseigné si le parametrage stock le permet
+If [M:ALP]STA="" & [F:STE]STACARFLG<>2
+    WRET=1
+    Return
+Endif
+# l emplacement peut ne pas être renseigné si le parametrage stock le permet
+If [F:ITF]LOCMGTCOD=2 & [M:ALP]LOC="" & [F:STE]LOCCARFLG<>2
+    WRET=1
+    Return
+Endif
+
+#--- Début 29075 ---
+# Récupération de la règle d'allocation
+#--- Issue X3-4501 : ajout 40 tache affaire
+Case [M:ALP]VCRTYP
+ When 2,40           : # Commande, Affaire
+                       WTRUCOD = [F:ITG]ALLRULORD
+ When 3,4,5,8        : # Livraison sous-traitance
+                       If [M:ALP]TRSTYP=20
+                          WTRUCOD = [F:ITG]ALLRULSCO
+                       # Préparation, Livraison, Facture, Retour fou
+                       Else
+                          WTRUCOD = [F:ITG]ALLRULSHI
+                       Endif
+ When 6              : # Réception (conso matières sous-rtraitance)
+                       WTRUCOD = [F:ITG]ALLRULSCC
+ When 10             : # OF (opération de sous-traitance)
+                       If [M:ALP]PECSCOLOC=2
+                          WTRUCOD = [F:ITG]ALLRULSCC
+                       # OF (interne)
+                       Else
+                          WTRUCOD = [F:ITG]ALLRULMAT
+                       Endif
+ When 12             : # Suivi matière (opération de sous-traitance)
+                       If [M:ALP]PECSCOLOC=2
+                          WTRUCOD = [F:ITG]ALLRULSCC
+                       # Suivi matière (interne)
+                       Else
+                          WTRUCOD = [F:ITG]ALLRULMFG
+                       Endif
+ When 20,29,31,32,33 : # Sortie diverse, Changement de stock,
+                       # Assemblage, Désassemblage, Demande de service
+                       WTRUCOD = [F:ITG]ALLRULTRF
+ When 34             : # Réappro zones de consommation
+                       If [M:ALP]LOCCAT=4
+                          WTRUCOD = [F:ITG]ALLRULSCO
+                       Else
+                          WTRUCOD = [F:ITG]ALLRULTRF
+                       Endif
+ When 36             : # Ordre sous-traitance
+                       WTRUCOD = [F:ITG]ALLRULSCC
+ When Default
+Endcase
+Raz [F:TRU]
+If WTRUCOD<>""
+   # Lecture règle d'allocation
+   Read [TRU]TRU0=WTRUCOD
+   If fstat Raz WTRUCOD Endif
+Endif
+#--- Fin 29075 ---
+
+# Lecture de la règle de gestion pour le mouvement à traiter
+Call LECSRU([M:ALP]STOFCY,[F:ITM]TCLCOD,[M:ALP]TRSTYP,[M:ALP]TRSCOD,"",WRET) From STKLIB
+If WRET<>0 : WRET=1 : Return : Endif
+
+# Stockage dans WCRITSTO des statuts/sous-statuts autorisés
+Call CTRL_STATUT("[F:STO]",[M:ALP]STA,WCRITSTO) From STKALL
+
+I=0
+Raz WQTY
+
+# Date de référence pour la péremption des lots
+WDAT = [M:ALP]DLVDAT
+If WDAT=[0/0/0] WDAT=[M:ALP]BESDAT Endif
+
+Raz WLOTOPT
+GPOINT = "REGSTJAUTO" : Gosub ENTREE From EXEFNC
+
+# No séries en E/S
+#--- Bug 71421
+#Case [F:ITM]SERMGTCOD
+#    When 1,2 : Gosub RECH_STOCK_NOSER
+#    When 2 : If [M:SHTS]SERNUM(PNOL)
+#                Gosub RECH_STOCK_SER
+#             Endif
+#             Gosub RECH_STOCK_NOSER
+#    When 3 : Gosub RECH_STOCK_SER
+#Endcase
+Case [F:ITM]SERMGTCOD
+    When 1 : Gosub RECH_STOCK_NOSER
+    When 2 : If [M:SHTS]SERNUM(PNOL)<>""
+                Gosub RECH_STOCK_SER
+             Endif
+             Gosub RECH_STOCK_NOSER
+    When 3 : Gosub RECH_STOCK_SER
+    When 4 : Gosub RECH_STOCK_SER	   : #--- Issue 110327
+Endcase
+#---
+
+$RECH_STOCK_SUI
+
+Return
+
+#######################################################
+$RECH_STOCK_SER
+Local Integer SAVNOLIGN
+   WSERNUM  = [M:SHTS]SERNUM(PNOL)
+
+   If WSERNUM=""
+       Return
+   Endif
+   Default Mask [SHTR]
+   SAVNOLIGN = nolign
+   While WQTY<[M:ALP]QTY
+      #--- Issue 110327
+      Gosub LEC_STOCK
+      #Readlock [STO]STO5=[M:ALP]ITMREF;WSERNUM
+      #---
+      If fstat
+          #--- Bug 71421
+          # Peut être normal si série géré en sortie
+          If [F:ITM]SERMGTCOD=2
+             Break
+          Else
+          #---
+             #----- Stock inexistant ------#
+             Call SHTTRACE ( mess(46,141,1)+chr$(13)
+&                           +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                           +mess(47,197,1)-":"-WSERNUM,0) From TRTSHTCOM
+             WRET=1
+          #--- Bug 71421
+          Endif
+      Else
+          Call STODISSOR("","","",WPCUDIS,WSTUDIS,WSTUACTDIS) From STKLIB
+          If WSTUACTDIS < 1
+          #---- N° de série non disponible  -------------#
+              Call SHTTRACE ( mess(6,180,1)+chr$(13)
+&                             +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                             +mess(47,197,1)-":"-WSERNUM,0) From TRTSHTCOM
+              WRET=1
+          Elsif [F:STO]CUNLOKFLG=2 & [M:ALP]PECCUNLOK = 2
+              #---- Inventaire en cours -------------#
+              Call SHTTRACE ( mess(185,199,1)+chr$(13)
+&                             +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                             +mess(47,197,1)-":"-WSERNUM,0) From TRTSHTCOM
+              WRET=1
+          Elsif [F:SRU]SHLLOT<>3          # hcb V6dlu  nouvelle gestion
+             If [F:STO]LOT<>[F:STL]LOT & [F:STO]SLO<>[F:STL]SLO
+                Read [STL]STL0=[F:STO]ITMREF;[F:STO]LOT;[F:STO]SLO
+                If fstat
+                   #---- Lot introuvable ------------#
+                   Call SHTTRACE ( mess(123,199,1)+chr$(13)
+&                                  +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                                  +mess(47,197,1)-":"-WSERNUM+chr$(13)
+&                                  +mess(43,197,1)-":"-[F:STO]LOT,0) From TRTSHTCOM
+                   WRET=1 : Break # Ici, si le lot n'a pas été trouvé ce n'est pas la peine de continuer
+Elsif ([F:SRU]SHLLOT=2 & [F:STL]DLUDAT<>[0/0/0] & [F:STL]DLUDAT<WDAT) | ([F:SRU]SHLLOT=1 & [F:STL]SHLDAT<>[0/0/0] & [F:STL]SHLDAT<WDAT)
+                   #---- Contrôle de la péremption ------------#
+                   Call SHTTRACE ( mess(398,199,1)+chr$(13)
+&                                  +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                                  +mess(47,197,1)-":"-WSERNUM+chr$(13)
+&                                  +mess(43,197,1)-":"-[F:STO]LOT,0) From TRTSHTCOM
+                   WRET=1 : Break # La péremption est valable pour tous les autres n° de série, puisque pour 1 mouvement en attente on a 1 lot
+                Endif
+             Endif
+          Endif
+      Endif
+      # Contrôle des statuts/sous-statuts autorisés
+      If !WRET & !evalue(WCRITSTO)
+          Call SHTTRACE ( mess(24,184,1)+chr$(13)
+&                         +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                         +mess(47,197,1)-":"-WSERNUM+chr$(13)
+&                         +mess(5,359,1) -":"-[F:STO]STA,0) From TRTSHTCOM
+         WRET=1
+#      Elsif !([M:SSC]CARFLG=2 & [M:ALP]LOC="" | [M:ALP]LOC=[F:STO]LOC)
+      Elsif !([F:STE]LOCCARFLG=2 & [M:ALP]LOC="" | [M:ALP]LOC=[F:STO]LOC)
+          # Contrôle de l'emplacement
+          Call SHTTRACE ( mess(68,184,1)+chr$(13)
+&                         +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                         +mess(47,197,1)-":"-WSERNUM+chr$(13)
+&                         +mess(44,197,1) -":"-[F:STO]LOC,0) From TRTSHTCOM
+          WRET=1
+      Elsif [F:STO]LOCCAT=3
+&         |([F:STO]LOCCAT=1 & [M:ALP]PECINTLOC=1)
+&         |([F:STO]LOCCAT=2 & [M:ALP]PECPLFLOC<>2)
+&         |([F:STO]LOCCAT=4 & [M:ALP]PECSCOLOC<>2)
+          # Contrôle de l'emplacement
+          Call SHTTRACE ( mess(399,199,1)+chr$(13)
+&                         +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                         +mess(47,197,1)-":"-WSERNUM+chr$(13)
+&                         +mess(2510,200,1) -":"-mess([F:STO]LOCCAT,2710,1),0) From TRTSHTCOM
+          WRET=1
+      Endif
+
+      If !WRET
+          # Alimentation STKSHTREG
+           nolign = I+1
+           [M:SHTR] = [F:STO]
+          I += 1
+      Endif
+      WQTY  +=1
+      If !WRET
+        WTRTQTY +=1
+      Endif
+      Raz WRET
+      Call PLUS_UN(WSERNUM, WSERNUM, WRET) From STKLIB
+      If WRET
+          Call SHTTRACE ( mess(476,197,1)+chr$(13)
+&                         +mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                         +mess(47,197,1)-":"-WSERNUM,1) From TRTSHTCOM
+          Break
+      Endif
+   Wend
+   [M:SHTR]NBLIG = I
+   nolign = SAVNOLIGN
+Return
+
+####################################################"
+$RECH_STOCK_NOSER
+
+   Raz WCRIT, WCRITLOT
+   WCRITLOT='[F:STL]ITMREF=[M:ALP]ITMREF'
+   # L'article est géré par lot
+   If [F:ITM]LOTMGTCOD<>1
+      If dim([M:SHTS]LOT(PNOL))<0
+         WRET=1 : Return
+      Endif
+      If [M:SHTS]LOT(PNOL)=""
+         # Si le lot n'est pas optionnel
+         If WLOTOPT<>1 WRET=1 : Return Endif
+# hcb / ts  48778  demande Bertrand DUFOUR pour  David Frith  (Fold Hill Foods Case 24145)
+# hcb / ts  48778  prise en compte PE dans TRTSHTA (ALIM_SHTS)
+#       Else
+        Elsif [M:SHTS]LOT(PNOL)<>"*"
+# hcb / ts  48778 fin
+           WCRITLOT+='&[F:STL]LOT=[M:SHTS]LOT(PNOL)'
+      Endif
+      # L'article est géré par sous-lot
+      If [F:ITM]LOTMGTCOD=4
+         If dim([M:SHTS]SLO(PNOL))<0
+            WRET=1 : Return
+         Endif
+         If [M:SHTS]SLO(PNOL)=""
+            # Si le lot n'est pas optionnel
+            If WLOTOPT<>1 WRET=1 : Return Endif
+# hcb / ts  48778  demande Bertrand DUFOUR pour  David Frith  (Fold Hill Foods Case 24145)
+# hcb / ts  48778  prise en compte PE dans TRTSHTA (ALIM_SHTS)
+#       Else
+        Elsif [M:SHTS]SLO(PNOL)<>"*"
+# hcb / ts  48778 fin
+
+            WCRITLOT+='&[F:STL]SLO=[M:SHTS]SLO(PNOL)'
+         Endif
+      Endif
+      # Contrôle de la péremption # hcb v6dlu nouvelle gestion
+      If [F:SRU]SHLLOT = 2
+         WCRITLOT+='&([F:STL]DLUDAT=[0/0/0]|[F:STL]DLUDAT>=WDAT)'
+      Endif
+      If [F:SRU]SHLLOT = 1
+         WCRITLOT+='&([F:STL]SHLDAT=[0/0/0]|[F:STL]SHLDAT>=WDAT)'
+      Endif
+   Endif
+
+   If [M:ALP]PECCUNLOK = 2
+       WCRIT='[F:STO]CUNLOKFLG<>2'
+   Else
+       WCRIT='1=1'
+   Endif
+   # L'article est géré avec emplacement
+   If [F:ITF]LOCMGTCOD=2
+      If dim([M:SHTS]LOC(PNOL))<0
+         WRET=1 : Return
+      Endif
+      If [M:SHTS]LOC(PNOL)=""
+         If [F:STE]LOCCARFLG<>2
+            WRET=1 : Return
+         #--- Début 29075 ---
+         # Prise en compte du type d'emplacement
+         Elsif min([F:TRU]LOCFLT(0..I-2))=3
+            Raz WLOCTYP
+            I = find([F:SRU]LOCNUM-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+            If I<>0
+               WLOCTYP=[F:ITF]DEFLOCTYP(I-1)
+               If !find(WLOCTYP,"","*")
+                  WCRIT+='&pat([F:STO]LOCTYP,WLOCTYP)'
+               Endif
+            Endif
+         #--- Fin 29075 ---
+         Endif
+      Else
+         WCRIT+='&[F:STO]LOC=[M:SHTS]LOC(PNOL)'
+      Endif
+   Endif
+
+   # Le statut a été renseigné
+   If dim([M:SHTS]STA(PNOL))<0
+       WRET=1 : Return
+   Endif
+   If [M:SHTS]STA(PNOL)=""
+     If [F:STE]STACARFLG<>2
+       WRET=1 : Return
+     Endif
+   Else
+     WCRIT+='&[F:STO]STA=[M:SHTS]STA(PNOL)'
+   Endif
+
+
+   # Lecture des lots
+   # La boucle sur le lot est justifiée par le fait qu'on ne trouve pas forcément le lot
+   # et cela évite de faire un Filter, puis un Read puis un "If fstat"
+   For [STL]STL0 Where evalue(WCRITLOT)
+      For [STO]STO3 Where ITMREF=[M:ALP]ITMREF & STOFCY=[M:ALP]STOFCY &
+&                          LOT=[F:STL]LOT & SLO=[F:STL]SLO &
+&                          evalue(WCRIT) & evalue(WCRITSTO) &
+&                          SERNUM="" & QLYCTLDEM = ""
+
+         # Contrôle de l'emplacement
+         If [F:STO]LOCCAT=3
+&         |([F:STO]LOCCAT=1 & [M:ALP]PECINTLOC=1)
+&         |([F:STO]LOCCAT=2 & [M:ALP]PECPLFLOC<>2)
+&         |([F:STO]LOCCAT=4 & [M:ALP]PECSCOLOC<>2)
+            Goto STO1_SUIV
+         Endif
+
+         # Contrôle du disponible
+         Call STODISSOR("[F:STO]","[F:ITM]","",WPCUDIS,WSTUDIS,WSTUACTDIS) From STKLIB
+
+         If WSTUDIS<=0 Goto STO1_SUIV Endif
+
+         Readlock [STO]Curr
+         If fstat Goto STO1_SUIV Endif
+
+         If [M:ALP]TYPQTY=1
+            [L]WQTYSTU    = min([M:ALP]QTY-WQTY,WSTUDIS)
+            [L]WQTY      += [L]WQTYSTU
+
+            [L]WQTYSTUACT = [L]WQTYSTU
+            # Si gestion en titres ou UI, calcul quantité en UA
+            Case [F:ITF]STOMGTCOD
+             When 3 : If [F:STL]POT<>0
+                         [L]WQTYSTUACT=[L]WQTYSTU*([F:STL]POT/100)
+                      Endif
+             When 4 : If [F:STL]ACT<>0
+                          [L]WQTYSTUACT=[L]WQTYSTU* [F:STL]ACT
+                      Endif
+            Endcase
+         Else
+            [L]WQTYSTUACT = min([M:ALP]QTY-WQTY,WSTUACTDIS)
+            [L]WQTY      += [L]WQTYSTUACT
+
+            [L]WQTYSTU    = [L]WQTYSTUACT
+            # Si gestion en titres ou UI, calcul quantité en US
+            Case [F:ITF]STOMGTCOD
+             When 3 : If [F:STL]POT<>0
+                         [L]WQTYSTU=[L]WQTYSTUACT/([F:STL]POT/100)
+                      Endif
+             When 4 : If [F:STL]ACT<>0
+                         [L]WQTYSTU=[L]WQTYSTUACT/ [F:STL]ACT
+                      Endif
+            Endcase
+         Endif
+
+         # Alimentation STOSORW
+         [M:SHTR]STOCOU(I)    = [F:STO]STOCOU
+         [M:SHTR]QTYSTU(I)    = [L]WQTYSTU
+         [M:SHTR]QTYSTUACT(I) = [L]WQTYSTUACT
+         [M:SHTR]LOT(I)       = [F:STO]LOT
+         [M:SHTR]SLO(I)       = [F:STO]SLO
+         [M:SHTR]LOC(I)       = [F:STO]LOC
+         [M:SHTR]SERNUM(I)    = [F:STO]SERNUM
+         [M:SHTR]STA(I)       = [F:STO]STA
+         I += 1
+         [M:SHTR]NBLIG = I
+         If [L]WQTY>=[M:ALP]QTY Break 2 Endif
+
+      $STO1_SUIV
+      Next
+   Next
+Return
+
+#--- Issue 110327
+#######################################################
+$LEC_STOCK
+
+If [F:ITM]SERMGTCOD=4
+   Read [STS]STS0=[M:ALP]ITMREF;WSERNUM
+   If fstat
+      #----- No série inexistant ------#
+      Call SHTTRACE ( mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                    +WSERNUM-":"-mess(43,196,1),0) From TRTSHTCOM
+      WRET=1
+   Elsif [F:STS]ISSDAT<>[0/0/0]
+      #----- No série sorti par une autre pièce
+      Call SHTTRACE ( mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                    +WSERNUM-":"-mess(37,184,1),0) From TRTSHTCOM
+      WRET=1
+   Elsif [F:STS]SDHNUM<>"" & !find([F:STS]SDHNUM,[M:SHTR]VCRNUM,[M:SHTR]VCRNUMORI)
+      #----- No série alloué par une autre pièce
+      Call SHTTRACE ( mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                    +WSERNUM-":"-mess(443,184,1),0) From TRTSHTCOM
+      WRET=1
+   Elsif func STKLIB.REC_STOSERW([M:ALP]ITMREF,WSERNUM)<>0
+      #----- No série en cours de traitement
+      Call SHTTRACE ( mess(18,7,1)  -":"-[M:ALP]ITMREF+chr$(13)
+&                    +WSERNUM-":"-mess(449,184,1),0) From TRTSHTCOM
+      WRET=1
+   Else
+      Read [STO]STO0=[M:ALP]STOFCY;[F:STS]STOCOU
+   Endif
+Else
+   Readlock [STO]STO5=[M:ALP]ITMREF;WSERNUM
+Endif
+
+Return
+#--- End issue 110327
+

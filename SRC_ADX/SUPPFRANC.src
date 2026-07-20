@@ -1,0 +1,816 @@
+#<AdxTL>@(#)10.0.0.0 $Revision$
+#CHECK IGNORE_SOURCE
+Local Char PARAM(10)(1..2) , VALEUR(10)
+Call TRAITE_CHAR(VALEUR,PARAM,"","SUPPFRANC","",2,"XYSUPPFRANC") From GTRAITE
+End
+
+################################################################################
+## Suppression du franc (ou peseta, ou lire, ...)
+################################################################################
+$ACTION
+Case ACTION
+ When "AVANT_PAR"  : Gosub AVANT_PAR
+ When "INIT"       : Gosub INIT
+ When "EXEC"       : Gosub EXEC
+Endcase
+Return
+
+$AVANT_PAR
+TIT = mess(131,116,1) : # Suppression du franc
+Return
+
+$INIT
+TMP = 1
+TRA = 1
+Return
+
+$EXEC
+Call SUPPFRANC(nomap,PSPE,PROGSPE)
+Return
+
+################################################################################
+## Suppression du franc (ou peseta, ou lire, ...)
+################################################################################
+Subprog SUPPFRANC(APPLI,PSPE,PROGSPE)
+Value Char    APPLI
+Value Integer PSPE
+Value Char    PROGSPE
+
+Local Integer OK , TEST
+Local Char    DEVISE(GLONCUR) , OLDDEV(GLONCUR)
+Local Char    ACTION(20)
+
+TEST = 0
+
+Call OUVRE_TRACE(mess(131,116,1)) From LECFIC : # Suppression du franc
+Call TRACE(mess(143,116,1),0) : # Début des opérations
+If filinfo(filpath("FIL","GACCENTRY","fde",APPLI),0)<0
+ Call ECR_TRACE(mess(132,116,1),1) From GESECRAN : # Module compta non implanté
+ Goto TERMINE
+Endif
+Call MONO(OK) From AX3MONO
+If !OK
+ Goto TERMINE
+Endif 
+
+# 1) Détermination de la devise à conserver
+
+Local File ADOSSIER [ADS]
+Read [ADS]DOSSIER = APPLI
+If fstat
+ Call ECR_TRACE(mess(7,125,1),1) From GESECRAN : # Dossier inexistant
+ Goto TERMINE
+Endif
+Local File =APPLI+".ADOVAL"  [ADW]
+Local File =APPLI+".COMPANY" [CPY]
+Read [ADW]ADW0 = "";"";"SYSCUR"
+If fstat
+ Call ECR_TRACE(mess(133,116,1),1) From GESECRAN : # Devise de reporting non définie
+ Goto TERMINE
+Endif
+OLDDEV = [F:ADW]VALEUR
+DEVISE = ""
+OK = 1
+For [CPY]CPY0 Where CPYLEGFLG=2
+ If DEVISE=""
+  DEVISE = [F:CPY]ACCCUR
+ Elsif [F:CPY]ACCCUR<>DEVISE
+  Call ECR_TRACE(mess(134,116,1),1) From GESECRAN : # Toutes les sociétés n'ont pas la même devise
+  If !TEST : OK = 0 : Break : Endif
+ Endif
+Next
+If !OK : Goto TERMINE : Endif
+If DEVISE=OLDDEV
+ Call ECR_TRACE(mess(135,116,1),1) From GESECRAN : # Opération déjà effectuée
+ Goto TERMINE
+Endif
+Call ECR_TRACE(mess(136,116,1)-":"-OLDDEV,0) From GESECRAN : # Ancienne devise de reporting
+Call ECR_TRACE(mess(137,116,1)-":"-DEVISE,0) From GESECRAN : # Nouvelle devise de reporting
+
+# 2) Affectation des champs
+
+Call AFFECT(APPLI,TEST,PSPE,PROGSPE)
+
+# 3) Suppressions des infos devenues inutiles
+
+Call SUPPRIME(APPLI,OLDDEV,TEST)
+
+# 4) Récup des balances en ancienne devise
+
+GSYSCUR = DEVISE
+Call BALANCE(APPLI,OLDDEV,TEST)
+GSYSCUR = OLDDEV
+
+# 5) Conversion des montants en devise reporting
+
+Call CONVMNT(APPLI,OLDDEV,DEVISE,TEST,PSPE,PROGSPE)
+
+# 6) Spécifiques
+
+ACTION = "SUPPFRANC" : Gosub ACTSPE
+
+# 7) Affectation devise de reporting
+
+# Ouverture de fichier - Fiche 85408
+If clalev([F:ADA])=0 : Local File ADOSACT  [ADA] : Endif
+If clalev([F:ADE])=0 : Local File ADOSDIM  [ADE] : Endif
+If clalev([F:ADD])=0 : Local File ADOSSOL  [ADD] : Endif
+
+Trbegin [ADW]
+ Readlock [ADW]ADW0 = "";"";"SYSCUR"
+ If fstat
+  Call ECR_TRACE(mess(20,100,1)-"ADOVAL SYSCUR",1) From GESECRAN : # Erreur de verouillage
+ Else
+  [F:ADW]VALEUR = DEVISE
+  Rewrite [ADW]
+  If fstat
+   Call ECR_TRACE(mess(27,125,1)-":"-"ADOVAL SYSCUR",1) From GESECRAN : # Erreur de réécriture
+  Endif
+ Endif
+If TEST : Rollback : Else : Commit : Endif
+
+Trbegin [ADS]
+ Readlock [ADS]DOSSIER = APPLI
+ If fstat
+  Call ECR_TRACE(mess(20,100,1)-"ADOSSIER"-APPLI,1) From GESECRAN
+ Else
+  [F:ADS]RPTCUR = DEVISE
+  Rewrite [ADS]
+  If fstat
+   Call ECR_TRACE(mess(27,125,1)-":"-"ADOSSIER"-APPLI,1) From GESECRAN
+  Endif
+  # Si modification => Génération du fichier PARAM.ini (F55926)
+  Call CREPAR From DOSDIV
+ Endif
+If TEST : Rollback : Else : Commit : Endif
+GSYSCUR = DEVISE
+
+$TERMINE
+Call TRACE(mess(138,116,1),0) : # Fin des opérations
+Call FERME_TRACE From LECFIC
+Call MULTI(OK) From AX3MONO
+End
+
+################################################################################
+## Affectation des champs
+################################################################################
+Subprog AFFECT(APPLI,TEST,PSPE,PROGSPE)
+Value Char    APPLI
+Value Integer TEST
+Value Integer PSPE
+Value Char    PROGSPE
+
+Gosub DEFVAR
+
+Local Char    NZONE(10)(1..MAXZONE) , OZONE(10)(1..MAXZONE)
+
+CAS    = 1
+
+# No de version
+
+If GVERSION>="1.4.0"
+ VERSION = 140
+Else
+ VERSION = 130
+Endif
+
+NBFIC = 0
+NBFIC += 1 : FICHIER(NBFIC) = "GACCENTRY"
+NBFIC += 1 : FICHIER(NBFIC) = "GACCENTRYD"
+NBFIC += 1 : FICHIER(NBFIC) = "GACCENTRYA"
+NBFIC += 1 : FICHIER(NBFIC) = "GACCTMP"
+NBFIC += 1 : FICHIER(NBFIC) = "GACCTMPD"
+NBFIC += 1 : FICHIER(NBFIC) = "GACCTMPA"
+NBFIC += 1 : FICHIER(NBFIC) = "GACCDUDATE"
+NBFIC += 1 : FICHIER(NBFIC) = "GCOMMIT"
+NBFIC += 1 : FICHIER(NBFIC) = "GCOMMITD"
+NBFIC += 1 : FICHIER(NBFIC) = "GENTLOTH"
+NBFIC += 1 : FICHIER(NBFIC) = "PAYMENTD"
+NBFIC += 1 : FICHIER(NBFIC) = "PAYLOT"
+NBFIC += 1 : FICHIER(NBFIC) = "PROROGPCE"
+NBFIC += 1 : FICHIER(NBFIC) = "PINVOICE"
+NBFIC += 1 : FICHIER(NBFIC) = "SINVOICE"
+NBFIC += 1 : FICHIER(NBFIC) = "FIXINVLIG"
+If VERSION=140
+ NBFIC += 1 : FICHIER(NBFIC) = "EXPENSES"
+ NBFIC += 1 : FICHIER(NBFIC) = "HISTODUD"
+Endif
+ACTION = "ADDFIC1" : Gosub ACTSPE
+
+For IFIC=1 To NBFIC
+
+ FICH   = FICHIER(IFIC)
+ FILTRE = "1=1"
+ NBZONE = 0
+
+ Case FICH
+
+  When "GACCENTRY"   : # Ecritures
+
+   NBZONE += 1 : NZONE(NBZONE) = "RATRPT"    : OZONE(NBZONE) = "RATCUR"
+
+  When "GACCENTRYD"  : # Lignes écritures
+
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT"    : OZONE(NBZONE) = "AMTLOC"
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT1"   : OZONE(NBZONE) = "AMTLOC1"
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPTFLG" : OZONE(NBZONE) = "AMTLOCFLG"
+
+  When "GACCENTRYA"  : # Lignes ana
+
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT"    : OZONE(NBZONE) = "AMTLOC"
+
+  When "GACCTMP"     : # Ecritures tmp
+
+   NBZONE += 1 : NZONE(NBZONE) = "RATRPT"    : OZONE(NBZONE) = "RATCUR"
+
+  When "GACCTMPD"    : # Lignes tmp
+
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT"    : OZONE(NBZONE) = "AMTLOC"
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT1"   : OZONE(NBZONE) = "AMTLOC1"
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPTFLG" : OZONE(NBZONE) = "AMTLOCFLG"
+
+  When "GACCTMPA"    : # Lignes ana tmp
+
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT"    : OZONE(NBZONE) = "AMTLOC"
+
+  When "GACCDUDATE"  : # Echeances
+
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT"    : OZONE(NBZONE) = "AMTLOC"
+   NBZONE += 1 : NZONE(NBZONE) = "PAYRPT"    : OZONE(NBZONE) = "PAYLOC"
+   NBZONE += 1 : NZONE(NBZONE) = "TMPRPT"    : OZONE(NBZONE) = "TMPLOC"
+
+  When "HISTODUD"    : # Historique écheances
+
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT"    : OZONE(NBZONE) = "AMTLOC"
+   NBZONE += 1 : NZONE(NBZONE) = "PAYRPT"    : OZONE(NBZONE) = "PAYLOC"
+   NBZONE += 1 : NZONE(NBZONE) = "TMPRPT"    : OZONE(NBZONE) = "TMPLOC"
+
+  When "GCOMMIT"     : # Engagements
+
+   NBZONE += 1 : NZONE(NBZONE) = "RATRPT"    : OZONE(NBZONE) = "RATCUR"
+
+  When "GCOMMITD"    : # Lignes engagements
+
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT"    : OZONE(NBZONE) = "AMTLOC"
+
+  When "GENTLOTH"    : # Lots
+
+   NBZONE += 1 : NZONE(NBZONE) = "RATRPT"    : OZONE(NBZONE) = "RATCUR"
+
+  When "PAYMENTD"    : # Règlements
+
+   NBZONE += 1 : NZONE(NBZONE) = "PAYRPTLIN" : OZONE(NBZONE) = "PAYLOCLIN"
+
+  When "PAYLOT"      : # Lots de règlements
+
+   NBZONE += 1 : NZONE(NBZONE) = "TOTRPT"    : OZONE(NBZONE) = "TOTLOC"
+
+  When "PROROGPCE"   : # Prorogations
+
+   NBZONE += 1 : NZONE(NBZONE) = "AMTRPT"    : OZONE(NBZONE) = "AMTLOC"
+
+  When "PINVOICE"    : # Factures fournisseur
+
+   NBZONE += 1 : NZONE(NBZONE) = "RATRPT"    : OZONE(NBZONE) = "RATCUR"
+
+  When "SINVOICE"    : # Factures client
+
+   NBZONE += 1 : NZONE(NBZONE) = "RATRPT"    : OZONE(NBZONE) = "RATCUR"
+
+  When "FIXINVLIG"   : # Lignes factures immos
+
+   NBZONE += 1 : NZONE(NBZONE) = "RATRPT"    : OZONE(NBZONE) = "RATCUR"
+
+  When "EXPENSES"    : # Frais
+
+   NBZONE += 1 : NZONE(NBZONE) = "RATRPT"    : OZONE(NBZONE) = "RATCUR"
+
+ Endcase
+ OK = 1
+ ACTION = "ADDZON1" : Gosub ACTSPE
+ If OK
+  Gosub CONVERT
+ Endif
+Next IFIC
+End
+
+$DEFVAR
+Local Integer MAXFIC  : MAXFIC  = 50
+Local Integer MAXZONE : MAXZONE = 50
+
+Local Char    FICH(GLONATB) , ABREV(5) , CHAINE(250)
+Local Integer NBFIC , IFIC
+Local Char    FICHIER(GLONATB)(1..MAXFIC)
+Local Integer VERSION , CAS
+Local Integer NBCLE
+Local Char    CLE(10)(1..16)
+Local Integer TPCLE(1..16)
+Local Integer NBZONE
+Local Integer REPET(1..MAXZONE)
+Local Integer I , J , K , REP
+Local Char    CRITERE(255) , FILTRE(255) , CHAINE(255)
+Local Integer SUITE , FIN
+Local Integer NBLIG , MAXLIG , TOTLIG
+Local Char    ACTION(20)
+Return
+
+######################################################################
+## Affectation de OZONE(1..NBZONE) => NZONE(1..NBZONE)
+######################################################################
+$CONVERT
+If filinfo(filpath("FIL",FICH,"fde",APPLI),0)<0
+ Goto FIN
+Endif
+Local File =APPLI+".ATABLE"  [ATB]
+Local File =APPLI+".ATABIND" [ATI]
+Read [ATB]CODFIC = FICH
+If fstat
+ Call ECR_TRACE(FICH-":"-mess(73,125,1),1) From GESECRAN : # Table inexistante
+ Goto FIN
+Endif
+ABREV = [F:ATB]ABRFIC
+Local File =APPLI+"."+FICH [AAA]
+I = 1
+While I<=NBZONE
+ Case CAS
+  When 1
+   REP = evalue("dim([F:AAA]"+NZONE(I)+")")
+   If REP<1
+    Call ECR_TRACE(NZONE(I)-":"-mess(41,100,1),1) From GESECRAN : # Champ inexistant
+    Dela I,1 NZONE,OZONE,REPET
+    NBZONE -= 1
+   Else
+    REPET(I) = REP
+    REP = evalue("dim([F:AAA]"+OZONE(I)+")")
+    If REP<1
+     Call ECR_TRACE(OZONE(I)-":"-mess(41,100,1),1) From GESECRAN : # Champ inexistant
+     Dela I,1 NZONE,OZONE,REPET
+     NBZONE -= 1
+    Else
+     REPET(I) = min(REP,REPET(I))
+     I += 1
+    Endif
+   Endif
+  When 2
+   REP = evalue("dim([F:AAA]"+ZONE(I)+")")
+   If REP<1
+    Call ECR_TRACE(ZONE(I)-":"-mess(41,100,1),1) From GESECRAN : # Champ inexistant
+    Dela I,1 ZONE,REPET
+    NBZONE -= 1
+   Else
+    REPET(I) = REP
+    I += 1
+   Endif
+ Endcase
+Wend
+If NBZONE<1
+ Call ECR_TRACE(FICH-":"-"NBZONE=0",1) From GESECRAN
+ Goto FIN
+Endif
+Read [ATI]NUMLIG(2) = FICH;1
+If fstat
+ Call ECR_TRACE(FICH-":"-mess(43,150,1),1) From GESECRAN : # Index non défini
+ Goto FIN
+Endif
+NBCLE = 0
+CHAINE = [F:ATI]DESCRIPT
+While CHAINE<>""
+ NBCLE += 1
+ I = instr(1,CHAINE,"+")
+ J = instr(1,CHAINE,"-")
+ If    I & J  : I = min(I,J)
+ Elsif J & !I : I = J
+ Endif
+ If I
+  CLE(NBCLE) = left$(CHAINE,I-1) : CHAINE = right$(CHAINE,I+1)
+ Else
+  CLE(NBCLE) = CHAINE : CHAINE = ""
+ Endif
+ Case evalue("type([F:AAA]"+CLE(NBCLE)+")")
+  When 1,2,4,5,6,7,8,9
+   TPCLE(NBCLE) = 2
+  When 3
+   TPCLE(NBCLE) = 3
+  When Default
+   TPCLE(NBCLE) = 1
+ Endcase
+Wend
+
+Call TRACE(mess(139,116,1)-FICH,0) : # Conversion de la table
+CRITERE = "1=1"
+If FILTRE=""
+ FILTRE = "1=1"
+Endif
+[G:AAA]currind = 1
+[G:AAA]currlen = 0
+SUITE   = 0
+TOTLIG  = 0
+MAXLIG  = 10000
+
+$BOUCLE
+NBLIG = 0
+FIN   = 1
+Trbegin [AAA]
+ Lock [AAA]
+ If fstat
+  Call ECR_TRACE(mess(20,100,1)-FICH,1) From GESECRAN : # Erreur de verrouillage
+ Else
+  For [AAA] Where evalue(CRITERE) & evalue(FILTRE)
+   Case CAS
+    When 1 : # Affectation
+     For I=1 To NBZONE
+      For J=1 To REPET(I)
+       Assign "[F:AAA]"+NZONE(I)+"("+num$(J-1)+")" With evalue("[F:AAA]"+OZONE(I)+"("+num$(J-1)+")")
+      Next J
+     Next I
+    When 2 : # Conversion
+     For I=1 To NBZONE
+      For J=1 To REPET(I)
+       MONTANT = evalue("[F:AAA]"+ZONE(I)+"("+num$(J-1)+")")
+       MONTANT = arr(MONTANT/COURS,AROND)
+       Assign "[F:AAA]"+ZONE(I)+"("+num$(J-1)+")" With MONTANT
+      Next J
+     Next I
+   Endcase
+   Rewrite [AAA]
+   If fstat
+    GCLE = sigma(1,NBCLE,num$(evalue("[F:AAA]"+CLE(indcum)))+" ")
+    Call ECR_TRACE(mess(27,125,1)-":"-GCLE,1) From GESECRAN
+   Endif
+   NBLIG  += 1
+   TOTLIG += 1
+   If NBLIG>=MAXLIG
+    FIN = 0
+    Break
+   Endif
+  Next
+ Endif
+If TEST : Rollback : Else : Commit : Endif
+
+If !FIN | SUITE
+ If !FIN
+  SUITE = 0
+ Endif
+ CRITERE = ""
+ K = 1
+ For I=SUITE+1 To NBCLE-1
+  Call ADDCRIT(CLE(K),TPCLE(K),"=",num$(evalue("[F:AAA]"+CLE(K))),CRITERE)
+  K += 1
+ Next I
+ Call ADDCRIT(CLE(K),TPCLE(K),">",num$(evalue("[F:AAA]"+CLE(K))),CRITERE)
+ If TEST
+  Call ECR_TRACE("---"-"Rupture"-num$(TOTLIG)-":"-CRITERE,0) From GESECRAN
+ Endif
+ SUITE += 1
+ If SUITE>=NBCLE
+  SUITE = 0
+ Endif
+ Goto BOUCLE
+Endif
+Call ECR_TRACE("---"-num$(TOTLIG)-mess(140,116,1),0) From GESECRAN : # Lignes traitées
+
+$FIN
+Close Local File
+Return
+
+Subprog ADDCRIT(CLE,TYP,OPE,VALEUR,CRITERE)
+Value    Char    CLE
+Value    Integer TYP
+Value    Char    OPE
+Value    Char    VALEUR
+Variable Char    CRITERE()
+If CRITERE<>""
+ CRITERE -= "&"
+Endif
+CRITERE -= CLE+OPE
+Case TYP
+ When 1 : CRITERE += '"'+VALEUR+'"'
+ When 2 : CRITERE += VALEUR
+ When 3 : CRITERE += "["+VALEUR+"]"
+Endcase
+End
+
+Subprog TRACE(MESSAGE,OK)
+Value Char    MESSAGE
+Value Integer OK
+Call ECR_TRACE(format$("D:"+GFMDAT4,date$)-time$-MESSAGE,OK) From GESECRAN
+End
+
+################################################################################
+## Suppression d'infos inutiles
+################################################################################
+Subprog SUPPRIME(APPLI,DEVISE,TEST)
+Value Char    APPLI
+Value Char    DEVISE
+Value Integer TEST
+
+Call TRACE(mess(142,116,1)-DEVISE,0) : # Suppressions des cours
+
+Local File =APPLI+".TABCHANGE" [TCH] 
+
+Trbegin [TCH]
+ Delete [TCH] Where (CUR=DEVISE or CURDEN=DEVISE)
+ If fstat=1
+  Call ECR_TRACE(mess(54,123,1),1) From GESECRAN : # Suppression impossible
+ Endif
+If TEST : Rollback : Else : Commit : Endif
+End
+
+
+################################################################################
+## Recalcul des balances
+################################################################################
+Subprog BALANCE(APPLI,DEVISE,TEST)
+Value Char    APPLI
+Value Char    DEVISE
+Value Integer TEST
+
+Local Integer ANOM
+
+Call TRACE(mess(54,116,1)-DEVISE,0) : # Resynchronisation balance
+
+Local File =APPLI+".GACCENTRY"     [HAE] 
+Local File =APPLI+".GACCENTRYD"    [DAE] 
+Local File =APPLI+".GACCENTRYA"    [DAA] 
+Local File =APPLI+".GCOMMIT"       [CMM] 
+Local File =APPLI+".GCOMMITD"      [CMD] 
+Local File =APPLI+".FISCALYEAR"    [FIY] 
+Local File =APPLI+".PERIOD"        [PER] 
+Local File =APPLI+".FACILITY"      [FCY] 
+Local File =APPLI+".COMPANY"       [CPY] 
+Local File =APPLI+".GACCOUNT"      [GAC] 
+Local File =APPLI+".BPARTNER"      [BPR] 
+Local File =APPLI+".BALANCE"       [BAL] 
+Local File =APPLI+".BALANA"        [BLA] 
+Local File =APPLI+".TABCUR"        [TCU]
+Local File =APPLI+".FACGROUP"      [FGR]
+Local File =APPLI+".CACNA"         [CNA] 
+Local File =APPLI+".TABUNIT"       [TUN] 
+Local File =APPLI+".BUD"           [BUD]
+Local File =APPLI+".BUDPAR"        [BUP]
+Local File =APPLI+".CACCE"         [CCE] 
+Local File =APPLI+".FISCALYEAR"   [FIY2]
+Local File =APPLI+".FISCALYEAR"   [FIY9]
+
+For [FIY9]FIY0
+ If !TEST
+  Call RECUPBAL([F:FIY9]CPY,2,"",[F:FIY9]FIYNUM,DEVISE,3,"",GSERVEUR,1,ANOM) From RECUPBAL
+  Call RECUPBLA([F:FIY9]CPY,2,"",[F:FIY9]FIYNUM,DEVISE,"",3,"",1,GSERVEUR,1) From RECUPBLA
+ Endif
+Next
+
+End
+
+################################################################################
+## Conversion de certains montants
+################################################################################
+Subprog CONVMNT(APPLI,OLDDEV,NEWDEV,TEST,PSPE,PROGSPE)
+Value Char    APPLI
+Value Char    OLDDEV
+Value Char    NEWDEV
+Value Integer TEST
+Value Integer PSPE
+Value Char    PROGSPE
+
+Gosub DEFVAR
+
+Local Decimal COURS , AROND , MONTANT
+Local Char    PAR(10)
+Local Char    ZONE(10)(1..MAXZONE)
+
+CAS    = 2
+
+Local File =APPLI+".TABCUR"  [TCU]
+Local File =APPLI+".ADOVAL"  [ADW]
+
+Read [TCU]TCU0 = OLDDEV
+If NEWDEV=GEURO & [F:TCU]EURFLG=2
+ COURS = [F:TCU]EURRAT
+Else
+ Call CONVERT(NEWDEV,OLDDEV,NEWDEV,1,date$,1000000,COURS,I) From TRTDEV
+ COURS /= 1000000
+Endif
+If COURS<=0
+ Call ECR_TRACE(NEWDEV-":"-mess(16,114,1)-OLDDEV,1) From GESECRAN : # Pas de cours de devise
+ End
+Endif
+Read [TCU]TCU0 = NEWDEV
+AROND = [F:TCU]CURRND
+
+Call TRACE(mess(144,116,1),0) : # Conversion des paramètres
+
+Trbegin [ADW]
+ For PAR="FUPAMT","AMTDCLDAS"
+  For [ADW] Where PARAM=PAR
+   Readlock [ADW] Curr
+   If fstat
+    Call ECR_TRACE(mess(20,100,1)-":"-"ADOVAL"-PAR,1) From GESECRAN : # Erreur de lecture
+   Else
+    [F:ADW]VALEUR = num$(arr(val([F:ADW]VALEUR)/COURS,AROND))
+    Rewrite [ADW]
+    If fstat
+     Call ECR_TRACE(PAR-":"+mess(27,125,1),1) From GESECRAN : # Erreur de réécriture
+    Endif
+   Endif
+  Next
+ Next PAR
+If TEST : Rollback : Else : Commit : Endif
+
+NBFIC = 0
+NBFIC += 1 : FICHIER(NBFIC) = "PFOOTINV"
+NBFIC += 1 : FICHIER(NBFIC) = "SFOOTINV"
+NBFIC += 1 : FICHIER(NBFIC) = "SFOOTINV2"
+NBFIC += 1 : FICHIER(NBFIC) = "CACNA"
+NBFIC += 1 : FICHIER(NBFIC) = "TABPAYTERM"
+NBFIC += 1 : FICHIER(NBFIC) = "TABPACKAGE"
+NBFIC += 1 : FICHIER(NBFIC) = "ITMSALES"
+NBFIC += 1 : FICHIER(NBFIC) = "BPCUSTOMER"
+NBFIC += 1 : FICHIER(NBFIC) = "BPSUPPLIER"
+NBFIC += 1 : FICHIER(NBFIC) = "CPYRAMIDG"
+NBFIC += 1 : FICHIER(NBFIC) = "GACCDENCOD"
+NBFIC += 1 : FICHIER(NBFIC) = "FIXCAT"
+NBFIC += 1 : FICHIER(NBFIC) = "TABEXPENS"
+NBFIC += 1 : FICHIER(NBFIC) = "EXPARAM"
+NBFIC += 1 : FICHIER(NBFIC) = "EXPARAMC"
+ACTION = "ADDFIC2" : Gosub ACTSPE
+
+For IFIC=1 To NBFIC
+
+ FICH    = FICHIER(IFIC)
+ FILTRE  = ""
+ NBZONE  = 0
+
+ Case FICH
+
+  When "PFOOTINV"    : # Eléments de facturation
+
+   NBZONE += 1 : ZONE(NBZONE) = "DEFVAL"
+   FILTRE = "AMTCOD=2"
+
+  When "SFOOTINV"    : # Eléments de facturation
+
+   NBZONE += 1 : ZONE(NBZONE) = "DEFVAL"
+   FILTRE = "AMTCOD=2"
+
+  When "SFOOTINV2"   : # Eléments de facturation bis
+
+   FICH = "SFOOTINV"
+   NBZONE += 1 : ZONE(NBZONE) = "TSDMIN"
+   NBZONE += 1 : ZONE(NBZONE) = "TSDMAX"
+
+  When "CACNA"       : # Natures
+
+   NBZONE += 1 : ZONE(NBZONE) = "VALUOM"
+
+  When "TABPAYTERM"  : # Condition de paiement
+
+   NBZONE += 1 : ZONE(NBZONE) = "PTEMINAMT"
+   NBZONE += 1 : ZONE(NBZONE) = "DUDMINAMT"
+
+  When "TABPACKAGE"  : # Emballages
+
+   NBZONE += 1 : ZONE(NBZONE) = "PCKPRI"
+
+  When "ITMSALES"    : # Articles ventes
+
+   NBZONE += 1 : ZONE(NBZONE) = "BASPRI"
+   NBZONE += 1 : ZONE(NBZONE) = "THEPRI"
+   NBZONE += 1 : ZONE(NBZONE) = "MINPRI"
+
+  When "BPCUSTOMER"  : # Clients
+
+   NBZONE += 1 : ZONE(NBZONE) = "CDTISR"
+   NBZONE += 1 : ZONE(NBZONE) = "FUPMINAMT"
+   NBZONE += 1 : ZONE(NBZONE) = "ORDMINAMT"
+   NBZONE += 1 : ZONE(NBZONE) = "OSTAUZ"
+
+  When "BPSUPPLIER"  : # Fournisseurs
+
+   NBZONE += 1 : ZONE(NBZONE) = "ORDMINAMT"
+   NBZONE += 1 : ZONE(NBZONE) = "OSTAUZAMT"
+
+  When "CPYRAMIDG"   : # Pyramides
+
+   NBZONE += 1 : ZONE(NBZONE) = "VALUOM"
+
+  When "GACCDENCOD"  : # Destinations comptables
+
+   NBZONE += 1 : ZONE(NBZONE) = "AMTMAX"
+
+  When "FIXCAT"      : # Catégories d'immos
+
+   NBZONE += 1 : ZONE(NBZONE) = "MAXDEP"
+
+  When "TABEXPENS"   : # Codes frais
+
+   NBZONE += 1 : ZONE(NBZONE) = "VLTDEFUNI"
+   NBZONE += 1 : ZONE(NBZONE) = "VLTPFDUNI"
+
+  When "EXPARAM"     : # Paramètres frais
+
+   NBZONE += 1 : ZONE(NBZONE) = "INDRAT"
+
+  When "EXPARAMC"    : # Paramètres collaborateurs
+
+   NBZONE += 1 : ZONE(NBZONE) = "INDKM"
+
+ Endcase
+ OK = 1
+ ACTION = "ADDZON2" : Gosub ACTSPE
+ If OK
+  Gosub CONVERT
+ Endif
+Next IFIC
+End
+
+$ACTSPE
+If PSPE
+ Onerrgo ERREUR
+ Gosub ACTION From =PROGSPE
+ Onerrgo
+Endif
+Return
+
+$ERREUR
+Call ECR_TRACE(errp-num$(errl)-":"-errmes$(errn)-errm,1) From GESECRAN
+Resume
+
+
+##############################################################################################################
+#                                                                                                            #
+#                           Gestion de numéros de série pour protéger des verticaux                          #
+#                           Ici mise en place pour protéger la moulinette de suppression du Franc            #
+#                                                                                                            #
+##############################################################################################################
+#
+# Sous-programme de vérification du fichier de clés (ici dans le répertoire .serialisation)
+# Pour tromper l'ennemi, son nom est anodin...
+# Doit être inclus dans un traitement non livré
+Local Integer OK
+Call OUVRE_TABLES(OK)
+Errbox num$(OK)
+End
+Subprog OUVRE_TABLES(OK)
+Variable Integer OK
+# On sauvegarde les valeurs des séparateurs...
+Local Char    ZADXIFS,ZADIRS
+Local Integer ZADXIUM
+ZADXIFS=adxifs : ZADXIRS=adxirs : ZADXIUM=adxium
+adxirs=chr$(13)+chr$(10)
+adxifs=""
+adxium=GASCII
+
+Local Integer SERIE
+SERIE=mod(val(right$(ver$(0),8)),10^6) : # La partie intéressante du numéro de licence "officiel"
+
+Local Char FICSERIE(20),NUMLU(20)(1..4)
+
+# Vous pouvez prendre le nom que vous voulez... mais pas serial_adonix !
+FICSERIE="supp_dev"
+
+# Le fichier existe-t-il bien ?
+If filinfo(filpath("!.serialisation",FICSERIE,""),0)<0
+    OK=0
+    End
+Endif
+
+Openi filpath("!.serialisation",FICSERIE,"") Using [SER]
+
+OK=1
+Rdseq NUMLU(1) Using [SER]: Rdseq NUMLU(2) Using [SER]: Rdseq NUMLU(3) Using [SER]: Rdseq NUMLU(4) Using [SER]
+Openi Using [SER]
+
+Local Integer NOMBRE1,NOMBRE2,NOMBRE3,NOMBRE4,NOMBRE5,NOMBRE6,NOMBRE7,NOMBRE8,NOMBRE9
+NOMBRE1=5000
+NOMBRE2=765400
+NOMBRE2+=5^2+5*2+int(5/2)
+NOMBRE3=99
+NOMBRE3*=1000
+NOMBRE3+=413
+NOMBRE7=int(10000*pi)+2*37
+NOMBRE5=3
+NOMBRE8=9659269
+NOMBRE1+=NOMBRE5
+NOMBRE5=int(10000*sqr(NOMBRE5))+NOMBRE5*4+1
+NOMBRE6=3457
+NOMBRE4=100* arr( 26534*100/3,1/100)
+NOMBRE9=8765
+
+# On traite par paquets de 4 chiffres, puisqu'il y a 8 chiffres dans le numéro
+Local Integer PART1,PART2,PART3,PART4,SERIE1
+SERIE1=mod(SERIE*1259,10^8)
+PART1=mod(SERIE1+NOMBRE9,10000)
+PART2=int(SERIE1/10000)
+PART3=100*int(PART1/100)+int(PART2/100)
+PART4=100*mod(PART1,100)+mod(PART2,100)
+
+
+If mod(PART1*NOMBRE1,NOMBRE2)<>val(NUMLU(1)) : OK=0 : Endif
+If mod(PART2*NOMBRE3,NOMBRE4)<>val(NUMLU(2)) : OK=0 : Endif
+If mod(PART3*NOMBRE5,NOMBRE6)<>val(NUMLU(3)) : OK=0 : Endif
+If mod(PART4*NOMBRE7,NOMBRE8)<>val(NUMLU(4)) : OK=0 : Endif
+
+# On restaure les valeurs des séparateurs et on termine ...
+adxifs=ZADXIFS : adxirs=ZADXIRS : adxium=ZADXIUM
+End
+

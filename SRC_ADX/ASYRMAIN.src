@@ -1,0 +1,1416 @@
+#<AdxTL>@(#)9.0.0.0 $Revision$
+
+# ASYRMAIN    Main program
+# ASYRDET     Manage "details" requests
+# ASYRQRY     Manage "query" requests
+# ASYRPRO     Manage requets for prototype description
+# ASYRJSO     JSON subprograms (temporary)
+# ASYRCOM     Communication program (for tests)
+
+#----------------------------------------------------------------#
+Subprog MAIN
+$_MAIN
+Local Integer SUCCESS: SUCCESS=1
+## Main variables
+Local Char    HANDLER(50)             : # The handler in charge of the request
+Local Integer COUNT                   : # workingCopy managing
+Local Clbfile CLBJSON
+Local Char    JSONSEP(1)
+
+# Managing errors
+Local Integer ERROR
+Local Clbfile DIAGNOSES
+
+#Parameters set in the HTTP header :
+Local Char    PRAGMA(250)
+
+#URL parameters :
+Local Char   S_KEYWORD(30)
+Local Char   S_OPERATION(50)
+Local Char   S_SELECTOR(250)
+Local Char   P_TRACKINGID(128)
+Local Char   P_REPRESENTATION(250)
+
+## For profiling
+Local Integer AMONITOR : AMONITOR=0
+Local Integer AP
+
+#FOR QLF
+If dim(GTEST)<=0 : Global Integer GTEST : GTEST = 0 : Endif
+
+Local Integer CTXERROR : CTXERROR=0
+
+[L]CTXERROR=func INIT_GLOBALS
+
+
+#103231
+#adxmto = max(adxmto,200)
+adxmto = max(adxmto,220)
+
+#initialize internal parameters
+Gosub SET_INTERNAL_PARAMETERS
+
+#----------------------------------------------------------------#
+# Main program
+#----------------------------------------------------------------#
+
+#Log without send to Syracuse
+#FOR QLF
+#If adxusr="mbeinat"
+If find(adxusr,"mbeinat","eboyard","rbu","ccl","jpga")
+ Call TRACE_OPEN("D") From ASYRCOM
+Endif
+
+Call TRACE("adxusr  :"+adxusr) From ASYRCOM
+Call TRACE("isomess :"+isomess) From ASYRCOM
+Call TRACE("adxctx  :"+adxctx) From ASYRCOM
+
+## Communication Instances with Syracuse server
+Local Instance ARCV Using C_ASYRRCV       : # Receive communication instance
+Local Instance PARCV Using C_ASYRRCV       : # Receive communication instance
+ARCV = NewInstance C_ASYRRCV AllocGroup null
+PARCV = ARCV
+Local Instance ASNB Using C_ASYRSNDBLB : # For images
+ASNB = null
+
+Local Instance ASNDG Using C_ASYRSND : # For others
+Local Instance PASND Using C_ASYRSND : # For others
+ASNDG = NewInstance C_ASYRSND AllocGroup null
+
+#JSON Managment :
+Local Instance  NODES(1..)  Using C_ASYRJSO
+Local Instance  NODE        Using C_ASYRJSO
+Local Instance  PNODE       Using C_ASYRJSO
+Local Instance  ITEM        Using C_ASYRJSO
+Local Instance  JSON        Using C_ASYRJSO
+Local Instance  PNODEUUID Using C_ASYRJSO
+
+# For $edit facets
+Local Instance ASWK(1..) Using C_ASYRWRK   : # workingCopies
+
+
+#open the session:
+HTTP_STATUS = func OPEN_SESSION(PARCV,adxusr,PSYR,[L]CTXERROR)
+Call TRACE("ASYRMAIN OPEN_SESSION:"-num$(HTTP_STATUS)) From ASYRCOM
+
+If HTTP_STATUS <> CST_AHTTP_CREATED :  Gosub END_OF_SESSION : Endif
+
+
+While SUCCESS
+ ## wait for a request:
+ Call SYRRCV(1,ARCV) From ASYRCOM
+
+ # start the monitoring is monitor=true
+ If tolower(func PARVAL(ARCV,"monitor")) = "true"
+  AMONITOR  = func ASYRMON.START()
+ Endif
+
+ PRAGMA = func ASYRMAIN.HEADVAL(ARCV,"pragma")
+ If len(PRAGMA)
+  # set debgmode:
+  Call SET_DBGMODE(PRAGMA)
+ Endif
+
+ # Flush scripts for developpers team
+ Gosub FLUSH_TRT
+
+ # Set the context property LANISO :
+ HTTP_STATUS = func CONTEXT_SET_LANISO(ARCV,PSYR)
+ If HTTP_STATUS <> CST_AHTTP_OK :  Gosub END_OF_SESSION : Endif
+
+
+ #Parse the data flow associated to the url if content-type=application/json
+ JSON = null
+ PSYR.CNTTYP = func ASYRMAIN.HEADVAL(ARCV,"content-type")
+ If instr(1,PSYR.CNTTYP,"application/json") > 0
+  COUNT = strDecode(ARCV.JSON,CLBJSON,GUTF8)
+  ERROR = func ASYRJSONPARSE.PARSEJSON(GACTX,CLBJSON,NODES,NODE)
+  If ERROR <> [V]CST_AOK :
+   Call SEND_ERROR(PSYR,CST_AHTTP_BAD_REQUEST,mess(1,149,1))
+   Gosub END_OF_SESSION
+   Break
+  Endif
+  JSON = NODE
+  #109897
+  Raz CLBJSON
+ Endif
+
+ # 1°) Look for the PREFIX :
+ If find(tolower(left$(ARCV.PREFIX,instr(1,ARCV.PREFIX,"(") )),"/$sessions(" , "/$connections(")
+  If ARCV.VERB="DELETE"
+   #End of session
+   Call SEND_ERROR(PSYR,CST_AHTTP_NO_CONTENT,"")
+   Gosub END_OF_SESSION
+   Break
+  #{SAM 115366
+  Elsif ARCV.VERB="PUT"
+   Gosub UPDATE_SESSION
+   Call SEND_ERROR(PSYR,CST_AHTTP_NO_CONTENT,"")
+  #SAM 115366}
+  Endif
+ Elsif len(ARCV.PREFIX)
+  If len(func ASYRMAIN.HEADVAL(ARCV,"accept"))>0
+   #Work with the actual request sent by syracuse :
+   PARCV = ARCV
+   # Remove the last '/' character and store the request context for the response:
+   PSYR.PREFIX = left$(ARCV.PREFIX,len(ARCV.PREFIX)-(instr(len(ARCV.PREFIX),ARCV.PREFIX,"/")/len(ARCV.PREFIX)))
+   PSYR.URL      = PSYR.PREFIX+"/"+"originalURL"
+
+   PASND = ASNDG
+   Gosub MANAGE_REQUEST
+  Endif
+ Endif
+
+
+  #Free JSO before the next call:
+ If JSON <> null :   FreeGroup JSON : Endif
+
+ # Send a response message:
+ If dim(ASNB)>0 & ASNB <> null
+  # Set the HTTP status :
+  ERROR = func ASYRSUB._AGETDIAGNOSES(GACTX,ASNB.STAT,DIAGNOSES)
+  Call SYRSNDBLB(ASNB) From ASYRCOM
+  FreeGroup ASNB
+  ASNB = null
+ Else
+  # Set the HTTP status :
+  #109897
+  If adxtyp=35 & dim(ASNDG)<0
+   Local Instance ASNDG Using C_ASYRSND : # For others
+   ASNDG = NewInstance C_ASYRSND AllocGroup null
+  Endif
+  If adxtyp=35 & dim(DIAGNOSES)<0
+   Local Integer ERROR
+   Local Clbfile DIAGNOSES
+  Endif
+  ERROR = func ASYRSUB._AGETDIAGNOSES(GACTX,ASNDG.STAT,DIAGNOSES)
+  If len(DIAGNOSES)>0
+#109897
+   If find(tolower(func ASYRMAIN.HEADVAL(ARCV,"accept")), "text/html","application/x-ms-application","*/*")
+&  & find(adxtyp,34,35)=0
+    ERROR = func ASYRSUB._AGETDIAGNOSESHTML(GACTX,ASNDG.STAT,DIAGNOSES)
+    ASNDG.DATA = "<html><body>"
+    Append  ASNDG.DATA, DIAGNOSES
+    Append  ASNDG.DATA ,"</body></html>"
+    ASNDG.CONTTYPE = "text/html"
+   Else
+     If len(ASNDG.DATA)>2 & right$(ASNDG.DATA,len(ASNDG.DATA)) = '}'
+     #Remove the last '}' :
+     ASNDG.DATA = left$(ASNDG.DATA,len(ASNDG.DATA)-1)
+     Append PASND.DATA, ','
+    Else
+     ASNDG.DATA = '{'
+    Endif
+    Append ASNDG.DATA, '"$diagnoses": ['
+    Append ASNDG.DATA, DIAGNOSES
+    Append ASNDG.DATA, ']}'
+   Endif
+  Endif
+  #109897
+  If adxtyp=35 & dim(AMONITOR)<0
+   Local Integer AMONITOR
+   # start the monitoring is monitor=true
+   If tolower(func PARVAL(ARCV,"monitor")) = "true"
+     AMONITOR  = 1
+   Endif
+  Endif
+  If AMONITOR
+   Call STOP(ASNDG.DATA) From ASYRMON
+   AMONITOR = 0
+  Endif
+  Call SYRSND(ASNDG) From ASYRCOM
+ Endif
+ # Reset the status for the next request:
+ Call _ADELSTATUS(GACTX) From ASYRSUB
+Wend
+
+#**
+#* END_OF_SESSION
+#*
+#*!
+$END_OF_SESSION
+Raz SUCCESS
+Call AUDIT_DECONNECT(GACTX) From ASYRCONNECT
+FreeInstance
+#SAM 100900 Call TRACE_END From ASYRCOM
+End
+
+#**
+#* UPDATE_SESSION
+#*
+#update preferences adxfmt2
+#shortDateFormat                     D :DD[/]MM[/]YY
+#longDateFormat          1          D :DD[/]MM[/]YYYY
+#shortTimeFormat         2          D :HH[ :]MM
+#longTimeFormat          3          D :HH[ :]MM[ :]SS
+#shortDatetimeFormat  4          D:DD[/]MM[/]YY[ ]HH[:]MM
+#longDatetimeFormat   5          D:DD MMM YYYY[, ]HH[:]MM[:]SS
+#decimalSep                  6           .
+#thousandsSep             7           ,
+#*!
+$UPDATE_SESSION
+Local Integer IDXFMT
+Local Char VALVAL(250)
+
+Onerrgo UPDATE_SESSION_ERROR
+
+PNODE     = JSON
+While PNODE <> null
+ If PNODE.PRO = "preferences"
+  ITEM = PNODE.SUB
+  While ITEM <> null
+   IDXFMT = find(ITEM.PRO,"shortDateFormat","longDateFormat","shortTimeFormat","longTimeFormat","shortDatetimeFormat","longDatetimeFormat","decimalSep","thousandsSep")
+   If IDXFMT
+    VALVAL=fmet ITEM.AGETCNT
+    IDXFMT -=1
+    adxfmt2(IDXFMT) = mid$(VALVAL,2,len(VALVAL)-2)
+    GACTX.AINTL.isReadonly = 0
+    Case IDXFMT
+     When 0: GACTX.AINTL.SHORTDATE = adxfmt2(IDXFMT)
+     When 1: GACTX.AINTL.LONGDATE = adxfmt2(IDXFMT)
+     When 2: GACTX.AINTL.SHORTTIME = adxfmt2(IDXFMT)
+     When 3: GACTX.AINTL.LONGTIME = adxfmt2(IDXFMT)
+     When 4: GACTX.AINTL.SHORTDATETIM = adxfmt2(IDXFMT)
+     When 5: GACTX.AINTL.LONGDATETIM = adxfmt2(IDXFMT)
+     When 6: GACTX.AINTL.DECIMALSEP = adxfmt2(IDXFMT)
+     When 7: GACTX.AINTL.THOUSANDSEP = adxfmt2(IDXFMT)
+    Endcase
+    GACTX.AINTL.isReadonly = 1
+   Endif
+   ITEM = ITEM.NEX
+  Wend
+
+ Elsif PNODE.PRO = "applicationConnectionData"
+  Call LOAD_APP_CNX_DATA_OBJ(PNODE) From ASYRCHGENV
+ Endif
+ PNODE = PNODE.NEX
+Wend
+
+Onerrgo
+Return
+
+$UPDATE_SESSION_ERROR
+Local Char ERROR_MESSAGE(250)
+ERROR_MESSAGE = errp+"("+num$(errl)+")"-mess(6,123,1)+"\"+errm
+Resume
+
+
+#**
+#* SEND_ERROR
+#*
+#* @param _HTTP_STATUS
+#* @param _MESSAGE
+#*!
+Subprog SEND_ERROR(_PSYR,_HTTP_STATUS,_MESSAGE)
+Variable Instance  _PSYR   Using C_ASYR #used by asyrerr!
+Value Integer _HTTP_STATUS
+Value Char _MESSAGE
+
+Local Instance ASND Using C_ASYRSND
+[L]ASND = NewInstance C_ASYRSND AllocGroup null
+[L]ASND.STAT          = _HTTP_STATUS
+[L]ASND.URL             = _PSYR.PREFIX
+[L]ASND.CONTTYPE = _PSYR.CNTPRE+"."+nomap+".$diagnoses"
+If len(_MESSAGE)
+ Append [L]ASND.DATA, '{"$diagnoses": [{'
+ Append [L]ASND.DATA, '"$severity": "error",'
+ Append [L]ASND.DATA, '"$message": "'+escJson(_MESSAGE)+'"'
+ Append [L]ASND.DATA, '}]}'
+Endif
+Call SYRSND([L]ASND) From ASYRCOM
+
+FreeInstance [L]ASND
+End
+
+#----------------------------------------------------------------#
+# Exit program
+#----------------------------------------------------------------#
+$ERR_UNEXPECTED
+Call TRACE("***Unexpected error***") From ASYRCOM
+Gosub ERRSTACK From ASYRERR
+End
+
+#*
+# Analyse the URL sent by the syracuse server :
+#*
+$MANAGE_REQUEST
+Raz HANDLER
+Raz S_KEYWORD,S_SELECTOR
+
+ERROR  = [V]CST_AOK
+
+Call GET_KEYWORD(PARCV.ENTITIES(1),S_KEYWORD,S_SELECTOR)
+
+Call TRACE("**ASYRMAIN KEYWORD"-S_KEYWORD) From ASYRCOM
+Call TRACE("**ASYRMAIN SELECTOR"-S_SELECTOR) From ASYRCOM
+
+If maxtab(PARCV.ENTITIES)=1 &  S_KEYWORD= "$PROTOTYPES" :
+ If  PARCV.VERB = "GET" & (len(S_SELECTOR)>0)
+  # $baseUrl/$prototypes('REPRESENTATION.$details')
+  ERROR = func SET_REPRESENTATION(GACTX,"",S_SELECTOR,PSYR,PASND,0)
+  If ERROR = [V]CST_AOK : HANDLER = "ASYRPRO.HANDLER_GET" : Endif
+ Endif
+Elsif maxtab(PARCV.ENTITIES)=2 &  S_KEYWORD= "$SERVICE"
+ Call GET_KEYWORD(PARCV.ENTITIES(2),PSYR.OPERATION,S_SELECTOR)
+ S_OPERATION = toupper(PSYR.OPERATION)
+ If S_OPERATION= "UPLOAD" & find(PARCV.VERB,"PUT","POST","GET","DELETE")
+  # $baseUrl/$service/upload?fileName='[space]directory/file_name.ext'&type=T)
+  HANDLER = "ASYRFIL.HANDLER_"+PARCV.VERB+"_DATA"
+ Elsif S_OPERATION= "SIGN" & PARCV.VERB = "GET"
+  # $baseUrl/$service/sign?chrono=ccc?answer=aaa?key=kkk?directory=ddd
+  HANDLER = "ASYRWRKSIG.HANDLER_GET"
+ Elsif S_OPERATION= "SCHEDULE" & PARCV.VERB = "POST"
+  # $baseUrl/$service/schedule
+  HANDLER = "ASYRBATCH.HANDLER_POST"
+ Elsif S_OPERATION= "ABOUT" & PARCV.VERB = "GET"
+  # $baseUrl/$service/about
+  HANDLER = "ASYRABOUT.HANDLER_GET"
+ Elsif S_OPERATION= "LICENSE" & PARCV.VERB= "POST"
+  HANDLER = "ASYRLIC.HANDLER_POST"
+ Elsif S_OPERATION= "QLF" & PARCV.VERB = "GET"
+  # $baseUrl/$service/about
+  HANDLER = "ASYRQLF.HANDLER_GET"
+ Elsif S_OPERATION= "PERF" & find(PARCV.VERB,"GET","POST")
+  # $baseUrl/$service/perf
+  HANDLER = "ASYRPERF.HANDLER_"+PARCV.VERB
+ Elsif S_OPERATION= "STUDIO" & find(PARCV.VERB,"GET","POST")
+  HANDLER = "ASYRSTUDIO.HANDLER_"+PARCV.VERB
+ Elsif S_OPERATION= "FOLDERSTREE" & PARCV.VERB="GET"
+  HANDLER = "ASYRFOLDERS.HANDLER_GET"
+ Elsif S_OPERATION= "STARTBATCH" & PARCV.VERB="POST"
+  HANDLER = "ASYRSERVBATCH.HANDLER_POST"
+ Elsif S_OPERATION= "STOPBATCH" & PARCV.VERB="DELETE"
+  HANDLER = "ASYRSERVBATCH.HANDLER_DELETE"
+ Elsif S_OPERATION= "SERVBATCH" & find(PARCV.VERB,"GET","PUT")
+  HANDLER = "ASYRSERVBATCH.HANDLER_"+PARCV.VERB
+ Elsif S_OPERATION= "PATCH" & find(PARCV.VERB,"GET","POST")
+  HANDLER = "ASYRPATCH.HANDLER_"+PARCV.VERB
+ Elsif S_OPERATION= "RESETLOG" & PARCV.VERB= "POST"
+  HANDLER = "ASYRLOG.HANDLER_"+PARCV.VERB
+ Elsif S_OPERATION= "MEMORYDUMP" & PARCV.VERB= "GET"
+  HANDLER = "ASYRMEMDMP.HANDLER_"+PARCV.VERB
+ #109897 add Remote call of Classic code protocol
+ Elsif S_OPERATION= "RPC" & PARCV.VERB= "POST"
+  HANDLER = "ASYRRPC.HANDLER_"+PARCV.VERB
+ #109897 Call batch request
+ Elsif S_OPERATION= "BATCH" & PARCV.VERB= "POST"
+  HANDLER = "ASYRSRVBATCH.HANDLER_"+PARCV.VERB
+ Elsif S_OPERATION= "DELIVERSCRIPT" & PARCV.VERB= "POST"
+  HANDLER = "ASYRDELIVERSCRIPT.HANDLER_POST"
+ Endif
+Elsif S_KEYWORD= "$WORKINGCOPIES" & maxtab(PARCV.ENTITIES)=1
+ # $baseUrl/$workingCopies('c2eca782-451d-41a4-adf2-c11908260035')?representation=AQCPROC08.$edit
+ ERROR = func SET_REPRESENTATION(GACTX,"",func ASYRMAIN.PARVAL(PARCV,"representation"),PSYR,PASND,1)
+ If ERROR = [V]CST_AOK
+  ERROR = func SET_TRACKINGID(GACTX, S_SELECTOR,PSYR)
+  If ERROR = [V]CST_AOK
+   Case PARCV.VERB
+    When "PUT" : HANDLER = "ASYREDT.HANDLER_PUT"
+    When "GET" : HANDLER = "ASYRWRK.HANDLER_GET"
+    When "DELETE" : HANDLER = "ASYRWRK.HANDLER_DELETE"
+   Endcase
+  Endif
+ Endif
+Elsif S_KEYWORD= "$WORKINGCOPIES" & maxtab(PARCV.ENTITIES)>1
+ ERROR = func SET_TRACKINGID(GACTX, S_SELECTOR,PSYR)
+ If ERROR = [V]CST_AOK
+  If  toupper(PARCV.ENTITIES(maxtab(PARCV.ENTITIES))) = "$LOCALIZE" and find(PARCV.VERB,"GET","PUT")
+   #  $baseUr/$workingCopies(%271f4b8b72-46e5-4efd-8eee-56e998e4e519%27)/AQCP01/DESCRIPTION/$localize
+   # The representation's name is stored in the working copy !
+   HANDLER = "ASYRLOC.HANDLER_"+PARCV.VERB
+  Elsif JSON = null
+    Case PARCV.VERB
+     When "GET"        : HANDLER = "ASYRWRKPRO.HANDLER_GET_DATA"
+     When "PUT"        : HANDLER = "ASYRWRKPRO.HANDLER_PUT_DATA"
+     When "DELETE" : HANDLER = "ASYRWRKPRO.HANDLER_DELETE_DATA"
+   Endcase
+  Endif
+ Endif
+Elsif maxtab(PARCV.ENTITIES)=1 &  S_KEYWORD= [V]CST_AURLCLOB & find(PARCV.VERB,"GET","PUT","DELETE")
+ # $baseUrl/CDOC('R_ATRACE~¨~TRACEFILE~¨~TRA~¨~F333308')
+ ERROR = func SET_LOB(GACTX,S_SELECTOR,PSYR,PASND)
+ If ERROR = [V]CST_AOK & PARCV.VERB = "GET" : HANDLER = "ASYRLOB.HANDLER_"+PARCV.VERB : Endif
+Elsif maxtab(PARCV.ENTITIES)=1 &  S_KEYWORD= [V]CST_AURLBLOB & find(PARCV.VERB,"GET","PUT","DELETE")
+ # $baseUrl/BDOC('C_AUTILIS~¨~AUSPIC~¨~AUSPIC~¨~ERB~¨~~¨~')?salt=594
+ ERROR = func SET_LOB(GACTX,S_SELECTOR,PSYR,PASND)
+ If ERROR = [V]CST_AOK & PARCV.VERB = "GET" : HANDLER = "ASYRLOB.HANDLER_"+PARCV.VERB+"_DATA" : Endif
+Elsif left$(S_KEYWORD,1) <> '$' : #Représentations :
+ #  check the representation :
+ P_REPRESENTATION = func ASYRMAIN.PARVAL(PARCV,"representation")
+ If maxtab(PARCV.ENTITIES) >1 & toupper(PARCV.ENTITIES(2))="$SERVICES" & len(P_REPRESENTATION)
+  ERROR = func SET_REPRESENTATION(GACTX,"",P_REPRESENTATION,PSYR,PASND,1)
+ Else
+  ERROR = func SET_REPRESENTATION(GACTX,S_KEYWORD,P_REPRESENTATION,PSYR,PASND,1)
+ Endif
+ If ERROR = [V]CST_AOK
+  PSYR.SELREP = S_SELECTOR
+  If maxtab(PARCV.ENTITIES) = 1
+   If len(S_SELECTOR) = 0
+    # $baseUrl/AVOLUME?representation=AVOLUME.$query
+     If PARCV.VERB = "GET" & find(PSYR.CODFAC,"$query","$lookup")
+      #TODO : review the management of errors in ASYRQRY
+      HANDLER = "ASYRQRY.HANDLER_GET"
+     Elsif PARCV.VERB = "GET" & PSYR.CODFAC = "$bulk"
+      HANDLER = "ASYRBLK.HANDLER_GET"
+     Elsif PARCV.VERB = "GET" & PSYR.CODFAC = "$search"
+      HANDLER = "ASYRSRH.HANDLER_GET"
+     Elsif PARCV.VERB ="POST" & PSYR.CODFAC = "$edit"
+      #TODO : gestion de la mémoire :
+      HANDLER = "ASYRMOB.HANDLER_POST"
+    Endif
+   Else : #If len(S_SELECTOR) > 0
+    If S_KEYWORD = "QUERY" & PARCV.VERB = "GET"  & ( PSYR.CODFAC = "$query" or PSYR.CODFAC = "$bulk")
+     # $baseUrl/QUERY('TESTREQ1')?representation=QUERY~TESTREQ1~1.$query&cube=true&displayLineNum=true
+     #TODO : gestion des erreurs et GACTX
+     HANDLER  = "ASYRREQ.HANDLER_GET"
+    Elsif S_KEYWORD = "PROCESS" & PARCV.VERB = "GET"  & PSYR.CODFAC = "$details"
+     # $baseUrl/PROCESS('CC23')?representation=PROCESS~CC23.$details
+     #TODO :
+     HANDLER  = "ASYRPROCESS.HANDLER_GET"
+    Elsif S_KEYWORD = "STATS" & PARCV.VERB = "GET"  & PSYR.CODFAC = "$cube"
+     # $baseUrl/STATS('DOM')?representation=STATS~DOM.$cube
+     HANDLER  = "ASYRSTATS.HANDLER_GET"
+    Elsif PARCV.VERB = "GET"  & find(PSYR.CODFAC,"$details","$summary")
+     #  $baseUrl/AVOLUME('TMP')?representation=AVOLUME.$details
+     #TODO : gestion des erreurs et de la mémoire :
+     HANDLER  = "ASYRDET.HANDLER_GET"
+    Elsif PARCV.VERB = "DELETE"  & find(PSYR.CODFAC,"$edit","$details")
+     #  $baseUrl/AVOLUME('TMP')?representation=AVOLUME.$edit
+     #TODO : gestion des erreurs et de la mémoire :
+     HANDLER  = "ASYRKIL.HANDLER_DELETE"
+    Elsif PARCV.VERB = "PUT"  & PSYR.CODFAC = "$edit"
+     #  $baseUrl/AVOLUME('TMP')?representation=AVOLUME.$edit
+     #TODO : gestion de la mémoire :
+     HANDLER  = "ASYRMOB.HANDLER_PUT"
+    Elsif PARCV.VERB = "GET"  & PSYR.CODFAC = "$edit"
+     #  $baseUrl/AVOLUME('TMP')?representation=AVOLUME.$edit
+     #TODO : gestion des erreurs et de la mémoire :
+     HANDLER  = "ASYRUPD.HANDLER_GET"
+    Elsif PARCV.VERB = "DELETE"  & PSYR.CODFAC = "$query"
+     #  $baseUrl/AVOLUME('TMP')?representation=AVOLUME.$query
+     ERROR = func SET_TRACKINGID(GACTX, func ASYRMAIN.PARVAL(PARCV,"trackingId"),PSYR)
+     If ERROR = [V]CST_AOK
+      # $baseUrl/AVOLUME('TMP')?representation=AVOLUME.$query&trackingId=58407b15-f249-4942-ab2a-d8d29c9108d3
+      #TODO : mode batch et/ou mobile ?
+      HANDLER  = "ASYRKIL.HANDLER_DELETE"
+     Endif
+    Endif
+   Endif : #If len(S_SELECTOR) = 0
+  Else :# maxtab(PARCV.ENTITIES) > 1
+   Call GET_KEYWORD(PARCV.ENTITIES(2),S_KEYWORD,S_SELECTOR)
+   Case S_KEYWORD
+    When "$SERVICES"
+     # $baseUrl/AQCQRY01('')/$services/SETUP?representation=AQCQRY01.$query&trackingId=8be49452-5159-492d-a6d3-de5070d4a178
+     If maxtab(PARCV.ENTITIES) = 3
+      If PARCV.VERB="GET" and PSYR.CODCLA = 'ARIGHTS' and toupper(PARCV.ENTITIES(3)) = "$RIGHTS"
+       HANDLER = "ASYRRIGHTS.HANDLER_GET"
+      Else
+       Call GET_KEYWORD(PARCV.ENTITIES(3),PSYR.OPERATION,S_SELECTOR)
+       If find(PARCV.VERB,"GET","POST") & find(PSYR.CODFAC,"$query","$details")
+        HANDLER = "ASYROPE.HANDLER_POST"
+       Endif
+      Endif
+     Endif
+    When "$WORKINGCOPIES"
+     P_TRACKINGID = func ASYRMAIN.PARVAL(PARCV,"trackingId")
+     If len(P_TRACKINGID)
+      ERROR = func SET_TRACKINGID(GACTX, P_TRACKINGID,PSYR)
+      If PARCV.VERB = "POST"  & PSYR.CODFAC = "$edit"
+       If len(PSYR.SELREP) = 0
+        # $baseUrl/AVOLUME/$workingCopies?representation=AVOLUME.$edit&trackingId=c2eca782-451d-41a4-adf2-c11908260035
+        #TODO ERRNUM dans ASYRCRE
+        HANDLER = "ASYRCRE.HANDLER_POST"
+       Else
+        # $baseUrl/AVOLUME('TMP')/$workingCopies?representation=AVOLUME.$edit&trackingId=c2eca782-451d-41a4-adf2-c11908260035
+        HANDLER = "ASYRUPD.HANDLER_POST"
+       Endif :#  If len(PSYR.SELREP) = 0
+      Elsif PARCV.VERB = "DELETE"  & PSYR.CODFAC = "$edit"
+       HANDLER = "ASYRWRK.HANDLER_DELETE"
+      Endif :# If PARCV.VERB = "POST"  & PSYR.CODFAC = "$edit"
+     Else :#  len(P_TRACKINGID) = 0
+      # $baseUrl/AVOLUME('TMP')/$workingCopies?representation=AVOLUME.$edit
+      HANDLER = "ASYRUPD.HANDLER_POST"
+     Endif :# len(P_TRACKINGID) ?
+    When "$BATCH"
+     #  $baseUrl//AQCQRY02/$batch?representation=AQCQRY02.$edit&device=phone
+     Gosub MANAGE_BATCH
+     HANDLER = "$BATCH"
+    When "$TEMPLATE"
+      If maxtab(PARCV.ENTITIES) = 2 and PARCV.VERB = "GET"  & PSYR.CODFAC = "$edit"
+       # {$baseUrl}/AVOLUME/$template?representation=AVOLUME.$edit&trackingId=41827f7b-c3df-483e-9e30-4131d3f6edaf
+       HANDLER = "ASYRCRE.HANDLER_GET"
+      Elsif maxtab(PARCV.ENTITIES) = 3 and toupper(PARCV.ENTITIES(3)) = "$WORKINGCOPIES"
+       # or {$baseUrl}/AVOLUME/$template/$workingCopies?representation=AVOLUME.$edit&trackingId=41827f7b-c3df-483e-9e30-4131d3f6edaf
+       P_TRACKINGID = func ASYRMAIN.PARVAL(PARCV,"trackingId")
+       If len(P_TRACKINGID)
+        ERROR = func SET_TRACKINGID(GACTX, P_TRACKINGID,PSYR)
+        If PARCV.VERB = "POST"  & PSYR.CODFAC = "$edit"
+         If len(PSYR.SELREP) = 0
+          HANDLER = "ASYRCRE.HANDLER_POST"
+         Endif
+        Endif
+       Endif :# len(P_TRACKINGID) ?
+      Endif
+    Endcase
+  Endif : # maxtab(PARCV.ENTITIES)
+ Endif :# SET_REPRESENTATION
+Endif
+
+If ERROR = [V]CST_AOK &  HANDLER <> "$BATCH"
+ If !len(HANDLER)
+  ERROR = func ASYRSUB._ASETSTATUS(GACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_NOT_IMPLEMENTED,mess(3,149,1))
+ Else
+ Call TRACE("ASYRMAIN HANDLER"-HANDLER) From ASYRCOM
+
+ Case right$(HANDLER,instr(1,HANDLER,'.')+1)
+  When "HANDLER_GET"
+   ERROR = func =HANDLER With (GACTX,ASWK,ARCV,PSYR,PASND)
+  When "HANDLER_POST","HANDLER_PUT","HANDLER_DELETE","HANDLER_PUT_DATA","HANDLER_DELETE_DATA"
+   ERROR = func =HANDLER With (GACTX,ASWK,ARCV,PSYR,PASND,JSON)
+  When "HANDLER_GET_DATA","HANDLER_POST_DATA"
+   ASNB = NewInstance C_ASYRSNDBLB AllocGroup null
+   ERROR = func =HANDLER With (GACTX,ASWK,ARCV,PSYR,ASNB)
+  Endcase
+ Endif
+Endif
+Return
+
+#**
+#* MANAGE_BATCH
+#*!
+$MANAGE_BATCH
+Raz ASNDG.DATA,JSONSEP
+Append ASNDG.DATA ,'{"$resources":['
+PNODE     = JSON
+While PNODE <> null
+ If PNODE.PRO = "$resources"
+  #"$resources" found:
+  ITEM = PNODE.SUB
+  While ITEM <> null
+   PARCV = func JSON_TO_ARCV(ITEM)
+   If PARCV <> null
+    JSON = ITEM.SUB
+
+    Local Instance ASNDU Using C_ASYRSND : # For others
+    ASNDU = NewInstance C_ASYRSND AllocGroup null
+    PASND = ASNDU
+
+    Gosub MANAGE_REQUEST
+
+    # Get the HTTP status :
+    ERROR = func ASYRSUB._AGETDIAGNOSES(GACTX,PASND.STAT,DIAGNOSES)
+    If len(PASND.DATA)
+     #Replace the last '}' by ',':
+     PASND.DATA = left$(PASND.DATA,len(PASND.DATA)-1)
+     Append PASND.DATA, ','
+    Else
+     PASND.DATA = '{'
+    Endif
+    Append PASND.DATA , '"$httpStatus":'+num$(PASND.STAT)
+    If len(DIAGNOSES)>0
+     Append PASND.DATA, ',"$diagnoses": ['
+     Append PASND.DATA, DIAGNOSES
+     Append PASND.DATA, ']'
+    Endif
+    #Replace the last '}' :
+    Append PASND.DATA , '}'
+
+    Append ASNDG.DATA ,JSONSEP
+    Append ASNDG.DATA ,PASND.DATA
+
+    # Reset the status for the next request:
+    Call _ADELSTATUS(GACTX) From ASYRSUB
+    JSONSEP = ','
+    FreeInstance PARCV
+    FreeInstance PASND
+    PASND = null
+   Endif
+   ITEM  = ITEM.NEX
+  Wend
+  PNODE = null
+ Endif
+ If PNODE <> null
+  PNODE = PNODE.NEX
+ Endif
+Wend
+Append ASNDG.DATA ,']}'
+Return
+#**
+#* GET_KEYWORD
+#*
+#* @param _ENTITY
+#* @param _KEYWORD
+#* @param _SELECTOR
+#*!
+Subprog GET_KEYWORD(_ENTITY,_KEYWORD,_SELECTOR)
+Value Char _ENTITY
+Variable Char _KEYWORD
+Variable Char _SELECTOR
+
+Local Integer AP
+_KEYWORD = toupper(_ENTITY)
+AP = instr(1,_KEYWORD,"(")
+If AP
+ _KEYWORD  = left$(_KEYWORD,AP-1 )
+ _SELECTOR = seg$(_ENTITY,AP+2,len(_ENTITY)-2)
+Endif
+End
+
+
+#-----------------------------------------------------------------#
+# Flush traitments ...
+#-----------------------------------------------------------------#
+
+$FLUSH_TRT
+Local Decimal TIMESTAMP
+TIMESTAMP = filinfo(filpath("","timestamp",""),9)
+If !find(nomap(1),"",nomap(0))
+ TIMESTAMP = max(TIMESTAMP,filinfo(filpath("","timestamp","",nomap(1)),9))
+Endif
+If !find(nomap(2),"",nomap(0..1))
+ TIMESTAMP = max(TIMESTAMP,filinfo(filpath("","timestamp","",nomap(2)),9))
+Endif
+If TIMESTAMP>GTIMESTAMP
+ adxmpr = adxmpr
+ adxmbm = adxmbm
+ GTIMESTAMP = TIMESTAMP
+Endif
+Return
+
+#----------------------------------------------------------------#
+# Initialisation parameters of URL
+#----------------------------------------------------------------#
+
+$SET_INTERNAL_PARAMETERS
+Local Instance  PSYR   Using C_ASYR
+PSYR = NewInstance C_ASYR AllocGroup null
+PSYR.PRELNK = "application/json;vnd.sage=syracuse"
+PSYR.URLPRO = "$prototype"
+PSYR.URLNEW = "$template/$workingCopies"
+PSYR.URLREP = "?representation="
+PSYR.URLX3  = "$sessions?f="
+PSYR.URLUPD = "$workingCopies"
+PSYR.CNTPRE = "application/json;vnd.sage=syracuse;vnd.sage.syracuse.representation=x3.erp"
+Return
+
+#--------------------------------------------------#
+#**
+#*
+#*
+#* @param PARCV
+#* @param LOGIN
+#* @param PSYR
+#*!
+#--------------------------------------------------#
+
+Funprog OPEN_SESSION(PARCV,LOGIN,PSYR,CTXERROR)
+Variable Instance PARCV Using C_ASYRRCV
+Value Char LOGIN
+Variable Instance  PSYR   Using C_ASYR #used by asyrerr!
+Variable Integer CTXERROR
+
+Local Integer ASTATUS: ASTATUS=[V]CST_AOK
+Local Instance ASND Using C_ASYRSND
+
+Local Integer HTTP_STATUS : HTTP_STATUS=CST_AHTTP_CREATED
+#Local Integer CTXERROR : CTXERROR=0
+Local Char ERRMSG(250)
+
+ASND = NewInstance C_ASYRSND AllocGroup null
+
+#Call TRACE("Open session '"+LOGIN + "'") From ASYRCOM
+
+Gosub CHECK_CTXERROR
+If CTXERROR>0
+ Goto EOF_OPEN_SESSION
+Endif
+
+#** initalize date
+datesyst = date$
+If   GDATFIN <> [00/00/0000] and  datesyst > GDATFIN : datesyst = GDATFIN :#SAM122539
+Elsif GDATDEB <> [00/00/0000] and datesyst < GDATDEB : datesyst = GDATDEB:#SAM122539
+Endif
+
+[L]CTXERROR = func CONTEXT_LOAD(isomess,nomap,LOGIN)
+Call TRACE("CONTEXT_LOAD datesyst :"+num$(datesyst)) From ASYRCOM
+
+Gosub CHECK_CTXERROR
+If CTXERROR>0
+ Goto EOF_OPEN_SESSION
+Endif
+
+#109897
+[L]CTXERROR=func SUITE_GLOBALS
+Gosub CHECK_CTXERROR
+If CTXERROR>0
+ Goto EOF_OPEN_SESSION
+Endif
+
+Call TRACE("ASYRMAIN LAN    :'"+GACTX.LAN +"'") From ASYRCOM
+Call TRACE("ASYRMAIN LANISO :'"+GACTX.LANISO   +"'") From ASYRCOM
+Call TRACE("ASYRMAIN USER   :'"+GACTX.USER   +"'") From ASYRCOM
+Call TRACE("ASYRMAIN LOGIN  :'"+GACTX.LOGIN  +"'") From ASYRCOM
+
+Local Decimal AECLIPSE,AECLIDBG
+If GACTX.APARAM<>null
+ AECLIPSE = fmet GACTX.APARAM.AGETUSERVALNUM("AECLIPSE")
+ AECLIDBG = fmet GACTX.APARAM.AGETUSERVALNUM("AECLIDBG")
+ Call TRACE("ASYRMAIN AECLIPSE   :"+ num$(AECLIPSE)) From ASYRCOM
+ Call TRACE("ASYRMAIN AECLIDBG   :"+ num$(AECLIDBG)) From ASYRCOM
+ Call TRACE("ASYRMAIN AECLIMAC   :"+ fmet GACTX.APARAM.AGETUSERVALCHAR("AECLIMAC")) From ASYRCOM
+ Call TRACE("ASYRMAIN AECLIPRT   :"+ fmet GACTX.APARAM.AGETUSERVALCHAR("AECLIPRT")) From ASYRCOM
+ Call TRACE("ASYRMAIN AECLIDBGTR :"+ num$(fmet GACTX.APARAM.AGETUSERVALNUM("AECLIDBGTR"))) From ASYRCOM
+Endif
+
+If AECLIDBG = 2
+ [S]adxdpg = "DEBUGGER"
+ [S]dbgmode(0)=1
+Endif
+
+
+
+#** session successfully opened
+
+#------------------------------------------#
+#** send the response to Syracuse
+#------------------------------------------#
+
+$EOF_OPEN_SESSION
+Local Integer POS,ERROR,STAT
+ASND.STAT          = HTTP_STATUS
+If HTTP_STATUS <> CST_AHTTP_CREATED
+ #log the logon failure:
+ Call AUDIT_CONNECT(GACTX,11,ERRMSG)  From ASYRCONNECT
+ ASND.URL             = PSYR.PREFIX
+ ASND.CONTTYPE = PSYR.CNTPRE+"."+nomap+".$diagnoses"
+ ASND.DATA          = ERRMSG
+Else
+ #log the newly opened session
+ Call AUDIT_CONNECT(GACTX,0,ERRMSG)  From ASYRCONNECT
+ ASND.CONTTYPE = "application/json"
+ ASND.URL = "/$sessions('"+num$(adxuid(1))+"')"
+ Raz ASND.DATA
+ Append ASND.DATA,'{"'+'id'+'":"'+num$(adxuid(1)) + '"'
+ Append ASND.DATA,',"wireProtocolVersion":2' :#SAM 115366
+ Append ASND.DATA,',"$links":{'
+ Append ASND.DATA,'"$rights":{'
+
+ POS = instr(8+1,baseUrl,"/")
+ Append ASND.DATA,'"$url": "'+right$(baseUrl,POS)+'/ARIGHTS('+ "'" + GACTX.LOGIN + "'" +')/$services/$rights"'
+ Append ASND.DATA,'}'
+ Append ASND.DATA,'}'
+
+#
+ If func ASYRLIC.CTLLIC
+  #106969
+  #Gosub VERCOM From GLOBVAR
+  Append ASND.DATA,',"license": {'
+  Append ASND.DATA,'"product": "'+func ASYRLIC.GET_CHPRODUCTSTDCODE+'",'
+  #Append ASND.DATA,'"version": "'+left$(VERSION,1)+'",'
+  Append ASND.DATA,'"version": "'+func APRODUCT.AGETVERSLIC+'",'
+  Append ASND.DATA,'"$links": {'
+  Append ASND.DATA,'"$license": {'
+  Append ASND.DATA,'"$url": "'+right$(baseUrl,POS)+'/$service/license",'
+  Append ASND.DATA,'"$method": "POST"'
+  Append ASND.DATA,' }}}'
+ Endif
+ #107271
+ Local Clbfile DIAGNOSES
+ ERROR = func ASYRSUB._AGETDIAGNOSES(GACTX,STAT,DIAGNOSES)
+ If len(DIAGNOSES)>0
+    Append ASND.DATA, ',"$diagnoses": ['
+    Append ASND.DATA, DIAGNOSES
+    Append ASND.DATA, ']'
+ Endif
+ ##107271
+ Append ASND.DATA,'}'
+Endif
+Call SYRSND(ASND) From ASYRCOM
+FreeInstance ASND
+End HTTP_STATUS
+
+#------------------------------------------------------#
+#**
+#* TRANSLATE_CLB
+#* Returns the value of a property PARAMCOD in a clob
+#* @param PARCV
+#* @param PARCOD
+#*!
+
+
+Funprog TRANSLATE_CLB(ARRAY_IN,ARRAY_OUT,VALUEIN)
+Variable Clbfile ARRAY_IN()(0..)
+Variable Clbfile ARRAY_OUT()(0..)
+Value Char VALUEIN
+
+Local Clbfile VALUEOUT
+Local Integer I
+VALUEOUT=""
+
+Call TRACE("translate clb maxtab(array_in)="+num$(maxtab(ARRAY_IN))) From ASYRCOM
+For I=0 To maxtab(ARRAY_IN)
+
+ If vireblc(toupper(ARRAY_IN(I)),2)=vireblc(toupper(VALUEIN),2)
+  Append VALUEOUT,ARRAY_OUT(I)
+  Break
+ Elsif len(ARRAY_IN(I))=0
+  Break
+ Endif
+Next I
+
+End VALUEOUT
+
+#**
+#* Funprog PARVAL(PARCV,PARCOD)
+#* Returns the value of a property PARAMCOD in a clob
+#*
+#* @param PARCV
+#* @param PARCOD
+#*!
+#------------------------------------------------------------------#
+Funprog PARVAL(PARCV,PARCOD)
+Variable Instance PARCV Using C_ASYRRCV
+Value Char PARCOD
+Local Clbfile PARVAL(2)
+PARVAL = func TRANSLATE_CLB(PARCV.PARAMCOD,PARCV.PARAMVAL,PARCOD)
+End PARVAL
+
+#------------------------------------------------------------------#
+#**
+#* Funprog HEADVAL(PARCV,PARCOD)
+#* Returns the value of a property PARAMCOD in a clob
+#*
+#* @param PARCV
+#* @param PARCOD
+#*!
+#------------------------------------------------------------------#
+Funprog HEADVAL(PARCV,PARCOD)
+Variable Instance PARCV Using C_ASYRRCV
+Value Char PARCOD
+Local Clbfile PARVAL(2)
+PARVAL = func TRANSLATE_CLB(PARCV.HEADERCOD,PARCV.HEADERVAL,PARCOD)
+End PARVAL
+#------------------------------------------------------------------#
+#**
+#* SET_REP_PARAMETERS
+#*
+#* @param REP
+#* @param PARCV
+#*!
+
+
+Subprog SET_REP_PARAMETERS(REP,PARCV)
+Variable Instance REP   Using OBJECT
+Variable Instance PARCV Using C_ASYRRCV
+
+Local Integer I,POS
+
+If dim(REP._APARAMURL)>0
+ For I=2 To maxtab(PARCV.PARAMCOD)
+  POS = find(PARCV.PARAMCOD(I), REP._APARAMURL(1..maxtab(REP._APARAMURL)).PAR)
+  If POS = 0
+    POS = maxtab(REP._APARAMURL) + 1
+    REP._APARAMURL(POS) = NewInstance  C_APARAMURL AllocGroup REP
+  Endif
+  REP._APARAMURL(POS).PAR = PARCV.PARAMCOD(I)
+  REP._APARAMURL(POS).VPR = PARCV.PARAMVAL(I)
+ Next I
+  I = find("x-file-name",PARCV.HEADERCOD)
+  If I
+   POS = find(PARCV.HEADERCOD(I), REP._APARAMURL(1..maxtab(REP._APARAMURL)).PAR)
+   If POS =0
+    POS = maxtab(REP._APARAMURL) + 1
+    REP._APARAMURL(POS) = NewInstance  C_APARAMURL AllocGroup REP
+   Endif
+   REP._APARAMURL(POS).PAR = PARCV.HEADERCOD(I)
+   REP._APARAMURL(POS).VPR = PARCV.HEADERVAL(I)
+ Endif
+Endif
+End
+
+#**
+#* SET_REPRESENTATION
+#*
+Funprog SET_REPRESENTATION(_ACTX,_CLASS,_ID,_PSYR,_ASND,CHECKRIGHT)
+Variable Instance _ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Value Char _CLASS
+Value Char _ID
+Variable Instance  _PSYR   Using C_ASYR
+Variable Instance _ASND Using C_ASYRSND
+Value Integer CHECKRIGHT
+
+Local Integer AI
+Local Char ENTITY(50),ENTITY_TYPE(50)
+Local Char FACET(10)
+Local Char CODFNC(30)
+Local Integer MODULE
+
+Local Integer ERROR : ERROR= [V]CST_AOK
+Local Integer READONLY
+
+Raz _PSYR.CODREP,_PSYR.CODCLA,_PSYR.SELREP
+_PSYR.WRKUID = NullUuid
+
+If len(_ID)
+ [L]AI = instr(1,_ID,".")
+ If [L]AI
+  ENTITY = left$(_ID ,[L]AI-1)
+  FACET = tolower(right$(_ID,[L]AI+1))
+
+  #Call TRACE("DBG ASYRMAIN :"+toupper(left$(ENTITY,instr(1,ENTITY,'~')))) From ASYRCOM
+
+  ENTITY_TYPE =  toupper(left$(ENTITY,instr(1,ENTITY,'~')))
+  Case ENTITY_TYPE
+   When "" :
+    If ENTITY = "DEBUG"
+     _PSYR.CODREP = ENTITY
+     _PSYR.CODFAC = FACET
+      #The URL syntax is correct :
+     _ASND.URL            = _PSYR.PREFIX+'/'+_PSYR.CODREP
+     _ASND.CONTTYPE = _PSYR.CNTPRE+"."+nomap+"."+_PSYR.CODREP+"."+_PSYR.CODFAC
+    Elsif find(FACET,"$query","$bulk","$details","$edit","$lookup","$summary")
+     _PSYR.CODREP = ENTITY
+     _PSYR.CODCLA = _CLASS
+     _PSYR.CODFAC = FACET
+      #The URL syntax is correct :
+     _ASND.URL            = _PSYR.PREFIX+'/'+_PSYR.CODREP
+     _ASND.CONTTYPE = _PSYR.CNTPRE+"."+nomap+"."+_PSYR.CODREP+"."+_PSYR.CODFAC
+     ERROR = func ASHWVAL._CHECK_ASW(_ACTX,_PSYR.CODREP,_PSYR.CODCLA,_PSYR.CODFAC,CODFNC,MODULE,CHECKRIGHT)
+
+      If ERROR = [V]CST_AOK and  _ACTX.ASOL.FCTCUR <> CODFNC
+      Call SET_CURFCT(CODFNC,MODULE,"") From PSADX
+       # The set_curfct function is time consuming
+       READONLY = _ACTX.isReadonly
+       _ACTX.ASOL.isReadonly = 0
+      _ACTX.ASOL.FCTCUR = CODFNC
+       _ACTX.ASOL.isReadonly = 1
+     Endif
+    Elsif FACET="$search"
+     _PSYR.CODCLA = ENTITY
+     _PSYR.CODFAC = FACET
+     ERROR =  func ACLAVAL._CHECK_ACLA(_ACTX,_PSYR.CODCLA,_PSYR.CODFAC)
+    Else
+      ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,func ASYRFNC.MES1(mess(63,149,1),FACET))
+    Endif
+   When "STATS~" :
+     If FACET="$cube"
+      _PSYR.CODREP = ENTITY
+      _PSYR.CODFAC = FACET
+     Else
+       ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,mess(2,149,1))
+     Endif
+   When "QUERY~" :
+     If find(FACET,"$query","$bulk") & instr(len(ENTITY_TYPE)+1,ENTITY,'~')
+      _PSYR.CODREP = ENTITY
+      _PSYR.CODFAC = FACET
+     Else
+       ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,mess(2,149,1))
+     Endif
+   When "PROCESS~" :
+     If FACET="$details"
+      _PSYR.CODREP = ENTITY
+      _PSYR.CODFAC = FACET
+     Else
+       ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,mess(2,149,1))
+     Endif
+   When Default :
+       ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,mess(2,149,1))
+  Endcase
+ Else
+   ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,mess(2,149,1))
+ Endif
+Else
+ If _CLASS = "ARIGHTS"
+  _PSYR.CODCLA = _CLASS
+ Else
+  ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,mess(2,149,1))
+ Endif
+Endif
+End ERROR
+
+#**
+#* SET_LOB
+#*
+Funprog SET_LOB(_ACTX,_ID,_PSYR,_ASND)
+Variable Instance _ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Value Char _ID
+Variable Instance  _PSYR   Using C_ASYR
+Variable Instance _ASND Using C_ASYRSND
+
+Local Integer AI,AJ
+Local Char ENTITY(50),ENTITY_TYPE(50)
+Local Char CODFNC(30)
+Local Integer MODULE
+Local Integer NBKEY
+Local Char    KEYVAL(250)(1..16)
+
+Local Integer ERROR : ERROR= [V]CST_AOK
+Raz _PSYR.CODREP,_PSYR.CODCLA, _PSYR.WRKUID,_PSYR.SELREP
+_PSYR.WRKUID = NullUuid
+[L]AI = max(instr(1,_ID,[V]CST_AURLSEPLOB),instr(1,_ID,[V]CST_AURLSEPLOB_ASCII))
+If [L]AI
+ ENTITY = toupper(left$(_ID,[L]AI-1))
+ If left$(ENTITY,2) = "R_"
+  _PSYR.CODREP = right$(ENTITY,3)
+  _PSYR.SELREP = _ID
+  ERROR = func ASHWVAL._CHECK_ASW(_ACTX,_PSYR.CODREP,_PSYR.CODCLA,_PSYR.CODFAC,CODFNC,MODULE,1)
+  If ERROR = [V]CST_AOK
+   Call SET_CURFCT(CODFNC,MODULE,"") From PSADX
+  Endif
+ Elsif left$(ENTITY,2) = "C_"
+  _PSYR.CODCLA = right$(ENTITY,3)
+  _PSYR.SELREP = _ID
+   ERROR =  func ACLAVAL._CHECK_ACLA(_ACTX,_PSYR.CODCLA,_PSYR.CODFAC)
+ Else
+  ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,mess(2,149,1))
+ Endif
+ #102634 don't set PSYR.WRKUID
+# If ERROR = [V]CST_AOK
+#  Call DECODE_KEY(_ID,NBKEY,KEYVAL) From ASYRLOB
+#  ERROR = func SET_UUID(KEYVAL(3),_PSYR.WRKUID)
+#  If ERROR <> [V]CST_AOK
+#   _PSYR.WRKUID = NullUuid
+#  Endif
+# Endif
+Endif
+End ERROR
+
+
+#**
+#* SET_UUID
+#*
+#* @param _ACTX
+#* @param _TRACKINGID
+#*!
+Funprog SET_UUID(_STRING,_UUID)
+Value Char _STRING
+Variable Uuident  _UUID
+
+_UUID = NullUuid
+Local Integer ERROR : ERROR = [V]CST_AOK
+If len(_STRING)
+ Onerrgo SET_UUID_ERROR
+ Assign "_UUID" With toUuid(_STRING)
+ ERROR = [V]CST_AOK
+ Onerrgo
+Else
+ ERROR =  [V]CST_AERROR
+Endif
+End ERROR
+
+$SET_UUID_ERROR
+ERROR =  [V]CST_AERROR
+Resume
+
+#**
+#* SET_TRACKINGID
+#*
+#* @param _ACTX
+#* @param _TRACKINGID
+#*!
+Funprog SET_TRACKINGID(_ACTX,_TRACKINGID,_PSYR)
+Variable Instance _ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Value Char _TRACKINGID
+Variable Instance  _PSYR   Using C_ASYR
+
+Local Integer ERROR : ERROR = [V]CST_AERROR
+Local Uuident  _UUID
+Raz _PSYR.WRKUID
+
+ERROR = func SET_UUID(_TRACKINGID,_UUID)
+If ERROR <> [V]CST_AOK
+ ERROR = func ASYRSUB._ASETSTATUS(_ACTX,"",0,[V]CST_AERROR,[V]CST_AHTTP_BAD_REQUEST,mess(19,149,1))
+Else
+ _PSYR.WRKUID = _UUID
+Endif
+End ERROR
+
+#**
+#* INIT_GLOBALS
+#*!
+Funprog INIT_GLOBALS
+Local Integer STAT
+#109897
+If find(adxtyp,34,35)>0
+Call DEFGLOBVAR1 From GLOBVAR
+Call INIGLOBVAR1 From GLOBVAR
+Endif
+If adxtyp=35
+ GSERVEUR=1
+Endif
+
+## Initialize constants such as GLONLAN!
+Call GLOBLON From WWGLOBLON
+
+## Declare global variables
+Call DEFVAR From ASYRGLOB
+
+## Initialise constants
+Call DEFVAR From ASYRCONST
+
+Gosub DECLARE_AVOID From ASYRCONST
+End STAT
+
+#**
+#* SUITE_GLOBALS
+#*!
+Funprog SUITE_GLOBALS
+Local Integer STAT
+#109897
+If find(adxtyp,34,35)>0 & (GLANGUE<>GACTX.LAN | GLANDEF="")
+  GLANGUE=GACTX.LAN
+  If GLANDEF=""
+   GLANDEF=GACTX.AFOLD.ALANGDEF
+  Endif
+
+  STAT=1
+  GOK = 1
+  Call INIGLOBVAR(STAT) From GLOBVAR
+  If !STAT : End 3 : Endif :#Context initialisation error
+  STAT=1
+  GOK = 1
+  Call INIGLOBVAR From GESUSER
+  If GOK<1 : End 3 : Endif :#Context initialisation error
+  STAT=0
+  GOK = 1
+
+  actihgup(0)   = "TIMOUT"    : # Traitement de déconnexion sur time out
+  actihgup(1) = "FIN"         : # Traitement de déconnexion volontaire
+  If adxtyp = 35              : # Batch Request : In case of Socket interruption, we update every BAtch request status to "Cancelled" in FIN_BATCH script
+    actihgup(2) = "FIN_BATCH" : # Traitement des erreurs involontaires
+  Else
+    actihgup(2) = "FINERR"    : # Traitement des erreurs involontaires
+  Endif
+Endif
+End STAT
+
+
+#**
+#* create instance of GACTX if not done yet
+#*!
+Subprog CONTEXT_NEW()
+Local Integer ASTATUS
+If dim(GACTX)<0
+ Global Instance GACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Endif
+If GACTX=null
+ #TODO AllocGroup
+ GACTX = NewInstance [ASYRACTX] With =[V]CST_C_NAME_CLASS_CONTEXT
+ ASTATUS = fmet GACTX.AINIT
+ #Add additionnal parameters :
+ Call LOAD From ASYRCHGENV
+Endif
+End
+
+
+#**
+#* CONTEXT_LOAD :
+#* Initialise GACTX
+#*
+#* @param PARCV
+#* @param AFOLDER
+#* @param LOGIN
+#*!
+Funprog CONTEXT_LOAD(LANISO, AFOLDER, LOGIN)
+Value Char LANISO
+Value Char AFOLDER
+Value Char LOGIN
+
+Local Integer CODERR
+
+Call CONTEXT_NEW
+CODERR = fmet GACTX.ACTX_INIT_LANISO([L]AFOLDER,[L]LANISO,[L]LOGIN)
+#VVVVV
+If !CODERR & dim(GSOPHIA)>0 & GSOPHIA & [L]AFOLDER="SUPERV" & toupper([L]LOGIN)="ADMIN" & mod(adxtyp,8)<>3
+ CODERR=11
+Elsif !CODERR & dim(GSOPHIA)>0 & GSOPHIA & [L]AFOLDER="REPOSUPERV" & find(toupper([L]LOGIN),"VPO","CCL","ERB")=0
+ CODERR=11
+Endif
+Gosub ASYRMAIN_CHARGE_LIC From ASYRLIC
+End CODERR
+
+
+
+#**
+#* reset the GACTX.LAN/LANISO, reinit the contexte if necessary
+#*
+#* @param PARCV
+#*!
+Funprog CONTEXT_SET_LANISO(PARCV,PSYR)
+Variable Instance PARCV Using C_ASYRRCV
+Variable Instance  PSYR   Using C_ASYR #used by asyrerr!
+
+Local Integer CTXERROR
+Local Integer HTTP_STATUS : HTTP_STATUS=CST_AHTTP_OK
+Local Char ERRMSG(250)
+Local Char LANISO(5)
+
+Call CONTEXT_NEW
+Local Char LANISO(10)
+
+# Get the LANISO parameter set in the HTTP request (URL or http header)
+# The language parameter set in the URL overrides the accept-language set in HTTP headers :
+[L]LANISO = func ASYRMAIN.PARVAL(PARCV,"language")
+If len([L]LANISO)  = 0
+ [L]LANISO = func ASYRMAIN.HEADVAL(PARCV,"accept-language")
+Endif
+If len([L]LANISO) & [L]LANISO <> GACTX.LANISO
+ CTXERROR = fmet GACTX.ACTX_SET_LANISO([L]LANISO)
+Endif
+Gosub ASYRMAIN_CHARGE_LIC From ASYRLIC
+
+Gosub CHECK_CTXERROR
+If HTTP_STATUS <> CST_AHTTP_OK
+ Call SEND_ERROR(PSYR,HTTP_STATUS,ERRMSG)
+Endif
+
+#109897
+[L]CTXERROR=func SUITE_GLOBALS
+Gosub CHECK_CTXERROR
+If HTTP_STATUS <> CST_AHTTP_OK
+ Call SEND_ERROR(PSYR,HTTP_STATUS,ERRMSG)
+Endif
+
+End HTTP_STATUS
+
+#**
+#* Check CTXERROR after ACTX initialization
+#* Set HTTP_STATUS & ERRMSG
+#*!
+$CHECK_CTXERROR
+If CTXERROR = -1
+ Call TRACE("CONTEXT init warning: given LANISO not supported, apply the default language of the folder") From ASYRCOM
+Elsif CTXERROR>0
+ Case CTXERROR
+  When 1 : HTTP_STATUS = CST_AHTTP_NOT_FOUND : ERRMSG = mess(106,125,1) : #ERRMSG = "Folder not accessible"
+  When 2 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(70,130,1) : #ERRMSG = "Incorrect user / password"
+  When 3 : HTTP_STATUS = CST_AHTTP_NOT_FOUND : ERRMSG = mess(234,124,1) :  #ERRMSG = "Context initialisation error"
+  When 4 : HTTP_STATUS = CST_AHTTP_NOT_FOUND : ERRMSG = mess(235,124,1) :  #ERRMSG = "Context cache clean error"
+  When 5 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(146,124,1) : #ERRMSG = "Folder modification in progress"
+  When 6 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(147,124,1) : #ERRMSG = "Folder save in progress"
+  When 7 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(148,124,1) : #ERRMSG = "Folder recovery in Progress"
+  When 8 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(149,124,1) : #ERRMSG = "Folder reset to Zero in Progress"
+  When 9 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(153,100,1) : #ERRMSG = "Folder is in single-user mode"
+  When 10 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(284,125,1):  #ERRMSG = "Release of this folder not up to date compare to the mother folder"
+  When 11 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(49,130,1) : #ERRMSG = "User not authorized to log in using this type of session"
+  When 12 : HTTP_STATUS = CST_AHTTP_UNAUTHORIZED : ERRMSG = mess(279,123,1) : #ERRMSG = "User code not authorized for this type of connection"
+  When Default : HTTP_STATUS = CST_AHTTP_NOT_FOUND : ERRMSG = mess(234,124,1) :  #ERRMSG = "Context initialisation error"
+ Endcase
+Endif
+Return
+
+#**
+#* JSON_TO_ARCV
+#*
+#* @param ITEM
+#*!
+Funprog JSON_TO_ARCV(JSO)
+Variable Instance  JSO   Using C_ASYRJSO
+
+Local Char      URLLOC(250)
+Local Integer  SUCCESS : SUCCESS=0
+Local Clbfile  PREFIX
+Local Clbfile  STRING
+Local Clbfile  ENTITY
+Local Clbfile  PARAM
+Local Integer  I,J
+
+Local Instance RCV Using C_ASYRRCV       : # Receive communication instance
+RCV = NewInstance C_ASYRRCV AllocGroup null
+
+Local Instance  NODE   Using C_ASYRJSO
+NODE = JSO.SUB
+While NODE <> null
+ STRING = fmet NODE.AGETCNT
+
+ If len(STRING)>2
+  STRING = seg$(STRING,2,len(STRING)-1)
+ Endif
+
+ Case NODE.PRO
+  When "$url":
+   SUCCESS += 1
+
+   I=0:J=0
+   I = instr(1,STRING,"?")
+   If I
+    PREFIX = left$(STRING ,I-1)
+    STRING = right$(STRING,I+1)
+    URLLOC = PREFIX
+    I = instr(1,PREFIX,"/")
+    If I
+     Append RCV.PREFIX, left$(PREFIX,I-1)
+     PREFIX = right$(PREFIX,I+1)
+     J=0
+     While len(PREFIX) > 0
+      I = instr(1,PREFIX,"/")
+      If I
+       ENTITY = left$(PREFIX,I-1)
+       PREFIX = right$(PREFIX,I+1)
+      Else
+       ENTITY = PREFIX
+       Raz PREFIX
+      Endif
+      If len(ENTITY)
+       #J+=1
+       J = 1 : # mb 31.7.13 bug DELETE/$Batch (Correction à valider avec Eric)
+       RCV.ENTITIES(J) = ENTITY
+      Endif
+     Wend
+    Endif
+    J=0
+    While len(STRING) > 0
+     I = instr(1,STRING,"&")
+     If I
+      PARAM  = left$(STRING,I-1)
+      STRING = right$(STRING,I+1)
+     Else
+      PARAM = STRING
+      Raz STRING
+     Endif
+     If len(PARAM)
+      I = instr(1,PARAM,"=")
+      If I
+       J += 1
+       RCV.PARAMCOD(J) = left$(PARAM,I-1)
+       RCV.PARAMVAL(J) = right$(PARAM,I+1)
+      Endif
+     Endif
+    Wend
+   Endif
+
+  When "$httpMethod":
+   RCV.VERB = STRING
+   SUCCESS += 1
+
+ Endcase
+ NODE = NODE.NEX
+Wend
+
+If SUCCESS < 2
+ FreeInstance RCV
+ RCV = null
+Endif
+End RCV
+
+
+#**
+#* SET_DBGMODE
+#*
+#* @param PARCV
+#*!
+Subprog SET_DBGMODE(_PRAGMA)
+Value Char _PRAGMA
+
+Call TRACE("dbgmode=[" + num$(dbgmode(0)) + "," + num$(dbgmode(1)) + "," + num$(dbgmode(2)) + "]") From ASYRCOM
+If [S]dbgmode(1) <> 1
+  If instr(1, tolower(_PRAGMA), "debug-on") > 0
+   If dim(GDBGRDV) < 0 : Global Integer GDBGRDV : Endif
+   GDBGRDV = 1
+   [S]dbgmode(1) = 1
+  Elsif instr(1, tolower(_PRAGMA), "debug-immediate") > 0
+   [S]dbgmode(1) = 1
+  Endif
+Endif
+End
+

@@ -1,0 +1,779 @@
+#<AdxTL>@(#)12.0.0.0 $Revision$
+#########################################################################
+#                                                                       #
+#     VALIDATION DES LIVRAISONS                                         #
+#                                                                       #
+#     - Traitement        : FUNCFMDLV                                   #
+#     - Action e_commerce : TRTCFMDLV  (Traitement standard)            #
+#                                                                       #
+#########################################################################
+
+#########################################################################
+# Etiquettes ACTION                                                     #
+#########################################################################
+$ACTION
+#--- Actions liées au traitement standard
+Case ACTION
+ When "OUVRE_BATCH" : Gosub INIT_TRTCFMDLV
+ When "INIT"        : Gosub INIT_TRTCFMDLV
+ When "DEBUT"       : Affzo [DIA]1-99
+ When "OK"          : GOK=1
+ When "END"         : GOK=0 : FIN=1
+ When "CONTROLE"    : Gosub CONTROLE_TRTCFMDLV
+ When "EXEC"        : Gosub EXEC_TRTCFMDLV
+ When "TERMINE"     : Gosub TERMINE_TRTCFMDLV
+ When Default
+Endcase
+Return
+
+#########################################################################
+# Détail des actions liées au traitement standard                       #
+#########################################################################
+
+#########################################################################
+$INIT_TRTCFMDLV
+
+# X3-1152 : Non invoiceable deliveries
+#GDLVTYP = 5
+GDLVTYP = 4
+# X3-1152 : Non invoiceable deliveries
+
+Local Char    STRNUM(GLONVCR), ENDNUM(GLONVCR)         : # BL début et fin
+
+#----- Ouverture des tables et déclaration des variables pour les états -----#
+Gosub INIT_ETAT From TRTX3ETA
+#-----
+
+# En batch , il vaut mieux mettre onerrgo
+If GSERVEUR
+    Onerrgo ERRBATCH
+Endif
+
+Gosub OUVRE
+
+Local Mask SCD1 [DIA]
+
+Raz [M:DIA]
+
+[M]STOFCY=GFCYDEF(7)
+[M]SHIDAT=date$
+
+Call LECMEMO ("STD","[M:DIA]","vl2") From GMEMO
+
+# Positionner le flag si saisie des paramêtres depuis la gestion des abonnements
+[M]ABT=1
+If GFONCTION1="GESABA" [M]ABT=2 Endif
+Return
+
+#########################################################################
+$CONTROLE_TRTCFMDLV
+If GOK < 1  FIN=1 Else TMP=1  Endif
+
+Return
+
+#########################################################################
+$EXEC_TRTCFMDLV
+
+Local Char WCPY(GLONCPY), WFCY(GLONFCY)   : # 96470 : Section analytique non alimentées ds STOJOU
+Raz WCPY, WFCY                            : # 96470
+
+# --- Déclaration masque de sauvegarde utilisé par les liv ss-traitance
+#     REGWAISTO du FUNRMA ouvre un ecran avec l'abréviation DIA
+Local Mask SCD1 [DIA1] : Default Mask [DIA]
+
+If !GSERVEUR
+# --> ouverture de la trace
+    Call OUVRE_TRACE(TIT) From LECFIC
+    Call ECR_TRACE(" ",0) From GESECRAN
+    Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+    Call PRTSCR("SCD1","DIA","",0,1) From ATRTX3
+    Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+    Call ECR_TRACE(" ",0) From GESECRAN
+Endif
+
+# Bornage de la date de prise en compte des livraisons si la requête est abonnée
+# Si date expédition non renseignée, on force la date du jour
+If [M]SHIDAT = [0/0/0] & [M]ABT=2 [M]SHIDAT = date$ : Endif
+
+# 96470 : Section analytique non alimentées ds STOJOU
+# --- Chargement des globales référenciels, comptes et sections de la société
+If [M:DIA]STOFCY<>""
+  Raz GSOC_ACTIVE
+  Call GETCPY([M:DIA]STOFCY,"",0,"") From TRTX3CPT
+  Call GLOBVAR([M:DIA]STOFCY) From WWGLOBVEN
+  WCPY=GSOCIETE : WFCY=[M:DIA]STOFCY
+Endif
+# 96470
+
+# --> lecture des entêtes de livraison
+Gosub TRAITEMENT
+
+Return
+
+#########################################################################
+$TERMINE_TRTCFMDLV
+
+If NBDLV
+  If [M:DIA]NDEFLG=2 & [M:DIA]NDENAM<>"" & [M:DIA]NDEDEN<>""
+    Call PRINT_ETAT (1,WARP_NUMREQ,[M:DIA]NDEDEN) From TRTX3ETA
+  Endif
+Endif
+
+If !GSERVEUR
+    If !NBDLV
+      Call ECR_TRACE(mess(48,192,1),0) From GESECRAN
+    Endif
+# --> fermeture trace
+    Call FERME_TRACE From LECFIC
+# --> aucune livraison à traiter ou lecture trace
+    If !NBDLV
+      GERR=2 : GMESSAGE=mess(48,192,1)
+    Endif
+    TRA=1
+Endif
+
+# Si présence module Support Client, impression
+If GMODU(12)=2
+   Call PRINTFLYER(2,STRNUM,ENDNUM,WRET) From TRTMACRULE
+   If WRET GERR=2 : GMESSAGE=mess(WRET,182,1) Endif
+Endif
+
+Return
+
+#-----------------------------------------------------------------------#
+# Ouverture des tables                                                  #
+#-----------------------------------------------------------------------#
+$OUVRE
+
+Local  Integer  OK, STAT
+Local  Char     CRITERE(250), SYMBOLE(50),SYMBOLE2(50)
+Local  Decimal  COEFF, WLIN
+Local  Integer  WMOD, WRET, NBDLV
+
+Local File SDELIVERY [SD2]
+If !clalev ([F:SDH]) : Local File SDELIVERY  [SDH] : Endif
+If !clalev ([F:SDD]) : Local File SDELIVERYD [SDD] : Endif
+If !clalev ([F:ITM]) : Local File ITMMASTER  [ITM] : Endif
+If !clalev ([F:ITF]) : Local File ITMFACILIT [ITF] : Endif
+If !clalev ([F:STA]) : Local File STOALL     [STA] : Endif
+If !clalev ([F:STO]) : Local File STOCK      [STO] : Endif
+If !clalev ([F:STL]) : Local File STOLOT     [STL] : Endif
+If !clalev ([F:STS]) : Local File STOSER     [STS] : Endif
+If !clalev ([F:SOQ]) : Local File SORDERQ    [SOQ] : Endif
+If !clalev ([F:REO]) : Local File STOREO     [REO] : Endif
+If !clalev ([F:MVC]) : Local File BPCUSTMVT  [MVC] : Endif
+If !clalev ([F:LCM]) : Local File LASTCUSMVT [LCM] : Endif
+If !clalev ([F:ARP]) : Local File AREPORT    [ARP] : Endif
+If !clalev ([F:BPD]) : Local File BPDLVCUST  [BPD] : Endif
+If !clalev ([F:BPC]) : Local File BPCUSTOMER [BPC] : Endif
+If !clalev ([F:SOH]) : Local File SORDER     [SOH] : Endif
+
+# --- Déclaration classe ecran pour les encours --- #
+Local Mask ORDK   [ORDK] : Raz [M:ORDK]
+
+# Issue X3-41004 - 2017-05-29 by CPO : Analyze mass delivery validation to increase performance - Spike 2
+#--opening once all tables/masks needed in VALIDATION.TRTVENLIVV
+#--opened in Subprog VALIDATION from TRTVENLIVV
+If !clalev ([F:ITS]) : Local File ITMSALES   [ITS] : Endif
+If !clalev ([F:STJ]) : Local File STOJOU     [STJ] : Endif
+If !clalev ([F:SOH]) : Local File SORDER     [SOH] : Endif
+If !clalev ([F:BPR]) : Local File BPARTNER   [BPR] : Endif
+If !clalev ([F:SRU]) : Local File TABSTORUL  [SRU] : Endif
+#DLUBPC
+If !clalev ([F:ITU]) : Local File ITMBPC  [ITU] : Endif
+
+If GMODU(6)=2 & clalev([F:POQ])=0 : Local File PORDERQ [POQ] : Endif
+
+If !clalev([F:SPH]) : Local File SPACK     [SPH] : Endif
+If !clalev([F:SPD]) : Local File SPACKD    [SPD] : Endif
+If !clalev([F:PRH]) : Local File STOPREH   [PRH] : Endif
+If !clalev([F:PRL]) : Local File STOPRELIS [PRL] : Endif
+If !clalev([F:CAL]) : Local File CPTANALIN [CAL] : Endif
+If !clalev([F:SVF]) : Local File SVCRFOOT  [SVF] : Endif
+If !clalev([F:SVV]) : Local File SVCRVAT   [SVV] : Endif
+If !clalev([F:BPD]) : Local File BPDLVCUST [BPD] : Endif
+
+# Classe écran pour les encours
+If !clalev([M:ORDK]) : Local Mask ORDK       [ORDK] : Endif
+# Classe écran pour le moteur de maj
+If !clalev([M:STW])  : Local Mask STOWORK    [STW]  : Endif
+If clalev([M:SVW])=0
+    Local Mask STOVALWORK [SVW]
+Endif
+Raz [M:SVW]
+#--opened in $TRT1.TRTVENLIVV called from VALIDATION
+If clalev ([F:TSD])=0 : Local File TABSDHTYP [TSD]  : Endif
+If clalev ([F:TCA])=0 : Local File TABCOUAFF [TCA]  : Endif
+If clalev([F:AOX]) =0 : Local File AOBJTXT   [AOX]  : Endif
+If clalev([F:AOM]) =0 : Local File AOBJTXTA  [AOM]  : Endif
+If clalev([F:ABB]) =0 : Local File ABLOB     [ABB]  : Endif
+If clalev([F:ACB]) =0 : Local File ACLOB     [ACB]  : Endif
+If clalev([F:BOLH])=0 : Local File BILLLADH  [BOLH] : Endif  # 101090.n
+If clalev([F:BOLC])=0 : Local File BILLLADC  [BOLC] : Endif  # 101090.n
+#--opened in $MAJ_ALL_SCO.TRTVENLIVV called from VALIDATION
+If !clalev([F:STJ1])  : Local File STOJOU    [STJ1] : Endif
+If !clalev([F:STO1])  : Local File STOCK     [STO1] : Endif
+If !clalev([F:SCM])   : Local File SCOMAT    [SCM]  : Endif
+If GMODU(8)=2
+   If !clalev([F:MFM]) Local File MFGMAT [MFM] Endif
+Endif
+#--opened in $TRT_MACRULE.TRTVENLIVV called from VALIDATION
+If !clalev ([M:MACW]) : Local Mask MACW [MACW]    : Endif
+If !clalev ([F:CCV8]) : Local File CONTCOV [CCV8] : Endif # FGR 28/10/2015 : X3SUIVI112034
+#--
+# End issue X3-41004
+
+# v6 affectations
+Gosub OPEN_MTO From MTOLINKLIB
+
+TIT = mess(34,191,1)  : # Validation Livraisons
+
+# C'est une fonction vente qui travaille sur un site d'expédition
+# On surcharge donc le site par défaut du module avec celui d'expédition
+# pour que les contrôles d'autorisation des sites soient corrects.
+GFCYDEF(0) = GFCYDEF(7)
+
+Local Integer  WCDTUNL
+#------------------------------------------------------------#
+# Chargement flag déblocage crédit autorisé                  #
+#------------------------------------------------------------#
+Local Char WPARAM(10)
+Call PARAMUTIL("SCDTUNL",WPARAM,"","") From SUBAUS
+WCDTUNL=val(WPARAM)
+If WCDTUNL=0 WCDTUNL=1 Endif
+
+Return
+
+#-----------------------------------------------------------------------#
+# Traitement de validation des livraisons                               #
+#-----------------------------------------------------------------------#
+$TRAITEMENT
+Local Char     WSTOFCY(GLONFCY), PADMIN
+
+Raz WSTOFCY
+
+# Récupération paramètre administrateur stock
+Call PARAMUTIL("STOADMIN",PADMIN,"","") From SUBAUS
+GSTOADMIN = val(PADMIN)
+
+# Constitution du filtre des entêtes livraison
+CRITERE = "INVFLG=1 & CFMFLG=1"
+
+If [M:DIA]CPY <> ""  : CRITERE -= '& CPY = "' +[M:DIA]CPY+ '"' : Endif : # 86982 : Ajout filtre sur la société
+If [M:DIA]STOFCY <> ""  : CRITERE -= '& STOFCY = "' +[M:DIA]STOFCY+ '"' : Endif
+If [M]SHIDAT <> [0/0/0] : CRITERE -= '& SHIDAT <=[' +format$(GFMD,[M]SHIDAT)+']': Endif
+If [M]SDHNUMDEB <> ""   : CRITERE -= '& SDHNUM >="' +[M]SDHNUMDEB+ '"' : Endif
+If [M]SDHNUMFIN <> ""   : CRITERE -= '& SDHNUM <="' +[M]SDHNUMFIN+ '"' : Endif
+If [M]BPCORDDEB <> ""   : CRITERE -= '& BPCORD >="' +[M]BPCORDDEB+ '"' : Endif
+If [M]BPCORDFIN <> ""   : CRITERE -= '& BPCORD <="' +[M]BPCORDFIN+ '"' : Endif
+
+#---------------------------------------------------------------------#
+# Point d'entree ajout filtres supplémentaires                        #
+#---------------------------------------------------------------------#
+Local Char FILSUP (250)
+FILSUP="1=1"
+GPOINT="CFMDLVFIL" : Gosub ENTREE From EXEFNC
+
+# Lecture des livraisons et traitement
+For [SD2] Hint Key SDH3 Where (evalue(CRITERE) & evalue (FILSUP))
+   # Client livré
+   OK = 2
+   If [M]BPAADDDEB <> "" & [F:SD2]BPCORD = [M]BPCORDDEB
+      If [F:SD2]BPAADD < [M]BPAADDDEB
+         OK=1 : Goto NEXT_SD2
+      Endif
+   Endif
+   If [M]BPAADDFIN <> "" & [F:SD2]BPCORD = [M]BPCORDFIN
+      If [F:SD2]BPAADD > [M]BPAADDFIN
+         OK = 1 : Goto NEXT_SD2
+      Endif
+   Endif
+
+   # Pour vérifier si la livraison est validable
+   GPOINT="CFMDLVSEL" : Gosub ENTREE From EXEFNC
+   If OK=1 Goto NEXT_SD2 Endif
+
+   # 96470 : Section analytique non alimentées ds STOJOU
+#   Call GETDEV([F:SD2]SALFCY)  From DEVSUB    : # Bug 61533
+   If WFCY<>[F:SD2]SALFCY
+      # --- Chargement des globales référenciels, comptes et sections de la société
+      Call GETCPY([F:SD2]SALFCY,"",0,"") From TRTX3CPT
+      Call GLOBVAR([F:SD2]SALFCY) From WWGLOBVEN : # Bug 61533
+      WCPY=GSOCIETE : WFCY=[F:SD2]SALFCY
+   Endif
+   # 96470
+
+   # Contrôle du client
+   Gosub VERIF_BPC
+   If OK=1 Goto NEXT_SD2 : Endif
+
+   If OK = 2
+      NBDLV +=1
+      SYMBOLE = "SDH"+[F:SD2]SDHNUM
+      Lock = SYMBOLE With lockwait=0
+      If fstat=1
+         # Modification en cours sur un autre poste
+         Call ECR_TRACE([F:SD2]SDHNUM-mess(10,100,1),1) From GESECRAN
+      Else
+         If [F:SD2]SCO=2 [M:DIA1]=[M:DIA] : Close Local Mask [DIA] : Default Mask [DIA1] : Endif
+         Call VALIDATION([F:SD2]SDHNUM) From TRTVENLIVV
+         If [F:SD2]SCO=2 Local Mask SCD1 [DIA] : [M:DIA]=[M:DIA1] : Default Mask [DIA] : Endif
+         If GOK=1
+           # Issue X3-69499 - 2018-05-16 by TS
+           If [F:SD2]CFMFLG=2
+
+             If [M:DIA]NDEFLG=2 & [M:DIA]NDENAM<>"" & [M:DIA]NDEDEN<>""
+               #----- Recherche du nouveau code état à partir du modèle -----#
+               If [F:BPC]BPCNUM<>[F:SD2]BPCORD
+                 Read [BPC] BPC0=[F:SD2]BPCORD : If fstat  Raz [F:BPC] : Endif
+               Endif
+               If [F:BPC]TPMCOD<>""
+                 If [F:TPM]TPMCOD<>[F:BPC]TPMCOD
+                   Read [TPM] TPM0=[F:BPC]TPMCOD : If fstat  Raz [F:TPM] : Endif
+                 Endif
+                 If [F:TPM]SALDLV<>""
+                   WARP_RPTCOD(0)=[F:TPM]SALDLV
+                 Else
+                   WARP_RPTCOD(0)=[M:DIA]NDENAM
+                 Endif
+                 WARP_NBRCPY=[F:SD2]COPNBR #Gbn-Fq73266
+               Else
+                 WARP_RPTCOD(0)=[M:DIA]NDENAM
+                 WARP_NBRCPY=[M:DIA]PRTCOP #Gbn-Fq73266
+               Endif
+               #----- Nombre de copies -----#
+               # Si modèle d'édition, nbr copie du modèle stocké à la création de la livraison
+               # Sinon, nbre de copie de la destination
+               #WARP_NBRCPY=[F:SD2]COPNBR#Gbn-Fq73266
+               #----- Ecriture AREPORTM et màj indicateur d'impression sur entête facture -----#
+               Call ALIM_ETAT(1,WARP_NBRCPY,WARP_RPTCOD,WARP_NUMREQ,WARP_NUMLIG,WARP_SEQREQ) From TRTX3ETA
+               #-----
+             Endif
+
+             If GMODU(12)=2
+               # Alimentation des bornes min et max des livraisons traitées
+               If STRNUM=""
+                  STRNUM=[F:SD2]SDHNUM
+               Elsif STRNUM>[F:SD2]SDHNUM
+                  STRNUM=[F:SD2]SDHNUM
+               Endif
+               If ENDNUM=""
+                  ENDNUM=[F:SD2]SDHNUM
+               Elsif ENDNUM<[F:SD2]SDHNUM
+                  ENDNUM=[F:SD2]SDHNUM
+               Endif
+             Endif
+           # Issue X3-69499 - 2018-05-16 by TS
+           Endif
+
+         Endif
+         Unlock =SYMBOLE
+      Endif
+   Endif
+$NEXT_SD2
+Next
+Return
+
+#------------------------------------------------------------------------------------ #
+# Contrôle du client                                                                  #
+# Si client bloqué ou dépassement d'en-cours et pas d'autorisation déblocage cde :    #
+# --> Pas de validation sf si ttes les cdes sont en déblocage autorisé                #
+#------------------------------------------------------------------------------------ #
+$VERIF_BPC
+Local Integer CDTSTA
+
+# 78411 Sage Exchange - skip credit processing
+If func AFNC.ACTIV("SEPP") & func SEPPLIB.SEPP_DOC([F:SD2]PTE) : Return : Endif
+
+#If [F:BPC]BPCNUM<>[F:SD2]BPCINV
+#    Read [F:BPC] BPC0=[F:SD2]BPCINV
+#    If fstat Raz [F:BPC] : Endif
+#Endif
+If [F:BPC]BPCNUM<>[F:SD2]BPCORD
+    Read [F:BPC] BPC0=[F:SD2]BPCORD
+    If fstat Raz [F:BPC] : Endif
+Endif
+
+# Alimentation à partir du modèle d'édition
+Call ALI2_PRTMOD("SDH",4) From TRTX3
+If [F:SDH]COPNBR=0 [F:SDH]COPNBR=1 Endif
+
+If [F:BPC]BPCNUM<>[F:BPC]BPCRSK
+    Read [F:BPC] BPC0=[F:BPC]BPCRSK
+    If fstat Raz [F:BPC] : Endif
+Endif
+
+# Bug 63136
+If [F:BPC]OSTCTL <> 3
+    Call SDCDTSTA ("",[F:SD2]BPCORD,[F:SD2]CHGTYP,0,"",[F:SD2]SHIDAT,0,1,CDTSTA,GBIDD1,GBIDD1) From TRTVENCDT
+Endif
+
+# Bug 63136
+If [F:BPC]OSTCTL = 3 | (CDTSTA=3 & WCDTUNL=1)  : # Bug 63136
+    # Client bloqué ou dépassement d'encours et déclocage crédit non autorisé
+    # --> On bloque la validation sf si déblocage autorisé sur ttes les cdes
+    Raz CDTSTA
+    If [F:SD2]SOHNUM<>""
+        # Une seule commande pour cette livraison
+        If [F:SOH]SOHNUM<>[F:SD2]SOHNUM
+            Read [SOH] SOH0=[F:SD2]SOHNUM
+            If fstat Raz [F:SOH] : Endif
+        Endif
+        # Déblocage non autorisé sur cette commande
+        If [F:SOH]UNL<>2 CDTSTA=2 : Endif
+    Else
+        # Lecture détail livraison pour rechercher les commandes
+        For [SDD]SDD0 Where SDHNUM=[F:SD2]SDHNUM & SOHNUM<>""
+            CDTSTA=1
+            If [F:SOH]SOHNUM<>[F:SDD]SOHNUM
+                Read [SOH] SOH0=[F:SDD]SOHNUM
+                If fstat Raz [F:SOH] : Endif
+            Endif
+            # Déblocage non autorisé sur cette commande : On arrête la recherche et on bloque la validation
+            If [F:SOH]UNL<>2 CDTSTA=2 : Break : Endif
+        Next
+        # Livraison directe : On bloque
+        If CDTSTA=0 CDTSTA=2 : Endif
+    Endif
+    # Bug 63136
+    If CDTSTA=2
+        OK=1
+        If [F:BPC]OSTCTL=3
+            Call ECR_TRACE([F:SD2]SDHNUM-mess(151,199,1),1) From GESECRAN
+        Else
+            Call ECR_TRACE([F:SD2]SDHNUM-mess(29,192,1),1) From GESECRAN
+        Endif
+    Endif
+    # Bug 63136
+# Bug 63136
+#Else
+#    Call SDCDTSTA ("",[F:SD2]BPCORD,[F:SD2]CHGTYP,0,"",[F:SD2]SHIDAT,0,1,CDTSTA,GBIDD1,GBIDD1) From TRTVENCDT
+#    Case CDTSTA
+#     When 3 : # Dépassement d'en cours
+#          # Si déblocage crédit non autorisé on bloque
+#          If WCDTUNL=1
+#              OK=1 : Call ECR_TRACE([F:SD2]SDHNUM-mess(29,192,1),1) From GESECRAN
+#          Endif
+#     When Default
+#    Endcase
+Endif
+Return
+
+
+#########################################################################
+# Actions champs                                                        #
+#########################################################################
+
+######################################## Obligatoire
+Subprog AM_SDHNUMDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M]SDHNUMFIN = VALEUR : Endif
+End
+
+######################################## Obligatoire
+Subprog AM_BPCORDDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> ""
+   [M]BPCORDFIN = VALEUR
+   Actzo [M]BPAADDDEB
+Else
+   Diszo [M]BPAADDDEB
+Endif
+End
+
+######################################## Obligatoire
+Subprog AM_BPAADDDEB(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> "" : [M]BPAADDFIN = VALEUR : Endif
+End
+
+######################################## Obligatoire
+Subprog AP_BPCORDFIN(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> ""
+   Actzo [M]BPAADDFIN
+Else
+   Diszo [M]BPAADDFIN
+Endif
+End
+
+######################################## Obligatoire
+Subprog C_BPAADDFIN(VALEUR)
+Variable Char    VALEUR()
+If   [M]BPCORDDEB = [M]BPCORDFIN
+     If   VALEUR  < [M]BPAADDDEB
+          GMESSAGE = mess(44,199,1) : mkstat = 2
+     Endif
+Endif
+End
+
+######################################## Obligatoire
+Subprog C_SHIDAT(VALEUR)
+Variable Date    VALEUR
+If VALEUR  > date$
+   GMESSAGE = mess(60,192,1) : mkstat = 2
+Endif
+End
+########################################
+Subprog AP_NDEFLG(VALEUR)
+Variable Integer VALEUR
+If VALEUR = 1
+   Raz [M]NDENAM, [M]NDEDEN, [M]NDEIMP, [M]NDESRV
+   Diszo [M]NDENAM, NDEDEN
+Else
+  If vireblc([M]NDENAM,2)=""
+#     Call INIT_IMP("SDH", [M]NDENAM, [M]NDEIMP) From TRTVENIMP
+     Call INIT_ARP("SDH", [M]NDENAM) From TRTVENIMP
+     Actzo [M]NDENAM, NDEDEN
+  Endif
+Endif
+Affzo [M]NDENAM, NDEDEN, NDEIMP, NDESRV
+End
+########################################
+Subprog C_NDENAM(VALEUR)
+Variable Char    VALEUR()
+Local    Char    AUTSIT(10)
+Local    Integer OK
+# Document obligatoire si impression bon de preparation
+If [M:DIA]NDEFLG = 2 & VALEUR = ""
+   GMESSAGE=mess(10,123,1) : mkstat = 2
+   End
+Endif
+End
+########################################
+Subprog C_NDESRV(VALEUR)
+Variable Char    VALEUR()
+Gosub CTL_SRV From TRTVENIMP
+End
+########################################
+Subprog C_NDEIMP(VALEUR)
+Variable Char    VALEUR()
+# Imprimante obligatoire si impression
+If [M:DIA]NDENAM <> "" & VALEUR = ""
+   GMESSAGE=mess(10,123,1) : mkstat = 2
+Endif
+End
+########################################
+$ERRBATCH
+Call ECR_TRACE(errmes$(errn)-num$(errl)-errm,1) From GESECRAN
+End
+
+##########################################################################
+Subprog C_NDEDEN(VALEUR)
+Variable Char    VALEUR()
+# Imprimante obligatoire si impression
+If [M:DIA]NDENAM <> "" & VALEUR = ""
+   GMESSAGE=mess(10,123,1) : mkstat = 2
+Endif
+End
+
+##########################################################################
+Subprog AP_NDEDEN(VALEUR)
+Variable Char    VALEUR()
+Call INIT_SRV(VALEUR, [M]NDESRV,[M]NDEIMP) From TRTVENIMP
+Affzo [M]NDESRV, NDEIMP
+[M:DIA]PRTCOP=func TRTVENIMP.GET_NBRCPY_AIM(VALEUR)#Fq73266-Gbn
+End
+##########################################################################
+
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran SCD1) 18/04/2006 13:43:25 (JL)
+######################################################################################
+Subprog D_CPY(VALEUR)
+Variable Char    VALEUR()
+Call GETSOC (GFCYDEF(7)) From DEVSUB   : # init avec societe du site stock par defaut
+VALEUR=GSOCIETE
+[M]STOFCY=GFCYDEF(7)
+End
+
+Subprog AM_CPY(VALEUR)
+Variable Char    VALEUR()
+GSOCIETE=VALEUR
+Raz [M]STOFCY
+End
+
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran SCD1) 28/01/2015 10:38:10 (FGR)
+######################################################################################
+Subprog AM_NDENAM(VALEUR)
+Variable Char    VALEUR()
+
+  # FGR 28/01/2015 : X3SUIVI105740
+  If VALEUR <> [M]NDENAM Then
+    Raz [M]NDEDEN
+    Affzo [M]NDEDEN
+  Endif
+End
+
+######################################################################################
+######################################################################################
+## Section automatically added (screen SCD1) 07/03/2014 12:45:56 (RICAR)
+######################################################################################
+Subprog AM_ENA(VALEUR)
+Variable Integer VALEUR
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+If VALEUR = 1
+  Raz   [M:DIA]STRDAYS,ENDDAYS,STRHOU,ENDHOU
+  Diszo [M:DIA]STRDAYS,ENDDAYS,STRHOU,ENDHOU
+  Effzo [M:DIA]STRDAYS,ENDDAYS,STRHOU,ENDHOU
+Else
+  Actzo [M:DIA]STRDAYS,ENDDAYS,STRHOU,ENDHOU
+  Read [FCY]FCY0=[M:DIA]STOFCY
+  If !fstat
+    [M:DIA]STRHOU = [F:FCY]STRHOU
+    [M:DIA]ENDHOU = [F:FCY]ENDHOU
+    Affzo [M:DIA]STRHOU,ENDHOU
+  Endif
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+End
+
+Subprog D_STRDAYS(VALEUR)
+Variable Decimal VALEUR
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+If [M:DIA]ENA<>2
+   Diszo [M:DIA]STRDAYS
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+End
+
+Subprog C_STRDAYS(VALEUR)
+Variable Decimal VALEUR
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+If VALEUR<0
+  Call ERREUR(mess(100,7711,1)) From GESECRAN
+  mkstat=2
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+
+End
+
+Subprog D_ENDDAYS(VALEUR)
+Variable Decimal VALEUR
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+If [M:DIA]ENA<>2
+   Diszo [M:DIA]ENDDAYS
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+
+End
+
+Subprog C_ENDDAYS(VALEUR)
+Variable Decimal VALEUR
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+If VALEUR<0
+  Call ERREUR(mess(100,7711,1)) From GESECRAN
+  mkstat=2
+Elsif VALEUR<[M:DIA]STRDAYS
+  Call ERREUR(mess(99,7711,1)) From GESECRAN
+  mkstat=2
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+
+End
+
+Subprog D_STRHOU(VALEUR)
+Variable Char    VALEUR()
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+If [M:DIA]ENA<>2
+   Diszo [M:DIA]STRHOU
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+
+End
+
+Subprog C_STRHOU(VALEUR)
+Variable Char    VALEUR()
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+Local Shortint LOK
+Local Char     LHOUR
+Local Char     LHOURINT : [L]LHOURINT = VALEUR
+
+Local File     FACILITY [FCY]
+
+If [M:DIA]ENA=2
+  If VALEUR<>''
+      Call CTRL_HOU(LHOURINT,LHOUR,LOK) From PORLEGLIB
+      If LOK=1
+        mkstat = 2
+      Else
+         VALEUR       = LHOUR
+      Endif
+  Else
+      Call ERREUR(mess(94,7711,1)) From GESECRAN
+      mkstat = 2
+  Endif
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+
+End
+
+Subprog D_ENDHOU(VALEUR)
+Variable Char    VALEUR()
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+If [M:DIA]ENA<>2
+   Diszo [M:DIA]ENDHOU
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+
+End
+
+Subprog C_ENDHOU(VALEUR)
+Variable Char    VALEUR()
+
+#93745 RICAR 2014/07/03 - Transportation notes - BEGIN
+Local Shortint LOK
+Local Char     LHOUR
+Local Char     LHOURINT : [L]LHOURINT = VALEUR
+
+If [M:DIA]ENA=2
+  If VALEUR<>''
+      Call CTRL_HOU([L]LHOURINT,[L]LHOUR,[L]LOK) From PORLEGLIB
+      If LOK=1
+        mkstat  = 2
+      Else
+         VALEUR = [L]LHOUR
+      Endif
+  Else
+      Read [FCY]FCY0=[M:DIA]STOFCY
+      If !fstat
+        [M:DIA]ENDHOU = [F:FCY]ENDHOU
+        Affzo [M:DIA]ENDHOU
+        If [M:DIA]ENDHOU = ''
+          Call ERREUR(mess(94,7711,1)) From GESECRAN
+          mkstat = 2
+        Endif
+      Else
+        Call ERREUR(mess(94,7711,1)) From GESECRAN
+        mkstat = 2
+      Endif
+  Endif
+
+  If VALEUR<>''& VALEUR <> '0000' & VALEUR <> '00:00'
+    If [M:DIA]STRDAYS=[M:DIA]ENDDAYS & VALEUR<[M:DIA]STRHOU
+      Call ERREUR(mess(98,7711,1)) From GESECRAN
+      mkstat = 2
+    Endif
+  Endif
+Endif
+#93745 RICAR 2014/07/03 - Transportation notes - END
+
+End
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran SCD1) 06/02/2015 12:00:03 (FGR)
+######################################################################################
+Subprog AS_NDEDEN(VALEUR)
+Variable Char    VALEUR()
+End
+
+
+######################################################################################
+

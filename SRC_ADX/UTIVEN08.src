@@ -1,0 +1,437 @@
+#<AdxTL>@(#)5.0.0.0 $Revision$
+######################################################################################
+# UTIVEN08 : Utilitaire de détection et suppression         Module Vente             #
+#            des allocations en trop sur des commandes non soldées                   #  
+#            (Bug 48662)                                                             #
+# ---------------------------------------------------------------------------------- #
+# Problème à résoudre suite au bug 45542                                             #
+#  Il subsiste des incohérences sur des lignes de commandes non soldées :            #
+#  Incohérences entre les allocations détaillées et globales (ruptures) dans STOALL  #
+#  et les qtés allouées/rupture ds SORDERQ                                           #
+#  Trop d'allocations dans STOALL                                                    #
+#                                                                                    #
+#  L'utilitaire :                                                                    #
+#  - lit les lignes de cdes non soldées et les allocations associées ds STOALL       #
+#  - supprime ds STOALL les alloc en trop par rapport à ce qu'il reste à allouer     #
+#  - remet à jour les qtés ds SORDERQ et recalcul l'état d'allocation sur la cde     #
+#                                                                                    #
+######################################################################################
+Call MAJ_UTIVEN08
+End
+
+##################################
+$ACTION
+Case ACTION
+ When "DEBUT"       : Gosub DEBUT
+ When "FIN"         : Gosub FIN
+ When Default
+Endcase
+Return
+
+##################################
+$DEBUT
+[M]WDAT=[0/0/0]
+[M]WSIM=2
+Affzo [M]1,99
+Return
+
+$FIN
+PARAM(1)=[M]WDAT
+PARAM(2)=num$([M]WSIM)
+Return
+
+##################################
+Subprog MAJ_UTIVEN08
+Local Char DOSSIER(30) : DOSSIER=nomap
+Call SAIDOS(DOSSIER,"") From SAIDOS
+If DOSSIER<>""
+   Call EXE_UTIVEN08(DOSSIER)
+Endif
+End
+
+##################################
+Subprog EXE_UTIVEN08(DOSSIER)
+Value Char DOSSIER
+
+Local Integer I, J, WMOD_SOH, WMOD_SOQ, WSIMU, LRET
+Local Integer WALLSTA, WALLLINNBR, WSOH_ALLLINNBR, WWIPTYP
+Local Decimal WSTA_ALLQTYSTU, WSTA_SHTQTYSTU, WALLQTYSTU, WSHTQTYSTU, WALLRESSTU, WQTE, WQT1, WQT2
+Local Decimal WCPLQTY, WALLQTY, WSHTQTY
+Local Decimal WQTYSTU, WREA_ALLQTYSTU, WREA_SHTQTYSTU, WQTYARR
+Local Char    WSAU, WSTU
+Local Decimal WSAUSTUCOE
+
+Local Char PARAM(30)(1..2)
+Local Date DATREF
+Call SAISIE_DAT(GBIDA1,PARAM,"UTIVEN08","UTIVEN08","XWUTIVEN08") From GSAISIE
+DATREF = PARAM(1)
+WSIMU  = val(PARAM(2))
+
+Call TEMPON("O") From GESECRAN
+Call OUVRE_TRACE("UTIVEN08 : Resynchronization STOALL with SORDER ") From LECFIC  
+Call ECR_TRACE("UTIVEN08 : Process start on : "+DOSSIER,0) From GESECRAN
+
+#----- Ouverture des fichiers -----#
+If clalev([F:SOH])=0  Local File =DOSSIER+".SORDER"     [SOH]  Endif
+If clalev([F:SOQ])=0  Local File =DOSSIER+".SORDERQ"    [SOQ]  Endif
+If clalev([F:SOC])=0  Local File =DOSSIER+".SORDERC"    [SOC]  Endif
+If clalev([F:SOP])=0  Local File =DOSSIER+".SORDERP"    [SOP]  Endif
+If clalev([F:STA])=0  Local File =DOSSIER+".STOALL"     [STA]  Endif
+If clalev([F:ORD])=0  Local File =DOSSIER+".ORDERS"     [ORD]  Endif
+If clalev([F:TUN])=0  Local File =DOSSIER+".TABUNIT"    [TUN]  Endif
+
+Raz I
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE("Delete allocation in STOALL",0) From GESECRAN 
+Call ECR_TRACE("With update allocated qty in SORDERQ and ORDERS",0) From GESECRAN 
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN 
+Call ECR_TRACE(" ",0) From GESECRAN 
+
+Call DEBTRANS From GLOCK
+Trbegin [SOH]
+
+#WSOHNUM="CST-ASN0800088"
+# Boucle sur les commandes non soldées
+#For [SOH]SOH4 Where ORDSTA<>2 & ORDDAT>=DATREF & SOHNUM=WSOHNUM
+For [SOH]SOH4 Where ORDSTA<>2 & ORDDAT>=DATREF 
+    Raz J, WMOD_SOH, LRET
+#    WSOH_WALLLINNBR=[F:SOH]ALLLINNBR
+#    # Boucle sur les lignes non soldées et allouées en détaillées 
+#    For [SOQ]SOQ0 Where SOHNUM=[F:SOH]SOHNUM & SOQSTA<>3 & ALLTYP=2 & STOMGTCOD<>1
+    # Boucle sur les lignes non soldées et allouées en détaillé et en global
+    For [SOQ]SOQ0 Where SOHNUM=[F:SOH]SOHNUM & SOQSTA<>3 & STOMGTCOD<>1
+        Raz WMOD_SOQ
+        Raz WSTA_ALLQTYSTU, WSTA_SHTQTYSTU, WALLQTYSTU, WSHTQTYSTU
+        If [F:SOH]SOHCAT = 3
+            WCPLQTY = [F:SOQ]INVQTYSTU 
+        Else 
+            WCPLQTY = [F:SOQ]DLVQTYSTU
+        Endif
+        # Calcul de la qté restant à allouer 
+        WALLRESSTU = max(0,[F:SOQ]QTYSTU - [F:SOQ]OPRQTYSTU - [F:SOQ]PREQTYSTU - [F:SOQ]ODLQTYSTU - WCPLQTY)
+
+        # Recherche des allocations exitantes dans STOALL
+        For [STA]STA2 Where ITMREF=[F:SOQ]ITMREF & VCRTYP=2 & VCRNUM=[F:SOQ]SOHNUM & VCRLIN=[F:SOQ]SOPLIN & VCRSEQ=[F:SOQ]SOQSEQ
+            Case [F:STA]ALLTYP
+                When 1,2 : WSTA_ALLQTYSTU += [F:STA]QTYSTUACT
+                When 4,5 : WSTA_SHTQTYSTU += [F:STA]QTYSTUACT
+            Endcase
+        Next
+        # --------------------------------------- #
+        # Réajustement qté en unité vente entière #
+        # --------------------------------------- #
+        If [F:SOH]SOHCAT<>4
+            Read [SOP]SOP0 = [F:SOQ]SOHNUM; [F:SOQ]SOPLIN; [F:SOQ]SOQSEQ
+            If fstat 
+                Call ECR_TRACE("File SORDERP"-[F:SOP]SOHNUM-num$([F:SOP]SOPLIN)-num$([F:SOP]SOPSEQ)+", Error ="-num$(fstat),1) From GESECRAN
+            Else
+                WSAU=[F:SOP]SAU : WSTU=[F:SOP]STU : WSAUSTUCOE=[F:SOP]SAUSTUCOE
+            Endif
+        Else
+            Read [SOC]SOC0 = [F:SOQ]SOHNUM; [F:SOQ]SOPLIN
+            If fstat 
+                Call ECR_TRACE("File SORDERC"-[F:SOC]SOHNUM-num$([F:SOC]SOPLIN)+", Error ="-num$(fstat),1) From GESECRAN
+            Else
+                WSAU=[F:SOC]SAU : WSTU=[F:SOC]STU : WSAUSTUCOE=[F:SOC]SAUSTUCOE
+            Endif
+        Endif    
+        WQTYSTU = WSTA_ALLQTYSTU : Gosub REAJUSTE_QTY : WREA_ALLQTYSTU = WQTYSTU 
+        WQTYSTU = WSTA_SHTQTYSTU : Gosub REAJUSTE_QTY : WREA_SHTQTYSTU = WQTYSTU 
+        # Qté allouée plus grande que la qté en unité de vente entière : On la diminue 
+        If WSTA_ALLQTYSTU>WREA_ALLQTYSTU
+            WQTE=WSTA_ALLQTYSTU-WREA_ALLQTYSTU
+            If WSIMU=1
+                # On diminue les allocations
+                Call DIMALL(2,[F:SOQ]SOHNUM,[F:SOQ]SOPLIN,[F:SOQ]SOQSEQ,[F:SOQ]ITMREF,1,WQTE,WQT1,WQT2,LRET) From STKALL
+                If LRET=0
+                    WSTA_ALLQTYSTU-=WQT1
+                Else
+#                    Call ECR_TRACE("Error in DIMALL :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF,1) From GESECRAN
+                Endif
+            Else
+                # Simulation  
+                WSTA_ALLQTYSTU-=WQTE                    
+            Endif
+        Endif
+        # Qté rupture plus grande que la qté en unité de vente entière : On la diminue 
+        If WSTA_SHTQTYSTU>WREA_SHTQTYSTU
+            WQTE=WSTA_SHTQTYSTU-WREA_SHTQTYSTU
+            If WSIMU=1
+                # On diminue les ruptures
+                Call DIMALL(2,[F:SOQ]SOHNUM,[F:SOQ]SOPLIN,[F:SOQ]SOQSEQ,[F:SOQ]ITMREF,2,WQTE,WQT1,WQT2,LRET) From STKALL
+                If LRET=0
+                    WSTA_SHTQTYSTU-=WQT2
+                Else
+#                    Call ECR_TRACE("Error in DIMALL :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF,1) From GESECRAN
+                Endif
+            Else
+                # Simulation  
+                WSTA_SHTQTYSTU-=WQTE
+            Endif
+        Endif
+        WALLQTYSTU=WSTA_ALLQTYSTU
+        WSHTQTYSTU=WSTA_SHTQTYSTU
+
+        # Qté allouée/rupture plus grande que la qté restant à allouer : On la diminue ou on la supprime 
+        If WSTA_ALLQTYSTU+WSTA_SHTQTYSTU>WALLRESSTU
+            WMOD_SOQ=1
+            If J=0
+                Call ECR_TRACE("*** Order :"-[F:SOH]SOHNUM-format$("DD2",[F:SOH]ORDDAT),0) From GESECRAN
+                J=1
+            Endif
+            If WALLRESSTU=0
+                # Il n'y a plus rien à allouer : On supprime les ruptures et les allocations
+                If WSIMU=1
+                    Call DELALL(2,[F:SOQ]SOHNUM,[F:SOQ]SOPLIN,[F:SOQ]SOQSEQ,[F:SOQ]ITMREF,0, WQT1, WQT2, LRET) From STKALL 
+                    If LRET=0
+                        WALLQTYSTU=0 : WSHTQTYSTU=0
+                        Call ECR_TRACE(mess(2,294,1)-"Allocation deleted :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF-
+&                                      "Quantity"-num$(WSTA_ALLQTYSTU),0) From GESECRAN
+                        Call ECR_TRACE(mess(4,294,1)-"Allocation deleled :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF-
+&                                      "Quantity"-num$(WSTA_SHTQTYSTU),0) From GESECRAN
+                    Else
+#                        Call ECR_TRACE("Error in DELALL :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF,1) From GESECRAN
+                    Endif
+                Else
+                    # Simulation
+                    WALLQTYSTU=0 : WSHTQTYSTU=0
+                    Call ECR_TRACE(mess(2,294,1)-"Allocation deleted :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF-
+&                                  "Quantity"-num$(WSTA_ALLQTYSTU),0) From GESECRAN
+                    Call ECR_TRACE(mess(4,294,1)-"Allocation deleled :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF-
+&                                  "Quantity"-num$(WSTA_SHTQTYSTU),0) From GESECRAN
+                Endif
+            Else 
+                # Il reste quelque chose à allouer : On diminue l'allocations
+                WQTE=WSTA_ALLQTYSTU+WSTA_SHTQTYSTU-WALLRESSTU
+                If WSIMU=1
+                    # On diminue les ruptures puis les allocations
+                    Call DIMALL(2,[F:SOQ]SOHNUM,[F:SOQ]SOPLIN,[F:SOQ]SOQSEQ,[F:SOQ]ITMREF,0,WQTE,WQT1,WQT2,LRET) From STKALL
+                    If LRET=0
+                        WALLQTYSTU-=WQT1
+                        WSHTQTYSTU-=WQT2
+                        Call ECR_TRACE(mess(2,294,1)-"Allocation deleted :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF-
+&                                      "Quantity"-num$(WQT1),0) From GESECRAN
+                        Call ECR_TRACE(mess(4,294,1)-"Allocation deleted :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF-
+&                                      "Quantity"-num$(WQT2),0) From GESECRAN
+                    Else
+#                        Call ECR_TRACE("Error in DIMALL :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF,1) From GESECRAN
+                    Endif
+                Else
+                    # Simulation  
+                    If WQTE<WSTA_SHTQTYSTU
+                        WSHTQTYSTU-=WQTE
+                        WQT1=0 : WQT2=WQTE
+                    Else
+                        WALLQTYSTU-=WQTE-WSHTQTYSTU
+                        WSHTQTYSTU=0
+                        WQT1=WQTE-WSHTQTYSTU : WQT2=WSHTQTYSTU
+                    Endif
+                    Call ECR_TRACE(mess(2,294,1)-"Allocation deleted :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF-
+&                                  "Quantity"-num$(WQT1),0) From GESECRAN
+                    Call ECR_TRACE(mess(4,294,1)-"Allocation deleted :"-num$([F:SOQ]SOPLIN)-[F:SOQ]ITMREF-
+&                                  "Quantity"-num$(WQT2),0) From GESECRAN
+                Endif
+            Endif 
+        Endif
+        If (WALLQTYSTU<>[F:SOQ]ALLQTYSTU | WSHTQTYSTU<>[F:SOQ]SHTQTYSTU) & LRET=0  
+            WMOD_SOQ=1
+            If J=0
+                Call ECR_TRACE("*** Order :"-[F:SOH]SOHNUM-format$("DD2",[F:SOH]ORDDAT),0) From GESECRAN
+                J=1
+            Endif
+            If WSIMU=1
+                Readlock [SOQ] Curr
+                If fstat 
+                    Call ECR_TRACE("File SORDERQ"-[F:SOQ]SOHNUM-num$([F:SOQ]SOPLIN)-num$([F:SOQ]SOQSEQ)+", Error ="-num$(fstat),1) From GESECRAN
+                Endif
+            Endif
+            # Mise à jour des qtés allouées dans SORDERQ        
+            If WSIMU=2 | !fstat
+                # --- Calcul ancien statut allocation de la ligne 
+                # Calcul de la qté réalisée : Livré ou facturé selon le type de commande
+                WQT1=[F:SOQ]ALLQTYSTU
+                WQT2=[F:SOQ]SHTQTYSTU
+                If [F:SOQ]ALLQTYSTU+[F:SOQ]OPRQTYSTU+[F:SOQ]PREQTYSTU+[F:SOQ]ODLQTYSTU+WCPLQTY >= [F:SOQ]QTYSTU & [F:SOQ]SHTQTYSTU=0
+                    # --- La ligne etait allouée 
+                    WALLSTA = 2
+                Else 
+                    # --- La ligne n'etait pas allouée 
+                    WALLSTA = 1 
+                Endif 
+                [F:SOQ]ALLQTYSTU=WALLQTYSTU
+                [F:SOQ]SHTQTYSTU=WSHTQTYSTU
+                If [F:SOP]SAU<>[F:SOP]STU
+                    WALLQTY=WALLQTYSTU*(1/[F:SOP]SAUSTUCOE)   
+                    Call QTEARR(WALLQTY, [F:SOP]SAU)
+                    WSHTQTY=WSHTQTYSTU*(1/[F:SOP]SAUSTUCOE)
+                    Call QTEARR(WSHTQTY, [F:SOP]SAU)
+                    [F:SOQ]ALLQTY=WALLQTY
+                    [F:SOQ]SHTQTY=WSHTQTY
+                Else
+                    [F:SOQ]ALLQTY=WALLQTYSTU
+                    [F:SOQ]SHTQTY=WSHTQTYSTU
+                Endif
+
+                If WSIMU=1
+                    Rewrite [F:SOQ] 
+                    If fstat
+                        Call ECR_TRACE("File SORDERQ"-[F:SOQ]SOHNUM-num$([F:SOQ]SOPLIN)-num$([F:SOQ]SOQSEQ)+", Error ="-num$(fstat),1) From GESECRAN
+                    Else
+                        Call ECR_TRACE("SORDERQ : Old All/Sht Qty ="-num$(WQT1)-"/"-num$(WQT2)-
+&                                      "New All/Sht Qty ="-num$(WALLQTYSTU)-"/"-num$(WSHTQTYSTU),0) From GESECRAN
+                        WMOD_SOH=1
+                        # Resynchro de l'encours
+                        If [F:SOH]BETFCY=2 & [F:SOH]BETCPY<>2 WWIPTYP=8 Else WWIPTYP=1 Endif
+                        Readlock [ORD] ORD0=WWIPTYP;[F:SOQ]DEMNUM;[F:SOQ]ITMREF
+                        If fstat 
+                            Call ECR_TRACE("File ORDERS"-num$(WWIPTYP)-num$([F:SOQ]DEMNUM)-[F:SOQ]ITMREF+", Error ="-num$(fstat),1) From GESECRAN
+                        Else
+                            [F:ORD]ALLQTY= [F:SOQ]ALLQTYSTU + [F:SOQ]ODLQTYSTU
+                            [F:ORD]SHTQTY= [F:SOQ]SHTQTYSTU
+                            Rewrite [F:ORD] 
+                            If fstat
+                                Call ECR_TRACE("File ORDERS"-num$(WWIPTYP)-num$([F:SOQ]DEMNUM)-[F:SOQ]ITMREF+", Error ="-num$(fstat),1) From GESECRAN
+                            Endif
+                        Endif
+
+                        WALLLINNBR=1
+                        # La ligne est passée du statut non alloué au statut alloué 
+                        If [F:SOQ]ALLQTYSTU+[F:SOQ]OPRQTYSTU+[F:SOQ]PREQTYSTU+[F:SOQ]ODLQTYSTU+WCPLQTY >= [F:SOQ]QTYSTU   
+&                           &  [F:SOQ]SHTQTYSTU = 0 &  WALLSTA = 1 
+                            WALLLINNBR *=-1 
+                            # La ligne est passée du statut alloué au statut non alloué 
+                        Elsif ([F:SOQ]ALLQTYSTU+[F:SOQ]OPRQTYSTU+[F:SOQ]PREQTYSTU+[F:SOQ]ODLQTYSTU+WCPLQTY < [F:SOQ]QTYSTU   
+&                           | [F:SOQ]SHTQTYSTU <> 0) &  WALLSTA = 2 
+                            WALLLINNBR *=1
+                        Else
+                            # La ligne n'a pas changé d'état
+                            WALLLINNBR=0
+                        Endif    
+#                        If [F:SOH]SOHCAT <> 4 WSOH_ALLLINNBR+=WALLLINNBR Endif
+                        If [F:SOH]SOHCAT <> 4 [F:SOH]ALLLINNBR += WALLLINNBR Endif
+                    Endif
+                Else
+                   Call ECR_TRACE("SORDERQ : Old All/Sht Qty ="-num$(WQT1)-"/"-num$(WQT2)-
+&                                   "New All/Sht Qty ="-num$(WALLQTYSTU)-"/"-num$(WSHTQTYSTU),0) From GESECRAN
+                Endif
+            Endif
+        Endif        
+        If WMOD_SOQ=1 I+=1 Endif
+    Next
+
+    If [F:SOH]SOHCAT <> 4 & WSIMU=1 & WMOD_SOH=1 
+       WSOH_ALLLINNBR=[F:SOH]ALLLINNBR
+       Readlock [SOH] Curr
+        If fstat 
+            Call ECR_TRACE("File SORDER"-[F:SOH]SOHNUM+", Error ="-num$(fstat),1) From GESECRAN
+        Else
+            # Mise à jour de l'état commande
+
+#            # --> Décrémentation du nbre lignes à allouer
+#            [F:SOH]ALLLINNBR += WALLLINNBR
+            [F:SOH]ALLLINNBR = WSOH_ALLLINNBR
+            # --> Mise à jour de l'état allocation
+            If [F:SOH]ALLLINNBR = 0 
+                # Aucune ligne à allouer     
+                # ==> La cde est totalement allouée ou non allouée (aucune ligne gérée en stock)
+                [F:SOH]ALLSTA=3
+                If [F:SOH]LINNBR>1 Gosub CALC_ALLSTA Endif
+            Elsif [F:SOQ]ALLQTYSTU <> 0 
+                [F:SOH]ALLSTA=2 
+            Elsif [F:SOH]ALLLINNBR >= [F:SOH]LINNBR 
+                [F:SOH]ALLSTA = 1 : # Ttes les lignes sont à allouer
+            Else
+                # Nbre de lignes à allouer < Nbre de lignes de la cde 
+                # ==> Le cde est partiellement allouée ou non allouée (aucune ligne gérée en stock)
+                [F:SOH]ALLSTA = 2 
+                Gosub CALC_ALLSTA
+            Endif
+            # --> Reecriture de la commande
+            Rewrite [SOH]
+            If fstat
+                Call ECR_TRACE("File SORDER"-[F:SOH]SOHNUM+", Error ="-num$(fstat),1) From GESECRAN
+            Endif
+        Endif
+    Endif
+Next
+
+Commit
+
+Call ECR_TRACE("Order line processed number ="-num$(I),0) From GESECRAN
+
+Call ECR_TRACE(" ",0) From GESECRAN
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN 
+Call ECR_TRACE(" ",0) From GESECRAN 
+
+$FIN_UTIVEN08
+Call TEMPOFF     From GESECRAN
+Call FERME_TRACE From LECFIC
+Call LEC_TRACE   From LECFIC
+
+End
+
+
+#-------------------------------------------------------------------------#  
+# Calcul de l'état d'allocation                                           #    
+#-------------------------------------------------------------------------#  
+$CALC_ALLSTA
+
+If clalev([F:SOQ1])=0  Local File =DOSSIER+".SORDERQ"    [SOQ1]  Endif
+
+Columns [SOQ1] (SOHNUM, SOPLIN, SOQSEQ, ALLQTYSTU, SHTQTYSTU)
+Filter [SOQ1] Where SOHNUM=[F:SOH]SOHNUM & sum(ALLQTYSTU, SHTQTYSTU)<>0
+Look [SOQ1]SOQ0 First
+If fstat [F:SOH]ALLSTA=1 : Endif : # Aucune ligne n'a des allocations : Commande non allouée
+Filter [SOQ1] 
+Columns [SOQ1]
+
+Return
+
+
+###########################################################################
+# Lecture de l'unite et arrondi
+Subprog QTEARR(QTY,UOM)
+Variable Decimal QTY
+Value Char UOM
+
+# lecture de l'unité
+If UOM <> ""
+ Read [TUN]TUN0 = UOM
+Endif
+# le format est determiné par la variable globale GF..(7)
+# Arrondi de la quantité selon nb de décimales :
+If QTY <> 0 & fstat = 0
+ Case [F:TUN]UOMDEC
+  When 0 : QTY = arr(QTY,1)
+  When 1 : QTY = arr(QTY,0.1)
+  When 2 : QTY = arr(QTY,0.01)
+  When 3 : QTY = arr(QTY,0.001)
+  When 4 : QTY = arr(QTY,0.0001)
+  When 5 : QTY = arr(QTY,0.00001)
+  When 6 : QTY = arr(QTY,0.000001)
+ Endcase
+# ou mieux : arr(QTY,10^-[F:TUN]UOMDEC)
+Endif
+End
+
+
+########################################################################
+$REAJUSTE_QTY
+#---------------------------------------------
+# TS : réajustement qté en unité vente entière
+#---------------------------------------------
+# Dem 35874 - TS 04.06
+#GPOINT = "NO_REAJUST" : Gosub ENTREE From EXEFNC
+#If GOK=0 : GOK=1 :  Return : Endif
+
+If WSAU<>WSTU 
+   Call CTRQTYPCU(WSAU,WSAUSTUCOE,WQTYSTU,WQTYARR) From STKLIB
+   If WQTYARR<>WQTYSTU
+      WQTYSTU = WQTYARR 
+      WQTY    = WQTYSTU/WSAUSTUCOE
+   Endif
+Endif
+Return
+#---------------------------------------------
+
+

@@ -1,0 +1,3532 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# V6
+# Gestion du masque MWF0             Traitement FUNWIPMFC
+# Finalisation d'en-cours OF à partir de la table WIPCOST
+# Solde des encours et calcul du PRF
+##########################################################################
+# >> adapter pour pouvoir éditer le détail du PRF sans rien mettre à jour (ou faire autre fct)
+#
+# NE CONCERNE QUE LES WIPCOST DONT L'ENTETE MFGWIP POINTE SUR UN OF
+
+# Partir de la table des OF entête
+# Pour chaque OF
+#    - parcours des MFGITM de l'OF pour charger le tableau Articles de MWF0
+#
+#    - parcours des WIPCOST liés pour charger le tableau ... de MWF0 par type
+#      Si lié à aucune ligne d'OF, imputer un prorata à chaque ligne Article
+#        (+ chargement de MFCCLCPRN pour l'édition)
+#    - CREE_PRF
+#      - Parcourir le tableau des produits pour alimenter MFGCOST
+#        Si on gère au cout réel ('ACTUAL')
+#            Calculer le montant régularisé
+#            Chercher combien sont en stock selon la valorisation de sortie
+#              - site (lire ITMMVT)
+#              - FIFO :
+#              - Lot  :
+#
+#            Eclater dans les zones régul de prix et COGS
+#            Créer un WIPCOST de type 17 (régul) pour la ligne d'OF
+#            imputer un prorata de Régul Stock et COGS sur chaque produit et appeler REGPRIX
+#
+#        Si on gère l'article au cout std ('STANDARD') appel de REGPRIX (pour mnt non absorbé)
+#    - Si on gère au cout std (ou actualisé)
+#        Créer les Wipcost d'écarts (type 9 à 13)
+#    - Sommer les montants de tous les Wipcost lié à l'OF (y compris les derniers créés)
+#        Si ce n'est pas équilibré, créer un Wipcost type 15
+#
+#    - Mettre à jour les flag des tables d'OF
+############################################################################################
+
+$ACTION
+Case ACTION
+  When "INIT"        Gosub INIT
+  When "OUVRE_BATCH" Gosub INIT
+  When "CONTROLE"    Gosub CONTROLE
+  When "EXEC"        Gosub EXEC
+  When "TERMINE"     Gosub TERMINE
+Endcase
+Return
+
+$INIT
+# > ouvrir un autre écran ne servant qu'aux zones mémoire (! [M] par défaut)
+
+Local Integer    LAST_SEQ, ERR, F_RCPVLTCOD, FIRST_VAL, FIRST_NAT
+Local Decimal    L_CURRND
+Local Decimal    ACTUALS(5), STANDARDS(5), SCRAP(5) # pour éclatement de la régul et Ecarts
+Local Decimal    SUM_CPLQTY, BAL_AMT, SUM_GRP, TOT_AMT
+Local Integer    ON_HAND
+Local Decimal    ON_HAND_PER, TOT_ABS, TOT_NABS, TOT_NABS2
+Local Integer    WRET, QUOT
+Local Date       WO_CLODAT : # Date cloture OF
+Local Decimal    LSCPAMT(8), LINVDTATOT
+Local Date       LIPTVCR
+Local Char       REQ(250)
+Local Date       LDATPER    # Date début 1ère période ouverte pour les stocks
+Local Integer    LOLDDAT    # Indique si un enreg de type 14 a une date antérieure à LDATPER
+Local Decimal    LQTYTOT
+
+# CCC (14/02/05) Bug 28345 : Utilisation devise société dans la valeur du lot
+Local Decimal    LCNVRPT    # Taux de conversion de la devise société à la devise dossier
+
+Local Integer    I,J,K,V,T
+
+Local Integer STAT
+Local Char    ORDSYS(250)
+Local Char    RESULT(80)(1..500)
+#Local Integer WADXUID(1..500), LNBUID : # GH 19/03/2014 bug 97454
+Local Integer LYEA
+Local Integer LOUVTRC : LOUVTRC=0
+
+Local Integer LNBLIN
+LNBLIN = max(1,func AFNC.ACTIV("MFI"))
+# Tableaux récapitulatifs des natures de FG.
+# Le 2ème indice de LNATAMTxxx correspond à l'origine des FG:
+# 0-Total / 1-Produit / 2-FG sortie cpn / 3-Main d'oeuvre / 4-Machine / 5-Sous-traitance / 6-FG entrée mat
+Local Decimal    LNATAMTACT(LNBLIN,7,100), LNATAMTSTD(LNBLIN,7,100), LNATAMTSCP(LNBLIN,7,100)
+Local Char       LOVENAT(GLONONA)(LNBLIN,100)
+
+If !clalev([F:ITM]) Local File ITMMASTER   [ITM] Endif
+If !clalev([F:ITG]) Local File ITMCATEG    [ITG] Endif
+If !clalev([F:ITF]) Local File ITMFACILIT  [ITF] Endif
+If !clalev([F:STJ]) Local File STOJOU      [STJ] Endif # pour la régul
+If !clalev([F:STJ2]) Local File STOJOU     [STJ2] Endif # pour recherche non absorbé car période fermée
+If !clalev([F:STP]) Local File STOCOST     [STP] Endif
+If !clalev([F:SLF]) Local File STOLOTFCY   [SLF] Endif
+If !clalev([F:ITV]) Local File ITMMVT      [ITV] Endif # pour les valorisations
+If !clalev([F:MFC]) Local File MFGCOST     [MFC] Endif
+If !clalev([F:MFC2]) Local File MFGCOST    [MFC2] Endif
+If !clalev([F:MCN]) Local File MFCNAT      [MCN] Endif # détail de natures FG
+If !clalev([F:MCC]) Local File MFCMAT      [MCC] Endif # détail des matières
+If !clalev([F:MCW]) Local File MFCWST      [MCW] Endif # détail des opérations
+If !clalev([F:MWI]) Local File WIPCOST     [MWI] Endif
+If !clalev([F:MWI2]) Local File WIPCOST    [MWI2] Endif
+If !clalev([F:MWH]) Local File MFGWIP      [MWH] Endif
+If !clalev([F:PER]) Local File PERIOD      [PER] Endif
+
+If GMODU(8)=2
+    If !clalev([F:MFG]) Local File MFGHEAD     [MFG] Endif
+    If !clalev([F:MFI]) Local File MFGITM      [MFI] Endif
+    If !clalev([F:MFM]) Local File MFGMAT      [MFM] Endif
+    If !clalev([F:MFO]) Local File MFGOPE      [MFO] Endif
+    If !clalev([F:MKI]) Local File MFGITMTRK   [MKI] Endif
+    If !clalev([F:MWS]) Local File WORKSTATIO  [MWS] Endif
+    If !clalev([F:MCS]) Local File MFCSCRAP    [MCS] Endif # détail des rebuts
+    If !clalev([F:MWC]) Local File WORKCOST    [MWC] Endif # Issue 92914 - 2014-07-15 by CCC
+Endif
+If GMODU(6)=2
+    If !clalev([F:SCO])  Local File SCOHEAD     [SCO]  Endif
+    If !clalev([F:SCI])  Local File SCOITM      [SCI]  Endif
+    If !clalev([F:SCM])  Local File SCOMAT      [SCM]  Endif
+    If !clalev([F:SCS])  Local File SCOSRV      [SCS]  Endif
+    If !clalev([F:PTD])  Local File PRECEIPTD   [PTD]  Endif
+Endif
+If !clalev([F:CAL]) Local File CPTANALIN   [CAL] Endif : # V6 GA 05/2008 pour MWIPLIB
+If !clalev([F:TCM]) Local File TABCOSTMET  [TCM] Endif
+If !clalev([F:TCU]) Local File TABCUR      [TCU] Endif
+If !clalev([F:TUN]) Local File TABUNIT     [TUN] Endif
+If !clalev([F:FCY]) Local File FACILITY    [FCY] Endif
+If !clalev([F:ACV]) Local File ACTIV       [ACV] Endif
+If clalev([F:OVE])=0 : Local File OVERHEAD [OVE] : Endif
+
+# code activité pour utilisation du plafond PROPER dans la régularisation
+Local Integer FLGUSA   # code activité (utilisé en pays anglo-saxons en principe)
+                       # si désactivé : la répartition se fait sans test de plafond
+Read [ACV]CODACT="MPR" # Plafond prorata régul
+If fstat Raz [F:ACV] Endif
+If [F:ACV]FLACT=2 FLGUSA=1 Endif
+
+Local Char    TIT(80) : TIT = mess(2,2363,1) : # "Calcul de PRF et solde d'encours"
+Local Char    LMSG(250)
+
+Local Char    TBPAR(10)(1..50),TBVAL(30)(1..50) # pour impression
+Local Integer LRET
+
+If !clalev([M:SDP]) : Local Mask SAIDECPRI : Endif
+If !clalev([M:CTP]) : Local Mask CLCCSTPAR : Endif
+If !clalev([M:CST]) : Local Mask CLCCST   : Endif
+If !clalev([M:CST0]): Local Mask CLCCST0  : Endif
+# Issue 94421 - 2013-11-15 by CCC
+If !clalev([M:CST2]) : Local Mask CLCCST [CST2] : Endif
+If !clalev([M:SDP2]) : Local Mask SAIDECPRI [SDP2] : Endif
+
+Return
+
+#############################################################
+$CONTROLE
+# Get legal companies currency
+Read [FCY]FCY0=[M]STOFCY
+If fstat
+  GERR = 1
+  GMESSAGE = mess(9,2363,1) - [M]STOFCY #"erreur de lecture sur FACILITY..."
+  Return
+Endif
+
+Call GET_CUR_RND([F:FCY]LEGCPY, L_CURRND, ERR) From MWIPLIB # charge aussi GLOCALDEV
+If ERR = 1
+  GERR = 1
+  GMESSAGE = mess(10,2363,1) - [F:FCY]LEGCPY #"Err lecture sur les devises société..."
+Endif
+Return
+
+#############################################################
+$EXEC
+Local Char LWAICTL(2)   # Issue 99496 - 2014-11-03 by CCC
+Local Integer LNEXT
+
+## GH 19/03/2014 bug 97454
+Local Integer LNBUID
+LNBUID = nbruser+10 : # GH 28/01/2016 +10 for security
+If LNBUID<1 : LNBUID=500 : Endif
+Local Integer WADXUID(1..LNBUID)
+LNBUID=0
+##
+
+If !GSERVEUR
+   If GTRACE=""
+       LOUVTRC=1
+       Call OUVRE_TRACE(TIT) From LECFIC
+   Endif
+   Call ECR_TRACE(" ",0) From GESECRAN
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+   Case [M]VCRTYP
+        When 10      : Call PRTSCR("MWF0","MWF0","",0,1) From ATRTX3
+        When 36      : Call PRTSCR("SWF0","SWF0","",0,1) From ATRTX3
+   Endcase
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Endif
+## GH 25/06/2014 Bug 99087 pour visualiser le filtre EO/OF saisi notamment en lancement batch
+If [M]FILMFG<>""
+   Call ECR_TRACE(mess(302,198,1)-"=|"-[M]FILMFG,0) From GESECRAN : # Filtre
+Endif
+Call ECR_TRACE(" ",0) From GESECRAN
+
+NB_MFG = 0
+Raz LMSG
+Raz [M:CTP], [M:CST], [M:CST0]
+
+## GH 19/03/2014 Bug 97454 ajout d'une transaction séparée la purge les coûts prévisionnels temporaires
+Call DEBTRANS From GLOCK
+Trbegin [MFC]
+
+Local Integer WDELTMP : [L]WDELTMP=1
+GPOINT="DELTMPMCP" : Gosub ENTREE From EXEFNC : # GH 19/03/2014 bug 97454 ajout PE (cf. bug 90053)
+If [L]WDELTMP=1
+  Call UIDADX(WADXUID, LNBUID) From TRTX3
+
+  Delete [MFC] Where UID<>0 & !find(UID,WADXUID(1..LNBUID))
+  Delete [MCN] Where UID<>0 & !find(UID,WADXUID(1..LNBUID))
+  Delete [MCC] Where UID<>0 & !find(UID,WADXUID(1..LNBUID))
+  Delete [MCW] Where UID<>0 & !find(UID,WADXUID(1..LNBUID))
+  If GMODU(8)=2
+      Delete [MCS] Where UID<>0 & !find(UID,WADXUID(1..LNBUID))
+  Endif
+Endif
+
+# GH 19/03/2014 Bug 86229
+#Update [MFC] Where STOFCY=[M]STOFCY
+#&                & PRNUID=adxuid(1)
+#&             With PRNUID=0
+Commit
+
+## GH 19/03/2014 Bug 97454 transaction par OF/EO
+#Call DEBTRANS From GLOCK
+#Trbegin [MFC]
+
+# Alimentation de CLCCSTPAR [CTP]
+[M:CST0]AFFZON = 1    # Pas d'affichage des zones
+[M:CST0]STOFCY = [M]STOFCY    # site
+[M:CTP]VCRTYP = [M]VCRTYP
+
+# GH 10/01/13 Dm 77455
+# CCC (2010-03-11) Bug 62665 : FILMFG peut être composé d'un "ou" => il faut mettre le filtre entre parenthèses
+#If [M]FILMFG<>""
+#  [M]FILMFG = "("+[M]FILMFG+")"
+#Endif
+
+# On part des entetes d'ordres
+Case [M]VCRTYP
+    When 10      : # Default File [MFG] : # GH 10/01/13 Dm 77455
+                   Gosub OUVFIC_LISTE From ="WO"+"SELOF" : # Pour les grep
+                   Gosub DEFAUT_LISTE From ="WO"+"SELOF" : # Pour les grep
+                   Filter [F] Order By Key MFG0
+                   If [M]FILMFG = ""
+                      [M]FILMFG = "[MFG]MFGNUM='"+[M]VCRNUM+"'"
+                      [M]FILSELMFG = "1=1"
+                   Else
+                     If [M]PRF1<>2 & [M]PRF2<>2   # par sécurité
+                        [M]PRF1=2
+                     Endif
+                     [M]FILSELMFG = "[MFG]MFGFCY='"+[M]STOFCY+"' & find([MFG]MFGTRKFLG"     # Issue 102919 - 2014-10-21 by CCC : move comma
+                     If [M]PRF1=2 : [M]FILSELMFG   += ",4,5" : Endif     # Issue 102919 - 2014-10-21 by CCC : move comma
+                     If [M]PRF2=2 : [M]FILSELMFG   += ",6"   : Endif     # Issue 102919 - 2014-10-21 by CCC : move comma
+                     [M]FILSELMFG+= ")<>0"
+                   Endif
+                   If [M]SIMFLG<>2
+                      [M]FILSELMFG += "& [MFG]MFGSTA=4"
+                   Endif
+                   [M:CTP]SLTOVECOL = GOVECOLMFC
+
+    When 36      : # Default File [SCO]  # GH 10/01/13 Dm 77455
+                   Gosub OUVFIC_LISTE From ="WO"+"SELEO" : # Pour les grep
+                   Gosub DEFAUT_LISTE From ="WO"+"SELEO" : # Pour les grep
+                   Filter [F] Order By Key SCI0(1)
+                   If [M]FILMFG = ""
+                       [M]FILMFG = "[SCO]SCONUM='"+[M]VCRNUM+"'"
+                       [M]FILSELMFG = "1=1"
+                   Else
+                     If [M]PRF1<>2 & [M]PRF2<>2   # par sécurité
+                        [M]PRF1=2
+                     Endif
+                     [M]FILSELMFG = "[SCI]PRHFCY='"+[M]STOFCY+"' & find([SCO]SCOTRKFLG"     # Issue 102919 - 2014-10-21 by CCC : move comma
+                     If [M]PRF1=2 : [M]FILSELMFG+= ",4,5" : Endif     # Issue 102919 - 2014-10-21 by CCC : move comma
+                     If [M]PRF2=2 : [M]FILSELMFG+= ",6"   : Endif     # Issue 102919 - 2014-10-21 by CCC : move comma
+                     [M]FILSELMFG+= ")<>0"
+                   Endif
+                   If [M]SIMFLG<>2
+                       [M]FILSELMFG-= "& [SCO]SCOSTA=4"
+                   Endif
+                   [M:CTP]SLTOVECOL = GOVECOLSCO
+
+    When Default : GOK=0
+                   Return
+Endcase
+
+# Issue 99094 - 2014-04-09 by CCC
+Call GETCPY([M]STOFCY,"",0,"") From TRTX3CPT
+
+Raz LWAICTL
+Case [M]VCRTYP
+    When 10 : Call PARAM([M]STOFCY, "WOMMVTWAI", LWAICTL) From ADOVAL
+    When 36 : Call PARAM([M]STOFCY, "EOMMVTWAI", LWAICTL) From ADOVAL
+Endcase
+
+[M:CTP]PRNNUM = uniqid([F:MFC]) : # GH 19/03/2014 bug 86229
+For [F] Where evalue([M]FILMFG) & evalue([M]FILSELMFG)
+
+    [M:CTP]TRANIV = 2   # Trace tout
+    Raz LMSG, ERR, LNEXT
+
+    # Issue 99496 - 2014-11-03 by CCC : pending transaction control
+    If LWAICTL="3"
+        Case [M]VCRTYP
+            When 10 : # WO
+                If func FUNMFGS.CTRL_WAITRS_WO([F:MFG]MFGFCY,[F:MFG]MFGNUM)>0
+                    Call ECRTRACE([F]MFGNUM-":"-mess(289,193,1),-1) From TRTCST
+                    LNEXT = 1
+                Endif
+            When 36 : # WO
+                If func FUNTEOCLO.CTRL_WAITRS_EO([F:SCO]SCONUM)>0
+                    Call ECRTRACE([F]SCONUM-":"-mess(477,194,1),-1) From TRTCST
+                    LNEXT = 1
+                Endif
+        Endcase
+    Endif
+
+    If !LNEXT
+        Call DEBTRANS From GLOCK
+        Trbegin [MFC]
+           Gosub TRANSAC
+        # Commit the records if there are no errors
+        If ERR = 1 | GOK < 1
+            Rollback
+        Else
+            Commit
+            Case [M:CTP]VCRTYP
+                 When 10 : # "Le calcul de PRF est terminé, pour l'OF"
+                     LMSG = mess(7,2363,1) - [F:MFG]MFGNUM +"\"
+                 When 36 : # "Le calcul de PRF est terminé, pour l'ordre de sous-traitance"
+                     LMSG = mess(26,2363,1) - [F:SCO]SCONUM +"\"
+            Endcase
+            LMSG += sum([M:CST]ITMREF+" ")     # liste des produits de l'OF
+            Call ECR_TRACE(LMSG,0) From GESECRAN
+            Raz LMSG
+            If BAL_AMT <> 0
+                # "Un solde d'encours a été généré pour ..."
+                LMSG = mess(8,2363,1) - num$(BAL_AMT * (-1))
+                Call ECR_TRACE(LMSG,0) From GESECRAN
+                Raz LMSG
+            Endif
+            Call ECR_TRACE(" ",0) From GESECRAN
+        Endif
+    Endif
+Next
+
+Case [M]VCRTYP
+  When 10 : Gosub DEFAUT_LISTE From ="WO"+"SELOF"
+  When 36 : Gosub DEFAUT_LISTE From ="WO"+"SELEO"
+Endcase
+Filter [F]
+Return
+
+$TRANSAC
+Case [M:CTP]VCRTYP
+    When 10 :
+        [M:CTP]VCRNUM = [F:MFG]MFGNUM
+        Readlock [F:MFG]MFG0=[M:CTP]VCRNUM
+        If fstat
+            Call RSTA("MFG",[M:CTP]VCRNUM) From GLOCK
+            ERR=1 : Return
+        Endif
+    When 36 :
+        [M:CTP]VCRNUM = [F:SCO]SCONUM
+        Readlock [F:SCO]SCO0=[M:CTP]VCRNUM
+        If fstat
+            Call RSTA("SCO",[M:CTP]VCRNUM) From GLOCK
+            ERR=1 : Return
+        Endif
+Endcase
+
+# PE permermettant d'éviter le calcul pour l'OF en cours
+GPE=0
+GPOINT="CTRMFG"
+Gosub ENTREE From EXEFNC
+If GPE=1 | !(func CTRMFG([M:CTP]VCRTYP,[M:CTP]VCRNUM))
+    ERR=1 : Return
+Endif
+
+# Issue 76963 - 2011-10-20 by CCC : renseigner ces paramètres systématiquement
+[M:CTP]CSTMATTYP=3
+[M:CTP]CSTOPETYP=3
+
+# CCC(02/05/05) DM 30042
+If [M]FLXBUD = 2
+    [M:CTP]TYPCST = 2      # Coût prévisionnel
+    [M:CTP]FXDCSTDSP= 2    # Pas de répartition des fixes au prorata (paramètre utile uniquement pour ITC)
+
+    [M:CTP]QTYITMTYP=3      # Issue 85341 - 2013-08-20 by CCC : "Budget flexible" => prix réels + qté prévue selon qté produite
+    [M:CTP]QTYMATTYP=[M]ORIDEVCLC
+    [M:CTP]QTYOPETYP=[M]ORIDEVCLC
+    [M:CTP]PROCPLEXT=2      # Issue 85341 - 2013-08-20 by CCC
+
+    Raz [M:CST]
+
+    Call CLCMFC(5,LRET) From SUBMCCB
+
+    Update [MFC] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=5
+&                With  UID=0
+    Update [MCN] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=5
+&                With  UID=0
+    Update [MCC] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=5
+&                With  UID=0
+    Update [MCW] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=5
+&                With  UID=0
+Endif
+
+[M:CTP]QTYITMTYP=3
+[M:CTP]PROCPLEXT=1                  # Issue 85341 - 2013-08-20 by CCC
+[M:CTP]TYPCST = 3     # Coût final
+
+Raz [M:CST]
+# Chargement des enreg WIP dans [CST]
+Call LOADWIP(1,LRET) From SUBCSTB
+If LRET
+    Call ECR_TRACE([M:CTP]VCRNUM-":"-GMESSAGE,1) From GESECRAN
+    Raz GMESSAGE
+    ERR=1 : Return
+Endif
+Call LOADWIP(2,LRET) From SUBCSTB
+If LRET
+    Call ECR_TRACE([M:CTP]VCRNUM-":"-GMESSAGE,1) From GESECRAN
+    Raz GMESSAGE
+    ERR=1 : Return
+Endif
+Call LOADWIP(3,LRET) From SUBCSTB
+If LRET
+    Call ECR_TRACE([M:CTP]VCRNUM-":"-GMESSAGE,1) From GESECRAN
+    Raz GMESSAGE
+    ERR=1 : Return
+Endif
+
+# Calcul du coût
+[M:CTP]NIV=1
+Call CLCCST  From TRTCST
+
+Raz ERR
+
+# Recherche de la 1ère date sur période comptable ouverte (recherche à partir de la date du jour)
+# 1- recherche de la dernière periode fermée
+Case [M]VCRTYP
+    When 10 : Read [FCY]FCY0=[F:MFG]MFGFCY
+    When 36 : If [F:SCI]SCONUM<>[F:SCO]SCONUM
+                  Filter [SCI] Where SCONUM=[F:SCO]SCONUM
+                  Read [SCI]SCI0 First  # V6 : mono-article
+                  Filter [SCI]
+              Endif
+              Read [FCY]FCY0=[F:SCI]PRHFCY
+Endcase
+If fstat : ERR=1 : Return : Endif
+
+Raz BAL_AMT, GPE, LDATPER
+# !! PE identique dans STKVALREG
+GPOINT="CTRIPTADJ"    #CHECK IGNORE_LINE
+Gosub ENTREE From EXEFNC
+If !GPE
+    # Issue 117364/X3-2667 - 2017-04-11 by ERMIL : Modify period search to limit to correct ledger type
+    #Filter [PER] Where CPY=[F:FCY]LEGCPY
+    #&                    & (PERSTA<>2 | PERSTOSTA>=4)
+    #&                    & PERSTR <= date$
+    #&                Order By FIYNUM Desc; PERNUM Desc
+    #Read [PER] First
+    #Filter [PER]
+    #If fstat
+    #    Raz LDATPER
+    #Else
+    #    LDATPER = [F:PER]PEREND
+    #Endif
+    # 2- lecture de la période suivante (qui est donc ouverte)
+    #Filter [PER] Where CPY=[F:FCY]LEGCPY
+    #&                    & PERSTR >= LDATPER
+    #&                Order By FIYNUM Asc; PERNUM Asc
+    #Read [PER] First
+    #Filter [PER]
+    #LDATPER = [F:PER]PERSTR
+    #If fstat : ERR=1 : Return : Endif
+    Raz LDATPER
+    For [PER] Where CPY=GSOCIETE & LEDTYP=GTYPGEN & PERSTR<=date$ & PERSTA=2 & PERSTOSTA<>4
+      LDATPER = [F:PER]PERSTR
+      Break
+    Next
+    If LDATPER = [0/0/0] : ERR=1 : Return : Endif
+    # End issue 117364/X3-2667
+Endif
+
+#---- Avant tout : suppression/annulation de wipcost de régul déjà existant
+Call DELADJMWI([M:CTP]VCRTYP,[M:CTP]VCRNUM,LDATPER,ERR)
+If ERR : Return : Endif
+
+# Une fois le coût calculé, il faut mettre à jour les WIP de FG puis calculer la valeur des rebuts.
+# Enregistrer le rebut dans MFCSCRAP et WIPCOST. Enregistrer MFGCOST et soustraire [MCS] à [MFC]
+
+#---- Calcul des wipcost de FG ---#
+Call UPDMWIOVE([M:CTP]VCRTYP,[M:CTP]VCRNUM,ERR)
+If ERR : Return : Endif
+
+Case [M:CTP]VCRTYP
+    When 10 : WO_CLODAT = [F:MFG]CLODAT
+    When 36 : WO_CLODAT = [F:SCO]CLODAT
+Endcase
+If WO_CLODAT=[0/0/0]
+    WO_CLODAT=date$
+Endif
+# Issue 93217 - 2013-10-16 by CCC : To calculate scrap qty has to be > 0
+LQTYTOT = func TRTCST.SUMQTY("P",0)
+# Pas de rebut dans les EO
+If [M:CTP]VCRTYP=10 & LQTYTOT>0
+    #---- Ecriture des wipcost de rebut -----#
+    Call SCPOPE([M:CST0]STOFCY,[M:CTP]VCRNUM,WO_CLODAT,LSCPAMT)
+Endif
+
+#---- Déduction du rebut dans MFGCOST ----#
+For I=0 To [M:CST]NBITM-1
+    If [M:CST]ITMTYP(I)<>2 & !find([M:CST]ILNK(I),[M:CST]ILNK(0..I-1))
+        Raz LYEA
+        Case [M:CTP]VCRTYP
+            When 10
+                # Pas de rebut dans les EO
+                #---- Enregistrer le total de rebut dans MFCSCRAP -----#
+                 Call SAVSCP([M:CST]ILNK(I),[M:CST]ITMREF(I),4,LSCPAMT,LRET)
+                 If LRET : Break : Endif
+                 Read [MFI]MFI0=[M:CTP]VCRNUM;[M:CST]ILNK(I)
+                 If !fstat
+                    LYEA = year([F:MFI]TRKLAST)
+                 Endif
+            When 36
+                # la date de dernière réception n'est pas connue
+        Endcase
+        If LYEA=0 : LYEA = year(date$) : Endif
+        Call SAVMFC(I,[M:CST]ITMREF(I),LYEA,4,LRET) From SUBMCCB
+        If LRET : Break : Endif
+    Endif
+Next
+If LRET : GOK=0 : Return : Endif
+
+# Issue 94421 - 2013-11-15 by CCC : Si mask CST2 ouvert => on le gère pour améliorer la précision
+If dim([M:CST2]ITMREF)>0
+    Raz [M:CST2]
+    [M:CST2] = [M:CST]
+Endif
+
+[M:CTP]NIV=2
+Call CLCCST  From TRTCST
+
+For I=0 To [M:CST]NBITM-1
+    If [M:CST]ITMTYP(I)<>2 & !find([M:CST]ILNK(I),[M:CST]ILNK(0..I-1))
+
+        # Pas de rebut dans les EO
+        If [M:CTP]VCRTYP=10
+            Call SAVSCP([M:CST]ILNK(I),[M:CST]ITMREF(I),4,LSCPAMT,LRET)
+            If LRET : Break : Endif
+        Endif
+
+        Call SAVMFC(I,[M:CST]ITMREF(I),LYEA,4,LRET) From SUBMCCB
+        If LRET : Break : Endif
+        Call SAVMCN(I,[M:CST]ITMREF(I),LYEA,4,LRET) From SUBMCCB
+        If LRET : Break : Endif
+        Call SAVMCC(I,[M:CST]ITMREF(I),LYEA,4,LRET) From SUBMCCB
+        If LRET : Break : Endif
+        Call SAVMCW(I,[M:CST]ITMREF(I),LYEA,4,LRET) From SUBMCCB
+        If LRET : Break : Endif
+    Endif
+Next
+If LRET : GOK=0 : Return : Endif
+
+Delete [MFC] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=0 & MFCTYP=4
+Delete [MCN] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=0 & MFCTYP=4
+Delete [MCC] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=0 & MFCTYP=4
+Delete [MCW] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=0 & MFCTYP=4
+
+Update [MFC] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=4
+&            With  UID=0
+Update [MCN] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=4
+&            With  UID=0
+Update [MCC] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=4
+&            With  UID=0
+Update [MCW] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=4
+&            With  UID=0
+
+# Dans le cas de la sous-traitance (module achat), il n'y a pas de rebut
+If clalev([F:MCS])
+    Delete [MCS] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=0 & MFCTYP=4
+    Update [MCS] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=adxuid(1) & MFCTYP=4
+&                With  UID=0
+Endif
+
+#----- Calcul de [MFC]CPLRIO ----# (utilisé dans consultation prf)
+If [M]FLXBUD<>2
+    Filter [MFC2] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=0 & ([F:MFC2]CSTTOT+[F:MFC2]OVETOT)*[F:MFC2]QTYSTU<>0 & MFCTYP=[M]ORIDEVCLC
+Else
+    Filter [MFC2] Where VCRTYP=[M:CTP]VCRTYP & VCRNUM=[M:CTP]VCRNUM & UID=0 & ([F:MFC2]CSTTOT+[F:MFC2]OVETOT)*[F:MFC2]QTYSTU<>0 & MFCTYP=5
+Endif
+For [MFC2]
+    Readlock [MFC]MFC0=[F:MFC2]STOFCY;[F:MFC2]ITMREF;[F:MFC2]VCRTYP;[F:MFC2]VCRNUM;[F:MFC2]VCRLIN;4;[F:MFC2]UID
+    If !fstat
+        [F:MFC]CPLRIO = arr(100 * (([F:MFC]CSTTOT+[F:MFC]OVETOT)*[F:MFC]QTYSTU - ([F:MFC2]CSTTOT+[F:MFC2]OVETOT)*[F:MFC2]QTYSTU) / (([F:MFC2]CSTTOT+[F:MFC2]OVETOT)*[F:MFC2]QTYSTU),0.01)
+        # FQ 54143 selon CCC (14/02/06) Bug 34870
+        [F:MFC]CPLRIO = max(-99999,min([F:MFC]CPLRIO,99999))
+        Rewrite [MFC]
+    Endif
+Next
+Filter [MFC2]
+
+If [M]SIMFLG<>2
+    Gosub SET_MFC    # --> régularise, finalise l'OF
+Endif
+
+GPOINT = "APCALMFC"
+Gosub ENTREE From EXEFNC
+Return
+
+##################################################
+$SET_MFC
+    For [MFC] Where VCRTYP = [M:CTP]VCRTYP
+&                 & VCRNUM = [M:CTP]VCRNUM
+&                 & MFCTYP = 4
+&                 & UID    = 0
+
+       Call GETTCM([F:MFC]ITMREF,[F:MFC]STOFCY,GBIDC1,ERR) From STKVAL    #GETTCM se positionne sur [F:TCM]
+       If !ERR
+           F_RCPVLTCOD = [F:TCM]RCPVLTCOD         # valo des entrées
+       Endif
+
+        # If receipt cost code is actual
+        #If F_RCPVLTCOD > 2 & [F:MFC]CPLQTY <> 0 & [F:MFG]MFGSTA=4 & [F:MFG]MFGTRKFLG>=5
+        If [M:CTP]VCRTYP=10 & ([F:MFG]MFGSTA<>4 | [F:MFG]MFGTRKFLG<5)
+         # CCC (V150) si OF non clos on passe au suivant
+           Call ECR_TRACE(mess(115,193,1)-"=>"-mess(203,107,1),0) From GESECRAN
+           Goto NEXT_MFC
+        Elsif [M:CTP]VCRTYP=36 & ([F:SCO]SCOSTA<>4 | [F:SCO]SCOTRKFLG<5)
+         # GA 05/2008 si EO non clos on passe au suivant
+           Goto NEXT_MFC
+        Endif
+
+        Gosub ALI_NATAMT
+        If GOK=0
+            Break
+        Endif
+
+        # Issue 94421 - 2013-11-15 by CCC : Si mask CST2 ouvert => on le gère pour améliorer la précision
+        If dim([M:CST2]ITMREF)>0
+            Call CST2SDP2([F:MFC]VCRLIN) From SUBSDPCOM
+        Endif
+
+        # Alimentation de SDP avec le coût réel pour appel à la régularisation de prix
+        Raz [M:SDP]
+        [M:SDP] = [F:MFC]
+        Call CST2SDP([F:MFC]VCRLIN) From SUBSDPCOM
+
+        [M:SDP]PRI    = [F:MFC]CSTTOT + [F:MFC]OVETOT
+        [M:SDP]QTY    = [F:MFC]QTYSTU
+        [M:SDP]AMTTOT = func SUBSDPCOM.SUMCST("SDP")
+
+        If F_RCPVLTCOD > 2
+            Gosub REGUL_REEL
+            If ERR = 1 : Break : Endif
+        Else
+            If [F:MFC]QTYSTU>0
+                # Standard : appel de REGPRIX pour écart
+                Call CONVERT2(GLOCALDEV,GSYSCUR,GLOCALDEV,GCHGTYP,[F:MFC]MFCDAT,
+&                             1,LCNVRPT,WRET) From TRTDEV
+
+                # Issue X3-48924 - 2017-09-28 by ERMIL : Add entry point to use custom REGPRIX
+                GPE=0
+                GPOINT="WIPREGPRIX"
+                Gosub ENTREE From EXEFNC
+
+                If !GPE
+                  Call REGPRIX3([F:MFC]STOFCY,5,[F:MFC]ITMREF,[F:MFC]MFCDAT,"",0,"",
+&                               0,[F:MFC]VCRTYP,[F:MFC]VCRNUM,[F:MFC]VCRLIN,LCNVRPT,TOT_ABS,TOT_NABS,TOT_NABS2,WRET) From STKVALREG
+                Endif
+
+                # WRET = Code retour 0 = OK
+                #                    1 = Erreur en lecture de fichier      > mess(12,100,1)?
+                #                    2 = pas de mouvement d'origine trouvé > mess(215,197,1)
+                #                    3 = Quantité active non renseignée dans un mouvement
+                Raz LMSG
+                Case WRET
+                    When 0 : # rien
+                    When 7 :       LMSG = GMESSAGE    # "Période indéfinie ou traitement interdit à cette date"
+                    When Default : LMSG = mess(519,197,1) +"("+num$(WRET)+")"# Erreur sur la régularisation de prix
+                Endcase
+                If LMSG<>""
+                    LMSG += "\"-[F:MFC]VCRNUM-[F:MFC]ITMREF
+                    Call ECR_TRACE(LMSG,0) From GESECRAN
+                Endif
+            Endif
+            # écrire aussi le détail absorbé, non-absorbé (param suppl dans REGPRIX2)
+            Filter [MWI2] Where VCRNUM=[F:MFC]VCRNUM
+&                             & VCRLIN=[F:MFC]VCRLIN
+&                             & TXNTYP=17
+            Look [MWI2] First
+            Filter [MWI2]
+            If fstat
+                Raz [F:MWI]CSTELM(9),[F:MWI]CSTELM(10)
+                For [STJ] Where STOFCY=[F:MFC]STOFCY
+&                             & UPDCOD=2
+&                             & ITMREF=[F:MFC]ITMREF
+&                             & VCRTYPORI=[F:MFC]VCRTYP
+&                             & VCRNUMORI=[F:MFC]VCRNUM
+&                             & VCRLINORI=[F:MFC]VCRLIN
+&                             & find(VCRTYP,15,6) # Déclaration de prod ou réception de sous-traitance
+                    [F:MWI]CSTELM(10) += [F:STJ]AMTDEV
+                Next
+                [F:MWI]CSTELM(9)=-[F:MWI]AMOUNT-[F:MWI]CSTELM(10)
+            Else
+                [F:MWI]CSTELM(9) = TOT_ABS
+                [F:MWI]CSTELM(10)= TOT_NABS
+            Endif
+            If GOK = 0 : ERR = 1 : Break : Endif : # inhibiting error
+        Endif
+
+        Case [M:CTP]VCRTYP
+            When 10 :
+                    Default Mask [MWF0]
+                    # Check receipt cost code to decide if need to do standard
+                    If F_RCPVLTCOD < 3    # géré au cout STANDARD (du moins le 1er produit)
+                       Gosub STANDARD
+                       If ERR = 1 : Break : Endif
+                    Endif
+
+# Issue 77387 - 2011-10-25 by CCC
+#                    # Check balance of WIPCOST Records for Work Order
+#                    Gosub CHK_BALANCE
+#                    If ERR = 1 : Goto ERROR_BREAK : Endif
+#
+#                    # Update the Work Order status to Costed
+#                    Gosub UPD_FLG
+#                    If ERR = 1 : Goto ERROR_BREAK : Endif
+            When 36 :
+                    Default Mask [SWF0]
+                    If F_RCPVLTCOD < 3    # géré au cout STANDARD (du moins le 1er produit)
+                       Gosub STANDARD
+                       If ERR = 1 : Break : Endif
+                    Endif
+
+# Issue 77387 - 2011-10-25 by CCC
+#                    Gosub CHK_BALANCE
+#                    If ERR = 1 : Goto ERROR_BREAK : Endif
+#
+#                    Gosub UPD_FLG
+#                    If ERR = 1 : Goto ERROR_BREAK : Endif
+        Endcase
+$NEXT_MFC
+    Next
+
+If ERR = 1 | GOK<1 : Return : Endif
+
+# Issue 77387 - 2011-10-25 by CCC
+# Check balance of WIPCOST Records for Work Order
+Gosub CHK_BALANCE
+If ERR = 1 : Return : Endif
+
+# Update the Work Order status to Costed
+Gosub UPD_FLG
+If ERR = 1 : Return : Endif
+
+Return
+
+##################################################
+$ALI_NATAMT
+Raz LNATAMTACT, LNATAMTSTD, LNATAMTSCP
+
+Local Integer LINDLIN : Raz LINDLIN
+Local Integer LTABLIN(LNBLIN) : Raz LTABLIN
+For I=0 To [M:CST]NBITM-1
+    If [M:CST]ILNK(I)<>0 & (I=0 | !find([M:CST]ILNK(I),[M:CST]ILNK(0..I-1)))
+        LTABLIN(LINDLIN) = [M:CST]ILNK(I)
+        LINDLIN+=1
+    Endif
+Next
+
+# Recherche des FG réels du niveau pour calcul des écarts
+For [MCN] Where VCRTYP = [M:CTP]VCRTYP
+&             & VCRNUM = [M:CTP]VCRNUM
+&             & MFCTYP = 4
+&             & UID    = 0
+&             & [F:MCN]NATAMTLEV(0) <> 0
+    J = find([F:MCN]VCRLIN,LTABLIN) -1
+# Issue 103359 - 2014-11-28 by CCC : VCRLIN has to exist in MFI
+#    If J<0 : GOK=0 : Break : Endif                # FQ 69909 Ctrl Des Sources Avant Return
+    If J>=0
+        Raz K
+        # Recherche [F:MCN]OVENAT dans LOVENAT
+        I=sigma(0,dim(LOVENAT,2)-1,(indcum+1)
+&                                 *( [F:MCN]OVENAT = LOVENAT(J,indcum)
+&                                  & K=0 & sigma(K=1,1,1)))
+        # Si non trouvé => on cherche le dernier indice pour insérer cette nouvelle nature
+        If !I
+            Raz K
+            I=sigma(0,dim(LOVENAT,2)-1,(indcum+1)
+&                                     *( LOVENAT(J,indcum) = ""
+&                                      & K=0 & sigma(K=1,1,1)))
+        Endif
+        I-=1
+        If I<0 : GOK=0 : Break : Endif                # FQ 69909 Ctrl des sources avant Return
+        LOVENAT(J,I) = [F:MCN]OVENAT
+        For K=0 To dim([F:MCN]NATAMTLEV)-1
+#            LNATAMTACT(J,K,I) += ([F:MCN]NATAMTLEV(K)+[F:MCN]NATAMTSSE(K))*[F:MCN]CPLQTY
+# Issue 87714 - 2013-02-06 by CCC
+#            LNATAMTACT(J,K,I) += ([F:MCN]NATAMTLEV(K))*[F:MCN]CPLQTY
+            LNATAMTACT(J,K,I) += ([F:MCN]NATAMTLEV(K))*([F:MCN]CPLQTY + ([F:MCN]CPLQTY=0))
+        Next
+    Endif
+Next
+If GOK=0
+    Call ECR_TRACE("Error in ALI_NATAMT (MCN)",1) From GESECRAN
+    Return
+Endif                                 # FQ 69909 Ctrl des sources Ligne ajoutée
+
+# Calcul des FG prévus enregistrés dans WIP (mono-niveau) pour calcul des écarts
+For [MWI] Where VCRTYP = [M:CTP]VCRTYP
+&             & VCRNUM = [M:CTP]VCRNUM
+&             & find(TXNTYP,14,16)<>0
+&             & ITMTYP=1
+&             & OVENAT<>""
+   If [F:MWI]VCRLIN<>0
+     J = find([F:MWI]VCRLIN,LTABLIN) -1
+     # Issue 103359 - 2014-11-28 by CCC : VCRLIN has to exist in MFI
+     #If J<0 : GOK=0 : Break : Endif                # FQ 69909 Ctrl Des Sources Avant Return
+     If J>=0
+        Raz K
+        # Recherche [F:MWI]OVENAT dans LOVENAT
+        I=sigma(0,dim(LOVENAT,2)-1,(indcum+1)
+&                                 *( [F:MWI]OVENAT = LOVENAT(J,indcum)
+&                                  & K=0 & sigma(K=1,1,1)))
+        # Si non trouvé => on cherche le dernier indice pour insérer cette nouvelle nature
+        If !I
+            Raz K
+            I=sigma(0,dim(LOVENAT,2)-1,(indcum+1)
+&                                     *( LOVENAT(J,indcum) = ""
+&                                      & K=0 & sigma(K=1,1,1)))
+        Endif
+        I-=1
+        If I<0 : GOK=0 : Break : Endif                # FQ 69909 Ctrl des sources avant Return
+        LOVENAT(J,I) = [F:MWI]OVENAT
+        For K=2 To 5
+            If [F:MWI]TXNTYP=16
+                LNATAMTSCP(J,K,I) += [F:MWI]CSTELM(K+2)
+                LNATAMTSCP(J,0,I) += [F:MWI]CSTELM(K+2)
+            Else
+                LNATAMTSTD(J,K,I) += [F:MWI]CSTELM(K+2)
+                LNATAMTSTD(J,0,I) += [F:MWI]CSTELM(K+2)
+            Endif
+        Next
+     Endif
+   Else
+        For J=0 To LINDLIN-1
+            Raz K
+            I=sigma(0,dim(LOVENAT,2)-1,(indcum+1)
+&                                     *( [F:MWI]OVENAT = LOVENAT(J,indcum)
+&                                      & K=0 & sigma(K=1,1,1)))
+
+            If !I
+                Raz K
+                I=sigma(0,dim(LOVENAT,2)-1,(indcum+1)
+&                                         *( LOVENAT(J,indcum) = ""
+&                                          & K=0 & sigma(K=1,1,1)))
+            Endif
+            I-=1
+            If I<0 : GOK=0 : Break : Endif            # FQ 69909 Ctrl des sources avant Return
+            LOVENAT(J,I) = [F:MWI]OVENAT
+
+            # Issue 90643 - 2013-06-25 by CCC
+            SUM_CPLQTY = func TRTCST.SUMQTY("P",0)
+            If SUM_CPLQTY<>0
+                LCOE = func TRTCST.SUMQTY("P",LTABLIN(J)) / SUM_CPLQTY
+            Endif
+
+            For K=2 To 5
+                If SUM_CPLQTY <> 0
+                    # répartition selon quantité réalisée
+                    If [F:MWI]TXNTYP=16
+                        LNATAMTSCP(J,K,I) += [F:MWI]CSTELM(K+2) * LCOE
+                        LNATAMTSCP(J,0,I) += [F:MWI]CSTELM(K+2) * LCOE
+                    Else
+                        LNATAMTSTD(J,K,I) += [F:MWI]CSTELM(K+2) * LCOE
+                        LNATAMTSTD(J,0,I) += [F:MWI]CSTELM(K+2) * LCOE
+                    Endif
+                Else
+                    # répartition selon nb de lignes
+                    If [F:MWI]TXNTYP=16
+                        LNATAMTSCP(J,K,I) += [F:MWI]CSTELM(K+2) / LINDLIN
+                        LNATAMTSCP(J,0,I) += [F:MWI]CSTELM(K+2) / LINDLIN
+                    Else
+                        LNATAMTSTD(J,K,I) += [F:MWI]CSTELM(K+2) / LINDLIN
+                        LNATAMTSTD(J,0,I) += [F:MWI]CSTELM(K+2) / LINDLIN
+                    Endif
+                Endif
+            Next
+        Next
+        If GOK=0 Break Endif                          # FQ 69909 Ctrl des sources Ligne ajoutée
+   Endif
+Next
+If GOK=0
+    Call ECR_TRACE("Error in ALI_NATAMT (MWI)",1) From GESECRAN
+    Return
+Endif                                 # FQ 69909 Ctrl des sources Ligne ajoutée
+Return
+
+##################################################
+$REGUL_REEL
+# régularisation quand on gère au cout réel (prix moyen...)
+
+# Issue 85549 - 2012-11-08 by CCC
+Raz TOT_ABS, TOT_NABS
+If [F:MFC]QTYSTU>0
+# CCC (14/02/05) Bug 28345 : Utilisation devise société dans la valeur du lot
+    Call CONVERT2(GLOCALDEV,GSYSCUR,GLOCALDEV,GCHGTYP,[F:MFC]MFCDAT,
+&                 1,LCNVRPT,WRET) From TRTDEV
+
+    [M:SDP]AMTTOT = func SUBSDPCOM.SUMCST("SDP")
+
+    # Issue X3-48924 - 2017-09-28 by ERMIL : Add entry point to use custom REGPRIX
+    GPE=0
+    GPOINT="WIPREGPRIX"
+    Gosub ENTREE From EXEFNC
+
+    If !GPE
+      Call REGPRIX3([F:MFC]STOFCY,5,[F:MFC]ITMREF,[F:MFC]MFCDAT,"",0,"",
+&                   0,[F:MFC]VCRTYP,[F:MFC]VCRNUM,[F:MFC]VCRLIN,LCNVRPT,TOT_ABS,TOT_NABS,TOT_NABS2,WRET) From STKVALREG
+    Endif
+Endif
+
+# Les éléments de facturation du niveau sont traités à part => on n'en tient pas compte
+If [F:MFC]INVDTACPN+[F:MFC]INVDTACST=0
+    [M:SDP]INVDTACST = [F:MFC]INVDTACPN * [F:MFC]QTYSTU
+Else
+    [M:SDP]INVDTACST = [M:SDP]INVDTACST/([F:MFC]INVDTACPN+[F:MFC]INVDTACST) * [F:MFC]INVDTACPN
+Endif
+
+Call GET_LAST_SEQ([M:CTP]VCRTYP,[M:CTP]VCRNUM,LAST_SEQ) From MWIPLIB
+
+# Create the WIPCOST records
+Raz [F:MWI]
+Case [M:CTP]VCRTYP
+     When 10 :
+          Read [MFI]MFI0 = [F:MFC]VCRNUM;[F:MFC]VCRLIN
+          [F:MWI]        = [F:MFI]
+          [F:MWI]QTY     = [F:MFI]CPLQTY
+          [F:MWI]ENTCOD    = GACCWIPENT
+     When 36 :
+          Read [SCI]SCI0 = [F:MFC]VCRNUM;[F:MFC]VCRLIN
+          [F:MWI]        = [F:SCI]
+          [F:MWI]QTY     = [F:SCI]CPLQTY
+          [F:MWI]MFGFCY  = [F:SCI]PRHFCY
+          [F:MWI]ENTCOD    = GACCWIPEOA
+Endcase
+
+[F:MWI]VCRTYP = [M:CTP]VCRTYP
+[F:MWI]VCRNUM = [M:CTP]VCRNUM
+[F:MWI]VCRLIN = [F:MFC]VCRLIN   # Issue 80485 - 2012-03-01 by CCC
+
+[F:MWI]PRINAT    = [F:TCM]ISSVLTCOD+1 # doit correspondre au ML 705 (comme déclaration de prod 14)
+
+[F:MWI]WIPSEQ    = LAST_SEQ + 1
+[F:MWI]TXNTYP    = 17
+[F:MWI]TXNDAT    = WO_CLODAT
+[F:MWI]TXNACT    = 1
+
+[F:MWI]GLPSTA    = 1
+
+LINVDTATOT = [M:SDP]INVDTACST
+
+# Le calcul de l'écart se fait hors élément de facturation
+# [SDP] a été alimenté avec les valeurs I*CST => le rebut a déjà été enlevé.
+[F:MWI]CSTELM(0) = func SUBSDPCOM.SUMCST("SDP")#-[M:SDP]INVDTACST
+
+Raz [F:MWI]CSTELM(1)
+# On somme ce qui a déjà été compté pour calculer un nouvel écart
+For [F:MWI2] Where VCRTYP = [M:CTP]VCRTYP
+&             & VCRNUM = [M:CTP]VCRNUM
+&             & VCRLIN = [F:MFC]VCRLIN
+&             & find(TXNTYP,14,17)
+&             & ITMTYP <> 2
+    [F:MWI]CSTELM(1) += [F:MWI2]AMOUNT
+Next
+[F:MWI]AMOUNT    = ([F:MWI]CSTELM(1) + [F:MWI]CSTELM(0)) * (-1)  # correspond à valeur mvt - dépense réelle
+
+# Détail de montant régularisé  (pour édition US-WIPVAL) au prorata du produit !!!
+For [F:MWI2] Where VCRTYP = [M:CTP]VCRTYP
+&             & VCRNUM = [M:CTP]VCRNUM
+&             & VCRLIN = [F:MFC]VCRLIN
+&             & find(TXNTYP,9,10,11,12,13,14,17,20)
+&             & ITMTYP <> 2
+# Issue 85937 - 2012-11-16 by CCC
+#    Case [F:MWI]TXNTYP
+    Case [F:MWI2]TXNTYP
+        When 9    : [F:MWI]CSTELM(4) += [F:MWI2]AMOUNT
+                    For I=0 To dim([F:MWI]MATCST)-1
+                        [F:MWI]MATCST(I) += [F:MWI2]MATCST(I)
+                    Next
+
+        When 10   : [F:MWI]CSTELM(5) += [F:MWI2]AMOUNT
+                    For I=0 To dim([F:MWI]LABCST)-1
+                        [F:MWI]LABCST(I) += [F:MWI2]LABCST(I)
+                    Next
+
+        When 11   : [F:MWI]CSTELM(6) += [F:MWI2]AMOUNT
+                    For I=0 To dim([F:MWI]MACCST)-1
+                        [F:MWI]MACCST(I) += [F:MWI2]MACCST(I)
+                    Next
+
+        When 12   : [F:MWI]CSTELM(7) += [F:MWI2]AMOUNT
+                    [F:MWI]SCOCST += [F:MWI2]SCOCST
+
+        When 13   : [F:MWI]CSTELM(8) += [F:MWI2]AMOUNT
+                    [F:MWI]OVEMATCST += [F:MWI2]OVEMATCST
+                    [F:MWI]OVEMACCST += [F:MWI2]OVEMACCST
+                    [F:MWI]OVELABCST += [F:MWI2]OVELABCST
+                    [F:MWI]OVESCOCST += [F:MWI2]OVESCOCST
+
+        When 14   : # Issue 91525 - 2013-07-31 by CCC : l'écart doit être calculé en multi-niveaux (comme pour les STJ)
+                    #[F:MWI]CSTELM(4) += [F:MWI2]CSTELM(0)
+                    #[F:MWI]CSTELM(5) += [F:MWI2]CSTELM(1)
+                    #[F:MWI]CSTELM(6) += [F:MWI2]CSTELM(2)
+                    #[F:MWI]CSTELM(7) += [F:MWI2]CSTELM(3)
+                    #[F:MWI]CSTELM(8) += [F:MWI2]CSTELM(4)
+                    [F:MWI]CSTELM(4) += [F:MWI2]CSTELM(8)
+                    [F:MWI]CSTELM(5) += [F:MWI2]CSTELM(9)
+                    [F:MWI]CSTELM(6) += [F:MWI2]CSTELM(10)
+                    [F:MWI]CSTELM(7) += [F:MWI2]CSTELM(11)
+                    [F:MWI]CSTELM(8) += sum([F:MWI2]CSTELM(12..15))
+                    For I=0 To dim([F:MWI]MATCST)-1
+                        [F:MWI]MATCST(I) += [F:MWI2]MATCST(I)
+                    Next
+                    For I=0 To dim([F:MWI]LABCST)-1
+                        [F:MWI]LABCST(I) += [F:MWI2]LABCST(I)
+                    Next
+                    For I=0 To dim([F:MWI]MACCST)-1
+                        [F:MWI]MACCST(I) += [F:MWI2]MACCST(I)
+                    Next
+                    [F:MWI]SCOCST += [F:MWI2]SCOCST
+                    [F:MWI]INVDTACST += [F:MWI2]INVDTACST
+
+                    [F:MWI]OVEMATCST += [F:MWI2]OVEMATCST
+                    [F:MWI]OVEMACCST += [F:MWI2]OVEMACCST
+                    [F:MWI]OVELABCST += [F:MWI2]OVELABCST
+                    [F:MWI]OVESCOCST += [F:MWI2]OVESCOCST
+
+        When 17   : For I=4,5,6,7,8,16
+                        [F:MWI]CSTELM(I) += [F:MWI2]CSTELM(I)
+                    Next
+                    For I=0 To dim([F:MWI]MATCST)-1
+                        [F:MWI]MATCST(I) += [F:MWI2]MATCST(I)
+                    Next
+                    For I=0 To dim([F:MWI]LABCST)-1
+                        [F:MWI]LABCST(I) += [F:MWI2]LABCST(I)
+                    Next
+                    For I=0 To dim([F:MWI]MACCST)-1
+                        [F:MWI]MACCST(I) += [F:MWI2]MACCST(I)
+                    Next
+                    [F:MWI]SCOCST    += [F:MWI2]SCOCST
+                    [F:MWI]INVDTACST += [F:MWI2]INVDTACST
+
+                    [F:MWI]OVEMATCST += [F:MWI2]OVEMATCST
+                    [F:MWI]OVEMACCST += [F:MWI2]OVEMACCST
+                    [F:MWI]OVELABCST += [F:MWI2]OVELABCST
+                    [F:MWI]OVESCOCST += [F:MWI2]OVESCOCST
+
+#        When 20   : [F:MWI]CSTELM(16) += [F:MWI2]AMOUNT
+#                    [F:MWI]INVDTACST  += [F:MWI2]INVDTACST
+
+    Endcase
+    [F:MWI]MATLEV0 += [F:MWI2]MATLEV0
+Next
+
+# Actual Material level Adjustment
+[F:MWI]MATLEV0 = ( sum([M:SDP]MATLEV0) + [F:MWI]MATLEV0) * (-1)
+
+# Actual Material Adjustment
+[F:MWI]CSTELM(4) = ( sum([M:SDP]MATCST) + [F:MWI]CSTELM(4)) * (-1)
+# Actual Labor Adjustment
+[F:MWI]CSTELM(5) = ( sum([M:SDP]LABCST) + [F:MWI]CSTELM(5)) * (-1)
+# Actual Machine Adjustment
+[F:MWI]CSTELM(6) = ( sum([M:SDP]MACCST) + [F:MWI]CSTELM(6)) * (-1)
+# Actual Sub-contract Adjustment
+[F:MWI]CSTELM(7) = ( [M:SDP]SCOCST + [F:MWI]CSTELM(7)) * (-1)
+# Actual Overhead Adjustment
+[F:MWI]CSTELM(8) = ( [M:SDP]OVEMATCST + [M:SDP]OVEMACCST + [M:SDP]OVELABCST + [M:SDP]OVESCOCST
+&                  +[F:MWI]CSTELM(8)) * (-1)
+
+# Eléments de facturation réels
+[F:MWI]CSTELM(16) = ( [M:SDP]INVDTACST + [F:MWI]CSTELM(16)) * (-1)
+
+For I=0 To GACTMAT-1
+    [F:MWI]MATCST(I) = ( [M:SDP]MATCST(I) + [F:MWI]MATCST(I) ) * (-1)
+Next
+
+For I=0 To GACTMAC-1
+    [F:MWI]MACCST(I) = ( [M:SDP]MACCST(I) + [F:MWI]MACCST(I) ) * (-1)
+Next
+
+For I=0 To GACTLAB-1
+    [F:MWI]LABCST(I) = ( [M:SDP]LABCST(I) + [F:MWI]LABCST(I) ) * (-1)
+Next
+
+[F:MWI]SCOCST = ( [M:SDP]SCOCST + [F:MWI]SCOCST) * (-1)
+
+[F:MWI]INVDTACST = ( [M:SDP]INVDTACST + [F:MWI]INVDTACST) * (-1)
+
+[F:MWI]OVEMATCST = ( [M:SDP]OVEMATCST + [F:MWI]OVEMATCST) * (-1)
+
+[F:MWI]OVEMACCST = ( [M:SDP]OVEMACCST + [F:MWI]OVEMACCST) * (-1)
+
+[F:MWI]OVELABCST = ( [M:SDP]OVELABCST + [F:MWI]OVELABCST) * (-1)
+
+[F:MWI]OVESCOCST = ( [M:SDP]OVESCOCST + [F:MWI]OVESCOCST) * (-1)
+
+Raz [M]BOTLIG,[M]LOT,[M]SLO,[M]LOTSTU,[M]LOTQTY,[M]LOTADJ,[M]LOTOH
+Raz ON_HAND_PER
+Case [F:MWI]PRINAT
+    When 5:    # Cas valorisation au PMP  : # GA 05/2008 remplacement des [F:MFI] pour la V6
+           Read [ITV]ITV0 = [F:MWI]ITMREF;[F:MWI]MFGFCY
+           If fstat
+                ERR = 1
+                LMSG = mess(14,2363,1) - [F:MWI]ITMREF - [F:MWI]MFGFCY
+                Call ECR_TRACE(LMSG,1) From GESECRAN # err lecture sur ITMMVT
+                Call ECR_TRACE(" ",0) From GESECRAN
+                Raz LMSG
+                Return
+           Endif
+           Read [ITF]ITF0=[F:MWI]ITMREF;[F:MWI]MFGFCY
+           [M]PROPER(0) = [F:ITF]PROPER
+           [M]LOTSTU(0)    = [F:MWI]STU
+           [M]LOT(0)       = ""
+           [M]LOTADJ(0)    = [F:MWI]AMOUNT
+           [M]LOTQTY(0)    = [F:MWI]QTY   # Qté réalisée
+           [M]LOTOH(0)     = [F:ITV]PHYSTO + [F:ITV]CTLSTO + [F:ITV]REJSTO # pas significatif par rapport à CET OF !!
+           [M]BOTLIG = 1
+
+    When 6:    # cas valorisation au prix FIFO : # GA 05/2008 remplacement des [F:MKI] pour la V6
+           Case [M:CTP]VCRTYP
+               When 10 : # cas d'un OF
+             # ------------------------------------------------------------------------------ #
+                  For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN = [F:MFI]MFGLIN
+                    # CCC (2009-09-23) Bug 58039 : La quantité produite doit être renseignée dans LOTQTY même s'il n'y a plus l'élément de pile correspondant
+                    [M]LOTSTU([M]BOTLIG) = [F:MKI]STU
+                    [M]LOTQTY([M]BOTLIG) = [F:MKI]CPLQTY
+                    #rech STO remplacée par boucle sur STOCOST (>>ou accès direct si 1 pile par ligne de doc)
+                    For [STP] Where ITMREF = [F:MKI]ITMREF & VCRTYP = 15 &
+&                             VCRNUM = [F:MKI]MFGTRKNUM & VCRLIN = [F:MKI]ITMTRKLIN
+                        [M]LOT([M]BOTLIG)    = num$([F:STP]CSTCOU)
+                        [M]LOTOH([M]BOTLIG)  = [F:STP]QTYSTUACT
+                        Break
+                    Next
+                    Read [ITF]ITF0=[F:MKI]ITMREF;[F:MKI]MFGFCY
+                    [M]PROPER([M]BOTLIG) = [F:ITF]PROPER
+                    [M]BOTLIG   += 1
+                  Next
+               When 36 : # cas d'un EO recherche des mvts de stock réception (pas de suivi)
+             # ------------------------------------------------------------------------------ #
+                  For [PTD] Where VCRTYPORI=[F:MWI]VCRTYP & VCRNUMORI=[F:MWI]VCRNUM & VCRLINORI= [F:MWI]VCRLIN
+                    # CCC (2009-09-23) Bug 58039 : La quantité produite doit être renseignée dans LOTQTY même s'il n'y a plus l'élément de pile correspondant
+                    [M]LOTSTU([M]BOTLIG) = [F:PTD]STU
+                    [M]LOTQTY([M]BOTLIG) = [F:PTD]QTYSTU
+                    #rech STO remplacée par boucle sur STOCOST (>>ou accès direct si 1 pile par ligne de doc)
+                    For [STP] Where ITMREF = [F:PTD]ITMREF
+&                                 & VCRTYP = 6 & VCRNUM = [F:PTD]PTHNUM & VCRLIN = [F:PTD]PTDLIN
+                        [M]LOT([M]BOTLIG)    = num$([F:STP]CSTCOU)
+                        [M]LOTOH([M]BOTLIG)  = [F:STP]QTYSTUACT
+                        Break
+                    Next
+                    Read [ITF]ITF0=[F:PTD]ITMREF;[F:PTD]PRHFCY
+                    [M]PROPER([M]BOTLIG) = [F:ITF]PROPER
+                    [M]BOTLIG   += 1
+                  Next
+           Endcase
+
+           For J = 0 To [M]BOTLIG - 1
+               If sum([M]LOTQTY) <> 0
+                  [M]LOTADJ(J) = arr(([M]LOTQTY(J) / sum([M]LOTQTY)) * [F:MWI]AMOUNT,L_CURRND)
+               Endif
+           Next
+
+           If sum([M]LOTADJ) <> [F:MWI]AMOUNT
+               # CCC (2009-12-22) Bug 60072 : écart d'arrondi mal calculé
+               #[M]LOTADJ(0) += (sum([M]LOTADJ) - [F:MWI]AMOUNT)
+               [M]LOTADJ(0) += [F:MWI]AMOUNT - sum([M]LOTADJ)
+           Endif
+
+    When 7:    # cas valorisation au prix moyen du lot : # GA 05/2008 remplacement des [F:MKI] pour la V6
+           Case [M:CTP]VCRTYP
+               When 10 : # cas d'un OF
+             # ------------------------------------------------------------------------------ #
+                 For [MKI]MKI1 Where MFGNUM = [F:MFI]MFGNUM & MFGLIN = [F:MFI]MFGLIN
+                   If [F:ITF]ITMREF<>[F:MKI]ITMREF | [F:ITF]STOFCY<>[F:MKI]MFGFCY
+                       Read [ITF]ITF0=[F:MKI]ITMREF;[F:MKI]MFGFCY
+                   Endif
+                   For [STJ]STJ1 Where STOFCY=[F:MFI]MFGFCY & ITMREF = [F:MKI]ITMREF & VCRTYP=15 &
+&                          VCRNUM = [F:MKI]MFGTRKNUM & VCRLIN = [F:MKI]ITMTRKLIN
+                     If [M]BOTLIG = 0
+                        [M]LOTSTU([M]BOTLIG) = [F:MKI]STU
+                        [M]LOT([M]BOTLIG)    = [F:STJ]LOT
+                        [M]SLO([M]BOTLIG)    = [F:STJ]SLO
+                        [M]LOTQTY([M]BOTLIG) = [F:STJ]ACTQTY # qté entrée sur ce lot
+                        [M]PROPER([M]BOTLIG) = [F:ITF]PROPER
+                        [M]BOTLIG = 1
+                     Else
+                         For J = 0 To [M]BOTLIG - 1
+                             If [M]LOT(J) = [F:STJ]LOT & [M]SLO(J)=[F:STJ]SLO
+                                  [M]LOTQTY(J) += [F:STJ]ACTQTY
+                                  Break
+                             Elsif J = [M]BOTLIG - 1
+                                 [M]LOTSTU([M]BOTLIG) = [F:MKI]STU
+                                 [M]LOT([M]BOTLIG)    = [F:STJ]LOT
+                                 [M]SLO([M]BOTLIG)    = [F:STJ]SLO
+                                 [M]LOTQTY([M]BOTLIG) = [F:STJ]ACTQTY
+                                 [M]PROPER([M]BOTLIG) = [F:ITF]PROPER
+                                 [M]BOTLIG += 1
+                             Endif
+                         Next J
+                     Endif
+                   Next
+                 Next
+
+               When 36 : # cas d'un EO recherche des mvts de stock réception (pas de suivi)
+             # ------------------------------------------------------------------------------ #
+                 For [PTD] Where VCRTYPORI=[F:MWI]VCRTYP & VCRNUMORI=[F:MWI]VCRNUM & VCRLINORI= [F:MWI]VCRLIN
+                   If [F:ITF]ITMREF<>[F:PTD]ITMREF | [F:ITF]STOFCY<>[F:PTD]PRHFCY
+                       Read [ITF]ITF0=[F:PTD]ITMREF;[F:PTD]PRHFCY
+                   Endif
+                   For [STJ]STJ1 Where STOFCY=[F:PTD]PRHFCY & ITMREF = [F:PTD]ITMREF
+&                                    & VCRTYP = 6 & VCRNUM = [F:PTD]PTHNUM & VCRLIN = [F:PTD]PTDLIN
+                     If [M]BOTLIG = 0
+                        [M]LOTSTU([M]BOTLIG) = [F:STJ]STU
+                        [M]LOT([M]BOTLIG)    = [F:STJ]LOT
+                        [M]SLO([M]BOTLIG)    = [F:STJ]SLO
+                        [M]LOTQTY([M]BOTLIG) = [F:STJ]ACTQTY # qté entrée sur ce lot
+                        [M]PROPER([M]BOTLIG) = [F:ITF]PROPER
+                        [M]BOTLIG = 1
+                     Else
+                        For J = 0 To [M]BOTLIG - 1
+                          If [M]LOT(J) = [F:STJ]LOT & [M]SLO(J)=[F:STJ]SLO
+                               [M]LOTQTY(J) += [F:STJ]ACTQTY
+                               Break
+                          Elsif J = [M]BOTLIG - 1
+                              [M]LOTSTU([M]BOTLIG) = [F:STJ]STU
+                              [M]LOT([M]BOTLIG)    = [F:STJ]LOT
+                              [M]SLO([M]BOTLIG)    = [F:STJ]SLO
+                              [M]LOTQTY([M]BOTLIG) = [F:STJ]ACTQTY
+                              [M]PROPER([M]BOTLIG) = [F:ITF]PROPER
+                              [M]BOTLIG += 1
+                          Endif
+                        Next J
+                     Endif
+                   Next
+                 Next
+           Endcase
+
+           For J = 0 To [M]BOTLIG - 1
+               Read [SLF]SLF0 = [F:MWI]ITMREF;[M]LOT(J);[M]SLO(J);[F:MWI]MFGFCY
+               If fstat
+                   [M]LOTOH(J) = 0
+               Else
+                   [M]LOTOH(J) = [F:SLF]AVCBASQTY
+               Endif
+
+               If sum([M]LOTQTY) <> 0
+                   [M]LOTADJ(J) = arr(([M]LOTQTY(J) / sum([M]LOTQTY)) * [F:MWI]AMOUNT,L_CURRND)
+               Endif
+           Next
+
+           If sum([M]LOTADJ) <> ([F:MWI]AMOUNT+LINVDTATOT)
+               # CCC (2009-12-22) Bug 60072 : écart d'arrondi mal calculé
+               #[M]LOTADJ(0) += (sum([M]LOTADJ) - [F:MWI]AMOUNT)
+               [M]LOTADJ(0) += [F:MWI]AMOUNT - sum([M]LOTADJ)
+           Endif
+Endcase
+
+# répartition entre 2 sous-totaux pour imputer sur le compte stock ou sur le compte Coût Biens vendus
+For J = 0 To [M]BOTLIG - 1
+    Raz ON_HAND_PER     # pourcentage de qté restante en stock
+    If [M]LOTQTY(J) <> 0
+        ON_HAND_PER    = ([M]LOTOH(J) / [M]LOTQTY(J)) * 100
+    Endif
+    If ON_HAND_PER > 100 ON_HAND_PER=100 Endif # cas de valo au PMP : on pourrait dépasser !
+    If [M]LOTOH(J) = 0
+        [F:MWI]CSTELM(2)    += 0
+#        [F:MWI]CSTELM(3)    += [M]LOTADJ(J)
+    Else
+      If (FLGUSA=1 & ON_HAND_PER <= [M]PROPER(I)) | FLGUSA=0  # pourcentage plafond (pour USA...) (18/05/04)
+        [F:MWI]CSTELM(2)    += arr(([M]LOTADJ(J) * ON_HAND_PER)/100,L_CURRND)
+#        [F:MWI]CSTELM(3)    += [M]LOTADJ(J) - [F:MWI]CSTELM(2)
+      Else
+        [F:MWI]CSTELM(2)    += [M]LOTADJ(J)
+#        [F:MWI]CSTELM(3)    += 0
+      Endif
+    Endif
+Next
+
+# CCC (2009-11-04) Bug 59548 : Calcul de CSTELM(3) en fonction de CSTELM(2)
+[F:MWI]CSTELM(3) = sum([M]LOTADJ(0..[M]BOTLIG-1)) - [F:MWI]CSTELM(2)
+
+If ([F:MWI]CSTELM(2) + [F:MWI]CSTELM(3)) <> ([F:MWI]AMOUNT+LINVDTATOT)
+    # CCC (2009-12-22) Bug 60072 : écart d'arrondi mal calculé
+    #[F:MWI]CSTELM(2) += (([F:MWI]CSTELM(2) + [F:MWI]CSTELM(3)) - ([F:MWI]AMOUNT+LINVDTATOT))
+    [F:MWI]CSTELM(2) += ([F:MWI]AMOUNT+LINVDTATOT) - ([F:MWI]CSTELM(2) + [F:MWI]CSTELM(3))
+Endif
+
+# Issue 85549 - 2012-11-08 by CCC
+#Raz TOT_ABS, TOT_NABS
+#
+#If [F:MFC]QTYSTU>0
+## CCC (14/02/05) Bug 28345 : Utilisation devise société dans la valeur du lot
+#    Call CONVERT2(GLOCALDEV,GSYSCUR,GLOCALDEV,GCHGTYP,[F:MFC]MFCDAT,
+#&                 1,LCNVRPT,WRET) From TRTDEV
+#
+#    Call REGPRIX3([F:MFC]STOFCY,5,[F:MFC]ITMREF,[F:MFC]MFCDAT,"",0,"",
+#&                 0,[F:MFC]VCRTYP,[F:MFC]VCRNUM,[F:MFC]VCRLIN,LCNVRPT,TOT_ABS,TOT_NABS,TOT_NABS2,WRET) From STKVALREG
+#Endif
+
+# erreurs en retour / WRET
+Raz LMSG
+Case WRET
+    When 0 : # rien
+    When 7 :       LMSG = GMESSAGE    # "Période indéfinie ou traitement interdit à cette date"
+    When Default : LMSG = mess(519,197,1) +"("+num$(WRET)+")"# Erreur sur la régularisation de prix
+Endcase
+If LMSG<>""
+    LMSG += "\"-[F:MFC]VCRNUM-[F:MFC]ITMREF
+    Call ECR_TRACE(LMSG,0) From GESECRAN
+Endif
+Raz GMESSAGE
+# écrire aussi le détail absorbé, non-absorbé (param suppl dans REGPRIX2)
+            # écrire aussi le détail absorbé, non-absorbé (param suppl dans REGPRIX2)
+Filter [MWI2] Where VCRTYP=[F:MFC]VCRTYP
+&                 & VCRNUM=[F:MFC]VCRNUM
+&                 & VCRLIN=[F:MFC]VCRLIN
+&                 & TXNTYP=17
+Look [MWI2] First
+Filter [MWI2]
+
+If fstat
+    Raz TOT_ABS,TOT_NABS,TOT_NABS2
+    Filter [STJ] Where STOFCY=[F:MFC]STOFCY
+&                 & UPDCOD=2
+&                 & ITMREF=[F:MFC]ITMREF
+&                 & VCRTYPORI=[F:MFC]VCRTYP
+&                 & VCRNUMORI=[F:MFC]VCRNUM
+&                 & VCRLINORI=[F:MFC]VCRLIN
+&                 & find(VCRTYP,15,6)<>0 # Déclaration de prod ou réception de sous-traitance
+    For [STJ]STJ1(4)
+        # Récupération de la date d'imputation de la ligne de doc
+        LIPTVCR = [F:STJ]IPTDAT
+        Raz REQ
+        REQ = "SELECT MIN(IPTDAT_0) FROM STOJOU"
+        REQ+= " WHERE STOFCY_0='"+[F:STJ]STOFCY+"'"
+        REQ+= " AND VCRTYP_0="+num$([F:STJ]VCRTYP)
+        REQ+= " AND VCRNUM_0='"+[F:STJ]VCRNUM+"'"
+        REQ+= " AND VCRLIN_0="+num$([F:STJ]VCRLIN)
+        REQ+= " AND REGFLG_0=1"
+        For (Date IPTVCR) From num$(GTYPDBA*2+1) Sql REQ As [IPTX]
+            LIPTVCR = [F:IPTX]IPTVCR
+        Next
+        # Récupération de l'écart non absorbé car sur une période fermée
+        For [STJ2] Where STOFCY=[F:STJ]STOFCY
+&                      & UPDCOD=2
+&                      & ITMREF=[F:STJ]ITMREF
+&                      & find(VCRTYP,15,6)<>0
+&                      & VCRNUM=[F:STJ]VCRNUM
+&                      & VCRLIN=[F:STJ]VCRLIN
+&                      & VCRTYPORI=[F:STJ]VCRTYPORI
+&                      & VCRNUMORI=[F:STJ]VCRNUMORI
+&                      & VCRLINORI=[F:STJ]VCRLINORI
+&                      & IPTDAT<>LIPTVCR
+            TOT_NABS2+=[F:STJ2]AMTDEV
+        Next
+        For [STJ]STJ1
+            TOT_NABS += [F:STJ]AMTDEV
+        Next
+    Next
+    TOT_ABS=-[F:MWI]AMOUNT-TOT_NABS
+Endif
+[F:MWI]CSTELM(9) = TOT_ABS + TOT_NABS2
+[F:MWI]CSTELM(10)= TOT_NABS - TOT_NABS2
+
+If GOK = 0 : ERR = 1 : Endif : # inhibiting error
+
+# CCC (2009-12-09) Bug 60341 : Créer un enreg d'écart par date de production
+#1- Calcul des valeurs pour chaque enreg 17
+If dim(LNBKEY)>0 : Kill LNBKEY : Endif
+If dim(LNBVAR)>0 : Kill LNBVAR : Endif
+Local Integer LNBKEY, LNBVAR
+For (Integer NB) From num$(GTYPDBA*2+1)
+&                Sql "SELECT COUNT(DISTINCT TXNDAT_0) FROM WIPCOST"
+&                   +" WHERE TXNTYP_0=14 AND OVENAT_0=' ' AND VCRTYP_0="+num$([F:MFC]VCRTYP)
+&                   +" AND VCRNUM_0='"+[F:MFC]VCRNUM+"' AND VCRLIN_0="+num$([F:MFC]VCRLIN)
+&                As [XXX]
+    LNBKEY = [F:XXX]NB
+    Break
+Next
+
+#If LNBKEY=0
+#    Filter [MWI2]
+#    GOK = 0 : ERR = 1
+#    Return
+#Endif
+LNBKEY = max(1,LNBKEY)
+
+LNBVAR = 14
+If dim(LTABKEY)>0 : Kill LTABKEY : Endif
+If dim(LTABREF)>0 : Kill LTABREF : Endif
+If dim(LTABVAL)>0 : Kill LTABVAL : Endif
+If dim(LTABVAR)>0 : Kill LTABVAR : Endif
+Local Char LTABKEY(12)(LNBKEY)
+Local Decimal LTABREF(LNBKEY)
+Local Decimal LTABVAL(LNBKEY,LNBVAR)
+Local Char LTABVAR(25)(LNBVAR)
+Raz LTABVAR, K, V
+LTABVAR(V) = "[F:MWI]AMOUNT" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(0)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(1)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(2)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(3)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(4)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(5)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(6)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(7)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(8)" : V+=1  # Issue 96029 - 2014-01-21 by CCC
+LTABVAR(V) = "[F:MWI]CSTELM(9)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(10)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(16)" : V+=1  # Issue 96029 - 2014-01-21 by CCC
+LTABVAR(V) = "[F:MWI]MATLEV0" : V+=1
+
+Raz LTABKEY, LTABREF, V, K
+Filter [MWI2] Where VCRTYP=[F:MFC]VCRTYP
+&                 & VCRNUM=[F:MFC]VCRNUM
+&                 & VCRLIN=[F:MFC]VCRLIN
+&                 & TXNTYP=14
+&                 & OVENAT=""
+&                 & TXNDAT<LDATPER
+# Issue 100887 - 2014-10-29 by CCC : tracking has to have qty not null to be taken into account
+#LTABKEY(0)=format$("D:DDMMYYYY",date$)
+Raz LOLDDAT
+For [MWI2]
+    LOLDDAT = 1
+    LTABREF(0) += [F:MWI2]QTY
+Next
+If LOLDDAT
+    # Issue 100887 - 2014-10-29 by CCC : tracking has to have qty not null to be taken into account
+    If LTABREF(0)<>0
+        LTABKEY(0)=format$("D:DDMMYYYY",date$)
+        K=1
+    Endif
+Endif
+Filter [MWI2]
+Filter [MWI2] Where VCRTYP=[F:MFC]VCRTYP
+&                 & VCRNUM=[F:MFC]VCRNUM
+&                 & VCRLIN=[F:MFC]VCRLIN
+&                & TXNTYP=14
+&                & OVENAT=""
+&                & TXNDAT>=LDATPER
+&            Order By Key KMWI=TXNDAT
+For [MWI2]KMWI(1)
+    # Issue 100887 - 2014-10-29 by CCC : tracking has to have qty not null to be taken into account
+    #LTABKEY(K)=format$("D:DDMMYYYY",[F:MWI2]TXNDAT)
+    For [MWI2]KMWI
+        LTABREF(K) += [F:MWI2]QTY
+    Next
+    # Issue 100887 - 2014-10-29 by CCC : tracking has to have qty not null to be taken into account
+    If LTABREF(K)<>0
+        LTABKEY(K)=format$("D:DDMMYYYY",[F:MWI2]TXNDAT)
+        K+=1
+    Endif
+Next
+Filter [MWI2]
+
+# S'il n'y a pas eu de déclaration de prod on date le solde à la date du jour
+If K=0
+    LTABKEY(0) = format$("D:DDMMYYYY",date$)
+    LNBKEY = 1
+    LTABREF(0)=1
+Endif
+Call CALCPROP(LNBKEY, LTABREF, LNBVAR, LTABVAR, L_CURRND, LTABVAL) From STKVAL
+If K=0
+    LTABREF(0)=0
+Endif
+
+#2- Ecriture des résultats
+For K=0 To LNBKEY-1
+    [F:MWI]TXNDAT = gdat$(val(left$(LTABKEY(K),2)),val(mid$(LTABKEY(K),3,2)),val(right$(LTABKEY(K),5)))
+    [F:MWI]QTY = LTABREF(K)
+    For V=0 To LNBVAR-1
+        Assign LTABVAR(V) With LTABVAL(K,V)
+    Next
+
+    # L'enregistrement de solde dont la date est forcée à la date du jour n'absorbe rien
+    If K=0 & LOLDDAT
+        [F:MWI]CSTELM(10) += [F:MWI]CSTELM(9)
+        [F:MWI]CSTELM(9) = 0
+    Endif
+
+    # Write record
+    If [F:MWI]AMOUNT <> 0 & !ERR
+        LAST_SEQ += 1
+        [F:MWI]WIPSEQ    = LAST_SEQ
+        # écrire avec le sous-pro commun qui contient le point d'entrée "BEFWRIMWI"
+        Call ECR_MWI From MWIPLIB
+        If fstat
+            ERR = 1
+            LMSG = mess(6,2363,1)-[F:MFC]VCRNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Raz LMSG
+        Else
+            LAST_SEQ = [F:MWI]WIPSEQ :  # GH 02/2016 bug 108954 incrementation for WIPCOST
+        Endif
+    Endif
+Next
+
+Local Integer LOLDTRT
+
+# Recherche des enreg avant modif 46145 et 46164
+# S'il en existe il ne faut pas créer des enreg d'écart 17 pour les natures car on ne sait pas les calculer
+LOLDTRT = 0
+For [F:MWI2] Where VCRTYP = [M:CTP]VCRTYP
+&              & VCRNUM = [M:CTP]VCRNUM
+&              & TXNTYP = 14
+&              & OVENAT = ""
+&              & sum(CSTELM(4..7))<>0
+    LOLDTRT=1
+    Break
+Next
+
+If !LOLDTRT
+    Raz [F:MWI]CSTELM, [F:MWI]AMOUNT, [F:MWI]QTY, [F:MWI]QTYACT, [F:MWI]REJQTY
+    J=0
+    I = find([F:MFC]VCRLIN,LTABLIN) -1
+    While I>=0 & J<dim(LOVENAT,2) & LOVENAT(I,J)<>""
+        [F:MWI]VCRLIN    = [F:MFC]VCRLIN
+        [F:MWI]WIPSEQ   += 1
+        [F:MWI]OVENAT    = LOVENAT(I,J)
+
+        [F:MWI]AMOUNT    = 0    # Car le 1er enreg de type 17 contient le total avec FG
+
+        # Issue 110939 - 2015-10-12 by CCC : material level cost has no sens for a record concerning overhead
+        [F:MWI]MATLEV0 = 0
+
+        [F:MWI]CSTELM(4) = (LNATAMTACT(I,1,J)
+&                          +LNATAMTACT(I,2,J)+LNATAMTSTD(I,2,J)+LNATAMTSCP(I,2,J))*-1
+        [F:MWI]CSTELM(5) = (LNATAMTACT(I,3,J)+LNATAMTSTD(I,3,J)+LNATAMTSCP(I,3,J))*-1
+        [F:MWI]CSTELM(6) = (LNATAMTACT(I,4,J)+LNATAMTSTD(I,4,J)+LNATAMTSCP(I,4,J))*-1
+        [F:MWI]CSTELM(7) = (LNATAMTACT(I,5,J)+LNATAMTSTD(I,5,J)+LNATAMTSCP(I,5,J))*-1
+
+        Call CALCPROP(LNBKEY, LTABREF, LNBVAR, LTABVAR, L_CURRND, LTABVAL) From STKVAL
+
+        #2- Ecriture des résultats
+        For K=0 To LNBKEY-1
+            [F:MWI]TXNDAT = gdat$(val(left$(LTABKEY(K),2)),val(mid$(LTABKEY(K),3,2)),val(right$(LTABKEY(K),5)))
+            [F:MWI]QTY = LTABREF(K)
+            For V=0 To LNBVAR-1
+                Assign LTABVAR(V) With LTABVAL(K,V)
+            Next
+
+            # Write record
+            If sigma(4,7,abs([F:MWI]CSTELM(indcum))) <> 0
+                LAST_SEQ += 1
+                [F:MWI]WIPSEQ    = LAST_SEQ
+                # écrire avec le sous-pro commun qui contient le point d'entrée "BEFWRIMWI"
+                Call ECR_MWI From MWIPLIB
+                If fstat
+                    ERR = 1
+                    LMSG = mess(6,2363,1)-[F:MFC]VCRNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+                    Call ECR_TRACE(LMSG,1) From GESECRAN
+                    Call ECR_TRACE(" ",0) From GESECRAN
+                    Raz LMSG
+                    Break
+                Endif
+                LAST_SEQ = [F:MWI]WIPSEQ :  # GH 02/2016 bug 108954 incrementation for WIPCOST
+            Endif
+        Next
+        J+=1
+    Wend
+Endif
+
+Filter [MWI] Where VCRTYP = [M:CTP]VCRTYP
+&                & VCRNUM = [M:CTP]VCRNUM
+&                & TXNTYP = 20
+&                & GLPSTA <> 2
+Read [MWI] First
+Filter [MWI]
+If !fstat
+    Raz [F:MWI]AMOUNT, [F:MWI]CSTELM
+    For [MWI2] Where VCRTYP = [M:CTP]VCRTYP
+&                  & VCRNUM = [M:CTP]VCRNUM
+&                  & find(TXNTYP,19,20)
+        [F:MWI]AMOUNT -= [F:MWI2]AMOUNT
+    Next
+    [F:MWI]CSTELM(16) = [F:MWI]AMOUNT
+    Rewrite [MWI]
+Else
+    Call GET_LAST_SEQ([M:CTP]VCRTYP,[M:CTP]VCRNUM,LAST_SEQ) From MWIPLIB
+    Filter [MWI] Where VCRTYP = [M:CTP]VCRTYP
+&                    & VCRNUM = [M:CTP]VCRNUM
+&                    & TXNTYP = 19
+    Read [MWI] First
+    Filter [MWI]
+    Raz [F:MWI]AMOUNT, [F:MWI]CSTELM
+    If !fstat
+        [F:MWI]TXNTYP = 20
+        For [MWI2] Where VCRTYP = [M:CTP]VCRTYP
+&                      & VCRNUM = [M:CTP]VCRNUM
+&                      & find(TXNTYP,19,20)
+            [F:MWI]AMOUNT -= [F:MWI2]AMOUNT
+        Next
+        [F:MWI]CSTELM(16) = [F:MWI]AMOUNT
+        [F:MWI]WIPSEQ = LAST_SEQ+1
+        Call ECR_MWI From MWIPLIB
+        If fstat
+            ERR = 1
+            LMSG = mess(6,2363,1)-[F:MFC]VCRNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Raz LMSG
+        Endif
+    Endif
+Endif
+Return
+
+##################################################
+$STANDARD
+# génération d'enregistrements d'écarts quand on gère au coût std
+
+Case [F:MFC]VCRTYP
+    When 10 : Read [MFI]MFI0 = [F:MFC]VCRNUM;[F:MFC]VCRLIN
+    When 36 : Read [SCI]SCI0 = [F:MFC]VCRNUM;[F:MFC]VCRLIN
+Endcase
+
+Call GET_LAST_SEQ([M:CTP]VCRTYP,[M:CTP]VCRNUM,LAST_SEQ) From MWIPLIB
+
+Local Integer LOLDTRT
+
+# Recherche des enreg avant modif 46145 et 46164
+# S'il en existe il faut continuer à faire un enreg de type 13 global à toutes les natures de FG
+LOLDTRT = 0
+For [MWI] Where VCRTYP = [M:CTP]VCRTYP
+&             & VCRNUM = [M:CTP]VCRNUM
+&             & TXNTYP = 14
+&             & OVENAT = ""
+&             & sum(CSTELM(4..7))<>0
+    LOLDTRT=1
+    Break
+Next
+
+# CCC (2009-12-09) Bug 60341 : Créer un enreg d'écart par date de production
+#1- Calcul des valeurs pour chaque enreg 17
+If dim(LNBKEY)>0 : Kill LNBKEY : Endif
+If dim(LNBVAR)>0 : Kill LNBVAR : Endif
+Local Integer LNBKEY, LNBVAR
+For (Integer NB) From num$(GTYPDBA*2+1)
+&                Sql "SELECT COUNT(DISTINCT TXNDAT_0) FROM WIPCOST"
+&                   +" WHERE TXNTYP_0=14 AND OVENAT_0=' ' AND VCRTYP_0="+num$([F:MFC]VCRTYP)
+&                   +" AND VCRNUM_0='"+[F:MFC]VCRNUM+"' AND VCRLIN_0="+num$([F:MFC]VCRLIN)
+&                As [XXX]
+    LNBKEY = [F:XXX]NB
+    Break
+Next
+
+#If LNBKEY=0
+#    GOK = 0 : ERR = 1
+#    Return
+#Endif
+LNBKEY = max(LNBKEY,1)
+
+LNBVAR = 13
+If dim(LTABKEY)>0 : Kill LTABKEY : Endif
+If dim(LTABREF)>0 : Kill LTABREF : Endif
+If dim(LTABVAL)>0 : Kill LTABVAL : Endif
+If dim(LTABVAR)>0 : Kill LTABVAR : Endif
+Local Char LTABKEY(12)(LNBKEY)
+Local Decimal LTABREF(LNBKEY)
+Local Decimal LTABVAL(LNBKEY,LNBVAR)
+Local Char LTABVAR(25)(LNBVAR)
+Raz LTABVAR, V
+LTABVAR(V) = "[F:MWI]AMOUNT" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(0)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(1)" : V+=1
+LTABVAR(V) = "[F:MWI]CSTELM(2)" : V+=1
+For J=9 To 16
+    LTABVAR(V) = "[F:MWI]CSTELM("+num$(J)+")" : V+=1
+Next
+LTABVAR(V) = "[F:MWI]MATLEV0" : V+=1
+
+# Les écart dans wipcost sont calculés avec le coût du niveau et les xxxCST ne peuvent être renseignés avec l'écart mono-niveau
+
+Raz LTABKEY, LTABREF, V, K
+Filter [MWI2] Where VCRTYP=[F:MFC]VCRTYP
+&                 & VCRNUM=[F:MFC]VCRNUM
+&                 & VCRLIN=[F:MFC]VCRLIN
+&                 & TXNTYP=14
+&                 & OVENAT=""
+&                 & TXNDAT<LDATPER
+LTABKEY(0)=format$("D:DDMMYYYY",date$)
+For [MWI2]
+    K = 1
+    LTABREF(0) += [F:MWI2]QTY
+Next
+Filter [MWI2]
+Filter [MWI2] Where VCRTYP=[F:MFC]VCRTYP
+&                 & VCRNUM=[F:MFC]VCRNUM
+&                 & VCRLIN=[F:MFC]VCRLIN
+&                & TXNTYP=14
+&                & OVENAT=""
+&                & TXNDAT>=LDATPER
+&            Order By Key KMWI=TXNDAT
+For [MWI2]KMWI(1)
+    LTABKEY(K)=format$("D:DDMMYYYY",[F:MWI2]TXNDAT)
+    For [MWI2]KMWI
+        LTABREF(K) += [F:MWI2]QTY
+    Next
+    K+=1
+Next
+Filter [MWI2]
+
+# S'il n'y a pas eu de déclaration de prod on date le solde à la date du jour
+If K=0
+    LTABKEY(0)=format$("D:DDMMYYYY",date$)
+    LTABREF(0)= 1
+    # Issue 93217 - 2013-10-16 by CCC : produced qty = 0  ==> values will be proportionnal to lines number
+    If [F:MFC]VCRTYP=10
+        If clalev([F:MFIX])=0 : Local File MFGITM [MFIX] : Endif
+        Filter [MFIX] Where MFGNUM=[F:MFC]VCRNUM
+&                         & ITMTYP<>2
+        [F:MFC]QTYSTU = rowcount([F:MFIX])
+        Filter [MFIX]
+        If [F:MFC]QTYSTU=0
+            [F:MFC]QTYSTU = 1
+        Else
+            [F:MFC]QTYSTU = 1/[F:MFC]QTYSTU
+        Endif
+    Else
+        [F:MFC]QTYSTU = 1
+    Endif
+Endif
+
+Local Decimal LDEVELM(9..16)
+Raz LDEVELM
+# Il est important de mettre le type 9 en dernier car il s'appuie sur les valeurs calculées avec les autres types
+For I = 10,11,12,13,20,9
+    If I<>13 | LOLDTRT
+        Raz [F:MWI]
+        [F:MWI]VCRNUM    = [F:MFC]VCRNUM
+        [F:MWI]VCRLIN    = [F:MFC]VCRLIN
+        [F:MWI]VCRTYP    = [F:MFC]VCRTYP
+
+        [F:MWI]TXNACT    = 1
+        Case [F:MWI]VCRTYP
+            When 10 : [F:MWI]MFGFCY    = [F:MFG]MFGFCY
+                      [F:MWI]ITMREF    = [F:MFI]ITMREF  # Issue 62956 - 2010-06-07 by CCC
+            When 36 : [F:MWI]MFGFCY    = [F:SCI]PRHFCY
+                      [F:MWI]ITMREF    = [F:SCI]ITMREF  # Issue 62956 - 2010-06-07 by CCC
+        Endcase
+
+        [F:MWI]TXNDAT    = WO_CLODAT
+
+        [F:MWI]ENTCOD    = GACCWIPENT
+        [F:MWI]GLPSTA    = 1
+        [F:MWI]TXNTYP    = I
+
+        If dim([M:CST2]ITMREF)>0
+            Gosub CALCSTELM
+        Else
+            Case I
+                When 9 :
+                            # CCC (2010-04-21) Bug 63524 : Les écart dans wipcost sont calculés avec le coût du niveau et xxxCST ne peuvent être renseignés avec l'écart mono-niveau
+                            #For J=0 To GACTMAT-1
+                            #    [F:MWI]MATCST(J) = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum)&[M:CST]ITMTYP(indcum)<>2)
+    #&                                                                     *([M:CST]IMATCST(indcum*GACTMAT+J)+[M:CST]IFMATCST(indcum*GACTMAT+J)))
+                            #Next
+                            [F:MWI]MATLEV0   = sum([F:MFC]MATLEV0)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(0) = sum([F:MFC]MATCST)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(8) = sum([F:MFC]MATCPNCST)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(9) = sum([F:MFC]LABCPNCST)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(10) = sum([F:MFC]MACCPNCST)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(11) = sum([F:MFC]SCOCPNCST)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(12) = sum([F:MFC]OVEMATCPN)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(13) = sum([F:MFC]OVELABCPN)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(14) = sum([F:MFC]OVEMACCPN)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(15) = sum([F:MFC]OVESCOCPN)* [F:MFC]QTYSTU
+                            [F:MWI]CSTELM(16) = sum([F:MFC]INVDTACPN)* [F:MFC]QTYSTU
+                            # Les rebuts sont déjà pris en compte dans [M:CST]
+                            #For J=0 To dim([F:MWI]MATCST)-1
+                            #    [F:MWI]MATCST(J) += LSCPAMT(0)*[F:MWI]MATCST(J)/[F:MWI]CSTELM(0)
+                            #Next
+                When 10:
+                            # CCC (2010-04-21) Bug 63524 : Les écart dans wipcost sont calculés avec le coût du niveau et xxxCST ne peuvent être renseignés avec l'écart mono-niveau
+                            #For J=0 To GACTLAB-1
+                            #    [F:MWI]LABCST(J) = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum) & [M:CST]ITMTYP(indcum)<>2)
+    #&                                                                     *([M:CST]ILABCST(indcum*GACTLAB+J)+[M:CST]IFLABCST(indcum*GACTLAB+J)))
+                            #Next
+                            [F:MWI]CSTELM(0) = sum([F:MFC]LABCST) * [F:MFC]QTYSTU
+                            # Les rebuts sont déjà pris en compte dans [M:CST]
+                            #For J=0 To dim([F:MWI]LABCST)-1
+                            #    [F:MWI]LABCST(J) += LSCPAMT(1)*[F:MWI]LABCST(J)/[F:MWI]CSTELM(0)
+                            #Next
+                When 11:
+                            #For J=0 To GACTMAC-1
+                            #    [F:MWI]MACCST(J) = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum) & [M:CST]ITMTYP(indcum)<>2)
+    #&                                                                     *([M:CST]IMACCST(indcum*GACTMAC+J)+[M:CST]IFMACCST(indcum*GACTMAC+J)))
+                            #Next
+                            [F:MWI]CSTELM(0) = sum([F:MFC]MACCST) * [F:MFC]QTYSTU
+                            # Les rebuts sont déjà pris en compte dans [M:CST]
+                            #For J=0 To dim([F:MWI]MACCST)-1
+                            #    [F:MWI]MACCST(J) += LSCPAMT(2)*[F:MWI]MACCST(J)/[F:MWI]CSTELM(0)
+                            #Next
+                When 12:
+                            # CCC (2010-04-21) Bug 63524 : Les écart dans wipcost sont calculés avec le coût du niveau et xxxCST ne peuvent être renseignés avec l'écart mono-niveau
+                            #[F:MWI]SCOCST = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum) & [M:CST]ITMTYP(indcum)<>2)*([M:CST]ISCOCST(indcum)+[M:CST]IFSCOCST(indcum)))
+                            [F:MWI]CSTELM(0) = [F:MFC]SCOCST * [F:MFC]QTYSTU
+                            # Les rebuts sont déjà pris en compte dans [M:CST]
+                            #[F:MWI]SCOCST += LSCPAMT(3)*[F:MWI]SCOCST/[F:MWI]CSTELM(0)
+                When 13:
+                            # CCC (2010-04-21) Bug 63524 : Les écart dans wipcost sont calculés avec le coût du niveau et xxxCST ne peuvent être renseignés avec l'écart mono-niveau
+                            #[F:MWI]OVEMATCST = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum) & [M:CST]ITMTYP(indcum)<>2)*[M:CST]IOVEMATCST(indcum))
+                            #[F:MWI]OVEMACCST = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum) & [M:CST]ITMTYP(indcum)<>2)*[M:CST]IOVEMACCST(indcum))
+                            #[F:MWI]OVELABCST = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum) & [M:CST]ITMTYP(indcum)<>2)*[M:CST]IOVELABCST(indcum))
+                            #[F:MWI]OVESCOCST = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum) & [M:CST]ITMTYP(indcum)<>2)*[M:CST]IOVESCOCST(indcum))
+                            [F:MWI]CSTELM(0) = ([F:MFC]OVEMATCST+[F:MFC]OVELABCST+[F:MFC]OVEMACCST+[F:MFC]OVESCOCST) * [F:MFC]QTYSTU
+                            # Les rebuts sont déjà pris en compte dans [M:CST]
+                            #[F:MWI]OVEMATCST += LSCPAMT(4)*[F:MWI]OVEMATCST/[F:MWI]CSTELM(0)
+                            #[F:MWI]OVEMACCST += LSCPAMT(4)*[F:MWI]OVEMACCST/[F:MWI]CSTELM(0)
+                            #[F:MWI]OVELABCST += LSCPAMT(4)*[F:MWI]OVELABCST/[F:MWI]CSTELM(0)
+                            #[F:MWI]OVESCOCST += LSCPAMT(4)*[F:MWI]OVESCOCST/[F:MWI]CSTELM(0)
+                When 20:
+                            # CCC (2010-04-21) Bug 63524 : Les écart dans wipcost sont calculés avec le coût du niveau et xxxCST ne peuvent être renseignés avec l'écart mono-niveau
+                            #[F:MWI]INVDTACST = sigma(0,[M:CST]NBITM-1,([F:MFC]VCRLIN=[M:CST]ILNK(indcum) & [M:CST]ITMTYP(indcum)<>2)*([M:CST]IINVDTA(indcum)+[M:CST]IFINVDTA(indcum)))
+                            [F:MWI]CSTELM(0) = [F:MFC]INVDTACST * [F:MFC]QTYSTU
+            Endcase
+        Endif
+        For [F:MWI2] Where VCRTYP = [M:CTP]VCRTYP
+&                      & VCRNUM = [M:CTP]VCRNUM
+&                      & VCRLIN = [F:MFC]VCRLIN
+&                      & find(TXNTYP,I,14,17)
+&                      & ITMTYP <> 2
+            Case [F:MWI2]TXNTYP
+                When 14,17   : Case I
+                                  When 13 :      [F:MWI]CSTELM(1) += sum([F:MWI2]CSTELM(4..7))
+                                                 LDEVELM(12) += [F:MWI2]CSTELM(4)
+                                                 LDEVELM(13) += [F:MWI2]CSTELM(5)
+                                                 LDEVELM(14) += [F:MWI2]CSTELM(6)
+                                                 LDEVELM(15) += [F:MWI2]CSTELM(7)
+                                  When 20 :      [F:MWI]CSTELM(1) += [F:MWI2]CSTELM(16)
+                                                 LDEVELM(16) += [F:MWI2]CSTELM(16)
+                                  When Default : [F:MWI]CSTELM(1) += [F:MWI2]CSTELM(I-9)
+                                                 If I>9 & I<13
+                                                     LDEVELM(I-1) += [F:MWI2]CSTELM(I-9)
+                                                 Elsif I=9
+                                                     For J=8 To 16
+                                                        [F:MWI]CSTELM(J) += [F:MWI2]CSTELM(J)
+                                                     Next
+                                                     [F:MWI]MATLEV0 += [F:MWI2]MATLEV0
+                                                 Endif
+                               Endcase
+                When Default : [F:MWI]CSTELM(1) += [F:MWI2]AMOUNT
+                               [F:MWI]MATLEV0 += [F:MWI2]MATLEV0
+            Endcase
+            # CCC (2010-04-21) Bug 63524 : Les écart dans wipcost sont calculés avec le coût du niveau et xxxCST ne peuvent être renseignés avec l'écart mono-niveau
+#            Case I
+#                When 9:
+#                    For J=0 To GACTMAT-1
+#                        [F:MWI]MATCST(J) += [F:MWI2]MATCST(J)
+#                    Next
+#                When 10:
+#                    For J=0 To GACTLAB-1
+#                        [F:MWI]LABCST(J) += [F:MWI2]LABCST(J)
+#                    Next
+#                When 11:
+#                    For J=0 To GACTMAC-1
+#                        [F:MWI]MACCST(J) += [F:MWI2]MACCST(J)
+#                    Next
+#                When 12:
+#                    [F:MWI]SCOCST += [F:MWI2]SCOCST
+#                When 13:
+#                    [F:MWI]OVEMATCST += [F:MWI2]OVEMATCST
+#                    [F:MWI]OVEMACCST += [F:MWI2]OVEMACCST
+#                    [F:MWI]OVELABCST += [F:MWI2]OVELABCST
+#                    [F:MWI]OVESCOCST += [F:MWI2]OVESCOCST
+#                When 20:
+#                    [F:MWI]INVDTACST += [F:MWI2]INVDTACST
+#            Endcase
+        Next
+
+        If I<13
+            [F:MWI]CSTELM(2) = LSCPAMT(I-9)
+        Else
+            [F:MWI]CSTELM(2) = sum(LSCPAMT(4..7))
+        Endif
+
+    # Les rebuts sont déjà pris en compte dans [M:CST]
+    #    [F:MWI]AMOUNT    = ( [F:MWI]CSTELM(0) + [F:MWI]CSTELM(1) + [F:MWI]CSTELM(2)) * (-1)
+        [F:MWI]AMOUNT    = ( [F:MWI]CSTELM(0) + [F:MWI]CSTELM(1) ) * (-1)
+
+        If I=9
+            [F:MWI]CSTELM(8) *= -1
+            For J=9 To 16
+                [F:MWI]CSTELM(J) = ([F:MWI]CSTELM(J) - LDEVELM(J)) * (-1)
+            Next
+            [F:MWI]MATLEV0 *= -1
+        Endif
+
+        # Répartition du total des écarts sur autant d'enreg que de dates d'imputation différentes
+        Call CALCPROP(LNBKEY, LTABREF, LNBVAR, LTABVAR, L_CURRND, LTABVAL) From STKVAL
+
+        #2- Ecriture des résultats
+        For K=0 To LNBKEY-1
+            [F:MWI]TXNDAT = gdat$(val(left$(LTABKEY(K),2)),val(mid$(LTABKEY(K),3,2)),val(right$(LTABKEY(K),5)))
+            For V=0 To LNBVAR-1
+                Assign LTABVAR(V) With LTABVAL(K,V)
+            Next
+
+            # Write record
+            If [F:MWI]AMOUNT <> 0 & !ERR
+                LAST_SEQ += 1
+                [F:MWI]WIPSEQ    = LAST_SEQ
+                # écrire avec le sous-pro commun qui contient le point d'entrée "BEFWRIMWI"
+                Call ECR_MWI From MWIPLIB
+                If fstat
+                    ERR = 1
+                    LMSG = mess(6,2363,1)-[F:MFC]VCRNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+                    Call ECR_TRACE(LMSG,1) From GESECRAN
+                    Call ECR_TRACE(" ",0) From GESECRAN
+                    Raz LMSG
+                    Break 2
+                Endif
+                LAST_SEQ = [F:MWI]WIPSEQ :  # GH 02/2016 bug 108954 incrementation for WIPCOST
+            Endif
+        Next
+    Endif
+Next I
+
+If !LOLDTRT & !ERR
+    LNBVAR = 4
+    # LTABREF et LTABKEY restent inchangés
+    If dim(LTABVAL)>0 : Kill LTABVAL : Endif
+    If dim(LTABVAR)>0 : Kill LTABVAR : Endif
+    Local Decimal LTABVAL(LNBKEY,LNBVAR)
+    Local Char LTABVAR(25)(LNBVAR)
+    Raz LTABVAR, V
+    LTABVAR(V) = "[F:MWI]AMOUNT" : V+=1
+    LTABVAR(V) = "[F:MWI]CSTELM(0)" : V+=1
+    LTABVAR(V) = "[F:MWI]CSTELM(1)" : V+=1
+    LTABVAR(V) = "[F:MWI]CSTELM(2)" : V+=1
+    Raz [F:MWI]
+    [F:MWI]VCRNUM    = [F:MFC]VCRNUM
+    [F:MWI]VCRTYP    = [F:MFC]VCRTYP    # Issue 86460 - 2013-01-24 by CCC
+    Call GET_LAST_SEQ([M:CTP]VCRTYP,[M:CTP]VCRNUM,LAST_SEQ) From MWIPLIB
+# Issue 92887 - 2013-09-26 by CCC : Only overheads of current line have to be created
+#    I=0
+#    While I<LNBLIN
+    I = find([F:MFC]VCRLIN,LTABLIN) -1
+        J=0
+        While I>=0 & J<dim(LOVENAT,2) & LOVENAT(I,J)<>""
+            [F:MWI]VCRLIN    = [F:MFC]VCRLIN
+            [F:MWI]OVENAT    = LOVENAT(I,J)
+            [F:MWI]TXNACT    = 1
+            Case [F:MWI]VCRTYP
+                When 10 : [F:MWI]MFGFCY    = [F:MFG]MFGFCY
+                          [F:MWI]ITMREF    = [F:MFI]ITMREF  # Issue 62956 - 2010-06-07 by CCC
+                When 36 : [F:MWI]MFGFCY    = [F:SCI]PRHFCY
+                          [F:MWI]ITMREF    = [F:SCI]ITMREF  # Issue 62956 - 2010-06-07 by CCC
+            Endcase
+            [F:MWI]TXNDAT    = WO_CLODAT
+            [F:MWI]AMOUNT    = (LNATAMTACT(I,0,J) + LNATAMTSTD(I,0,J) + LNATAMTSCP(I,0,J)) * (-1)
+            [F:MWI]CSTELM(0) = LNATAMTACT(I,0,J)
+            [F:MWI]CSTELM(1) = LNATAMTSTD(I,0,J)
+            [F:MWI]CSTELM(2) = LNATAMTSCP(I,0,J)
+
+            [F:MWI]ENTCOD    = GACCWIPENT
+            [F:MWI]GLPSTA    = 1
+
+            [F:MWI]TXNTYP    = 13       # écart FG
+
+            # Répartition du total des écarts sur autant d'enreg que de dates d'imputation différentes
+            Call CALCPROP(LNBKEY, LTABREF, LNBVAR, LTABVAR, L_CURRND, LTABVAL) From STKVAL
+
+            #2- Ecriture des résultats
+            For K=0 To LNBKEY-1
+                [F:MWI]TXNDAT = gdat$(val(left$(LTABKEY(K),2)),val(mid$(LTABKEY(K),3,2)),val(right$(LTABKEY(K),5)))
+                For V=0 To LNBVAR-1
+                    Assign LTABVAR(V) With LTABVAL(K,V)
+                Next
+
+                # Write record
+                If [F:MWI]AMOUNT <> 0 & !ERR
+                    LAST_SEQ += 1
+                    [F:MWI]WIPSEQ    = LAST_SEQ
+                    # écrire avec le sous-pro commun qui contient le point d'entrée "BEFWRIMWI"
+                    Call ECR_MWI From MWIPLIB
+                    If fstat
+                        ERR = 1
+                        LMSG = mess(6,2363,1)-[F:MFC]VCRNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+                        Call ECR_TRACE(LMSG,1) From GESECRAN
+                        Call ECR_TRACE(" ",0) From GESECRAN
+                        Raz LMSG
+                        Break 2
+                    Endif
+                    LAST_SEQ = [F:MWI]WIPSEQ :  # GH 02/2016 bug 108954 incrementation for WIPCOST
+                Endif
+            Next
+            J+=1
+        Wend
+#        I+=1
+#    Wend
+Endif
+Return
+
+$CALCSTELM
+# Issue 101086 - 2014-06-27 by CCC : SDP (multi-level cost) and SDP2 (mono-level cost) were inverted
+Case I
+    When 9 :
+                [F:MWI]MATLEV0   = sum([M:SDP2]MATLEV0)
+                [F:MWI]CSTELM(0) = sum([M:SDP2]MATCST)
+                [F:MWI]CSTELM(8) = sum([M:SDP]MATCST)
+                [F:MWI]CSTELM(9) = sum([M:SDP]LABCST)-sum([M:SDP2]LABCST)
+                [F:MWI]CSTELM(10) = sum([M:SDP]MACCST)-sum([M:SDP2]MACCST)
+                [F:MWI]CSTELM(11) = sum([M:SDP]SCOCST)-sum([M:SDP2]SCOCST)
+                [F:MWI]CSTELM(12) = sum([M:SDP]OVEMATCST)-sum([M:SDP2]OVEMATCST)
+                [F:MWI]CSTELM(13) = sum([M:SDP]OVELABCST)-sum([M:SDP2]OVELABCST)
+                [F:MWI]CSTELM(14) = sum([M:SDP]OVEMACCST)-sum([M:SDP2]OVEMACCST)
+                [F:MWI]CSTELM(15) = sum([M:SDP]OVESCOCST)-sum([M:SDP2]OVESCOCST)
+                [F:MWI]CSTELM(16) = sum([M:SDP]INVDTACST)-sum([M:SDP2]INVDTACST)
+    When 10:
+                [F:MWI]CSTELM(0) = sum([M:SDP2]LABCST)
+    When 11:
+                [F:MWI]CSTELM(0) = sum([M:SDP2]MACCST)
+    When 12:
+                [F:MWI]CSTELM(0) = [M:SDP2]SCOCST
+    When 13:
+                [F:MWI]CSTELM(0) = ([M:SDP2]OVEMATCST+[M:SDP2]OVELABCST+[M:SDP2]OVEMACCST+[M:SDP2]OVESCOCST)
+    When 20:
+                [F:MWI]CSTELM(0) = [M:SDP2]INVDTACST
+Endcase
+Return
+
+##################################################
+$CHK_BALANCE
+# Issue 77387 - 2011-10-25 by CCC
+Raz BAL_AMT
+
+Local Char LSTU(GLONUOM)
+# Read all of WIPCOST records for the Work or External Order
+If dim(GOVEPRD)>0 & GOVEPRD
+    Filter [MWI] Where VCRTYP=[F:MFC]VCRTYP & VCRNUM = [F:MFC]VCRNUM & (TXNTYP<>5 | ITMTYP<>1)
+Else
+    Filter [MWI] Where VCRTYP=[F:MFC]VCRTYP & VCRNUM = [F:MFC]VCRNUM
+Endif
+For [MWI]MWI5
+    BAL_AMT   += [F:MWI]AMOUNT
+    If [F:MWI]TXNTYP=14 : LSTU = [F:MWI]STU : Endif
+Next
+Filter [MWI]
+
+If BAL_AMT <> 0.0
+    # Get Last Seq Number used
+    Call GET_LAST_SEQ([F:MFC]VCRTYP,[F:MFC]VCRNUM,LAST_SEQ) From MWIPLIB
+
+    # Create the WIPCOST records
+    Raz [F:MWI]
+
+    [F:MWI]VCRNUM    = [F:MFC]VCRNUM
+    # Issue 77387 - 2011-10-25 by CCC
+    #[F:MWI]VCRLIN    = [F:MFC]VCRLIN
+    [F:MWI]VCRLIN    = 0
+    [F:MWI]VCRTYP    = [F:MFC]VCRTYP
+    [F:MWI]WIPSEQ    = LAST_SEQ + 1
+    [F:MWI]TXNACT    = 1
+    [F:MWI]MFGFCY    = [F:MFC]STOFCY
+    [F:MWI]TXNDAT    = WO_CLODAT
+    Case [F:MWI]VCRTYP
+        When 10 : [F:MWI]ENTCOD    = GACCWIPENT
+        When 36 : [F:MWI]ENTCOD    = GACCWIPEOA
+    Endcase
+    [F:MWI]GLPSTA    = 1
+    [F:MWI]TXNTYP    = 15
+    [F:MWI]STU       = LSTU       # pour cohérence de la base
+
+    [F:MWI]AMOUNT    = BAL_AMT * (-1)
+
+    # SECTIONS ANALYTIQUE !!!!!!!!!!!!!!!
+    # section par défaut = GBALCCE
+
+    If [F:MWI]AMOUNT <> 0
+        # écrire avec le sous-pro commun qui contient le point d'entrée "BEFWRIMWI"
+        Call ECR_MWI From MWIPLIB
+        If fstat
+            ERR = 1
+            LMSG = mess(6,2363,1)-[F:MFC]VCRNUM-"("+mess([F:MWI]TXNTYP,2358,1)+")"
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Raz LMSG
+        Endif
+    Endif
+Endif
+
+Return
+
+##################################################
+$UPD_FLG
+# mise à jour des flag sur les OF
+
+Case [M:CTP]VCRTYP
+    When 10 :
+        # (le Readlock [MFG]Curr est fait dans la boucle)
+        [F:MFG]MFGTRKFLG = 6
+        Rewrite [MFG]
+        If fstat
+            ERR = 1
+            LMSG = mess(16,2363,1)-"MFGHEAD :"-[F:MFG]MFGNUM
+            Call ECR_TRACE(LMSG,1) From GESECRAN # "Erreur de mise à jour du flag sur MFGHEAD :..."
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Return
+        Endif
+
+        Update [MFI] Where MFGNUM = [F:MFG]MFGNUM With MFITRKFLG = 6
+        If fstat
+            ERR = 1
+            LMSG = mess(16,2363,1)-"MFGITM :" -[F:MFG]MFGNUM
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Return
+        Endif
+
+        Update [MFM] Where MFGNUM = [F:MFG]MFGNUM With MFMTRKFLG = 6
+        If fstat
+            ERR = 1
+            LMSG = mess(16,2363,1) -"MFGMAT :" -[F:MFG]MFGNUM
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Return
+        Endif
+
+        Update [MFO] Where MFGNUM = [F:MFG]MFGNUM With MFOTRKFLG = 6
+        If fstat
+            ERR = 1
+            LMSG = mess(16,2363,1) -"MFGOPE :"- [F:MFG]MFGNUM
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Return
+        Endif
+    When 36 :
+        # (le Readlock [SCO]Curr est fait dans la boucle)
+        [F:SCO]SCOTRKFLG = 6
+        Rewrite [SCO]
+        If fstat
+            ERR = 1
+            LMSG = mess(16,2363,1)-"SCOHEAD :"-[F:SCO]SCONUM
+            Call ECR_TRACE(LMSG,1) From GESECRAN # "Erreur de mise à jour du flag sur SCOHEAD :..."
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Return
+        Endif
+
+        If dim([F:SCI]SCITRKFLG)>0
+          Update [SCI] Where SCONUM = [F:SCO]SCONUM With SCITRKFLG = 6
+          If fstat
+            ERR = 1
+            LMSG = mess(16,2363,1) -"SCOITM :" -[F:SCO]SCONUM
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Return
+          Endif
+        Endif
+
+        If dim([F:SCM]SCMTRKFLG)>0
+          Update [SCM] Where SCONUM = [F:SCO]SCONUM With SCMTRKFLG = 6
+          If fstat
+            ERR = 1
+            LMSG = mess(16,2363,1) -"SCOMAT :" -[F:SCO]SCONUM
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Return
+          Endif
+        Endif
+
+        If dim([F:SCS]SCSTRKFLG)>0
+          Update [SCS] Where SCONUM = [F:SCO]SCONUM With SCSTRKFLG = 6
+          If fstat
+            ERR = 1
+            LMSG = mess(16,2363,1) -"SCOSRV :" -[F:SCO]SCONUM
+            Call ECR_TRACE(LMSG,1) From GESECRAN
+            Call ECR_TRACE(" ",0) From GESECRAN
+            Return
+          Endif
+        Endif
+Endcase
+Readlock [MWH]MWH0=[M:CTP]VCRTYP;[M:CTP]VCRNUM  # entête Wipcost
+If !fstat
+  [F:MWH]MFGTRKFLG = 6
+  Rewrite [MWH]
+  If fstat
+    ERR = 1
+    LMSG = mess(16,2363,1)-"MFGWIP :"-[M:CTP]VCRNUM
+    Call ECR_TRACE(LMSG,1) From GESECRAN # "Err de mise à jour du flag sur ..."
+    Call ECR_TRACE(" ",0) From GESECRAN
+  Endif
+Endif
+
+Return
+
+$TERMINE
+
+If !GSERVEUR
+  SAI = 1
+  TRA = 1
+
+  If  [M]PRNCOD > 1
+    Raz GBIDI1
+    GBIDI1+=1 : TBPAR(GBIDI1) = "site"  : TBVAL(GBIDI1) = [M]STOFCY # car vpd /M:DIA indéfinies (l'abv est MWF0 ici)
+    GBIDI1+=1 : TBPAR(GBIDI1) = "uid"   : TBVAL(GBIDI1) = "0"
+    GBIDI1+=1 : TBPAR(GBIDI1) = "prnuid": TBVAL(GBIDI1) = num$([M:CTP]PRNNUM) : # GH 19/03/2014 bug 86229 # num$(adxuid(1))
+    GBIDI1+=1 : TBPAR(GBIDI1) = "vcrtyp" : TBVAL(GBIDI1) = num$([M]VCRTYP)
+    GBIDI1+=1 : TBPAR(GBIDI1) = "vcrnumdeb" : TBVAL(GBIDI1) = [M]VCRNUM
+    GBIDI1+=1
+    If [M]VCRNUM <> ""
+        TBPAR(GBIDI1) = "vcrnumfin" : TBVAL(GBIDI1) = [M]VCRNUM # un seul OF à éditer
+    Endif
+    GBIDI1+=1
+    If [M]PRVCSTPRT=2
+        TBPAR(GBIDI1) = "mfctypdeb" : TBVAL(GBIDI1) = "1"
+    Else
+        TBPAR(GBIDI1) = "mfctypdeb" : TBVAL(GBIDI1) = "4"
+    Endif
+    GBIDI1+=1 : TBPAR(GBIDI1) = "mfctypfin" : TBVAL(GBIDI1) = "4"
+    GBIDI1+=1 : TBPAR(GBIDI1) = "affdet"    : TBVAL(GBIDI1) = num$(4-[M]PRNCOD)
+    # Pour le type 3 on présente le type 6 pour les valeurs réelles et le type 3 pour les valeurs prévues
+    GBIDI1+=1 : TBPAR(GBIDI1) = "mfctypprv"
+      Local Integer LORIDEV
+      If [M]FLXBUD<>2
+          LORIDEV = [M]ORIDEVCLC
+      Else
+          LORIDEV = 5
+      Endif
+      # Pour le type 4 on présente le type 4 pour les valeurs réelles et le type LORIDEV pour les valeurs prévues
+      TBVAL(GBIDI1)="3:3~6;4:"+num$(LORIDEV)+"~4"
+
+    GBIDI1+=1 : TBPAR(GBIDI1) = "ediprv" : TBVAL(GBIDI1) = num$([M]EDIPRV)
+    If [M]VCRTYP=36
+        # Lancement du code état SCOCOST qui utilise l'état MFGCOST
+         Call ETAT("SCOCOST", GFONCTION, TBPAR, TBVAL) From ETAT
+    Else
+         Call ETAT("MFGCOST", GFONCTION, TBPAR, TBVAL) From ETAT
+    Endif
+  Endif
+  Raz [M]
+
+  If LOUVTRC
+      Call FERME_TRACE From LECFIC
+  Endif
+Endif
+
+Return
+
+##########################################################################
+Subprog SCPOPE(PFCY,PVCRNUM,PIPTDAT,PSCPAMT)
+Value Char PFCY
+Value Char PVCRNUM
+Value Date PIPTDAT
+Variable Decimal PSCPAMT()
+
+Local Integer NBOPE, INDFRAC, NBFRAC, NBFRACOPE
+Local Integer LOPENUM, LFRACOPE
+Local Decimal LCURRND, LTOT, LQTYOPE, LMNTOPE, LMNTFRAC
+Local Integer LRET, I, J, LASTSEQ
+Local Char    LCCE(GLONCCE)
+
+Local Integer NBOPEMAX
+Local Integer NBONAMAX
+Local Char REQ(250)(2)
+
+If !clalev([MWS]) : Local File WORKSTATIO [MWS] : Endif
+If !clalev([MKO]) : Local File MFGOPETRK [MKO] : Endif
+If !clalev([MWI]) : Local File WIPCOST   [MWI] : Endif
+If !clalev([FCY]) : Local File FACILITY  [FCY] : Endif
+
+# Si pas d'opération => pas de rebut
+Filter [MKO] Where MFGNUM=PVCRNUM
+Look [MKO]MKO1 First
+Filter [MKO]
+If fstat
+    End
+Endif
+
+Raz I, REQ
+Call ADDCRIT(REQ, I, "", "SELECT COUNT(*) N FROM ( SELECT OVENAT_0 From WIPCOST", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "Where VCRTYP_0=10", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "and VCRNUM_0='"+PVCRNUM+"'", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "and OVENAT_0<>' '", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "Group by OVENAT_0 ) OVE", " ") From GOBJSUB
+For (Integer NB) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+    NBONAMAX=max([F:SQLX]NB,1)
+Next
+
+Raz I, REQ
+Call ADDCRIT(REQ, I, "", "SELECT  COUNT(*) N From (", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "SELECT OPENUM_0 From MFGOPETRK", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "Where MFGNUM_0='"+PVCRNUM+"'", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "Group by OPENUM_0,OPESPLNUM_0 ) OPE", " ") From GOBJSUB
+For (Integer NB) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+    NBOPEMAX=max([F:SQLX]NB,1)
+Next
+
+
+# Tableau des montants
+# 0:n°opé           - 1:fraction opé - 2:qté réalisée    - 3:rejetée - 4:ratio qté par fraction - 5:nb de fractions
+Local Decimal TABOPE(NBOPEMAX,8)
+
+# 1:matières - 2:mo           - 3:machine      - 4:sous-trait
+# 5:fg mat   - 6:fg mo        - 7:fg mac       - 8:fg sous-trait
+Local Decimal TABMNT(NBOPEMAX,1..4)
+Local Decimal TABMNTOVE(NBOPEMAX,5..8,NBONAMAX)
+Local Char    PSCPONA(GLONONA)(NBONAMAX)
+
+Local Decimal LCSTELM(dim([F:MWI]CSTELM))
+Local Decimal LCSTELMOVE(dim([F:MWI]CSTELM),NBONAMAX)
+
+Raz REQ, I
+Call ADDCRIT(REQ, I, "", "SELECT OVENAT_0 From WIPCOST", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "Where VCRTYP_0=10", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "and VCRNUM_0='"+PVCRNUM+"'", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "and OVENAT_0<>' '", " ") From GOBJSUB
+Call ADDCRIT(REQ, I, "", "Group by OVENAT_0", " ") From GOBJSUB
+Raz I
+For (Char OVENAT) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+    PSCPONA(I)=[F:SQLX]OVENAT
+    I+=1
+Next
+
+# Tableau totaux rebuts
+# 0: mnt tot et les autres indices <=> TABOPE
+Local Decimal TABSCP(9)
+Local Decimal TABSCPOVE(9,NBONAMAX)
+
+Local Char    TABWST(GLONWST)(NBOPEMAX)
+Local Char    TABVLT(20)(NBOPEMAX)
+
+Raz PSCPAMT
+
+If [F:FCY]FCY<>PFCY
+    Read [FCY]FCY0 = PFCY
+Endif
+Call GET_CUR_RND([F:FCY]LEGCPY, LCURRND, LRET) From MWIPLIB # charge aussi GLOCALDEV
+Raz NBFRAC, LOPENUM, TABWST, TABVLT
+INDFRAC = -1
+
+#----- Alimentation des qtés réalisées et réalisées rejetées
+Columns [MKO] (OPENUM, OPESPLNUM,CPLQTY,OPEWORCOE,REJCPLQTY,CPLWST)
+Filter [MKO] Where MFGNUM = PVCRNUM Order By OPENUM; OPESPLNUM
+For [MKO]
+    If LOPENUM<[F:MKO]OPENUM | LFRACOPE<>[F:MKO]OPESPLNUM
+        INDFRAC+=1
+        If LOPENUM<[F:MKO]OPENUM
+            NBOPE+=1
+            LOPENUM  = [F:MKO]OPENUM
+            Raz LQTYOPE
+        Endif
+        LFRACOPE = [F:MKO]OPESPLNUM
+        TABOPE(INDFRAC,0) = [F:MKO]OPENUM
+        TABOPE(INDFRAC,1) = [F:MKO]OPESPLNUM
+        # CCC (11/01/06) DM 34255 : ajout du poste et de la section de valo pour utilisation dans paramétrage CCE
+        TABWST(INDFRAC) = [F:MKO]CPLWST
+        Read [MWS]WST0=[F:MKO]CPLWST;PFCY
+        If !fstat
+            TABVLT(INDFRAC) = [F:MWS]VLTCCE
+        Endif
+    Endif
+    TABOPE(INDFRAC,2) += [F:MKO]CPLQTY * [F:MKO]OPEWORCOE
+    TABOPE(INDFRAC,3) += [F:MKO]REJCPLQTY * [F:MKO]OPEWORCOE
+    LQTYOPE += TABOPE(INDFRAC,2)
+Next
+Filter [MKO]
+Columns [MKO]
+NBFRAC = INDFRAC+1
+If NBFRAC<=0
+    End
+Endif
+
+#------------ Alimentation des prorata de quantité réalisée de la fraction d'opération par opération ----#
+For I=0 To NBFRAC-1
+    NBFRACOPE = sigma(I,NBFRAC-1,TABOPE(indcum,0)=TABOPE(I,0))
+    LQTYOPE   = sigma(I,I+NBFRACOPE-1,(TABOPE(indcum,0)=TABOPE(I,0))*TABOPE(indcum,2))
+    For J=I To I+NBFRACOPE-1
+        If LQTYOPE>0
+            TABOPE(J,4) = TABOPE(J,2)/LQTYOPE
+        Else
+            TABOPE(J,4) = 0
+        Endif
+        TABOPE(J,5) = NBFRACOPE
+    Next
+    I+=NBFRACOPE-1
+Next
+
+#----- Alimentation des montants dans TABMNT ------#
+Raz LOPENUM, LFRACOPE
+INDFRAC = -1
+
+# Issue 92055 - 2013-08-27 by CCC
+#Columns [MWI] (AMOUNT,OPENUM,OPESPLNUM,TXNTYP,WIPSEQ,STU,OVENAT)
+Filter [MWI] Where VCRNUM  = PVCRNUM
+&                & TXNTYP <= 8
+&            Order By OPENUM; OPESPLNUM; WIPSEQ
+For [MWI]
+
+# Issue 92055 - 2013-08-27 by CCC
+#    # Issue 90588 - 2013-06-19 by CCC
+#    # On vérifie d'abord que le suivi n'a pas été supprimé
+#    Filter [MKO] Where MFGTRKNUM=[F:MWI]MFGTRKNUM
+#&                    & OPETRKLIN = [F:MWI]MFGTRKLIN
+#&                    & MFGNUM=[F:MWI]VCRNUM
+#    Look [MKO] reckey First
+#    Filter [MKO]
+
+    #Les FG entrée ne sont pas comptabilisés dans les rebuts
+    If !(dim(GOVEPRD)>0 & GOVEPRD & [F:MWI]TXNTYP=5 & [F:MWI]VCRLIN<>0 & [F:MWI]ITMTYP<>2)
+&    & ([F:MWI]OPENUM=0 | sigma(0,NBOPEMAX-1,TABOPE(indcum,0)=[F:MWI]OPENUM & TABOPE(indcum,1)=[F:MWI]OPESPLNUM)>0)
+        If [F:MWI]TXNTYP>=5
+            INDONA = find([F:MWI]OVENAT,PSCPONA)-1
+        Endif
+        If [F:MWI]OPENUM=0    # Il n'y a que les sorties matières qui peuvent ne pas avoir de n° d'opé
+# Issue 80443 - 2012-02-29 by CCC : Considérer les matières non liées comme consommées sur la 1ère opération
+#            Raz LTOT
+#            #---- Répartition équitable du montant sur toutes les opérations -----#
+#            I=0
+#            While I< NBFRAC-1
+#                Raz LMNTOPE
+#                For J=1 To TABOPE(I,5)-1
+#                    LMNTFRAC = arr([F:MWI]AMOUNT*TABOPE(I,4)/NBOPE,LCURRND)
+#                    TABMNT(I,[F:MWI]TXNTYP) += LMNTFRAC
+#                    LTOT += LMNTFRAC
+#                    LMNTOPE += LMNTFRAC
+#                    I += 1
+#                    If I>=NBFRAC-1
+#                        Break 2
+#                    Endif
+#                Next
+#                LMNTFRAC = arr([F:MWI]AMOUNT/NBOPE- LMNTOPE,LCURRND)
+#                TABMNT(I,[F:MWI]TXNTYP) += LMNTFRAC
+#                LTOT += LMNTFRAC
+#                I += 1
+#            Wend
+#            TABMNT(NBFRAC-1,[F:MWI]TXNTYP) += [F:MWI]AMOUNT-LTOT
+            Raz LTOT
+            LMNTFRAC = arr([F:MWI]AMOUNT*TABOPE(0,4),LCURRND)
+            For J=0 To TABOPE(0,5)-2
+                If [F:MWI]TXNTYP<5
+                    TABMNT(0+J,[F:MWI]TXNTYP) += LMNTFRAC
+                Else
+                    TABMNTOVE(0+J,[F:MWI]TXNTYP,INDONA) += LMNTFRAC
+                Endif
+                LTOT += LMNTFRAC
+            Next
+            If [F:MWI]TXNTYP<5
+                TABMNT(0+TABOPE(0,5)-1,[F:MWI]TXNTYP) += [F:MWI]AMOUNT-LTOT
+            Else
+                TABMNTOVE(0+TABOPE(0,5)-1,[F:MWI]TXNTYP,INDONA) += [F:MWI]AMOUNT-LTOT
+            Endif
+        Else
+            If LOPENUM<[F:MWI]OPENUM | (LFRACOPE>0 & LFRACOPE<[F:MWI]OPESPLNUM)
+                INDFRAC+=1
+                LOPENUM = [F:MWI]OPENUM
+            Endif
+            LFRACOPE = [F:MWI]OPESPLNUM
+            If LFRACOPE=0
+                Raz LTOT
+                LMNTFRAC = arr([F:MWI]AMOUNT*TABOPE(INDFRAC,4),LCURRND)
+                For J=0 To TABOPE(INDFRAC,5)-2
+                    If [F:MWI]TXNTYP<5
+                        TABMNT(INDFRAC+J,[F:MWI]TXNTYP) += LMNTFRAC
+                    Else
+                        TABMNTOVE(INDFRAC+J,[F:MWI]TXNTYP,INDONA) += LMNTFRAC
+                    Endif
+                    LTOT += LMNTFRAC
+                Next
+                If [F:MWI]TXNTYP<5
+                    TABMNT(INDFRAC+TABOPE(INDFRAC,5)-1,[F:MWI]TXNTYP) += [F:MWI]AMOUNT-LTOT
+                Else
+                    TABMNTOVE(INDFRAC+TABOPE(INDFRAC,5)-1,[F:MWI]TXNTYP,INDONA) += [F:MWI]AMOUNT-LTOT
+                Endif
+            Else
+                If [F:MWI]TXNTYP<5
+                    TABMNT(INDFRAC,[F:MWI]TXNTYP) += [F:MWI]AMOUNT
+                Else
+                    TABMNTOVE(INDFRAC,[F:MWI]TXNTYP,INDONA) += LMNTFRAC
+                Endif
+            Endif
+        Endif
+    Endif
+Next
+Filter [MWI]
+#Columns [MWI]
+
+# Issue 78143 - 2011-11-25 by CCC : Donner la main avant calcul des TXNTYP=16
+GPOINT="BEFCLCSCP"
+Gosub ENTREE From EXEFNC
+
+#---------- Ecriture des WIPCOST de rebut opératoire ---------#
+Call GET_LAST_SEQ(10,PVCRNUM,LASTSEQ) From MWIPLIB
+Raz [F:MFI]
+Filter [MFI] Where MFGNUM=PVCRNUM
+Read [MFI]MFI0 First
+Filter [MFI]
+Raz TABSCP
+Local Char MSG(255)
+For I=0 To NBFRAC-1
+    If TABOPE(I,3)>0
+        Raz [F:MWI]
+        LASTSEQ +=1
+        [F:MWI]VCRTYP    = 10
+        [F:MWI]VCRNUM    = PVCRNUM
+        [F:MWI]WIPSEQ    = LASTSEQ
+        [F:MWI]TXNTYP    = 16
+        [F:MWI]TXNACT    = 1
+        [F:MWI]OPENUM    = TABOPE(I,0)
+        [F:MWI]OPESPLNUM = TABOPE(I,1)
+        [F:MWI]TXNDAT    = PIPTDAT
+        [F:MWI]MFGFCY    = PFCY
+        [F:MWI]QTY       = TABOPE(I,2)
+        [F:MWI]STU       = [F:MFI]STU
+        [F:MWI]REJQTY    = TABOPE(I,3)
+        [F:MWI]WST       = TABWST(I)    # DM 34255
+        [F:MWI]VLTCCE    = TABVLT(I)    # DM 34255
+        [F:MWI]ITMREF    = [F:MFI]ITMREF  # DM 54826
+        [F:MWI]ITMTYP    = 1
+
+        #--- On calcule ce qui a déjà été pris en compte ----#
+        Raz LCSTELM, LCSTELMOVE
+        Columns [MWI2] (CSTELM, OVENAT)
+        For [F:MWI2] Where VCRNUM = [F:MWI]VCRNUM
+&                      & TXNTYP = 16
+&                      & OPENUM = [F:MWI]OPENUM
+&                      & OPESPLNUM = [F:MWI]OPESPLNUM
+            If [F:MWI]OVENAT<>""
+                INDONA = find([F:MWI]OVENAT,PSCPONA)-1
+                For J=1 To dim(LCSTELMOVE,1)
+                    LCSTELMOVE(J-1,INDONA) += [F:MWI2]CSTELM(J-1)
+                Next
+            Else
+                For J=1 To dim(LCSTELM)
+                    LCSTELM(J-1) += [F:MWI2]CSTELM(J-1)
+                Next
+            Endif
+        Next
+        Columns [MWI2]
+
+        # Les montants du WIP de rebut sont normalement négatifs
+        For J=1 To 4
+                LTMPAMT = arr( ( sigma( 0,I , (TABOPE(indcum,0)<TABOPE(I,0) | indcum=I)
+&                                            * TABMNT(indcum,J) )
+&                                     -TABSCP(J) )
+&                                   *TABOPE(I,3)/TABOPE(I,2),LCURRND)
+                PSCPAMT(J-1) -= LTMPAMT
+                [F:MWI]CSTELM(J-1) = -LTMPAMT-LCSTELM(J-1)
+            # Issue 77068 - 2011-10-12 by CCC : bug 35110 en v140
+            TABSCP(J) -= [F:MWI]CSTELM(J-1)
+        Next
+        [F:MWI]AMOUNT = sum([F:MWI]CSTELM)
+        TABSCP(0) -= [F:MWI]AMOUNT
+        If sigma(0,dim([F:MWI]CSTELM)-1,abs([F:MWI]CSTELM(indcum)))>0
+            [F:MWI]ENTCOD    = GACCWIPENT
+            [F:MWI]GLPSTA    = 1
+
+            Call ECR_MWI From MWIPLIB
+            If fstat
+                Call FSTA("MWI") From GLOCK
+                GOK = 0
+                End
+            Endif
+            LAST_SEQ = [F:MWI]WIPSEQ :  # GH 02/2016 bug 108954 incrementation for WIPCOST
+        Endif
+
+        For K=0 To NBONAMAX-1
+            #LASTSEQ+=1
+            #[F:MWI]WIPSEQ    = LASTSEQ  : # GH 02/2016 deplaced just before the writing of a new record in WIPCOST
+            Raz [F:MWI]CSTELM
+            [F:MWI]OVENAT = PSCPONA(K)
+            For J=5 To 8
+                    LTMPAMT = arr( ( sigma( 0,I , (TABOPE(indcum,0)<TABOPE(I,0) | indcum=I)
+&                                                * TABMNTOVE(indcum,J,K) )
+&                                   -TABSCPOVE(J,K) )
+&                                  *TABOPE(I,3)/TABOPE(I,2),LCURRND)
+                    #PSCPAMTOVE(J-1,K) -= LTMPAMT
+                    [F:MWI]CSTELM(J-1) = -LTMPAMT-LCSTELMOVE(J-1,K)
+                # Issue 77068 - 2011-10-12 by CCC : bug 35110 en v140
+                TABSCPOVE(J,K) -= [F:MWI]CSTELM(J-1)
+            Next
+            [F:MWI]AMOUNT = sum([F:MWI]CSTELM)
+            TABSCPOVE(0,K) -= [F:MWI]AMOUNT
+            If sigma(0,dim([F:MWI]CSTELM)-1,abs([F:MWI]CSTELM(indcum)))>0
+                [F:MWI]ENTCOD    = GACCWIPENT
+                [F:MWI]GLPSTA    = 1
+
+                LASTSEQ+=1
+                [F:MWI]WIPSEQ    = LASTSEQ
+                Call ECR_MWI From MWIPLIB
+                If fstat
+                    Call FSTA("MWI") From GLOCK
+                    GOK = 0
+                    End
+                Endif
+                LAST_SEQ = [F:MWI]WIPSEQ :  # GH 02/2016 bug 108954 incrementation for WIPCOST
+            Endif
+            # Issue 90643 - 2013-06-25 by CCC : calculer les totaux de rebut FG pour les déduire sur le PRF
+            For J=4 To 7
+                PSCPAMT(J)+=[F:MWI]CSTELM(J)
+            Next
+        Next
+    Endif
+Next
+End
+
+#########################################################################
+# UPDMWIOVE : Met à jour les WIPCOST FG des déclarations de production
+#########################################################################
+Subprog UPDMWIOVE(PVCRTYP, PVCRNUM, PERR)
+Value    Integer PVCRTYP
+Value    Char    PVCRNUM
+Variable Integer PERR
+
+Local Integer LLASTSEQ   # Dernier n° de séquence
+Local Char LCCECOD(GLONCDE)
+Local Char WCCE(GLONCCE)
+Local Decimal LAMTTMP
+Local Integer LFIND
+
+If !clalev([F:MWI2]) : Local File WIPCOST [MWI2] : Endif
+
+Call GET_LAST_SEQ(PVCRTYP,PVCRNUM,LLASTSEQ) From MWIPLIB
+
+# On cumule dans lamttmp tous les montants d'un couple nature FG / matière ou poste
+# le résultat est ensuite comparé au calcul des FG effectué précédemment et dont le résultat est dans [M:CST]
+# La différence est alors enregistrée dans WIPCOST
+# Il ne faut pas spécifier TXNTYP dans le filtre servant à cumuler les montants de FG d'une nature
+# car il dépend du type de la nature.
+For I=0 To [M:CST]NBFGITM-1
+    Raz LAMTTMP
+    # Issue 107298 - 2015-04-01 by CCC : add link with VCRLIN
+    For [F:MWI2] Where VCRTYP = PVCRTYP
+&                  & VCRNUM = PVCRNUM
+&                  & VCRLIN = [M:CST]IOLNK(I)
+&                  & ITMREF = [M:CST]OITMREF(I)
+&                  & OVENAT = [M:CST]NATITM(I)
+&                  & TXNTYP = 5
+&                  & WST=""     # Issue 82159 - 2012-07-06 by CCC : Les FG type matière calculés sur une opé ont le produit dans ITMREF=> tester aussi WST=""
+        LAMTTMP += [F:MWI2]AMOUNT
+    Next
+    Filter [MWI2] Where VCRTYP = PVCRTYP
+&                     & VCRNUM = PVCRNUM
+&                     & VCRLIN = [M:CST]IOLNK(I)
+&                     & TXNTYP = 14
+&                     & ITMREF = [M:CST]OITMREF(I)
+    Read [MWI2] First
+    Filter [MWI2]
+    If !fstat
+        Gosub ECR_MWI
+    Endif
+Next
+
+For I=0 To [M:CST]NBFGMAT-1
+    Raz LAMTTMP
+    # Issue 107298 - 2015-04-01 by CCC : add link with VCRLIN
+    For [F:MWI2] Where VCRTYP = PVCRTYP
+&                     & VCRNUM = PVCRNUM
+&                     & VCRLIN = [M:CST]MOLNK(I)
+&                     & ITMREF = [M:CST]OMATREF(I)
+&                     & OVENAT = [M:CST]NATMAT(I)
+&                     & find(TXNTYP,5,6,7,8)<>0
+        LAMTTMP += [F:MWI2]AMOUNT
+    Next
+    Filter [MWI2] Where VCRTYP = PVCRTYP
+&                     & VCRNUM = PVCRNUM
+&                     & VCRLIN = [M:CST]MOLNK(I)
+&                     & TXNTYP = 1
+&                     & ITMREF = [M:CST]OMATREF(I)
+    Read [MWI2] First
+    Filter [MWI2]
+    If !fstat
+        Gosub ECR_MWI
+    Endif
+Next
+
+For I=0 To [M:CST]NBFGWST-1
+    Raz LAMTTMP
+    # Issue 107298 - 2015-04-01 by CCC : add link with VCRLIN
+    For [F:MWI2] Where VCRTYP = PVCRTYP
+&                     & VCRNUM = PVCRNUM
+&                     & VCRLIN = [M:CST]WOLNK(I)
+&                     & WST    = [M:CST]OWST(I)
+&                     & OVENAT = [M:CST]NATWST(I)
+&                     & find(TXNTYP,5,6,7,8)<>0
+        LAMTTMP += [F:MWI2]AMOUNT
+    Next
+    Filter [MWI2] Where VCRTYP = PVCRTYP
+&                     & VCRNUM = PVCRNUM
+&                     & VCRLIN = [M:CST]WOLNK(I)
+&                     & find(TXNTYP,2,3)
+&                     & WST    = [M:CST]OWST(I)
+    Read [MWI2] First
+    Filter [MWI2]
+    If !fstat
+        Gosub ECR_MWI
+    Endif
+Next
+
+For I=0 To [M:CST]NBFGSCO-1
+    Raz LAMTTMP
+    # Issue 107298 - 2015-04-01 by CCC : add link with VCRLIN
+    For [F:MWI2] Where VCRTYP = PVCRTYP
+&                     & VCRNUM = PVCRNUM
+&                     & VCRLIN = [M:CST]SOLNK(I)
+&                     & WST    = [M:CST]OSCOWST(I)
+&                     & OVENAT = [M:CST]NATSCO(I)
+&                     & find(TXNTYP,5,6,7,8)<>0
+        LAMTTMP += [F:MWI2]AMOUNT
+    Next
+    Filter [MWI2] Where VCRTYP = PVCRTYP
+&                     & VCRNUM = PVCRNUM
+&                     & VCRLIN = [M:CST]SOLNK(I)
+&                     & TXNTYP = 4
+&                     & WST    = [M:CST]OSCOWST(I)
+    Read [MWI2] First
+    Filter [MWI2]
+    If !fstat
+        Gosub ECR_MWI
+    Endif
+Next
+
+# Issue 96926 - 2015-04-03 by CCC
+# Look for all overheads in WIPCOST but that are no more in the real cost
+Filter [MWI2] Where VCRTYP = PVCRTYP
+&                 & VCRNUM = PVCRNUM
+&                 & find(TXNTYP,5,6,7,8)<>0
+&                 & OVENAT<>""
+&             Order By Key MWIX=VCRLIN;TXNTYP;OVENAT;WST;ITMREF
+For [MWI2]MWIX(5)
+    Raz LAMTTMP : # GH 21/04/2016 bug 113496 start to 0
+    For [MWI2]MWIX
+        LAMTTMP += [F:MWI2]AMOUNT
+    Next
+
+    If LAMTTMP<>0
+        Raz LFIND
+        [F:MWI]=[F:MWI2]
+        # GH 21/04/2016 bug 113496 use indice indcum instead of I with sigma
+        If [F:MWI2]WST<>""
+            LFIND = sigma(0,[M:CST]NBFGWST-1, ([M:CST]NATWST(indcum)=[F:MWI2]OVENAT
+&                                            & [M:CST]WOLNK(indcum)=[F:MWI2]VCRLIN
+&                                            & [M:CST]OWST(indcum)=[F:MWI2]WST))
+            If !LFIND
+                LFIND = sigma(0,[M:CST]NBFGSCO-1, ([M:CST]NATSCO(indcum)=[F:MWI2]OVENAT
+&                                                & [M:CST]SOLNK(indcum)=[F:MWI2]VCRLIN
+&                                                & [M:CST]OSCOWST(indcum)=[F:MWI2]WST))
+            Endif
+        Else
+            LFIND = sigma(0,[M:CST]NBFGITM-1, ([M:CST]NATITM(indcum)=[F:MWI2]OVENAT
+&                                            & [M:CST]IOLNK(indcum)=[F:MWI2]VCRLIN
+&                                            & [M:CST]OITMREF(indcum)=[F:MWI2]ITMREF))
+            If !LFIND
+                LFIND = sigma(0,[M:CST]NBFGMAT-1, ([M:CST]NATMAT(indcum)=[F:MWI2]OVENAT
+&                                                & [M:CST]MOLNK(indcum)=[F:MWI2]VCRLIN
+&                                                & [M:CST]OMATREF(indcum)=[F:MWI2]ITMREF))
+                # Issue 116399 - 2016-06-07 by CCC : if EO => no WST and overheads in the grid NBFGSCO are only for the unique service
+                If !LFIND & PVCRTYP=36
+                    LFIND = find([F:MWI2]OVENAT,[M:CST]NATSCO)
+                Endif
+            Endif
+        Endif
+        If !LFIND
+            Raz [F:MWI]AMOUNT
+            Raz [F:MWI]CSTELM
+            [F:MWI]AMOUNT = -LAMTTMP
+            LLASTSEQ += 1
+            [F:MWI]WIPSEQ    = LLASTSEQ
+
+            [F:MWI]TXNACT = 2
+
+            Call ECR_MWI From MWIPLIB
+            If !fstat : LLASTSEQ=[F:MWI]WIPSEQ : Endif : # GH 02/2016 bug 108954 incrementation for WIPCOST
+        Endif
+    Endif
+Next
+Filter [MWI2]
+End
+
+$ECR_MWI
+    [F:MWI] = [F:MWI2]
+    Raz [F:MWI]AMOUNT
+    Raz [F:MWI]CSTELM
+#    [F:MWI]TXNTYP    = 0    # enregistrements temporaire    : non, on calcule directement la bonne valeur
+#   [F:MWI]CSTELM(0) = ???
+    Case [F:MWI2]TXNTYP
+        When 1   : # Issue 105714 - 2015-03-20 by CCC : correspondence between [M:CST]xOVETYP and TXNTYP was erroneously retrieved
+                   #[F:MWI]TXNTYP = max(find([M:CST]MOVETYP(I),2,3,4,5)+3,5)
+                   [F:MWI]TXNTYP = max(find([M:CST]MOVETYP(I),2,4,3,5)+4,5)
+                   [F:MWI]OVENAT = [M:CST]NATMAT(I)
+                   [F:MWI]AMOUNT = [M:CST]MVARAMT(I)+[M:CST]MFXDAMT(I) - LAMTTMP
+
+        When 2,3 : # Issue 105714 - 2015-03-20 by CCC : correspondence between [M:CST]xOVETYP and TXNTYP was erroneously retrieved
+                   #[F:MWI]TXNTYP = max(find([M:CST]WOVETYP(I),2,3,4,5)+3,5)
+                   [F:MWI]TXNTYP = max(find([M:CST]WOVETYP(I),2,4,3,5)+4,5)
+                   [F:MWI]OVENAT = [M:CST]NATWST(I)
+                   [F:MWI]AMOUNT = [M:CST]WVARAMT(I)+[M:CST]WFXDAMT(I) - LAMTTMP
+
+        When 4   : # Issue 105714 - 2015-03-20 by CCC : correspondence between [M:CST]xOVETYP and TXNTYP was erroneously retrieved
+                   #[F:MWI]TXNTYP = max(find([M:CST]SOVETYP(I),2,3,4,5)+3,5)
+                   [F:MWI]TXNTYP = max(find([M:CST]SOVETYP(I),2,4,3,5)+4,5)
+                   [F:MWI]OVENAT = [M:CST]NATSCO(I)
+                   [F:MWI]AMOUNT = [M:CST]SVARAMT(I)+[M:CST]SFXDAMT(I) - LAMTTMP
+
+        When 14  : # Issue 105714 - 2015-03-20 by CCC : correspondence between [M:CST]xOVETYP and TXNTYP was erroneously retrieved
+                   #[F:MWI]TXNTYP = max(find([M:CST]IOVETYP(I),2,3,4,5)+3,5)
+                   [F:MWI]TXNTYP = max(find([M:CST]IOVETYP(I),2,4,3,5)+4,5)
+                   [F:MWI]OVENAT = [M:CST]NATITM(I)
+                   [F:MWI]AMOUNT = [M:CST]IVARAMT(I)+[M:CST]IFXDAMT(I) - LAMTTMP
+    Endcase
+    If [F:MWI]AMOUNT<>0
+        LLASTSEQ += 1
+        [F:MWI]WIPSEQ    = LLASTSEQ
+
+        [F:MWI]TXNACT = 2
+
+        Call ECR_MWI From MWIPLIB
+        If !fstat : LLASTSEQ = [F:MWI]WIPSEQ : Endif : # GH 02/2016 incrementation for WIPCOST
+    Endif
+Return
+
+
+######################################################################
+# Teste si un OF est éligible pour un calcul de PRF
+######################################################################
+Funprog CTRMFG(PTYP,PVCRNUM)
+Value Integer PTYP
+Value Char PVCRNUM
+
+Local Integer LRES
+LRES = 1
+
+Case PTYP
+    When 10 : # Ordre de fabrication
+        Read [MFG]MFG0 = PVCRNUM
+        If fstat
+            LRES = 0
+            GMESSAGE = mess(23,100,1)
+        Elsif [F:MFG]MFGFCY <> [M]STOFCY
+            LRES = 0
+            GMESSAGE = mess(224,193,1) #le site de l'ordre ne correspond pas au site sélectionné
+        Else
+            LRES = 0
+            # Avant de calculer le PRF, il faut qu'une conso (mat ou ope) et une entrée aient été faites
+            Filter [MFI] Where MFGNUM = PVCRNUM & CPLQTY>0
+            For [MFI]
+                LRES = 1
+                Break
+            Next
+            Filter [MFI]
+            If !LRES
+                Filter [MFM] Where MFGNUM = PVCRNUM & USEQTY>0
+                For [MFM]
+                    LRES = 1
+                    Break
+                Next
+                Filter [MFM]
+                If !LRES
+                    Filter [MFO] Where MFGNUM = PVCRNUM & CPLQTY>0
+                    For [MFO]
+                        LRES = 1
+                        Break
+                    Next
+                    Filter [MFO]
+                Endif
+            Endif
+            If !LRES
+             # GA 08/2006 "Calcul impossible: aucune entrée, aucune sortie matière"
+              GMESSAGE=mess(25,2363,1)
+            Endif
+        Endif
+    When 36 : # Ordre de sous-traitance
+        Read [SCO]SCO0 = PVCRNUM
+        If !fstat
+           Read [SCI]SCI0(1) = PVCRNUM
+           [G:SCI]currlen=0
+        Endif
+        If fstat
+            LRES = 0
+            GMESSAGE = mess(23,100,1)-PVCRNUM
+        Elsif [F:SCI]PRHFCY <> [M]STOFCY
+            LRES = 0
+            GMESSAGE = mess(224,193,1) #le site de l'ordre ne correspond pas au site sélectionné
+        Else
+            LRES = 0
+            # Avant de calculer le PRF, il faut qu'une conso (mat ou ope) et une entrée aient été faites
+            Filter [SCI] Where SCONUM = PVCRNUM & CPLQTY>0
+# Issue 91184  - 2013-08-07 by CCC
+#            For [SCI]
+#                LRES = 1
+#                Break
+#            Next
+            Look [SCI] First
+            If !fstat : LRES=1 : Endif
+            Filter [SCI]
+            If !LRES
+                Filter [SCM] Where SCONUM = PVCRNUM & USEQTY>0
+# Issue 91184  - 2013-08-07 by CCC
+#                For [SCM]
+#                    LRES = 1
+#                    Break
+#                Next
+                Look [SCM] First
+                If !fstat : LRES=1 : Endif
+                Filter [SCM]
+                If !LRES
+                    Filter [SCS] Where SCONUM = PVCRNUM & CPLQTY>0
+# Issue 91184  - 2013-08-07 by CCC
+#                    For [SCS]
+#                        LRES = 1
+#                        Break
+#                    Next
+                    Look [SCS] First
+                    If !fstat : LRES=1 : Endif
+                    Filter [SCS]
+                Endif
+            Endif
+            If !LRES
+             # GA 08/2006 "Calcul impossible: aucune entrée, aucune sortie matière"
+              GMESSAGE=mess(25,2363,1)
+            Endif
+        Endif
+Endcase
+End LRES
+
+######################################################################################
+Subprog SAVSCP(PLNK,PITM,PTYP,PSCPAMT,PRET)
+Value Integer PLNK
+Value Char    PITM
+Value Integer PTYP
+Value Decimal PSCPAMT()
+Variable Integer PRET
+
+Local Integer LEXI, IT_BRD
+Local Decimal LAMTTMP, LTMP, LCOE, LCOEQTY
+Local Integer J, PIND
+
+# Issue 93217 - 2013-10-04 by CCC : calculate scrap in accordance with quantity produced
+If func TRTCST.SUMQTY("P", 0)=0
+    End
+Endif
+
+Local Integer LTRANSAC : LTRANSAC=0
+If adxlog<>1
+    LTRANSAC = 1
+    Call DEBTRANS From GLOCK
+    Trbegin [MCS]
+Endif
+
+Raz [F:MCS]
+Readlock [MCS]MCS0=[M:CST0]STOFCY;PITM;[M:CTP]VCRTYP;[M:CTP]VCRNUM;PLNK;PTYP;adxuid(1)
+If fstat = 1
+    ERR_TRA = mess(14,100,1)-"fstat="+num$(fstat) - [M:CTP]VCRNUM-PITM
+    Call ECR_TRACE(ERR_TRA,1) From GESECRAN
+    PRET=1
+    Goto FIN
+Elsif !fstat
+    LEXI = 1
+Elsif fstat
+    LEXI = 0
+Endif
+
+[F:MCS]STOFCY  = [M:CST0]STOFCY
+[F:MCS]ITMREF  = PITM
+[F:MCS]VCRTYP  = [M:CTP]VCRTYP
+[F:MCS]VCRNUM  = [M:CTP]VCRNUM
+[F:MCS]VCRLIN  = PLNK
+[F:MCS]MFCTYP  = PTYP
+[F:MCS]UID     = adxuid(1)
+[F:MCS]QTYSTU  = func TRTCST.SUMQTY("P", PLNK)
+
+# Issue 93217 - 2013-10-04 by CCC : calculate scrap in accordance with quantity produced
+LCOEQTY = [F:MCS]QTYSTU / func TRTCST.SUMQTY("P", 0)
+
+For PIND=0 To [M:CST]NBITM-1
+    If [M:CST]ILNK(PIND)=PLNK
+        LAMTTMP = sigma(PIND*GACTMAT,(PIND+1)*GACTMAT-1,[M:CST]IMATCST(indcum))
+        If [F:MCS]QTYSTU=0
+            LCOE=1
+        Else
+            LCOE = [M:CST]IQTYSTU(PIND)/[F:MCS]QTYSTU
+        Endif
+
+        LCOE *= LCOEQTY
+
+        If LAMTTMP<>0
+            For J=0 To GACTMAT-1
+                LTMP = PSCPAMT(0)*[M:CST]IMATCST(PIND*GACTMAT+J)/LAMTTMP*LCOE
+                If [M:CTP]NIV=1
+                    [F:MCS]MATCST(J) += LTMP
+                Else
+                    [F:MCS]MATCPNCST(J) += LTMP
+                Endif
+                [M:CST]IMATCST(PIND*GACTMAT+J) += LTMP
+            Next
+        Endif
+
+        LAMTTMP = sigma(PIND*GACTMAC,(PIND+1)*GACTMAC-1,[M:CST]IMACCST(indcum))
+        If LAMTTMP<>0
+            For J=0 To GACTMAC-1
+                LTMP = PSCPAMT(2)*[M:CST]IMACCST(PIND*GACTMAC+J)/LAMTTMP*LCOE
+                If [M:CTP]NIV=1
+                    [F:MCS]MACCST(J) += LTMP
+                Else
+                    [F:MCS]MACCPNCST(J) += LTMP
+                Endif
+                [M:CST]IMACCST(PIND*GACTMAC+J) += LTMP
+            Next
+        Endif
+
+        LAMTTMP = sigma(PIND*GACTLAB,(PIND+1)*GACTLAB-1,[M:CST]ILABCST(indcum))
+        If LAMTTMP<>0
+            For J=0 To GACTLAB-1
+                LTMP = PSCPAMT(1)*[M:CST]ILABCST(PIND*GACTLAB+J)/LAMTTMP*LCOE
+                If [M:CTP]NIV=1
+                    [F:MCS]LABCST(J) += LTMP
+                Else
+                    [F:MCS]LABCPNCST(J) += LTMP
+                Endif
+                [M:CST]ILABCST(PIND*GACTLAB+J) += LTMP
+            Next
+        Endif
+
+        LTMP = PSCPAMT(3)*LCOE
+        If [M:CTP]NIV=1
+            [F:MCS]SCOCST += LTMP
+        Else
+            [F:MCS]SCOCPNCST += LTMP
+        Endif
+        [M:CST]ISCOCST(PIND) += LTMP
+        LTMP = PSCPAMT(4)*LCOE
+        If [M:CTP]NIV=1
+            [F:MCS]OVEMATCST += LTMP
+        Else
+            [F:MCS]OVEMATCPN += LTMP
+        Endif
+        [M:CST]IOVEMATCST(PIND) += LTMP
+        LTMP = PSCPAMT(5)*LCOE
+        If [M:CTP]NIV=1
+            [F:MCS]OVEMACCST += LTMP
+        Else
+            [F:MCS]OVEMACCPN += LTMP
+        Endif
+        [M:CST]IOVEMACCST(PIND) += LTMP
+        LTMP = PSCPAMT(6)*LCOE
+        If [M:CTP]NIV=1
+            [F:MCS]OVELABCST += LTMP
+        Else
+            [F:MCS]OVELABCPN += LTMP
+        Endif
+        [M:CST]IOVELABCST(PIND) += LTMP
+        LTMP = PSCPAMT(7)*LCOE
+        If [M:CTP]NIV=1
+            [F:MCS]OVESCOCST += LTMP
+        Else
+            [F:MCS]OVESCOCPN += LTMP
+        Endif
+        [M:CST]IOVESCOCST(PIND) += LTMP
+    Endif
+Next
+
+If [M:CTP]NIV=1
+    [F:MCS]MATTOT = sum([F:MCS]MATCST)
+    [F:MCS]MACTOT = sum([F:MCS]MACCST)
+    [F:MCS]LABTOT = sum([F:MCS]LABCST)
+    [F:MCS]SCOTOT = [F:MCS]SCOCST
+    [F:MCS]CSTTOT = [F:MCS]MATTOT+[F:MCS]MACTOT+[F:MCS]LABTOT+[F:MCS]SCOTOT
+    [F:MCS]OVETOT = [F:MCS]OVEMATCST+[F:MCS]OVEMACCST+[F:MCS]OVELABCST+[F:MCS]OVESCOCST
+Else
+    For J=0 To GACTMAC-1
+        [F:MCS]MACCPNCST(J) -= [F:MCS]MACCST(J)
+    Next
+    For J=0 To GACTLAB-1
+        [F:MCS]LABCPNCST(J) -= [F:MCS]LABCST(J)
+    Next
+    [F:MCS]SCOCPNCST -= [F:MCS]SCOCST
+
+    [F:MCS]OVEMATCPN -= [F:MCS]OVEMATCST
+
+    [F:MCS]OVEMACCPN -= [F:MCS]OVEMACCST
+
+    [F:MCS]OVELABCPN -= [F:MCS]OVELABCST
+
+    [F:MCS]OVESCOCPN -= [F:MCS]OVESCOCST
+
+Endif
+
+If LEXI
+    [F:MCS]UPDDAT  = date$
+    [F:MCS]UPDUSR  = GUSER
+    Rewrite [MCS]
+Else
+    [F:MCS]CREDAT  = date$
+    [F:MCS]CREUSR  = GUSER
+    [F:MCS]EXPNUM  = [C]EXPORT
+    Write [MCS]
+Endif
+
+If fstat
+    GOK = 0
+Endif
+
+$FIN
+
+If LTRANSAC
+    If GOK
+        Commit
+    Else
+        Rollback
+    Endif
+Endif
+
+End
+
+##################################################################################################
+################################    ACTIONS CHAMPS    ############################################
+##################################################################################################
+Subprog D_STOFCY(VALEUR)
+Variable Char    VALEUR()
+Call FIND_GFCYDEF(8) From TRTX3  # FQ 54218
+VALEUR = GFCY
+Call GETCPY(VALEUR,"",0,"") From TRTX3CPT   # Issue 75315 - 2011-07-25 by CCC : Alimentation de GNBDIE
+End
+
+##########################################################################
+Subprog AM_STOFCY(VALEUR)
+Variable Char    VALEUR()
+# charger les éventuels paramètres de niveau site
+Call GLOBVAR(VALEUR)    From WWGLOBGPA
+Call GETCPY(VALEUR,"",0,"") From TRTX3CPT   # Issue 75315 - 2011-07-25 by CCC : Alimentation de GNBDIE
+End
+
+##########################################################################
+Subprog C_VCRNUM(VALEUR)
+Variable Char    VALEUR()
+
+Local Char LWAICTL(2)
+
+If VALEUR <> ""
+    If !func CTRMFG([M]VCRTYP,VALEUR)  : # se positionne sur MFG
+        mkstat = 2
+    Elsif [M]PRF1=1 & [F:MFG]MFGTRKFLG<6
+        GMESSAGE = mess(225,193,1) #"Le prix de revient n'a pas encore été calculé pour cet ordre"
+        mkstat=2
+    Elsif [M]PRF2=1 & [F:MFG]MFGTRKFLG=6
+        GMESSAGE = mess(85,193,1) : #"Le prix de revient a déjà été calculé pour cet ordre"
+        mkstat=2
+    Elsif [F:MFG]MFGSTA < 4 & [M]SIMFLG<>2 : # contrôler que l'OF est clos
+        [M]SIMFLG = 2 : [M]MFGTYP=1
+        [M]PRF1=2
+        [M]PRF2=1
+        Diszo PRF1,PRF2
+        Affzo SIMFLG,PRF1,PRF2
+        GERR = 2 : GMESSAGE = mess(115,193,1) : #"Cet ordre de fabrication n'est pas clos"
+    Endif
+    If mkstat : End : Endif
+
+    # Issue 99496 - 2014-11-03 by CCC : pending transaction control
+    Raz LWAICTL
+    Call PARAM([F:MFG]MFGFCY, "WOMMVTWAI", LWAICTL) From ADOVAL
+    If LWAICTL="3"
+        If func FUNMFGS.CTRL_WAITRS_WO([F:MFG]MFGFCY,VALEUR)>0
+            mkstat=2
+            GMESSAGE = mess(289,193,1)
+            End
+        Endif
+    Endif
+
+Endif
+
+If VALEUR<>""
+    [M]MFGTYP = ([F:MFG]MFGSTA=4)+1
+    [M]FILMFG = ""
+    [M]FILFLG = 1
+Else
+    [M]MFGTYP = ([M]SIMFLG<>2)+1
+Endif
+Call UPDMSG(VALEUR)
+
+If GERR=2 : zonsui="SIMFLG" : Endif
+If VALEUR="" & [M]FILMFG = "" : mkstat = 2 : Endif
+End
+
+######################################################################################
+# Affiche un message à coté du n° d'ordre
+# /s-pro utilisé dans FUNWIPMFC et FUNWIPSCO
+######################################################################################
+Subprog UPDMSG(VCRNUM)
+Value Char VCRNUM
+Local Char LTXT(80)
+
+Raz [M]MSG
+If [M]FILFLG=2
+    If [M]MSG<>"" : [M]MSG+=" / " : Endif
+    If !clalev([F:AMZ]) : Local File AMSKZON [AMZ] : Endif
+    Read [AMZ]CODE = maskcou;"FILFLG"
+    If fstat : Raz [F:AMZ] : Endif
+
+    Call TEXTE([F:AMZ]INTIT,LTXT) From OBJDIV  # Filtre activé
+    ## Call TEXTE(8695,LTXT) From OBJDIV       ## GH 10/01/13 dm 77455
+    [M]MSG += LTXT
+Endif
+If [M]MFGTYP=2
+    If [M]MSG<>"" : [M]MSG+=" / " : Endif
+    If !clalev([F:AMZ]) : Local File AMSKZON [AMZ] : Endif
+    Read [AMZ]CODE = maskcou;"MFGTYP"
+    If fstat : Raz [F:AMZ] : Endif
+    Call TEXTE([F:AMZ]INTIT,LTXT) From OBJDIV  # Ordre clos
+    ## Call TEXTE(27360,LTXT) From OBJDIV      ## GH 10/01/13 dm 77455
+    [M]MSG += LTXT
+Endif
+Affzo MSG
+End
+
+######################################################################################
+Subprog C_PRNCOD(VALEUR)
+Variable Integer VALEUR
+    If VALEUR>1
+        Actzo PRVCSTPRT,EDIPRV
+        Actzo FLXBUD
+        If [M]FLXBUD<>2
+            Actzo ORIDEVCLC
+        Else
+            Grizo ORIDEVCLC
+        Endif
+    Else
+        [M]PRVCSTPRT = 1
+        [M]EDIPRV = 1
+        Diszo PRVCSTPRT,EDIPRV
+        Grizo FLXBUD
+        Grizo ORIDEVCLC
+    Endif
+    Affzo PRVCSTPRT,EDIPRV
+End
+
+######################################################################################
+Subprog C_FLXBUD(VALEUR)
+Variable Integer VALEUR
+# Issue 85341 - 2013-08-20 by CCC
+#    If VALEUR=2
+#        Grizo ORIDEVCLC
+#    Else
+#        Actzo ORIDEVCLC
+#    Endif
+End
+
+######################################################################################
+Subprog C_PRF2(VALEUR)
+Variable Integer VALEUR
+If VALEUR<>2 & [M]PRF1<>2
+    GMESSAGE = mess(266,199,1)
+    mkstat=2
+Endif
+End
+
+######################################################################
+Subprog DELADJMWI(PVCRTYP, PVCRNUM, PDATPER, PERR)
+Value    Integer PVCRTYP
+Value    Char    PVCRNUM
+Value    Date    PDATPER
+Variable Integer PERR
+
+Local Integer LFIND, LAST_SEQ, LRET
+# Issue 95486 - 2014-01-06 by CCC : TXNTYP=17 records have to be canceled and not deleted because of CSTELM(9) & (10)
+Local Decimal LCUMCST(dim([F:MWI]CSTELM)), LCUMAMT, LCUMLEV0
+
+If dim(GDIMCST)<=0 : Global Integer GDIMCST : Endif
+GDIMCST = GACTMAT+GACTMAC+GACTLAB+2+4     # = dim mat + dim mac + dim lab + sco + invdta + fg mat + fg mac + fg lab + fg sco
+Local Decimal LCSTDET(GDIMCST+1)
+
+Raz PERR
+
+Columns [MWI] (GLPSTA)
+Raz LFIND
+# Issue 95486 - 2014-01-06 by CCC : TXNTYP=17 records have to be canceled and not deleted because of CSTELM(9) & (10)
+For [MWI] Where VCRTYP = PVCRTYP
+&             & VCRNUM = PVCRNUM
+&             & ( TXNTYP=17
+&               | find(TXNTYP,9,10,11,12,13,16,15,20) & (GLPSTA=2 | TXNDAT<PDATPER) )
+    LFIND = 1
+    Break
+Next
+Columns [MWI]
+
+# Suppression des wipcost de solde non comptabilisés
+Delete [MWI] Where VCRTYP = PVCRTYP
+&                & VCRNUM = PVCRNUM
+&                & find(TXNTYP,9,10,11,12,13,16,15,20)
+&                & GLPSTA<>2
+&                & TXNDAT>=PDATPER
+
+If LFIND
+    # Annulation des wipcost déjà comptabilisés
+    Call GET_LAST_SEQ(PVCRTYP, PVCRNUM,LAST_SEQ) From MWIPLIB
+    Filter [MWI2] Where VCRTYP = PVCRTYP
+&                     & VCRNUM = PVCRNUM
+&                     & ( TXNTYP=17
+&                       | find(TXNTYP,9,10,11,12,13,16,15,20) & (GLPSTA=2 | TXNDAT<PDATPER) )
+&                     & WIPSEQ<=LAST_SEQ
+&                 Order By Key XMWI=VCRTYP;VCRNUM;TXNTYP;OPENUM;OPESPLNUM;OVENAT;WIPSEQ Desc
+    # Issue 75407 - 2011-07-27 by CCC : (2) --> (3)
+    # Issue 89378 - 2013-07-04 by CCC : il faut distinguer les txntyp=17 avec ou sans FG (3) --> (4)
+    # Issue 92823 - 2015-03-18 by CCC : take into account OPENUM & OPESPLNUM
+    For [MWI2]XMWI(6)
+        [F:MWI]=[F:MWI2]
+        Raz [F:MWI]QTY,[F:MWI]QTYACT,[F:MWI]AMOUNT,[F:MWI]CSTELM, LCUMAMT, LCUMCST, LCSTDET, LCUMLEV0
+        For [MWI2]XMWI
+            [F:MWI]QTY-=[F:MWI2]QTY
+            [F:MWI]QTYACT-=[F:MWI2]QTYACT
+            LCUMAMT-=[F:MWI2]AMOUNT
+            For I=0 To dim([F:MWI]CSTELM)-1
+                # On ne fait pas d'extourne des montants déjà absorbés et non absorbés
+                # Cela ne concerne que le type 17, les autres n'ayant pas cette info
+                If [F:MWI]TXNTYP=17 & find(I,9,10)
+                    Raz [F:MWI]CSTELM(I)
+                Else
+                    LCUMCST(I)-=[F:MWI2]CSTELM(I)
+                Endif
+            Next
+            # Issue 92823 - 2015-03-18 by CCC
+            ## Issue 91525 - 2013-07-31 by CCC : signe des valeurs [MWI]xxxCST de l'annulation
+            #Call LOADVAR(LCSTDET,"[F:MWI]", 0, "", -1, 0, 0) From STKVALECR
+            #Call LOADFIC("[F:MWI]",LCSTDET, "", "CST", 1, 0) From STKVALECR
+            Call LOADVAR(LCSTDET,"[F:MWI2]", 0, "", -1, 1, 0) From STKVALECR
+
+            # Issue 110939 - 2015-10-12 by CCC : cancel material level cost
+            LCUMLEV0 -=[F:MWI2]MATLEV0
+        Next
+        [F:MWI]AMOUNT = LCUMAMT
+        For I=0 To dim([F:MWI]CSTELM)-1
+            # On ne fait pas d'extourne des montants déjà absorbés et non absorbés
+            # Cela ne concerne que le type 17, les autres n'ayant pas cette info
+            If [F:MWI]TXNTYP=17 & find(I,9,10)
+                Raz [F:MWI]CSTELM(I)
+            Else
+                [F:MWI]CSTELM(I)=LCUMCST(I)
+            Endif
+        Next
+        # Issue 92823 - 2015-03-18 by CCC
+        Call LOADFIC("[F:MWI]",LCSTDET, "", "CST", 1, 0) From STKVALECR
+
+        # Issue 110939 - 2015-10-12 by CCC : cancel material level cost
+        [F:MWI]MATLEV0 = LCUMLEV0
+
+        If [F:MWI]QTY<>0 | [F:MWI]AMOUNT<>0
+            If [F:MWI]TXNDAT<PDATPER
+                [F:MWI]TXNDAT=date$
+            Endif
+            LAST_SEQ+=1
+            [F:MWI]GLPSTA=1
+            Raz [F:MWI]GLPDAT
+            [F:MWI]WIPSEQ = LAST_SEQ
+            [F:MWI]TXNACT=3
+            Call ECR_MWI From MWIPLIB
+            If fstat
+                Call FSTA("MWI") From GLOCK
+                LRET = 1
+                Break    # FQ 69909 Ctrl des sources avant End
+            Endif
+            LAST_SEQ = [F:MWI]WIPSEQ :  # GH 02/2016 bug 108954 incrementation for WIPCOST
+        Endif
+    Next
+    Filter [MWI2]
+    [G:MWI2]currlen=0
+    If LRET End Endif    # FQ 69909 Ctrl des sources Ligne ajoutée
+Endif
+End
+
+######################################################################################
+## Etiquette ajoutée par le superviseur (écran MWF0) 10/05/2010 16:37:44 (CCC)
+######################################################################################
+
+Subprog D_SIMFLG(VALEUR)
+Variable Integer VALEUR
+[M]MFGTYP=1+(VALEUR<>2)
+Call UPDMSG([M]VCRNUM)
+End
+
+Subprog AM_SIMFLG(VALEUR)
+Variable Integer VALEUR
+If VALEUR=2
+    [M]PRF1=2
+    [M]PRF2=1
+    Diszo PRF1,PRF2
+Else
+    Actzo PRF1,PRF2
+Endif
+
+[M]MFGTYP=1+(VALEUR<>2)
+
+Call UPDMSG([M]VCRNUM)
+End
+
+#############################################################
+Subprog CALMFC(PFCY,PVCRTYP,PVCRNUM)
+Value Char    PFCY
+Value Integer PVCRTYP
+Value Char    PVCRNUM
+
+Local Integer LTRA
+If GTRACE=""
+    LTRA=1
+    Call OUVRE_TRACE(mess(80,195,1)) From LECFIC
+Endif
+
+#If !clalev([M:MWF0]) : Local Mask MWF0 : Endif
+#Raz [M:MWF0]    # Issue 74041 - 2011-05-25 by CCC
+#Gosub INIT     From FUNWIPMFC
+#
+#Default Mask [MWF0]
+#[M:MWF0]STOFCY = PFCY
+#[M:MWF0]VCRTYP = PVCRTYP
+#[M:MWF0]VCRNUM = PVCRNUM
+#[M:MWF0]PRNCOD = 1    # Pas d'impression
+#[M:MWF0]FLXBUD = 1    # --> utile uniquement pour l'impression => valeur 1 car on n'a pas d'impression
+#[M:MWF0]ORIDEVCLC = 1 # Origine écart utile uniquement pour l'impression
+
+Case PVCRTYP
+    When 10 :
+        If !clalev([M:MWF0]) : Local Mask MWF0 [MWF0] : Endif
+        Raz [M:MWF0], GERR, GMESSAGE  # Il faut s'assurer que l'écran est bien vide
+        Gosub INIT     From FUNWIPMFC
+
+        Default Mask [MWF0]
+
+    When 36 :
+        If !clalev([M:SWF0]) : Local Mask SWF0 [SWF0] : Endif
+        Raz [M:SWF0], GERR, GMESSAGE  # Il faut s'assurer que l'écran est bien vide
+        Gosub INIT     From FUNWIPMFC
+
+        Default Mask [SWF0]
+Endcase
+[M]STOFCY = PFCY
+[M]VCRTYP = PVCRTYP
+[M]VCRNUM = PVCRNUM
+[M]PRNCOD = 1    # Pas d'impression
+[M]FLXBUD = 1    # --> utile uniquement pour l'impression => valeur 1 car on n'a pas d'impression
+[M]ORIDEVCLC = 1 # Origine écart utile uniquement pour l'impression
+
+Call GETCPY(PFCY,"",0,"") From TRTX3CPT   # Issue 75315 - 2011-07-25 by CCC : Alimentation de GNBDIE
+
+Raz GERR
+Gosub CONTROLE From FUNWIPMFC
+If !GOK | GERR
+    Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+Else
+    Gosub EXEC     From FUNWIPMFC
+    If GOK & !GERR
+        Gosub TERMINE  From FUNWIPMFC
+    Endif
+Endif
+
+If LTRA
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+Endif
+
+End
+
+######################################################################################
+## GH 10/01/2013 Dm 77455
+######################################################################################
+
+Subprog S_VCRNUM(VALEUR)
+Variable Char    VALEUR()
+
+[M]FILSELMFG=""
+# [M]FILSELMFG-="[MFG]SUSFLG<>2" : # ordre non suspendu
+If [M]SIMFLG<>2
+   [M]FILSELMFG-= "& [MFG]MFGSTA=4" : # ordre clos
+Endif
+If [M]PRF1=2
+  [M]FILSELMFG-= "& "
+  If [M]PRF2=2 : [M]FILSELMFG+= "(" : Endif
+  [M]FILSELMFG+= "find([MFG]MFGTRKFLG,4,5)<>0" : # En cours ou soldé
+Endif
+If [M]PRF2=2
+   If [M]PRF1=2 : [M]FILSELMFG-= "| (" : Else  [M]FILSELMFG-= "& " : Endif
+   [M]FILSELMFG+= "[MFG]MFGTRKFLG=6 & [MWH]MFGTRKFLG=5" : # Prix de revient calculé
+   If [M]PRF1=2 : [M]FILSELMFG+= "))" : Endif
+Endif
+If left$([M]FILSELMFG,3)=" & " : [M]FILSELMFG = right$([M]FILSELMFG,4) : Endif
+End
+
+######################################################################################
+
+Subprog IB_VCRNUM
+If [M]PRF2<>2
+    Raz GBOUT3
+Elsif [M]PRF1<>2
+    GBOUT3=mess(293,193,1) : # Sélection OF avec prix revient calculé
+Else
+    GBOUT3=mess(294,193,1) : # Sélection OF clos
+Endif
+End
+
+######################################################################################
+
+Subprog B2_VCRNUM(VALEUR)
+Variable Char    VALEUR()
+
+[M]FILFLG = ([M]FILMFG<>"")+1
+If [M]FILMFG<>"" : VALEUR="" : Endif
+
+Call UPDMSG(VALEUR)
+End
+
+######################################################################################
+
+Subprog B3_VCRNUM(VALEUR)
+Variable Char    VALEUR()
+
+# ici , on a forcément [M]SIMFLG=1 & [M]PRF2=2
+[M]FILSELMFG = "[MFG]MFGSTA=4" : # ordre clos
+#[M]FILSELMFG-=" & [MFG]SUSFLG<>2" : # ordre non suspendu
+If [M]PRF1<>2
+   [M]FILSELMFG-= "& [MFG]MFGTRKFLG=6" : # Prix de revient calculé
+Else
+   [M]FILSELMFG-= "& find([MFG]MFGTRKFLG,4,5)<>0"  : # En cours ou soldé
+Endif
+End
+

@@ -1,0 +1,1003 @@
+#<AdxTL>@(#)9.0.0.0 $Revision$
+#---------------------------------------------------------------------------#
+# **** SCOSTKLIB selon MTKLIB                                 GA Oct 2005   #
+#                                                                           #
+# -------------En déclaration de production, saisie stock-------------------#
+#  MAJ_SCO       : MAJ des quantité en Q et R en retour contrôle qualité    #
+#  MAJ_STK       : Maj du stock en réception de sous-traitance              #
+#  ANNULE_MAJ_STK: Maj stock en suppression réception(DEL_SUIV de MTKLIB)   #
+#---------------------------------------------------------------------------#
+#############################################################################
+# 02/2007 dans SCOSRV CPNITMREF devient SRVITMREF                           #
+#############################################################################
+# Bibliotheque de traitements liés à la maj des stocks en saisie directe    #
+# pour les achats de sous-traitance                                         #
+#############################################################################
+# -- Création d'une sortie de stock                                         #
+# Subprog ALI_ALP(LABR,LLIG)   : # selon ALI_ALP de SUBMTKB
+# $CHARGE_STOSOR              appelé par CHARGE_PARAM(TRTSTOSORA)           #
+# $APRES_STOSOR               appelé par APRES_ENR(TRTSTOSORA)              #
+#                                                                           #
+# -- Uitlisé pour Suppression d'une sortie de stock                         #
+# $CHARGE_STOSOM              appelé par CHARGE_PARAM(TRTSTOSOMA)           #
+# $APRES_STOSOM               appelé par APRES_ENR(TRTSTOSOMA)              #
+#############################################################################
+
+#############################################################################
+#   ATTENTION: revoir les lignes #?  ou #GA
+#   suppression de tous les accès [M:MKO],[M:MKI],[M:MKM],[M:MTK]
+#############################################################################
+
+
+##########################################################################
+# MISE A JOUR SCO suite à contrôle qualité                               #
+# LQTYA   : quantité passée en statut "A"                                #
+# LQTYR   : quantité passée en statut "R"                                #
+# LVCRTYP : Type : 36=ordre de sous-traitance                            #
+# LVCRNUM : Numéro d'ordre de sous-traitance                             #
+# LVCRLIN : Numéro de ligne d'ordre de sous-traitance                    #
+##########################################################################
+Subprog MAJ_SCO (LQTYA,LQTYR,LVCRTYP,LVCRNUM,LVCRLIN)
+
+Value Decimal  LQTYA,LQTYR
+Value Integer  LVCRTYP
+Value Char     LVCRNUM
+Value Integer  LVCRLIN
+
+# Ouverture des tables si nécessaire
+Gosub OPEN_FILES
+
+If LVCRTYP<>36 : End : Endif
+
+#-----------------------------#
+# lecture entête SCO          #
+#-----------------------------#
+Readlock [SCO]SCO0 = LVCRNUM
+If fstat = 1
+          GOK = -1 : GLOCK = "$SCOHEAD"-LVCRNUM
+          Call ROLL From GLOCK
+          End
+Elsif fstat
+          GOK = 0 : Call RSTA ("SCO",LVCRNUM) From GLOCK
+          End
+Endif
+
+#-----------------------------#
+# lecture ligne article lancé #
+#-----------------------------#
+Readlock [SCI]SCI0 = LVCRNUM;LVCRLIN
+If fstat = 1
+   GOK = -1 : GLOCK = "$SCOITM"-LVCRNUM-num$(LVCRLIN)
+   Call ROLL From GLOCK
+   End
+Elsif fstat
+   GOK = 0 : Call RSTA ("SCI",LVCRNUM) From GLOCK
+   End
+Endif
+
+#--------------------------------#
+# mise a jour des qtés en Q et R #
+#--------------------------------#
+If LQTYA <> 0
+    #[F:SCO]QUACPLQTY -= LQTYA   # FQ 65646
+    [F:SCI]QUACPLQTY -= LQTYA
+Endif
+If LQTYR <> 0
+    #[F:SCO]QUACPLQTY -= LQTYR   # FQ 65646
+    [F:SCI]QUACPLQTY -= LQTYR
+    #[F:SCO]REJCPLQTY += LQTYR   # FQ 65646
+    [F:SCI]REJCPLQTY += LQTYR
+Endif
+
+Gosub REWRITE_SCO From SCOLIB
+
+Gosub REWRITE_SCI From SCOLIB
+
+End
+
+###############################################################################
+# Appelé en réception d'un article sous-traité   MAJ_SOUS_TRAIT_SCO(SUBPTHC)  #
+###############################################################################
+Subprog MAJ_STK(LPTHNUM,LPTDLIN,LSCONUM,LSCILIN,LRET)
+Value    Char     LPTHNUM
+Value    Integer  LPTDLIN
+Value    Char     LSCONUM
+Value    Integer  LSCILIN
+Variable Integer  LRET
+
+# Ouverture des tables si nécessaire
+Gosub OPEN_FILES
+
+Local Integer NOL : NOL=nolign-1
+Local Integer STAT
+Local Char    WLOT(GLONLOT)    : # pour MAJ_STKENT_SCI un seul lot plusieurs entrées
+Global Shortint GSCOTRACE      : # affichage d'une trace en gestion
+
+# Issue 79859 GA 03/2012 Suivi de sous-traitance
+Local Char    WSTA(GLONSTA)
+Local Decimal  WCOEF,WTOTAMTPRI,WTOTAMTCPR
+Local Shortint WSCOTRK
+Local File PRECEIPTD [PTDW]
+Filter [PTDW] Where PTHNUM=LPTHNUM
+Local File PRECEIPT  [PTHW]
+Filter [PTHW] Where PTHNUM=LPTHNUM
+#Local File WIPCOST [MWIK]
+Local File STOJOU  [STJK]   # Issue 82913 GA 06/2012
+
+ # Issue 94558 GA 11/2013 selon [F:PTRW]MODALL
+ If !clalev([F:PTRW]) Local File PURTRS [F:PTRW] Endif
+ If GSCOPTRNUM<>"" & ([F:PTR]PTRTYP<>9 | [F:PTR]PTRNUM<>GSCOPTRNUM)
+   Read [F:PTRW]PTR0=9;GSCOPTRNUM
+   If fstat Raz [F:PTRW] Endif
+ Else
+   [F:PTRW] = [F:PTR]
+ Endif
+
+# entête de l'EO
+If [F:SCO]SCONUM<>LSCONUM
+   Read [F:SCO]SCO0 = LSCONUM
+   If fstat : Raz [F:SCO] : Endif
+Endif
+
+#--- Issue 108540 by  TS : pas d'alloc de l'EO si on crée une ligne de réception
+# allocation EO si nécessaire
+# Issue 94558 GA 11/2013 selon [F:PTR]MODALL
+# Issue 79164 - 2012-03-15 by CCC : Suppression du paramètre EOMALLMGT
+#If GEOMALLMGT = 2 & !find([F:SCO]ALLSTA,3,5) & [F:SCO]MATLINNBR <> 0
+#If !find([F:SCO]ALLSTA,3,5) & [F:SCO]MATLINNBR <> 0 & [F:PTRW]MODALL>1
+#   # FQ 55997 Call ALLOC_EO("C", 0, [F:SCO]SCONUM, 1, 1, LRET) From SCOALL
+#   Local Integer WALLTYP : WALLTYP=[F:PTRW]MODALL-1 # Issue 94558 GA 11/2013 before =2
+#   Call ALLOC_EO("C", 0, [F:SCO]SCONUM, WALLTYP, 1, LRET) From SCOALL
+#   #If LRET <> 0 : GOK = 0 : End : Endif
+#Endif
+#---
+
+#----------------------------- déclaration de production -------------------------------#
+If [F:SCI]SCONUM<>LSCONUM | [F:SCI]SCILIN<>LSCILIN
+   Read [F:SCI]SCI0 = LSCONUM;LSCILIN
+   If fstat : Raz [F:SCI] : LRET = 1 : End : Endif
+Endif
+
+ # Maj de SCOITM + entrée stock selon qté réceptionnée
+   Gosub MAJ_STKENT_SCI From SCOSTKAUTLIB
+   If GOK < 1 : LRET = 1 : Goto FIN_MAJ_STK_ERR : Endif
+
+   # On conserve le n° de lot pour les entrées suivantes si nécessaires
+   WLOT = [M:STW]LOT(0)   # FQ 72505 GA 03/2011 demande TS ajout (0) car champ indicé
+   WSTA = [M:STW]STA(0)   # Issue 79859 GA 03/2012
+
+   # Issue 79859 GA 03/2012 Suivi de sous-traitance
+   If filinfo(filpath("FIL","SCOTRK","fde",nomap),0)>0
+      WSCOTRK=1
+      Raz [F:SCK] : [F:SCK] = [F:SCI]
+      [F:SCK]LINTYP=2
+      [F:SCK]ITMREF=[F:SCI]ITMREF
+      [F:SCK]LOT   =WLOT
+      [F:SCK]PJT   =[F:SCI]PJT
+      [F:SCK]STA   =WSTA
+      [F:SCK]PTHNUM=LPTHNUM   # Issue  GA 12/2012
+      [F:SCK]PTDLIN=LPTDLIN   # Issue  GA 12/2012
+      Gosub COPY_PTD_TO_SCK
+      Gosub WRITE_SCK From SCOLIB
+      If GOK < 1 : LRET = 1 : Goto FIN_MAJ_STK_ERR : Endif
+   Else
+      WSCOTRK=0
+   Endif
+
+#----------------------------- suivi opération de sous-traitance ------------------------#
+ If [F:SCS]SCONUM<>LSCONUM | [F:SCS]SCILIN<>LSCILIN
+   Read [F:SCS]SCS0 = LSCONUM;LSCILIN
+     If fstat : Raz [F:SCS] : LRET = 1 : Goto FIN_MAJ_STK_ERR : Endif
+  Endif
+
+ # Maj de SCOSRV selon qté réceptionnée (lock et rewrite)
+   Gosub MAJ_STKENT_SCS From SCOSTKAUTLIB
+   If GOK < 1 : LRET = 1 : Goto FIN_MAJ_STK_ERR : Endif
+
+#----------------------------- suivi matière -------------------------------------------#
+    Local        Integer WLINMAT,SAVNOL
+    If dim(NOL)<=0 Local Integer NOL Endif
+    SAVNOL=NOL
+    #NOL=-1 # pour CTRL_MATSTA ?
+
+    Raz WLINMAT
+  # On ne traite que les matières qui ne sont pas déjà soldées ni exclues
+    Filter [F:SCM] Where SCONUM=LSCONUM & SCILIN=LSCILIN
+    #
+    For [F:SCM]SCM0
+
+       #If [F:SCM]SCOFLG=1 | [F:SCM]MATSTA=4 | [F:SCM]SCMTRKFLG=5 Goto NEXTMAT Endif
+       If [F:SCM]SCOFLG=1 | [F:SCM]MATSTA=4 Goto NEXTMAT Endif
+       WLINMAT += 1
+
+       If [F:SCM]SCOFLG = 2
+       # Maj de SCOMAT + sortie stock selon qté backflush
+         Gosub MAJ_STKSOR_SCM From SCOSTKAUTLIB
+        If GOK < 1 : LRET = 1 : Break : Endif
+       Elsif [F:SCM]SCOFLG = 3
+       # Maj de SCOMAT + selon qté facturée
+         Gosub MAJ_STKPRI_SCM From SCOSTKAUTLIB
+         If GOK < 1 : LRET = 1 : Break : Endif
+       Endif
+
+       # Issue 79859 GA 03/2012 Suivi de sous-traitance
+       If WSCOTRK
+          Raz [F:SCK] : [F:SCK] = [F:SCM]
+          [F:SCK]LINTYP=4
+          [F:SCK]ITMREF=[F:SCM]CPNITMREF
+          [F:SCK]PJT   =[F:SCI]PJT
+          [F:SCK]SCONUM=[F:SCM]SCONUM
+          [F:SCK]SCSLIN=[F:SCM]SCSLIN
+          [F:SCK]SCMLIN=[F:SCM]SCMLIN
+          [F:SCK]PTHNUM=LPTHNUM   # Issue  GA 12/2012
+          [F:SCK]PTDLIN=LPTDLIN   # Issue  GA 12/2012
+          If [F:SCM]SCOFLG = 3 Gosub COPY_PTD_TO_SCK Endif
+          If [F:SCM]SCOFLG = 2 Gosub COPY_STJ_TO_SCK Endif # Issue 82913 GA 06/2012 avant COPY_MWI_TO_SCK
+          Gosub WRITE_SCK From SCOLIB
+          If GOK < 1 : LRET = 1 : Break : Endif
+       Endif
+
+$NEXTMAT
+    Next
+    Filter [F:SCM]
+    If GOK < 1 : LRET = 1 : Goto FIN_MAJ_STK_ERR : Endif
+
+# Issue 93349 GA 10/2013 Conso de matière non prévue sur un EO
+#----------------------------- suivi matière non prévue ---------------------------------------#
+    Local        Integer WLINMAT,SAVNOL
+    If dim(NOL)<=0 Local Integer NOL Endif
+    SAVNOL=NOL
+
+    Raz WLINMAT
+    # Issue 106496 - 2015-05-07 by CCC : in case of 2 receipts of a unique EO, do the distinction with VCRLIN
+    # Il ne reste que les lignes [F:PWS] correspondant à des matières ajoutées
+    Filter [F:PWS] Where PRONUM=adxuid(1) & CODFNC="PTH" & VCRTYP=36 & VCRNUM=LSCONUM & TRSTYP=29
+&                      & VCRLIN = LSCILIN+[M:PTH1]WSTOSEQ(NOL)
+    #
+    For [F:PWS]
+       WLINMAT += 1
+
+       If WSCOTRK
+          Raz [F:SCK] : [F:SCK] = [F:PWS]
+          [F:SCK]LINTYP=4
+          [F:SCK]ITMREF=[F:PWS]ITMREF
+          [F:SCK]PJT   =[F:SCI]PJT
+          [F:SCK]SCONUM=[F:SCI]SCONUM
+          [F:SCK]SCILIN=[F:SCI]SCILIN
+          [F:SCK]SCSLIN=0
+          [F:SCK]SCMLIN=0
+          [F:SCK]POHNUM=[F:SCI]POHNUM
+          [F:SCK]POPLIN=[F:SCI]POPLIN
+          [F:SCK]PTHNUM=LPTHNUM
+          [F:SCK]PTDLIN=LPTDLIN
+          Gosub COPY_STJ_TO_SCK
+          Gosub WRITE_SCK From SCOLIB
+          If GOK < 1 : LRET = 1 : Break : Endif
+       Endif
+
+       # Maj de la sortie stock selon qté backflush
+       # Attention: Suppression et raz de la ligne PWS
+       Gosub MAJ_STKSOR_PWS From SCOSTKAUTLIB
+       If GOK < 1 : LRET = 1 : Break : Endif
+
+$NEXTPWS
+    Next
+    Filter [F:PWS]
+    If GOK < 1 : LRET = 1 : Goto FIN_MAJ_STK_ERR : Endif
+
+    NOL=SAVNOL
+    # Issue 79859 GA 03/2012 le Service en dernier pour répartition CPR
+    If WSCOTRK
+      Raz [F:SCK] : [F:SCK] = [F:SCS]
+      [F:SCK]LINTYP=3
+      [F:SCK]ITMREF=[F:SCS]SRVITMREF
+      [F:SCK]PJT   =[F:SCI]PJT
+      [F:SCK]SCSLIN=[F:SCS]SCSLIN
+      [F:SCK]SCMLIN=0
+      [F:SCK]PTHNUM=LPTHNUM   # Issue  GA 12/2012
+      [F:SCK]PTDLIN=LPTDLIN   # Issue  GA 12/2012
+      Gosub COPY_PTD_TO_SCK
+      Gosub WRITE_SCK From SCOLIB
+      If GOK < 1 : LRET = 1 : Goto FIN_MAJ_STK_ERR : Endif
+    Endif
+
+$FIN_MAJ_STK
+
+  Readlock [F:SCO]SCO0 = LSCONUM
+  If fstat=1  GOK=-1 : GLOCK="$SCOHEAD"-LSCONUM : End
+  Elsif fstat GOK=0  : Call RSTA("SCO",LSCONUM) From GLOCK : End
+  Endif
+
+ # recomptage des matières/opérations soldées
+  Gosub MAJSCOHEAD  From SCOLIB
+  If GOK < 1 : LRET = 1 : End : Endif
+
+  Gosub REWRITE_SCO From SCOLIB
+  If GOK < 1 : LRET = 1 : End : Endif
+
+  Filter [PTDW]
+  Close File [PTDW]
+  Filter [PTHW]
+  Close File [PTHW]
+
+ # Ordre de sous-traitance :
+  WMSGSUI = mess(641,197,1) +" : "+ [F:SCO]SCONUM
+  GSCOTRACE = 2
+  Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+End
+
+$FIN_MAJ_STK_ERR
+  Filter [PTDW]
+  Close File [PTDW]
+  Filter [PTHW]
+  Close File [PTHW]
+  # Ordre de sous-traitance :
+  WMSGSUI = mess(641,197,1) +" : "+ [F:SCO]SCONUM
+  GSCOTRACE = 2
+  Call ECR_TRACE(WMSGSUI,1) From GESECRAN
+End
+
+####################################################
+# Issue 79859 GA 03/2012 Suivi de sous-traitance
+# This code fires before [F:PTD] lines are inserted
+####################################################
+$COPY_PTD_TO_SCK
+Local Decimal WQTYUO, WPRIUO # Issue 100967 GA 06/2014
+
+For IPTH=0 To [M:PTH1]NBLIG-1
+
+   # Issue GA 12/2012 ctrl ligne de rcp courante
+  If [M:PTH1]VCRNUMORI(IPTH)=[F:SCK]SCONUM
+&  & [M:PTH1]VCRLINORI(IPTH)=[F:SCK]SCILIN
+&  & [M:PTH0]PTHNUM         =[F:SCK]PTHNUM
+&  & [M:PTH1]PTDLIN(IPTH)  >=[F:SCK]PTDLIN
+
+    If [M:PTH1]LINTYP(IPTH)=2   # le prix de revient unitaire est sur le sous-traité
+       WTOTAMTPRI=[M:PTH1]CPRPRI(IPTH)*[M:PTH1]QTYSTU(IPTH)
+    Endif
+
+    # Issue 111647 - 2015-10-21 by MUARN : désynchron PTDLIN entre PTD et SCK
+    If [M:PTH1]LINTYP(IPTH) <= 3 | ( [M:PTH1]LINTYP(IPTH) = 4 & [M:PTH1]VCRSEQORI(IPTH) = [F:SCK]SCMLIN )
+      If [M:PTH1]ITMREF(IPTH)= [F:SCK]ITMREF
+&  &   [M:PTH1]LINTYP(IPTH)= [F:SCK]LINTYP
+
+        Call ECR_DEBUG("COPY_PTD_TO_SCK(SCOSTKLIB):"-[F:SCK]SCONUM-num$([F:SCK]SCILIN)-[F:SCK]ITMREF-mess([F:SCK]LINTYP,570,1)-"\Receipt line="-[F:SCK]PTHNUM-num$([F:SCK]PTDLIN)) From SCOSTKAUTLIB
+
+        #[F:SCK]PTHNUM   =[M:PTH0]PTHNUM
+        [F:SCK]PRHFCY   =[M:PTH0]PRHFCY
+        [F:SCK]IPTDAT   =[M:PTH0]RCPDAT
+
+        # Issue 111647 - 2015-10-09 by MUARN : déjà alimenté avec [F:PTD] sur le composé
+        If [M:PTH1]LINTYP(IPTH)>2 : [F:SCK]PTDLIN = [M:PTH1]PTDLIN(IPTH) : Endif
+        [F:SCK]POHNUM   =[M:PTH1]POHNUM(IPTH)
+        [F:SCK]POPLIN   =[M:PTH1]POPLIN(IPTH)
+        [F:SCK]POQSEQ   =[M:PTH1]POQSEQ(IPTH)
+        [F:SCK]STU      =[M:PTH1]STU   (IPTH)
+        [F:SCK]UOM      =[M:PTH1]UOM   (IPTH)
+        [F:SCK]UOMSTUCOE=[M:PTH1]UOMSTUCOE(IPTH)
+        [F:SCK]UOMCPLQTY=[M:PTH1]QTYUOM(IPTH)
+        [F:SCK]CPLQTY   =[M:PTH1]QTYSTU(IPTH)
+        [F:SCK]INVQTY   =[M:PTH1]INVQTYSTU(IPTH)
+       # Issue 100967 GA 06/2014 take care of currency conversion
+       # [F:SCK]EXTPRI   =[M:PTH1]NETPRI(IPTH) / [M:PTH1]UOMSTUCOE(IPTH) # Issue 90045 prix en US
+       # If [F:SCK]LINTYP=4 & WTOTAMTPRI<>0  & [F:SCK]CPLQTY<>0          # Matière => répartition
+       #    WCOEF = [F:SCK]EXTPRI*[F:SCK]CPLQTY / WTOTAMTPRI
+       #    [F:SCK]CPLPRI=([F:PTD]CPR*[F:PTD]QTYSTU * WCOEF)/[F:SCK]CPLQTY         # [F:PTD]CPR se trouve sur la ligne Article sous-traité
+       #    WTOTAMTCPR += ([F:SCK]CPLPRI * [F:SCK]CPLQTY)
+       # Elsif [F:SCK]LINTYP=3 & [F:SCK]CPLQTY<>0   # Service : le reste
+       #    [F:SCK]CPLPRI=([F:PTD]CPR*[F:PTD]QTYSTU - WTOTAMTCPR)/[F:SCK]CPLQTY    # [F:PTD]CPR se trouve sur la ligne Article sous-traité
+       # Endif
+        If [M:PTH1]CPR(IPTH)<>0 # Issue 100967 GA 07/2014
+            WPRIUO = [M:PTH1]CPR(IPTH)
+            WQTYUO = [M:PTH1]QTYSTU(IPTH)
+        Else
+        # Issue 102605 GA 03/2015 special V8 [M:PTH1]CPR(IPTH) and [M:PTH1]CPRCUR(IPTH) are void !
+        #    WPRIUO = [M:PTH1]NETPRI(IPTH)
+        #    WQTYUO = [M:PTH1]QTYUOM(IPTH)   # Issue 90045 NETPRI exprimé en UO avant [M:PTH1]QTYSTU(IPTH)
+        #    If [M:PTH1]NETCUR(IPTH)<>[M:PTH1]CPRCUR(IPTH) & WPRIUO<>0
+        #      Local Integer WSTAT
+        #      Call CONVERT2([M:PTH1]NETCUR(IPTH),[M:PTH1]CPRCUR(IPTH),GLOCALDEV,[M:PTH0]CHGTYP,[M:PTH0]RCPDAT,WPRIUO,WPRIUO, WSTAT) From TRTDEV
+        #    Endif
+            If [M:PTH1]QTYUOM(IPTH)>0
+              WPRIUO = [M:PTH1]LINAMT(IPTH)/[M:PTH1]QTYUOM(IPTH)
+              WQTYUO = [M:PTH1]QTYUOM(IPTH)
+            Endif
+            If [M:PTH1]NETCUR(IPTH)<>GLOCALDEV & WPRIUO<>0
+              Local Integer WSTAT
+              Call CONVERT2([M:PTH1]NETCUR(IPTH),GLOCALDEV,GLOCALDEV,[M:PTH0]CHGTYP,[M:PTH0]RCPDAT,WPRIUO,WPRIUO, WSTAT) From TRTDEV
+            Endif
+         Endif
+         [F:SCK]EXTPRI=WPRIUO
+         [F:SCK]CPLPRI=WPRIUO
+         [F:SCK]CPLQTY=WQTYUO
+         [F:SCK]CPLCRG=0     # pas de frais en saisie de rcp ???
+         # Issue 107513/US4 GA 06/2015 : ECC for table SCOMAT + LOT
+         If dim([M:PTH1]ECCVALMAJ)>0  & dim([F:SCK]ECCVALMAJ)>0
+            [F:SCK]ECCVALMAJ=[M:PTH1]ECCVALMAJ(IPTH)
+         Endif
+         If dim([M:PTH1]ECCVALMIN)>0 & dim([F:SCK]ECCVALMIN)>0
+            [F:SCK]ECCVALMIN=[M:PTH1]ECCVALMIN(IPTH)
+         Endif
+         Break
+      Endif
+    Endif
+  Endif
+Next
+If [F:SCK]LINTYP=2 & [F:SCK]CPLQTY<>0
+   [F:SCK]EXTPRI   =WTOTAMTPRI/[F:SCK]CPLQTY
+   [F:SCK]CPLPRI   =[F:PTD]CPR
+Endif
+Return
+
+# Issue 82913 GA 06/2012 Erreur rcp partielle car le WIPCOST ne comporte pas la ref PTHNUM pour prendre le bon
+####################################################
+# Issue 79859 GA 03/2012 Suivi de sous-traitance
+####################################################
+###$COPY_MWI_TO_SCK
+###
+###[F:SCK]PTHNUM   =[M:PTH0]PTHNUM
+###[F:SCK]PRHFCY   =[M:PTH0]PRHFCY
+###[F:SCK]IPTDAT   =[M:PTH0]RCPDAT
+###
+#### MWI4: VCRTYP+VCRNUM+VCRLIN+BOMSEQ+ITMREF+STU+WIPSEQ
+###Read [MWIK]MWI4=36;[F:SCK]SCONUM;[F:SCK]SCILIN;[F:SCK]SCMLIN;[F:SCK]ITMREF;[F:SCK]STU
+###If !fstat
+###    [F:SCK]STU      =[F:SCM]STU
+###    [F:SCK]UOM      =[F:SCM]STU     # [F:SCM]BOMUOM
+###    [F:SCK]UOMSTUCOE=1              # [F:SCM]BOMSTUCOE
+###    [F:SCK]UOMCPLQTY=[F:MWIK]QTY
+###    [F:SCK]CPLQTY   =[F:MWIK]QTY
+###    [F:SCK]INVQTY   =0
+###    [F:SCK]EXTPRI   =[F:SCM]NETPRI
+###    If [F:MWIK]QTY<>0
+###       [F:SCK]CPLPRI=[F:MWIK]AMOUNT / [F:MWIK]QTY
+###    Endif
+###    [F:SCK]CPLCRG   =0
+###Endif
+###
+###Return
+
+# Issue 82913 GA 06/2012
+$COPY_STJ_TO_SCK
+
+#[F:SCK]PTHNUM  =LPTHNUM # done just before calling COPY_STJ_TO_SCK
+#[F:SCK]PTDLIN  =LPTDLIN # done just before calling COPY_STJ_TO_SCK
+[F:SCK]PRHFCY   =[F:PTH]PRHFCY
+[F:SCK]IPTDAT   =[F:PTH]RCPDAT
+
+# Issue 93349 GA 10/2013 l'ancienne lecture était Ko + complété pour les matières ajoutées
+If !clalev([F:STJK]) Local File STOJOU [F:STJK] Endif
+# STJ1: STOFCY+VCRTYP+VCRNUM+VCRLIN
+#Read [F:STJK]STJ1=[F:PTH]PRHFCY;6;[F:PTD]PTHNUM;[F:PTD]PTDLIN
+#If !fstat
+   Filter [F:STJK] Where STOFCY=[F:SCI]PRHFCY & VCRTYP=6 & VCRNUM=LPTHNUM & VCRLIN=LPTDLIN & TRSTYP=29
+&                       & VCRTYPORI=36 & VCRNUMORI=[F:SCK]SCONUM & VCRLINORI=[F:SCK]SCILIN
+&                       & (VCRSEQORI=[F:SCK]SCMLIN | ITMREF=[F:SCK]ITMREF)
+&                  Order By Key STJ1
+   For [F:STJK]
+  Call ECR_DEBUG("COPY_STJ_TO_SCK(SCOSTKLIB):"-[F:SCK]SCONUM-num$([F:SCK]SCILIN)-[F:SCK]ITMREF-mess([F:SCK]LINTYP,570,1)-"\Receipt line="-[F:SCK]PTHNUM-num$([F:SCK]PTDLIN)) From SCOSTKAUTLIB
+      [F:SCK]UOMSTUCOE=1              # [F:SCM]BOMSTUCOE
+      [F:SCK]UOMCPLQTY=-1 * [F:STJK]QTYSTU
+      [F:SCK]CPLQTY   =-1 * [F:STJK]QTYSTU
+      [F:SCK]INVQTY   =0
+      [F:SCK]EXTPRI   =  [F:STJK]PRIORD   # Issue 93349 GA 10/2013 avant [F:SCM]NETPRI
+      If [F:SCK]SCMLIN>0 # Matière prévue: on a les infos dans [F:SCM]
+          [F:SCK]STU      =[F:SCM]STU
+          [F:SCK]UOM      =[F:SCM]STU     # [F:SCM]BOMUOM
+      Else
+          # Issue 93349 GA 10/2013 Ajout matière non prévue
+          [F:SCK]STU      =[F:PWS]STU
+          [F:SCK]UOM      =[F:PWS]STU     # [F:SCM]BOMUOM
+      Endif
+      If [F:STJK]QTYSTU<>0
+         [F:SCK]CPLPRI= -1 * [F:STJK]AMTORD / [F:STJK]QTYSTU
+      Endif
+      [F:SCK]CPLCRG   =0
+      # Issue 107513/US4 GA 06/2015 : ECC for table SCOMAT + LOT
+      If dim([F:STJK]LOT)>0 & dim([F:SCK]LOT)>0
+         [F:SCK]LOT=[F:STJK]LOT
+      Endif
+      If dim([F:STJK]STA)>0 & dim([F:SCK]STA)>0
+         [F:SCK]STA=[F:STJK]STA
+      Endif
+      If dim([F:STJK]ECCVALMAJ)>0  & dim([F:SCK]ECCVALMAJ)>0
+         [F:SCK]ECCVALMAJ=[F:STJK]ECCVALMAJ
+      Endif
+      If dim([F:STJK]ECCVALMIN)>0 & dim([F:SCK]ECCVALMIN)>0
+         [F:SCK]ECCVALMIN=[F:STJK]ECCVALMIN
+      Endif
+      Break
+   Next
+   Filter [F:STJK]
+   #If GOK < 1 : LRET = 1 : End : Endif     # ne pas planter si pas de lignes
+
+#Endif
+
+Return
+
+####################################################################################
+# Appelé en suppression de ligne rcp article ss-traité  MAJ_SOUS_TRAIT_SCO(SUBPTHC)#
+####################################################################################
+Subprog ANNULE_MAJ_STK(LPTHNUM,LPTDLIN,LSCONUM,LSCILIN,LRET)
+Value    Char     LPTHNUM
+Value    Integer  LPTDLIN
+Value    Char     LSCONUM
+Value    Integer  LSCILIN
+Variable Integer  LRET
+
+# Issue 79859 GA 03/2012 Suivi(s) de sous-traitance
+Local Decimal  WCOEF,WTOTAMTPRI,WTOTAMTCPR
+Local Shortint WSCOTRK
+
+# Ouverture des tables/écrans nécessaires
+Gosub OPEN_FILES
+
+Local Integer NOL : NOL=nolign-1
+Local Integer STAT
+Local Char    WLOT(GLONLOT)    : # pour RAZ_STKENT_SCI un seul lot plusieurs entrées
+Global Shortint GSCOTRACE      : # affichage d'une trace en gestion
+
+Raz LRET
+
+# Issue 97904 GA 12/2014
+If !clalev([F:PTRW]) Local File PURTRS [F:PTRW] Endif
+If GSCOPTRNUM<>"" & ([F:PTR]PTRTYP<>9 | [F:PTR]PTRNUM<>GSCOPTRNUM)
+  Read [F:PTRW]PTR0=9;GSCOPTRNUM
+  If fstat Raz [F:PTRW] Endif
+Else
+  [F:PTRW] = [F:PTR]
+Endif
+
+If [F:SCO]SCONUM<>LSCONUM
+   Read [F:SCO]SCO0 = LSCONUM
+   If fstat : Raz [F:SCO] : GOK=0 : Endif
+Endif
+
+If [F:PTH]PTHNUM<>LPTHNUM
+   Read [F:PTH]PTH0 = LPTHNUM
+   If fstat : Raz [F:PTH] : GOK=0 : Endif
+Endif
+
+If [F:PTD]PTHNUM<>LPTHNUM | [F:PTD]PTDLIN<>LPTDLIN
+   Read [F:PTD]PTD0 = LPTHNUM;LPTDLIN
+   If fstat : Raz [F:PTD] : GOK=0 : Endif
+Endif
+
+If GOK < 1 : LRET = 1 : End : Endif
+
+# Contrôle que l'EO n'est pas clos et que la période est ouverte pour maj du stock
+Gosub VERF_ANU
+If OK = 0 : LRET = 1 : End : Endif
+
+#----------------------------- annulation déclaration de production -------------------------------#
+If [F:SCI]SCONUM<>LSCONUM | [F:SCI]SCILIN<>LSCILIN
+   Read [F:SCI]SCI0 = LSCONUM;LSCILIN
+   If fstat : Raz [F:SCI] : LRET = 1 : End : Endif
+Endif
+
+ # Maj de SCOITM + annulation entrée en stock
+   Gosub RAZ_STKENT_SCI From SCOSTKAUTLIB
+   If GOK < 1 : LRET = 1 : End : Endif    # Issue 97004 GA 02/2014 ligne réactivée
+
+#----------------------------- annulation suivi opération de sous-traitance ------------------------#
+   Read [F:SCS]SCS0 = LSCONUM;LSCILIN
+   If fstat : Raz [F:SCS] : LRET = 1 : End : Endif
+
+ # Maj de SCOSRV + annulation entrée en stock
+   Gosub RAZ_STKENT_SCS From SCOSTKAUTLIB
+   #If GOK < 1 : LRET = 1 : End : Endif    # ne pas planter si pas de lignes
+
+#----------------------------- annulation suivi matière -------------------------------------------#
+ # pour chaque matière
+   For [F:SCM] Where SCONUM=LSCONUM & SCILIN=LSCILIN & MATSTA<>4
+     If [F:SCM]SCOFLG=2
+       # Maj de SCOMAT + annulation sortie de stock
+        Gosub RAZ_STKSOR_SCM From SCOSTKAUTLIB
+     Else
+       # Maj de SCOMAT
+        Gosub RAZ_STKPRI_SCM From SCOSTKAUTLIB
+     Endif
+     #If GOK < 1 : LRET = 1 : Break : Endif # ne pas planter si pas de lignes
+   Next
+   #If GOK < 1 : LRET = 1 : End : Endif     # ne pas planter si pas de lignes
+
+# Issue 93349 GA 10/2013 Conso de matière non prévue sur un EO
+#----------------------------- annulationsuivi matière non prévue ---------------------------------#
+ # pour chaque matière
+   If !clalev([F:STJK]) Local File STOJOU [F:STJK] Endif
+# STJ1: STOFCY+VCRTYP+VCRNUM+VCRLIN
+   Filter [F:STJK] Where STOFCY=[F:SCI]PRHFCY & VCRTYP=6 & VCRNUM=LPTHNUM & VCRLIN=LPTDLIN & TRSTYP=29
+&                       & VCRTYPORI=36 & VCRNUMORI=[F:SCI]SCONUM & VCRLINORI=[F:SCI]SCILIN & VCRSEQORI=0
+&                  Order By Key STJ1
+   For [F:STJK]
+      # annulation sortie de stock
+        Gosub RAZ_STKSOR_STJK From SCOSTKAUTLIB
+      #If GOK < 1 : LRET = 1 : Break : Endif # ne pas planter si pas de lignes
+   Next
+   Filter [F:STJK]
+   #If GOK < 1 : LRET = 1 : End : Endif     # ne pas planter si pas de lignes
+
+
+
+   # Issue 79859 GA 03/2012 Suivi(s) de sous-traitance
+   If filinfo(filpath("FIL","SCOTRK","fde",nomap),0)>0
+      WSCOTRK=1
+      Raz [F:SCK] : [F:SCK] = [F:SCI]
+      Gosub DELETE_SCK From SCOLIB
+   Endif
+
+$FIN_ANNUL_MAJ_STK
+
+   # Issue 94558 GA 11/2013 selon [F:PTRW]MODALL
+   If !clalev([F:PTRW]) Local File PURTRS [F:PTRW] Endif
+   If GSCOPTRNUM<>"" & ([F:PTR]PTRTYP<>9 | [F:PTR]PTRNUM<>GSCOPTRNUM)
+     Read [F:PTRW]PTR0=9;GSCOPTRNUM
+     If fstat Raz [F:PTRW] Endif
+   Else
+     [F:PTRW] = [F:PTR]
+   Endif
+
+   Readlock [F:SCO]SCO0 = LSCONUM
+   If fstat=1  GOK=-1 : GLOCK="$SCOHEAD"-LSCONUM : End
+   Elsif fstat GOK=0  : Call RSTA("SCO",LSCONUM) From GLOCK : End
+   Endif
+
+   # FQ 55088 refaire allocation EO si nécessaire après suppression de la rcp
+   # Issue 79164 - 2012-03-15 by CCC : Suppression du paramètre EOMALLMGT
+   #If GEOMALLMGT = 2 & [F:SCO]MATLINNBR <> 0
+   If [F:SCO]MATLINNBR <> 0 & [F:PTRW]MODALL>1         # Issue 94558 GA 11/2013 selon [F:PTR]MODALL
+      Local Integer WALLTYP : WALLTYP=[F:PTRW]MODALL-1 # Issue 94558 GA 11/2013 before =2
+      Call ALLOC_EO("C", 0, [F:SCO]SCONUM, WALLTYP, 1, LRET) From SCOALL
+      #If LRET <> 0 : GOK = 0 : End : Endif
+   Endif
+
+ # recomptage des matières/opérations soldées
+   [F:SCO]SCOTRKFLG = 4
+   Gosub MAJSCOHEAD  From SCOLIB
+   If GOK < 1 : LRET = 1 : End : Endif
+
+   Gosub REWRITE_SCO From SCOLIB
+   If GOK < 1 : LRET = 1 : End : Endif
+
+   # Ordre de sous-traitance :
+   WMSGSUI = mess(641,197,1) +" : "+ [F:SCO]SCONUM
+   GSCOTRACE = 2
+   Call ECR_TRACE(WMSGSUI,0) From GESECRAN
+End
+
+#########################################################################
+Subprog ALI_ALP(LABR,LLIG)   : # selon ALI_ALP de SUBMTKB
+Value Char    LABR
+Value Integer LLIG
+Local Integer K : K = [M:PSCM]ORINOL
+
+Case LABR
+    When "PSCM"
+        Raz [M:ALP]
+        [M:ALP]TRSTYP     = [M:PSCM]TRSTYP       : # Menu 704: 3=Rcp fournisseur
+        [M:ALP]TRSCOD     = [M:PSCM]TRSCODS
+        [M:ALP]VCRTYP     = 6                    : # RÃ©ception
+        [M:ALP]VCRNUM     = [M:PTH0]PTHNUM
+        [M:ALP]VCRLIN     = [M:PTH1]PTDLIN(K)
+        [M:ALP]STOFCY     = [M:PSCM]STOFCY(LLIG)
+        [M:ALP]ITMREF     = [M:PSCM]ITMREF(LLIG)
+        [M:ALP]QTY        = [M:PSCM]USEQTY(LLIG)
+        [M:ALP]TYPQTY     = 2
+# Les champs STA, LOC et LOT sont des filtres exclusifs (pas préférentiels)
+####### [M:ALP]STA        = [M:PSCM]STAPREF(LLIG)
+####### [M:ALP]LOT        = [M:PSCM]LOTPREF(LLIG)
+####### [M:ALP]LOC        = [M:PSCM]LOCPREF(LLIG) : # GA 02/2008 demande TS ne pas renseigner LOC
+        [M:ALP]PCU        = [M:PSCM]STU(LLIG)
+        [M:ALP]PCUSTUCOE  = 1
+        [M:ALP]TYPQTY     = 2
+        [M:ALP]BESDAT     = [M:PSCM]DLVDAT(LLIG)
+        #--- Issue 100529 GA 03/2015 suite TS 101789
+        If dim([M:PSCM]LOC)>0
+          [M:ALP]STOLOC   = [M:PSCM]LOC(LLIG)     : # FQ 55088
+          [M:ALP]LOC      = [M:PSCM]LOC(LLIG)     : # GA 01/2009 demande TS renseigner LOC ...
+        #--- Issue 101789
+        Endif
+        #[M:ALP]VCRTYPORI  = 36
+        #[M:ALP]VCRNUMORI  = [M:PSCM]SCONUM
+        #[M:ALP]VCRLINORI  = [M:PSCM]SCILIN
+        #[M:ALP]VCRSEQORI  = [M:PSCM]SCMLIN(LLIG)
+        [M:ALP]VCRTYP  = 36                         # idem TRTPSAISCM: doc origine = la ligne SCM de l'EO ?
+        [M:ALP]VCRNUM  = [M:PSCM]SCONUM
+        [M:ALP]VCRLIN  = [M:PSCM]SCILIN
+        [M:ALP]VCRSEQ  = [M:PSCM]SCMLIN(LLIG)
+        [M:ALP]ALLTYPORI  = [M:PSCM]ALLSTA(LLIG)
+        [M:ALP]PECQLYCTL   = 1
+        If [M:ALP]STOLOC<>"" & max([F:TRU]LOCFLT)=2 # Issue 100529 GA 03/2015
+           [M:ALP]PECINTLOC   = 1  # Pas d'emplacement interne pour les matières sous-traitance V6 05/2008
+        Else
+           [M:ALP]PECINTLOC = 2  # Issue 100529 GA 03/2015 # not exclusive location authorized now
+        Endif
+        [M:ALP]PECPLFLOC   = 1  # FQ 59372 GA 04/2010 sur demande TS avant 2
+        [M:ALP]PECSCOLOC   = 2
+        If dim([M:PSCM]WRH)>0 [M:ALP]WRH=[M:PSCM]WRH(LLIG) Endif
+        # Issue 107513/US4 GA 05/2015 : ECC for [M:PSCM] table SCOMAT
+        If [F:ITM]ITMREF<>[M:PSCM]ITMREF(LLIG)
+           Read [ITM]ITM0=[M:PSCM]ITMREF(LLIG) : If fstat : Raz [F:ITM] : Endif
+        Endif
+        If dim([M:PSCM]ECCVALMAJ)>0 & [F:ITM]ECCSTO>1
+           [M:ALP]ECCVALMAJ=[M:PSCM]ECCVALMAJ(LLIG)
+        Endif
+        If dim([M:ALP]ECCVALMIN)>0 & [F:ITM]ECCSTO>2
+           [M:ALP]ECCVALMIN=[M:PSCM]ECCVALMIN(LLIG)
+        Endif
+    When Default
+Endcase
+End
+
+#########################################################################
+$CHARGE_STOSOR
+#-----------------------------------------------------------------------#
+# Chargement des paramètres dans masque STOSOR pour saisie des sorties  #
+# Cette étiquette est appelée depuis CHARGE_PARAM From TRTSTOSORA       #
+#-----------------------------------------------------------------------#
+Case LABR
+  When "PSCM" :
+    [M:SOR]WSTOSEQ   = [M:PSCM]WSTOSEQ(LNOL)
+    [M:SOR]TRSTYP    = [M:PSCM]TRSTYP         : # Menu704: 29=Sortie ordre de sous-traitance
+    [M:SOR]TRSCOD    = [M:PSCM]TRSCODS
+    [M:SOR]TRFFCY    = ""
+    [M:SOR]BETCPY    = 1
+    [M:SOR]BPRNUM    = [M:PTH0]BPSNUM         : # à vérifier ...
+    [M:SOR]CUR       = GLOCALDEV
+    #[M:SOR]STOFCY   = [M:PSCM]STOFCY(LNOL)   : # STOFCY Paramètre de l'action SAISTOSOR
+    ###[M:SOR]VCRTYP = 6                      : # VCRTYP Paramètre de l'action SAISTOSOR
+    [M:SOR]VCRNUM    = [M:PTH0]PTHNUM
+    [M:SOR]VCRLIN    = [M:PTH1]PTDLIN(K)
+    # selon CCC FQ 41947 pour retrouver les allocs initiales
+    [M:SOR]VCRTYPORI = 36                     # FQ 51330 selon SUBMTKB avant dans VCRTYP
+    [M:SOR]VCRNUMORI = [M:PSCM]SCONUM         # FQ 51330 selon SUBMTKB avant dans VCRNUM
+    [M:SOR]VCRLINORI = [M:PSCM]SCILIN         # FQ 51330 selon SUBMTKB avant dans VCRLIN
+    [M:SOR]VCRSEQORI = [M:PSCM]SCMLIN(LNOL)   # FQ 51330 selon SUBMTKB avant non transmis
+    [M:SOR]MVTDES    = [M:PSCM]MVTDES(LNOL)
+    [M:SOR]STU       = [M:PSCM]STU(LNOL)
+    [M:SOR]PCU       = [M:PSCM]STU(LNOL)
+    [M:SOR]PCUSTUCOE = 1
+    [M:SOR]SORQTY    = [M:PSCM]USEQTY(LNOL)
+    [M:SOR]SORQTYACT = [M:PSCM]USEQTY(LNOL)
+    [M:SOR]RETDAT    = [M:PSCM]DLVDAT(LNOL)
+    [M:SOR]DLVDAT    = [M:PSCM]DLVDAT(LNOL)   : # à vérifier ...
+     #--- Issue 100529 GA 03/2015 suite TS 101789
+    If dim([M:PSCM]LOC)>0
+       [M:SOR]STOLOC    = [M:PSCM]LOC(LNOL)        # Issue 100529 GA 03/2015 (déplacé)
+    Endif
+    If [M:SOR]STOLOC<>"" & max([F:TRU]LOCFLT)=2 # Issue 100529 GA 03/2015
+       [M:SOR]PECINTLOC = 1  # FQ 59372 GA 04/2010 sur demande TS avant 2
+    Else
+       [M:SOR]PECINTLOC = 2  # Issue 100529 GA 03/2015 # not exclusive location authorized now
+    Endif
+    [M:SOR]PECPLFLOC = 1  # FQ 59372 GA 04/2010 sur demande TS avant 2
+    [M:SOR]PECSCOLOC = 2
+    [M:SOR]PECQLYCTL = 1
+    [M:SOR]XLOT      = [M:PSCM]LOTPREF(LNOL)
+    [M:SOR]XLOC      = [M:PSCM]LOCPREF(LNOL)
+    [M:SOR]XSTA      = [M:PSCM]STAPREF(LNOL)
+    [M:SOR]CCECODS   = [M:PSCM]CCECODS
+    If find([M:PSCM]ALLSTA(LNOL),2,3)
+         [M:SOR]GLOALLQTY = [M:PSCM]ALLQTY(LNOL)
+    Else
+         Raz [M:SOR]GLOALLQTY
+    Endif
+    [M:SOR]PECOWNER  = [M:PSCM]STOFCY(LNOL)
+    If dim([M:PSCM]WRH)>0 [M:SOR]XWRH=[M:PSCM]WRH(LNOL) Endif
+    # Issue 107513/US4 GA 04/2015: ECC for stock issue
+    If dim([M:PSCM]ECCVALMAJ) >= 0
+      [M:SOR]WECCVALMAJ=[M:PSCM]ECCVALMAJ(LNOL)
+    Endif
+Endcase
+Return
+
+#########################################################################
+#-----------------------------------------------------------------------#
+# Mise à jour de la ligne de réception au retour du moteur de stock     #
+# Cette étiquette est appelée depuis TRTSTOSORA                         #
+# quand TRSTYP = 29 sortie ss-traitance et écran PSCM ouvert            #
+#-----------------------------------------------------------------------#
+$APRES_STOSOR
+Local Decimal WTOTUSEQTY, WUSEQTY
+Local Integer WRET
+
+    WUSEQTY = [M:SOR]SHTQTY + [M:SOR]PECQTY
+    If [M:PSCM]USEQTY(LNOL) <> WUSEQTY
+       [M:PSCM]USEQTY(LNOL) = WUSEQTY
+       If [M:PSCM]ITMREF(LNOL) <> ""
+          WTOTUSEQTY = [M:PSCM]USEQTY(LNOL) + [M:PSCM]SCMUSEQTY(LNOL)
+          Call CONT_SOLDE_MAT([M:PSCM]STOFCY(LNOL),[M:PSCM]ITMREF(LNOL),
+&                             WTOTUSEQTY,[M:PSCM]SCMRETQTY(LNOL),WRET) From SCOLIB
+          If WRET = 0 : [M:PSCM]CLEFLG(LNOL) = 1
+          Else        : [M:PSCM]CLEFLG(LNOL) = 2
+          Endif
+          Affzo [M:PSCM]CLEFLG(LNOL)
+       Endif
+       Affzo [M:PSCM]USEQTY(LNOL)
+    Endif
+Return
+
+
+#########################################################################
+$CHARGE_STOSOM      : # Extrait de CHARGE_STOSOM de SUBMTKB
+#----------------------------------------------------------------------------#
+# Chargement des paramètres dans masque STOSOM pour suppression              #
+# des sorties matières                                                       #
+# Cette étiquette est appelée depuis CHARGE_PARAM From TRTSTOSOMA            #
+#----------------------------------------------------------------------------#
+  [M:SOM]TRSTYP    = 29
+  If dim([F:PTRW]TRSCODS)>0 : [M:SOM]TRSCOD    = [F:PTRW]TRSCODS : Endif    # Issue 97904 before [F:PTR]
+  [M:SOM]TRFFCY    = ""
+  [M:SOM]VCRTYPORI = 36
+  [M:SOM]VCRNUMORI = [F:SCM]SCONUM
+  [M:SOM]VCRLINORI = [F:SCM]SCILIN
+  [M:SOM]VCRSEQORI = [F:SCM]SCMLIN
+  [M:SOM]VCRTYP    = 6
+  [M:SOM]VCRNUM    = [F:PTD]PTHNUM
+  [M:SOM]VCRLIN    = [F:PTD]PTDLIN
+  [M:SOM]STU       = [F:ITM]STU
+  [M:SOM]PCU       = [F:ITM]STU
+  [M:SOM]PCUSTUCOE = 1
+  #[M:SOM]SORQTY    = [F:SCM]USEQTY : # on laisse zero pour la suppression du mvt
+  #[M:SOM]SORQTYACT = [F:SCM]USEQTY : # on laisse zero pour la suppression du mvt
+  [M:SOM]DLVDAT    = GWIPTDAT
+  [M:SOM]STOLOC    = [F:SCM]LOC               # Issue 100529 GA 03/2015
+  If [M:SOM]STOLOC<>"" & max([F:TRU]LOCFLT)=2 # Issue 100529 GA 03/2015
+     [M:SOM]PECINTLOC = 1  # FQ 59372 GA 04/2010 sur demande TS avant 2
+  Else
+     [M:SOM]PECINTLOC = 2  # Issue 100529 GA 03/2015 # not exclusive location authorized now
+  Endif
+  [M:SOM]PECPLFLOC = 1  # FQ 59372 GA 04/2010 sur demande TS avant 2
+  [M:SOM]PECSCOLOC = 2
+  [M:SOM]PECQLYCTL = 1
+  [M:SOM]XLOT      = [F:SCM]LOT   # FQ 65646 avant LOTPREF
+  [M:SOM]XLOC      = [F:SCM]LOC   # FQ 65646 avant LOCPREF
+  [M:SOM]XSTA      = [F:SCM]STA   # FQ 65646 avant STAPREF
+  If dim([F:SCM]WRH)>0 [M:SOM]XWRH=[F:SCM]WRH Endif
+  # Issue 107513/US4 GA 04/2015: ECC for stock issue
+  If dim([F:SCM]ECCVALMAJ) >= 0
+    [M:SOM]WECCVALMAJ=[F:SCM]ECCVALMAJ
+  Endif
+Return
+
+#########################################################################
+$APRES_STOSOM
+#-----------------------------------------------------------------------#
+# Mise à jour complémentaires après enregistrement
+# - Recalcul des quantités sorties US, UC de la ligne de document
+# - Réalimentation des zones dépendant de la quantité
+# - Coloriage de la ligne document si la quantité est nulle
+# - etc ...
+#-----------------------------------------------------------------------#
+#   [M:SOM]NBLIG     contient le nombre de ligne de stock traité
+#   [M:SOM]SORQTY    contient la quantité US qui était à sortir
+#   [M:SOM]SORQTYACT contient la quantité en UA qui était à sortir
+#   [M:SOM]PECQTY    contient la quantité US sortie
+#   [M:SOM]PECQTYACT contient la quantité en UA sortie
+#   [M:SOM]SHTQTY    contient la quantité manquante
+Local Decimal WUSEQTY
+Local Integer WRET
+
+    WUSEQTY = [M:SOM]SHTQTY + [M:SOM]PECQTY
+Return
+
+########################################################################
+$VERF_ANU     : # extrait de VERF_ANU de SUBMTKA
+Local Date    WDATE
+Local Integer WOK
+Local Char    WMSG(250)
+
+#On ne peut pas supprimer une réception portant sur un EO clos
+If [F:SCO]SCONUM <> "" & [F:SCO]SCOSTA = 4
+ # Ordre de sous-traitance clos: Mise à jour impossible !
+   Call ERREUR(mess(359,194,1)) From GESECRAN : OK = 0 : Return
+Endif
+
+OK=1
+
+# message d'avertissement si le contrôle qualité a été fait
+Raz WOK
+If [F:PTD]QUARTNFLG = 2
+   WOK=2 : Call AVERTIR(mess(234,194,1),WOK)  From GESECRAN
+   If WOK=1 : OK=0 : Endif
+Endif
+If OK = 0 : Return : Endif
+
+# message d'avertissement si article en inventaire
+Read [F:ITF]ITF0 = [F:PTD]ITMREF;[F:PTH]PRHFCY
+If fstat : Raz [F:ITF] : Endif
+If [F:ITF]CUNFLG = 2
+   WOK=2 : Call AVERTIR(mess(162,190,1),WOK)  From GESECRAN
+   If WOK=1 : OK=0 : Endif
+Endif
+If OK = 0 : Return : Endif
+
+#contrôle que la période est ouverte
+# On essaie d'abord sur la date de réception et si pas possible on essaie avec date$
+GMESSAGE = ""
+WDATE = [F:PTH]RCPDAT
+Call STKCTRIPT(WDATE, [F:PTH]PRHFCY,"1") From STKLIB
+If GMESSAGE <> ""
+    Raz GMESSAGE
+    Call STKCTRIPT(date$, [F:PTH]PRHFCY,"1") From STKLIB
+    If GMESSAGE <> "" OK = 0 : Return
+    Else GWIPTDAT = date$
+    Endif
+Else GWIPTDAT = WDATE
+Endif
+Return
+
+#########################################################################
+$OPEN_FILES
+If clalev([M:ORDK])= 0 : Local Mask ORDK       [ORDK]: Endif  # pour générer encours
+If clalev([M:STW]) = 0 : Local Mask STOWORK    [STW] : Endif
+If clalev([M:SVW]) = 0 : Local Mask STOVALWORK [SVW] : Endif
+If clalev([M:ALP]) = 0 : Local Mask ALLPAR     [ALP] : Endif
+If clalev([M:ENTW])= 0 : Local Mask STOENTW    [ENTW]: Endif  # masque init entrée stock
+If clalev([M:ENM]) = 0 : Local Mask STOENTM    [ENM] : Endif  # masque maj  entrée stock
+If clalev([M:SOW]) = 0 : Local Mask STOSORW    [SOW] : Endif  # masque init sortie stock
+If clalev([M:SOM]) = 0 : Local Mask STOSORM    [SOM] : Endif  # masque maj  sortie stock
+# ouverture tables si nécessaire
+If clalev([F:ITM]) = 0 : Local File ITMMASTER  [ITM] : Endif  # article
+If clalev([F:ITG]) = 0 : Local File ITMCATEG   [ITG] : Endif  # catégories article
+If clalev([F:ITV]) = 0 : Local File ITMMVT     [ITV] : Endif  # mouvements article
+If clalev([F:STJ1])= 0 : Local File STOJOU     [STJ1]: Endif  # journal mvt stock (STJ réservé)
+If clalev([F:STA]) = 0 : Local File STOALL     [STA] : Endif  # allocations
+If clalev([F:STS]) = 0 : Local File STOSER     [STS] : Endif  # numéros de série
+If clalev([F:STO]) = 0 : Local File STOCK      [STO] : Endif  # pour REC_LOC de SCOSTKAUTLIB
+If clalev([F:TRU]) = 0 : Local File TABALLRUL  [TRU] : Endif
+If clalev([F:SRU]) = 0 : Local File TABSTORUL  [SRU] : Endif
+If clalev([F:POQ1])= 0 : Local File PORDERQ    [POQ1]: Endif  # relecture ligne de cde (SCOSTKAUTLIB)
+If clalev([F:POQW])= 0 : Local File PORDERQ    [POQW]: Endif  # relecture ligne de cde (SCOSTKAUTLIB)
+If clalev([F:POPW])= 0 : Local File PORDERP    [POPW]: Endif  # relecture ligne de cde (SCOSTKAUTLIB)
+If GWRHACT=2
+   If !clalev([F:WRH])  Local File WAREHOUSE  [WRH] : Endif
+   If !clalev([F:ITW])  Local File ITMWRH     [ITW] : Endif
+Endif
+
+Gosub OPEN_FILES_SCO From SCOLIB
+
+Return
+
+#########################################################################
+
+$OUVERTURE_TRACE
+#---------------------------------------#
+# Ouverture fichier trace si nécessaire #
+#---------------------------------------#
+If GSCOTRACE=0 & !GIMPORT
+  Call OUVRE_TRACE(mess(193,197,1)) From LECFIC : GSCOTRACE=1
+Endif
+Return
+
+$LECTURE_TRACE
+#----------------------------------------#
+# Lecture du fichier trace si nécessaire #
+#----------------------------------------#
+If GSCOTRACE=2 & !GIMPORT
+  Call FERME_TRACE From LECFIC
+  Call LEC_TRACE   From LECFIC
+  GSCOTRACE=0
+Endif
+Return
+
+$LECT_EFFAC_TRACE
+#----------------------------------------------------------#
+# Lecture et effacement trace si abandon de la transaction #
+#----------------------------------------------------------#
+If GSCOTRACE=2 & !GIMPORT
+  Call FERME_TRACE From LECFIC
+  Call SUPP_TRACE  From LECFIC
+  GSCOTRACE=0
+Endif
+Return
+
+$FERMETURE_TRACE
+#---------------------------------------#
+# Fermeture fichier trace si nécessaire #
+#---------------------------------------#
+If GSCOTRACE<>0 & !GIMPORT
+   Call FERME_TRACE From LECFIC : GSCOTRACE=0
+Endif
+Return
+

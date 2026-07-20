@@ -1,0 +1,497 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$
+######################################################################################
+#    Program Name:    INTCPYLIB - Intercompany enhancement  SAM #87307 and SAM #88747
+#
+#    Authors:         BeSpr   May 01-31, 2013   AR AP Intercompany invoice enhancements
+#
+#    Modifications:
+#                     BeSpr   June-July, 2013   GL Intercompany journal enhancements
+#
+# Handles the display and processing of the Intercompany enhancement
+#
+# INTCO is the Activity Code for Intercompany transactions
+# INTCPYINV is the Parameter for Allow intercompany invoices (it is by Company)
+#
+# GESBICI is the Customer intercompany invoices function
+# GESBISI is the Supplier intercompany invoices function
+#
+# For Intercompany processing in AP/AR Invoice entry:
+#   Supplier:
+#     Data:     PINVOICE (PIH) (Supplier invoice) for NBRCPY (Intercompany counter)
+#               BPSINVLIG (PIL) (Supplier invoice lines) for CPYLIN (Company line field)
+#     Screens:  BIS3 (Supplier invoices) for line
+#     Progams:  SUBBIS (Supplier invoice)
+#               SUBBIS2 (Supplier invoice lines)
+#
+#   Customer:
+#     Data:     PINVOICE (PIH) (Customer invoice) for NBRCPY (Intercompany counter)
+#               BPSINVLIG (PIL) (Customer invoice lines) for CPYLIN (Company line field)
+#     Screens:  BIC3 (Customer invoices) for line
+#     Progams:  SUBBIC (Customer invoice)
+#               SUBBIC2 (Customer invoice lines)
+#
+#   Other:
+#     Progams:  SUBBICS (Customer/Supplier invoice)
+#
+######################################################################################
+######################################################################################
+# BESPR 87307 05/14/2013
+# Count the number of Different companies on this invoice if intercompany is active, including source
+# Changed on 6/6/13 per Christine and Pascale to allow NBRCPY to have 1 = Source only
+# When NBRCPY = 0, it is a non-intercompany invoice; 1 = Intercompany for Source only; > 1 multiple companies
+# Called from SUBBIC / SUBBIS; INIMOD
+# It also makes cleanup on INTCOFLO according X3-101937
+
+Subprog INTCPY_INIMOD(NUM, CAS)
+Value Char    NUM()     : # Document Number
+Value Integer CAS       : # 1:Customer  2:Suppliers
+
+# Issue X3-101937 by MRDAB
+If clalev([F:ICF])=0   : Local File INTCOFLO  [ICF]   : Endif
+# Issue end X3-101937
+
+Local Char    TABCPY(GLONCPY)(0..[M]NBLIG)  : # List of companies
+Local Char    ABREV(GLONABR)                : # Table abbreviations
+Local Integer I, NBCPY, INTFLG              : # Looping, number of different companies, and flag variables
+
+Case CAS
+  When 1
+    [F:SIH]NBRCPY = 0
+    ABREV = 'SIH'
+  When 2
+    [F:PIH]NBRCPY = 0
+    ABREV = 'PIH'
+Endcase
+
+If GFONC1 = "GESBICI" or GFONC1="GESBISI"
+  # Issue X3-101937 by MRDAB
+  Delete [ICF] Where ABRFIC=[L]ABREV & NUM=[L]NUM
+  If fstat = 1
+    GOK = -1 : GLOCK = "$INTCOFLO" - [L]ABREV - [L]NUM : End
+  Endif
+  # Issue end X3-101937
+
+  NBCPY = 1 : INTFLG = 1
+
+  TABCPY(0) = evalue("[F:"+ABREV+"]CPY")
+
+  For I=0 To [M]NBLIG-1
+    If !find([M]CPYLIN(I),TABCPY(0..NBCPY-INTFLG))
+      NBCPY += 1
+      TABCPY(NBCPY-INTFLG) = [M]CPYLIN(I)
+    Endif
+  Next I
+
+Else
+  NBCPY = 0 : INTFLG = 0
+Endif
+
+Assign("[F:"+ABREV+"]NBRCPY") With NBCPY
+
+End
+
+######################################################################################
+# CATUA 87307 06/24/2013
+# Check Intercompany parameter
+# When performing invoice deletion, check delete invoice accounting entry (SIVUP) parameter for every target company
+# When performing invoice accounting cancellation, check invoice accouting cancellation (POSTINVSUP) parameter for every target company
+# Return Company RETCPY if parameter is set to 'No'
+# Called from SUBBIC / SUBBIS;
+
+Funprog CHKINTCPY(CAS,RETCPY)
+Value Integer CAS       : # 1: Customer deletion process check  2:Accounting Cancellation process check 3: Supplier deletion process check
+Variable Char RETCPY
+
+Local Char    TABCPY(GLONCPY)(0..[M]NBLIG)  : # List of companies
+Local Integer NBCPY
+Local Integer CHKPARAM
+Raz NBCPY
+Raz CHKPARAM
+
+  For I=0 To [M]NBLIG-1
+    If [M]CPYLIN(I)<>"" & [M]CPYLIN(I)<>[M]CPY
+      If NBCPY=0
+        CHKPARAM = 1
+      Else
+        If !find([M]CPYLIN(I),TABCPY(0..NBCPY-1))
+          CHKPARAM = 1
+        Else
+          CHKPARAM = 0
+        Endif
+      Endif
+
+      If CHKPARAM
+        NBCPY += 1
+        TABCPY(NBCPY-1) = [M]CPYLIN(I)
+        Case CAS
+          When 1
+            If func AFNC.PARAM("SIVSUP",[M]CPYLIN(I))="1"
+              RETCPY = [M]CPYLIN(I)
+              End 0
+            Endif
+          When 2
+            # Issue 116064
+            #If func AFNC.PARAM("POSTINVSUP",[M]CPYLIN(I))="1"
+            If func AFNC.PARAM("POSTINVSUP",[M]CPYLIN(I))="1" | func PORLEGLIB.DIGSIGN("", [M]CPYLIN(I)) = 1
+            # End issue 116064
+              RETCPY = [M]CPYLIN(I)
+              End 0
+            Endif
+          When 3
+# Issue 114426 - 2016-03-18 by RICAR : SIVSUP parameter to split in PIVSUP and GASSUP
+# Issue 114426
+            If func AFNC.PARAM("PIVSUP",[M]CPYLIN(I))="1"
+              RETCPY = [M]CPYLIN(I)
+              End 0
+            Endif
+# End issue 114426
+        Endcase
+      Endif
+    Endif
+  Next I
+End 1
+
+######################################################################################
+# CATUA 87307 06/24/2013
+# Check Intercompany fiscal year / period against invoice accounting date
+# Return  1 = Success (no errors)
+#        -1 = Fiscal Year Not Open
+#        -2 = Fiscal Period Not Open
+# Return Company RETCPY if not success
+# Called from SUBBIC / SUBBIS;
+
+Funprog CHKFIYPER(ACCDAT, RETCPY)
+Variable Date ACCDAT
+Variable Char RETCPY
+
+Local Decimal EXERCICE , PERIODE
+Local Char    TABCPY(GLONCPY)(0..[M]NBLIG)  : # List of companies
+Local Integer NBCPY
+Local Integer CHKFISC
+Raz NBCPY
+Raz CHKFISC
+
+  For I=0 To [M]NBLIG-1
+    If [M]CPYLIN(I)<>"" & ACCDAT<>[0/0/0] & [M]CPYLIN(I)<>[M]CPY
+      If NBCPY=0
+        CHKFISC = 1
+      Else
+        If !find([M]CPYLIN(I),TABCPY(0..NBCPY-1))
+          CHKFISC = 1
+        Else
+          CHKFISC = 0
+        Endif
+      Endif
+
+      If CHKFISC
+        NBCPY += 1
+        TABCPY(NBCPY-1) = [M]CPYLIN(I)
+        # Must set GTYPGEN correctly SAM 93786
+        Call RESET_INTCPYCOA([M]CPYLIN(I),[M]FCYLIN(I)) From INTCPYLIB
+        Call GETPERSOC([M]CPYLIN(I),GTYPGEN,ACCDAT,EXERCICE,PERIODE) From CPTSUB
+        Read [FIY]FIY0 = [M]CPYLIN(I);GTYPGEN;EXERCICE
+        If fstat | [F:FIY]FIYSTA<>2
+          RETCPY = [M]CPYLIN(I)
+          End -1
+        Endif
+        If [F:PER]PERSTA<>2
+          RETCPY = [M]CPYLIN(I)
+          End -2
+        Endif
+      Endif
+    Endif
+  Next I
+# Reset the global variables back to source SAM 93786
+Call RESET_INTCPYCOA([M]CPY,[M]FCY) From INTCPYLIB
+End 1
+
+######################################################################################
+# BESPR 87307 06/06/2013
+# This routine is called from SUBBIS/SUBBIC; OUVRE
+$INTCPY_OUVRE
+Global Integer GINTCPYFLG   : # Flag to determine whether to reset to Source COA; 0 = No, 1 = Yes
+Global Char GCURINTCPY      : # Current Company that the COA is set for
+Return
+
+######################################################################################
+# These are changes for the Invoice entries
+# This routine is called from SUBBIS2/SUBBIC2,SUBBIS/SUBBIC; from multiple places to reset GL info when CPYLIN changes
+
+Subprog CONT_INTCPYCOA (TGRCPY)
+Value Char TGRCPY           : # Target company
+Local Char TGRGCM, SRCGCM   : # Target and Source account code models
+
+# The reset GL check needs to be if the Company account core model's are different
+# But the reset will take place if the Companys are different because Dimensions change based upon company
+If [M]CPY <> TGRCPY
+  Call RESET_INTCPYCOA (TGRCPY,[M]FCYLIN(nolign-1)) From INTCPYLIB
+Else
+  # Re-set the Company / GL data back to the Source company - always reset it because of possible deleted lines
+  Call RESET_INTCPYCOA ([M]CPY,[M]FCY) From INTCPYLIB
+Endif
+
+End
+
+######################################################################################
+# BESPR 88747 06/16/2013
+# This routine is called from SUBBIC2,SUBBIS2; FCYLIN and SUBGIC; FCYLIN for mapping verification
+Subprog INTCPY_FCYLIN (TGRCPY)
+Value Char TGRCPY           : # Target company
+
+# This only needs to be checked if entering the target Site
+# Check the Intercompany mapping
+If [M]CPY <> TGRCPY
+  If !clalev([F:TCI]) : Local File TABACCINT [TCI] : Endif
+  Read [F:TCI]TCI0 = [M]CPY;TGRCPY
+  If fstat : mkstat = 2 : End : Endif
+Endif
+
+End
+
+######################################################################################
+# This routine is called from above and from SUBBIC/SUBBIS; LIENS and CREFAC
+# This routine resets the GL info when the Accounting core model changes
+# This routine is called from SUBGIC; from multiple places to reset GL info when CPYLIN changes
+
+Subprog RESET_INTCPYCOA (SETCPY,SETSITE)
+Value Char    SETCPY      : # Company to reset the COA and Global variables for
+Value Char    SETSITE     : # Site to reset the Global variables for
+Local Integer STAT        : # Status error
+Local Char    MESSA(250)  : # Message error
+Local Integer CAS         : CAS = 0 # 1:Customer  2:Suppliers  0:GL Journal
+
+Case GFONC1
+  When "GESBICI"  : CAS = 1
+  When "GESBISI"  : CAS = 2
+Endcase
+
+If CAS
+  Call INI_GLOBAL(CAS,SETCPY,STAT,MESSA) From SUBBICS
+Else
+  Call INI_GLOBAL(SETCPY,SETSITE) From SUBGIC
+Endif
+
+Call GETSOC(SETSITE) From DEVSUB
+GCURINTCPY = SETCPY
+
+End
+
+######################################################################################
+# BESPR 87307 07/03/2013
+# Determine whether or not to display the right click dimension option
+# Called from SUBBIC2 / SUBBIS2; IB_NBLIG
+Subprog INTCPY_IB_NBLIG (TGRCPY, TGRFCY, CAS)
+Value Integer CAS         : # 1:Customer  2:Suppliers
+Value Char TGRCPY, TGRFCY : # Target Company and Target Site
+Local Integer CCEDISFLG   : CCEDISFLG = 1 : # Flag to allow right click button; 0 = No, 1 = Yes
+
+# Need to reset the Global variables due to click right opening of window
+Call RESET_INTCPYCOA(TGRCPY,TGRFCY) From INTCPYLIB
+
+Call CHECK_FOR_CCE(CCEDISFLG)
+
+If CCEDISFLG : Call CHECK_CCE_ENTRY(CCEDISFLG, TGRCPY, CAS)  : Endif
+
+# If there are no dimensions to enter then clear right click Intercompany dimensions option/button
+If CCEDISFLG = 0
+  Raz GBOUT6
+Else
+  GBOUT6 = mess(179,111,1) : # Dimensions
+Endif
+
+End
+
+######################################################################################
+# BESPR 87307 06/13/2013
+# Set a global variable to know when to pop the child dimension window for new or inserted lines
+# Called from SUBBIC2 / SUBBIS2; C_NBLIG
+Subprog INTCPY_C_NBLIG (CAS)
+Value Integer CAS         : # 1:Customer  2:Suppliers
+Global Integer GCCEMODIF  : GCCEMODIF = 0 : # Flag to determine when to pop child window; 0 = No, 1 = Yes
+
+If find(status,73,82) # Only new and inserted lines
+  GCCEMODIF = 1
+Endif
+
+End
+
+######################################################################################
+# BESPR 87307 05/21/2013 and 88747 7/01/13
+# If the target dimensions are greater than the source dimensions then pop a child window to enter them
+# Called from SUBBIC2 / SUBBIS2; APRES_NBLIG and from SUBGIC; APRES_NBLIG
+Subprog INTCPY_APRES_NBLIG (CAS, TGRCPY, TGRFCY)
+Value Integer CAS         : # 1:Customer  2:Suppliers   3: GL Journal
+Value Char TGRCPY, TGRFCY : # Target Company and Target Site
+Local Integer TMPLOP      : # Looping variable
+Local Integer CCEDISFLG   : CCEDISFLG = 0 : # Flag to pop child window; 0 = No, 1 = Yes
+
+# From SUBBICS D_CCE and AS_CCE and SUBBIS2; IB_NBLIG so no reason to display the child window in this case
+If [M]DSP(nolign-1)<>"" : mkstat = 1 : End : Endif
+If CAS<>3
+  If GIMPORT | [M]STA>=3 : mkstat = 2 : End : Endif
+Endif
+If !GCCEMODIF : mkstat = 2 : End : Endif
+
+Call CHECK_FOR_CCE(CCEDISFLG)
+
+# If there are no dimensions to enter then skip the child screen
+If CCEDISFLG : Call CHECK_CCE_ENTRY(CCEDISFLG, TGRCPY, CAS)  : Endif
+
+# Display the new Intercompany dimension screen; Action: INTCPYCCE
+If CCEDISFLG
+  Local Decimal BASPAG
+  If !GWEBSERV
+    Local Char    PARMSK(250)(1..20) , SAVACT(20)
+    SAVACT = GACTION : GACTION = "INTCPYCCE"
+    PARMSK(1) = num$(CAS)
+    Case CAS
+      When 1
+        PARMSK(2) = [M:BIC3]CPYLIN(nolign-1)
+        PARMSK(3) = [M:BIC3]FCYLIN(nolign-1)
+      When 2
+        PARMSK(2) = [M:BIS3]CPYLIN(nolign-1)
+        PARMSK(3) = [M:BIS3]FCYLIN(nolign-1)
+      When 3
+        PARMSK(2) = [M:GIC1]CPYLIN(nolign-1)
+        PARMSK(3) = [M:GIC1]FCYLIN(nolign-1)
+    Endcase
+    PARMSK(4) = num$(nolign-1)
+    PARMSK(5) = [M]ACCDAT
+    Call SAISIE_NUM(BASPAG,PARMSK,"FINTCPYCCE","INTCPYCCE","SPEINTCPYCCE") From GSAISIE
+    GACTION = SAVACT
+    Case CAS
+      When 1
+        Affzo [M:BIC3]CCE1(nolign-1),CCE2(nolign-1),CCE3(nolign-1),CCE4(nolign-1),CCE5(nolign-1),CCE6(nolign-1),CCE7(nolign-1),CCE8(nolign-1),CCE9(nolign-1),CCE10(nolign-1)
+        Affzo [M:BIC3]CCE11(nolign-1),CCE12(nolign-1),CCE13(nolign-1),CCE14(nolign-1),CCE15(nolign-1),CCE16(nolign-1),CCE17(nolign-1),CCE18(nolign-1),CCE19(nolign-1),CCE20(nolign-1)
+      When 2
+        Affzo [M:BIS3]CCE1(nolign-1),CCE2(nolign-1),CCE3(nolign-1),CCE4(nolign-1),CCE5(nolign-1),CCE6(nolign-1),CCE7(nolign-1),CCE8(nolign-1),CCE9(nolign-1),CCE10(nolign-1)
+        Affzo [M:BIS3]CCE11(nolign-1),CCE12(nolign-1),CCE13(nolign-1),CCE14(nolign-1),CCE15(nolign-1),CCE16(nolign-1),CCE17(nolign-1),CCE18(nolign-1),CCE19(nolign-1),CCE20(nolign-1)
+      When 3
+        Affzo [M:GIC1]CCE1(nolign-1),CCE2(nolign-1),CCE3(nolign-1),CCE4(nolign-1),CCE5(nolign-1),CCE6(nolign-1),CCE7(nolign-1),CCE8(nolign-1),CCE9(nolign-1),CCE10(nolign-1)
+        Affzo [M:GIC1]CCE11(nolign-1),CCE12(nolign-1),CCE13(nolign-1),CCE14(nolign-1),CCE15(nolign-1),CCE16(nolign-1),CCE17(nolign-1),CCE18(nolign-1),CCE19(nolign-1),CCE20(nolign-1)
+    Endcase
+  Endif
+  If mkstat=99 : mkstat = 0 : Elsif mkstat=0 : mkstat = 2 : Endif
+  Gosub AFF From GSAISIE
+Endif
+
+End
+
+######################################################################################
+Subprog CHECK_FOR_CCE (CCEFLG)
+Variable Integer CCEFLG         : # The flag is set to 1 when a dimension is found that can be entered
+Local Integer TMPLOP            : # Looping variable
+
+CCEFLG = 0
+
+# GNBAXE is the number of dimensions for the line or target company
+# max(NBRCCE) is the number of dimensions on the header or source company dimensions
+If GNBAXE <> [M]NBRCCE
+  CCEFLG = 1
+Else
+  # Test to see if the dimensions are the same type and if not display the new screen
+  # GAXE is the dimension types of the line company
+  # DIE is the dimension types from the header or source company
+  For TMPLOP = 1 To min(GNBAXE,[M]NBRCCE)
+    If GAXE(TMPLOP) <> DIE(TMPLOP-1)
+      CCEFLG = 1
+    Endif
+  Next TMPLOP
+Endif
+
+End
+
+######################################################################################
+Subprog CHECK_CCE_ENTRY (ENTRYFLG, TGRCPY, CAS)
+Variable Integer ENTRYFLG       : # The flag is set to 1 when a dimension is found that can be entered
+Value Integer CAS               : # 1:Customer  2:Suppliers   3: GL Journal
+Variable Char TGRCPY            : # Target company
+Local Char    COMPTE(GLONGAC)   : # Account
+Local Integer NLED, TLED, NAXE  : # Looping and ledger variables
+Local Integer AXI, IND          : # Looping variable
+# The flag is set to 1 when a dimension is found that can be entered
+ENTRYFLG = 0
+
+# This routine needs to be skipped for GL intercompany journal
+If GFONCTION<>"GESGIC"
+  # Check if any dimensions are allowed for the target company
+  For I=1 To GNBAXE
+  Call LECTURE("DIE",evalue("GAXE("+num$(I)+")"),"") From CONTOBJ
+  Call SAI_AMONT(TGRCPY,GNBTYPLED,GTYPLED,evalue("GAXE("+num$(I)+")"),AXI) From CPTDIV
+  If AXI=2
+   ENTRYFLG = 1 : Break
+  Endif
+  Next
+  AXI=0
+  # No Company dimensions so return
+  If ENTRYFLG=0 : End : Endif
+Endif
+
+# Check if any Dimensions are allowed for this GL account
+ENTRYFLG = 0
+For NAXE=1 To GNBAXE
+  For NLED=1 To GNBTYPLED
+    [L]TLED = GTYPLED(NLED) : Gosub LECLED
+    Call INDLED([L]LED,GAXE(NAXE),IND,AXI) From CPTDIV
+    If AXI
+        Case CAS
+          When 1
+            COMPTE = evalue("[M:BIC3]ACC"+num$(NLED)+"("+num$(nolign-1)+")")
+          When 2
+            COMPTE = evalue("[M:BIS3]ACC"+num$(NLED)+"("+num$(nolign-1)+")")
+          When 3
+            COMPTE = evalue("[M:GIC1]ACC"+num$(NLED)+"("+num$(nolign-1)+")")
+        Endcase
+        If COMPTE<>""
+          Call LECTURE("GAC",COMPTE,GPLAN(NLED)) From CONTOBJ
+          If find(GAXE(NAXE),[F:GAC]DIE(0..[F:GAC]DACDIENBR-1)) : ENTRYFLG = 1 : Break : Endif
+        Endif
+    Endif
+  Next NLED
+  If ENTRYFLG : Break : Endif
+Next NAXE
+
+End
+
+######################################################################################
+# Cannot use the SUBBICS routine due to variables not available from here
+$LECLED
+Local Char LED(GLONLED)
+Local Char DEV(GLONCUR)
+Call LECLED (TGRCPY,[L]TLED,LED,DEV) From CPTDIV
+Call LECTURE("LED",[L]LED,"") From CONTOBJ
+Return
+
+######################################################################################
+# BESPR 87307 06/14/2013
+# This routine is called from SUBBIC / SUBBIS; FERME
+$INTCPY_FERME
+If dim(GINTCPYFLG)>0 : Kill GINTCPYFLG : Endif      : # Flag to determine whether to reset to Source COA; 0 = No, 1 = Yes
+If dim(GCURINTCPY)>0 : Kill GCURINTCPY : Endif      : # Current Company that the COA is set for
+If dim(GCCEMODIF)>0  : Kill GCCEMODIF : Endif       : # Flag to determine when to pop child window; 0 = No, 1 = Yes
+Return
+
+######################################################################################
+# BESPR 88747 07/16/2013
+# This routine is called from SUBGIC; OUVRE
+$GL_INTCPY_OUVRE
+Global Char GINTCPYTABCPY(GLONCPY)(0..GNBSOC)  : # List of companies for TYLINP and JOULIN checks
+Global Char GINTCPYTABTYP(GLONCPY)(0..GNBSOC)  : # List of document types by company for TYLINP and JOULIN checks
+Global Char GINTCPYTABJOU(GLONCPY)(0..GNBSOC)  : # List of journal codes by company for TYLINP and JOULIN checks
+Global Integer GCCEMODIF  : GCCEMODIF = 0      : # Flag to determine when to pop child window; 0 = No, 1 = Yes
+
+Return
+
+######################################################################################
+# BESPR 88747 07/16/2013
+# This routine is called from SUBGIC; FERME
+$GL_INTCPY_FERME
+If dim(GINTCPYTABCPY)>0 : Kill GINTCPYTABCPY : Endif   : # List of companies for TYLINP and JOULIN checks
+If dim(GINTCPYTABTYP)>0 : Kill GINTCPYTABTYP : Endif   : # List of document types by company for TYLINP and JOULIN checks
+If dim(GINTCPYTABJOU)>0 : Kill GINTCPYTABJOU : Endif   : # List of journal codes by company for TYLINP and JOULIN checks
+
+Return
+
+######################################################################################
+######################################################################################
+

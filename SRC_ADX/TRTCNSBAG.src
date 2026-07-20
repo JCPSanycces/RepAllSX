@@ -1,0 +1,1099 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+Raz GTUNCPT
+Local Char PARAM(10)(1..8)
+PARAM(1)="1"
+PARAM(2)="BOB"
+PARAM(3)="ADX"
+PARAM(5)=[28/02/2003]
+PARAM(6)="1"     :#Balance âgée normale (pas historisée !)
+PARAM(7)="CONSBAG4"     :#position 1er onglet
+Call GCONSULT("BAG","",PARAM) From GCONSULT
+End
+
+########################################################################################################################
+# Remplissage des onglets 3 & 4 des consultations Tiers
+#  La société n'est pas une donnée obligatoire
+#  Les montants restitués sont en
+#    - Devise société lorsque la société est renseignée (si Regroupement de sites, toutes les devises = même devise)
+#    - Devise dossier lorsque la société n'est pas renseignée (si Regroupement de sites avec devises <>)
+#
+# La restitution des montants s'effectue selon le paramètre
+#  Selon le paramètre TC "OSTCHGTYP" Origine de l'en-cours
+#    1 - Historisé
+#    2 - Actualisé
+#  Si l'en-cours doit être actualisé... les montants *C (de transaction) seront éventuellement convertis
+#
+########################################################################################################################
+Subprog RISQUE(CRITERE,TSITE,NBSITE,TBSOC,NBSOC,GRP,TDEVSOC)
+Value Char CRITERE ()
+Value Char TSITE()(1..)  # FGR 01/02/2010 : X3SUIVI60986 : pas TBSITE()(1..)
+Value Integer NBSITE
+Value Char TBSOC()(1..)
+Value Integer NBSOC
+Value Integer GRP
+Value Char TDEVSOC()(1..)
+
+Local Decimal RISKCOM
+Local Decimal ENCOURS
+Local Decimal MONTSRC(0..12)
+Local Decimal MONTDES(0..12)
+Local Decimal IMPSRC
+Local Decimal IMPDES
+Local Integer SPSTAT
+Local Char CRITCPY(200)
+Local Char CRITRSK(200)
+Local Decimal RISKFI
+Local Decimal ABSRISKFI
+Local Integer TYPBPR
+Local Integer SENS
+
+Local Integer X, NBRCLE
+Local Char TABACC (15)(0..2000)
+Local Integer TABCLE (0..2000)
+
+Local Integer IND
+
+Local Char    RSTMVT(1)        # Contient le type de restitution des mouvements (L=Devise société ou R=Devise dossier)
+Local Char    CURMVT(GLONCUR)  # Contient la devise d'affichage de l'encours.
+
+Local Char WPAR(1)
+
+# Remise à zéro des zones
+Call RAZ_ZONE(1)
+
+# Critère sur société + détermination dans quelle devise de Restitution des mouvements
+#   Groupes de sites           (GRP=1)
+#   Société                    (GRP=0)
+#   Toutes sociétés confondues (GRP=-1)
+Case GRP
+ When -1 : CRITCPY = "[F:CPY]CPYLEGFLG=2"
+ When 0  : CRITCPY = "CPY = '"+[M:BAG1]CPY+"'"
+ When 1  : CRITCPY = "find(CPY,TBSOC(1..NBSOC))<>0"
+Endcase
+[L]CURMVT = [M:BAG1]ACCCUR
+[M:BAG3]LEVCTL="("-mess(1,286,1)-")" #"( Dossier )"  # Par défaut
+
+# Selon le paramètre TC "OSTCHGTYP" Origine de l'en-cours
+#    1 - Historisé
+#    2 - Actualisé
+# Si l'en-cours doit être actualisé... les montants *C (de transaction) seront éventuellement convertis
+
+Raz GOSTCHGTYP
+If GMODU(5)<>2 : Raz GOSTCTL : Endif
+# Origine cours ctl en-cours
+Call PARAM("","OSTCHGTYP",WPAR) From ADOVAL
+GOSTCHGTYP= val(WPAR)
+If GOSTCHGTYP=2  # Affichage de l'en-cours  Actualisé
+ # Devise de transaction
+ RSTMVT  ="C"
+Elsif !GRP
+ # Niveau de contrôle d'en-cours
+ Call PARAM([M:BAG1]CPY,"OSTCTL",WPAR) From ADOVAL
+ GOSTCTL = val(WPAR)
+ If GOSTCTL=2  # Affichage de l'en-cours  Actualisé  avec contrôle "Société"
+  # Devise de société
+  RSTMVT  ="L"
+  [M:BAG3]LEVCTL="("-mess(2,286,1)-")" #"( Société )"
+ Else
+  # Affichage de l'en-cours  Actualisé  avec contrôle "Dossier"
+  # Devise de Dossier
+  RSTMVT  ="R"
+ Endif
+Else
+  # Affichage de l'en-cours  Actualisé  avec contrôle "Dossier"
+  # Devise de Dossier
+  RSTMVT  ="R"
+Endif
+
+
+# Version Beryl, pas de solde comptable en devise dossier...
+If RSTMVT="R" : RSTMVT="C" : Endif
+
+# Affichage du type de cours
+If dim([M:BAG3]OSTCHGTYP)>0
+ If RSTMVT="C"
+  [M:BAG3]OSTCHGTYP = 2 # Cours actualisé
+ Else
+  [M:BAG3]OSTCHGTYP = 1 # Cours historisé
+ Endif
+Endif
+
+#--- Restitution du risque Tiers
+If [M:BAG1]CLIFOUR="C"
+ #--- Filtre
+ CRITRSK = "BPCRSK='"+[M:BAG1]BPRRSK+"'"
+ SENS=1 : TYPBPR=-1 : Gosub RISK_CLI
+Else
+ #--- Filtre
+ CRITRSK = "BPSRSK='"+[M:BAG1]BPRRSK+"'"
+ SENS=-1 : TYPBPR=1 : Gosub RISK_FOUR
+Endif
+
+Gosub DETAILS
+Gosub POURCENT
+
+If [M:BAG1]CLIFOUR="C"
+ Gosub GRAPH_CLI
+Else
+ Gosub GRAPH_FOUR
+Endif
+
+Affzo[M:BAG3]
+End
+
+########################################################################################################################
+$RISK_CLI
+
+#--- Information de la table des Clients (BPCUSTOMER) - Tiers risque
+Call LECTURE("BPC",[M:BAG1]BPRRSK,"") From CONTOBJ
+MONTSRC (0) = [F:BPC]OSTAUZ
+MONTSRC (1) = [F:BPC]CDTISR
+For IND=0 To 1
+ Call CONVERT(GCURSHR,[L]CURMVT,[L]CURMVT,GCHGTYP,datesyst,MONTSRC(IND),MONTDES(IND),SPSTAT) From TRTDEV
+ If SPSTAT
+  Call ERREUR(mess(4,109,1)-GCURSHR-"=>"-[L]CURMVT) From GESECRAN
+  Raz MONTDES : Break
+ Endif
+Next
+
+#gbn-103108
+If dim([M:BAG4]LNDBPCATI)>0 : Raz [M:BAG4]LNDBPCATI : Endif
+Raz [M:BAG4]ORDBPCATI
+
+[M:BAG3]OSTCTL = [F:BPC]OSTCTL      # Contrôle en-cours
+[M:BAG3]OSTAUZ = MONTDES (0)        # En-cours autorisé
+[M:BAG3]CDTISR = MONTDES (1)        # Assurance crédit
+
+RISKCOM=0 : ENCOURS=0
+For [CPY]CPY0 Where evalue (CRITCPY)
+
+ #--- Lecture des paramètres Tronc Commun
+ Raz GOSTTYPCUR
+ # Type cours ctl cours actualisé
+ Call PARAM([F:CPY]CPY,"OSTTYPCUR",WPAR) From ADOVAL
+ GOSTTYPCUR= val(WPAR)
+
+ #--- Lecture des paramètres Ventes
+ If GMODU(5)<>2 : Raz GOSTDRAFT,GOSTLND,GOSTORD : Endif
+ # Mnt portefeuille dans en-cours
+ Call PARAM([F:CPY]CPY,"OSTDRAFT",WPAR) From ADOVAL
+ GOSTDRAFT = val(WPAR)
+ # Prêt dans total en-cours
+ Call PARAM([F:CPY]CPY,"OSTLND",WPAR) From ADOVAL
+ GOSTLND = val(WPAR)
+ # Carnet cde dans total en-cours
+ Call PARAM([F:CPY]CPY,"OSTORD",WPAR) From ADOVAL
+ GOSTORD = val(WPAR)
+
+ #--- Information de la table des Mouvements clients (BPCUSTMVT) - Tiers Risque
+ For [MVC] Where evalue(CRITRSK) & CPY=[F:CPY]CPY
+
+  MONTSRC(0) = evalue("[F:MVC]BLC"+RSTMVT)          # Solde comptable
+  MONTSRC(1) = evalue("[F:MVC]ORDBPIATI"+RSTMVT)    # En commande
+  MONTSRC(2) = evalue("[F:MVC]DLVOST"+RSTMVT)       # En-cours livraison
+  MONTSRC(3) = evalue("[F:MVC]NIVDLV"+RSTMVT)       # Livré non facturé
+  MONTSRC(4) = evalue("[F:MVC]NPTINV"+RSTMVT)       # Facture non compta
+
+  # Gestion des prêts (code activité LND)
+  # 75329
+  If func AFNC.ACTIV("LND") & dim([F:MVC]LNDBPIATIC)>0
+   MONTSRC(5) = evalue("[F:MVC]LNDBPIATI"+RSTMVT)  # En prêt commande
+   MONTSRC(6) = evalue("[F:MVC]LNDDLV"+RSTMVT)     # Livré en prêt
+   MONTSRC(7) = evalue("[F:MVC]LNDBPCATI"+RSTMVT)  # En prêt client cde
+  Else
+   MONTSRC(5) = 0
+   MONTSRC(6) = 0
+   MONTSRC(7) = 0
+  Endif
+
+  # Portefeuilles
+  MONTSRC(8)  = evalue("[F:MVC]NYTBIL"+RSTMVT+"(0)")   # Portefeuille 1
+  MONTSRC(9)  = evalue("[F:MVC]NYTBIL"+RSTMVT+"(1)")   # Portefeuille 2
+  MONTSRC(10) = evalue("[F:MVC]NYTBIL"+RSTMVT+"(2)")   # Portefeuille 3
+
+  #Commandes client
+  MONTSRC(11) = evalue("[F:MVC]ORDBPCATI"+RSTMVT)  # En commande client #Gbn-103108
+
+  # Conversion si nécessaire
+  Case RSTMVT
+   When "R"
+    For IND=0 To 11
+     MONTDES(IND)=MONTSRC(IND)
+    Next IND
+   When "C"
+    For IND=0 To 11
+     Call CONVERT([F:MVC]CUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,MONTSRC(IND),MONTDES(IND),SPSTAT) From TRTDEV
+     If SPSTAT
+      Call ERREUR(mess(4,109,1)-[F:MVC]CUR-"=>"-CURMVT) From GESECRAN
+      Raz MONTDES : Break 3
+     Endif
+     Next IND
+   When "L"
+    For IND=0 To 11
+     Call CONVERT([F:CPY]ACCCUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,MONTSRC(IND),MONTDES(IND),SPSTAT) From TRTDEV
+     If SPSTAT
+      Call ERREUR(mess(4,109,1)-[F:MVC]CUR-"=>"-CURMVT) From GESECRAN
+      Raz MONTDES : Break 3
+     Endif
+     Next IND
+   Endcase
+
+  [M:BAG3]SLDCPT    += MONTDES(0)    # Solde comptable
+  [M:BAG3]ORDBPIATI += MONTDES(1)    # En commande
+  [M:BAG3]DLVOST    += MONTDES(2)    # En-cours livraison
+  [M:BAG3]NIVDLV    += MONTDES(3)    # Livré non facturé
+  [M:BAG3]NPTINV    += MONTDES(4)    # Facture non compta
+
+  # Gestion des prêts (code activité LND)
+  # 75329
+  If func AFNC.ACTIV("LND") & dim([F:MVC]LNDBPIATIC)>0
+   [M:BAG3]LNDBPIATI += MONTDES(5)   # En prêt commande
+   [M:BAG3]LNDDLV    += MONTDES(6)   # Livré en prêt
+   [M:BAG4]LNDBPCATI += MONTDES(7)   # En prêt client cde
+  Endif
+  [M:BAG4]ORDBPCATI  += MONTDES(11)  # En commande client #Gbn-103108
+
+  # Portefeuilles
+  [M:BAG3]NYTBIL1 += MONTDES(8)      # Portefeuille 1
+  [M:BAG3]NYTBIL2 += MONTDES(9)      # Portefeuille 2
+  [M:BAG3]NYTBIL3 += MONTDES(10)     # Portefeuille 3
+
+  # En cours
+  If GOSTORD<>2
+   #-En commande-   #-En prêt commande #-   #Livré en prêt
+   ENCOURS -= MONTDES(1)
+   ENCOURS -= MONTDES(5)
+   ENCOURS -= MONTDES(6)
+  Endif
+  If GOSTORD<>2 | GOSTLND<>2
+   ENCOURS -= MONTDES(7)        #-Livré en prêt
+  Endif
+  If GOSTDRAFT=2
+   ENCOURS += MONTDES(8)
+   ENCOURS += MONTDES(9)
+   ENCOURS += MONTDES(10)
+  Endif
+
+ Next
+Next
+
+# Risque commerciale (En commande + En prêt commande + En-cours livraison + Livré non facturé + Livré en prêt + Facture non compta)
+RISKCOM   = [M:BAG3]ORDBPIATI+[M:BAG3]LNDBPIATI+[M:BAG3]DLVOST+[M:BAG3]NIVDLV+[M:BAG3]LNDDLV+[M:BAG3]NPTINV
+RISKFI    = abs([M:BAG3]NYTBIL1)+abs([M:BAG3]NYTBIL2)+abs([M:BAG3]NYTBIL3)
+ABSRISKFI = abs([M:BAG3]NYTBIL1)+abs([M:BAG3]NYTBIL2)+abs([M:BAG3]NYTBIL3)
+
+Gosub TOTBLK1
+Return
+
+
+########################
+$RISK_FOUR
+#--- Information de la table des Fournisseurs (BPSUPPLIER) - Fournisseurs
+Call LECTURE("BPS",[M:BAG1]BPRRSK,"") From CONTOBJ
+MONTSRC (0) = [F:BPS]OSTAUZAMT
+For IND=0 To 0
+ Call CONVERT(GCURSHR,[L]CURMVT,[L]CURMVT,GCHGTYP,datesyst,MONTSRC(IND),MONTDES(IND),SPSTAT) From TRTDEV
+ If SPSTAT
+  Call ERREUR(mess(4,109,1)-GCURSHR-"=>"-[L]CURMVT) From GESECRAN
+  Raz MONTDES : Break
+ Endif
+Next
+[M:BAG3]OSTCTL = [F:BPS]OSTCTL      # Contrôle en-cours
+[M:BAG3]OSTAUZ = MONTDES (0)        # En-cours autorisé
+
+RISKCOM=0 : ENCOURS=0
+For [CPY]CPY0 Where evalue (CRITCPY)
+
+ #--- Lecture des paramètres Tronc Commun
+ Raz GOSTTYPCUR
+ # Type cours ctl cours actualisé
+ Call PARAM([F:CPY]CPY,"OSTTYPCUR",WPAR) From ADOVAL
+ GOSTTYPCUR= val(WPAR)
+
+ #--- Lecture des paramètres Achat
+ If GMODU(6)<>2 : Raz GOSTSDRAFT : Endif
+ Call PARAM([F:CPY]CPY,"OSTSDRAFT",WPAR) From ADOVAL
+ GOSTSDRAFT=val(WPAR)
+
+ #--- Information de la table des Mouvements fournisseurs (BPSUPPMVT) - Tiers Risque
+ For [MVS] Where evalue(CRITRSK) & CPY=[F:CPY]CPY
+
+  MONTSRC(0) = evalue("[F:MVS]BLCAMT"+RSTMVT)       # Solde comptable
+  MONTSRC(1) = evalue("[F:MVS]ORDATI"+RSTMVT)       # En commande
+  MONTSRC(2) = evalue("[F:MVS]RCPATI"+RSTMVT)       # Livré non facturé
+  MONTSRC(3) = evalue("[F:MVS]INVAMT"+RSTMVT)       # Facture non compta
+
+  # Portefeuilles
+  MONTSRC(4) = evalue("[F:MVS]BILAMT"+RSTMVT+"(0)")   # Portefeuille 1
+  MONTSRC(5) = evalue("[F:MVS]BILAMT"+RSTMVT+"(1)")   # Portefeuille 2
+  MONTSRC(6) = evalue("[F:MVS]BILAMT"+RSTMVT+"(2)")   # Portefeuille 3
+
+  # Conversion si nécessaire
+  Case RSTMVT
+   When "R"
+    For IND=0 To 6
+     MONTDES(IND)=MONTSRC(IND)
+    Next IND
+   When "C"
+    For IND=0 To 6
+     Call CONVERT([F:MVS]CUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,MONTSRC(IND),MONTDES(IND),SPSTAT) From TRTDEV
+     If SPSTAT
+      Call ERREUR(mess(4,109,1)-[F:MVC]CUR-"=>"-CURMVT) From GESECRAN
+      Raz MONTDES : Break 3
+     Endif
+     Next IND
+   When "L"
+    For IND=0 To 6
+     Call CONVERT([F:CPY]ACCCUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,MONTSRC(IND),MONTDES(IND),SPSTAT) From TRTDEV
+     If SPSTAT
+      Call ERREUR(mess(4,109,1)-[F:MVC]CUR-"=>"-CURMVT) From GESECRAN
+      Raz MONTDES : Break 3
+     Endif
+    Next IND
+   Endcase
+
+  [M:BAG3]SLDCPT    += MONTDES(0)      # Solde comptable
+  [M:BAG3]ORDBPIATI += MONTDES(1)      # En commande
+  [M:BAG3]NIVDLV    += MONTDES(2)      # Livré non facturé
+  [M:BAG3]NPTINV    += MONTDES(3)      # Facture non compta
+
+  # Portefeuilles
+  [M:BAG3]NYTBIL1 +=  MONTDES(4)   # Portefeuille 1
+  [M:BAG3]NYTBIL2 +=  MONTDES(5)   # Portefeuille 2
+  [M:BAG3]NYTBIL3 +=  MONTDES(6)   # Portefeuille 3
+
+  # En cours
+  If GOSTORD<>2
+   ENCOURS -= MONTDES(1)        #-En commande
+  Endif
+  If GOSTDRAFT=2
+   ENCOURS += MONTDES(8)
+   ENCOURS += MONTDES(9)
+   ENCOURS += MONTDES(10)
+  Endif
+
+ Next
+Next
+
+# Risque commerciale (En commande + Livré non facturé  + Facture non compta)
+RISKCOM = [M:BAG3]ORDBPIATI+[M:BAG3]NIVDLV+[M:BAG3]NPTINV
+RISKFI    = abs([M:BAG3]NYTBIL1)+abs([M:BAG3]NYTBIL2)+abs([M:BAG3]NYTBIL3)
+ABSRISKFI = abs([M:BAG3]NYTBIL1)+abs([M:BAG3]NYTBIL2)+abs([M:BAG3]NYTBIL3)
+
+Gosub TOTBLK1
+Return
+
+
+#########################################
+$DETAILS
+#Remise à zéro des zones remplies par $DETAILS
+#
+# Information venant de la table GACCDUDATE où seul les montants AMTCUR & AMTLOC sont accessibles.
+# Si la restitution est "C" Cours Actualisé => AMTCUR à convertir.
+# Si la restitution est "L" Cours historique devise société => AMTLOC
+# Si la restitution est "R" Cours historique... AMTCUR ou AMTLOC... convertir si pas d'autres solution.
+
+Call RAZ_ZONE(0)
+
+If [M:BAG1]CLIFOUR="C"
+ CRITRSK = "[F:BPC]BPCRSK='"+[M:BAG1]BPRRSK+"'"
+Else
+ CRITRSK = "[F:BPS]BPSRSK='"+[M:BAG1]BPRRSK+"'"
+Endif
+
+Filter [F:LNK] Where evalue(CRITERE) & evalue(CRITRSK)
+For [LNK]
+
+ #---- Conversion... Règlements provisoires PAYNEX
+ Case RSTMVT
+  When "C"
+   IMPSRC = [F:DUD]TMPCUR*[F:DUD]SNS   #Règlement prévisionnel
+   Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+   If SPSTAT
+    Call ERREUR(mess(4,109,1)-[F:DUD]CUR-"=>"-[L]CURMVT) From GESECRAN
+    Raz IMPDES
+   Endif
+  When "L"
+   IMPSRC=[F:DUD]TMPLOC*[F:DUD]SNS   #Règlement prévisionnel
+   Call CONVERT([F:CPY]ACCCUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+   If SPSTAT
+    Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+    Raz IMPDES
+   Endif
+  When "R"
+   If [F:DUD]CUR = [L]CURMVT
+    IMPSRC=[F:DUD]TMPCUR*[F:DUD]SNS   #Règlement prévisionnel
+   Elsif [F:CPY]ACCCUR = [L]CURMVT
+    IMPSRC=[F:DUD]TMPLOC*[F:DUD]SNS   #Règlement prévisionnel
+   Else
+    IMPSRC=[F:DUD]TMPCUR*[F:DUD]SNS   #Règlement prévisionnel
+    Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+    If SPSTAT
+     Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+     Raz IMPDES
+    Endif
+   Endif
+ Endcase
+ #---- Conversion... Résultat
+ [M:BAG3]PAYNEX += (IMPDES*SENS)
+
+
+ If [M:BAG1]CLIFOUR="C"
+  #Facture de vente=échéances non soldées de factures de ventes+tiers+note de débit
+  #DdM38499 : Pas de facture mais TYPDUD=2 alors pièce de relevés (à prendre en compte)
+  If ([F:DUD]AMTLOC -([F:DUD]PAYLOC+[F:DUD]TMPLOC))>=0
+   Read [SIH]SIH0 = [F:DUD]NUM
+   If (!fstat & ([SIH]INVTYP=1 |[SIH]INVTYP=3) & [SIH]STA=3) or
+&     (fstat & [F:DUD]TYPDUD=2)
+
+     #---- Conversion... Facture INV
+     Case RSTMVT
+      When "C"
+       IMPSRC = ([F:DUD]AMTCUR-([F:DUD]PAYCUR+[F:DUD]TMPCUR))*[F:DUD]SNS
+       Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+       If SPSTAT
+        Call ERREUR(mess(4,109,1)-[F:DUD]CUR-"=>"-[L]CURMVT) From GESECRAN
+        Raz IMPDES
+       Endif
+      When "L"
+       IMPSRC=([F:DUD]AMTLOC-([F:DUD]PAYLOC+[F:DUD]TMPLOC))*[F:DUD]SNS
+       Call CONVERT([F:CPY]ACCCUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+       If SPSTAT
+        Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+        Raz IMPDES
+       Endif
+      When "R"
+       If [F:DUD]CUR = [L]CURMVT
+        IMPSRC=([F:DUD]AMTCUR-([F:DUD]PAYCUR+[F:DUD]TMPCUR))*[F:DUD]SNS
+       Elsif [F:CPY]ACCCUR = [L]CURMVT
+        IMPSRC=([F:DUD]AMTLOC-([F:DUD]PAYLOC+[F:DUD]TMPLOC))*[F:DUD]SNS
+       Else
+        IMPSRC=([F:DUD]AMTCUR-([F:DUD]PAYCUR+[F:DUD]TMPCUR))*[F:DUD]SNS
+        Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+        If SPSTAT
+         Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+         Raz IMPDES
+        Endif
+       Endif
+     Endcase
+     #---- Conversion... Résultat
+     [M:BAG3]INV += IMPDES
+   Endif
+  Endif
+
+
+  #Avoirs non imputés = échéances d'avoirs non lettrées
+  Read [SIH]SIH0 = [F:DUD]NUM
+  If !fstat & [SIH]INVTYP = 2
+   Read [DAE]DAE2= [F:DUD]ACCNUM
+   If !fstat & [DAE]MTC=""
+    #---- Conversion... Avoirs non lettrés CNONIP
+    Case RSTMVT
+      When "C"
+       IMPSRC = [F:DUD]AMTCUR*[F:DUD]SNS
+       Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+       If SPSTAT
+        Call ERREUR(mess(4,109,1)-[F:DUD]CUR-"=>"-[L]CURMVT) From GESECRAN
+        Raz IMPDES
+       Endif
+     When "L"
+       IMPSRC=[F:DUD]AMTLOC*[F:DUD]SNS
+       Call CONVERT([F:CPY]ACCCUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+       If SPSTAT
+        Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+        Raz IMPDES
+       Endif
+      When "R"
+       If [F:DUD]CUR = [L]CURMVT
+        IMPSRC=[F:DUD]AMTCUR*[F:DUD]SNS
+       Elsif [F:CPY]ACCCUR = [L]CURMVT
+        IMPSRC=[F:DUD]AMTLOC*[F:DUD]SNS
+       Else
+        IMPSRC=[F:DUD]AMTCUR*[F:DUD]SNS
+        Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+        If SPSTAT
+         Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+         Raz IMPDES
+        Endif
+       Endif
+     Endcase
+     #---- Conversion... Résultat
+    [M:BAG3]CNONIP += IMPDES
+   Endif
+  Endif
+
+ Else
+
+  #Facture d'achat=échéances non soldées de factures de achats+tiers+note de crédit
+  #DdM38499 : Pas de facture mais TYPDUD=2 alors pièce de relevés (à prendre en compte)
+  If ([F:DUD]AMTLOC-([F:DUD]PAYLOC+[F:DUD]TMPLOC))>=0
+   Read [PIH]PIH0 = [F:DUD]NUM
+   If (!fstat & ([PIH]INVTYP=1 |[PIH]INVTYP=4) & [PIH]STA=3) or
+&     (fstat & [F:DUD]TYPDUD=2)
+
+     #---- Conversion... Echéances BAP/non BAP (INV/INVNBP)
+     Case RSTMVT
+      When "C"
+       IMPSRC = ([F:DUD]AMTCUR-([F:DUD]PAYCUR+[F:DUD]TMPCUR))*[F:DUD]SNS
+       Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+       If SPSTAT
+        Call ERREUR(mess(4,109,1)-[F:DUD]CUR-"=>"-[L]CURMVT) From GESECRAN
+        Raz IMPDES
+       Endif
+      When "L"
+       IMPSRC=([F:DUD]AMTLOC-([F:DUD]PAYLOC+[F:DUD]TMPLOC))*[F:DUD]SNS
+       Call CONVERT([F:CPY]ACCCUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+       If SPSTAT
+        Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+        Raz IMPDES
+       Endif
+      When "R"
+       If [F:DUD]CUR = [L]CURMVT
+        IMPSRC=([F:DUD]AMTCUR-([F:DUD]PAYCUR+[F:DUD]TMPCUR))*[F:DUD]SNS
+       Elsif [F:CPY]ACCCUR = [L]CURMVT
+        IMPSRC=([F:DUD]AMTLOC-([F:DUD]PAYLOC+[F:DUD]TMPLOC))*[F:DUD]SNS
+       Else
+        IMPSRC=([F:DUD]AMTCUR-([F:DUD]PAYCUR+[F:DUD]TMPCUR))*[F:DUD]SNS
+        Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+        If SPSTAT
+         Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+         Raz IMPDES
+        Endif
+       Endif
+     Endcase
+     #---- Conversion... Résultat
+     If [F:DUD]FLGPAZ<>len(mess(0,510,1))
+      [M:BAG3]INVNBP += (IMPDES*SENS)
+     Elsif [PIH]STA=3
+      [M:BAG3]INV += (IMPDES*SENS)
+     Endif
+   Endif
+  Endif
+
+  #Avoirs non imputés = échéances d'avoirs non liées à une facture
+  Read [PIH]PIH0 = [F:DUD]NUM
+  If !fstat & [PIH]INVTYP = 2
+   Read [DAE]DAE2= [F:DUD]ACCNUM
+   If !fstat & [DAE]MTC=""
+    #---- Conversion... Avoirs non lettrés CNONIP
+    Case RSTMVT
+      When "C"
+       IMPSRC = [F:DUD]AMTCUR*[F:DUD]SNS
+       Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,GOSTTYPCUR,datesyst,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+       If SPSTAT
+        Call ERREUR(mess(4,109,1)-[F:DUD]CUR-"=>"-[L]CURMVT) From GESECRAN
+        Raz IMPDES
+       Endif
+     When "L"
+       IMPSRC=[F:DUD]AMTLOC*[F:DUD]SNS
+       Call CONVERT([F:CPY]ACCCUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+       If SPSTAT
+        Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+        Raz IMPDES
+       Endif
+      When "R"
+       If [F:DUD]CUR = [L]CURMVT
+        IMPSRC=[F:DUD]AMTCUR*[F:DUD]SNS
+       Elsif [F:CPY]ACCCUR = [L]CURMVT
+        IMPSRC=[F:DUD]AMTLOC*[F:DUD]SNS
+       Else
+        IMPSRC=[F:DUD]AMTCUR*[F:DUD]SNS
+        Call CONVERT([F:DUD]CUR,[L]CURMVT,[L]CURMVT,[F:HAE]TYPRAT,[F:HAE]ACCDAT,IMPSRC,IMPDES,SPSTAT) From TRTDEV
+        If SPSTAT
+         Call ERREUR(mess(4,109,1)-[F:CPY]ACCCUR-"=>"-[L]CURMVT) From GESECRAN
+         Raz IMPDES
+        Endif
+       Endif
+     Endcase
+     #---- Conversion... Résultat
+    [M:BAG3]CNONIP += IMPDES
+   Endif
+  Endif
+ Endif
+Next
+
+[M:BAG3]CNONIP *= -1
+RISKFI   +=[M:BAG3]PAYNEX+[M:BAG3]INV+[M:BAG3]INVNBP
+If (RISKFI>=0 and TYPBPR=-1) or (RISKFI<0 and TYPBPR=1)
+ RISKFI   -=[M:BAG3]CNONIP
+Else
+ RISKFI  +=[M:BAG3]CNONIP
+Endif
+ABSRISKFI+=[M:BAG3]PAYNEX+[M:BAG3]INV+abs([M:BAG3]CNONIP)+[M:BAG3]INVNBP
+
+Filter [LNK]
+
+#########################################
+#Risque Financier
+[M:BAG3]BLC=RISKFI
+Return
+
+########################
+$POURCENT
+#Risque total
+[M:BAG3]TOTRSK+=[M:BAG3]BLC
+[M:BAG3]TOTRSK+=[M:BAG3]OST
+If ABSRISKFI >0
+ [M:BAG3]PER11 = arr(( abs([M:BAG3]CNONIP)  / ABSRISKFI ) * 100 ,0.1)
+ [M:BAG3]PER12 = arr(( abs([M:BAG3]INV)     / ABSRISKFI ) * 100 ,0.1)
+ [M:BAG3]PER13 = arr(( abs([M:BAG3]INVNBP)  / ABSRISKFI ) * 100 ,0.1)
+ [M:BAG3]PER14 = arr(( abs([M:BAG3]PAYNEX)  / ABSRISKFI ) * 100 ,0.1)
+ [M:BAG3]PER16 = arr(( abs([M:BAG3]NYTBIL1) / ABSRISKFI ) * 100 ,0.1)
+ [M:BAG3]PER17 = arr(( abs([M:BAG3]NYTBIL2) / ABSRISKFI ) * 100 ,0.1)
+ [M:BAG3]PER18 = arr(( abs([M:BAG3]NYTBIL3) / ABSRISKFI ) * 100 ,0.1)
+Endif
+Return
+
+#########################################
+$TOTBLK1
+#Solde Comptable
+Call LECTURE("TCU",[M:BAG1]ACCCUR,"") From CONTOBJ
+If ([M:BAG3]SLDCPT>=0 and TYPBPR=-1) or ([M:BAG3]SLDCPT<0 and TYPBPR=1)
+ [M:BAG3]LIBSOL = "D"+right$(format$("N3:"+[F:TCU]CURFMT1,abs([M:BAG3]SLDCPT)),2)
+Else
+ [M:BAG3]LIBSOL = "C"+right$(format$("N3:"+[F:TCU]CURFMT1,abs([M:BAG3]SLDCPT)),2)
+Endif
+ENCOURS+=[M:BAG3]SLDCPT
+
+#Risque Commercial
+[M:BAG3]OST=RISKCOM
+
+#Encours ="Risque commercial" + "Solde comptable"-("En commande" si GOSTORD = Non)
+#-("Livré en prêt" si GOSTORD = Non)-("En prêt commande" si GOSTORD = Non ou GOSTLND = Non)
+#+("Portefeuilles 1 2 3" si GOSTDRAFT= Oui)
+[M:BAG3]OSTTOT=ENCOURS+RISKCOM
+Return
+
+#########################################
+Subprog RAZ_ZONE(NUMBLC)
+Value Integer NUMBLC
+If NUMBLC=-1
+ If [M:BAG4]ORDBPCATI<>0                            : Local Decimal SORDBPCATI : SORDBPCATI=[M:BAG4]ORDBPCATI : Endif #Gbn-103108
+ If dim([M:BAG4]LNDBPCATI)>0 & [M:BAG4]LNDBPCATI<>0 : Local Decimal SLNDBPCATI : SLNDBPCATI=[M:BAG4]LNDBPCATI : Endif #Gbn-103108
+ Raz [M:BAG4]
+ Gosub DEVISE From CNSBAGSTD
+ If dim(SORDBPCATI)>0 : [M:BAG4]ORDBPCATI=SORDBPCATI : Kill SORDBPCATI : Endif #Gbn-103108
+ If dim(SLNDBPCATI)>0 : [M:BAG4]LNDBPCATI=SLNDBPCATI : Kill SLNDBPCATI : Endif #Gbn-103108
+Elsif NUMBLC=0
+ If dim([M:BAG3]PAYNEX)>=0 : Raz[M:BAG3]PAYNEX : Endif
+ If dim([M:BAG3]PAYNIP)>=0 : Raz[M:BAG3]PAYNIP : Endif
+ If dim([M:BAG3]INV)   >=0 : Raz[M:BAG3]INV    : Endif
+ If dim([M:BAG3]CNONIP)>=0 : Raz[M:BAG3]CNONIP : Endif
+ If dim([M:BAG3]INVNBP)>=0 : Raz[M:BAG3]INVNBP : Endif
+ If dim([M:BAG3]UNP)   >=0 : Raz[M:BAG3]UNP    : Endif
+Else
+ If dim([M:BAG3]TOTRSK)   >=0 : Raz [M:BAG3]TOTRSK : Endif
+ If dim([M:BAG3]OSTAUZ)   >=0 : Raz [M:BAG3]OSTAUZ : Endif
+ If dim([M:BAG3]OSTCTL)   >=0 : Raz [M:BAG3]OSTCTL : Endif
+ If dim([M:BAG3]SLDCPT)   >=0 : Raz [M:BAG3]SLDCPT : Endif
+ If dim([M:BAG3]OSTTOT)   >=0 : Raz [M:BAG3]OSTTOT : Endif
+ If dim([M:BAG3]CDTISR)   >=0 : Raz [M:BAG3]CDTISR : Endif
+ If dim([M:BAG3]ORDBPIATI)>=0 : Raz [M:BAG3]ORDBPIATI : Endif
+ If dim([M:BAG3]LNDBPIATI)>=0 : Raz [M:BAG3]LNDBPIATI : Endif
+ If dim([M:BAG3]DLVOST)   >=0 : Raz [M:BAG3]DLVOST : Endif
+ If dim([M:BAG3]NIVDLV)   >=0 : Raz [M:BAG3]NIVDLV : Endif
+ If dim([M:BAG3]LNDDLV)   >=0 : Raz [M:BAG3]LNDDLV : Endif
+ If dim([M:BAG3]NPTINV)   >=0 : Raz [M:BAG3]NPTINV : Endif
+ If dim([M:BAG3]OST)      >=0 : Raz [M:BAG3]OST : Endif
+ If dim([M:BAG3]NYTBIL1)  >=0 : Raz [M:BAG3]NYTBIL1 : Endif
+ If dim([M:BAG3]NYTBIL2)  >=0 : Raz [M:BAG3]NYTBIL2 : Endif
+ If dim([M:BAG3]NYTBIL3)  >=0 : Raz [M:BAG3]NYTBIL3 : Endif
+ If dim([M:BAG3]BLC)      >=0 : Raz [M:BAG3]BLC : Endif
+ If dim([M:BAG3]PER10)    >=0 : Raz [M:BAG3]PER10 : Endif
+ If dim([M:BAG3]PER11)    >=0 : Raz [M:BAG3]PER11 : Endif
+ If dim([M:BAG3]PER12)    >=0 : Raz [M:BAG3]PER12 : Endif
+ If dim([M:BAG3]PER13)    >=0 : Raz [M:BAG3]PER13 : Endif
+ If dim([M:BAG3]PER14)    >=0 : Raz [M:BAG3]PER14 : Endif
+ If dim([M:BAG3]PER15)    >=0 : Raz [M:BAG3]PER15 : Endif
+ If dim([M:BAG3]PER16)    >=0 : Raz [M:BAG3]PER16 : Endif
+ If dim([M:BAG3]PER17)    >=0 : Raz [M:BAG3]PER17 : Endif
+ If dim([M:BAG3]PER18)    >=0 : Raz [M:BAG3]PER18 : Endif
+ If dim([M:BAG3]OSTCHGTYP)>=0 : Raz [M:BAG3]OSTCHGTYP : Endif
+Endif
+End
+
+
+############### GraphV5
+$GRAPH_CLI
+#Remplissage tableau graphe cas Situations Clients
+Local Integer J
+J=0
+[M:BAG3]NBRISK=0
+For I=1 To len(mess(0,2676,1))
+ If [F:GBS]DAC2(I-1)=2
+  [M:BAG3]LIBEL(J)  = mess(I,2676,1)
+  Case I
+   When 1  : [M:BAG3]AMT(J) = [M:BAG3]ORDBPIATI  : #En commande
+   When 2  : [M:BAG3]AMT(J) = [M:BAG3]LNDBPIATI  : #En prêt commande
+   When 3  : [M:BAG3]AMT(J) = [M:BAG3]DLVOST     : #En-cours livraison
+   When 4  : [M:BAG3]AMT(J) = [M:BAG3]NIVDLV     : #Livré non facturé
+   When 5  : [M:BAG3]AMT(J) = [M:BAG3]LNDDLV     : #Livré en prêt
+   When 6  : [M:BAG3]AMT(J) = [M:BAG3]NPTINV     : #Fact. non compta
+   When 7  : [M:BAG3]AMT(J) = [M:BAG3]CNONIP*(-1)          : #Avoirs non lettrés
+   When 8  : [M:BAG3]AMT(J) = [M:BAG3]INV        : #Factures
+   When 9  : [M:BAG3]AMT(J) = [M:BAG3]PAYNEX     : #Règl. provisoires
+   When 10 : [M:BAG3]AMT(J) = [M:BAG3]NYTBIL1    : #Portefeuille 1
+   When 11 : [M:BAG3]AMT(J) = [M:BAG3]NYTBIL2    : #Portefeuille 2
+   When 12 : [M:BAG3]AMT(J) = [M:BAG3]NYTBIL3    : #Portefeuille 3
+  Endcase
+  [M:BAG3]NBRISK+=1
+  J+=1
+ Endif
+Next
+Return
+
+$GRAPH_FOUR
+#Remplissage tableau graphe cas Situations Fournisseurs
+Local Integer J
+J=0
+[M:BAG3]NBRISK=0
+For I=1 To len(mess(0,2677,1))
+ If [F:GBS]DAC3(I-1)=2
+  [M:BAG3]LIBEL(J)  = mess(I,2677,1)
+  Case I
+   When 1  : [M:BAG3]AMT(J) = [M:BAG3]ORDBPIATI  : #En commande
+   When 2  : [M:BAG3]AMT(J) = [M:BAG3]NIVDLV     : #Livré non facturé
+   When 3  : [M:BAG3]AMT(J) = [M:BAG3]NPTINV     : #Fact. non compta
+   When 4  : [M:BAG3]AMT(J) = [M:BAG3]CNONIP*(-1)         : #Avoirs non lettrés
+   When 5  : [M:BAG3]AMT(J) = [M:BAG3]INV        : #Echéances BAP
+   When 6  : [M:BAG3]AMT(J) = [M:BAG3]INVNBP     : #Echéances non BAP
+   When 7  : [M:BAG3]AMT(J) = [M:BAG3]PAYNEX     : #Règl. provisoires
+   When 8  : [M:BAG3]AMT(J) = [M:BAG3]NYTBIL1    : #Portefeuille 1
+   When 9  : [M:BAG3]AMT(J) = [M:BAG3]NYTBIL2    : #Portefeuille 2
+   When 10 : [M:BAG3]AMT(J) = [M:BAG3]NYTBIL3    : #Portefeuille 3
+  Endcase
+  [M:BAG3]NBRISK+=1
+  J+=1
+ Endif
+Next
+Return
+
+
+
+####################################################################################
+#                           Mask [M:BAG4]
+####################################################################################
+
+Subprog DERNIER
+Local Decimal MONTSRC(0..12)
+Local Decimal MONTDES(0..12)
+Local Integer SPSTAT
+Local Char CRITPAY(200)
+
+Local Integer IND
+
+Local Char    RSTMVT(1)        # Contient le type de restitution des mouvements (L=Devise société ou R=Devise dossier)
+Local Char    CURMVT(GLONCUR)  # Contient la devise d'affichage de l'encours.
+
+Local Char WPAR(1)
+
+# Remise à zéro des zones
+Call RAZ_ZONE(-1)
+
+[L]CURMVT = [M:BAG1]ACCCUR
+
+If [M:BAG1]CLIFOUR="C"
+ Gosub DERN_CLI
+Else
+ Gosub DERN_FOUR
+Endif
+
+If [M:BAG1]BPRPAY<>""
+ Gosub CALJOURS
+Endif
+Affzo[M:BAG4]
+End
+
+########################################################################################################################
+$DERN_CLI
+#--- Information de la table des Clients (BPCUSTOMER) - Tiers risque
+Call LECTURE("BPC",[M:BAG1]BPRRSK,"") From CONTOBJ
+
+ #--- Intitulé du tableau des derniers mouvements
+ For I=1 To 8
+  [M:BAG4]DES(I-1) = mess(I,2610,1)
+ Next
+
+ # Client crée le ...
+ [M:BAG4]DAT(0) = [F:BPC]BPCSNCDAT        # Client depuis
+
+  #--- Information de la table des Derniers Mouvements clients (LASTCUSMVT) - Tiers mouvements
+  Raz MONTSRC, MONTDES
+  For nolign=2 To 8
+   Case nolign
+    When 2 :
+     Read [LCM]LCM0=[M:BAG1]BPR;4;[M:BAG1]CPY                 : #--- Dernier devis
+     Gosub VERF_DOCNUM
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LCM]MVTDAT
+      MONTSRC(nolign-1)=[F:LCM]AMT : Gosub CONVERT_MVC : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LCM]MVTDAT # Date dernier devis
+      [M:BAG4]NUM(nolign-1) = [F:LCM]VCRNUM # Numéro dernier devis
+     Endif
+    When 3 :
+     Read [LCM]LCM0=[M:BAG1]BPR;6;[M:BAG1]CPY                 : #--- Derniere commande
+     Gosub VERF_DOCNUM
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LCM]MVTDAT
+      MONTSRC(nolign-1)=[F:LCM]AMT : Gosub CONVERT_MVC : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LCM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LCM]VCRNUM
+     Endif
+    When 4 :
+     Read [LCM]LCM0=[M:BAG1]BPR;7;[M:BAG1]CPY                 : #--- Derniere livraison
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LCM]MVTDAT
+      MONTSRC(nolign-1)=[F:LCM]AMT : Gosub CONVERT_MVC : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LCM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LCM]VCRNUM
+     Endif
+    When 5 :
+     Read [LCM]LCM0=[M:BAG1]BPR;9;[M:BAG1]CPY                 : #--- Derniere facture
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LCM]MVTDAT
+      MONTSRC(nolign-1)=[F:LCM]AMT : Gosub CONVERT_MVC : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LCM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LCM]VCRNUM
+     Endif
+    When 6 :
+     Read [LCM]LCM0=[M:BAG1]BPR;15;[M:BAG1]CPY                 : #--- Dernier règlement
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LCM]MVTDAT
+      MONTSRC(nolign-1)=[F:LCM]AMT : Gosub CONVERT_MVC : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LCM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LCM]VCRNUM
+     Endif
+    When 7 :
+     Read [LCM]LCM0=[M:BAG1]BPR;16;[M:BAG1]CPY                 : #--- Dernier impayé
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LCM]MVTDAT
+      MONTSRC(nolign-1)=[F:LCM]AMT : Gosub CONVERT_MVC : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LCM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LCM]VCRNUM
+     Endif
+    When 8 :
+    #93920
+     Read [LCM]LCM0=[M:BAG1]BPR;18;[M:BAG1]CPY                 : #--- Dernière relance
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LCM]MVTDAT         : #--- Date
+      [M:BAG4]DAT(nolign-1) = [F:LCM]MVTDAT
+      Read [LCM]LCM0=[M:BAG1]BPR;19;[M:BAG1]CPY
+      If !fstat
+       # Dernier niveau de relance
+       [M:BAG4]NUM(nolign-1) = mess(46,104,1)-":"-num$([F:LCM]AMT)    # Niveau
+      Endif
+     Endif
+   Endcase
+  Next
+  Read [LCM]LCM0=[M:BAG1]BPR;17;[M:BAG1]CPY                      #--- Nb d'impayés (le + grand Nb ???)
+  If !fstat & [M:BAG4]UNPNBR < [F:LCM]AMT : [M:BAG4]UNPNBR = [F:LCM]AMT : Endif
+  Read [LCM]LCM0=[M:BAG1]BPR;20;[M:BAG1]CPY                      #--- Le + haut niveau de relance atteint...
+  If !fstat & [M:BAG4]MAXFUPLEV < [F:LCM]AMT : [M:BAG4]MAXFUPLEV = [F:LCM]AMT : Endif
+
+  #--- Information CRM
+  Read [LCM]LCM0=[M:BAG1]BPR;1;[M:BAG1]CPY                     # Premier contact
+  If !fstat & ([F:LCM]MVTDAT<[M:BAG4]CNTFIRDAT | [M:BAG4]CNTFIRDAT=[0/0/0])
+   [M:BAG4]CNTFIRDAT=[F:LCM]MVTDAT
+   [M:BAG4]CNTFIRTYP=[F:LCM]MVTTYP
+  Endif
+  Read [LCM]LCM0=[M:BAG1]BPR;2;[M:BAG1]CPY                     # Dernier contact
+  If !fstat & ([F:LCM]MVTDAT>[M:BAG4]CNTLASDAT | [M:BAG4]CNTLASDAT=[0/0/0])
+   [M:BAG4]CNTLASDAT=[F:LCM]MVTDAT
+   [M:BAG4]CNTLASTYP=[F:LCM]MVTTYP
+  Endif
+  Read [LCM]LCM0=[M:BAG1]BPR;3;[M:BAG1]CPY                     # Prochain contact
+  If !fstat & ([F:LCM]MVTDAT<[M:BAG4]CNTNEXDAT  | [M:BAG4]CNTNEXDAT=[0/0/0])
+   [M:BAG4]CNTNEXDAT=[F:LCM]MVTDAT
+   [M:BAG4]CNTNEXTYP=[F:LCM]MVTTYP
+  Endif
+
+[M:BAG4]NBRLIG=len(mess(0,2610,1))
+
+
+#Impayés
+If [M:BAG1]BPRPAY<>""
+ Filter [PYH] Where [F:PYH]BPR=[M:BAG1]BPRPAY & [F:PYH]CPY=[M:BAG1]CPY  & [F:PYH]STAFLG(len(mess(0,689,1))-1)=2
+ For [PYH]
+  MONTSRC=[F:PYH]AMTCUR
+  Call CONVERT([F:PYH]CUR,[L]CURMVT,[L]CURMVT,GCHGTYP,datesyst,MONTSRC,MONTDES,SPSTAT) From TRTDEV
+  If SPSTAT
+   Call ERREUR(mess(4,109,1)-[F:PYH]CUR-"=>"-[L]CURMVT) From GESECRAN
+   Raz MONTDES : Break
+  Endif
+ [M:BAG4]UNP +=MONTDES
+ Next
+ Filter [PYH]
+Endif
+
+Return
+
+$CONVERT_MVC
+For IND=1 To 8
+ Call CONVERT([F:LCM]CUR,[L]CURMVT,[L]CURMVT,GCHGTYP,datesyst,MONTSRC(IND),MONTDES(IND),SPSTAT) From TRTDEV
+ If SPSTAT
+  If [F:LCM]CUR<>"" : Call ERREUR(mess(4,109,1)-[F:LCM]CUR-"=>"-[L]CURMVT) From GESECRAN  : Endif
+  Raz MONTDES : Break
+ Endif
+Next
+Return
+
+########################
+$DERN_FOUR
+#--- Information de la table des Fournisseurs (BPSUPPLIER) - Fournisseurs
+Call LECTURE("BPS",[M:BAG1]BPRRSK,"") From CONTOBJ
+
+ #--- Intitulé du tableau des derniers mouvements
+ For I=1 To 5
+  [M:BAG4]DES(I-1) = mess(I,2611,1)
+ Next
+
+  #--- Information de la table des Derniers Mouvements fournisseurs (LASTSUPMVT) - Tiers mouvements
+  Raz MONTSRC, MONTDES
+  For nolign=1 To 5
+   Case nolign
+    When 1 :
+     Read [LSM]LSM0=[M:BAG1]BPR;1;[M:BAG1]CPY                 : #--- Dernier appel d'offre
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LSM]MVTDAT
+      MONTSRC(nolign-1)=[F:LSM]AMT : Gosub CONVERT_MVS : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LSM]MVTDAT # Date dernier devis
+      [M:BAG4]NUM(nolign-1) = [F:LSM]VCRNUM # Numéro dernier devis
+     Endif
+    When 2 :
+     Read [LSM]LSM0=[M:BAG1]BPR;3;[M:BAG1]CPY                 : #--- Derniere commande
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LSM]MVTDAT
+      MONTSRC(nolign-1)=[F:LSM]AMT : Gosub CONVERT_MVS : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LSM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LSM]VCRNUM
+     Endif
+    When 3 :
+     Read [LSM]LSM0=[M:BAG1]BPR;4;[M:BAG1]CPY                : #--- Derniere réception
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LSM]MVTDAT
+      MONTSRC(nolign-1)=[F:LSM]AMT : Gosub CONVERT_MVS : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LSM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LSM]VCRNUM
+     Endif
+    When 4 :
+     Read [LSM]LSM0=[M:BAG1]BPR;6;[M:BAG1]CPY                 : #--- Derniere facture
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LSM]MVTDAT
+      MONTSRC(nolign-1)=[F:LSM]AMT : Gosub CONVERT_MVS : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LSM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LSM]VCRNUM
+     Endif
+    When 5 :
+     Read [LSM]LSM0=[M:BAG1]BPR;8;[M:BAG1]CPY                 : #--- Dernier règlement
+     If !fstat & [M:BAG4]DAT(nolign-1) < [F:LSM]MVTDAT
+      MONTSRC(nolign-1)=[F:LSM]AMT : Gosub CONVERT_MVS : [M:BAG4]AMT(nolign-1)=MONTDES(nolign-1)
+      [M:BAG4]DAT(nolign-1) = [F:LSM]MVTDAT
+      [M:BAG4]NUM(nolign-1) = [F:LSM]VCRNUM
+     Endif
+   Endcase
+  Next
+
+[M:BAG4]NBRLIG=len(mess(0,2611,1))
+Return
+
+$CONVERT_MVS
+For IND=0 To 4
+ Call CONVERT([F:LSM]CUR,[L]CURMVT,[L]CURMVT,GCHGTYP,datesyst,MONTSRC(IND),MONTDES(IND),SPSTAT) From TRTDEV
+ If SPSTAT
+  If [F:LSM]CUR<>"" : Call ERREUR(mess(4,109,1)-[F:LSM]CUR-"=>"-[L]CURMVT) From GESECRAN  : Endif
+  Raz MONTDES : Break
+ Endif
+Next
+Return
+
+
+
+# ------------------------------------------------------- #
+# Vérification que le dernier n° document existe toujours #
+# ------------------------------------------------------- #
+$VERF_DOCNUM
+Case nolign
+ When 2 :    : # Devis
+  If GMODU(5)<>2 :  Raz [F:LCM]MVTDAT : Return : Endif
+  If clalev ([F:SQH])=0 : Local File SQUOTE   [SQH] : Endif
+  Look [F:SQH]SQH0=[F:LCM]VCRNUM
+  If fstat
+   # Le dernier devis a été supprimé : Il faut le rechercher
+   Link [SQH] With [BPC]BPC0=[F:SQH]BPCORD As [XSQH]
+   Filter [XSQH] Where [F:BPC]BPCRSK=[M:BAG1]BPR & CPY=[M:BAG1]CPY  Order By Key NEWCLE=QUODAT;SQHNUM
+   Read [XSQH]NEWCLE Last
+   If !fstat
+    [F:LCM]VCRNUM = [F:SQH]SQHNUM
+    [F:LCM]MVTDAT = [F:SQH]QUODAT
+    [F:LCM]AMT    = [F:SQH]QUOATI
+    [F:LCM]CUR    = [F:SQH]CUR
+   Else
+     Raz [F:LCM]MVTDAT
+   Endif
+   Filter [XSQH]
+  Endif
+ When 3 :   : # Commande
+  If GMODU(5)<>2 :  Raz [F:LCM]MVTDAT : Return : Endif
+  If clalev ([F:SOH])=0 : Local File SORDER [SOH] : Endif
+  Look [F:SOH]SOH0=[F:LCM]VCRNUM
+  If fstat
+   # La derniere commande a été supprimée : Il faut la rechercher
+   Link [SOH] With [BPC]BPC0=[F:SOH]BPCORD  As [XSOH]
+   Filter [XSOH] Where [F:BPC]BPCRSK=[M:BAG1]BPR & CPY=[M:BAG1]CPY  Order By Key NEWCLE=ORDDAT;SOHNUM
+   Read [XSOH]NEWCLE Last
+   If !fstat
+    [F:LCM]VCRNUM = [F:SOH]SOHNUM
+    [F:LCM]MVTDAT = [F:SOH]ORDDAT
+    [F:LCM]AMT    = [F:SOH]ORDATI
+    [F:LCM]CUR    = [F:SOH]CUR
+   Else
+     Raz [F:LCM]MVTDAT
+   Endif
+   Filter [XSOH]
+  Endif
+Endcase
+Return
+
+############################
+#Délai moyen de règlement et Nb de jours moyen de retard de règlement
+$CALJOURS
+Local Decimal DELAI
+Local Decimal RETARD, RETARD2
+Local Decimal SUMDUD, SUMDUD2
+
+Raz DELAI,RETARD,RETARD2,SUMDUD,SUMDUD2
+
+If clalev ([F:DUD2])=0 : Local File GACCDUDATE [DUD2] : Endif
+
+CRITPAY = "BPRPAY='"+[M:BAG1]BPRPAY+"'"
+If [M:BAG1]CPY<>""
+ CRITPAY += "& CPY='"+[M:BAG1]CPY+"'"
+Endif
+
+For[DUD2]DUD5 Where evalue(CRITPAY)
+ If [M:BAG1]CLIFOUR="C"
+  Read [SIH]SIH0 = [F:DUD2]NUM
+  If !fstat
+   If [DUD2]PAYDAT<>[0/0/0]
+    DELAI+ =[F:SIH]AMTATI*([F:DUD2]PAYDAT-[F:SIH]ACCDAT)
+    RETARD+=[F:SIH]AMTATI*([F:DUD2]PAYDAT-[F:DUD2]DUDDAT)
+    SUMDUD+=[F:SIH]AMTATI
+   Elsif (date$-[F:DUD2]DUDDAT)>0
+    RETARD2+=[F:SIH]AMTATI*(date$-[F:DUD2]DUDDAT)
+    SUMDUD2+=[F:SIH]AMTATI
+   Endif
+  Endif
+ Else
+  Read [PIH]PIH0 = [F:DUD2]NUM
+  If !fstat
+   If [DUD2]PAYDAT<>[0/0/0]
+    DELAI+ =[F:PIH]AMTATI*([F:DUD2]PAYDAT-[F:PIH]ACCDAT)
+    RETARD+=[F:PIH]AMTATI*([F:DUD2]PAYDAT-[F:DUD2]DUDDAT)
+    SUMDUD+=[F:PIH]AMTATI
+   Elsif (date$-[F:DUD2]DUDDAT)>0
+    RETARD2+=[F:PIH]AMTATI*(date$-[F:DUD2]DUDDAT)
+    SUMDUD2+=[F:PIH]AMTATI
+   Endif
+  Endif
+ Endif
+Next
+
+If SUMDUD>0
+ If dim([M:BAG4]LTIPAY)>=0 : [M:BAG4]LTIPAY = ar2(DELAI/SUMDUD)  : Endif
+ If dim([M:BAG4]LATPAY)>=0 : [M:BAG4]LATPAY = ar2(RETARD/SUMDUD) : Endif
+Endif
+If SUMDUD2>0
+ If RETARD2 >0
+  If dim([M:BAG4]LATPAY2)>=0 : [M:BAG4]LATPAY2 = ar2(RETARD2/SUMDUD2) : Endif
+ Endif
+Endif
+Return

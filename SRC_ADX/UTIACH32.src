@@ -1,0 +1,451 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+##########################################################################
+# UTIACH32 : Utilitaire de rectification des EO           Module Achats  #
+##########################################################################
+#            FQ 77611 ajout EXTSTUQTY et OPESTUCOE sur [F:SCS]           #
+#            FQ 79859 GA 04/2012 ajout SCOTRK                            #
+#            FQ 84500 GA 10/2012 Recalcul [F:SCx]ORDQTY et maj encours   #
+##########################################################################
+
+Call MAJ_UTIACH32
+End
+
+##################################
+Subprog MAJ_UTIACH32
+Local Char DOSSIER(30) : DOSSIER=nomap
+#Call SAIDOS(DOSSIER,"") From SAIDOS
+If [L]DOSSIER<>""
+   If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+   Read [ADS] DOSSIER=[L]DOSSIER : If fstat Raz [F:ADS] : Endif
+
+   Call EXE_UTIACH32([L]DOSSIER)
+Endif
+End
+
+##################################
+Subprog EXE_UTIACH32(DOSSIER)
+Value Char DOSSIER
+
+Local Integer LRET
+
+Call TEMPON("O") From GESECRAN
+Call OUVRE_TRACE("UTIACH32 : Rectification des EO avec données manquantes") From LECFIC
+Call ECR_TRACE("UTIACH32 : Début traitement du dossier "+DOSSIER,0) From GESECRAN
+
+# Traitement des EO
+If GMODU(6)=2 : # Module Achat actif
+  Gosub TRT_EO
+Endif
+
+
+$FIN_UTIACH32
+Call TEMPOFF     From GESECRAN
+Call FERME_TRACE From LECFIC
+Call LEC_TRACE   From LECFIC
+
+End
+
+
+##################################
+$TRT_EO
+
+Local File =DOSSIER+".SCOHEAD"    [SCO]
+Local File =DOSSIER+".SCOITM"     [SCI]
+Local File =DOSSIER+".SCOMAT"     [SCM]
+Local File =DOSSIER+".SCOSRV"     [SCS]
+Local File =DOSSIER+".SCOTRK"     [SCK]    # FQ 79859
+Local File =DOSSIER+".PORDERQ"    [POQ]    # FQ 79859 & 84500
+Local File =DOSSIER+".PRECEIPTD"  [PTD]    # FQ 79859 & 84500
+Local File =DOSSIER+".ORDERS"     [ORD]    # FQ 79859 & 84500
+
+Local File =DOSSIER+".BOMD"       [BOD]
+Local File =DOSSIER+".FACILITY"   [FCY]    # Issue 86974
+Local File =DOSSIER+".ITMFACILIT" [ITF]
+Local File =DOSSIER+".ITMMASTER"  [ITM]
+Local File =DOSSIER+".ITMBPS"     [ITP]
+Local File =DOSSIER+".BPARTNER"   [BPR]
+Local File =DOSSIER+".BPSUPPLIER" [BPS]
+Local File =DOSSIER+".BPDLVCUST"  [BPD]
+
+Local Mask =DOSSIER+".ORDK"       [ORDK]
+
+Local Char     WSCONUM(GLONVCR),WBPRNUM(GLONBPR)
+Local Integer  WSIMFLG, SCS_STUCOE,SCS_STRCOE,SCI_ORDQTY,SCS_ORDQTY,SCM_SCK,SCS_SCK,SCI_SCK, SCI_BPAADD, WBOMALTTYP : WBOMALTTYP=3
+Local Shortint STAT, WCHGTYP : STAT=0
+Local Decimal  WSCI_ORDQTY, WSCS_ORDQTY # Issue 84500 GA 10/2012
+
+WSIMFLG=2
+If !GBATCH
+   Call OUINON(mess(6,115,1)-"?"-nomap,WSIMFLG) From GESECRAN
+Endif
+
+Call ECR_TRACE(" ",0) From GESECRAN
+If WSIMFLG=2
+   Call ECR_TRACE("Correction des données EO"-mess(6,115,1),0) From GESECRAN
+Else
+   Call ECR_TRACE("Correction des données EO",0) From GESECRAN
+Endif
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+Call ECR_TRACE(" ",0) From GESECRAN
+
+Trbegin [SCO]
+# ------------------------------------------------------------------
+If !clalev([F:PTR]) : Local File =DOSSIER+".PURTRS"      [PTR] : Endif
+If GSCOPTRNUM<>""
+   Read  [PTR]PTR0=9;GSCOPTRNUM : If fstat : Raz [F:PTR] : Endif
+Endif
+Raz SCS_STUCOE,SCS_STRCOE,SCI_ORDQTY,SCS_ORDQTY,SCM_SCK,SCS_SCK,SCI_SCK,SCI_BPAADD
+Filter [F:SCO] Order By POHFCY;BPRNUM;SCONUM
+For [F:SCO]
+    If GFCY<>[F:SCO]POHFCY
+       GFCY=[F:SCO]POHFCY
+       Gosub CHARG_PARAM # pour GSOCIETE, GLOCALDEV
+    Endif
+    If [F:SCO]SCOSTA=4 Goto NEXT_SCO Endif
+
+    Read [SCI]SCI0=[F:SCO]SCONUM
+    If fstat
+       Call ECR_TRACE("SCOITM Ligne manquante anomalie trouvée: EO"-[F:SCO]SCONUM,1) From GESECRAN
+       Goto NEXT_SCO
+    Endif
+    If [F:SCI]SCITRKFLG>4 Goto NEXT_SCO Endif
+
+    Read [SCS]SCS0=[F:SCI]SCONUM;[F:SCI]SCILIN
+    If fstat
+       Call ECR_TRACE("SCOSRV Ligne manquante anomalie trouvée: EO"-[F:SCO]SCONUM,1) From GESECRAN
+       Goto NEXT_SCO
+    Endif
+    If [F:SCS]SCSTRKFLG>4 Goto NEXT_SCO Endif
+
+    # Issue 84500 GA 10/2012
+    Raz WSCI_ORDQTY, WSCS_ORDQTY
+    For [F:POQ]POQ4 Where VCRTYPORI=36 & VCRNUMORI=[F:SCI]SCONUM & VCRLINORI=[F:SCI]SCILIN
+       Case [F:POQ]LINTYP
+         When 2 : WSCI_ORDQTY+=[F:POQ]QTYSTU
+         When 3 : WSCS_ORDQTY+=[F:POQ]QTYSTU
+         When 4 :
+            Read [SCM]SCM0=[F:POQ]VCRNUMORI;[F:POQ]VCRLINORI;[F:POQ]VCRSEQORI
+       Endcase
+
+       # Issue 79859
+       Gosub UPD_SCOTRK
+
+    Next
+
+    # Issue 84500 GA 10/2012
+    Gosub UPD_ORDQTY
+
+    # Issue 87021 GA 01/2013
+    Gosub CTL_OPESTRCOE
+
+    # Issue xxx GA 12/2012
+    Gosub UPD_BPAADD
+
+    # Issue 77611 GA 04/2012 ajout EXTSTUQTY & OPESTUCOE sur SCS
+    If dim([F:SCS]OPESTUCOE)>0 & [F:SCS]OPESTUCOE=0
+       Gosub UPD_EXTSTUQTY
+    Endif
+
+$NEXT_SCO
+Next
+
+If SCS_STUCOE=0
+   Call ECR_TRACE("SCOSRV Aucune anomalie trouvée: EXTSTUQTY,OPESTUCOE",0) From GESECRAN
+Else
+   Call ECR_TRACE(num$(SCS_STUCOE)-"SCOSRV complétées EXTSTUQTY,OPESTUCOE",0)  From GESECRAN
+Endif
+If SCS_STRCOE=0
+   Call ECR_TRACE("SCOSRV Aucune anomalie trouvée: EXTSTRQTY,OPESTRCOE",0) From GESECRAN
+Else
+   Call ECR_TRACE(num$(SCS_STRCOE)-"SCOSRV complétées EXTSTRQTY,OPESTRCOE",0)  From GESECRAN
+Endif
+If SCI_ORDQTY=0
+   Call ECR_TRACE("SCOITM Aucune anomalie trouvée: ORDQTY",0) From GESECRAN
+Else
+   Call ECR_TRACE(num$(SCI_ORDQTY)-"SCOITM complétées ORDQTY + encours EOx",0)  From GESECRAN
+Endif
+If SCS_ORDQTY=0
+   Call ECR_TRACE("SCOSRV Aucune anomalie trouvée: ORDQTY",0) From GESECRAN
+Else
+   Call ECR_TRACE(num$(SCS_ORDQTY)-"SCOSRV complétées ORDQTY + encours SCx",0)  From GESECRAN
+Endif
+If SCI_SCK=0
+   Call ECR_TRACE("SCOITM Aucune anomalie trouvée: SCOTRK",0) From GESECRAN
+Else
+   Call ECR_TRACE(num$(SCI_SCK)-"SCOITM complétées dans SCOTRK",0)  From GESECRAN
+Endif
+If SCS_SCK=0
+   Call ECR_TRACE("SCOSRV Aucune anomalie trouvée: SCOTRK",0) From GESECRAN
+Else
+   Call ECR_TRACE(num$(SCS_SCK)-"SCOSRV complétées dans SCOTRK",0)  From GESECRAN
+Endif
+If SCM_SCK=0
+   Call ECR_TRACE("SCOMAT Aucune anomalie trouvée: SCOTRK",0) From GESECRAN
+Else
+   Call ECR_TRACE(num$(SCM_SCK)-"SCOMAT complétées dans SCOTRK",0)  From GESECRAN
+Endif
+Filter [F:SCO]
+If WSIMFLG=2
+   Rollback
+   Call ECR_TRACE("Mode simulation: Rollback !!!",0) From GESECRAN
+Else
+   Commit
+Endif
+
+$FIN_UTIACH32_EO
+Close Local File [SCO]
+Close Local File [SCI]
+Close Local File [SCM]
+Close Local File [SCS]
+Close Local File [SCK]
+Close Local File [POQ]
+Close Local File [PTD]
+Close Local File [ORD]
+
+Close Local File [BOD]
+Close Local File [FCY]
+Close Local File [ITM]
+Close Local File [ITF]
+Close Local File [ITP]
+Close Local File [BPR]
+Close Local File [BPS]
+Return
+
+#----------------------------------------------------------------------#
+# Chargement des paramètres avec GFCY = Site de la commande            #
+# -------------------------------------------------------------------- #
+# Chargement GSOCIETE   : Société juridique                            #
+#            GLOCALDEV  : Devise société juridique                     #
+#----------------------------------------------------------------------#
+$CHARG_PARAM
+Local  Char     PARAM2(10)
+If [F:ADS]MODULE(1) = 2  # Dossier avec module comptabilité
+  Call GLOBVAR(GFCY)  From WWGLOBCPT
+  #----- Chargement des globales référentiels, comptes et sections de la société -----#
+  Call GETCPY(GFCY,"PTR",9,GSCOPTRNUM) From TRTX3CPT
+Endif
+Call GLOBVAR(GFCY)    From WWGLOBACH
+Raz GMESSAGE
+Return
+
+# ----------------------------------------------------------- #
+# Issue 77611 ajout EXTSTUQTY et OPESTUCOE sur [F:SCS]        #
+# ----------------------------------------------------------- #
+$UPD_EXTSTUQTY
+Local Decimal WCOEFF
+  # Issue 87021 GA 01/2013 ce coeff renseigne plutôt [F:SCS]OPESTUCOE
+  Local Date WDATE
+  If [F:SCO]ORDDAT<>[0/0/0] WDATE=[F:SCO]ORDDAT Else WDATE=date$ Endif
+  Filter [BOD] Where ITMREF = [F:SCS]ITMREF  & CPNITMREF = [F:SCS]SRVITMREF
+&                   & BOMALT = [F:SCS]BOMALT & BOMALTTYP=3 & CPNTYP=7
+&                 &  (BOMSTRDAT = [0/0/0] | BOMSTRDAT <= WDATE)
+&                 &  (BOMENDDAT = [0/0/0] | BOMENDDAT >= WDATE)
+  # lecture premier enregistrement
+  Read [F:BOD]BOD0 First
+  #If fstat : GOK=0 : End Endif   # ne pas planter si on a choisi un service hors nomenclature
+  If fstat : Raz [F:BOD] : Endif
+  Filter [BOD]
+  If dim([F:BOD]BOMUOM)>0 & [F:BOD]BOMUOM=[F:SCS]SCOPUU
+    [F:SCS]OPESTUCOE = [F:BOD]BOMSTUCOE
+    If [F:SCS]OPESTUCOE = 0
+       [F:SCS]OPESTUCOE = 1
+    Endif
+    [F:SCS]EXTSTUQTY = [F:SCI]EXTQTY / [F:SCS]OPESTUCOE
+  Else
+    # Coef de conversion entre "Unité Stock (article lancé)" et "Unité Stock (article commandé)"
+    Call RECH_COEFF([F:SCS]SRVITMREF,[F:SCO]BPRNUM,[F:SCI]STU,[F:SCS]OPESTU,WCOEFF) From SCOLIB
+    If WCOEFF = 0
+       WCOEFF = 1
+    Endif
+    [F:SCS]EXTSTUQTY = [F:SCI]EXTQTY / WCOEFF
+    [F:SCS]OPESTUCOE = WCOEFF
+  Endif
+
+  Gosub REWRITE_SCS From SCOLIB
+  SCS_STUCOE+=1
+Return
+
+# ----------------------------------------------------------- #
+# FQ 79859 GA 04/2012 ajout SCOTRK                            #
+# ----------------------------------------------------------- #
+$UPD_SCOTRK
+Filter [PTD] Where POHNUM=[F:POQ]POHNUM
+&                & POPLIN=[F:POQ]POPLIN
+&                & LINTYP=[F:POQ]LINTYP
+&                & LINTYP=2
+&            Order By Key PKX=PTDLIN Desc
+
+For [PTD]PKX
+    Read [SCK]SCK0=[F:SCI]SCONUM;[F:SCI]SCILIN;0;0;[F:PTD]PTHNUM;[F:PTD]PTDLIN
+    If fstat
+       [F:SCK] = [F:SCI]
+       [F:SCK] = [F:PTD]
+       [F:SCK]PTHNUM = [F:PTD]PTHNUM
+       [F:SCK]PTDLIN = [F:PTD]PTDLIN
+       [F:SCK]EXTPRI = [F:SCI]NETPRIL   # Issue 100967 GA 07/2014 before [F:SCI]NETPRI
+       SCI_SCK+=1
+       Gosub WRITE_SCK From SCOLIB
+    Endif
+Next
+Filter [PTD]
+
+Filter [PTD] Where POHNUM=[F:POQ]POHNUM
+&                & POPLIN=[F:POQ]POPLIN
+&                & LINTYP=[F:POQ]LINTYP
+&                & LINTYP=3
+&            Order By Key PKX=PTDLIN Desc
+
+For [PTD]PKX
+    Read [SCK]SCK0=[F:SCS]SCONUM;[F:SCS]SCILIN;[F:SCS]SCSLIN;0;[F:PTD]PTHNUM;[F:PTD]PTDLIN
+    If fstat
+       [F:SCK] = [F:SCS]
+       [F:SCK] = [F:PTD]
+       [F:SCK]PTHNUM = [F:PTD]PTHNUM
+       [F:SCK]PTDLIN = [F:PTD]PTDLIN
+       [F:SCK]EXTPRI = [F:SCS]NETPRIL   # Issue 100967 GA 07/2014 before [F:SCS]NETPRI
+       SCS_SCK+=1
+       Gosub WRITE_SCK From SCOLIB
+    Endif
+Next
+Filter [PTD]
+
+Filter [PTD] Where POHNUM=[F:POQ]POHNUM
+&                & POPLIN=[F:POQ]POPLIN
+&                & LINTYP=[F:POQ]LINTYP
+&                & LINTYP=4
+&            Order By Key PKX=PTDLIN Desc
+
+For [PTD]PKX
+    Read [SCK]SCK0=[F:SCM]SCONUM;[F:SCM]SCILIN;[F:SCM]SCSLIN;[F:SCM]SCMLIN;[F:PTD]PTHNUM;[F:PTD]PTDLIN
+    If fstat
+       [F:SCK] = [F:SCM]
+       [F:SCK] = [F:PTD]
+       [F:SCK]PTHNUM = [F:PTD]PTHNUM
+       [F:SCK]PTDLIN = [F:PTD]PTDLIN
+       [F:SCK]EXTPRI = [F:SCM]NETPRIL   # Issue 100967 GA 07/2014 before [F:SCM]NETPRI
+       SCM_SCK+=1
+       Gosub WRITE_SCK From SCOLIB
+    Endif
+Next
+Filter [PTD]
+
+Return
+
+# ----------------------------------------------------------- #
+# FQ 84500 GA 10/2012 Recalcul [F:SCx]ORDQTY et maj encours   #
+# ----------------------------------------------------------- #
+$UPD_ORDQTY
+If [F:SCI]ORDQTY<>WSCI_ORDQTY
+   [F:SCI]ORDQTY=WSCI_ORDQTY
+   If [F:SCI]ORDQTY>[F:SCI]EXTQTY
+      Call ECR_TRACE("SCOITM Qté commandée > Qté prévue"-[F:SCI]SCONUM-num$([F:SCI]SCILIN),1) From GESECRAN
+   Endif
+   Gosub REWRITE_SCI From SCOLIB
+
+   # Màj ORDERS
+   Call UPDATE_EOX("M") From SCOLIB
+
+   SCI_ORDQTY+=1
+Endif
+
+If [F:SCS]ORDQTY<>WSCS_ORDQTY
+   [F:SCS]ORDQTY=WSCS_ORDQTY
+   If [F:SCS]ORDQTY>[F:SCS]EXTQTY
+      Call ECR_TRACE("SCOSRV Qté commandée > Qté prévue"-[F:SCI]SCONUM-num$([F:SCI]SCILIN),1) From GESECRAN
+   Endif
+   Gosub REWRITE_SCS From SCOLIB
+
+   # Màj ORDERS
+   Call UPDATE_SCX("M") From SCOLIB
+
+   SCS_ORDQTY+=1
+Endif
+Return
+
+# ----------------------------------------------------------- #
+# Contrôle adresse client livré                               #
+# ----------------------------------------------------------- #
+$UPD_BPAADD
+Local Char WBPRNUM(30) : WBPRNUM=[F:SCI]BPRNUM
+Local Char WBPAADD(30) : WBPAADD=[F:SCI]BPAADD
+ [F:SCI]BPRNUM=[F:SCO]BPRNUM
+ If [F:SCI]BPAADD<>""
+    Look [BPD] BPD0=[F:SCI]BPRNUM;[F:SCI]BPAADD
+    If fstat
+       Call ECR_TRACE("SCOITM Erreur BPAADD"-[F:SCI]SCONUM-num$([F:SCI]SCILIN)-[F:SCI]BPRNUM-[F:SCI]BPAADD,1) From GESECRAN
+       Raz [F:SCI]BPAADD
+    Endif
+ Endif
+ If [F:SCI]BPAADD=""
+    # Issue 86974 GA 01/2013
+    #Call FIND_BPDADD ([F:SCI]BPRNUM,[F:SCI]BPAADD) From  BPRLIB
+    Call FIND_PRHFCY ([F:SCO]POHFCY,[F:SCI]BPRNUM,[F:SCI]BPAADD,[F:SCO]MFGFCY,[F:SCI]PRHFCY,[F:SCI]PRHADD,[F:SCI]LOC) From SCOLIB
+    If [F:SCI]BPAADD<>""
+       Call ECR_TRACE("SCOITM ajout BPAADD"-[F:SCI]SCONUM-num$([F:SCI]SCILIN)-[F:SCI]BPRNUM-[F:SCI]BPAADD,1) From GESECRAN
+    Endif
+ Endif
+ If WBPAADD<>[F:SCI]BPAADD | WBPRNUM<>[F:SCI]BPRNUM
+   Gosub REWRITE_SCI From SCOLIB
+   SCI_BPAADD+=1
+ Endif
+Return
+
+# ----------------------------------------------------------- #
+# Issue 87021 GA 01/2013 suite correction 80045
+# ----------------------------------------------------------- #
+$CTL_OPESTRCOE
+Local Decimal WEXTSTRQTY
+    WEXTSTRQTY=[F:SCS]OPESTRCOE * [F:SCS]EXTQTY
+    Call QTEARR(WEXTSTRQTY,[F:SCS]OPESTU) From TRTDIV
+    If abs(WEXTSTRQTY - [F:SCS]EXTSTRQTY)>1 & [F:SCS]STRQTYCOD<>2
+      If [F:SCS]EXTQTY=0
+        Call ECR_TRACE("SCOSRV EXTQTY Ko sur EO ="-[F:SCS]SCONUM-[F:SCS]SRVITMREF-num$([F:SCS]EXTQTY),1) From GESECRAN
+      Elsif [F:SCS]ORDQTY<[F:SCS]EXTQTY
+        Call ECR_TRACE("SCOSRV vérifier: OPESTRCOE Ko sur EO non commandé="-[F:SCS]SCONUM-[F:SCS]SRVITMREF-num$(WEXTSTRQTY - [F:SCS]EXTSTRQTY),1) From GESECRAN
+        Gosub UPD_OPESTRCOE
+      Else  #### [F:SCS]ORDQTY>=[F:SCS]EXTQTY
+        Call ECR_TRACE("SCOSRV OPESTRCOE Ko sur EO déjà commandé="-[F:SCS]SCONUM-[F:SCS]SRVITMREF,1) From GESECRAN
+      Endif
+    Endif
+Return
+$UPD_OPESTRCOE
+Local Decimal WOPESTRCOE : WOPESTRCOE=[F:SCS]OPESTRCOE
+
+  [F:SCS]BPRNUM=[F:SCO]BPRNUM
+  Call UPD_SRV_UOM(-1) From SCOLIB
+  If  WOPESTRCOE<>[F:SCS]OPESTRCOE
+    [F:SCS]EXTSTRQTY=[F:SCS]EXTQTY*[F:SCS]OPESTRCOE
+    Call QTEARR([F:SCS]EXTSTRQTY,[F:SCS]OPESTU) From TRTDIV
+
+    Gosub REWRITE_SCS From SCOLIB
+
+    # Màj ORDERS
+    Call UPDATE_SCX("M") From SCOLIB
+
+    SCS_STRCOE+=1
+  Endif
+Return
+
+########################################################################
+# Pour exécution automatique  en gestion de patch                      #
+########################################################################
+Subprog PATCH(APPLI)
+Value Char    APPLI
+If APPLI="X3" : End : Endif
+If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+Read [ADS] DOSSIER=APPLI : If fstat Raz [F:ADS] : Endif
+############## uniquement si nécessaire de maj les données
+############## Call EXE_UTIACH32(APPLI)
+End
+
+#######################################################################
+# Pour exécution depuis dosmaj6 (validation dossier)
+########################################################################
+Subprog UTI_MOUL (APPLI)
+Value Char    APPLI
+If APPLI="X3" End : Endif
+############## uniquement si nécessaire de maj les données
+############## Call EXE_UTIACH32(APPLI)
+End
+
+#######################################################################

@@ -1,0 +1,2284 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+################################################################################
+#    ACTUALISER VALEUR BIEN COMPTABLE
+#    Création le :
+#
+#*********************************************************************
+#   Rq : En V5, il n'y a plus qu'un seul type d'événement FASACT
+#               et les montants avant actualisation, d'actualisation et
+#               après actualisation sont alimentés dans l'événement par
+#               les variables globales suivantes à créer :
+#
+#               GETRNOTO    GACTETR    GETRNOTD
+#               GIVCVATAMTO GACTIVC    GIVCVATAMTD
+#               GDEDVATAMTO GACTDED    GDEDVATAMTD
+#               GDPRBASO    GACTDPR    GDPRBASD
+#               GTAXBASO    GACTTAX    GTAXBASD
+#               GGALREFBASO GACTGAL    GGALREFBASD
+#
+#  On peut actualiser aussi les plans dont l'origine base d'amortissement est "Montant à saisir"
+#
+################################################################################
+#  Modification
+#   CBO - 22.04.2016  FQ115207  prendre date d'effet
+#   MWA : 10.09.2014  FQ95754_3 : Classement pour vente (Sprint 38 - US 3) Opération interdite pour un bien classé pour vente
+#   MDJ - 30.08.2012  FQ84216 : Contrôle avec Echéancier si FRADGI="oui" (et pas ACCPERCTL)
+#   MDJ - 27.07.2012  FQ81004 : Pouvoir actualiser bien immobilisé via immo des dépenses
+#   GLE - 25.07.2012  FQ83754 : problème d'actualisation des plans libres origine base IAS
+#   GLE - 13.07.2011  FQ74815 : Pas d'actualisation si le bien est sorti
+#   GBO - 25.02.2011  Fq67577 : Pologne - Modernisation
+#   MDJ - 22.12.2010  Fq70141 : Vérification de sources (interne)
+#   MDJ - 26.04.2010  FQ64312 : Certification NF NC35 : Echéancier et dotations
+#   MDJ - 10.12.2009  FQ54343 : Actualisation biens en concessions : maj des provisions
+#   MDJ - 28.10.2009  FQ59226 : On doit pouvoir actualiser un bien saisi sur l'exercice suivant si bien acquis dans l'exercice suivant
+#   GLE - 07.09.2009  FQ57624 : Standard Edition
+#   GLE - 05.01.2009  FQ51378 : Correction plantages divers + modification valeur bilan sur origine "A saisir" sans avoir à modifier le PCG
+################################################################################
+Raz GPILOBJ
+Call DEFVAR From GLOBIMM
+Call INIVAR From GLOBIMM
+Call OBJET("FAS",GBIDC1,GBIDC2) From GOBJET
+End
+
+################################################################################
+$ACTION
+  #Infbox "ACTION="-num$(ACTION)
+  Case ACTION
+    When "OUVRE"         : Gosub OUVRE
+    When "DEBUT"         : Gosub DEBUT
+    When "APRES_MODIF"   : Gosub APRES_MODIF
+    When "AVANT_MODFIC"  : Gosub AVANT_MODFIC
+    When "OK"            : Gosub OK
+    When "ABA"           : Gosub ABA
+    When "FIN"           : Gosub FIN
+  Endcase
+Return
+
+################################################################################
+#-------------------------------------------------------------------------------
+$OUVRE
+Global Integer   N_ACT_PCG, N_ACT_IAS
+Global Char      ANO_PCG(255), ANO_IAS(255)
+Global Decimal   GETRNOTO,    GACTETR,    GETRNOTD
+Global Decimal   GIVCVATAMTO, GACTIVC,    GIVCVATAMTD
+Global Decimal   GDEDVATAMTO, GACTDED,    GDEDVATAMTD
+Global Decimal   GDPRBASO,    GACTDPR,    GDPRBASD
+Global Decimal   GTAXBASO,    GACTTAX,    GTAXBASD
+Global Decimal   GGALREFBASO, GACTGAL,    GGALREFBASD
+
+  #Fq67577-Pologne
+  If G_ACTKPL=G_OUI & [M:FPC]LEG="POL"
+   Local Integer I_PLN
+   For I_PLN=1 To [M:FAS3]NBLIG1
+    If [M:FAS3]KMDRDEV(I_PLN-1)<>0
+     GERR     = 1
+     GMESSAGE = mess(827,GML_MSGFAS,1)
+     FIN      = 1
+     Return
+    Endif
+   Next I_PLN
+  Endif
+  #Fin-Pologne
+
+  # F46680 Nouvelles règles TVA
+  If ( GKFR = G_OUI ) and ( [M:FAS5]VATYEAFLG = G_OUI )  # FQ57624
+    # Bien ayant subi une régularisation annuelle
+    GERR     = 1
+    GMESSAGE = mess(670,GML_MSGFAS,1)
+    FIN      = 1
+  Endif
+
+  # Bien en cours de CIG ?
+  Local Integer BCO_ACTIF
+  Call TEST_BIEN_ACTIF([M:FAS0]AASREF, BCO_ACTIF) From GLOBIENS
+  If BCO_ACTIF <> G_OUI
+   GERR     = 1
+   GMESSAGE = mess(505,GML_MSGFAS,1)
+   FIN      = 1
+  Endif
+  #--------------------------
+  If clalev([F:CNX])  = 0 : Local File CONTEXT    [CNX]  : Endif : # Contextes
+  #--------------------------
+  N_ACT_PCG = G_OUI
+  N_ACT_IAS = G_OUI
+  #--------------------------
+  [M:FASA]DATEFF     = max( date$,[M:FAS1]AASIPTDAT )    #FQ-59226
+  [M:FASA]TAXBAS     = [M:FAS2]TAXBAS
+  GTAXBASO           = [M:FASA]TAXBAS
+  [M:FASA] GALREFBAS = [M:FAS4]GALREFBAS
+  GGALREFBASO        = [M:FAS4]GALREFBAS
+  #--------------------------
+  Gosub TEST_PCG_IAS
+  #--------------------------
+  If GCNXPROIAS = G_OUI
+    # Si le plan IAS est géré et que plan comptable et plan IAS ont été clos depuis
+    # l'acquisition du bien on ne peut plus actualiser du tout
+    If N_ACT_PCG <> G_OUI and N_ACT_IAS <> G_OUI
+       # On met volontairement le message d'anomalie PCG
+       GERR     = 1
+       GMESSAGE = ANO_PCG
+       FIN      = 1
+    Endif
+  Else
+    # Si le contexte IAS n'est pas géré et que plan comptable a été clos depuis
+    # l'acquisition du bien on ne peut plus actualiser du tout
+    If N_ACT_PCG <> G_OUI
+       GERR     = 1
+       GMESSAGE = ANO_PCG
+       FIN      = 1
+    Endif
+  Endif
+
+  # FQ74815 Le bien a fait l'objet d'une sortie réelle
+  If ( [M:FAS4]ISSDAT <> [0/0/0] and [M:FAS4]EXTISSFLG <> G_OUI )
+    GERR     = 1
+    GMESSAGE = mess(66,GML_MSGFAS,1)
+    FIN      = 1
+  Endif
+
+  # FQ95754_3 Le bien a fait l'objet d'un classement pour vente.
+  If ( [M:FAS4]SALCLSDAT <> [0/0/0] )
+    GERR= 1: GMESSAGE = mess(931,GML_MSGFAS,1) : FIN=1 : Return
+  Endif
+
+ # Si erreur, on sort immediatement de l'action. On détruit donc les masques de l'action.
+ # #--------------------------
+ #  Gosub ACTION From TRTOBJACT
+ #  #--------------------------
+ If FIN=1
+  If clalev([M:OAC0]) : Close Mask [OAC0] : Endif
+  If clalev([M:OCP])  : Close Mask [OCP]  : Endif
+ Else
+  Gosub ACTION From TRTOBJACT
+ Endif
+
+Return
+#-------------------------------------------------------------------------------
+$DEBUT
+  #--------------------------
+  # Valorisation PCG actuelle
+  [M:FASA]ACGETRNOT = [M:FAS1]ACGETRNOT
+  [M:FASA]IVCVATRAT = [M:FAS1]IVCVATRAT
+  [M:FASA]IVCVATFLG = [M:FAS1]IVCVATFLG
+  [M:FASA]IVCVATAMT = [M:FAS1]IVCVATAMT
+  [M:FASA]DEDVATRAT = [M:FAS1]DEDVATRAT
+  [M:FASA]DEDVATFLG = [M:FAS1]DEDVATFLG
+  [M:FASA]DEDVATAMT = [M:FAS1]DEDVATAMT
+  [M:FASA]PCGBASVAL = [M:FASA]ACGETRNOT + [M:FASA]IVCVATAMT - [M:FASA]DEDVATAMT
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "ACGETRNOT") From GLOBIENS
+  #--------------------------
+  # Valorisation IAS actuelle
+  [M:FASA]IASETRNOT  = [M:FAS1]IASETRNOT
+  [M:FASA]IVCVATRATI = [M:FAS1]IVCVATRATI
+  [M:FASA]IVCVATFLGI = [M:FAS1]IVCVATFLGI
+  [M:FASA]IVCVATAMTI = [M:FAS1]IVCVATAMTI
+  [M:FASA]DEDVATRATI = [M:FAS1]DEDVATRATI
+  [M:FASA]DEDVATFLGI = [M:FAS1]DEDVATFLGI
+  [M:FASA]DEDVATAMTI = [M:FAS1]DEDVATAMTI
+  [M:FASA]IASBASVAL  = [M:FASA]IASETRNOT + [M:FASA]IVCVATAMTI - [M:FASA]DEDVATAMTI
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "IASETRNOT") From GLOBIENS
+  #--------------------------
+  # Initialisation Actualisation PCG
+  If N_ACT_PCG = G_OUI
+    [M:FASA]ACGETRNOA = 0
+    [M:FASA]IVCVATRAA = [M:FAS1]IVCVATRAT
+    [M:FASA]IVCVATFLA = G_NON
+    [M:FASA]DEDVATRAA = [M:FAS1]DEDVATRAT
+    [M:FASA]DEDVATFLA = G_NON
+    Call CALCUL_TVAS_PCG ([M:FASA]IVCVATRAA, [M:FASA]IVCVATFLA, [M:FASA]DEDVATRAA, [M:FASA]DEDVATFLA)
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "ACGETRNOA") From GLOBIENS
+  Else
+    [M:FASA]ACGETRNOA = 0
+    [M:FASA]IVCVATRAA = 0
+    [M:FASA]IVCVATFLA = G_NON
+    [M:FASA]IVCVATAMA = 0
+    [M:FASA]DEDVATRAA = 0
+    [M:FASA]DEDVATFLA = G_NON
+    [M:FASA]DEDVATAMA = 0
+    [M:FASA]PCGBASVALA = 0
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "ACGETRNOA") From GLOBIENS
+  Endif
+  Gosub REMPLI_PLN_PCG
+  #--------------------------
+  # Initialisation Actualisation IAS
+  If N_ACT_IAS = G_OUI
+    [M:FASA]IASETRNOA  = 0
+    [M:FASA]IVCVATRATA = [M:FAS1]IVCVATRATI
+    [M:FASA]IVCVATFLGA = G_NON
+    [M:FASA]DEDVATRATA = [M:FAS1]DEDVATRATI
+    [M:FASA]DEDVATFLGA = G_NON
+    Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, [M:FASA]IVCVATFLGA, [M:FASA]DEDVATRATA, [M:FASA]DEDVATFLGA)
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "IASETRNOA") From GLOBIENS
+  Else
+    [M:FASA]IASETRNOA  = 0
+    [M:FASA]IVCVATRATA = 0
+    [M:FASA]IVCVATFLGA = G_NON
+    [M:FASA]IVCVATAMTA = 0
+    [M:FASA]DEDVATRATA = 0
+    [M:FASA]DEDVATFLGA = G_NON
+    [M:FASA]DEDVATAMTA = 0
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "IASETRNOA") From GLOBIENS
+  Endif
+  Gosub REMPLI_PLN_IAS
+  #--------------------------
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  Gosub ACTION From TRTOBJACT
+  Setmok [M:FASA] With 0
+  #--------------------------
+
+  If GNBDEPLIEES > 0 : Diszo [FASA] : Endif
+Return
+
+#-------------------------------------------------------------------------------
+$OK
+Local Integer N_I, N_E, ERROR   #FQ-54343
+  #--------------------------
+  If N_ACT_PCG = G_OUI and [M:FASA]ACGETRNOA <> 0
+    If [M:FASA]PCGBASVAL = [M:FAS2]TAXBAS
+      [M:FAS2]TAXBAS = [M:FASA]PCGBASVALN
+      Affzo [M:FAS2]TAXBAS
+    Endif
+    If [M:FASA]PCGBASVAL = [M:FAS4]GALREFBAS
+      [M:FAS4]GALREFBAS = [M:FASA]PCGBASVALN
+      Affzo [M:FAS4]GALREFBAS
+    Endif
+    [M:FAS1]ACGETRNOT = [M:FASA]ACGETRNON
+    [M:FAS1]IVCVATFLG = G_OUI
+    [M:FAS1]IVCVATAMT = [M:FASA]IVCVATAMN
+    [M:FAS1]DEDVATFLG = G_OUI
+    [M:FAS1]DEDVATAMT = [M:FASA]DEDVATAMN
+    [M:FAS1]ACGBSEVAL = [M:FASA]PCGBASVALN
+    Affzo [M:FAS1]ACGETRNOT
+    Affzo [M:FAS1]IVCVATFLG
+    Affzo [M:FAS1]IVCVATAMT
+    Affzo [M:FAS1]DEDVATFLG
+    Affzo [M:FAS1]DEDVATAMT
+    Affzo [M:FAS1]ACGBSEVAL
+    For N_I = 1 To [M:FASB]NBPLNPCG
+      If [M:FASB]UPDPLNPCG(N_I-1) = G_OUI and [M:FASB]ORIBASDPR(N_I-1) <> GVML_OBSAI
+        N_E = [M:FASB]LINFAS3PCG(N_I-1)
+        [M:FAS3]BSEVAL(N_E-1) = [M:FASB]DPRBASPCGN(N_I-1)
+        [M:FAS3]DPRBAS(N_E-1) = [M:FASB]DPRBASPCGN(N_I-1)
+        [M:FAS3]DPRVAL(N_E-1) = [M:FAS3]DPRBAS(N_E-1) - [M:FAS3]RSDVAL(N_E-1)
+        [M:FAS3]DEPSTA(N_E-1) = GVML_SCNOCAL
+        [M:FAS0]FLGCLC                            = G_OUI
+        [M:FAS0]FLGCNXCLC([M:FAS3]CNX(N_E-1)-1)   = G_OUI
+        Affzo [M:FAS3]BSEVAL(N_E-1)
+        Affzo [M:FAS3]DPRBAS(N_E-1)
+        Affzo [M:FAS3]DPRVAL(N_E-1)
+      Endif
+      #-------------------
+      # Suite de la boucle
+    Next N_I
+    G_ACT_MOD = 1
+  Endif
+  #--------------------------
+  If N_ACT_IAS = G_OUI and [M:FASA]IASETRNOA <> 0
+    [M:FAS1]IASETRNOT  = [M:FASA]IASETRNON
+    [M:FAS1]IVCVATFLGI = G_OUI
+    [M:FAS1]IVCVATAMTI = [M:FASA]IVCVATAMTN
+    [M:FAS1]DEDVATFLGI = G_OUI
+    [M:FAS1]DEDVATAMTI = [M:FASA]DEDVATAMTN
+    [M:FAS1]IASBSEVAL  = [M:FASA]IASBASVALN
+    Affzo [M:FAS1]IASETRNOT
+    Affzo [M:FAS1]IVCVATFLGI
+    Affzo [M:FAS1]IVCVATAMTI
+    Affzo [M:FAS1]DEDVATFLGI
+    Affzo [M:FAS1]DEDVATAMTI
+    Affzo [M:FAS1]IASBSEVAL
+    For N_I = 1 To [M:FASB]NBPLNIAS
+      If [M:FASB]UPDPLNIAS(N_I-1) = G_OUI
+        N_E = [M:FASB]LINFAS3IAS(N_I-1)
+        [M:FAS3]BSEVAL(N_E-1) = [M:FASB]DPRBASIASN(N_I-1)
+        [M:FAS3]DPRBAS(N_E-1) = [M:FASB]DPRBASIASN(N_I-1)
+        [M:FAS3]DPRVAL(N_E-1) = [M:FAS3]DPRBAS(N_E-1) - [M:FAS3]RSDVAL(N_E-1)
+        [M:FAS3]DEPSTA(N_E-1) = GVML_SCNOCAL
+        [M:FAS0]FLGCLC                            = G_OUI
+        [M:FAS0]FLGCNXCLC([M:FAS3]CNX(N_E-1)-1)   = G_OUI
+        Affzo [M:FAS3]BSEVAL(N_E-1)
+        Affzo [M:FAS3]DPRBAS(N_E-1)
+        Affzo [M:FAS3]DPRVAL(N_E-1)
+      Endif
+      #-------------------
+      # Suite de la boucle
+    Next N_I
+
+    G_ACT_MOD = 1
+  Endif
+
+  # Pour les plans avec base d'amortissement en saisie manuelle
+  For N_I = 1 To [M:FASB]NBPLNPCG
+    If [M:FASB]UPDPLNPCG(N_I-1) = G_OUI and [M:FASB]ORIBASDPR(N_I-1) = GVML_OBSAI
+      N_E = [M:FASB]LINFAS3PCG(N_I-1)
+      [M:FAS3]BSEVAL(N_E-1) = [M:FASB]DPRBASPCGN(N_I-1)
+      [M:FAS3]DPRBAS(N_E-1) = [M:FASB]DPRBASPCGN(N_I-1)
+      [M:FAS3]DPRVAL(N_E-1) = [M:FAS3]DPRBAS(N_E-1) - [M:FAS3]RSDVAL(N_E-1)
+      [M:FAS3]DEPSTA(N_E-1) = GVML_SCNOCAL
+      [M:FAS0]FLGCLC                            = G_OUI
+      [M:FAS0]FLGCNXCLC([M:FAS3]CNX(N_E-1)-1)   = G_OUI
+      Affzo [M:FAS3]BSEVAL(N_E-1)
+      Affzo [M:FAS3]DPRBAS(N_E-1)
+      Affzo [M:FAS3]DPRVAL(N_E-1)
+
+      G_ACT_MOD = 1
+    Endif
+    #-------------------
+    # Suite de la boucle
+  Next N_I
+
+  #Fq-81004 Pour les plans normés IAS avec base d'amortissement en saisie manuelle
+  For N_I = 1 To [M:FASB]NBPLNIAS
+    If [M:FASB]UPDPLNIAS(N_I-1) = G_OUI and [M:FASB]ORIBASIAS(N_I-1) = GVML_OBSAI
+      N_E = [M:FASB]LINFAS3IAS(N_I-1)
+      [M:FAS3]BSEVAL(N_E-1) = [M:FASB]DPRBASIASN(N_I-1)
+      [M:FAS3]DPRBAS(N_E-1) = [M:FASB]DPRBASIASN(N_I-1)
+      [M:FAS3]DPRVAL(N_E-1) = [M:FAS3]DPRBAS(N_E-1) - [M:FAS3]RSDVAL(N_E-1)
+      [M:FAS3]DEPSTA(N_E-1) = GVML_SCNOCAL
+      [M:FAS0]FLGCLC                            = G_OUI
+      [M:FAS0]FLGCNXCLC([M:FAS3]CNX(N_E-1)-1)   = G_OUI
+      Affzo [M:FAS3]BSEVAL(N_E-1)
+      Affzo [M:FAS3]DPRBAS(N_E-1)
+      Affzo [M:FAS3]DPRVAL(N_E-1)
+
+      G_ACT_MOD = 1
+    Endif
+    #-------------------
+    # Suite de la boucle
+  Next N_I  #Fq-81004
+  #CHECK UNUSED_BEGIN
+  #------------------------------
+  # -Ajout point d'entrée pour traitements complémentaire sur le bien après rattachement de dépense
+  GOK    = 1
+  GPOINT = "APFASACT" : Gosub ENTREE From EXEFNC
+  If GOK < 1 : Return : Endif
+  #CHECK UNUSED_END
+  #--------------------------
+  Gosub ACTION From TRTOBJACT
+  #--------------------------
+Return
+
+#-------------------------------------------------------------------------------
+$ABA
+  Gosub DEBUT : # Clic sur abandon, on recharge toutes les valeurs d'origine
+  REP = ""    : # On repasse en mode consultation
+Return
+
+#-------------------------------------------------------------------------------
+$FIN
+  #--------------------------
+  Kill N_ACT_PCG
+  Kill N_ACT_IAS
+  Kill ANO_PCG
+  Kill ANO_IAS
+  #--------------------------
+  Gosub ACTION From TRTOBJACT
+  #--------------------------
+Return
+
+#-------------------------------------------------------------------------------
+$APRES_MODIF
+  REP = "M"
+ # GLE - correction pb de couleur dans la table des plans - fiche 26530
+  Affzo [FASB]UPDPLNPCG(nolign-1)
+  Affzo [FASB]UPDPLNIAS(nolign-1)
+Return
+
+#-------------------------------------------------------------------------------
+$AVANT_MODFIC
+
+If dim(N_I)>0 : Kill N_I : Endif :
+
+Global Integer N_I
+Local  Integer RETOUR
+Local  Char LEVT(30)
+Local Integer WNORME, I_PLN             # Norme du plan : 1=standard,2=CRC,3=IAS
+Local Date    WDATEFF                   # Date d'effet de l'événement=date d'application de l'actualisation
+Local Date    WACCDAT                   # date de comptabilisatioT
+Local Date    WCNXDAT(1..5)
+Local Date    WCNXDATI(1..5)
+Local Integer WRET
+Local Integer I_CNX
+Local Integer WMODPLNIND : WMODPLNIND= G_NON #*Fq-54343
+
+  #--------------------------------------------------------------------------------------------------------
+  # POUR LES PLANS PCG
+  For N_I = 1 To [M:FASB]NBPLNPCG
+    I_CNX = [M:FASB]CNXPCG(N_I-1)
+    Call GET_CNX_DAT( [M:FAS0]CPY, I_CNX, WCNXDAT, WRET ) From GLOBIENS
+    #--------------------------
+    If [M:FASB]UPDPLNPCG(N_I-1) = G_OUI and [M:FASB]DPRBASPCG(N_I-1) <> [M:FASB]DPRBASPCGN(N_I-1)
+      #-------------------------------------------
+      # alimentation des champs numériques de l'événement
+      GETRNOTO       =  [M:FASA]ACGETRNOT
+      GACTETR        =  [M:FASA]ACGETRNOA
+      GETRNOTD       =  [M:FASA]ACGETRNON
+      GIVCVATAMTO    =  [M:FASA]IVCVATAMT
+      GACTIVC        =  [M:FASA]IVCVATAMA
+      GIVCVATAMTD    =  [M:FASA]IVCVATAMN
+      GDEDVATAMTO    =  [M:FASA]DEDVATAMT
+      GACTDED        =  [M:FASA]DEDVATAMA
+      GDEDVATAMTD    =  [M:FASA]DEDVATAMN
+      GDPRBASO       =  [M:FASB]DPRBASPCG(N_I-1)
+      GACTDPR        =  [M:FASB]DPRBASPCGN(N_I-1)  - [M:FASB]DPRBASPCG(N_I-1)
+      GDPRBASD       =  [M:FASB]DPRBASPCGN(N_I-1)
+      #FQ-81004  GTAXBASO       =  [M:FAS2]TAXBAS
+      GTAXBASO       =  [M:FASA]TAXBAS
+      GACTTAX        =  [M:FAS2]TAXBAS - [M:FASA]TAXBAS
+      GTAXBASD       =  [M:FAS2]TAXBAS
+      GGALREFBASO    =  [M:FAS4]GALREFBAS
+      GACTGAL        =  [M:FAS4]GALREFBAS - [M:FASA]GALREFBAS
+      GGALREFBASD    =  [M:FASA]GALREFBAS
+      #-------------------------------------------
+      I_PLN=find( [M:FASB]PLNPCG(N_I-1),[M:FAS3]DPRPLN )
+      If G_ACTCCN=G_OUI
+       If [M:FASB]PLNPCG(N_I-1) = G_CCNPLNIND
+          WMODPLNIND = G_OUI
+       Endif
+      Endif
+      LEVT = "FASACT"+num$([M:FASB]PLNPCG(N_I-1))
+#      WDATEFF = max([M:FASA]DATEFF,    [M:FAS3]STRDPRDAT(I_PLN-1)) # Issue 115207
+      WDATEFF = [M:FASA]DATEFF # Issue 115207
+      WACCDAT = max(WCNXDAT(3), [M:FAS3]STRDPRDAT(I_PLN-1))
+       Call GENER_EVE
+&           (GVML_OMBIEN,[M:FAS0]CPY,[M:FAS0]FCY,[M:FAS0]AASREF,0,LEVT,WDATEFF,WACCDAT, RETOUR)
+&           From GENEVE
+       If (RETOUR > 20)
+         # Erreur technique
+         RMES = mess(107,GML_MSGFAS,1)-LCDINT+"-"+num$(RETOUR)
+         GOK=0 : Return
+       Endif
+
+    Endif
+    #--------------------------
+    # Suite de la boucle
+  Next N_I
+
+  #*Fq-54343
+  If (G_ACTCCN = G_OUI )
+     If ( G_CCNRPR = G_OUI and WMODPLNIND = G_OUI )
+        # Récupération de la date de fin de l'exercice courant
+        # et de la date de fin de la période courante du contexte comptable et fiscal
+        Local Date L_FIYENDCUR, L_PERENDCUR
+        Local Decimal L_GLOCOE
+        Filter [FIS] Where CPY=[M:FAS0]CPY and CNX = G300CPFI and STAFIY = GVML_TECOURA
+        Read [FIS]First
+        If (fstat)  : Raz [F:FIS] : Endif
+        Filter [FIS]
+        L_FIYENDCUR = [F:FIS]DATENDFIY
+        L_PERENDCUR = [F:FIS]DATENDPER([F:FIS]INDCURPER-1)
+        If clalev([F:RPR]) = 0    : Local File CCNRPR        [RPR]    : Endif
+        [M:FAS0]FLGRPRCLC = G_OUI
+        Read [RPR]RPR0= [M:FAS0]AASREF;L_FIYENDCUR;L_PERENDCUR
+        If fstat=0
+           If [M:FAS1]PURDAT > [F:FIS]DATSTRFIY
+              If [F:RPR]RNWVALFLG <> G_OUI
+                 [F:RPR]STRRNWVAL = GDPRBASD
+              Endif
+           Else
+              If [F:RPR]RNWVALFLG <> G_OUI and GDPRBASO <> 0
+                 L_GLOCOE =   arr([F:RPR]STRRNWVAL/GDPRBASO , 0.06)
+                 [F:RPR]STRRNWVAL = GDPRBASD*L_GLOCOE
+              Endif
+           Endif
+           If [M:FAS6]RNWVALFLG <> G_OUI and [M:FAS6]RNWDONFLG=G_OUI
+              [M:FAS6]CCNCADDEV = [M:FAS6]CCNCADDEV+GACTDPR
+           Endif
+          [M:FAS0]FLGRPRCLC = G_OUI
+          Rewrite [RPR]
+          If (fstat)
+             GOK = 0: GMODOK = G_NON
+             Call RSTA("RPR",[M:FAS0]AASREF) From GLOCK
+             Return
+          Endif
+        Endif
+     Endif
+  Endif
+  #--------------------------------------------------------------------------------------------------------
+  # POUR LES PLANS IAS (rien pour le moment)
+  For N_I= 1 To [M:FASB]NBPLNIAS
+    I_CNX = [M:FASB]CNXIAS(N_I-1)
+    #--------------------------
+    If [M:FASB]UPDPLNIAS(N_I-1) = G_OUI and [M:FASB]DPRBASIAS(N_I-1) <> [M:FASB]DPRBASIASN(N_I-1)
+      #-------------------------------------------
+      # alimentation des champs numériques de l'événement
+      GETRNOTO       =  [M:FASA]IASETRNOT
+      GACTETR        =  [M:FASA]IASETRNOA
+      GETRNOTD       =  [M:FASA]IASETRNON
+      GIVCVATAMTO    =  [M:FASA]IVCVATAMTI
+      GACTIVC        =  [M:FASA]IVCVATAMTA
+      GIVCVATAMTD    =  [M:FASA]IVCVATAMTN
+      GDEDVATAMTO    =  [M:FASA]DEDVATAMTI
+      GACTDED        =  [M:FASA]DEDVATAMTA
+      GDEDVATAMTD    =  [M:FASA]DEDVATAMTN
+      GDPRBASO       =  [M:FASB]DPRBASIAS(N_I-1)
+      GACTDPR        =  [M:FASB]DPRBASIASN(N_I-1) - [M:FASB]DPRBASIAS(N_I-1)
+      GDPRBASD       =  [M:FASB]DPRBASIASN(N_I-1)
+      #-------------------------------------------
+      I_PLN=find( [M:FASB]PLNPCG(N_I-1),[M:FAS3]DPRPLN )
+      LEVT = "FASACT"+num$([M:FASB]PLNIAS(N_I-1))
+#      WDATEFF = max([M:FASA]DATEFF, [M:FAS3]STRDPRDAT(I_PLN-1)) # Issue 115207
+      WDATEFF = [M:FASA]DATEFF # Issue 115207
+      WACCDAT = max(WCNXDATI(3)   , [M:FAS3]STRDPRDAT(I_PLN-1))
+      Call GENER_EVE
+&            (GVML_OMBIEN,[M:FAS0]CPY,[M:FAS0]FCY,[M:FAS0]AASREF,0,LEVT,WDATEFF,WACCDAT, RETOUR)
+&        From GENEVE
+          If (RETOUR > 20)
+          # Erreur technique
+          RMES = mess(107,GML_MSGFAS,1)-LCDINT+"-"+num$(RETOUR)
+          GOK=0 : Return
+        Endif
+    Endif
+    #--------------------------
+    # Suite de la boucle
+  Next N_I
+  #--------------------------
+  Kill N_I
+  #--------------------------
+  # Calcul de tous les plans
+  For N_I = 1 To [M:FASB]NBPLNPCG
+     If [M:FASB]UPDPLNPCG(N_I-1) = G_OUI and [M:FASB]ORIBASDPR(N_I-1) <> GVML_OBSAI   : # FQ51378
+        N_E = [M:FASB]LINFAS3PCG(N_I-1)
+        [M:FAS0]FLGCLC                            = G_OUI
+        [M:FAS0]FLGCNXCLC([M:FAS3]CNX(N_E-1)-1)   = G_OUI
+        [M:FAS3]DEPSTA(N_E-1) = GVML_SCNOCAL
+     Endif
+     #-------------------
+     # Suite de la boucle
+  Next N_I
+
+  #- FQ-64312  --------------------------
+  If ( G_ACTLEA = G_OUI )
+      If [M:FAS2]LEAREF <> ""
+        Update [LEA]
+&       Where LEAREF= [M:FAS2]LEAREF
+&       With  CUMIASBSE += [M:FASA]IASETRNOA
+        If ( fstat )
+           GOK = 0
+           Call FSTA("LEA") From GLOCK
+        Endif
+     Endif
+  Endif
+
+
+
+Return
+################################################################################
+#
+################################################################################
+#-------------------------------------------------------------------------------
+$ACTMET
+  Case ACTMET
+    When "CRITMEN"      : Gosub CRITMEN       # Critère d'activation du menu.
+    When "LCK_OBJ_LNK"  : Gosub LCK_OBJ_LNK   # Lock manuel des objets liés.
+    When "ULK_OBJ_LNK"  : Gosub ULK_OBJ_LNK   # Unlock manuel des objet liés
+    When "FILL_HEA"     : Gosub FILL_HEA      # Alimentation zones spé à l'action de l'en-tête [OAC0]
+    When "INIT_OBJ_DIV" : Gosub INIT_OBJ_DIV  # Ouvertures tables à mettre à jour dans MAJ_LNK
+    When "MAJ_LNK"      : Gosub MAJ_LNK       # Mise à jour et alimentation des objets liés
+    When Default
+  Endcase
+Return
+
+#-------------------------------------------------------------------------------
+$CRITMEN
+# Permet d'alimenter la variable CRITMEN, avec le critère permettant d'activer
+# le menu associé à l'action métier dans l'étiquette CRITMEN
+
+Local Integer AUTORISE
+Local Integer ACCFCY
+Local Char AUZFCY (15)
+
+  AUTORISE = G_OUI
+  # Accès selon droit à l'option
+  Call DROITSITE ( [M:FAS0]FCY, [L]AUZFCY, [L]ACCFCY ) From SUPCPT
+  If ( not [L]ACCFCY or not instr(1, [L]AUZFCY, 'U') )
+    AUTORISE = G_NON
+  Else
+    If (GREP = "" and [M:FAS0]AASREF <> "")
+      If (func GLOBIENS.GET_NB_LOF_ON_FAS([M:FAS0]AASREF) <> 0)
+        # On ne peut pas actualiser un bien liée à des dépenses
+        AUTORISE = G_NON
+      Endif
+    Else
+      AUTORISE = G_NON
+    Endif
+  Endif
+
+  If AUTORISE = G_NON
+    CRITMEN = "1=0"
+  Else
+    CRITMEN = 'REP=""'
+  Endif
+Return
+
+#-------------------------------------------------------------------------------
+$LCK_OBJ_LNK
+# Ecrire les instructions de lock des objets liés dans cette étiquette
+# si les objets liés ne sont pas des objets métiers.
+Return
+
+#-------------------------------------------------------------------------------
+$ULK_OBJ_LNK
+# Ecrire les instructions d'unlock des objets liés dans cette étiquette
+# si les objets liés ne sont pas des objets métiers.
+Return
+
+#-------------------------------------------------------------------------------
+$FILL_HEA
+# Permet d'alimenter d'autre élément de l'en-tête en dehors de l'identifiant
+# et de la désignation
+Return
+
+#-------------------------------------------------------------------------------
+$INIT_OBJ_DIV
+# Ouvrir les tables à mettre à jour
+Return
+
+#-------------------------------------------------------------------------------
+$MAJ_LNK
+# Ecrire le traitement de maj des tables des objets liés.
+Return
+
+#-------------------------------------------------------------------------------
+$EVT_LNK
+
+Return
+################################################################################
+#-------------------------------------------------------------------------------
+$TEST_PCG_IAS
+Local Integer N_I
+
+  If [M:FAS1]GACACN =  GVML_NICHARG # #FQ-64312 nature de type Charge
+    # Si la nature PCG du bien est de type "Charge"
+    Call ACTION_BLOCK (ACB_DISZO, "FASACT1", "ACGETRNOA") From GLOBIENS
+    N_ACT_PCG = G_NON
+  Endif
+  If GCNXPROIAS = G_OUI
+     If [M:FAS1]IASACN =  GVML_NICHARG #FQ-64312 nature de type Charge
+       # Si la nature IAS du bien est de type "Charge"
+       Call ACTION_BLOCK (ACB_DISZO, "FASACT1", "IASETRNOA") From GLOBIENS
+       N_ACT_IAS = G_NON
+     Endif
+  Endif
+  #--------------------------
+  # Tests pour savoir si le contexte comptable et fiscal a été clos depuis le début
+  # d'amortissement du bien
+  For N_I = 1 To [M:FAS3]NBLIG1
+    If [M:FAS3]CNX(N_I-1) = G300CPFI
+      If [M:FAS3]BSEVAL(N_I-1) <> [M:FAS3]DPRBAS(N_I-1)
+        # Si une réévaluation a eu lieu, on ne peut pas actualiser
+        Call ACTION_BLOCK (ACB_DISZO, "FASACT1", "ACGETRNOA") From GLOBIENS
+        N_ACT_PCG = G_NON
+        # Une réévaluation a eu lieu.
+        # La valorisation PCG ne peut être actualisée
+        ANO_PCG = mess(391,GML_MSGFAS,1)-mess(86,GML_MSGFAS,1)
+        Break
+      Endif
+    Endif
+    #--------------------------
+    # Suite de la boucle
+  Next N_I
+  #--------------------------
+  If GCNXPROIAS = G_OUI
+    # Tests pour savoir si le contexte IAS a été clos depuis le début
+    # d'amortissement du bien
+    For N_I = 1 To [M:FAS3]NBLIG1
+      If [M:FAS3]DPRPLN(N_I-1) = G301IAS
+        If  [M:FAS3]BSEVAL(N_I-1) <> [M:FAS3]DPRBAS(N_I-1)
+          # Si une réévaluation a eu lieu, on ne peut pas actualiser
+          Call ACTION_BLOCK (ACB_DISZO, "FASACT1", "IASETRNOA") From GLOBIENS
+          N_ACT_IAS = G_NON
+          # Une réévaluation a eu lieu.
+          # La valorisation IAS/IFRS ne peut être actualisée
+          ANO_IAS = mess(391,GML_MSGFAS,1)-mess(88,GML_MSGFAS,1)
+          Break
+        Endif
+      Endif
+      #--------------------------
+      # Suite de la boucle
+    Next N_I
+  Else
+    N_ACT_IAS = G_NON
+    Call ACTION_BLOCK (ACB_DISZO, "FASACT1", "IASETRNOA") From GLOBIENS
+  Endif
+  #--------------------------
+Return
+
+#-------------------------------------------------------------------------------
+$CALCUL_NOUVELLE_VALEUR
+  If N_ACT_PCG = G_OUI
+    [M:FASA]ACGETRNON  = [M:FASA]ACGETRNOT + [M:FASA]ACGETRNOA
+    [M:FASA]IVCVATRAN  = [M:FASA]IVCVATRAT
+    [M:FASA]IVCVATFLN  = G_OUI
+    [M:FASA]IVCVATAMN  = [M:FASA]IVCVATAMT + [M:FASA]IVCVATAMA
+    [M:FASA]DEDVATRAN  = [M:FASA]DEDVATRAT
+    [M:FASA]DEDVATFLN  = G_OUI
+    [M:FASA]DEDVATAMN  = [M:FASA]DEDVATAMT + [M:FASA]DEDVATAMA
+    [M:FASA]PCGBASVALN = [M:FASA]ACGETRNON + [M:FASA]IVCVATAMN - [M:FASA]DEDVATAMN
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "ACGETRNON") From GLOBIENS
+    Call ACTUALISE_TAB_PLN_PCG ( )
+  Else
+    [M:FASA]ACGETRNON  = 0
+    [M:FASA]IVCVATRAN  = 0
+    [M:FASA]IVCVATFLN  = G_NON
+    [M:FASA]IVCVATAMN  = 0
+    [M:FASA]DEDVATRAN  = 0
+    [M:FASA]DEDVATFLN  = G_NON
+    [M:FASA]DEDVATAMN  = 0
+    [M:FASA]PCGBASVALN = 0
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "ACGETRNON") From GLOBIENS
+  Endif
+
+  If N_ACT_IAS = G_OUI
+    Call GET_TX_COURS_IAS()
+    [M:FASA]IASETRNON  = [M:FASA]IASETRNOT + [M:FASA]IASETRNOA
+    [M:FASA]IVCVATRATN = [M:FASA]IVCVATRATI
+    [M:FASA]IVCVATFLGN = G_OUI
+    [M:FASA]IVCVATAMTN = [M:FASA]IVCVATAMTI + [M:FASA]IVCVATAMTA
+    [M:FASA]DEDVATRATN = [M:FASA]DEDVATRATI
+    [M:FASA]DEDVATFLGN = G_OUI
+    [M:FASA]DEDVATAMTN = [M:FASA]DEDVATAMTI + [M:FASA]DEDVATAMTA
+    [M:FASA]IASBASVALN = [M:FASA]IASETRNON + [M:FASA]IVCVATAMTN - [M:FASA]DEDVATAMTN
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "IASETRNON") From GLOBIENS
+    Call ACTUALISE_TAB_PLN_IAS ( )
+  Else
+    [M:FASA]IASETRNON  = 0
+    [M:FASA]IVCVATRATN = 0
+    [M:FASA]IVCVATFLGN = G_NON
+    [M:FASA]IVCVATAMTN = 0
+    [M:FASA]DEDVATRATN = 0
+    [M:FASA]DEDVATFLGN = G_NON
+    [M:FASA]DEDVATAMTN = 0
+    [M:FASA]IASBASVALN = 0
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "IASETRNON") From GLOBIENS
+  Endif
+Return
+
+#-------------------------------------------------------------------------------
+$REMPLI_PLN_PCG
+Local Integer N_I, N_E, N_ADDLIGNE
+
+  Call ACTION_BLOCK (ACB_EFFZO, "FASACT2", "NBPLNPCG") From GLOBIENS
+  If N_ACT_PCG = G_OUI
+    N_E = 0
+    For N_I = 1 To [M:FAS3]NBLIG1
+      N_ADDLIGNE = G_OUI
+      #-------------------
+      Read[CNX]CNX0=[M:FAS0]CPY;[M:FAS3]CNX(N_I-1)
+      If [M:FAS3]DPRPLN(N_I-1) = G301SUB
+         N_ADDLIGNE = G_NON
+      Else
+        #Fq-81004 If [M:FAS3]ORIBAS(N_I-1) = GVML_OBPCG or [M:FAS3]ORIBAS(N_I-1) = GVML_OBSAI
+        If  [M:FAS3]ORIBAS(N_I-1) = GVML_OBPCG  or ([M:FAS3]ORIBAS(N_I-1) = GVML_OBSAI and [F:CNX]PLNSTD(N_I-1) <> GVML_NPIAS)
+           If [M:FAS3]BSEVAL(N_I-1) <> [M:FAS3]DPRBAS(N_I-1)
+              N_ADDLIGNE = G_NON
+          Endif
+        Else
+          N_ADDLIGNE = G_NON
+        Endif
+      Endif
+      #-------------------
+      If N_ADDLIGNE = G_OUI
+        #-------------------
+        N_E   += 1
+        #-------------------
+        [M:FASB]PLNPCG(N_E-1)     = [M:FAS3]DPRPLN(N_I-1)
+        [M:FASB]DPRBASPCG(N_E-1)  = [M:FAS3]DPRBAS(N_I-1)
+        [M:FASB]ORIBASDPR(N_E-1)  = [M:FAS3]ORIBAS(N_I-1)
+        [M:FASB]CNXPCG(N_E-1)     = [M:FAS3]CNX(N_I-1)
+        [M:FASB]CURPLNPCG(N_E-1)  = [F:CNX]CUR
+        [M:FASB]CURTYPPCG(N_E-1)  = [F:CNX]CURTYP
+        [M:FASB]LINFAS3PCG(N_E-1) = N_I
+        #-------------------
+        # FQ51378
+        #If ( [M:FASB]CNXPCG(N_E-1) = G300CPFI  ) and  [M:FASA]ACGETRNOA <> 0
+        If [M:FASB]ORIBASDPR(N_E-1) = GVML_OBPCG
+           #Fq-81004[M:FASB]UPDPLNPCG(N_E-1) = G_OUI
+           #+Fq-81004
+           If GNBDEPLIEES > 0
+              [M:FASB]UPDPLNPCG(N_E-1) = G_NON
+              Diszo [M:FASB]UPDPLNPCG(N_E-1)
+           Else
+              [M:FASB]UPDPLNPCG(N_E-1) = G_OUI
+              Actzo [M:FASB]UPDPLNPCG(N_E-1)
+           Endif
+        Else
+          If [M:FASB]ORIBASDPR(N_E-1) = GVML_OBSAI
+             Actzo [M:FASB]UPDPLNPCG(N_E-1)
+        Endif
+        Endif   #+Fq-81004
+        Affzo [M:FASB]UPDPLNPCG(N_E-1)
+        [M:FASB]DPRBASPCGN(N_E-1) = [M:FASB]DPRBASPCG(N_E-1)  #+Fq-81004
+        #-------------------
+      Endif
+      #-------------------
+      # Suite de la boucle
+    Next N_I
+    #-------------------
+    [M:FASB]NBPLNPCG = N_E
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNPCG") From GLOBIENS
+    #-------------------
+    For N_E = 1 To [M:FASB]NBPLNPCG
+      #If [M:FASB]CNXPCG(N_E-1) = G300CPFI   : FQ51378
+      #Fq-81004 If [M:FASB]UPDPLNPCG(N_E-1) <> G_OUI or ([M:FASB]UPDPLNPCG(N_E-1) = G_OUI and [M:FASB]ORIBASDPR(N_E-1) <> GVML_OBSAI)
+      If  [M:FASB]ORIBASDPR(N_E-1) <> GVML_OBSAI
+        Diszo [M:FASB]UPDPLNPCG(N_E-1) : # FQ51378
+        Grizo [M:FASB]DPRBASPCGN(N_E-1)
+      Else
+            Actzo [M:FASB]DPRBASPCGN(N_E-1)
+      Endif
+      #-------------------
+      # Suite de la boucle
+    Next N_E
+    #-------------------
+     Call ACTION_BLOCK (ACB_AFFZO,  "FASACT2",  "NBPLNPCG") From GLOBIENS
+     Call ACTUALISE_TAB_PLN_PCG ( )
+    #-------------------
+  Endif
+Return
+
+#-------------------------------------------------------------------------------
+$REMPLI_PLN_IAS
+Local Integer N_I, N_E, N_ADDLIGNE
+
+  Call ACTION_BLOCK (ACB_EFFZO, "FASACT2", "NBPLNIAS") From GLOBIENS
+  If N_ACT_IAS = G_OUI
+    N_E = 0
+    For N_I = 1 To [M:FAS3]NBLIG1
+      N_ADDLIGNE = G_OUI
+      #-------------------
+      Read[CNX]CNX0=[M:FAS0]CPY;[M:FAS3]CNX(N_I-1)
+      If [M:FAS3]DPRPLN(N_I-1) = G301IAS
+      Else
+         #Fq-81004 If  [M:FAS3]ORIBAS(N_I-1) = GVML_OBIAS
+        If  [M:FAS3]ORIBAS(N_I-1) = GVML_OBIAS  or ([M:FAS3]ORIBAS(N_I-1) = GVML_OBSAI and [F:CNX]PLNSTD(N_I-1) = GVML_NPIAS)
+          If [M:FAS3]BSEVAL(N_I-1) <> [M:FAS3]DPRBAS(N_I-1)
+            N_ADDLIGNE = G_NON
+          Endif
+        Else
+          N_ADDLIGNE = G_NON
+        Endif
+      Endif
+      #-------------------
+      If N_ADDLIGNE = G_OUI
+        #-------------------
+        N_E += 1
+        #-------------------
+        [M:FASB]PLNIAS(N_E-1)     = [M:FAS3]DPRPLN(N_I-1)
+        [M:FASB]DPRBASIAS(N_E-1)  = [M:FAS3]DPRBAS(N_I-1)
+        [M:FASB]ORIBASIAS(N_E-1)  = [M:FAS3]ORIBAS(N_I-1)
+        [M:FASB]CNXIAS(N_E-1)     = [F:CNX]CNX
+        [M:FASB]CURPLNIAS(N_E-1)  = [F:CNX]CUR
+        [M:FASB]CURTYPIAS(N_E-1)  = [F:CNX]CURTYP
+        [M:FASB]LINFAS3IAS(N_E-1) = N_I
+        #-------------------
+        # If [M:FASB]PLNIAS(N_E-1) = G301IAS  and [M:FASA]IASETRNOA <> 0 : # FQ83754
+        If [M:FASA]IASETRNOA <> 0
+          [M:FASB]UPDPLNIAS(N_E-1) = G_OUI
+          [M:FASB]DPRBASIASN(N_E-1) = [M:FASB]DPRBASIAS(N_E-1)
+        # Else                                                           : # FQ83754
+        #   [M:FASB]UPDPLNIAS(N_E-1) = G_NON                             : # FQ83754
+        Endif
+        Affzo  [M:FASB]UPDPLNIAS(N_E-1)
+        Affzo  [M:FASB]DPRBASIASN(N_E-1)
+        #-------------------
+      Endif
+      #-------------------
+      # Suite de la boucle
+    Next N_I
+    #-------------------
+    [M:FASB]NBPLNIAS = N_E
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNIAS") From GLOBIENS
+#    #-------------------
+##FQ-81004    For N_E = 1 To [M:FASB]NBPLNIAS
+##FQ-81004      If [M:FASB]CNXIAS(N_E-1) = G300IAS
+##FQ-81004          Diszo [M:FASB]UPDPLNIAS(N_E-1)
+##FQ-81004          Break
+##FQ-81004        Endif
+#    #-------------------
+    #-------------------
+    For N_E = 1 To [M:FASB]NBPLNIAS
+      If [M:FASB]UPDPLNIAS(N_E-1) <> G_OUI and [M:FASB]ORIBASIAS(N_E-1) <> GVML_OBSAI
+        Diszo [M:FASB]UPDPLNIAS(N_E-1) : # FQ51378
+        Grizo [M:FASB]DPRBASIASN(N_E-1)
+      Else #+Fq-81004
+         If  [M:FASB]ORIBASIAS(N_E-1) = GVML_OBSAI
+            Actzo [M:FASB]DPRBASIASN(N_E-1)
+      Endif
+      Endif #+Fq-81004
+      #-------------------
+      # Suite de la boucle
+    Next N_E
+    #-------------------
+    Call ACTION_BLOCK (ACB_AFFZO,  "FASACT2", "NBPLNIAS" ) From GLOBIENS
+    Call ACTUALISE_TAB_PLN_IAS ( )
+    #-------------------
+  Endif
+Return
+
+################################################################################
+########################################
+Subprog RECUPERE_COURS_PLN_PCG (N_I)
+Value Integer N_I
+
+  If [M:FASB]RATCURPCG(N_I-1) = 0
+    Call CDVCAL([M:FASB]RATCURPCG(N_I-1), [M:FAS1]ACGCUR, [M:FASB]CURPLNPCG(N_I-1), [M:FAS0]CPY, [M:FASB]CURTYPPCG(N_I-1), [M:FASA]DATEFF) From TRTDIV
+  Endif
+End
+
+########################################
+Subprog ACTUALISE_UN_PLN_PCG (N_I)
+Value Integer N_I
+
+Local Integer LSTAT
+Local Decimal N_MNTACTU
+
+  Call RECUPERE_COURS_PLN_PCG (N_I)
+  If [M:FASB]UPDPLNPCG(N_I-1) = G_OUI
+    If  [M:FASB]ORIBASDPR(N_I-1) <> GVML_OBSAI
+       Call CONVERT3([M:FAS1]ACGCUR, [M:FASB]CURPLNPCG(N_I-1), GLOCALDEV, [M:FASB]CURTYPPCG(N_I-1),
+&                    [M:FASA]DATEFF, [M:FASA]PCGBASVALA, N_MNTACTU, [M:FASB]RATCURPCG(N_I-1), LSTAT) From CPTSUB
+       [M:FASB]DPRBASPCGN(N_I-1) = [M:FASB]DPRBASPCG(N_I-1) + N_MNTACTU
+    Endif
+  Else
+    [M:FASB]DPRBASPCGN(N_I-1) = [M:FASB]DPRBASPCG(N_I-1)
+  Endif
+  GACTDPR  =  N_MNTACTU
+  GDPRBASD =  [M:FASB]DPRBASPCGN(N_I-1)
+
+
+End
+########################################
+Subprog ACTUALISE_TAB_PLN_PCG ( )
+Local Integer N_I
+
+  For N_I = 1 To [M:FASB]NBPLNPCG
+    Call ACTUALISE_UN_PLN_PCG (N_I)
+    #-------------------
+    # Suite de la boucle
+  Next N_I
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNPCG") From GLOBIENS
+
+End
+########################################
+Funprog CONTROLE_TAB_PLN_PCG (RMSG)
+Variable Char RMSG
+
+Local Integer LINERROR, N_I
+
+  LINERROR = 0
+  For N_I = 1 To [M:FASB]NBPLNPCG
+    If  (sgn([M:FASB]DPRBASPCG(N_I-1))+sgn([M:FASB]DPRBASPCGN(N_I-1)) = 0) and (sgn([M:FASB]DPRBASPCG(N_I-1))<>0)
+      LINERROR = N_I
+      RMSG     = mess(101,GML_MSGFAS,1)-"("+mess([M:FASB]PLNPCG(N_I-1),GML_NPLAN,1)+")"
+      Break
+    Endif
+    #-------------------
+    # Suite de la boucle
+  Next N_I
+
+End LINERROR
+########################################
+Subprog RECUPERE_COURS_PLN_IAS (N_I)
+Value Integer N_I
+
+  If [M:FASB]RATCURIAS(N_I-1) = 0
+    Call CDVCAL([M:FASB]RATCURIAS(N_I-1), [M:FAS1]IASCUR, [M:FASB]CURPLNIAS(N_I-1), [M:FAS0]CPY, [M:FASB]CURTYPIAS(N_I-1), [M:FASA]DATEFF) From TRTDIV
+  Endif
+
+End
+########################################
+Subprog ACTUALISE_UN_PLN_IAS (N_I)
+Value Integer N_I
+
+Local Integer LSTAT
+Local Decimal N_MNTACTU
+
+  Call RECUPERE_COURS_PLN_IAS (N_I)
+  If [M:FASB]UPDPLNIAS(N_I-1) = G_OUI
+    Call CONVERT3([M:FAS1]IASCUR, [M:FASB]CURPLNIAS(N_I-1), GLOCALDEV, [M:FASB]CURTYPIAS(N_I-1),
+&                 [M:FASA]DATEFF, [M:FASA]IASBASVALA, N_MNTACTU, [M:FASB]RATCURIAS(N_I-1), LSTAT) From CPTSUB
+    [M:FASB]DPRBASIASN(N_I-1) = [M:FASB]DPRBASIAS(N_I-1) + N_MNTACTU
+  Else
+    [M:FASB]DPRBASIASN(N_I-1) = [M:FASB]DPRBASIAS(N_I-1)
+  Endif
+  GACTDPR  =  N_MNTACTU
+  GDPRBASD =  [M:FASB]DPRBASIASN(N_I-1)
+
+End
+########################################
+Subprog ACTUALISE_TAB_PLN_IAS ( )
+Local Integer N_I
+
+  For N_I = 1 To [M:FASB]NBPLNIAS
+    Call ACTUALISE_UN_PLN_IAS (N_I)
+    #-------------------
+    # Suite de la boucle
+  Next N_I
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNIAS") From GLOBIENS
+End
+
+########################################
+Funprog CONTROLE_TAB_PLN_IAS (RMSG)
+Variable Char RMSG
+
+Local Integer LINERROR, N_I
+
+  LINERROR = 0
+  For N_I = 1 To [M:FASB]NBPLNIAS
+    If  (sgn([M:FASB]DPRBASIAS(N_I-1))+sgn([M:FASB]DPRBASIASN(N_I-1)) = 0) and (sgn([M:FASB]DPRBASIAS(N_I-1))<>0)
+      LINERROR = N_I
+      RMSG     = mess(101,GML_MSGFAS,1)-"("+mess([M:FASB]PLNIAS(N_I-1),GML_NPLAN,1)+")"
+      Break
+    Endif
+    #-------------------
+    # Suite de la boucle
+  Next N_I
+End LINERROR
+
+########################################
+Subprog CALCUL_TVAS_PCG (PTVA_F, PFLG_TVA_F, PTVA_R, PFLG_TVA_R)
+Value Decimal PTVA_F
+Value Integer PFLG_TVA_F
+Value Decimal PTVA_R
+Value Integer PFLG_TVA_R
+
+  If PFLG_TVA_F <> G_OUI
+    Call GET_MNT_ARRONDI ([M:FASA]ACGETRNOA*PTVA_F/100, [M:FAS1]ACGCUR, [M:FASA]IVCVATAMA) From GLOBIENS
+  Endif
+  If PFLG_TVA_R <> G_OUI
+    Call GET_MNT_ARRONDI ([M:FASA]IVCVATAMA*PTVA_R/100, [M:FAS1]ACGCUR, [M:FASA]DEDVATAMA) From GLOBIENS
+  Endif
+  [M:FASA]PCGBASVALA = [M:FASA]ACGETRNOA + [M:FASA]IVCVATAMA - [M:FASA]DEDVATAMA
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "ACGETRNOA") From GLOBIENS
+  Call ACTUALISE_TAB_PLN_PCG ( )
+End
+
+########################################
+Subprog CALCUL_TVAS_IAS (PTVA_F, PFLG_TVA_F, PTVA_R, PFLG_TVA_R)
+Value Decimal PTVA_F
+Value Integer PFLG_TVA_F
+Value Decimal PTVA_R
+Value Integer PFLG_TVA_R
+
+  If PFLG_TVA_F <> G_OUI
+    Call GET_MNT_ARRONDI ([M:FASA]IASETRNOA*PTVA_F/100, [M:FAS1]IASCUR, [M:FASA]IVCVATAMTA) From GLOBIENS
+  Endif
+  If PFLG_TVA_R <> G_OUI
+    Call GET_MNT_ARRONDI ([M:FASA]IVCVATAMTA*PTVA_R/100, [M:FAS1]IASCUR, [M:FASA]DEDVATAMTA) From GLOBIENS
+  Endif
+  [M:FASA]IASBASVALA = [M:FASA]IASETRNOA + [M:FASA]IVCVATAMTA - [M:FASA]DEDVATAMTA
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT1", "IASETRNOA") From GLOBIENS
+  Call ACTUALISE_TAB_PLN_IAS ( )
+End
+
+########################################
+Subprog GET_TX_COURS_IAS ()
+
+  If [M:FASA]IASRATCUR = 0
+    Call CDVCAL([M:FASA]IASRATCUR, [M:FAS1]ACGCUR, [M:FAS1]IASCUR, [M:FAS0]CPY, [M:FASA]IASCURTYP, [M:FASA]DATEFF) From TRTDIV
+    Affzo [M:FASA]IASRATCUR
+  Endif
+End
+
+########################################
+Subprog PROPOSE_VAL_ENTREE_IAS (P_VALPCG)
+Value Decimal P_VALPCG
+
+Local Integer LSTAT
+  #Fq-81004 If (N_ACT_IAS = G_OUI)
+  If (N_ACT_IAS = G_OUI) and ([M:FASA]IASETRNOA=0)
+    Call CONVERT3([M:FAS1]ACGCUR, [M:FAS1]IASCUR, GLOCALDEV, [M:FASA]IASCURTYP, [M:FASA]DATEFF, P_VALPCG, [M:FASA]IASETRNOA, [M:FASA]IASRATCUR, LSTAT) From CPTSUB
+    Call GET_TX_COURS_IAS()
+    Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, [M:FASA]IVCVATFLGA, [M:FASA]DEDVATRATA, [M:FASA]DEDVATFLGA)
+  Endif
+End
+
+################################################################################
+# ECRAN : FASACT1
+################################################################################
+Subprog C_DATEFF(VALEUR)
+Variable Date    VALEUR
+
+Local Char LMSG(200)
+
+[M:FASA]DATEFF = VALEUR
+  #--------------------------
+  N_ACT_PCG = G_OUI
+  N_ACT_IAS = G_OUI
+  #--------------------------
+  Gosub TEST_PCG_IAS
+  #--------------------------
+  If N_ACT_PCG = G_OUI
+    # On regarde si la date d'effet n'est pas dans un exercice ant. à l'exercice courant PCG
+    # Si c'est pas le cas on ne peut pas actualiser le PCG
+    #FQ-59226 If VALEUR < GDEBEXECPF or VALEUR > GFINEXECPF
+    If VALEUR < GDEBEXECPF or ( VALEUR <  [M:FAS1]AASIPTDAT)
+      N_ACT_PCG = G_NON
+      # La date d'effet doit être dans l'exercice courant ou dans l'exercice suivant du contexte "Comptable et fiscal".
+      # La valorisation PCG ne peut être actualisée
+      ANO_PCG = mess(85,GML_MSGFAS,1)-mess(86,GML_MSGFAS,1)
+      Call ACTION_BLOCK (ACB_DISZO, "FASACT1", "ACGETRNOA") From GLOBIENS
+    Else
+      Call ACTION_BLOCK (ACB_ACTZO, "FASACT1", "ACGETRNOA") From GLOBIENS
+      If [M:FASA]DEDVATRAA = 100 : Diszo [M:FASA]DEDVATAMA : Endif :
+    Endif
+  Endif
+  #--------------------------
+  If GCNXPROIAS = G_OUI
+    If N_ACT_IAS = G_OUI
+      # On regarde si la date d'effet n'est pas dans un exercice ant. à l'exercice courant IAS
+      # Si c'est pas le cas on ne peut pas actualiser le IAS
+      #FQ-59226 If VALEUR < GDEBEXEIAS or VALEUR > GFINEXEIAS
+      If ( VALEUR < GDEBEXEIAS ) or  ( VALEUR < [M:FAS1]AASIPTDAT )
+        N_ACT_IAS = G_NON
+        # La date d'effet doit être dans l'exercice courant ou dans l'exercice suivant du contexte "IAS".
+        # La valorisation IAS ne peut être actualisée
+        ANO_IAS = mess(87,GML_MSGFAS,1)-mess(88,GML_MSGFAS,1)
+        Call ACTION_BLOCK (ACB_DISZO, "FASACT1", "IASETRNOA") From GLOBIENS
+      Else
+        Call ACTION_BLOCK (ACB_ACTZO, "FASACT1", "IASETRNOA") From GLOBIENS
+
+        If [M:FASA]DEDVATRATA = 100 : Diszo [M:FASA]DEDVATAMTA : Endif
+      Endif
+    Endif
+  Endif
+  #--------------------------
+  #Fq-81004  Gosub REMPLI_PLN_PCG
+  #Dq-81004   Gosub REMPLI_PLN_IAS
+  #Fq-81004   Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_PCG (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+  If N_ACT_PCG <> G_OUI and ANO_PCG <> ""
+    Infbox(ANO_PCG)
+  Endif
+  If GCNXPROIAS = G_OUI and N_ACT_IAS <> G_OUI  and ANO_IAS <> ""
+    Infbox(ANO_IAS)
+  Endif
+  #----------------------------------------------------
+  #Fq-81004 If N_ACT_IAS = G_OUI
+  If N_ACT_IAS = G_OUI and [M:FASA]IASETRNOA = 0
+    [M:FASA]IASRATCUR = 0
+    Call PROPOSE_VAL_ENTREE_IAS ([M:FASA]ACGETRNOA)
+  Endif
+  #----------------------------------------------------
+End
+################################################
+# ECRAN : FASACT1 - PCG - Valeur avant actualisation
+################################################
+Subprog AV_IVCVATAMT(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]IVCVATFLG = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]IVCVATAMT With "FORCAGE"
+    Else
+      Chgstl [M:FASA]IVCVATAMT With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]IVCVATAMT With ""
+  Endif
+End
+########################################
+Subprog AV_DEDVATAMT(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]DEDVATFLG = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]DEDVATAMT With "FORCAGE"
+    Else
+      Chgstl [M:FASA]DEDVATAMT With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]DEDVATAMT With ""
+  Endif
+End
+
+################################################
+# ECRAN : FASACT1 - IAS - Valeur avant actualisation
+################################################
+
+########################################
+Subprog AV_IVCVATAMTI(VALEUR)
+Variable Decimal VALEUR
+  # Gestion du code forçage
+  If ([M:FASA]IVCVATFLGI = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]IVCVATAMTI With "FORCAGE"
+    Else
+      Chgstl [M:FASA]IVCVATAMTI With "TFORCAGE"
+    Endif
+
+  Else
+    Chgstl [M:FASA]IVCVATAMTI With ""
+  Endif
+End
+
+########################################
+Subprog AV_DEDVATAMTI(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]DEDVATFLGI = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]DEDVATAMTI With "FORCAGE"
+    Else
+      Chgstl [M:FASA]DEDVATAMTI With "TFORCAGE"
+    Endif
+
+  Else
+    Chgstl [M:FASA]DEDVATAMTI With ""
+  Endif
+End
+################################################
+# ECRAN : FASACT1 - PCG
+################################################
+########################################
+Subprog C_ACGETRNOA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation valeur entrée (PCG)
+
+  If (sgn([M:FASA]ACGETRNOT)+sgn([M:FASA]ACGETRNOT+VALEUR) = 0) and (sgn([M:FASA]ACGETRNOT) <> 0)
+    GMESSAGE = mess(89,GML_MSGFAS,1)  : # L'actualisation ne peut aboutir à une valorisation PCG négative
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+End
+
+########################################
+Subprog AM_ACGETRNOA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation valeur entrée (PCG)
+
+Local Char LMSG(200)
+  If VALEUR = [M:FASA]ACGETRNOA
+     End
+  Endif
+
+  [M:FASA]ACGETRNOA = VALEUR : Affzo [M:FASA]ACGETRNOA
+  Call CALCUL_TVAS_PCG ([M:FASA]IVCVATRAA, [M:FASA]IVCVATFLA, [M:FASA]DEDVATRAA, [M:FASA]DEDVATFLA)
+  #Fq-81004 If N_ACT_IAS = G_OUI
+  If N_ACT_IAS = G_OUI and  [M:FASA]IASETRNOA = 0
+    Call PROPOSE_VAL_ENTREE_IAS (VALEUR)
+    #--------------------------
+    If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+      Call PROPOSE_VAL_ENTREE_IAS ([M:FASA]IASETRNOA)
+      GMESSAGE = LMSG
+      GERR     = 1
+      mkstat   = 2
+      End
+    Endif
+    #--------------------------
+  Endif
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_PCG (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+  Gosub REMPLI_PLN_PCG
+  Gosub REMPLI_PLN_IAS
+
+End
+
+########################################
+Subprog AM_IVCVATRAA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation taux TVA facturée (PCG)
+
+Local Char LMSG(200)
+
+  Call CALCUL_TVAS_PCG (VALEUR, [M:FASA]IVCVATFLA, [M:FASA]DEDVATRAA, [M:FASA]DEDVATFLA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_PCG (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+########################################
+Subprog AM_IVCVATFLA(VALEUR)
+Variable Integer VALEUR
+# Flag forçage actualisation TVA facturée (PCG)
+
+End
+
+########################################
+Subprog AV_IVCVATAMA(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]IVCVATFLA = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]IVCVATAMA With "FORCAGE"
+    Else
+      Chgstl [M:FASA]IVCVATAMA With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]IVCVATAMA With ""
+  Endif
+End
+
+########################################
+Subprog AS_IVCVATAMA(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]IVCVATFLA <> G_OUI or func GLOBIENS.IS_CHAMP_ENABLE ("[M:FASA]IVCVATAMA", 0) <> G_OUI )
+    GBOUT1 = ""
+  Endif
+End
+
+########################################
+Subprog B1_IVCVATAMA(VALEUR)
+Variable Decimal VALEUR
+
+Local Char    LMSG(200)
+Local Integer LVALEUR
+
+
+  LVALEUR           = [M:FASA]IVCVATFLA
+  [M:FASA]IVCVATFLA = G_NON
+  Call CALCUL_TVAS_PCG ([M:FASA]IVCVATRAA, G_NON, [M:FASA]DEDVATRAA, [M:FASA]DEDVATFLA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_PCG (LMSG) > 0
+    [M:FASA]IVCVATFLA = LVALEUR
+    GMESSAGE          = LMSG
+    GERR              = 1
+    mkstat            = 2
+    End
+  Endif
+  #--------------------------
+
+  VALEUR = [M:FASA]IVCVATAMA
+  # Gestion du code forçage
+  G_DEFORCE = 1
+  Chgstl [M:FASA]IVCVATAMA  With ""
+  Affzo [M:FASA]IVCVATAMA
+  mkstat = 99
+
+End
+
+########################################
+Subprog C_IVCVATAMA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation TVA facturée (PCG)
+
+  If ([M:FASA]ACGETRNOA < 0 and VALEUR > 0) or ([M:FASA]ACGETRNOA > 0 and VALEUR < 0)
+    GMESSAGE = mess(91,GML_MSGFAS,1)  : # La TVA facturée PCG est obligatoirement du même signe que la valeur entrée HT saisie
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+
+  If (sgn([M:FASA]IVCVATAMT) + sgn([M:FASA]IVCVATAMT+VALEUR) = 0) and (sgn([M:FASA]IVCVATAMT) <> 0)
+    GMESSAGE = mess(93,GML_MSGFAS,1)  : # L'actualisation ne peut aboutir à une TVA facturée PCG négative
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+End
+
+########################################
+Subprog AM_IVCVATAMA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation TVA facturée (PCG)
+
+Local Char LMSG(200)
+
+
+  # Gestion du code forçage
+  If (G_DEFORCE and evalue("[M]"+zoncou+"("+num$(indice)+") = VALEUR") )
+    G_DEFORCE = 0
+  Else
+    [M:FASA]IVCVATFLA = G_OUI:  Affzo [M:FASA]IVCVATFLA
+    Affzo [M:FASA]IVCVATAMA
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]IVCVATAMA With "FORCAGE"
+    Else
+      Chgstl [M:FASA]IVCVATAMA With "TFORCAGE"
+    Endif
+  Endif
+
+  [M:FASA]IVCVATAMA = VALEUR
+  Call CALCUL_TVAS_PCG ([M:FASA]IVCVATRAA, [M:FASA]IVCVATFLA, [M:FASA]DEDVATRAA, [M:FASA]DEDVATFLA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_PCG (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+########################################
+Subprog AM_DEDVATRAA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation taux TVA récupérée (PCG)
+
+Local Char LMSG(200)
+
+  Call CALCUL_TVAS_PCG ([M:FASA]IVCVATRAA, [M:FASA]IVCVATFLA, VALEUR, [M:FASA]DEDVATFLA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_PCG (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+########################################
+Subprog AM_DEDVATFLA(VALEUR)
+Variable Integer VALEUR
+# Flag forçage actualisation TVA récupérée (PCG)
+
+End
+
+########################################
+Subprog AV_DEDVATAMA(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]DEDVATFLA = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]DEDVATAMA With "FORCAGE"
+    Else
+      Chgstl [M:FASA]DEDVATAMA With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]DEDVATAMA With ""
+  Endif
+End
+
+########################################
+Subprog AS_DEDVATAMA(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]DEDVATFLA <> G_OUI or func GLOBIENS.IS_CHAMP_ENABLE ("[M:FASA]DEDVATAMA", 0) <> G_OUI )
+    GBOUT1 = ""
+  Endif
+End
+
+########################################
+Subprog B1_DEDVATAMA(VALEUR)
+Variable Decimal VALEUR
+
+Local Char    LMSG(200)
+Local Integer LVALEUR
+
+
+  LVALEUR           = [M:FASA]DEDVATFLA
+  [M:FASA]DEDVATFLA = G_NON
+  Call CALCUL_TVAS_PCG ([M:FASA]IVCVATRAA, [M:FASA]IVCVATFLA, [M:FASA]DEDVATRAA, G_NON)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_PCG (LMSG) > 0
+    [M:FASA]DEDVATFLA = LVALEUR
+    GMESSAGE          = LMSG
+    GERR              = 1
+    mkstat            = 2
+    End
+  Endif
+  #--------------------------
+
+  VALEUR = [M:FASA]DEDVATAMA
+  # Gestion du code forçage
+  G_DEFORCE = 1
+  Chgstl [M:FASA]DEDVATAMA  With ""
+  Affzo [M:FASA]DEDVATAMA
+  mkstat = 99
+
+End
+
+
+########################################
+Subprog C_DEDVATAMA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation TVA récupérée (PCG)
+
+  If ([M:FASA]ACGETRNOA < 0 and VALEUR > 0) or ([M:FASA]ACGETRNOA > 0 and VALEUR < 0)
+    # La TVA récupérée PCG est obligatoirement du même signe que la valeur entrée HT saisie
+    GMESSAGE = mess(95,GML_MSGFAS,1)
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+
+  If (sgn([M:FASA]IVCVATAMT) + sgn([M:FASA]IVCVATAMT+VALEUR) =  0) and (sgn([M:FASA]IVCVATAMT) <> 0)
+    GMESSAGE = mess(97,GML_MSGFAS,1)  : # L'actualisation ne peut aboutir à une TVA facturée PCG négative
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+
+  If abs(VALEUR) > abs([M:FASA]IVCVATAMA)
+    # La TVA récupérée PCG ne peut être supérieure à la TVA facturée PCG
+    GMESSAGE = mess(99,GML_MSGFAS,1)
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+End
+
+########################################
+Subprog AM_DEDVATAMA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation TVA récupérée (PCG)
+
+Local Char LMSG(200)
+
+  # Gestion du code forçage
+  If (G_DEFORCE and evalue("[M]"+zoncou+"("+num$(indice)+") = VALEUR") )
+    G_DEFORCE = 0
+  Else
+    [M:FASA]DEDVATFLA = G_OUI:  Affzo [M:FASA]DEDVATFLA
+    Affzo [M:FASA]DEDVATAMA
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]DEDVATAMA With "FORCAGE"
+    Else
+      Chgstl [M:FASA]DEDVATAMA With "TFORCAGE"
+    Endif
+  Endif
+
+
+  [M:FASA]DEDVATAMA = VALEUR
+  Call CALCUL_TVAS_PCG ([M:FASA]IVCVATRAA, [M:FASA]IVCVATFLA, [M:FASA]DEDVATRAA, [M:FASA]DEDVATFLA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_PCG (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+################################################
+# ECRAN : FASACT1 - IAS
+################################################
+########################################
+Subprog AM_IASCURTYP(VALEUR)
+Variable Integer VALEUR
+# Type de cours actualisation IAS
+
+  [M:FASA]IASRATCUR = 0
+  Call PROPOSE_VAL_ENTREE_IAS ([M:FASA]ACGETRNOA)
+End
+
+########################################
+Subprog AM_IASRATCUR(VALEUR)
+Variable Decimal VALEUR
+# Cours actualisation IAS
+
+  [M:FASA]IASRATCUR = VALEUR
+  Call PROPOSE_VAL_ENTREE_IAS ([M:FASA]ACGETRNOA)
+End
+
+########################################
+Subprog C_IASETRNOA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation valeur entrée (IAS)
+
+  If ([M:FASA]ACGETRNOA < 0 and VALEUR > 0) or ([M:FASA]ACGETRNOA > 0 and VALEUR < 0)
+    # Les montant HT, PCG et IFRS soit obligatoirement du même signe. Zéro est autorisé pour l'un des deux montants
+    GMESSAGE = mess(280,GML_MSGFAS,1)
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+
+  If (sgn([M:FASA]IASETRNOT) + sgn([M:FASA]IASETRNOT+VALEUR) = 0) and (sgn([M:FASA]IASETRNOT) <> 0)
+    GMESSAGE = mess(90,GML_MSGFAS,1)  : # L'actualisation ne peut aboutir à une valorisation IAS négative
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+
+End
+
+########################################
+Subprog AM_IASETRNOA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation valeur entrée (IAS)
+Local Char LMSG(200)
+Local Decimal SCUMIASBSE  #Fq-64312
+Local Decimal SCUMRNT     #Fq-64312
+
+ #Fq-81004
+ If VALEUR = [M:FASA]IASETRNOA
+    End
+ Endif  #Fq-81004
+
+ If G_ACTLEA=G_OUI
+    #Fq-76672 Ctrl uniquement si FRADGI = "OUI" ==> si LEG ="FRA"
+    #Fq-84216 If func GLOBIENS.ACCPERCTL([M:FAS0]CPY)
+    If func GLOBIENS.FRADGI([M:FAS0]CPY)
+    If [M:FAS2]LEAREF <> ""
+      Read[LEA]LEA0 = [M:FAS2]LEAREF
+      If fstat = 0
+        SCUMIASBSE = [F:LEA]CUMIASBSE + VALEUR
+        SCUMRNT =  [F:LEA]CUMRNTAMT
+        If SCUMRNT <  SCUMIASBSE
+          #Le cumul des bases des biens rattachés au contrat de location dépasse le cumul des redevances du contrat.
+          GERR= 1: GMESSAGE = mess(806,GML_MSGFAS,1)
+           mkstat = 2 : End
+        Endif
+      Endif
+      Endif  #Fq-76672
+    Endif
+  Endif
+  [M:FASA]IASETRNOA = VALEUR : Affzo [M:FASA]IASETRNOA
+
+  Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, [M:FASA]IVCVATFLGA, [M:FASA]DEDVATRATA, [M:FASA]DEDVATFLGA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+Gosub REMPLI_PLN_IAS
+End
+
+########################################
+Subprog AM_IVCVATRATA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation taux TVA facturée (IAS)
+
+Local Char LMSG(200)
+  Call CALCUL_TVAS_IAS (VALEUR, [M:FASA]IVCVATFLGA, [M:FASA]DEDVATRATA, [M:FASA]DEDVATFLGA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+########################################
+Subprog AM_IVCVATFLGA(VALEUR)
+Variable Integer VALEUR
+# Flag forçage actualisation TVA facturée (IAS)
+
+End
+
+########################################
+Subprog AV_IVCVATAMTA(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]IVCVATFLGA = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]IVCVATAMTA With "FORCAGE"
+    Else
+      Chgstl [M:FASA]IVCVATAMTA With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]IVCVATAMTA With ""
+  Endif
+End
+
+########################################
+Subprog AS_IVCVATAMTA(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]IVCVATFLGA <> G_OUI or func GLOBIENS.IS_CHAMP_ENABLE ("[M:FASA]IVCVATAMTA", 0) <> G_OUI )
+    GBOUT1 = ""
+  Endif
+End
+
+########################################
+Subprog B1_IVCVATAMTA(VALEUR)
+Variable Decimal VALEUR
+
+
+Local Char    LMSG(200)
+Local Integer LVALEUR
+
+  LVALEUR            = [M:FASA]IVCVATFLGA
+  [M:FASA]IVCVATFLGA = G_NON
+  Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, G_NON, [M:FASA]DEDVATRATA, [M:FASA]DEDVATFLGA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    [M:FASA]IVCVATFLGA = LVALEUR
+    GMESSAGE           = LMSG
+    GERR               = 1
+    mkstat             = 2
+    End
+  Endif
+  #--------------------------
+
+  VALEUR = [M:FASA]IVCVATAMTA
+  # Gestion du code forçage
+  G_DEFORCE = 1
+  Chgstl [M:FASA]IVCVATAMTA  With ""
+  Affzo [M:FASA]IVCVATAMTA
+  mkstat = 99
+
+End
+
+
+########################################
+Subprog C_IVCVATAMTA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation TVA facturée (IAS)
+
+  If ([M:FASA]IASETRNOA < 0 and VALEUR > 0) or ([M:FASA]IASETRNOA > 0 and VALEUR < 0)
+    # La TVA facturée IAS est obligatoirement du même signe que la valeur entrée HT saisie
+    GMESSAGE = mess(92,GML_MSGFAS,1)
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+
+  If (sgn([M:FASA]IVCVATAMTI) + sgn([M:FASA]IVCVATAMTI+VALEUR) = 0) and (sgn([M:FASA]IVCVATAMTI) <> 0)
+    GMESSAGE = mess(94,GML_MSGFAS,1)  : # L'actualisation ne peut aboutir à une TVA facturée IAS négative
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+End
+
+########################################
+Subprog AM_IVCVATAMTA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation TVA facturée (IAS)
+
+Local Char LMSG(200)
+
+  # Gestion du code forçage
+  If (G_DEFORCE and evalue("[M]"+zoncou+"("+num$(indice)+") = VALEUR") )
+    G_DEFORCE = 0
+  Else
+    [M:FASA]IVCVATFLGA = G_OUI:  Affzo [M:FASA]IVCVATFLGA
+    Affzo [M:FASA]IVCVATAMTA
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]IVCVATAMTA With "FORCAGE"
+    Else
+      Chgstl [M:FASA]IVCVATAMTA With "TFORCAGE"
+    Endif
+  Endif
+
+
+  [M:FASA]IVCVATAMTA = VALEUR
+  Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, [M:FASA]IVCVATFLGA, [M:FASA]DEDVATRATA, [M:FASA]DEDVATFLGA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+########################################
+Subprog AM_DEDVATRATA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation taux TVA récupérée (IAS)
+
+Local Char LMSG(200)
+
+  Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, [M:FASA]IVCVATFLGA, VALEUR, [M:FASA]DEDVATFLGA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+########################################
+Subprog AM_DEDVATFLGA(VALEUR)
+Variable Integer VALEUR
+# Flag forçage actualisation TVA facturée (IAS)
+
+Local Char    LMSG(200)
+Local Integer LVALEUR
+
+  LVALEUR            = [M:FASA]DEDVATFLGA
+  [M:FASA]DEDVATFLGA = VALEUR
+  Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, [M:FASA]IVCVATFLGA, [M:FASA]DEDVATRATA, VALEUR)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    [M:FASA]DEDVATFLGA = LVALEUR
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+########################################
+Subprog AV_DEDVATAMTA(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]DEDVATFLGA = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]DEDVATAMTA With "FORCAGE"
+    Else
+      Chgstl [M:FASA]DEDVATAMTA With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]DEDVATAMTA With ""
+  Endif
+End
+
+########################################
+Subprog AS_DEDVATAMTA(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]DEDVATFLGA <> G_OUI or func GLOBIENS.IS_CHAMP_ENABLE ("[M:FASA]DEDVATAMtA", 0) <> G_OUI )
+    GBOUT1 = ""
+  Endif
+End
+
+########################################
+Subprog B1_DEDVATAMTA(VALEUR)
+Variable Decimal VALEUR
+
+Local Char    LMSG(200)
+Local Integer LVALEUR
+
+  LVALEUR            = [M:FASA]DEDVATFLGA
+  [M:FASA]DEDVATFLGA = G_NON
+  Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, [M:FASA]IVCVATFLGA, [M:FASA]DEDVATRATA, G_NON)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    [M:FASA]DEDVATFLGA = LVALEUR
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+
+
+  VALEUR = [M:FASA]DEDVATAMTA
+  # Gestion du code forçage
+  G_DEFORCE = 1
+  Chgstl [M:FASA]DEDVATAMTA  With ""
+  Affzo [M:FASA]DEDVATAMTA
+  mkstat = 99
+End
+
+########################################
+Subprog C_DEDVATAMTA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation TVA récupérée (IAS)
+
+  If ([M:FASA]IASETRNOA < 0 and VALEUR > 0) or ([M:FASA]IASETRNOA > 0 and VALEUR < 0)
+    # La TVA récupérée IAS est obligatoirement du même signe que la valeur entrée HT saisie
+    GMESSAGE = mess(96,GML_MSGFAS,1)  :
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+
+  If (sgn([M:FASA]DEDVATAMTI) + sgn([M:FASA]DEDVATAMTI+VALEUR) = 0) and (sgn([M:FASA]DEDVATAMTI) <> 0)
+    GMESSAGE = mess(98,GML_MSGFAS,1)  : # L'actualisation ne peut aboutir à une TVA récupérée IAS négative
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+
+  If abs(VALEUR) > abs([M:FASA]IVCVATAMTA)
+    # La TVA récupérée IAS ne peut être supérieure à la TVA facturée IAS
+    GMESSAGE = mess(100,GML_MSGFAS,1)
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+End
+
+########################################
+Subprog AM_DEDVATAMTA(VALEUR)
+Variable Decimal VALEUR
+# Actualisation TVA récupérée (IAS)
+
+Local Char LMSG(200)
+
+  # Gestion du code forçage
+  If (G_DEFORCE and evalue("[M]"+zoncou+"("+num$(indice)+") = VALEUR") )
+    G_DEFORCE = 0
+  Else
+    [M:FASA]DEDVATFLGA = G_OUI:  Affzo [M:FASA]DEDVATFLGA
+    Affzo [M:FASA]DEDVATAMTA
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]DEDVATAMTA With "FORCAGE"
+    Else
+      Chgstl [M:FASA]DEDVATAMTA With "TFORCAGE"
+    Endif
+  Endif
+
+  [M:FASA]DEDVATAMTA = VALEUR
+  Call CALCUL_TVAS_IAS ([M:FASA]IVCVATRATA, [M:FASA]IVCVATFLGA, [M:FASA]DEDVATRATA, [M:FASA]DEDVATFLGA)
+  Gosub CALCUL_NOUVELLE_VALEUR
+  #--------------------------
+  If func TRTFASACT.CONTROLE_TAB_PLN_IAS (LMSG) > 0
+    GMESSAGE = LMSG
+    GERR     = 1
+    mkstat   = 2
+    End
+  Endif
+  #--------------------------
+End
+
+################################################
+# ECRAN : FASACT1 - PCG  Valeur après actualisation
+################################################
+
+########################################
+Subprog AV_IVCVATAMN(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]IVCVATFLN = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]IVCVATAMN With "FORCAGE"
+    Else
+      Chgstl [M:FASA]IVCVATAMN With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]IVCVATAMN With ""
+  Endif
+End
+
+########################################
+Subprog AV_DEDVATAMN(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]DEDVATFLN = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]DEDVATAMN With "FORCAGE"
+    Else
+      Chgstl [M:FASA]DEDVATAMN With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]DEDVATAMN With ""
+  Endif
+End
+
+################################################
+# ECRAN : FASACT1 - IAS  Valeur après actualisation
+################################################
+
+########################################
+Subprog AV_IVCVATAMTN(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]IVCVATFLGN = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]IVCVATAMTN With "FORCAGE"
+    Else
+      Chgstl [M:FASA]IVCVATAMTN With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]IVCVATAMTN With ""
+  Endif
+End
+
+########################################
+Subprog AV_DEDVATAMTN(VALEUR)
+Variable Decimal VALEUR
+  If ([M:FASA]DEDVATFLGN = G_OUI )
+    If ( GBROWS = 0 )
+      Chgstl [M:FASA]DEDVATAMTN With "FORCAGE"
+    Else
+      Chgstl [M:FASA]DEDVATAMTN With "TFORCAGE"
+    Endif
+  Else
+    Chgstl [M:FASA]DEDVATAMTN With ""
+  Endif
+End
+
+################################################################################
+# ECRAN : FASACT2
+################################################################################
+################################################
+# ECRAN : FASACT2 - PCG
+################################################
+########################################
+Subprog AV_UPDPLNPCG(VALEUR)
+Variable Integer VALEUR
+#V5 Local Integer LNCNX
+
+  #V5 Call GET_CNX_FROM_PLN ([M:FASB]PLNPCG(nolign-1), LNCNX) From GLOBIENS
+  #If  [M:FASB]PLNPCG(nolign-1) = G301CPT
+  #  pcolor = GCOUL(3) : # Bleu
+  #Else
+  #  pcolor = GCOUL(0) : # Normal
+  #Endif
+End
+
+########################################
+Subprog AS_UPDPLNPCG(VALEUR)
+Variable Integer VALEUR
+Local Integer N_I
+# Témoin d'actualisation d'un plan (PCG)
+
+  If [M:FASA]ACGETRNOA <> 0 and [M:FASB]ORIBASDPR(nolign-1) <> GVML_OBSAI
+    VALEUR = 2
+    mkstat = 2
+    End
+  Endif
+
+  If [M:FASA]ACGETRNOA = 0 and [M:FASB]ORIBASDPR(nolign-1) <> GVML_OBSAI
+    # Impossible de sélectionner ce plan. l'actualisation PCG est à 0
+    GMESSAGE = mess(102,GML_MSGFAS,1)-"("+mess(PLNPCG(nolign-1),GML_NPLAN,1)+")"
+    GERR     = 1
+    mkstat   = 2 : End
+  Endif
+
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNPCG") From GLOBIENS
+End
+
+########################################
+Subprog AM_UPDPLNPCG(VALEUR)
+Variable Integer VALEUR
+
+# Témoin d'actualisation d'un plan (PCG)
+   #*>>>>>>>>> +V5
+   If  VALEUR = G_OUI and [M:FASB]ORIBASDPR(nolign-1) = GVML_OBSAI
+      Actzo   [M:FASB]DPRBASPCGN(nolign-1)
+   Else
+      Diszo   [M:FASB]DPRBASPCGN(nolign-1)
+   Endif
+  [M:FASB]UPDPLNPCG(nolign-1) = VALEUR
+  Call ACTUALISE_UN_PLN_PCG (nolign)
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNPCG") From GLOBIENS
+
+End
+########################################
+Subprog AS_CURTYPPCG(VALEUR)
+Variable Integer VALEUR
+# Type de cours d'un plan (PCG)
+
+  If [M:FASB]UPDPLNPCG(nolign-1) <> G_OUI
+    mkstat = 2
+  Endif
+  If [M:FASB]CURPLNPCG(nolign-1) = GCNXCURCPF
+    mkstat = 2
+  Endif
+End
+
+########################################
+Subprog AM_CURTYPPCG(VALEUR)
+Variable Integer VALEUR
+# Type de cours d'un plan (PCG)
+
+  [M:FASB]RATCURPCG(nolign-1) = 0
+  Call ACTUALISE_UN_PLN_PCG(nolign)
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNPCG") From GLOBIENS
+End
+
+########################################
+Subprog AS_RATCURPCG(VALEUR)
+Variable Decimal VALEUR
+# Cours d'un plan (PCG)
+
+  If [M:FASB]UPDPLNPCG(nolign-1) <> G_OUI
+    mkstat = 2
+  Endif
+End
+
+########################################
+Subprog AM_RATCURPCG(VALEUR)
+Variable Decimal VALEUR
+# Cours d'un plan (PCG)
+
+Local Decimal LSVRATCUR, LSVDPRBAS
+
+  LSVRATCUR      = [M:FASB]RATCURPCG(nolign-1)
+  LSVDPRBAS      = [M:FASB]DPRBASPCGN(nolign-1)
+
+  [M:FASB]RATCURPCG(nolign-1) = VALEUR
+  Call ACTUALISE_UN_PLN_PCG(nolign)
+  If (sgn([M:FASB]DPRBASPCG(nolign-1)) + sgn([M:FASB]DPRBASPCGN(nolign-1)) = 0) and (sgn([M:FASB]DPRBASPCG(nolign-1)) <> 0)
+    [M:FASB]RATCURPCG(nolign-1)  = LSVRATCUR
+    [M:FASB]DPRBASPCGN(nolign-1) = LSVDPRBAS
+    # L'actualisation ne peut aboutir à une valorisation d'un plan négative
+    GMESSAGE = mess(101,GML_MSGFAS,1)-"("+mess(PLNPCG(nolign-1),GML_NPLAN,1)+")"
+    GERR     = 1
+    mkstat   = 2
+    End
+  Else
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNPCG") From GLOBIENS
+  Endif
+End
+########################################
+Subprog AS_DPRBASPCGN(VALEUR)
+Variable Decimal VALEUR
+
+# Nouvelle Base : saisissable si ORIBAS = "montant à saisir"
+   If   [M:FASB]UPDPLNPCG(nolign-1)= G_OUI  and [M:FASB]ORIBASDPR(nolign-1) =  GVML_OBSAI
+      Actzo  [M:FASB]DPRBASPCGN(nolign-1)
+   Else
+      Diszo  [M:FASB]DPRBASPCGN(nolign-1)
+   Endif
+
+ Affzo  [M:FASB]DPRBASPCGN(nolign-1)
+
+End
+######################################################################################
+Subprog AM_DPRBASPCGN(VALEUR)
+Variable Decimal VALEUR
+
+If ( VALEUR <> [M:FASB]DPRBASPCG(nolign-1)) &  ([M:FASB]ORIBASDPR(nolign-1)  =  GVML_OBSAI)
+   [M:FASB]DPRBASPCGN(nolign-1) = VALEUR
+   Affzo [M:FASB]DPRBASPCGN(nolign-1)
+Endif
+
+End
+################################################
+# ECRAN : FASACT2 - IAS
+################################################
+########################################
+Subprog AV_UPDPLNIAS(VALEUR)
+Variable Integer VALEUR
+
+End
+
+########################################
+Subprog AS_UPDPLNIAS(VALEUR)
+Variable Integer VALEUR
+# Témoin d'actualisation d'un plan (IAS)
+
+  If [M:FASA]IASETRNOA <> 0 and [M:FASB]ORIBASIAS(nolign-1) <> GVML_OBSAI
+    VALEUR = 2
+    mkstat = 2
+    End
+  Endif
+
+  If [M:FASA]IASETRNOA = 0 and [M:FASB]ORIBASIAS(nolign-1) <> GVML_OBSAI
+    # Impossible de sélectionner ce plan. l'actualisation IAS est à 0
+    GMESSAGE = mess(103,GML_MSGFAS,1)-"("+mess(PLNIAS(nolign-1),GML_NPLAN,1)+")"
+    GERR     = 1
+    mkstat   = 2 : End
+  Endif
+
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNIAS") From GLOBIENS
+
+End
+
+########################################
+Subprog AM_UPDPLNIAS(VALEUR)
+Variable Integer VALEUR
+
+#FQ-81004
+# Témoin d'actualisation d'un plan (IAS)
+   #FQ-81004
+   If  VALEUR = G_OUI and [M:FASB]ORIBASIAS(nolign-1) = GVML_OBSAI
+      Actzo   [M:FASB]DPRBASIASN(nolign-1)
+   Else
+      Diszo   [M:FASB]DPRBASIASN(nolign-1)
+   Endif  #Fq-81004
+
+  [M:FASB]UPDPLNIAS(nolign-1) = VALEUR
+  Call ACTUALISE_UN_PLN_IAS(nolign)
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNIAS") From GLOBIENS
+
+End
+########################################
+Subprog AS_DPRBASIASN(VALEUR)
+Variable Decimal VALEUR
+
+   # Nouvelle Base : saisissable si ORIBASIAS = "montant à saisir"
+   If   [M:FASB]UPDPLNIAS(nolign-1)= G_OUI  and [M:FASB]ORIBASIAS(nolign-1) =  GVML_OBSAI
+      Actzo  [M:FASB]DPRBASIASN(nolign-1)
+   Else
+      Diszo  [M:FASB]DPRBASIASN(nolign-1)
+   Endif
+
+
+End
+######################################################################################
+Subprog AM_DPRBASIASN(VALEUR)
+Variable Decimal VALEUR
+
+If ( VALEUR <> [M:FASB]DPRBASIAS(nolign-1)) &  ([M:FASB]ORIBASIAS(nolign-1)  =  GVML_OBSAI)
+   [M:FASB]DPRBASIASN(nolign-1) = VALEUR
+   Affzo [M:FASB]DPRBASIASN(nolign-1)
+Endif
+
+End
+########################################
+Subprog AS_CURTYPIAS(VALEUR)
+Variable Integer VALEUR
+# Type de cours d'un plan (IAS)
+
+  If [M:FASB]UPDPLNIAS(nolign-1) <> G_OUI
+    mkstat = 2
+  Endif
+  If [M:FASB]CURPLNIAS(nolign-1) = GCNXCURIAS
+    mkstat = 2
+  Endif
+End
+
+########################################
+Subprog AM_CURTYPIAS(VALEUR)
+Variable Integer VALEUR
+# Type de cours d'un plan (IAS)
+
+  [M:FASB]RATCURIAS(nolign-1) = 0
+  Call ACTUALISE_UN_PLN_IAS(nolign)
+  Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNIAS") From GLOBIENS
+End
+
+########################################
+Subprog AS_RATCURIAS(VALEUR)
+Variable Decimal VALEUR
+# Cours d'un plan (IAS)
+
+  If [M:FASB]UPDPLNIAS(nolign-1) <> G_OUI
+    mkstat = 2
+  Endif
+End
+
+########################################
+Subprog AM_RATCURIAS(VALEUR)
+Variable Decimal VALEUR
+# Cours d'un plan (IAS)
+
+Local Decimal LSVRATCUR, LSVDPRBAS
+
+  LSVRATCUR                   = [M:FASB]RATCURIAS(nolign-1)
+  LSVDPRBAS                   = [M:FASB]DPRBASIASN(nolign-1)
+
+  [M:FASB]RATCURIAS(nolign-1) = VALEUR
+  Call ACTUALISE_UN_PLN_IAS(nolign)
+  If (sgn([M:FASB]DPRBASIAS(nolign-1)) + sgn([M:FASB]DPRBASIASN(nolign-1)) = 0) and (sgn([M:FASB]DPRBASIAS(nolign-1)) <> 0)
+    [M:FASB]RATCURIAS(nolign-1)  = LSVRATCUR
+    [M:FASB]DPRBASIASN(nolign-1) = LSVDPRBAS
+    # L'actualisation ne peut aboutir à une valorisation d'un plan négative
+    GMESSAGE = mess(101,GML_MSGFAS,1)-"("+mess(PLNIAS(nolign-1),GML_NPLAN,1)+")"  :
+    GERR     = 1
+    mkstat   = 2
+    End
+  Else
+    Call ACTION_BLOCK (ACB_AFFZO, "FASACT2", "NBPLNIAS") From GLOBIENS
+  Endif
+End
+
+######################################################################################
+

@@ -1,0 +1,750 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+Local File ITMCATEG [ITG]
+Local Mask ITG3 [ITG3]
+[M]PCU(0)="00"
+[M]PCU(1)="11"
+[M]PCU(2)="22"
+[F]=[M]
+Infbox [F:ITG]PCU(0)-[F:ITG]PCU(1)-[F:ITG]PCU(2)
+End
+
+########################################################################
+# Traitement STKMAJE - Librairie des composants de màj stock      V140 #
+#                      Entrée                                 MBT 2003 #
+########################################################################
+# Etiquette appelée par Gosub depuis le STKMAJ
+#
+# ENTREES       Traitement des entrées en stock
+#
+#-----------------------------------------------------------------------
+# Autres étiquettes appelées par Gosub depuis ce traitement :
+#
+# MAJENT        Traitement d'une ligne détail d'entrée en stock
+# MAJENT_TRT    Traitement de màj des entrées (STOCK, STOSER, STOJOU)
+# MAJENT_STOSTJ Màj ligne stock (STOCK), no série (STOSER) et mvt d'entrée (STOJOU)
+#
+########################################################################
+
+
+###################################
+# Traitement des entrées en stock #
+###################################
+$ENTREES
+
+GPOINT="MAJENTSTR" : Gosub ENTREE From EXEFNC
+
+#---------------------------------
+# CCC (12/11/04) bug 26586 : Régularisation de prix sur modif assemblage
+If  [M:STW]VCRTYP=31
+    Local Decimal LQTYORI, LDELTAQTY, LAMTORI
+    LDELTAQTY = sigma(0,dim([M:STW]ITMREFLIG)-1,[M:STW]QTYSTU(indcum)*([M:STW]MAJCOD(indcum)="C")
+&                                              -[M:STW]QTYSTU(indcum)*([M:STW]MAJCOD(indcum)="A"))
+    If LDELTAQTY<>0
+        Columns [STJ] (QTYSTU,AMTORD)
+        For [STJ] Hint Key STJ1
+&                 Where STOFCY = [M:STW]STOFCY
+&                     & VCRTYP = 31
+&                     & VCRNUM = [M:STW]VCRNUM
+&                     & VCRLIN = 1
+&                     & REGFLG<> 2
+            LQTYORI += [F:STJ]QTYSTU
+            LAMTORI += [F:STJ]AMTORD
+        Next
+        Columns [STJ]
+    Endif
+Endif
+#---------------------------------
+
+Raz [L]WITMREF, [L]WANA
+[L]WMAJTYP="E"
+If find([M:STW]TRSTYP,2,4,6,12,14,19,24,29) & [M:STW]TRFFCY<>""
+  [L]WFCY=[M:STW]TRFFCY : Gosub CHARG_PARAM From STKMAJ
+Else
+  [L]WFCY=[M:STW]STOFCY : Gosub CHARG_PARAM From STKMAJ
+Endif
+
+Raz WAMTDEV_ITC
+#----- Boucle de traitement des lignes pour les entrées -----#
+For I=0 To dim([M:STW]ITMREFLIG)-1
+  #--- PE 70186
+  GPOINT="LOOP_STWE" : Gosub ENTREE From EXEFNC
+
+  If [M:STW]ITMREFLIG(I)=""  Break : Endif
+  If ([M:STW]QTYSTU(I)<>0 | [M:STW]QTYSTUACT(I)<>0) & [M:STW]MAJTYP(I)="E"
+    Gosub INI_WMAJCODSTO From STKMAJ
+    Gosub MAJENT : If GOK<1  Break : Endif
+    Call AMTDEVITC(1, I, WAMTDEV_ITC) From STKVALMAJ2      # 84744
+
+    #--- Bug 77900
+    If [M:STW]VCRTYP=35 & [M:STW]TRSTYP=1 & WMODLOT=1
+       [M:STW]STOCOU(I)=[F:STO]STOCOU
+    Endif
+    #---
+
+  Endif
+Next I
+If GOK<1  Return : Endif
+#----- Màj cumuls article-site, ... -----#
+Raz [L]WRUPTPREC,   [L]WANA
+Gosub MAJ_ITMMVT  From STKMAJ : If GOK<1  Return : Endif
+
+Call MAJPMP(1,WAMTDEV_AVC) From STKVALMAJ2
+If GOK<1 : Return : Endif
+
+# Issue 114528 - 2016-05-13 by MM : To update active quatity in FIFO table
+Call MAJFIFO(1,WAMTDEV_STP) From STKVALMAJ2
+If GOK<1 : Return : Endif
+
+If WMODLOT<>1
+    Raz WAMTDEV_TOT
+    For I=0 To GACTVLT2
+        For J=0 To dim(WAMTDEV_AVC,2)-1
+            WAMTDEV_TOT(I,J) += WAMTDEV_AVC(I,J)+WAMTDEV_STP(I,J)+WAMTDEV_LOT(I,J)
+        Next
+    Next
+    Call MAJITH(1,WAMTDEV_TOT,WAMTDEV_ITC,WMVTSEQSTR, WCTR_MVTSEQ+1) From STKVALMAJ2
+    If GOK<1 : Return : Endif
+Endif
+
+#---------------------------------
+# CCC (12/11/04) bug 26586 : Régularisation de prix sur modif assemblage
+If [M:STW]VCRTYP=31 & LQTYORI<>0
+    # Issue X3-25086 - 2017-03-22 by ERMIL : Modify to Transmask for performance reasons
+    #[M:SDP] = [M:SDPA]    # SDPA est alimenté dans STKVALMAJ et contient le cumul des montants
+    Raz [M:SDP] : Transmask [M:SDPA] To [M:SDP]
+    Call PROSDP("SDP",-1) From SUBSDPCOM
+    Gosub CAL_TOT From SUBSDP    # Calcule PRI = somme de toutes les composantes
+
+    [M:SDP]QTY    = 0    # On passe un delta
+    [M:SDP]AMTTOT = [M:SDP]PRI
+
+# CCC (14/02/05) Bug 28345 : Utilisation devise société dans la valeur du lot
+    Call CONVERT2(GLOCALDEV,GSYSCUR,GLOCALDEV,GCHGTYP,[M:STW]IPTDAT,
+&                 1,WCNVRPT,WRET) From TRTDEV
+    Call REGPRIX([M:STW]STOFCY, [M:STW]TRSTYP, [M:STW]ITMREF, [M:STW]IPTDAT,
+&                [M:STW]TRSCOD, [M:STW]VCRTYP, [M:STW]VCRNUM, [M:STW]VCRLIN,
+&                [M:STW]VCRTYP, [M:STW]VCRNUM, [M:STW]VCRLIN, WCNVRPT,
+&                WRET) From STKVALREG
+    If WRET
+        Call ERREUR([M:STW]VCRNUM-mess(519,197,1)-"("+num$(WRET)+")") From GESECRAN
+        GOK=0
+        Return
+    Endif
+Endif
+#---------------------------------
+GPOINT="MAJENTEND" : Gosub ENTREE From EXEFNC
+Return
+
+
+#-------------------------------------------#
+#   Traitement ligne des entrées en stock   #
+# ----------------------------------------- #
+#                          [L]SIGN  [L]SENS #
+# Entrée                      +1       +1   #
+# Annulation entrée           -1       +1   #
+# Entrée négative             +1       -1   #
+# Annulation entrée négative  -1       -1   #
+#                                           #
+# Test pour entrée ou annulation            #
+#      entrée négative : [L]SIGN*[L]SENS=1  #
+#-------------------------------------------#
+$MAJENT
+
+[L]WCODFONC  =1  : # Code fonction (1=entrée, 2=sortie, 3=changement emplacement)
+[L]WFLUX     =1  : # Flux d'entrée en stock
+[L]WGESLIBEMP="" : # Pour gérer libération emplacement  : #--- Bug 65765
+If [M:STW]MAJCOD(I)="A" [L]SIGN=-1 Else [L]SIGN=+1 : Endif
+#----- Trace début de mise à jour d'une ligne détail -----#
+If [M:STW]TRAFLG>2  Gosub TRACE_DEB_LIGNE From STKMAJSUP : Endif
+#----- Contrôles élémentaires et valeurs par défaut sur ligne à traiter -----#
+Gosub CTL_VALDEF_LIG From STKMAJ : If GOK<1  Return : Endif
+#----- Lecture des tables et Raz des cumuls si 1ère fois -----#
+If [L]WITMREF=""
+  Gosub LEC_FICHIERS From STKMAJ : If GOK<1  Return : Endif
+  [L]WMAJITV=1
+Endif
+#----- Si rupture sur article, maj cumuls article-site -----#
+If [M:STW]ITMREFLIG(I)<>[L]WITMREF
+  Gosub MAJ_ITMMVT   From STKMAJ : If GOK<1  Return : Endif
+  Gosub LEC_FICHIERS From STKMAJ : If GOK<1  Return : Endif
+  [L]WMAJITV=1
+Endif
+#----- Création d'une nouvelle ligne dans [M:STW] si nécessaire -----#
+If [L]SENS=-1 & [M:STW]MAJCOD(I)<>"A"
+  Read [STO] STO0=[L]WFCY;[M:STW]STOCOU(I)
+  If !fstat
+    If [F:STO]PCU<>[F:ITM]STU
+      If mod([M:STW]QTYSTU(I),[F:STO]PCUSTUCOE)<>0 &
+&        fix([M:STW]QTYSTU(I)/[F:STO]PCUSTUCOE)<>0
+        Gosub SPLITTAGE From STKMAJ
+        If GOK<1 Return Endif
+      Endif
+    Endif
+    #----- Alignement de l'UC saisie par rapport à la ligne de stock -----#
+    If [M:STW]PCU(I)<>[F:STO]PCU & mod([M:STW]QTYSTU(I),[F:STO]PCUSTUCOE)=0
+      [M:STW]PCU(I)      =[F:STO]PCU
+      [M:STW]PCUSTUCOE(I)=[F:STO]PCUSTUCOE
+      [M:STW]QTYPCU(I)   =[M:STW]QTYSTU(I)/[M:STW]PCUSTUCOE(I)
+    Endif
+  Endif
+Endif
+#----- Si mvt en attente, pas de màj juste une écriture du STOJOU -----#
+If [L]WUPDCOD=1
+  Gosub MAJENT_WAI From STKMAJ : Return : # Théoriquement n'arrive jamais pour les entrées
+Endif
+
+#----- Réception transfert inter-sites (màj stock transit) -----#
+If [M:STW]TRFFCY<>"" & [M:STW]TRFFCY<>[M:STW]STOFCY
+  If [L]SENS=+1
+    [L]WQTYACT_TRF-=[M:STW]QTYSTUACT(I)*[L]SIGN
+  Else
+    [L]WQTYACT_TRA-=[M:STW]QTYSTUACT(I)*[L]SIGN
+  Endif
+Endif
+
+#----- Dernière date d'entrée et comptage des entrées -----#
+If find([M:STW]TRSTYP,1,3,5,14) & [L]SENS=1 & [L]WMODLOT<>1
+  If [L]WMAJCOD="C"    : # Création
+    If [L]SENS=1  [L]WCTR_RCP=+1 : [L]WLASDAT_RCP=[M:STW]IPTDAT : Endif
+  Elsif [L]WMAJCOD="A" : # Annulation
+    If [L]SENS=1  [L]WCTR_RCP=-1 : Endif
+  Endif
+Endif
+
+#----- Contrôle gestion des no série -----#
+Gosub CTL_SERIE From STKMAJSER : If GOK<1  Return : Endif
+#----- Traitement de mise à jour des entrées (STOCK, STOSER, STOJOU) -----#
+Gosub MAJENT_TRT            : If GOK<1  Return : Endif
+#----- Màj fichiers lot (STOLOT, STOLOTFCY) -----#
+Gosub LECSTL  From STKMAJ   : If GOK<1  Return : Endif
+Case left$([M:STW]STA(I),1)
+ When "A" : [F:SLF]AAACUMQTY+=[M:STW]QTYSTU(I)*[L]SIGN
+ When "Q" : [F:SLF]QQQCUMQTY+=[M:STW]QTYSTU(I)*[L]SIGN
+ When "R" : [F:SLF]RRRCUMQTY+=[M:STW]QTYSTU(I)*[L]SIGN
+Endcase
+#----- Mise à jour dernière date d'entrée ou inventaire sauf en annulation -----#
+If find([M:STW]TRSTYP,1,3,5,14)
+  If [M:STW]MAJCOD(I)<>"A" & [L]SENS=1 & [F:SLF]LASRCPDAT<[M:STW]IPTDAT
+    [F:SLF]LASRCPDAT=[M:STW]IPTDAT
+  Endif
+Elsif find([M:STW]TRSTYP,13)
+  If [M:STW]MAJCOD(I)<>"A" & [L]SENS=1 & [F:SLF]LASCUNDAT<[M:STW]IPTDAT
+    [F:SLF]LASCUNDAT=[M:STW]IPTDAT
+  Endif
+Endif
+
+If [M:STW]OWNER(I)=[L]WFCY
+  Call MAJVALLOT(1,I,WAMTDEV_LOT) From STKVALMAJ2
+Endif
+
+#----- Ne pas tester le stock négatif si mvt inverse en modification -----#
+If [L]WMAJCOD<>"M" | [M:STW]MAJCOD(I)="C"
+  If [F:SLF]AAACUMQTY<0 | [F:SLF]QQQCUMQTY<0 | [F:SLF]RRRCUMQTY<0
+    [M:STW]ERRCOD=12 : Gosub TRT_ERR From STKMAJ : Return
+  Endif
+Endif
+#----- Réécriture enregistrement lot (STOLOTFCY) -----#
+Call REWSLF From STKLIB
+If fstat
+  Call FSTA("SLF") From GLOCK
+  [M:STW]ERRCOD=70 : [L]WFIC="STOLOTFCY" : Gosub TRT_ERR From STKMAJ : Return
+Endif
+#----- Suppression enregistrement lot (STOLOTFCY) -----#
+# Si annulation de l'entrée qui a créé le lot et quantités nulles
+#--- Bug 83506
+#If [M:STW]MAJCOD(I)="A" & find([M:STW]TRSTYP,1,3,5,14) &
+If [M:STW]MAJCOD(I)="A" & [L]WMAJCOD="A" & find([M:STW]TRSTYP,1,3,5,14) &
+&  [M:STW]VCRTYP=[F:STL]VCRTYP &
+&  [M:STW]VCRNUM=[F:STL]VCRNUM &
+&  [M:STW]VCRLIN=[F:STL]VCRLIN &
+&  func STKLIB.QTYLOT([F:STL]ITMREF,[F:STL]LOT,[F:STL]SLO,"")=0
+   #--- Issue 97254
+   GPE=0
+   GPOINT="NODELETE_LOT"
+   Gosub ENTREE From EXEFNC
+   If GPE=0
+      Delete [SLF] Where ITMREF=[F:STL]ITMREF & LOT=[F:STL]LOT & SLO=[F:STL]SLO
+   Endif
+   #Delete [SLF] Where ITMREF=[F:STL]ITMREF & LOT=[F:STL]LOT & SLO=[F:STL]SLO
+   #---
+Endif
+If fstat
+  Call FSTA("SLF") From GLOCK
+  [M:STW]ERRCOD=70 : [L]WFIC="STOLOTFCY" : Gosub TRT_ERR From STKMAJ : Return
+Endif
+If [M:STW]TRAFLG>2
+  [L]WCLE=[F:SLF]ITMREF-[F:SLF]LOT-[F:SLF]SLO
+  [L]WFIC="STOLOTFCY" : [L]WMESSAGE=mess(232,197,1) : Gosub TRACE_DETAILLEE From STKMAJSUP
+Endif
+# Si annulation de l'entrée qui a créé le lot et quantités nulles
+#--- Bug 83506
+#If [M:STW]MAJCOD(I)="A" & find([M:STW]TRSTYP,1,3,5,14) &
+If [M:STW]MAJCOD(I)="A" & [L]WMAJCOD="A" & find([M:STW]TRSTYP,1,3,5,14) &
+&  [M:STW]VCRTYP=[F:STL]VCRTYP &
+&  [M:STW]VCRNUM=[F:STL]VCRNUM &
+&  [M:STW]VCRLIN=[F:STL]VCRLIN &
+&  func STKLIB.QTYLOT([F:STL]ITMREF,[F:STL]LOT,[F:STL]SLO,"")=0
+   #--- Issue 97254
+   GPE=0
+   GPOINT="NODELETE_LOT"
+   Gosub ENTREE From EXEFNC
+   If GPE=0
+      Delete [STL] Curr
+   Endif
+   #Delete [STL] Curr
+   #---
+#----- Réécriture enregistrement lot (STOLOT) -----#
+#--- Issue 95246 by TS
+#Else
+Elsif (func STKLIB.QTYLOT([F:STL]ITMREF,[F:STL]LOT,[F:STL]SLO,"")=0) |
+&     ([L]WMODLOT=1 & [L]WCODFONC=1)
+#---
+  Call REWSTL From STKLIB
+#--- Issue 95246 by TS
+#Endif
+  If fstat
+    Call FSTA("STL") From GLOCK
+    [M:STW]ERRCOD=70 : [L]WFIC="STOLOT" : Gosub TRT_ERR From STKMAJ : Return
+  Endif
+  If [M:STW]TRAFLG>2
+    [L]WCLE=[F:STL]ITMREF-[F:STL]LOT-[F:STL]SLO
+    [L]WFIC="STOLOT" : [L]WMESSAGE=mess(232,197,1) : Gosub TRACE_DETAILLEE From STKMAJSUP
+  Endif
+#--- Issue 95246 by TS
+Endif
+
+Return
+
+
+#---------------------------------------------------------------#
+# Traitement de mise à jour des entrées (STOCK, STOSER, STOJOU) #
+#---------------------------------------------------------------#
+$MAJENT_TRT
+
+# Alimentation emplacement à tester pour optimisation appel au STKLIBEMP
+If I<dim([M:STW]ITMREFLIG)-1
+   If [M:STW]MAJTYP(I)="C"
+      WLOCRUP=[M:STW]LOCDES(I+1)
+   Else
+      WLOCRUP=[M:STW]LOC(I+1)
+   Endif
+Else
+   Raz WLOCRUP
+Endif
+#--- Issue 110327
+# No série géré en E/S ou en Sortie (existe déjà)
+#If [M:STW]SERNUM(I)<>""
+If [M:STW]SERNUM(I)<>"" & [F:ITM]SERMGTCOD<>4
+#---
+  #----- Sauvegarde des quantités -----#
+  [L]WQTYSTU_SER     =[M:STW]QTYSTU(I)
+  [L]WQTYSTUACT_SER  =[M:STW]QTYSTUACT(I)
+  [L]WQTYPCU_SER     =[M:STW]QTYPCU(I)
+  [L]WDIFALLQTY_SER  =[L]WDIFALLQTY
+  [L]WDIFALLQTA_SER  =[L]WDIFALLQTA
+  #----- Initialisation des qtés pour traiter un no de série à la fois -----#
+  [M:STW]QTYSTU(I)   =1*[L]SENS
+  [M:STW]QTYSTUACT(I)=1*[L]SENS
+  If [M:STW]PCUSTUCOE(I)<>0
+    [M:STW]QTYPCU(I) =1*[L]SENS/[M:STW]PCUSTUCOE(I) : # On devrait peut être l'arrondir ?
+  Else
+    [M:STW]QTYPCU(I) =1*[L]SENS
+  Endif
+  #----- Boucle sur les numéros de série -----#
+  For J=[L]WNBRSER To 1 Step -1
+    If [L]WCODFONC=3 & [M:STW]MAJCOD(I)<>"A"
+      [L]WDIFALLQTY=min([L]WDIFALLQTY_SER,1)
+      [L]WDIFALLQTA=min([L]WDIFALLQTA_SER,1)
+      [L]WDIFALLQTY_SER-=[L]WDIFALLQTY
+      [L]WDIFALLQTA_SER-=[L]WDIFALLQTA
+    Endif
+    # Sur le dernier no série de la séquence :
+    # En rupture d'emplacement, alimentation de la globale GSTKLIBEMP à 1
+    # pour optimiser les performances en maj de la ligne de stock.
+    # Appel au sous-programme STKLIBEMP uniquement si GSTKLIBEMP=1
+    Raz GSTKLIBEMP
+    If J=1
+      If [M:STW]LOC(I)<>""
+        If I>=dim([M:STW]ITMREFLIG)-1 | [M:STW]LOC(I)<>WLOCRUP
+          GSTKLIBEMP=1
+        Endif
+      Endif
+    Endif
+    Gosub MAJENT_STOSTJ : If GOK<1  Break : Endif
+    #---- Prendre le numéro de série suivant -----#
+    If J>1
+      If [L]WSERNUM=""
+        Call NUMERO([L]WSERCOU,[L]WFCY,[M:STW]IPTDAT,[F:ITM]ITMREF,
+&                   [M:STW]SERNUM(I),[L]WRET) From SUBANM
+        If GOK<0
+          [M:STW]ERRCOD=99 : Gosub TRT_LCK From STKMAJ : Break
+        Elsif GOK<1 | [L]WRET<>0
+          [M:STW]ERRCOD=50 : [L]WCTEUR=[L]WSERCOU : Gosub TRT_ERR From STKMAJ : Break
+        Endif
+      Else
+        Call PLUS_UN([M:STW]SERNUM(I),[M:STW]SERNUM(I),[L]WRET) From STKLIB
+        If [L]WRET<>0  [M:STW]ERRCOD=33 : Gosub TRT_ERR From STKMAJ : Break : Endif
+      Endif
+    Endif
+  Next J
+  #----- Restitution des quantités -----#
+  [M:STW]QTYSTU(I)   =[L]WQTYSTU_SER
+  [M:STW]QTYSTUACT(I)=[L]WQTYSTUACT_SER
+  [M:STW]QTYPCU(I)   =[L]WQTYPCU_SER
+Else
+  #--- Issue 110327
+  # No série géré en E/S globale et no série fin non renseigné
+  If [F:ITM]SERMGTCOD=4 & [M:STW]SERNUMF(I)="" & [M:STW]SERNUM(I)<>""
+    # Vérification que les no série n'existent pas et alimentation du no série fin
+    WSERNUMF = [M:STW]SERNUM(I)
+    For J=2 To [M:STW]QTYSTU(I)
+      If [L]WSERNUM=""
+        Call NUMERO([L]WSERCOU,[L]WFCY,[M:STW]IPTDAT,[F:ITM]ITMREF,WSERNUMF,[L]WRET) From SUBANM
+        If GOK<0
+          [M:STW]ERRCOD=99 : Gosub TRT_LCK From STKMAJ : Break
+        Elsif GOK<1 | [L]WRET<>0
+          [M:STW]ERRCOD=50 : [L]WCTEUR=[L]WSERCOU : Gosub TRT_ERR From STKMAJ : Break
+        Endif
+      Else
+        Call PLUS_UN(WSERNUMF,WSERNUMF,WRET) From STKLIB
+        If WRET<>0
+          [M:STW]ERRCOD=33 : Gosub TRT_ERR From STKMAJ : Break
+        Endif
+      Endif
+      Read [STS]STS0=[M:STW]ITMREF;WSERNUMF
+      If !fstat
+        [M:STW]ERRCOD=47 : Gosub TRT_ERR From STKMAJ : Break
+      Endif
+    Next J
+    If GOK=0 Return Endif
+    [M:STW]SERNUMF(I) = WSERNUMF
+  Endif
+  #--- End issue 110327
+
+  # En rupture d'emplacement, alimentation de la globale GSTKLIBEMP à 1
+  # pour optimiser les performances en maj de la ligne de stock.
+  # Appel au sous-programme STKLIBEMP si GSTKLIBEMP=1
+  Raz GSTKLIBEMP
+  If [M:STW]LOC(I)<>""
+    If I>=dim([M:STW]ITMREFLIG)-1 | [M:STW]LOC(I)<>WLOCRUP
+      GSTKLIBEMP=1
+      Endif
+  Endif
+  Gosub MAJENT_STOSTJ
+Endif
+Return
+
+
+#---------------------------------------------------------------------#
+# Màj ligne stock (STOCK), no série (STOSER) et mvt d'entrée (STOJOU) #
+#---------------------------------------------------------------------#
+$MAJENT_STOSTJ
+#--- Issue 110327
+Local Char    WSVGSERNUM(GLONSER)
+Local Integer WJ
+#---
+
+GPOINT="ENT_STOSTJ"
+Gosub ENTREE From EXEFNC
+
+Case [L]WRUPTFLG1
+  When 1 : [L]WRUPTACTU=[M:STW]ITMREFLIG(I)
+  When 2 : [L]WRUPTACTU=[M:STW]ITMREFLIG(I)+[M:STW]LOT(I)
+  When 3 : [L]WRUPTACTU=[M:STW]ITMREFLIG(I)+[M:STW]LOT(I)+[M:STW]SLO(I)
+  When 4 : [L]WRUPTACTU=[M:STW]ITMREFLIG(I)+[M:STW]LOT(I)+[M:STW]SLO(I)+[M:STW]SERNUM(I)
+Endcase
+#----- Si 1ère fois, initialisation valeur précédente -----#
+If [L]WRUPTPREC=""  [L]WRUPTPREC=[L]WRUPTACTU : Endif
+#----- Si rupture sur article, lot ...etc, màj contrôle qualité -----#
+If [L]WRUPTACTU<>[L]WRUPTPREC
+  Raz [L]WANA
+  [L]WRUPTPREC=[L]WRUPTACTU
+Endif
+#----- Cumuls des qtés pour màj des tables STOQUAL et ITMMVT -----#
+[L]WSTA   =[M:STW]STA(I)    : # Statut
+[L]WLOCCAT=[M:STW]LOCCAT(I) : # Catégorie d'emplacement
+Gosub CUMULS_QTES From STKMAJ
+
+#----- Statut "Q", gestion des demandes d'analyse et emplacement différent de quai -----#
+If (left$([M:STW]STA(I),1)="Q" & [M:STW]QLYCTLFLG(I)=2 & [M:STW]LOCCAT(I)<>2) |
+&  [M:STW]QLYCTLDEM(I)<>""
+  #----- Lecture ou création de la demande d'analyse -----#
+  If [L]WANA=""
+    Gosub LECQLY From STKMAJ : If GOK<1  Return : Endif
+  Elsif [M:STW]MAJCOD(I)="A" & [M:STW]QLYCTLDEM(I)<>"" & [M:STW]QLYCTLDEM(I)<>[L]WANA
+    Raz [L]WANA
+    Gosub LECQLY From STKMAJ : If GOK<1  Return : Endif
+  #Else
+  #  [M:STW]QLYCTLDEM(I)=[L]WANA
+  Elsif [M:STW]QLYCTLDEM(I)=""
+    [M:STW]QLYCTLDEM(I)=[L]WANA
+  Endif
+Endif
+#----- Reconditionnement si annulation sortie et unité ou coef d'origine différent -----#
+If [M:STW]MAJCOD(I)="A" & [L]WMAJCOD="A" & [L]SENS=-1 &
+&  [M:STW]PCUORI(I)<>"" & [M:STW]PCUSTUORI(I)<>0 &
+& ([M:STW]PCU(I)<>[M:STW]PCUORI(I) | [M:STW]PCUSTUCOE(I)<>[M:STW]PCUSTUORI(I))
+  Gosub RECONDITION_ENTIER From STKMAJ
+  Raz [L]WPCURUL
+Else
+  Raz [L]WRECOND
+Endif
+#----- Test si création d'une entrée négative classique (retour réception) -----#
+#-----   ou si annulation d'un changement d'emplacement                    -----#
+If ([L]WCODFONC=1 & [L]SENS=-1 & [M:STW]MAJCOD(I)="C") |
+&  ([L]WCODFONC=3 & [M:STW]MAJCOD(I)="A")
+  #----- Lecture directe de la ligne de stock -----#
+  [L]WFIC="STOCK"
+  [L]WCLE=[L]WFCY-num$([M:STW]STOCOU(I))
+  #--- Issue 116401 : ajout With lockwait=3
+  #--- Issue X3-74576 : suppression lockwait=3
+  Readlock [STO] STO0=[L]WFCY;[M:STW]STOCOU(I)
+  If fstat=1
+    GLOCK="$STOCK"-[L]WCLE
+    [M:STW]ERRCOD=99 : Gosub TRT_LCK From STKMAJ : Return
+  Elsif fstat
+    Call RSTA("STO",[L]WCLE) From GLOCK
+    [M:STW]ERRCOD=60 : Gosub TRT_ERR From STKMAJ : Return
+  Endif
+  [L]WSTOCOU=[M:STW]STOCOU(I)
+  #-----
+  [L]WPCU_ORI      =[F:STO]PCU
+  [L]WPCUSTUCOE_ORI=[F:STO]PCUSTUCOE
+Else
+  [L]WPCU_ORI      =[M:STW]PCU(I)
+  [L]WPCUSTUCOE_ORI=[M:STW]PCUSTUCOE(I)
+
+  #--- Issue 89625
+  # TS pb owner inter-site le 16.04.08
+  #If [M:STW]TRSTYP=14 [M:STW]OWNER(I)=[L]WFCY Endif
+  If [M:STW]TRSTYP=14 & [M:STW]OWNER(I)=[M:STW]STOFCY
+    [M:STW]OWNER(I)=[L]WFCY
+  Endif
+  #---
+
+  #----- Recherche existence ligne de stock avec les mêmes caractéristiques -----#
+  nolign=I+1 : [F:STJ1]=[M:STW]
+
+  #--- Issue 110327
+  If [F:ITM]SERMGTCOD=4 : Raz [F:STJ1]SERNUM : Endif
+  #---
+
+  # Pour traiter l'annulation de mvts d'entrée sur lesquels,
+  # la demande d'analyse n'existe plus
+  [L]WQLYCTLDEM = [F:STJ1]QLYCTLDEM
+  If [L]WCODFONC=1 & [M:STW]MAJCOD(I)="A" & [F:STJ1]QLYCTLDEM<>""
+     Look [QLH]QLH0=28;[F:STJ1]QLYCTLDEM
+     If fstat Raz [L]WQLYCTLDEM Endif
+  Endif
+  #--- Issue X3-53322 : Ajout LPN
+  Call CLESTO([L]WFCY,[L]WITMREF,[F:STJ1]LOT,[F:STJ1]SLO,[F:STJ1]BPSLOT,
+&             [F:STJ1]PALNUM,[F:STJ1]CTRNUM,[F:STJ1]STA,[F:STJ1]LOC,[F:STJ1]PCU,
+&             [F:STJ1]PCUSTUCOE,[F:STJ1]SERNUM,[L]WQLYCTLDEM,[F:STJ1]OWNER,
+&             [F:STJ1]STOFLD1,[F:STJ1]STOFLD2,[F:STJ1]LPNNUM,[L]WSTOCOU) From STKLIB
+  [M:STW]STOCOU(I)=[L]WSTOCOU
+Endif
+#----- Création d'une nouvelle ligne de stock -----#
+If [L]WSTOCOU=0
+  #----- Attribution du chrono stock -----#
+  Call NUMERO(GSTKCPT(0),[L]WFCY,[M:STW]IPTDAT,"",[L]WPARAM,[L]WRET) From SUBANM
+  If GOK<0
+    [M:STW]ERRCOD=99 : Gosub TRT_LCK From STKMAJ : Return
+  Elsif GOK<1 | [L]WRET<>0
+    [M:STW]ERRCOD=50 : [L]WCTEUR=GSTKCPT(0) : Gosub TRT_ERR From STKMAJ : Return
+  Endif
+  [M:STW]STOCOU(I)=val([L]WPARAM)
+  [L]WSTOCOU      =val([L]WPARAM)
+  #----- Chargement et écriture ligne de stock (STOCK) -----#
+  Raz [F:STO]
+  nolign=I+1 : [F:STO]=[M:STW]
+  Raz [F:STO]PCUORI, [F:STO]QTYPCUORI, [F:STO]QTYSTUORI
+  [F:STO]STOFCY=[L]WFCY
+
+  #--- Issue 110327
+  If [F:ITM]SERMGTCOD=4 : Raz [F:STO]SERNUM : Endif
+  #---
+
+  #--- Issue 89625
+  # TS pb owner inter-site le 16.04.08
+  #If [M:STW]TRSTYP=14 [F:STO]OWNER=[L]WFCY Endif
+  If [M:STW]TRSTYP=14 & [M:STW]OWNER(I)=[M:STW]STOFCY
+    [F:STO]OWNER(I)=[L]WFCY
+  Endif
+  #---
+
+  # Au cas où !
+  If [F:STO]OWNER="" : [F:STO]OWNER=[L]WFCY : Endif
+  [F:STO]ITMREF=[L]WITMREF
+  #----- Mise à jour dernière date d'entrée ou inventaire sauf en annulation -----#
+  If find([M:STW]TRSTYP,1,3,5,14) : #----- Entrée
+    If [M:STW]MAJCOD(I)<>"A" & [L]SENS=1
+      [F:STO]LASRCPDAT=[M:STW]IPTDAT
+    Endif
+  Elsif find([M:STW]TRSTYP,13) : #----- Inventaire
+    [F:STO]CUNLOKFLG=1 : [F:STO]CUNLISNUM=""
+    If [M:STW]MAJCOD(I)<>"A" & [L]SENS=1
+      [F:STO]LASCUNDAT=[M:STW]IPTDAT
+    Endif
+  Elsif [L]WCODFONC=3          : #----- Changement d'emplacement
+    If [M:STW]STOFCY<>[M:STW]TRFFCY | ([M:STW]LOCCAT(I)>2 & [M:STW]LOCDESCAT(I)<3)
+      [F:STO]LASRCPDAT=[M:STW]IPTDAT
+    Endif
+  Endif
+  #-----
+  [F:STO]QTYPCU   =[M:STW]QTYPCU(I)*[L]SIGN
+  [F:STO]QTYSTU   =[M:STW]QTYSTU(I)*[L]SIGN
+  [F:STO]QTYSTUACT=[M:STW]QTYSTUACT(I)*[L]SIGN
+  Gosub VERIF_ALLOC From STKMAJ : If GOK<1  Return : Endif
+  Gosub ECRSTO      From STKMAJ : If GOK<1  Return : Endif
+Else
+  #----- Mise à jour ancienne ligne de stock -----#
+  [L]WFIC="STOCK"
+  [L]WCLE=[L]WFCY-num$([L]WSTOCOU)
+  #--- Issue 116401 : ajout With lockwait=3
+  #--- Issue X3-74576 : suppression lockwait=3
+  Readlock [STO] STO0=[L]WFCY;[L]WSTOCOU
+  If fstat=1
+    GLOCK="$STOCK"-[L]WCLE
+    [M:STW]ERRCOD=99 : Gosub TRT_LCK From STKMAJ : Return
+  Elsif fstat
+    Call RSTA("STO",[L]WCLE) From GLOCK
+    [M:STW]ERRCOD=60 : Gosub TRT_ERR From STKMAJ : Return
+  Endif
+  #----- Traitement du fractionnement d'une unité de conditionnement -----#
+  If [L]SENS=-1             &
+&    [M:STW]MAJCOD(I)<>"A"  &
+&    [F:STO]PCU<>[F:ITM]STU &
+&    mod([F:STO]QTYSTU+([M:STW]QTYSTU(I)*[L]SIGN),[F:STO]PCUSTUCOE)
+    If find([F:STO]PCU,[F:ITM]PCU)
+      [L]WPCURUL=[F:ITM]PCURUL(find([F:STO]PCU,[F:ITM]PCU)-1)
+      If [L]WPCURUL<1 | [L]WPCURUL>3  [L]WPCURUL=1 : Endif
+    Else
+      [L]WPCURUL=1
+    Endif
+    Case [L]WPCURUL
+      When 1 : Call CTRQTYPCU([F:STO]PCU,[F:STO]PCUSTUCOE,[M:STW]QTYSTU(I),[L]WQTYSTUARR) From STKLIB
+               If [M:STW]QTYSTU(I)<>[L]WQTYSTUARR
+                  Gosub DECONDITION_ROMPU From STKMAJ
+               Else
+                  [F:STO]QTYPCU   +=[M:STW]QTYPCU(I)*[M:STW]PCUSTUCOE(I)/[F:STO]PCUSTUCOE*[L]SIGN
+                  [F:STO]QTYSTU   +=[M:STW]QTYSTU(I)*[L]SIGN
+                  [F:STO]QTYSTUACT+=[M:STW]QTYSTUACT(I)*[L]SIGN
+               Endif
+      When 2 : Gosub DECONDITION_ROMPU From STKMAJ : # Rompu (recalcul du coefficient UC-US)
+      When 3 : Gosub FRACTION          From STKMAJ : # Fractionnement (recalcul de la qté UC)
+    Endcase
+    Raz [L]WPCURUL
+    If GOK<1  Return : Endif
+  #----- Mise à jour ligne de stock si pas de fractionnement -----#
+  Else
+    [F:STO]QTYPCU   +=[M:STW]QTYPCU(I)*[M:STW]PCUSTUCOE(I)/[F:STO]PCUSTUCOE*[L]SIGN
+    [F:STO]QTYSTU   +=[M:STW]QTYSTU(I)*[L]SIGN
+    [F:STO]QTYSTUACT+=[M:STW]QTYSTUACT(I)*[L]SIGN
+  Endif
+  #-----
+  If [F:STO]QTYSTU=0  [F:STO]QTYPCU=0 : Endif
+  #----- Mise à jour dernière date d'entrée ou inventaire sauf en annulation -----#
+  If find([M:STW]TRSTYP,1,3,5,14) : #----- Entrée
+    If [M:STW]MAJCOD(I)<>"A" & [L]SENS=1 & [F:STO]LASRCPDAT<[M:STW]IPTDAT
+      [F:STO]LASRCPDAT=[M:STW]IPTDAT
+    Endif
+  Elsif find([M:STW]TRSTYP,13) : #----- Inventaire
+    [F:STO]CUNLOKFLG=1 : [F:STO]CUNLISNUM=""
+    If [M:STW]MAJCOD(I)<>"A" & [L]SENS=1 & [F:STO]LASCUNDAT<[M:STW]IPTDAT
+      [F:STO]LASCUNDAT=[M:STW]IPTDAT
+    Endif
+  Elsif [L]WCODFONC=3          : #----- Changement d'emplacement
+    If [M:STW]STOFCY<>[M:STW]TRFFCY | ([M:STW]LOCCAT(I)>2 & [M:STW]LOCDESCAT(I)<3)
+      If [F:STO]LASRCPDAT<[M:STW]IPTDAT  [F:STO]LASRCPDAT=[M:STW]IPTDAT : Endif
+    Endif
+  Endif
+  #----- Réécriture de la ligne de stock -----#
+  [L]WQTEACT=[M:STW]QTYSTUACT(I)*[L]SIGN : # Pour le plan de rangement
+  Gosub VERIF_ALLOC From STKMAJ : If GOK<1  Return : Endif
+  Gosub REWSTO      From STKMAJ : If GOK<1  Return : Endif
+Endif
+#----- Restitution des valeurs ligne écran si reconditionnement -----#
+If [L]WRECOND=2
+  [M:STW]PCU(I)      =[M:STW]STU(I)
+  [M:STW]PCUSTUCOE(I)=1
+  [M:STW]QTYPCU(I)   =[L]WQTYPCU
+  [M:STW]QTYSTU(I)   =[L]WQTYSTU
+  [M:STW]QTYSTUACT(I)=[L]WQTYSTUACT
+  Raz [L]WRECOND
+Endif
+#----- Ne pas tester le stock négatif si mvt inverse en modification -----#
+If ([L]WMAJCOD<>"M" | [M:STW]MAJCOD(I)="C") & [F:STO]QTYSTU<0
+  [M:STW]ERRCOD=12 : Gosub TRT_ERR From STKMAJ : Return
+Endif
+#----- Mise à jour des numéros de série -----#
+If [M:STW]SERNUM(I)<>""
+  #--- Issue 110327
+  # Si retour client ou réintégration de stock
+  If WCODFONC=2
+    WSVGSERNUM = [M:STW]SERNUM(I)
+    For WJ=1 To abs([M:STW]QTYSTU(I))
+      If WJ>1
+        Call PLUS_UN([M:STW]SERNUM(I),[M:STW]SERNUM(I),[L]WRET) From STKLIB
+        If [L]WRET<>0 : [M:STW]ERRCOD=33 : Gosub TRT_ERR From STKMAJ : Break : Endif
+      Endif
+      Gosub MAJ_SERIE From STKMAJSER : If GOK<1 : Break : Endif
+    Next WJ
+    [M:STW]SERNUM(I) = WSVGSERNUM
+    If GOK<1 : Return : Endif
+  Else
+     Gosub MAJ_SERIE From STKMAJSER : If GOK<1 : Return : Endif
+  Endif
+  #Gosub MAJ_SERIE From STKMAJSER : If GOK<1  Return : Endif
+  #--- End issue 110327
+Endif
+#----- Repérage des mvts qui s'annulent et écriture mvt d'entrée -----#
+If [L]WCODFONC=3 & [M:STW]MAJCOD(I)="A"
+  [L]WMVTSEQ=[L]WMVTSEQ_RCP
+  [L]WMVTIND=[L]WMVTIND_RCP
+Else
+  [L]WMVTSEQ=[M:STW]MVTSEQ(I)
+  [L]WMVTIND=[M:STW]MVTIND(I)
+Endif
+Gosub MAJ_STOJOU  From STKMAJ : If GOK<1  Return : Endif
+#----- Màj de la ligne demande d'analyse (contrôle qualité) -----#
+Gosub MAJ_STOQLYD From STKMAJ : If GOK<1  Return : Endif
+#----- Si changement d'emplacement, traitement des allocations -----#
+If [L]WCODFONC=3 & [M:STW]MAJCOD(I)<>"A" & ([L]WDIFALLQTY<>0 | [L]WDIFALLQTA<>0)
+  [L]WALLQTY    =[L]WDIFALLQTY
+  [L]WALLQTA    =[L]WDIFALLQTA
+  #--- Issue X3-109881 by TS
+  #[L]WSTOCOU_SVG=[L]WSTOCOU_ISS
+  [L]WSTOCOU_SVG=[L]WSTOCOU_ISS(0)
+  #---
+  Gosub CUMULS_QTEALL  From STKMAJ : If GOK<1  Return : Endif
+  Gosub TRT_ALLOCATION From STKMAJ : If GOK<1  Return : Endif
+  Raz [L]WDIFALLQTY, [L]WDIFALLQTA
+Endif
+
+####################################################
+#--- Issue 110327 --- à ne pas reporter
+# Mouchard pour tracker les déphasages stock-séries
+####################################################
+If [F:ITM]SERMGTCOD=4
+  # Pas de contrôle si annulation d'un changement de stock
+  #If WCODFONC<>3 | WMAJCODSTO<>"A"
+  If WCODFONC=1 | WCODFONC=2 |(WCODFONC=3 & WMAJCODSTO="C")
+    Local Decimal WWSTOCOU       : WWSTOCOU=[F:STO]STOCOU
+    Read [STO]STO0=[F:STO]STOFCY;[F:STO]STOCOU
+    If fstat [F:STO]QTYSTU=0 Endif
+    If [F:STO]LOCCAT<>2
+      Filter [STS] Where ITMREF=[F:ITM]ITMREF & STOCOU=WWSTOCOU & ISSDAT=[0/0/0] Order By Key STS3
+      If [F:STO]QTYSTU <> rowcount([F:STS])
+        Infbox "ATTENTION, génération d'un déphasage entre stock et séries, merci de prévenir les stocks : informations à suivre"
+        Infbox "Type mouvement :"-mess([M:STW]TRSTYP,704,1)-"---"-"Type pièce :"-mess([M:STW]VCRTYP,701,1)+"\"+"WMAJCOD="+WMAJCOD-"WMAJCODSTO="+WMAJCODSTO-"WMAJTYP="+WMAJTYP-"WFLUX="+num$(WFLUX)
+        Infbox "Entrée"-[F:ITM]ITMREF-mess(50,196,1)-num$(WWSTOCOU)-mess(146,184,1)-"="-num$([F:STO]QTYSTU)-mess(483,184,1)-"="-num$(rowcount([F:STS]))
+        GOK=0
+      Endif
+      Filter [STS]
+    Endif
+  Endif
+Endif
+####################################################
+
+Return
+

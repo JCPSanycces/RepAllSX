@@ -1,0 +1,1384 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+##################################################################################
+# Cette action CPCMAJ la mise à jours des compétences emploi-type et poste
+# depuis les groupes de compétences
+# JML 27/09/10 CG nouveau fonctionnement : on part de 4=Grp de cpc, 3=métier, 2=Famille, 1=Dossier en remontant
+#              On supprime tout sauf si Manuel ou sur Famille on touche plus à métier,
+#              sur dossier on touche plus à Famille, Métier
+# JML 14/10/10 CG Ajout d'un niveau 5 sur Emploi type (Ajout GFLAG="5" sur fonction GESJOT, pas besoin, écrasé par GOBJET !)
+#              Ajout Action CPCMAJ sur Fenêtre OJOT
+# Modifications :
+# SEGAY 10/11/10 EXI 66105 lot P02
+#Dans les postes non reliés à un emploi type,
+#les seuls héritages possibles sont « manuelle » ou « groupe de compétences ».
+#Le seul cas où il peut arriver qu’on ait d’autres valeurs (famille, métier, emploi type)
+#est le suivant : un poste était lié à un emploi type ; le lien a été enlevé.
+# Si on n'est pas en maj héritage groupe,
+# on supprime compétences origine groupes si elles existent dans le père
+# pour les mettre à jour avec la bonne origine du père
+#  A-Pour la MAJ héritage depuis GESJOT (emploi type)
+#    on garde les niveaux de compétence et la colonne héritage (dossier, famille ou métier) de l’emploi type dans les postes.
+#    Exception :
+#    - les compétences issues d’un groupe de compétence dans l’emploi type, pour qui la colonne héritage devient « Emploi type » dans le poste.
+#    - les compétences dont la colonne héritage est manuelle dans l’emploi type, pour qui la colonne héritage devient « Emploi type »
+#  B-Pour la MAJ héritage depuis GESCP4 (Groupe de compétence)
+#    Pour un groupe de compétences, on met à jour les emplois types
+#    ayant un lien avec ce groupe, puis les postes liés pour chaque emploi type.
+#    Enfin, on met à jour les postes restant (sans lien avec les emplois type mis à jour) mais ayant un lien avec le groupe de compétences.
+#  C-Pour la MAJ héritage depuis GESCP3 (Métier)
+#    on remet à jour tous les emplois type liés au métier et dans les postes (liés aux emplois type du métier),
+#    on modifie toutes les compétences qui viennent de l’emploi type (et pas seulement les compétences métier).
+#  D-Pour la MAJ héritage depuis GESCP2 (Famille)
+#    On commence par mettre à  jour  les compétences des niveaux métiers qui ont une dépendance avec la famille.
+#    Si pour la même famille on a plusieurs métiers, on boucle sur les métiers (comme dans C).
+#    Puis on met à jour tous les emplois type liés à la famille,
+#    et dans les postes (liés aux emplois type de la famille),
+#    on modifie toutes les compétences qui viennent de l’emploi type (et pas seulement les compétences familles).
+#  E-Pour la MAJ héritage depuis GESCP1 (Dossier)
+#    par cette fonction l’utilisateur doit être capable de remettre à jour l’ensemble de son référentiel
+#    et de restaurer tous les liens (dossier, famille, métier, emploi type, poste) qui ne serait plus cohérents.
+# SEGAY - 24/01/11 LOT P02
+#  Recherche s'il y a des origines de compétences dont le groupe n'existe plus
+#  Il faut les supprimer
+#  MABOS - 22/07/13 - FQ90539-US1804 - Action called from CONSRJO
+#                                    - init & manage NIVGRP / new parameters on Action CPCMAJ
+##################################################################################################
+Raz GPILOBJ
+GFLAG="4"
+Call OBJET("GCP",GBIDC1,"") From GOBJET
+End
+
+$ACTION
+# SEGAY 10/11/10 CG Bouton Héritage
+# When "INIT" : TIT = mess(22,10720,1)  :#Voulez-vous mettre à jour les compétences des emplois type et des postes ?
+Case ACTION
+ When "INIT" : Gosub INIT
+ When "EXEC" : Gosub EXEC
+Endcase
+Return
+#####################################
+$INIT
+# SEGAY 10/11/10 CG Bouton Héritage  sur emploi type (Pas possible de gérer GFLAG sur GOBJET de GESJOT)
+#MABOS-FQ90539-US1804-add paramters on Action CPCMAJ
+Local Integer NIVGRP
+NIVGRP=val(GFLAG)
+If NIVGRP = 0 Then
+  NIVGRP=val(PARAM(5))
+Endif
+#If val(GFLAG)=0
+If NIVGRP>4
+#end MABOS-FQ90539-US1804
+Local Integer NIVGRP
+  TIT = mess(64,10720,1)  :#Voulez-vous mettre à jour les compétences des postes liés à l'emploi type ?
+Else
+  TIT = mess(22,10720,1)  :#Voulez-vous mettre à jour les compétences des emplois type et des postes ?
+Endif
+Return
+#####################################
+$EXEC
+TRA=1
+If clalev([F:JOT])=0    : Local File JOBTYP     [JOT]   : Endif
+If clalev([F:POT])=0    : Local File POSTE      [POT]   : Endif
+If clalev([F:GCP])=0    : Local File GRPCPC     [GCP]   : Endif
+If clalev([F:CPC])=0    : Local File COMPETENCE [CPC]   : Endif
+If clalev([F:HRGCD])=0  : Local File GRPCPCD    [HRGCD] : Endif : # JML 30/07/10 LOT P02
+If clalev([F:ADI])=0    : Local File ATABDIV    [ADI]   : Endif : # SEGAY 10/11/10 LOT P02
+
+If clalev([F:JOT1])=0   : Local File JOBTYP     [JOT1]  : Endif
+
+Local Char    CODGRP(GLONADI)
+Local Integer NBJOT, NBPOT, FLGMAJ, I, J, K ,NIVGRP
+Local Char    L_CRITGCP(GDIMFIC), L_CRITGCD(GDIMFIC) : # JML 30/07/10
+Local Char    L_CPC(GLONCPC)(0..)                    : # JML 30/07/10 To charge GCD
+Local Char    L_NIV(GLONNIV)(0..)                    : # JML 30/07/10 To charge GCD
+Local Integer L_ORI(0..)                             : # SEGAY 10/11/10  LOT P02 origine de la compétence dans le groupe père
+Local Char    L_LEG(5)(0..)                          : # SEGAY 25/10/12 US 930 81085
+Local Char    L_LEG_NIV(5)                           : # SEGAY 25/10/12 US 930 81085
+Local Char    L_LEG_NIV_SUP(5)                           : # SEGAY 25/10/12 US 930 81085
+
+Local Integer L_NB_CPC
+Local Integer L_IJ, L_JK
+Local Integer L_I, L_CPT                             : # SEGAY 10/11/10 variable de compteur
+Local Integer FLGMAJMOD                              : # SEGAY 10/11/10 flag si modification à faire(niveau ou origine) sur la ligne de compétence du poste
+Local Integer L_IP                                   : # SEGAY 10/11/10 Indice du niveau de mise à jour 1=dossier 2=famille 3=metier 4=groupe compétence 5=emploi type
+Local Integer L_IDEL                                 : # SEGAY 10/11/10 Indice du niveau supression cpc dans origine n'existe plus
+Local Integer L_SAV_IJ                               : # SEGAY 10/11/10 Indice du niveau supression cpc dans origine n'existe plus
+
+Local Char    L_SAV_CPC(GLONCPC)(0..)                : # SEGAY 10/11/10 sauvegarde des compétences à modifier
+Local Char    L_SAV_NIV(GLONNIV)(0..)                : # SEGAY 10/11/10 sauvegarde des niveaux à modifier
+Local Char    L_SAV_LEG(5)(0..)                          : # SEGAY 25/10/12 US 930 81085
+
+Local Integer L_SAV_NB_CPC                           : # SEGAY 10/11/10 sauvegarde du nombre de compétence à modifier
+Local Char    CRITJOT(GDIMFIC), CRITPOT(GDIMFIC)
+Local Char    WMESSAGE(250)                          : # SEGAY 25/10/12 US 930 81085
+Local Char    WDESAX3(30)                            : # SEGAY 25/10/12 US 930 81085
+Local Char    W_AFF_LEG1(50)                         : # SEGAY 25/10/12 US 930 81085
+Local Char    W_AFF_LEG2(50)                         : # SEGAY 25/10/12 US 930 81085
+Local Integer WOK                                    : # SEGAY 25/10/12 US 930 81085
+Local Char    SAV_CRITGCD(GDIMFIC) :# SEGAY 25/10/12 US 930 81085
+SYMBOLE = "CPCMAJ"
+Lock =SYMBOLE
+If fstat
+ GMESSAGE = mess(30,100,1) : # Opération en cours sur autre poste
+ Unlock =SYMBOLE
+ GERR = 1 : SAI = 0 : Return
+Endif
+# SEGAY 10/11/10 Indice du niveau de mise à jour 1=dossier 2=famille 3=metier 4=groupe compétence 5=emploi type
+NIVGRP=val(GFLAG)
+#MABOS-FQ90539-US1804-add paramters on Action CPCMAJ
+If NIVGRP = 0 Then
+  # from GESJOT & CONSRJO
+  NIVGRP=val(PARAM(5))
+Endif
+If NIVGRP=1
+ CODGRP = ""
+#Elsif NIVGRP=0
+# # JML 14/10/10 CG Bouton Héritage sur emploi type (Pas possible de gérer GFLAG sur GOBJET de GESJOT)
+# NIVGRP = 5
+# # ACTION CPCMAJ : 3 Paramètres : UOMGRP, JOBGRP, CPCFAM
+# CODGRP = PARAM(1)
+#end MABOS-FQ90539-US1804-
+Else
+ # ACTION CPCMAJ : 4 Paramètres : UOMGRP, JOBGRP, CPCFAM,JOBPOT
+ CODGRP = PARAM(NIVGRP-1)
+Endif
+
+##################################################################################################
+#Mise à jour des compétences dans les emplois type et les postes
+TIT = mess(23,10720,1)-":"-mess(NIVGRP,10937)-CODGRP
+If !GSERVEUR
+ Call OUVRE_TRACE(TIT) From LECFIC
+Endif
+
+#####################################
+# JML 30/07/10 LOT P02 Newfile GRPCPCD
+# JML 27/09/10 CG nouveau fonctionnement : on part de 4=Grp de cpc, 3=métier, 2=Famille, 1=Dossier en remontant
+# JML 29/09/10 CG ne pas faire Grp de cpc
+# JML 14/10/10 CG Faire GRP de CPC et ajouter Niveau 5 Emploi type
+For L_IJ=5 To NIVGRP Step -1
+ Raz [F:GCP]
+ If L_IJ=5 & NIVGRP=5
+  # JML 14/10/10 CG Bouton Héritage sur emploi type
+  CRITJOT ="1=0" : # On fait rien par défaut
+  If NIVGRP=5
+   CRITJOT ="[JOT]COD='"+CODGRP+"'"
+  Endif
+  For [JOT]JOT0 Where evalue(CRITJOT)
+   Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG, L_LEG_NIV, L_LEG_NIV_SUP # SEGAY 25/10/12 US 930 81085
+   L_LEG_NIV = [F:JOT]LEG                  : # SEGAY 25/10/12 US 930 81085
+   For L_JK=0 To dim([F:JOT]CPC)-1
+    If [F:JOT]CPC(L_JK)="" : Break : Endif
+# SEGAY 25/10/12 US 930 81085
+#    If !func SUBJOT.CHECKLEG_CPC([F:JOT]CPC(L_JK),[F:JOT]LEG)
+    Call LECTURE("CPC",[F:JOT]CPC(L_JK),"") From CONTOBJ
+    If ([F:CPC]LEG<>"" & [F:JOT]LEG<>"" & [F:CPC]LEG<>[F:JOT]LEG )
+&    | ([F:JOT]LEG="" & [F:CPC]LEG<>[F:JOT]LEG )    Then
+      WMESSAGE = mess(L_IJ,10937,1)-[F:JOT]COD-mess(37,10720,1)-": " +[F:JOT]CPC(L_JK) - mess(62,127,1)-":"-[F:CPC]LEG : # Réservé à la législation
+      GOK = 0
+      Break(1)
+    Endif
+# END SEGAY 25/10/12 US 930 81085
+    L_CPC(L_NB_CPC) = [F:JOT]CPC(L_JK)
+    L_NIV(L_NB_CPC) = [F:JOT]NIV(L_JK)
+    # SEGAY 10/11/10  LOT P02 origine de la compétence dans le groupe Emploi type
+    L_ORI(L_NB_CPC) = [F:JOT]ORI(L_JK)
+    L_LEG(L_NB_CPC) = [F:CPC]LEG            : # SEGAY 25/10/12 US 930 81085
+    L_NB_CPC += 1
+   Next : # [HRGCD]GCD0
+
+   Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+#   Call ECR_TRACE(TIT-":"-mess(L_IJ,10937,1)-[F:JOT]COD-": ("+CRITJOT+")",0) From GESECRAN
+   Call ECR_TRACE(mess(23,10720,1)-":"-mess(L_IJ,10937,1)-[F:JOT]COD,0) From GESECRAN
+
+   Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+
+# SEGAY 25/10/12 US 930 81085
+    If GOK<1
+      If WMESSAGE <> ""
+        Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+      Endif
+      Break(1)
+    Endif
+
+# END SEGAY 25/10/12 US 930 81085
+# SEGAY 10/11/10  LOT P02 même si on a aucune compétence il faut mettre à jour le poste
+# Pour mettre à jour les suppressions dans les postes
+   # JML 30/07/10 LOT P02 Newfile GRPCPCD
+#   If L_NB_CPC>0
+    GOK = 1
+    Call DEBTRANS From GLOCK
+    Gosub TR1
+    If GOK<1 : Break(2) : Endif
+#   Endif
+  Next : # [JOT]JOT0
+  # On s'arrete
+  Break
+ ####
+ Else
+ ####
+#  SEGAY 10/11/10 LOT P02
+#  If NIVGRP=4 | L_IJ<4
+  If (NIVGRP=4 & L_IJ=NIVGRP) | L_IJ<4
+
+   # On y va que pour dossier, Famille, Métier ou 1 seule fois GRP de CPC
+   # ML 2400 De Emploi type à Famille, Dossier
+   L_CRITGCP = "LEVGRP=L_IJ" : # ML 2400
+   L_CRITGCD = "1=1"
+
+#  SEGAY 24/01/11 LOT P02
+#  Recherche s'il y a des origines de compétences dont le groupe n'existe plus
+#  Il faut les supprimer
+   If NIVGRP =1 & L_IJ=NIVGRP
+    For L_IDEL = 4 To NIVGRP Step -1
+    Case L_IDEL
+     When 1 : # ML 2400 Dossier
+      Filter [F:JOT1] Where find(L_IDEL,[F:JOT1]ORI(0..dim([F:JOT1]ORI)-1))
+      For [F:JOT1]JOT0
+        Filter [F:GCP] Where [F:GCP]LEVGRP=L_IDEL
+        If !rowcount([F:GCP])>0 Then
+          Raz [F:GCP]
+          [F:GCP]LEVGRP=L_IDEL
+          Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG, L_LEG_NIV, L_LEG_NIV_SUP # SEGAY 25/10/12 US 930 81085
+          L_LEG_NIV = [F:GCP]LEG                  : # SEGAY 25/10/12 US 930 81085
+          Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+          Call ECR_TRACE(mess(23,10720,1)-":"-mess(L_IDEL,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM-mess(73,10720,1),0) From GESECRAN
+          Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+          GOK = 1
+          Call DEBTRANS From GLOCK
+          L_SAV_IJ=L_IJ
+          L_IJ=L_IDEL
+          Gosub TR1
+          L_IJ=L_SAV_IJ
+          If GOK<1 :Filter [F:JOT1]: Break(3) : Endif
+        Endif
+      Next
+      Filter [F:JOT1]
+     When 2 : #ML 2400 FAMILLE
+      Filter [F:JOT1] Where [F:JOT1]UOMGRP<>"" & find(L_IDEL,[F:JOT1]ORI(0..dim([F:JOT1]ORI)-1))
+      For [F:JOT1]JOT0
+        Filter [F:GCP] Where [F:GCP]LEVGRP=L_IDEL & [F:GCP]UOMGRP=[F:JOT1]UOMGRP
+        If !rowcount([F:GCP])>0 Then
+          Raz [F:GCP]
+          [F:GCP]UOMGRP=[F:JOT1]UOMGRP
+          [F:GCP]LEVGRP=L_IDEL
+          Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG, L_LEG_NIV # SEGAY 25/10/12 US 930 81085
+          L_LEG_NIV = [F:GCP]LEG                  : # SEGAY 25/10/12 US 930 81085
+          Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+          Call ECR_TRACE(mess(23,10720,1)-":"-mess(L_IDEL,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM-mess(73,10720,1),0) From GESECRAN
+          Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+          GOK = 1
+          Call DEBTRANS From GLOCK
+          L_SAV_IJ=L_IJ
+          L_IJ=L_IDEL
+          Gosub TR1
+          L_IJ=L_SAV_IJ
+          If GOK<1 :Filter [F:JOT1]: Break(3) : Endif
+        Endif
+      Next
+      Filter [F:JOT1]
+     When 3 : # ML 2400 Metier
+      Filter [F:JOT1] Where [F:JOT1]JOBGRP<>"" & find(L_IDEL,[F:JOT1]ORI(0..dim([F:JOT1]ORI)-1))
+      For [F:JOT1]JOT0
+        Filter [F:GCP] Where [F:GCP]LEVGRP=L_IDEL & [F:GCP]JOBGRP=[F:JOT1]JOBGRP
+        If !rowcount([F:GCP])>0 Then
+          Raz [F:GCP]
+          [F:GCP]JOBGRP=[F:JOT1]JOBGRP
+          [F:GCP]LEVGRP=L_IDEL
+          Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG, L_LEG_NIV # SEGAY 25/10/12 US 930 81085
+          L_LEG_NIV = [F:GCP]LEG                  : # SEGAY 25/10/12 US 930 81085
+          Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+          Call ECR_TRACE(mess(23,10720,1)-":"-mess(L_IDEL,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM-mess(73,10720,1),0) From GESECRAN
+          Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+          GOK = 1
+          Call DEBTRANS From GLOCK
+          L_SAV_IJ=L_IJ
+          L_IJ=L_IDEL
+          Gosub TR1
+          L_IJ=L_SAV_IJ
+          If GOK<1 :Filter [F:JOT1]: Break(3) : Endif
+        Endif
+      Next
+      Filter [F:JOT1]
+     When 4 : # ML 2400 Groupe de compétence
+      Filter [F:JOT1] Where find(L_IDEL,[F:JOT1]ORI(0..dim([F:JOT1]ORI)-1))
+      For [F:JOT1]JOT0
+        L_CPT=find ("",[F:JOT1]CPCFAM)
+        L_I = 0
+        If L_CPT > 0
+         L_I = L_CPT-1
+        Endif
+        If L_I > 0
+         Filter [F:GCP] Where [F:GCP]LEVGRP=L_IDEL & find([F:GCP]CPCFAM,[F:JOT1]CPCFAM(0..L_I))
+         If !rowcount([F:GCP])>0 Then
+          L_CPT=find ("",[F:JOT1]CPCFAM)
+          L_I = dim([F:JOT1]CPCFAM)
+          If L_CPT > 0
+            L_I = L_CPT-1
+          Endif
+          For K=L_I-1 To 0 Step -1 # Compteur groupe de compétence
+           If [F:JOT1]CPCFAM(K)="" : Break : Endif
+           Raz [F:GCP]
+           [F:GCP]CPCFAM=[F:JOT1]CPCFAM(K)
+           [F:GCP]LEVGRP=L_IDEL
+           Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG, L_LEG_NIV # SEGAY 25/10/12 US 930 81085
+           L_LEG_NIV = [F:GCP]LEG                  : # SEGAY 25/10/12 US 930 81085
+           Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+           Call ECR_TRACE(mess(23,10720,1)-":"-mess(L_IDEL,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM-mess(73,10720,1),0) From GESECRAN
+           Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+           GOK = 1
+           Call DEBTRANS From GLOCK
+           L_SAV_IJ=L_IJ
+           L_IJ=L_IDEL
+           Gosub TR1
+           L_IJ=L_SAV_IJ
+           If GOK<1 :Filter [F:JOT1]: Break(4) : Endif
+          Next # Compteur groupe de compétence
+        Endif
+       Endif
+      Next # Compteur emploi type
+      Filter [F:JOT1]
+    Endcase
+    Next # Compteur niveau
+   Endif
+
+
+   If L_IJ=NIVGRP
+    # JML 30/07/10 LOT P02 New size for CPC (from 5 to 15 car.) New file GRPCPCD
+    # JML 27/09/10 On ne filtre le code que pour le niveau concerné, pour les 'sous niveaux' on prend tout
+    Case NIVGRP
+     When 1 : # ML 2400 Dossier
+              L_CRITGCD = "1=1"
+     When 2 : # ML 2400 Famille
+              L_CRITGCD = "[F]UOMGRP='"+[L]CODGRP+"'"
+     When 3 : # ML 2400 Métier
+              L_CRITGCD = "[F]JOBGRP='"+[L]CODGRP+"'"
+     When 4 : # ML 2400 Groupe de compétence
+              L_CRITGCD = "[F]CPCFAM='"+[L]CODGRP+"'"
+    Endcase
+   Endif
+   #  SEGAY 10/11/10 LOT P02
+   #  Remplacer par FOR_GCP
+   # To be sure...
+#   Filter [GCP] Where evalue(L_CRITGCP) & evalue(L_CRITGCD)
+#   Read [GCP]GCP0 Last
+#   If fstat>=4 & L_IJ=NIVGRP
+#    Call ERREUR([L]CODGRP-mess(10,112,1)) From GESECRAN
+#    #### Code inexistant
+#    GERR = 1 : SAI = 0 : Break
+#   Elsif fstat>=4
+#    Raz [F:GCP]
+#   Endif
+#   Filter [GCP]
+#
+#   # JML 27/09/10 CG Parcourir tous les niveaux...
+#   For [GCP]GCP0 Where evalue(L_CRITGCP) & evalue(L_CRITGCD)
+#    Raz L_CPC, L_NIV, L_NB_CPC
+#    For [HRGCD]GCD0 Where evalue(L_CRITGCP) & evalue(L_CRITGCD)
+#     L_CPC(L_NB_CPC) = [F:HRGCD]CPC
+#     L_NIV(L_NB_CPC) = [F:HRGCD]NIV
+#     L_NB_CPC += 1
+#    Next : # [HRGCD]GCD0
+#
+#    Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+#    Call ECR_TRACE(TIT-":"-mess(L_IJ,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM,0) From GESECRAN
+#    Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+#
+#    # JML 30/07/10 LOT P02 Newfile GRPCPCD
+#    GOK = 1
+#    Call DEBTRANS From GLOCK
+#    Gosub TR1
+#    If GOK<1 : Break(2) : Endif
+#   Next : # [GCP]GCP0
+#   If NIVGRP=4  : # ML 2400 Groupe de compétence
+#    Break
+#   Endif
+#  SEGAY 10/11/10 LOT P02
+   L_LEG_NIV_SUP="" # SEGAY 25/10/12 US 930 81085
+#  Pour le lancement Famille(niveau NIVGRP=2), pour les métiers(niveau L_IJ=3) dépendants de la famille, il faut prendre les compétences métier
+#  sinon on passe au niveau Famille (L_IJ=2)
+   If NIVGRP=2 & L_IJ = 3
+     I = 0
+# SEGAY 25/10/12 US 930 81085
+     Read [F:ADI]CODE=10459;[L]CODGRP
+     If !fstat
+        L_LEG_NIV_SUP=[F:ADI]LEG
+     Endif
+# END SEGAY 25/10/12 US 930 81085
+     Filter [ADI] Where NUMTAB=10460 & DEPCOD=[L]CODGRP
+     If rowcount([F:ADI]) > 0
+       SAV_CRITGCD = L_CRITGCD
+       For [ADI]CODE
+#         L_CRITGCD -= "& [F]JOBGRP='"+[F:ADI]CODE+"'"
+         L_CRITGCD = SAV_CRITGCD+" & [F]JOBGRP='"+[F:ADI]CODE+"'"
+
+         Gosub FOR_GCP
+         If GOK<1 : Break(2) : Endif
+       Next
+     Endif
+     Filter [F:ADI]
+   Else : # NIVGRP=2 & L_IJ = 3
+     Gosub FOR_GCP
+     If GOK<1 : Break : Endif
+   Endif
+  Endif : # If (NIVGRP=4 & L_IJ=NIVGRP) | L_IJ<4
+ Endif : # If L_IJ=5
+Next L_IJ
+##################################################################################################
+
+Unlock =SYMBOLE
+
+#  SEGAY 10/11/10 LOT P02
+# On fait afficher la trace des postes à la fin dans $TR1
+#Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+#If NBPOT>0
+# #Nombre de postes mis à jour :
+# Call ECR_TRACE(mess(26,10720,1)-":"-num$(NBPOT),0) From GESECRAN
+#Else
+# #Aucun poste à traiter
+# Call ECR_TRACE(mess(27,10720,1),0) From GESECRAN
+#Endif
+If !GSERVEUR
+ Call FERME_TRACE From LECFIC
+Endif
+Return
+#  SEGAY 10/11/10 LOT P02
+#  Boucle sur GCP
+#####################################
+$FOR_GCP
+   # To be sure...
+   Filter [GCP] Where evalue(L_CRITGCP) & evalue(L_CRITGCD)
+   Read [GCP]GCP0 Last
+   If fstat>=4 & L_IJ=NIVGRP
+    Call ERREUR([L]CODGRP-mess(10,112,1)) From GESECRAN
+    #### Code inexistant
+    GERR = 1 : SAI = 0 : Return
+   Elsif fstat>=4
+    Raz [F:GCP]
+   Endif
+   Filter [GCP]
+   # JML 27/09/10 CG Parcourir tous les niveaux...
+   For [GCP]GCP0 Where evalue(L_CRITGCP) & evalue(L_CRITGCD)
+    WGOK=1 # SEGAY 25/10/12 US 930 81085
+    Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG, L_LEG_NIV # SEGAY 25/10/12 US 930 81085
+    L_LEG_NIV =[F:GCP]LEG # SEGAY 25/10/12 US 930 81085
+#    If L_LEG_NIV_SUP <> "" & L_LEG_NIV <>"" &  L_LEG_NIV_SUP <> L_LEG_NIV
+    If L_LEG_NIV_SUP <> ""  &  L_LEG_NIV_SUP <> L_LEG_NIV
+ # Incompatibilié de législation
+       Gosub MESSAGE_NIV
+       WMESSAGE = mess(104,10720,1)-":"-mess(NIVGRP,10937,1)-[L]CODGRP-":"-L_LEG_NIV_SUP-"/"-mess(L_IJ,10937,1)-WMESSAGE-":"-L_LEG_NIV    # Incompatibilié de législation
+       WGOK = 0
+    Endif
+    # SEGAY
+    # Si maj Dossier il faut garder le lien entre GPC et GCD
+    If NIVGRP = 1
+     For [HRGCD]GCD0 Where UOMGRP=[F:GCP]UOMGRP & JOBGRP=[F:GCP]JOBGRP & CPCFAM=[F:GCP]CPCFAM & evalue(L_CRITGCP) & evalue(L_CRITGCD)
+# SEGAY 25/10/12 US 930 81085
+       Call LECTURE("CPC",[F:HRGCD]CPC,"") From CONTOBJ
+       If ([F:CPC]LEG<>"" & [F:GCP]LEG<>"" & [F:CPC]LEG<>[F:GCP]LEG)
+&    | ([F:GCP]LEG="" & [F:CPC]LEG<>[F:GCP]LEG)    Then
+
+         WMESSAGE = mess(L_IJ,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM-mess(37,10720,1)-": " +[F:HRGCD]CPC - mess(62,127,1)-":"-[F:CPC]LEG : # Réservé à la législation
+         WGOK = 0
+         Break(1)
+       Endif
+# END SEGAY 25/10/12 US 930 81085
+       L_CPC(L_NB_CPC) = [F:HRGCD]CPC
+       L_NIV(L_NB_CPC) = [F:HRGCD]NIV
+       L_LEG(L_NB_CPC) = [F:CPC]LEG # SEGAY 25/10/12 US 930 81085
+       L_NB_CPC += 1
+     Next : # [HRGCD]GCD0
+    Else
+     For [HRGCD]GCD0 Where evalue(L_CRITGCP) & evalue(L_CRITGCD)
+# SEGAY 25/10/12 US 930 81085
+       Call LECTURE("CPC",[F:HRGCD]CPC,"") From CONTOBJ
+       If ([F:CPC]LEG<>"" & [F:GCP]LEG<>"" & [F:CPC]LEG<>[F:GCP]LEG)
+&    | ([F:GCP]LEG="" & [F:CPC]LEG<>[F:GCP]LEG)    Then
+
+         WMESSAGE = mess(L_IJ,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM-mess(37,10720,1)-": " +[F:HRGCD]CPC - mess(62,127,1)-":"-[F:CPC]LEG : # Réservé à la législation
+         WGOK = 0
+         Break(1)
+       Endif
+# END SEGAY 25/10/12 US 930 81085
+       L_CPC(L_NB_CPC) = [F:HRGCD]CPC
+       L_NIV(L_NB_CPC) = [F:HRGCD]NIV
+       L_LEG(L_NB_CPC) = [F:CPC]LEG # SEGAY 25/10/12 US 930 81085
+       L_NB_CPC += 1
+     Next : # [HRGCD]GCD0
+    Endif
+
+    Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+#    Call ECR_TRACE(TIT-":"-mess(L_IJ,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM,0) From GESECRAN
+    Call ECR_TRACE(mess(23,10720,1)-":"-mess(L_IJ,10937,1)-[F:GCP]UOMGRP-[F:GCP]JOBGRP-[F:GCP]CPCFAM,0) From GESECRAN
+    Call ECR_TRACE(string$(70,"*"),0) From GESECRAN
+# SEGAY 25/10/12 US 930 81085
+    If !WGOK Then
+     Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+    Else
+# END SEGAY 25/10/12 US 930 81085
+      # JML 30/07/10 LOT P02 Newfile GRPCPCD
+      GOK = 1
+      Call DEBTRANS From GLOCK
+      Gosub TR1
+      If GOK<1 : Break : Endif
+    Endif
+   Next : # [GCP]GCP0
+
+Return
+
+#####################################
+$TR1
+Trbegin [JOT],[POT]
+NBJOT=0 : NBPOT=0
+If L_IJ<>5
+ Gosub CRITERE_JOT
+ For [JOT]JOT0 Where evalue (CRITJOT)
+  WOK=1 :# SEGAY 25/10/12 US 930 81085
+  #Emploi type :
+  Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+# SEGAY 25/10/12 US 930 81085
+#  Call ECR_TRACE(mess(5,10937,1)-":"-[F:JOT]COD-[F:JOT]DES,0) From GESECRAN
+  Call LECTEXTRA(WDESAX3,"JOBTYP","DES",[F:JOT]COD,"") From ATEXTRA
+  Call ECR_TRACE(mess(5,10937,1)-":"-[F:JOT]COD-WDESAX3,0) From GESECRAN
+# SEGAY 25/10/12 US 930 81085
+#  If WOK & L_IJ <> 1 &  L_LEG_NIV<>"" & [F:JOT]LEG<>"" & L_LEG_NIV <>[F:JOT]LEG # SEGAY 25/10/12 US 930 81085
+  If WOK & L_IJ <> 1 &  L_LEG_NIV<>""  & L_LEG_NIV <>[F:JOT]LEG # SEGAY 25/10/12 US 930 81085
+     Gosub MESSAGE_NIV
+     W_AFF_LEG1=L_LEG_NIV
+     W_AFF_LEG2=[F:JOT]LEG
+     If L_LEG_NIV =""
+        W_AFF_LEG1=mess(91,187,1)
+     Endif
+     If [F:JOT]LEG  =""
+        W_AFF_LEG2=mess(91,187,1)
+     Endif
+ # Incompatibilié de législation
+     WMESSAGE = mess(104,10720,1)-":"-mess(L_IJ,10937,1)-WMESSAGE-":"-W_AFF_LEG1  -"/"- mess(5,10937,1)- [F:JOT]COD -":"-W_AFF_LEG2  # Incompatibilié de législation
+     Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+     WOK = 0
+  Endif
+  # SEGAY 25/10/12 US 930 81085
+  If WOK
+     For L_JK=0 To L_NB_CPC
+       If ([F:JOT]LEG <> "" & L_LEG(L_JK) <>  "" & L_LEG(L_JK)<>[F:JOT]LEG)
+&       | ([F:JOT]LEG = "" & L_LEG(L_JK) <> [F:JOT]LEG) Then
+        WMESSAGE = mess(L_IJ,10937,1) -":"- mess(103,10720,1)- L_CPC(L_JK) -mess(62,127,1)-":"-L_LEG(L_JK) : # Réservé à la législation
+        Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+        WOK = 0
+        Break
+       Endif
+     Next
+  Endif
+  If WOK
+#  Gosub MAJ_JOT
+#  ...
+     Gosub MAJ_JOT_POT
+     If !GOK : Break : Endif
+# END SEGAY 25/10/12 US 930 81085
+  Endif : # WOK SEGAY 25/10/12 US 930 81085
+  # Segay 10/11/10 Fin Mise à jour du niveau pour les postes à emploi type
+ Next
+ If   GOK<0 : Goto ROLL_TR1
+ Elsif !GOK : Goto AB_TR1
+ Endif
+ Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+ If NBJOT>0
+  #Nombre d'emplois type mis à jour :
+  Call ECR_TRACE(mess(24,10720,1)-":"-num$(NBJOT),0) From GESECRAN
+ Else
+  #Aucun emploi type à traiter
+  Call ECR_TRACE(mess(25,10720,1),0) From GESECRAN
+ Endif
+Endif
+
+# Segay 10/11/10 lot P02 MAJ postes directement pour niveau = groupe de compétence ou = emploi type
+If NIVGRP=4 or NIVGRP=5
+  Gosub CRITERE_POT
+  For [POT]POT0 Where evalue(CRITPOT)
+   WOK=1 :# SEGAY 25/10/12 US 930 81085
+   #Poste :
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+#   Call ECR_TRACE(space$(5)+mess(4,10939,1)-":"-[F:POT]COD-[F:POT]DES-": ("+CRITPOT+")",0) From GESECRAN
+# SEGAY 25/10/12 US 930 81085
+#   Call ECR_TRACE(space$(5)+mess(4,10939,1)-":"-[F:POT]COD-[F:POT]DES,0) From GESECRAN
+   Call LECTEXTRA(WDESAX3,"POSTE","DES",[F:POT]COD,"") From ATEXTRA
+   Call ECR_TRACE(space$(5)+mess(4,10939,1)-":"-[F:POT]COD-WDESAX3,0) From GESECRAN
+
+# SEGAY 25/10/12 US 930 81085
+#   If WOK & L_IJ <> 1 & L_LEG_NIV <>"" & [F:POT]LEG <> "" & L_LEG_NIV <> [F:POT]LEG # SEGAY 25/10/12 US 930 81085
+   If WOK & L_IJ <> 1 & L_LEG_NIV <>"" & L_LEG_NIV <> [F:POT]LEG # SEGAY 25/10/12 US 930 81085
+
+     Gosub MESSAGE_NIV
+     W_AFF_LEG1=L_LEG_NIV
+     W_AFF_LEG2=[F:POT]LEG
+     If L_LEG_NIV =""
+        W_AFF_LEG1=mess(91,187,1)
+     Endif
+     If [F:POT]LEG  =""
+        W_AFF_LEG2=mess(91,187,1)
+     Endif
+# Incompatibilié de législation
+     WMESSAGE = mess(104,10720,1)-":"-mess(L_IJ,10937,1)-WMESSAGE-":"-W_AFF_LEG1 -"/"- mess(6,10937,1)- [F:POT]COD -":"-W_AFF_LEG2
+
+     Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+     WOK = 0
+   Endif
+
+#   If  WOK & [F:POT]LEG<>"" & [F:JOT]LEG<>"" & [F:POT]LEG <> [F:JOT]LEG Then
+#   If  WOK & [F:JOT]LEG<>"" & [F:POT]LEG <> [F:JOT]LEG Then
+#      WMESSAGE = mess(6,10937,1)-[F:POT]COD -mess(62,127,1)-":"-[F:POT]LEG : # Réservé à la législation
+#      Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+#      WOK = 0
+#   Endif
+   If WOK
+     For L_JK=0 To L_NB_CPC
+#       If L_LEG(L_JK) <>  "" & [F:POT]LEG <> "" & L_LEG(L_JK) <> [F:POT]LEG
+       If ([F:POT]LEG <>  "" & L_LEG(L_JK) <> "" & L_LEG(L_JK) <> [F:POT]LEG)
+&    | ([F:POT]LEG="" & L_LEG(L_JK)<>[F:POT]LEG )    Then
+        WMESSAGE = mess(NIVGRP,10937,1) -":"- mess(103,10720,1)- L_CPC(L_JK) -mess(62,127,1)-":"-L_LEG(L_JK) : # Réservé à la législation
+        Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+        WOK = 0
+       Endif
+     Next
+   Endif
+
+   If WOK
+     Gosub MAJ_POT_OF_JOBPOT
+     If !GOK : Break : Endif
+   Endif
+# END SEGAY 25/10/12 US 930 81085
+
+#   # Segay 10/11/10 lot P02 MAJ postes par l'emploi type si le groupe de compétence n'existe pas dans l'emploi-type
+#     If NIVGRP=4 & [F:POT]JOBPOT <> ""
+#       Call LECTURE("JOT",[F:POT]JOBPOT,"") From CONTOBJ
+#       If !fstat & !evalue(CRITJOT)
+#         # Sauvegarde des tableau maj poste
+#         Raz L_SAV_CPC, L_SAV_NIV, L_SAV_NB_CPC, L_SAV_LEG # SEGAY 25/10/12 US 930 81085
+##       For L_I=0 To L_NB_CPC
+##          L_SAV_CPC(L_I)=L_CPC(L_I)
+##       Next
+##       For L_I=0 To L_NB_CPC
+##          L_SAV_NIV(L_I)=L_NIV(L_I)
+##       Next
+#         For L_I=0 To L_NB_CPC
+#            L_SAV_CPC(L_I)=L_CPC(L_I)
+#            L_SAV_NIV(L_I)=L_NIV(L_I)
+#            L_SAV_LEG(L_I)=L_LEG(L_I)
+#         Next
+## ENDSEGAY 25/10/12 US 930 81085
+#
+#         L_SAV_NB_CPC = L_NB_CPC
+#
+#         Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG # SEGAY 25/10/12 US 930 81085
+#         For L_JK=0 To dim([F:JOT]CPC)-1
+#           If [F:JOT]CPC(L_JK)="" : Break : Endif
+## SEGAY 25/10/12 US 930 81085
+#           Call LECTURE("CPC",[F:JOT]CPC(L_JK),"") From CONTOBJ
+#           If [F:CPC]LEG<>"" & [F:JOT]LEG<>"" & [F:CPC]LEG<>[F:JOT]LEG Then
+#            WMESSAGE = mess(NIVGRP,10937,1)-[F:JOT]COD-mess(37,10720,1)-": " +[F:JOT]CPC(L_JK) - mess(62,127,1)-":"-[F:CPC]LEG : # Réservé à la législation
+#            Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+#            FLGMAJ=0
+#            WOK = 0
+#            Break(1)
+#           Endif
+#  # END SEGAY 25/10/12 US 930 81085
+#
+#           L_CPC(L_NB_CPC) = [F:JOT]CPC(L_JK)
+#           L_NIV(L_NB_CPC) = [F:JOT]NIV(L_JK)
+#           # SEGAY 10/11/10  LOT P02 origine de la compétence dans le groupe emploi type
+#           L_ORI(L_NB_CPC) = [F:JOT]ORI(L_JK)
+#           L_LEG(L_NB_CPC) = [F:CPC]LEG # SEGAY 25/10/12 US 930 81085
+#
+#           L_NB_CPC += 1
+#         Next : # [HRGCD]GCD0
+#         If WOK # SEGAY 25/10/12 US 930 81085
+#           # Segay 10/11/10 On met le niveau maj pour les postes
+#           L_IP = 5
+#           NIVGRP = 5
+#           Gosub MAJ_POT
+#           NIVGRP = 4
+#         Endif
+#         Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG # SEGAY 25/10/12 US 930 81085
+##       For L_I=0 To L_SAV_NB_CPC
+##          L_CPC(L_I)=L_SAV_CPC(L_I)
+##       Next
+##       For L_I=0 To L_SAV_NB_CPC
+##          L_NIV(L_I)=L_SAV_NIV(L_I)
+##       Next
+#         For L_I=0 To L_SAV_NB_CPC
+#            L_CPC(L_I)=L_SAV_CPC(L_I)
+#            L_NIV(L_I)=L_SAV_NIV(L_I)
+#            L_LEG(L_I)=L_SAV_LEG(L_I)
+#         Next
+## END SEGAY 25/10/12 US 930 81085
+#
+#         L_NB_CPC = L_SAV_NB_CPC
+#         If FLGMAJ=1
+#          [F:POT]UPDDAT=date$ :  [F:POT]UPDUSR=GUSER :  [F:POT]UPDTIM=time
+#          Rewrite [F:POT]
+#          If fstat
+#           GOK = 0 : Call FSTA("POT") From GLOCK : Break
+#          Endif
+#          NBPOT+=1
+#          #Mise à jour du poste :
+## SEGAY 25/10/12 US 930 81085
+##        Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-[F:POT]DES,0) From GESECRAN
+#          Call LECTEXTRA(WDESAX3,"POSTE","DES",[F:POT]COD,"") From ATEXTRA
+#          Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-WDESAX3,0) From GESECRAN
+#         Endif
+#       Endif
+#     Endif
+#     # Segay 10/11/10 On met le niveau maj pour les postes
+#     L_IP = L_IJ
+#     Gosub MAJ_POT
+#     If FLGMAJ=1
+#      [F:POT]UPDDAT=date$ :  [F:POT]UPDUSR=GUSER :  [F:POT]UPDTIM=time
+#      Rewrite [F:POT]
+#      If fstat
+#       GOK = 0 : Call FSTA("POT") From GLOCK : Break
+#      Endif
+#      NBPOT+=1
+#      #Mise à jour du poste :
+## SEGAY 25/10/12 US 930 81085
+##    Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-[F:POT]DES,0) From GESECRAN
+#      Call LECTEXTRA(WDESAX3,"POSTE","DES",[F:POT]COD,"") From ATEXTRA
+#      Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-WDESAX3,0) From GESECRAN
+#     Endif
+#   Endif # WOK SEGAY 25/10/12 US 930 81085
+  Next
+Endif : # PAS DE MAJ POSTES POUR NIVEAU DOSSIER
+
+Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+If NBPOT>0
+ #Nombre de postes mis à jour :
+ Call ECR_TRACE(mess(26,10720,1)-":"-num$(NBPOT),0) From GESECRAN
+Else
+ #Aucun poste à traiter
+ Call ECR_TRACE(mess(27,10720,1),0) From GESECRAN
+Endif
+Commit
+Return
+
+#SEGAY 25/10/12 US 930 81085
+$MAJ_JOT_POT
+Gosub MAJ_JOT
+If FLGMAJ=1
+   [F:JOT]UPDDAT=date$ :  [F:JOT]UPDUSR=GUSER :  [F:JOT]UPDTIM=time
+   Rewrite [F:JOT]
+   If fstat
+    GOK = 0 : Call FSTA("JOT") From GLOCK : Return
+   Endif
+# SEGAY 25/10/12 US 930 81085
+#   Call ECR_TRACE(mess(29,10720,1)-":"-[F:JOT]COD-[F:JOT]DES,0) From GESECRAN
+   Call LECTEXTRA(WDESAX3,"JOBTYP","DES",[F:JOT]COD,"") From ATEXTRA
+   Call ECR_TRACE(mess(29,10720,1)-":"-[F:JOT]COD-WDESAX3,0) From GESECRAN
+   NBJOT+=1
+Endif
+# SEGAY 10/11/10 mise à jour des postes liés à l'emploi type
+For [POT]POT0 Where JOBPOT=[F:JOT]COD
+   WOK=1 :# SEGAY 25/10/12 US 930 81085
+   #Poste :
+   Call ECR_TRACE(string$(70,"-"),0) From GESECRAN
+# SEGAY 25/10/12 US 930 81085
+#     Call ECR_TRACE(space$(5)+mess(4,10939,1)-":"-[F:POT]COD-[F:POT]DES,0) From GESECRAN
+   Call LECTEXTRA(WDESAX3,"POSTE","DES",[F:POT]COD,"") From ATEXTRA
+   Call ECR_TRACE(space$(5)+mess(4,10939,1)-":"-[F:POT]COD-WDESAX3,0) From GESECRAN
+# SEGAY 25/10/12 US 930 81085
+#  If WOK & L_IJ<>1 & [F:POT]LEG<>"" & [F:JOT]LEG<>"" & [F:POT]LEG <> [F:JOT]LEG # SEGAY 25/10/12 US 930 81085
+  If WOK & L_IJ<>1 &  [F:JOT]LEG<>"" & [F:POT]LEG <> [F:JOT]LEG # SEGAY 25/10/12 US 930 81085
+
+     W_AFF_LEG1=[F:POT]LEG
+     W_AFF_LEG2=[F:JOT]LEG
+     If W_AFF_LEG1 =""
+        W_AFF_LEG1=mess(91,187,1)
+     Endif
+     If W_AFF_LEG2  =""
+        W_AFF_LEG2=mess(91,187,1)
+     Endif
+ # Incompatibilié de législation
+     WMESSAGE = mess(104,10720,1)-":"-mess(5,10937,1) - [F:JOT]COD  -":"-W_AFF_LEG1 -"/"- mess(6,10937,1)- [F:POT]COD -":"-W_AFF_LEG2
+
+     Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+     WOK = 0
+  Endif
+
+#   If WOK & [F:POT]LEG<>"" & [F:JOT]LEG<>"" & [F:POT]LEG <> [F:JOT]LEG Then
+   If WOK & [F:JOT]LEG<>"" & [F:POT]LEG <> [F:JOT]LEG Then
+
+      WMESSAGE = mess(6,10937,1)-[F:POT]COD -mess(62,127,1)-":"-[F:POT]LEG : # Réservé à la législation
+      Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+      FLGMAJ=0
+      WOK = 0
+   Endif
+   If WOK & [F:POT]LEG <> ""
+      For L_JK=0 To dim([F:JOT]CPC)-1
+         If  [F:JOT]CPC(L_JK)<> ""
+           Call LECTURE("CPC",[F:JOT]CPC(L_JK),"") From CONTOBJ
+
+           If ([F:CPC]LEG <>  "" & [F:POT]LEG <> "" & [F:CPC]LEG <> [F:POT]LEG)
+&           | ([F:POT]LEG="" & [F:CPC]LEG<>[F:POT]LEG )    Then
+
+            WMESSAGE = +mess(5,10937,1) -":"- mess(103,10720,1)-[F:JOT]CPC(L_JK) -mess(62,127,1)-":"-[F:CPC]LEG : # Réservé à la législation
+            Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+            WOK = 0
+            Break
+           Endif
+         Endif
+      Next
+   Endif
+
+   If WOK
+# END SEGAY 25/10/12 US 930 81085
+
+     # Sauvegarde des tableau maj poste
+     Raz L_SAV_CPC, L_SAV_NIV, L_SAV_NB_CPC, L_SAV_LEG # SEGAY 25/10/12 US 930 81085
+#     For L_J=0 To L_NB_CPC
+#        L_SAV_CPC(L_I)=L_CPC(L_I)
+#     Next
+#     For L_I=0 To L_NB_CPC
+#        L_SAV_NIV(L_I)=L_NIV(L_I)
+#     Next
+     For L_I=0 To L_NB_CPC
+        L_SAV_CPC(L_I)=L_CPC(L_I)
+        L_SAV_NIV(L_I)=L_NIV(L_I)
+        L_SAV_LEG(L_I)=L_LEG(L_I)
+     Next
+# ENDSEGAY 25/10/12 US 930 81085
+     L_SAV_NB_CPC = L_NB_CPC
+     Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG # SEGAY 25/10/12 US 930 81085
+     For L_JK=0 To dim([F:JOT]CPC)-1
+       If [F:JOT]CPC(L_JK)="" : Break : Endif
+# SEGAY 25/10/12 US 930 81085
+#    If !func SUBJOT.CHECKLEG_CPC([F:JOT]CPC(L_JK),[F:JOT]LEG)
+       Call LECTURE("CPC",[F:JOT]CPC(L_JK),"") From CONTOBJ
+       If ([F:CPC]LEG<>"" & [F:JOT]LEG<>"" & [F:CPC]LEG<>[F:JOT]LEG)
+&       | ([F:JOT]LEG="" & [F:CPC]LEG<>[F:JOT]LEG )    Then
+
+          WMESSAGE = mess(L_IJ,10937,1)-[F:JOT]COD-mess(37,10720,1)-": " +[F:JOT]CPC(L_JK) - mess(62,127,1)-":"-[F:CPC]LEG : # Réservé à la législation
+          FLGMAJ=0
+          WOK = 0
+          Break(1)
+       Endif
+# END SEGAY 25/10/12 US 930 81085
+
+       L_CPC(L_NB_CPC) = [F:JOT]CPC(L_JK)
+       L_NIV(L_NB_CPC) = [F:JOT]NIV(L_JK)
+       # SEGAY 10/11/10  LOT P02 origine de la compétence dans le groupe emploi type
+       L_ORI(L_NB_CPC) = [F:JOT]ORI(L_JK)
+       L_LEG(L_NB_CPC) = [F:CPC]LEG # SEGAY 25/10/12 US 930 81085
+       L_NB_CPC += 1
+     Next : # [HRGCD]GCD0
+     If WOK # SEGAY 25/10/12 US 930 81085
+
+     # Segay 10/11/10 On met le niveau maj pour les postes
+       L_IP = 5
+       Gosub MAJ_POT
+#     Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG # SEGAY 25/10/12 US 930 81085
+#     For L_I=0 To L_SAV_NB_CPC
+#        L_CPC(L_I)=L_SAV_CPC(L_I)
+#     Next
+#     For L_I=0 To L_SAV_NB_CPC
+#        L_NIV(L_I)=L_SAV_NIV(L_I)
+#     Next
+# END SEGAY 25/10/12 US 930 81085
+
+       L_NB_CPC = L_SAV_NB_CPC
+
+       If FLGMAJ=1
+        [F:POT]UPDDAT=date$ :  [F:POT]UPDUSR=GUSER :  [F:POT]UPDTIM=time
+        Rewrite [F:POT]
+        If fstat
+         GOK = 0 : Call FSTA("POT") From GLOCK : Return
+        Endif
+        NBPOT+=1
+        #Mise à jour du poste :
+# SEGAY 25/10/12 US 930 81085
+#      Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-[F:POT]DES,0) From GESECRAN
+        Call LECTEXTRA(WDESAX3,"POSTE","DES",[F:POT]COD,"") From ATEXTRA
+        Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-WDESAX3,0) From GESECRAN
+       Endif
+     Endif : # WOK SEGAY 25/10/12 US 930 81085
+     # SEGAY 25/10/12 US 930 81085
+     Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG # SEGAY 25/10/12 US 930 81085
+     For L_I=0 To L_SAV_NB_CPC
+          L_CPC(L_I)=L_SAV_CPC(L_I)
+          L_NIV(L_I)=L_SAV_NIV(L_I)
+          L_LEG(L_I)=L_SAV_LEG(L_I)
+     Next
+     L_NB_CPC = L_SAV_NB_CPC
+     # END SEGAY 25/10/12 US 930 81085
+   Endif : # WOK SEGAY 25/10/12 US 930 81085
+Next
+Return
+
+# SEGAY 25/10/12 US 930 81085
+$MAJ_POT_OF_JOBPOT
+# Segay 10/11/10 lot P02 MAJ postes par l'emploi type si le groupe de compétence n'existe pas dans l'emploi-type
+If NIVGRP=4 & [F:POT]JOBPOT <> ""
+  Call LECTURE("JOT",[F:POT]JOBPOT,"") From CONTOBJ
+  If !fstat & !evalue(CRITJOT)
+   # SEGAY 25/10/12 US 930 81085
+   If  WOK & [F:JOT]LEG<>"" & [F:POT]LEG <> [F:JOT]LEG Then
+      WMESSAGE = mess(6,10937,1)-[F:POT]COD -mess(62,127,1)-":"-[F:POT]LEG : # Réservé à la législation
+      Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+      WOK = 0
+      Return
+   Endif
+
+   # Sauvegarde des tableau maj poste
+   Raz L_SAV_CPC, L_SAV_NIV, L_SAV_NB_CPC, L_SAV_LEG # SEGAY 25/10/12 US 930 81085
+   For L_I=0 To L_NB_CPC
+       L_SAV_CPC(L_I)=L_CPC(L_I)
+       L_SAV_NIV(L_I)=L_NIV(L_I)
+       L_SAV_LEG(L_I)=L_LEG(L_I)
+   Next
+# ENDSEGAY 25/10/12 US 930 81085
+
+    L_SAV_NB_CPC = L_NB_CPC
+    Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG # SEGAY 25/10/12 US 930 81085
+    For L_JK=0 To dim([F:JOT]CPC)-1
+       If [F:JOT]CPC(L_JK)="" : Break : Endif
+# SEGAY 25/10/12 US 930 81085
+       Call LECTURE("CPC",[F:JOT]CPC(L_JK),"") From CONTOBJ
+       If ([F:CPC]LEG<>"" & [F:JOT]LEG<>"" & [F:CPC]LEG<>[F:JOT]LEG)
+&      | ([F:JOT]LEG="" & [F:CPC]LEG<>[F:JOT]LEG )    Then
+
+          WMESSAGE = mess(NIVGRP,10937,1)-[F:JOT]COD-mess(37,10720,1)-": " +[F:JOT]CPC(L_JK) - mess(62,127,1)-":"-[F:CPC]LEG : # Réservé à la législation
+          Call ECR_TRACE(WMESSAGE,1) From GESECRAN
+          FLGMAJ=0
+          WOK = 0
+          Break(1)
+       Endif
+  # END SEGAY 25/10/12 US 930 81085
+       L_CPC(L_NB_CPC) = [F:JOT]CPC(L_JK)
+       L_NIV(L_NB_CPC) = [F:JOT]NIV(L_JK)
+       # SEGAY 10/11/10  LOT P02 origine de la compétence dans le groupe emploi type
+       L_ORI(L_NB_CPC) = [F:JOT]ORI(L_JK)
+       L_LEG(L_NB_CPC) = [F:CPC]LEG # SEGAY 25/10/12 US 930 81085
+
+       L_NB_CPC += 1
+     Next : # [HRGCD]GCD0
+     If WOK # SEGAY 25/10/12 US 930 81085
+       # Segay 10/11/10 On met le niveau maj pour les postes
+       L_IP = 5
+       NIVGRP = 5
+       Gosub MAJ_POT
+       NIVGRP = 4
+     Endif
+     Raz L_CPC, L_NIV, L_NB_CPC, L_ORI, L_LEG # SEGAY 25/10/12 US 930 81085
+     For L_I=0 To  L_SAV_NB_CPC
+         L_CPC(L_I)=L_SAV_CPC(L_I)
+         L_NIV(L_I)=L_SAV_NIV(L_I)
+         L_LEG(L_I)=L_SAV_LEG(L_I)
+     Next
+# END SEGAY 25/10/12 US 930 81085
+
+     L_NB_CPC = L_SAV_NB_CPC
+     If FLGMAJ=1
+        [F:POT]UPDDAT=date$ :  [F:POT]UPDUSR=GUSER :  [F:POT]UPDTIM=time
+        Rewrite [F:POT]
+        If fstat
+         GOK = 0 : Call FSTA("POT") From GLOCK : Return
+        Endif
+        NBPOT+=1
+        #Mise à jour du poste :
+# SEGAY 25/10/12 US 930 81085
+#        Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-[F:POT]DES,0) From GESECRAN
+         Call LECTEXTRA(WDESAX3,"POSTE","DES",[F:POT]COD,"") From ATEXTRA
+         Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-WDESAX3,0) From GESECRAN
+      Endif
+  Endif
+Endif
+# Segay 10/11/10 On met le niveau maj pour les postes
+L_IP = L_IJ
+Gosub MAJ_POT
+If FLGMAJ=1
+  [F:POT]UPDDAT=date$ :  [F:POT]UPDUSR=GUSER :  [F:POT]UPDTIM=time
+  Rewrite [F:POT]
+  If fstat
+   GOK = 0 : Call FSTA("POT") From GLOCK : Return
+  Endif
+  NBPOT+=1
+  #Mise à jour du poste :
+# SEGAY 25/10/12 US 930 81085
+#    Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-[F:POT]DES,0) From GESECRAN
+   Call LECTEXTRA(WDESAX3,"POSTE","DES",[F:POT]COD,"") From ATEXTRA
+   Call ECR_TRACE(space$(5)+mess(28,10720,1)-":"-[F:POT]COD-WDESAX3,0) From GESECRAN
+Endif
+Return
+
+#Ajout dans les emplois type, des compétences groupes inexistantes.
+#Maj des niveaux de compétences dans les emplois type, en fonction de ceux définis dans les groupes, à condition
+#que les compétences à modifier proviennent du même héritage (et même famille si niveau famille)
+#####################################
+$MAJ_JOT
+FLGMAJ=0
+K = 0
+Gosub SUPP_JOT
+# Segay 10/11/10 lot P02
+# K étant la prochaine position libre
+#If K>=dim([F:JOT]CPC)-1
+#If K>=dim([F:JOT]CPC)
+# #Tableau des compétences plein
+# Call ECR_TRACE(mess(5,10720,1)-":"-[F:JOT]COD-[F:JOT]DES,1) From GESECRAN
+# Return
+#Endif
+
+If !(L_IJ=1 & NIVGRP=1 & [F:JOT]JOBGRP = "") # Bug 71019 récupération des compétences dossier, famille, métier que si le métier est renseigné
+For I=0 To L_NB_CPC-1
+ If L_CPC(I)<>""
+  J=find(L_CPC(I),[F:JOT]CPC)
+  If !J
+   # K étant la prochaine position libre
+   # Segay 10/11/10 lot P02
+   If K>=dim([F:JOT]CPC)
+    #Tableau des compétences plein
+# SEGAY 25/10/12 US 930 81085
+#    Call ECR_TRACE(mess(5,10720,1)-":"-[F:JOT]COD-[F:JOT]DES,1) From GESECRAN
+    Call LECTEXTRA(WDESAX3,"JOBTYP","DES",[F:JOT]COD,"") From ATEXTRA
+    Call ECR_TRACE(mess(5,10720,1)-":"-[F:JOT]COD-WDESAX3,1) From GESECRAN
+    Break
+   Endif
+
+   [F:JOT]CPC(K) = L_CPC(I)
+   [F:JOT]NIV(K) = L_NIV(I)
+   [F:JOT]ORI(K) = L_IJ       : # ML 2400 (JML 27/09/10 ce n'est plus NIVGRP mais L_IJ)
+   [F:JOT]WEI(K) = 1
+   If NIVGRP=4 : # ML 2400 Groupe de compétence
+    [F:JOT]CODORI(K) = [F:GCP]CPCFAM
+   Else
+    [F:JOT]CODORI(K) = ""
+   Endif
+   FLGMAJ =1
+   #Compétence attribuée :
+   Call ECR_TRACE(mess(14,10720,1)-":"-[F:JOT]CPC(K)-[F:JOT]NIV(K)-mess([F:JOT]ORI(K),10937,1),0) From GESECRAN
+   K += 1
+   # Segay 10/11/10 lot P02
+   # K étant la prochaine position libre
+   #If K=dim([F:JOT]CPC)-1
+#   If K>=dim([F:JOT]CPC)
+#    #Tableau des compétences plein
+#    Call ECR_TRACE(mess(5,10720,1)-":"-[F:JOT]COD-[F:JOT]DES,1) From GESECRAN
+#    Break
+#   Endif
+  Else
+   If [F:JOT]ORI(J-1)= L_IJ & [F:JOT]NIV(J-1)<>L_NIV(I)  & (NIVGRP<>4 | [F:JOT]CODORI(J-1)=[F:GCP]CPCFAM)
+    [F:JOT]NIV(J-1) = L_NIV(I)
+    FLGMAJ=1
+    #Mise à jour du niveau de compétence :
+    Call ECR_TRACE(mess(16,10720,1)-":"-[F:JOT]CPC(J-1)-[F:JOT]NIV(J-1)-mess([F:JOT]ORI(J-1),10937,1),0) From GESECRAN
+   Endif
+  Endif
+ Else
+  Break
+ Endif
+Next
+Endif # END_Bug 71019 récupération des compétences dossier, famille, métier que si le métier est renseigné
+Return
+
+#####################################
+#Gestion des suppressions
+#Si une compétence héritée du groupe courant, existe dans l'emploi type
+#mais plus dans le groupe -> on la supprime
+#En sortie de boucle K =  du 1er indice libre
+$SUPP_JOT
+# Segay 10/11/10 lot P02
+# Pour eviter de reboucler sur le tableau CPC en mettant K=-1
+# On lit le tableau CPC à l'envers en partant de la dernière item renseigné
+
+#For K=0 To dim([F:JOT]CPC)-1
+# If [F:JOT]CPC(K)="" : Break : Endif
+## If [F:JOT]ORI(K)=NIVGRP & !find([F:JOT]CPC(K),L_CPC(0..L_NB_CPC)) & (NIVGRP<>4 | [F:JOT]CODORI(K)=[F:GCP]CPCFAM)
+# If [F:JOT]ORI(K)=L_IJ & [F:JOT]ORI(K)<>7 & !find([F:JOT]CPC(K),L_CPC(0..L_NB_CPC))
+#  # JML 27/09/10 CG on supprime si Origine & Origine<>Manuelle
+#  #Compétence supprimée :
+#  Call ECR_TRACE(mess(32,10720,1)-":"-[F:JOT]CPC(K)-[F:JOT]NIV(K),0) From GESECRAN
+#  Dela K,1 [F:JOT]CPC, [F:JOT]NIV, [F:JOT]ORI, [F:JOT]WEI, [F:JOT]CODORI
+#  K=-1     :#pour repartir de 0
+#  FLGMAJ =1
+# Endif
+#Next
+
+If dim([F:JOT]CPC)< 1
+  Return
+Endif
+L_CPT=find ("",[F:JOT]CPC)
+L_I = dim([F:JOT]CPC)
+If L_CPT > 0
+  L_I = L_CPT-1
+Endif
+For K=L_I-1 To 0 Step -1
+ If [F:JOT]CPC(K)="" : Break : Endif
+# If [F:JOT]ORI(K)=NIVGRP & !find([F:JOT]CPC(K),L_CPC(0..L_NB_CPC)) & (NIVGRP<>4 | [F:JOT]CODORI(K)=[F:GCP]CPCFAM)
+# If [F:JOT]ORI(K)=L_IJ & [F:JOT]ORI(K)<>7 & !find([F:JOT]CPC(K),L_CPC(0..L_NB_CPC))
+ If [F:JOT]ORI(K)=L_IJ & [F:JOT]ORI(K)<>len(mess(0,10937,1)) & !find([F:JOT]CPC(K),L_CPC(0..L_NB_CPC))
+&   & (NIVGRP<>4 | (NIVGRP=4 & [F:JOT]CODORI(K)=[F:GCP]CPCFAM))
+  # JML 27/09/10 CG on supprime si Origine & Origine<>Manuelle
+  #Compétence supprimée :
+  Call ECR_TRACE(mess(32,10720,1)-":"-[F:JOT]CPC(K)-[F:JOT]NIV(K)-mess([F:JOT]ORI(K),10937,1),0) From GESECRAN
+  Dela K,1 [F:JOT]CPC, [F:JOT]NIV, [F:JOT]ORI, [F:JOT]WEI, [F:JOT]CODORI
+#  K=-1     :#pour repartir de 0
+  FLGMAJ =1
+ Endif
+ # Segay 10/11/10 lot P02
+# Si on n'est pas en maj héritage groupe,
+# on supprime compétences origine groupes si elles existent dans le père
+# pour les mettre à jour avec la bonne origine du père
+ If [F:JOT]ORI(K)<>L_IJ & [F:JOT]ORI(K)=4 & find([F:JOT]CPC(K),L_CPC(0..L_NB_CPC))
+&   & NIVGRP<>4
+  #Compétence supprimée :
+  Call ECR_TRACE(mess(32,10720,1)-":"-[F:JOT]CPC(K)-[F:JOT]NIV(K)-mess([F:JOT]ORI(K),10937,1),0) From GESECRAN
+  Dela K,1 [F:JOT]CPC, [F:JOT]NIV, [F:JOT]ORI, [F:JOT]WEI, [F:JOT]CODORI
+#  K=-1     :#pour repartir de 0
+  FLGMAJ =1
+ Endif
+# Bug 71019 récupération des compétences dossier, famille, métier que si le métier est renseigné
+ If L_IJ=1 & [F:JOT]JOBGRP = "" & [F:JOT]ORI(K)<>4 and [F:JOT]ORI(K)<>len(mess(0,10937,1))
+&   & NIVGRP=1
+  #Compétence supprimée :
+  Call ECR_TRACE(mess(32,10720,1)-":"-[F:JOT]CPC(K)-[F:JOT]NIV(K)-mess([F:JOT]ORI(K),10937,1),0) From GESECRAN
+  Dela K,1 [F:JOT]CPC, [F:JOT]NIV, [F:JOT]ORI, [F:JOT]WEI, [F:JOT]CODORI
+#  K=-1     :#pour repartir de 0
+  FLGMAJ =1
+ Endif
+# END_Bug 71019 récupération des compétences dossier, famille, métier que si le métier est renseigné
+Next
+L_CPT=find ("",[F:JOT]CPC)
+K = dim([F:JOT]CPC)
+If L_CPT > 0
+  K = L_CPT -1
+Endif
+Return
+
+#Ajout dans les postes, des compétences venant de l'emploi type inexistantes
+#Maj des niveaux de compétences dans les postes, en fonction de ceux définis dans les emplois type, à condition
+#que les compétences à modifier proviennent du même héritage.
+#####################################
+$MAJ_POT
+FLGMAJ=0
+K = 0
+Gosub SUPP_POT
+# Segay 10/11/10 lot P02
+# K étant la prochaine position libre
+#If K>=dim([F:POT]CPC)-1
+#If K>=dim([F:POT]CPC)
+# #Tableau des compétences plein
+# Call ECR_TRACE(space$(5)+mess(5,10720,1)-":"-[F:POT]COD-[F:POT]DES,1) From GESECRAN
+# Return
+#Endif
+For I=0 To L_NB_CPC-1
+ If L_CPC(I)<>""
+  J=find(L_CPC(I),[F:POT]CPC)
+  If !J
+   # K étant la prochaine position libre
+   # Segay 10/11/10 lot P02
+   If K>=dim([F:POT]CPC)
+    #Tableau des compétences plein
+# SEGAY 25/10/12 US 930 81085
+#    Call ECR_TRACE(space$(5)+mess(5,10720,1)-":"-[F:POT]COD-[F:POT]DES,1) From GESECRAN
+    Call LECTEXTRA(WDESAX3,"POSTE","DES",[F:POT]COD,"") From ATEXTRA
+    Call ECR_TRACE(space$(5)+mess(5,10720,1)-":"-[F:POT]COD-WDESAX3,1) From GESECRAN
+    Break
+   Endif
+
+   [F:POT]CPC(K) = L_CPC(I)
+   [F:POT]NIV(K) = L_NIV(I)
+#   [F:POT]ORI(K) = L_IJ       : # ML 2400 (JML 27/09/10 ce n'est plus NIVGRP mais L_IJ)
+   # Si le père = emploi type et que l'origine de l'empoi type = "Dossier ou Famille ou Métier"
+   # on prend l'origine de l'emploi type, sinon origine = père
+   If L_IP = 5 & L_ORI(I)<4 & L_ORI(I) > 0 # SEGAY 10/11/10  LOT P02 origine de la compétence dans le groupe emploi type
+    [F:POT]ORI(K) = L_ORI(I)
+   Else
+    [F:POT]ORI(K) = L_IP       : # ML 2400 (SEGAY 10/11/10 ce n'est plus NIVGRP mais L_IP)
+   Endif
+   [F:POT]WEI(K) = 1
+   If NIVGRP=4 : # ML 2400 Groupe de compétence
+    [F:POT]CODORI(K) = [F:GCP]CPCFAM
+   Else
+    [F:POT]CODORI(K) = ""
+   Endif
+   FLGMAJ =1
+   #Compétence attribuée :
+   Call ECR_TRACE(space$(5)+mess(14,10720,1)-":"-[F:POT]CPC(K)-[F:POT]NIV(K)-mess([F:POT]ORI(K),10937,1),0) From GESECRAN
+   K += 1
+   # K étant la prochaine position libre
+   # Segay 10/11/10 lot P02
+#   If K=dim([F:POT]CPC)-1
+#   If K>=dim([F:POT]CPC)
+#    #Tableau des compétences plein
+#    Call ECR_TRACE(space$(5)+mess(5,10720,1)-":"-[F:POT]COD-[F:POT]DES,1) From GESECRAN
+#    Break
+#   Endif
+  Else
+   # Si le père est emploi type
+   If L_IP = 5
+     FLGMAJMOD = 0
+     # Si la compétence du poste a une origine <> "manuelle"  ou une origine "groupe" mais inexistant dans la liste des groupes du poste
+#     If [F:POT]ORI(J-1)<>7 and ([F:POT]ORI(J-1)<>4 or ([F:POT]ORI(J-1) = 4 &  ([F:POT]CODORI(J-1)="" or !find([F:POT]CODORI(J-1),[F:POT]CPCFAM))))
+     # Si la compétence du poste a une origine <> "manuelle"
+     If [F:POT]ORI(J-1)<>len(mess(0,10937,1))
+      # maj du niveau si niveau différent
+      If [F:POT]NIV(J-1)<>L_NIV(I)
+       [F:POT]NIV(J-1) = L_NIV(I)
+       FLGMAJMOD=1
+      Endif
+      # Maj de l'origine
+      # si origine <> de l'origine de l'emploi type(dont origine <> "manuelle" et <> "groupe"
+      If (L_ORI(I)> 0  & L_ORI(I) <> len(mess(0,10937,1)) & L_ORI(I) <> 4)
+       If [F:POT]ORI(J-1) <> L_ORI(I)
+       # si origine du poste <> manuelle et <> groupe de compétence l'origine prend la valeur de l'origine de celle de emploi type
+         FLGMAJMOD=1
+         [F:POT]ORI(J-1) = L_ORI(I)
+       Endif
+      # si origine <> de "emploi type" et si emploi type à origine = "manuelle" ou = "groupe"
+      Elsif L_ORI(I)> 0 & (L_ORI(I) = len(mess(0,10937,1)) or L_ORI(I) = 4) & [F:POT]ORI(J-1) <> L_IP
+         FLGMAJMOD=1
+         [F:POT]ORI(J-1) = L_IP       : # ML 2400 (SEGAY 10/11/10 ce n'est plus NIVGRP mais L_IP)
+      Endif
+      If FLGMAJMOD=1
+         FLGMAJ=1
+         #Mise à jour du niveau de compétence :
+         Call ECR_TRACE(space$(5)+mess(16,10720,1)-":"-[F:POT]CPC(J-1)-[F:POT]NIV(J-1)-mess([F:POT]ORI(J-1),10937,1),0) From GESECRAN
+       Endif
+     Endif
+   Else
+     # Si le père <> emploi type
+     If [F:POT]ORI(J-1)=L_IP & [F:POT]NIV(J-1)<>L_NIV(I)  & (NIVGRP<>4 | [F:POT]CODORI(J-1)=[F:GCP]CPCFAM)
+      [F:POT]NIV(J-1) = L_NIV(I)
+      FLGMAJ=1
+      #Mise à jour du niveau de compétence :
+      Call ECR_TRACE(space$(5)+mess(16,10720,1)-":"-[F:POT]CPC(J-1)-[F:POT]NIV(J-1)-mess([F:POT]ORI(J-1),10937,1),0) From GESECRAN
+     Endif
+   Endif
+  Endif
+ Else
+  Break
+ Endif
+Next
+Return
+
+#####################################
+#Gestion des suppressions
+#Si une compétence héritée de l'emploi type, existe dans le poste
+#mais plus dans l'emploi type -> on la supprime
+#En sortie de boucle K =  du 1er indice libre
+$SUPP_POT
+# Segay 10/11/10 lot P02
+# Pour eviter de reboucler sur le tableau CPC en mettant K=-1
+# On lit le tableau CPC à l'envers en partant de la dernière item renseigné
+
+#For K=0 To dim([F:POT]CPC)-1
+# If [F:POT]CPC(K)="" : Break : Endif
+## If [F:POT]ORI(K)=NIVGRP & !find([F:POT]CPC(K),[F:JOT]CPC) & (NIVGRP<>4 | [F:POT]CODORI(K)=[F:GCP]CPCFAM)
+# If [F:POT]ORI(K)=L_IP & [F:POT]ORI(K)<>7 & !find([F:POT]CPC(K),L_CPC(0..L_NB_CPC))
+#    # JML 27/09/10 CG on supprime si Origine & Origine<>Manuelle
+#    #Compétence supprimée :
+#    Call ECR_TRACE(space$(5)+mess(32,10720,1)-":"-[F:POT]CPC(K)-[F:POT]NIV(K)-mess([F:POT]ORI(K),10937,1),0) From GESECRAN
+#    Dela K,1 [F:POT]CPC, [F:POT]NIV, [F:POT]ORI, [F:POT]WEI, [F:POT]CODORI
+#    K=-1     :#pour repartir de 0
+#    FLGMAJ =1
+# Endif
+#Next
+
+If dim([F:POT]CPC)< 1
+  Return
+Endif
+L_CPT=find ("",[F:POT]CPC)
+L_I = dim([F:POT]CPC)
+If L_CPT > 0
+  L_I = L_CPT-1
+Endif
+For K=L_I-1 To 0 Step -1
+ If [F:POT]CPC(K)="" : Break : Endif
+# If [F:POT]ORI(K)=NIVGRP & !find([F:POT]CPC(K),[F:JOT]CPC) & (NIVGRP<>4 | [F:POT]CODORI(K)=[F:GCP]CPCFAM)
+# If [F:POT]ORI(K)=L_IP & [F:POT]ORI(K)<>7 & !find([F:POT]CPC(K),L_CPC(0..L_NB_CPC))
+ # Si père est emploi type
+ If L_IP=5
+  # Si Compétence fils n'existe pas dans le père et que l'origine du fils <> "manuelle" et  <> "groupe" ou (= "groupe" et que le groupe n'existe pas dans la liste des groupes)
+  If ([F:POT]ORI(K)<>len(mess(0,10937,1)) & !find([F:POT]CPC(K),L_CPC(0..L_NB_CPC))
+&   & [F:POT]ORI(K)<>4) or ([F:POT]ORI(K) = 4 & ([F:POT]CODORI(K)="" or !find([F:POT]CODORI(K),[F:POT]CPCFAM)))
+    #Compétence supprimée :
+    Call ECR_TRACE(space$(5)+mess(32,10720,1)-":"-[F:POT]CPC(K)-[F:POT]NIV(K)-mess([F:POT]ORI(K),10937,1),0) From GESECRAN
+    Dela K,1 [F:POT]CPC, [F:POT]NIV, [F:POT]ORI, [F:POT]WEI, [F:POT]CODORI
+#    K=-1     :#pour repartir de 0
+    FLGMAJ =1
+  Endif
+ Else
+  If [F:POT]ORI(K)=L_IP & [F:POT]ORI(K)<>len(mess(0,10937,1)) & !find([F:POT]CPC(K),L_CPC(0..L_NB_CPC))
+&     & (NIVGRP<>4 | (NIVGRP=4 & [F:POT]CODORI(K)=[F:GCP]CPCFAM))
+    # JML 27/09/10 CG on supprime si Origine & Origine<>Manuelle
+    #Compétence supprimée :
+    Call ECR_TRACE(space$(5)+mess(32,10720,1)-":"-[F:POT]CPC(K)-[F:POT]NIV(K)-mess([F:POT]ORI(K),10937,1),0) From GESECRAN
+    Dela K,1 [F:POT]CPC, [F:POT]NIV, [F:POT]ORI, [F:POT]WEI, [F:POT]CODORI
+#    K=-1     :#pour repartir de 0
+    FLGMAJ =1
+  Endif
+ Endif
+  # Segay 10/11/10 lot P02
+# Si on n'est pas en maj héritage groupe,
+# on supprime compétences origine groupes si elles existent dans le père
+# pour les mettre à jour avec la bonne origine du père
+ If [F:POT]ORI(K)<>L_IJ & [F:POT]ORI(K)=4 & find([F:POT]CPC(K),L_CPC(0..L_NB_CPC))
+&   & NIVGRP<>4
+  #Compétence supprimée :
+    Call ECR_TRACE(space$(5)+mess(32,10720,1)-":"-[F:POT]CPC(K)-[F:POT]NIV(K)-mess([F:POT]ORI(K),10937,1),0) From GESECRAN
+    Dela K,1 [F:POT]CPC, [F:POT]NIV, [F:POT]ORI, [F:POT]WEI, [F:POT]CODORI
+#  K=-1     :#pour repartir de 0
+  FLGMAJ =1
+ Endif
+Next
+L_CPT=find ("",[F:POT]CPC)
+K = dim([F:POT]CPC)
+If L_CPT > 0
+  K = L_CPT -1
+Endif
+Return
+
+#####################################
+# SEGAY 25/10/12 US 930 81085
+$MESSAGE_NIV
+ Case L_IJ
+  When 1 : WMESSAGE =""                                   :#ML 2400 Dossier
+  When 2 : WMESSAGE =[F:GCP]UOMGRP                        :#ML 2400 Famille
+  When 3 : WMESSAGE =[F:GCP]JOBGRP                        :#ML 2400 Métier
+  When 4 : WMESSAGE =[F:GCP]CPCFAM                        :#ML 2400 Groupe de compétence
+  When 5 : WMESSAGE =CODGRP                               :#ML 2400 Emploi type
+ Endcase
+Return
+#####################################
+
+#####################################
+$CRITERE_JOT
+CRITJOT ="1=1"
+#If L_IJ=NIVGRP
+ Case L_IJ
+  When 1 : CRITJOT ="1=1"                                                 :#ML 2400 Dossier
+  When 2 : CRITJOT ="[F:JOT]UOMGRP='"+[F:GCP]UOMGRP+"'"                          :#ML 2400 Famille
+  When 3 : CRITJOT ="[F:JOT]JOBGRP='"+[F:GCP]JOBGRP+"'"                          :#ML 2400 Métier
+  When 4 : CRITJOT ="find([F:GCP]CPCFAM,[F:JOT]CPCFAM(0..dim([F:JOT]CPCFAM)-1))" :#ML 2400 Groupe de compétence
+ Endcase
+#Endif
+Return
+#####################################
+$CRITERE_POT
+CRITPOT ="1=1"
+#If L_IJ=NIVGRP
+ Case L_IJ
+  When 1 : CRITPOT ="1=1"                                                 :#ML 2400 Dossier
+  When 2 : CRITPOT ="[F:POT]UOMGRP='"+[F:GCP]UOMGRP+"'"                          :#ML 2400 Famille
+  When 3 : CRITPOT ="[F:POT]JOBGRP='"+[F:GCP]JOBGRP+"'"                          :#ML 2400 Métier
+  When 4 : CRITPOT ="find([F:GCP]CPCFAM,[F:POT]CPCFAM(0..dim([F:POT]CPCFAM)-1))" :#ML 2400 Groupe de compétence
+  When 5 : CRITPOT ="[F:POT]JOBPOT='"+CODGRP+"'"                          :#ML 2400 Emploi type
+ Endcase
+#Endif
+Return
+#####################################
+$AB_TR1
+Rollback
+Return
+
+#####################################
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+

@@ -1,0 +1,1196 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+##############################################################################
+## CPTLET
+#
+# Issue X3-34747 - 2017-08-09 by BEFOU : Currency variance not anymore calculated when partial matching
+#         ==> Deleted by X3-51971
+# Issue X3-51971 - 2017-08-09 by BEFOU : Add a parameter to trigger or not the new behavior
+#
+##############################################################################
+Local Integer NBECH  , TBECR(1..10) , TBECH(1..10) , STA, CAS
+Local Decimal TBIPT(1..10)
+Local Char MESSA , PCETYP(GLONGTE) , PCENUM(GLONVCR)
+GOK=1
+Trbegin GACCENTRYD , GACCDUDATE
+ NBECH = 2
+ TBECR(1) = 38716
+ TBECH(1) = 1
+ TBECR(2) = 38718
+ TBECH(2) = 1
+ CAS=1
+ If CAS=1
+  TBIPT(1) = 600
+  TBIPT(2) = 595
+ Else
+  TBIPT(1) = 100
+  TBIPT(2) = 100
+ Endif
+ # Subprog LETTRAGE(NBECH,TBECR,TBECH,TBIPT,CAS,TRACE,STA,MESSA,PCETYP,PCENUM)
+ Call LETTRAGE(NBECH,TBECR,TBECH,TBIPT,CAS,0,STA,MESSA,PCETYP,PCENUM)
+ #Infbox "STA="+num$(STA)+" PCETYP="+PCETYP+" PCENUM="+PCENUM
+Commit
+End
+
+######################################################
+## Mise en queue pour lettrage différé              ##
+## (on est déjà dans une transaction)               ##
+## On ne lettre qu'un référentiel : celui dont les  ##
+## accnums sont passés en paramètres                ##
+######################################################
+Subprog LETDIF(NBECH,ACCNUM,DUDLIG,AMTIPT,MTCTYP)
+Value Integer NBECH
+Value Integer ACCNUM(1..)
+Value Integer DUDLIG(1..)
+Value Decimal AMTIPT(1..)
+Value Integer MTCTYP
+
+Local Integer CAS : CAS = 0 : # Pas de lettrage des autres référentiels
+
+Goto LET_DIF
+
+
+#################################################################################################
+## Mise en queue pour lettrage différé                                                         ##
+## (on est déjà dans une transaction)                                                          ##
+## On lettre les accnums passés en paramètres (tous associés au référentiel et en principe le  ##
+## référentiel général principal) et on lettre les autres référentiels si les comptes sont     ##
+## lettrables                                                                                  ##
+#################################################################################################
+Subprog LETDIF2(NBECH,ACCNUM,DUDLIG,AMTIPT,MTCTYP)
+Value Integer NBECH
+Value Integer ACCNUM(1..)
+Value Integer DUDLIG(1..)
+Value Decimal AMTIPT(1..)
+Value Integer MTCTYP
+
+Local Integer CAS : CAS = 1 : # Lettrage des autres référentiels
+
+Goto LET_DIF
+
+
+$LET_DIF
+Local Integer I, J, K, MTCNUM
+Local Integer REFTYP, REFANA
+If clalev([F:MTB])=0 : Local File =GTABCPT+"MTCBATCH" [MTB] : Endif
+MTCNUM = uniqid([MTB])
+# Recherche de la société/site
+Local Char SOCIETE(GLONCPY) , SITE(GLONFCY)
+If dim([F:MTB]CPY)>0
+ If clalev([F:DUD])=0  : Local File GACCDUDATE [DUD] : Endif
+ If clalev([F:DAEX])=0 : Local File GACCENTRYD [DAEX] : Endif
+ If clalev([F:DATX])=0 : Local File GACCTMPD   [DATX] : Endif
+ If [F:DUD]ACCNUM=ACCNUM(NBECH)
+  SOCIETE = [F:DUD]CPY
+  SITE    = [F:DUD]FCY
+  ## Le référentiel général principal puisque c'est sur celui ci que sont générées les échéances...
+  Call SETMAINREF(SOCIETE,GTYPGEN,GTYPANA) From CPTDIV
+  REFTYP = GTYPGEN
+ Else
+  Read [DAEX]DAE2 = ACCNUM(NBECH)
+  If !fstat
+   SOCIETE = [F:DAEX]CPY
+   SITE    = [F:DAEX]FCYLIN
+   REFTYP  = [F:DAEX]LEDTYP
+  Else
+   Read [DATX]DAT1 = ACCNUM(NBECH)
+   If !fstat
+    SOCIETE = [F:DATX]CPY
+    SITE    = [F:DATX]FCYLIN
+    REFTYP  = [F:DATX]LEDTYP
+   Endif
+  Endif
+ Endif
+Endif
+
+# Première passe pour virer les doublons
+I = 2
+While I<=NBECH
+ K = 0
+ For J=1 To I-1
+  If ACCNUM(I)=ACCNUM(J) & DUDLIG(I)=DUDLIG(J)
+   K = J : Break
+  Endif
+ Next J
+ If K
+  AMTIPT(K) += AMTIPT(I)
+  Dela I,1,NBECH ACCNUM,DUDLIG,AMTIPT
+  NBECH -= 1
+ Else
+  I += 1
+ Endif
+Wend
+For I=1 To NBECH
+ Raz [F:MTB]
+ [F:MTB]MTCNUM = MTCNUM
+ [F:MTB]ACCNUM = ACCNUM(I)
+ [F:MTB]DUDLIG = DUDLIG(I)
+ [F:MTB]AMTIPT = AMTIPT(I)
+ [F:MTB]MTCTYP = MTCTYP
+ If dim([F:MTB]CPY)>0
+  [F:MTB]CPY = SOCIETE
+ Endif
+ Write [MTB]
+ If fstat
+  GOK=0 : Call FSTA("MTB") From GLOCK : Break
+ Endif
+Next I
+
+
+If CAS : # Lettrage des autres référentiels... (si LETDIF2 a été appelé)
+ Local Char    PARAM(10)
+ Local Integer YNBECH
+ Call PARAML("","MTCNBR",PARAM) From ADOVAL
+ YNBECH = min(32767,max(1000,val(PARAM)))
+ Local Integer XACCNUM(1..YNBECH)
+ Local Integer IREF, XNBECH
+ Local Integer XDUDLIG(1..YNBECH)
+ Local Decimal XAMTIPT(1..YNBECH)
+ For IREF=1 To len(mess(0,2644,1))
+  Call PROPAGE(SITE,REFTYP,NBECH,ACCNUM,IREF,XNBECH,XACCNUM)
+  If XNBECH>1
+   Call LETDIF(XNBECH,XACCNUM,XDUDLIG,XAMTIPT,MTCTYP) From CPTLET
+  Endif
+ Next IREF
+Endif
+End
+
+###############################################################################
+## Propagation du lettrage
+###############################################################################
+## Règles de propagation
+###############################################################################
+## On propage le lettrage si
+## - Le référentiel origine est le "principal général" (échéances)
+## - Le référentiel destination est lettrable et non automatique
+## - Le compte destination est toujours le même et est lettrable
+## - Il y a au moins 2 écritures
+###############################################################################
+Subprog PROPAGE(SITE,REFORG,NBORG,ACCORG,REFDES,NBDES,ACCDES)
+Value Char       SITE
+Value Integer    REFORG
+Value Integer    NBORG
+Value Integer    ACCORG(1..)
+Value Integer    REFDES
+Variable Integer NBDES
+Variable Integer ACCDES(1..)
+
+If REFORG=REFDES : End : Endif
+
+If clalev([F:FCY])=0  : Local File FACILITY   [FCY]  : Endif
+If clalev([F:CPY])=0  : Local File COMPANY    [CPY]  : Endif
+If clalev([F:GCM])=0  : Local File GACM       [GCM]  : Endif
+If clalev([F:LED])=0  : Local File GLED       [LED]  : Endif
+If clalev([F:ADW])=0  : Local File ADOVAL     [ADW]  : Endif
+If clalev([F:GAC])=0  : Local File GACCOUNT   [GAC]  : Endif
+If clalev([F:DAEX])=0 : Local File GACCENTRYD [DAEX] : Endif
+If clalev([F:DATX])=0 : Local File GACCTMPD   [DATX] : Endif
+
+Local Integer I , OK
+Local Char    TYPPCE(GLONGTE), NUMPCE(GLONVCR), IDTLIG(5)
+Local Char    SOCIETE(GLONCPY) , PLAN(GLONCOA), COMPTE(GLONGAC)
+Local Char    VALPAR(10)
+
+NBDES = 0
+Call LECTURE("FCY",SITE,"") From CONTOBJ
+Call LECTURE("CPY",[F:FCY]LEGCPY,"") From CONTOBJ
+Call LECTURE("GCM",[F:CPY]ACM,"") From CONTOBJ
+If REFORG<>[F:GCM]GENLEDTYP : End : Endif
+If [F:GCM]LED(REFDES-1)="" or [F:GCM]CFMAUT(REFDES-1)=2 : End : Endif
+Call LECTURE("LED",[F:GCM]LED(REFDES-1),"") From CONTOBJ
+If [F:LED]MTCFLG<>2 : End : Endif
+
+PLAN   = ""
+COMPTE = ""
+OK     = 1
+For I=1 To NBORG
+ Read [DAEX]DAE2 = ACCORG(I)
+ If !fstat
+  TYPPCE = [F:DAEX]TYP
+  NUMPCE = [F:DAEX]NUM
+  IDTLIG = [F:DAEX]IDTLIN
+  Default File [DAEX]
+  For [DAEX] Where TYP=[L]TYPPCE & NUM=[L]NUMPCE & IDTLIN=[L]IDTLIG & LEDTYP=[L]REFDES
+   Gosub TEST_ECR
+   If !OK : Break 2 : Endif
+  Next
+ Else
+  Read [DATX]DAT1 = ACCORG(I)
+  If !fstat
+   TYPPCE = [F:DATX]TYP
+   NUMPCE = [F:DATX]NUM
+   IDTLIG = [F:DATX]IDTLIN
+   Default File [DATX]
+   For [DATX] Where TYP=[L]TYPPCE & NUM=[L]NUMPCE & IDTLIN=[L]IDTLIG & LEDTYP=[L]REFDES
+    Gosub TEST_ECR
+    If !OK : Break 2 : Endif
+   Next
+  Endif
+ Endif
+Next I
+If !OK or NBDES<2 : NBDES = 0 : Endif
+End
+
+$TEST_ECR
+If PLAN=""
+ PLAN   = [F]COA
+ COMPTE = [F]ACC
+ Call LECTURE("GAC",COMPTE,PLAN) From CONTOBJ
+ If [F:GAC]MTC<>2
+  OK = 0 : Return : # Compte non lettrable
+ Endif
+Elsif [F]COA<>PLAN or [F]ACC<>COMPTE
+ OK = 0 : Return : # Comptes différents
+Endif
+NBDES += 1
+ACCDES(NBDES) = [F]ACCNUM
+Return
+
+#############################################################
+## Lettrage proprement dit appelé par BATCHCPT             ##
+#############################################################
+Subprog LETTRAGE(NBECH,TBECR,TBECH,TBIPT,CAS,TRACE,STA,MESSA,PCETYP,PCENUM)
+Value    Integer NBECH
+Value    Integer TBECR(1..)
+Value    Integer TBECH(1..)
+Value    Decimal TBIPT(1..)
+Value    Integer CAS
+Value    Integer TRACE
+Variable Integer STA
+Variable Char    MESSA
+Variable Char    PCETYP()(1..)
+Variable Char    PCENUM()(1..)
+
+Onerrgo ERREUR
+
+## CAS = 1  => Lettrage en devise société
+## CAS = 2  => Lettrage en devise de pièce si possible
+## CAS = 3  => Indication que le lettrage vient d'une imputation acompte (appel du sous programme IMPUTE de IPTACPT)
+## CAS += 4 => On force la date à GBIDA1 (RECUPLET)
+## CAS <0   => MTCPAY
+
+## STA = Statut de retour
+## 31 => Les écritures ont un quadruplet (référentiel,compte,tiers,site) différent
+## 32 => Une écriture n'existe pas
+## 33 => Pb de conversion devise
+## 34 => Une échéance n'existe pas
+## 35 => Erreur en génération pièce diff change/conversion d'arrondi
+## 36 => Compte non lettrable ou letttrage
+## 37 => Pièce comptable inexistante
+## 38 => Echéance en cours de règlement
+## 39 => Pb transactionnel (GOK=0) ou erreur de verrouillage (GOK=-1)
+## 40 => Erreur programme
+
+If clalev([F:CPY])=0  : Local File COMPANY               [CPY] : Endif
+If clalev([F:TCU])=0  : Local File TABCUR                [TCU] : Endif
+If clalev([F:GAC])=0  : Local File =GTABCPT+"GACCOUNT"   [GAC] : Endif
+If clalev([F:HAE])=0  : Local File =GTABCPT+"GACCENTRY"  [HAE] : Endif
+If clalev([F:HAE3])=0 : Local File =GTABCPT+"GACCENTRY"  [HAE3]: Endif
+If clalev([F:DAE])=0  : Local File =GTABCPT+"GACCENTRYD" [DAE] : Endif
+If clalev([F:DAE2])=0 : Local File =GTABCPT+"GACCENTRYD" [DAE2]: Endif
+If clalev([F:DUD])=0  : Local File =GTABCPT+"GACCDUDATE" [DUD] : Endif
+If clalev([F:MTC])=0  : Local File =GTABCPT+"MATCHCODE"  [MTC] : Endif
+If clalev([F:MTU])=0  : Local File MTCAUTO               [MTU] : Endif
+If clalev([F:COA])=0  : Local File GCOA                  [COA] : Endif
+If clalev([F:GCM])=0  : Local File GACM                  [GCM] : Endif
+
+Local Libelle MTCMAJ, MTCPAY, FLMES, FLDAT
+Local Integer I , J , K , R , STAT , OKDEV , FLECH
+Local Char    PLAN(GLONCOA) , COMPTE(GLONGAC) , TIERS(GLONBPR) , SYMBOLE(50) , LETTRE(5)
+Local Char    SOCIETE(GLONCPY) , SITE(GLONFCY) , DEVISE(GLONCUR) , DEVLED(GLONCUR) , LTR(5) , OPT(1)
+Local Char    VALPAR(30)
+Local Date    DATMIN, DATMAX, DATMAX2
+Local Decimal MTCUR, MTLOC, MONTDIF , MONTDEV
+Local Decimal CURDEB, CURCRE, SOMDEB, SOMCRE, CONTCRE, CONTDEB, MTCNV
+Local Integer MAXECR
+Local Integer REFERENTIEL , ECHEANCES
+Local Decimal COURCPY
+Local Char    PARAM(10)
+Call PARAML("","MTCNBR",PARAM) From ADOVAL
+MAXECR = min(32767,max(dim(TBECR)+100,1000,val(PARAM)))
+
+Local Integer XNBECH
+Local Integer XTBECR(1..MAXECR)
+Local Integer XTBECH(1..MAXECR)
+Local Decimal XTBIPT(1..MAXECR)   :# Montants en devise société
+## <ECHEANCES NEGATIVES>
+Local Integer XTBSNS(1..MAXECR)
+## <Fin ECHEANCES NEGATIVES
+Local Decimal XTBIPT2(1..MAXECR)  :# Montants en devise de pièce
+Local Decimal X_TBIPT(1..MAXECR)
+Local Decimal MTCDEB, MTCCRE
+Local Decimal SEUIL , MINLED , MINDEV
+Local Integer OKRND , IPCE
+Local Integer NBREF , REFAUTO(1..10)
+Local Decimal DEBAUTO(1..10) , CREAUTO(1..10) , MTAUTO(1..10)
+Local Integer OPTRPT
+Local Integer FLECART
+
+Local Decimal MTCDEBAUTO(1..10), MTCCREAUTO(1..10)
+Local Integer FLGAUTO
+Local Char    DEVAUTO(GLONCUR)(1..10)
+#
+
+Local Date EVTDAT : # Used for the BEFHISDUD Entry point
+
+Local Integer IPTACPT # Indication que le lettrage vient d'une imputation acompte (appel du sous programme IMPUTE de IPTACPT)
+
+OPTRPT = 1 : # Option écart d'arrondi pour reporting
+
+## 1) On équilibre (par montant forcé) les référentiels auto en cas de lettrage majuscule
+## 2) On génère une pièce d'écart si le lettrage est en devise société
+
+Raz MTCDEB, MTCCRE, X_TBIPT, DEBAUTO, CREAUTO, MTCDEBAUTO, MTCCREAUTO
+
+# Amélioration des performances
+Local Integer NBMTC : Raz NBMTC
+Local Char STKMTC(5)(1..MAXECR)
+
+Raz PCETYP , PCENUM , IPCE , STA , MESSA , IPTACPT
+If CAS<0 : CAS = -CAS : MTCPAY = 1 : Endif
+If CAS>4 : CAS -= 4   : FLDAT  = 1 : Endif
+IPTACPT = (CAS=3)     : If IPTACPT : CAS=2 : Endif
+OKDEV = (CAS=2)
+
+## Premier parcours des écritures, vérifs, inits
+XNBECH = 0
+DATMAX = [0/0/0]
+DATMAX2 = [0/0/0]
+DATMIN = [31/12/9999]
+
+  For I=1 To NBECH
+    Read [DAE]DAE2 = TBECR(I)
+    If fstat
+      STA = 32
+      MESSA = num$(TBECR(I))
+      Break
+    Endif
+
+    Gosub VERIF
+    If STA
+      Break
+    Endif
+
+    If TIERS<>"" & ECHEANCES
+      If !find(TBECR(I),XTBECR(1..XNBECH))
+        If [F:DAE]SNS>0
+          CONTDEB += [F:DAE]AMTLED
+        Else
+          CONTCRE += [F:DAE]AMTLED
+        Endif
+
+        For [DUD]DUD1 Where ACCNUM=TBECR(I)
+          J = [F:DUD]DUDLIG
+          Readlock [DUD]DUD1 Curr
+          If fstat=1
+            STA = 39 : GOK=-1 : GLOCK="$GACCDUDATE"-num$(TBECR(I))-num$(J) : Break 2
+          Elsif fstat
+            STA = 34 : MESSA = num$(TBECR(I))-num$(J) : Break 2
+          Elsif !MTCPAY & ([F:DUD]TMPCUR<>0 | [F:DUD]TMPLOC<>0)
+           # si on lettre manuellement, le lettrage va mouvementer le montant réglé de l'échéance,
+           # mais la validation des règlements va débiter le mtt provisoire de l'échéance, et pas
+           # forcément du meme montant que le lettrage, d'où pb...
+            STA = 38 : MESSA = [F:DUD]TYP-[F:DUD]NUM-"("+num$(TBECR(I))-num$(J)+")" : Break 2
+          Endif
+          XNBECH += 1
+          XTBECH(XNBECH)  = [F:DUD]DUDLIG
+          XTBECR(XNBECH)  = [F:DUD]ACCNUM
+          XTBIPT(XNBECH)  = [F:DAE]SNS*[F:DUD]PAYLOC
+          XTBSNS(XNBECH)  = [F:DAE]SNS
+          XTBIPT2(XNBECH) = [F:DAE]SNS*[F:DUD]PAYCUR
+          Gosub SOMME_TIERS
+        Next
+        FLGAUTO=0 : Gosub SOMME_AUTO
+      Endif
+
+      K = 0
+      For J=1 To XNBECH
+        If XTBECR(J)=TBECR(I) & XTBECH(J)=TBECH(I) : K = J : Break : Endif
+      Next J
+      If K=0 : STA = 34 : MESSA = num$(TBECR(I))-num$(TBECH(I)) : Break : Endif
+      Read [DUD]DUD1 = XTBECR(K);XTBECH(K)
+      If CAS=1
+        # Affecter les imputations négatives des échéances négatives ou inversement ou les deux.
+        If [F:DUD]AMTLOC<0
+          XTBIPT(K)  = [F:DAE]SNS*max((TBIPT(I)+[F:DUD]PAYLOC),[F:DUD]AMTLOC)
+        Else
+          XTBIPT(K)  = [F:DAE]SNS*min((TBIPT(I)+[F:DUD]PAYLOC),[F:DUD]AMTLOC)
+        Endif
+
+        XTBSNS(K)  = [F:DAE]SNS
+      Else
+        If [F:DUD]AMTCUR<0
+          XTBIPT2(K)  = [F:DAE]SNS*max((TBIPT(I)+[F:DUD]PAYCUR),[F:DUD]AMTCUR)
+        Else
+          XTBIPT2(K)  = [F:DAE]SNS*min((TBIPT(I)+[F:DUD]PAYCUR),[F:DUD]AMTCUR)
+        Endif
+
+        If [F:HAE]RATDIV([F:DAE]LEDTYP-1)=0
+          COURCPY=0
+        Else
+          COURCPY = [F:HAE]RATMLT([F:DAE]LEDTYP-1)/[F:HAE]RATDIV([F:DAE]LEDTYP-1)
+        Endif
+        Call CONVERT3([F:HAE]CUR,[F:DAE]CURLED,[F:DAE]CURLED,[F:HAE]TYPRAT,[F:HAE]RATDAT,TBIPT(I),MTCNV,COURCPY,STAT) From CPTSUB
+        If STAT : STA = 33 : MESSA = [F:HAE]CUR-[F:DAE]CURLED : Break : Endif
+
+        If [F:DUD]AMTLOC<0
+          XTBIPT(K)  = [F:DAE]SNS*max((MTCNV+[F:DUD]PAYLOC),[F:DUD]AMTLOC)
+        Else
+          XTBIPT(K)  = [F:DAE]SNS*min((MTCNV+[F:DUD]PAYLOC),[F:DUD]AMTLOC)
+        Endif
+
+        XTBSNS(K)  = [F:DAE]SNS
+      Endif
+
+    Elsif !find(TBECR(I),XTBECR(1..XNBECH))
+      XNBECH += 1
+      XTBECH(XNBECH) = 0
+      XTBECR(XNBECH) = TBECR(I)
+      FLGAUTO=0 : Gosub SOMME_GENE
+    Endif
+
+    If [F:DAE]MTC<>""
+      LTR = [F:DAE]MTC
+      If LETTRE="" : LETTRE = LTR : Endif
+      If !find([F:DAE]MTC,STKMTC(1..NBMTC))
+        NBMTC+=1 : STKMTC(NBMTC) = [F:DAE]MTC
+
+        For [DAE]DAE2 Where LEDTYP=REFERENTIEL & CPY=SOCIETE & FCYLIN=SITE & ACC=COMPTE & BPR=TIERS & MTC=LTR
+          If !find([F:DAE]ACCNUM,XTBECR(1..XNBECH))
+            Gosub VERIF
+            If STA : Break 2 : Endif
+
+            Read [HAE3]HAE0 = [F:DAE]TYP;[F:DAE]NUM
+            If fstat : STA = 37 : MESSA = [F:DAE]TYP-[F:DAE]NUM : Break 2 : Endif
+            If left$([F:HAE3]REFINT,3)="MTC"
+              If [F:DAE]SNS>0
+                MTCDEB += [F:DAE]AMTLED
+              Else
+                MTCCRE += [F:DAE]AMTLED
+              Endif
+            Endif
+
+            If TIERS<>"" & ECHEANCES
+              FLECH = 0
+              If [F:DAE]SNS>0
+                CONTDEB += [F:DAE]AMTLED
+              Else
+                CONTCRE += [F:DAE]AMTLED
+              Endif
+              For [DUD]DUD1 Where ACCNUM=[F:DAE]ACCNUM
+                J = [F:DUD]DUDLIG
+                Readlock [DUD]DUD1 Curr
+                If fstat=1
+                  STA = 39 : GOK=-1 : GLOCK="$GACCDUDATE"-num$([F:DAE]ACCNUM)-num$(J) : Break 3
+                Elsif fstat
+                  STA = 34 : MESSA = num$([F:DAE]ACCNUM)-num$(J) : Break 3
+                Elsif !MTCPAY & ([F:DUD]TMPCUR<>0 | [F:DUD]TMPLOC<>0)
+                  # si on lettre manuellement, le lettrage va mouvementer le montant réglé de l'échéance,
+                  # mais la validation des règlements va débiter le mtt provisoire de l'échéance, et pas
+                  # forcément du meme montant que le lettrage, d'où pb...
+                  STA = 38 : MESSA = [F:DUD]TYP-[F:DUD]NUM-"("+num$([F:DAE]ACCNUM)-num$(J)+")" : Break 3
+                Endif
+                FLECH = 1
+                XNBECH += 1
+                XTBECR(XNBECH)  = [F:DAE]ACCNUM
+                XTBECH(XNBECH)  = [F:DUD]DUDLIG
+                XTBIPT(XNBECH)  = [F:DAE]SNS*[F:DUD]PAYLOC
+                XTBSNS(XNBECH)  = [F:DAE]SNS
+                XTBIPT2(XNBECH) = [F:DAE]SNS*[F:DUD]PAYCUR
+                Gosub SOMME_TIERS
+              Next
+              FLGAUTO=1 : Gosub SOMME_AUTO
+              If !FLECH : STA =34 : MESSA = num$([F:DAE]ACCNUM) : Break 2 : Endif
+            Else
+              XNBECH += 1
+              XTBECR(XNBECH) = [F:DAE]ACCNUM
+              FLGAUTO=1 : Gosub SOMME_GENE
+            Endif
+          Endif
+        Next
+      Endif
+    Endif
+  Next I
+
+  If STA
+    Goto FIN
+  Endif
+
+  # Localisation italienne
+  # Issue X3-103268
+  #If func AFNC.PARAM("ITAMTC",SOCIETE)="2"
+  If func AFNC.ACTIV("KIT") and func AFNC.PARAM("ITAMTC",SOCIETE)="2"
+    Call DUDLNK(NBECH,TBECR,TBECH,TBIPT) From CPTLETIT
+  Endif
+
+  # Vérif de l'équilibre des échéances
+  If TIERS<>"" & ECHEANCES & (CONTDEB<>SOMDEB or CONTCRE<>SOMCRE)
+    STA = 41 : Goto FIN
+  Endif
+
+  # Attribution de la lettre
+  If LETTRE=""
+    Call GETLET(PLAN,COMPTE,TIERS,LETTRE)
+    If GOK<1 : STA = 39 : Goto FIN : Endif
+  Endif
+
+  # Equilibre en devise référentiel
+  If  SOMDEB=SOMCRE & (CAS=1 or !OKDEV)
+    #LETTRE = toupper(LETTRE) : MTCMAJ = 1
+    # Pour l'imputation d'acompte, X3 ne doit pas lettrer même si l'équilibre existe en devise référentiel.
+    #    - LETTRE reste doit rester en minuscule et MTCMAJ à 0.
+    #    - Réinitialise CAS = 2 pour l'imputation des montants
+    If !IPTACPT
+      LETTRE = toupper(LETTRE) : MTCMAJ = 1
+    Endif
+  Endif
+
+  ###############################################################
+  # Pièce de perte et profit (pièce MTP, refint MTC3)
+  #  S'il y a "quasi-équilibre" dans la devise des pièces
+  #   (ou la devise de référentiel si devises différentes)
+  ###############################################################
+
+  If DEVISE="" or !OKDEV : DEVISE = DEVLED : Endif
+
+  If (DEVISE<>DEVLED & CURDEB<>CURCRE) or (DEVISE=DEVLED & SOMDEB<>SOMCRE) : # Il n'y a pas équilibre
+    Call LEC_GAC(COMPTE,PLAN) From CPTLEC
+    SEUIL = 0
+    If [F:GAC]LOSGAIGNR = 2
+      If !GSERVEUR & dim([M:LTC]MTCRND)>0
+        SEUIL = [M:LTC]MTCRND
+      Elsif GSERVEUR & dim([M:LTA]MTCRND)>0
+        SEUIL = [M:LTA]MTCRND
+      Elsif MTCPAY
+        ## En dehors du lettrage manuel, la génération d'une pièce de perte et profit ne doit s'appliquer que sur les règlements
+        Call PARAM(SITE,"MTCRNDBAT",VALPAR) From ADOVAL
+        SEUIL = val(VALPAR)
+      Endif
+    Endif
+
+    If OKDEV
+      Call CONVERT(GCURSHR,DEVISE,DEVLED,GCHGTYP,DATMAX,SEUIL,MINDEV,STAT) From TRTDEV
+      If STAT : MINDEV = 0 : Endif
+      OKRND = (abs(CURDEB-CURCRE)<=MINDEV)
+    Else
+      Call CONVERT(GCURSHR,DEVLED,DEVLED,GCHGTYP,DATMAX,SEUIL,MINLED,STAT) From TRTDEV
+      If STAT : MINLED = 0 : Endif
+      OKRND = (abs(SOMDEB-SOMCRE)<=MINLED)
+    Endif
+    If OKRND
+      FLECART = 2 : # => MTP
+      If DEVISE<>DEVLED
+        MONTDIF = 0
+        MONTDEV = CURCRE-CURDEB
+      Else
+        MONTDIF = SOMCRE-SOMDEB
+        MONTDEV = MONTDIF : # 0
+      Endif
+      If MONTDIF<>0 or MONTDEV<>0
+        IPCE += 1
+        # Dans un premier temps, on laisse faire pour les réfs autos
+        Raz MTAUTO
+        GPE = 0
+        Gosub PE_ENTREE
+        If !GPE
+          Call GEN_PIECE(SITE,REFERENTIEL,PLAN,COMPTE,TIERS,DATMAX,DEVISE,MONTDEV,DEVLED,MONTDIF,MTAUTO,FLECART
+&                 ,XNBECH,XTBECR,XTBECH,XTBIPT,XTBIPT2,STAT,MESSA,PCETYP(IPCE),PCENUM(IPCE)) From LETTAUTO
+          If STAT
+            If GOK<0 : STA = 39 : Else STA = 35 : Endif
+              Goto FIN
+          Elsif TRACE
+            Gosub FLMES0
+            Call ECR_TRACE(mess(40,107,1)-PCETYP(IPCE)-PCENUM(IPCE),0) From GESECRAN
+          Endif
+        Endif
+
+        GPOINT = "AFTCREVCR" : Gosub ENTREE From EXEFNC
+        If GOK<1 : Goto FIN : Endif
+
+        If FLDAT
+          Update [DAE] Where TYP=PCETYP(IPCE) & NUM=PCENUM(IPCE) & LEDTYP=REFERENTIEL & MTC<>"" With MTCDAT=GBIDA1
+        Endif
+        If OKDEV & DEVISE<>DEVLED
+          # A ce stade, il y a équilibre en devise de pièce, pas forcément en devise référentiel...
+          CURDEB  = CURCRE
+          For [DAE] Where TYP=PCETYP(IPCE) & NUM=PCENUM(IPCE) & LEDTYP=REFERENTIEL & ACC=COMPTE & BPR=TIERS
+           SOMDEB += [F:DAE]SNS*[F:DAE]AMTLED
+          Next
+          If SOMDEB=SOMCRE : # ... sauf par hasard
+           LETTRE  = toupper(LETTRE)
+           MTCMAJ  = 1
+          Endif
+        Else
+          # Dans ce cas, il y a équilibre en devise référentiel
+          LETTRE  = toupper(LETTRE)
+          MTCMAJ  = 1
+          SOMDEB  = SOMCRE
+        Endif
+        # Ensuite on va lire ce qui a été fait pour les réfs autos
+        If OPTRPT
+          For R=1 To NBREF
+            For [DAE] Where TYP=PCETYP(IPCE) & NUM=PCENUM(IPCE) & LEDTYP=REFAUTO(R) & ACC=COMPTE & BPR=TIERS
+              DEBAUTO(R) += [F:DAE]SNS*[F:DAE]AMTLED
+            Next
+          Next R
+        Endif
+      Else : # On ne devrait plus passer par là
+        Call ECR_TRACE("(BY 150) c'est pas normal",1) From GESECRAN
+      Endif
+    Endif
+  Endif
+
+  ###############################################################
+  # Pièce de différence de change
+  ###############################################################
+
+  MONTDIF = 0 : # Différence de change
+  MONTDEV = 0 : # Valeur en devise (forcément 0)
+  FLDIF   = 0 : # Flag différence
+  Raz MTAUTO  : # Montants sur référentiels auto
+
+  If !MTCMAJ                 : # Pas d'équilibre en devise référentiel
+    If OKDEV & DEVISE<>DEVLED : # Toutes les pièces dans la même devise et pas celle du référentiel
+
+      # On va générer soit
+      # - Une différence de change (FLECART=0, pièce MTC, refint MTC1) si on est entre devise in et out
+      # - Un écart d'arrondi       (FLECART=1, pièce MTC, refint MTC2) si on est entre devises "in"
+      #   (phase transitoire euro conservée pour de futurs pays candidats à l'euro)
+
+      FLECART = 0
+      Call LECTURE("TCU",DEVLED,"") From CONTOBJ
+      If [F:TCU]EURFLG=2 & ([F:TCU]EURDAT=[0/0/0] | [F:TCU]EURDAT<=DATMAX2)
+        Call LECTURE("TCU",DEVISE,"") From CONTOBJ
+        If [F:TCU]EURFLG=2
+          FLECART = 1 : # Les 2 devises sont "in"
+        Endif
+      Endif
+
+      # Issue X3-51971 - 2017-08-09 by BEFOU : Add a parameter to trigger or not the new behavior
+      Local Char LOWMTCGEN
+      Call PARAM([L]SITE,"LOWMTCGEN",[L]LOWMTCGEN) From ADOVAL
+
+      If CURDEB=CURCRE
+
+        # Il y a équilibre en devise de pièce => lettrage majuscule
+
+        LETTRE  = toupper(LETTRE)
+        MTCMAJ  = 1
+        MONTDIF = SOMCRE-SOMDEB
+        If MONTDIF<>0
+          FLDIF = 1
+        Endif
+        # On solde aussi les référentiels auto dans la foulée
+        If OPTRPT # Option écart d'arrondi pour reporting
+          For R=1 To NBREF
+            MTAUTO(REFAUTO(R)) = CREAUTO(R)-DEBAUTO(R)
+            If MTAUTO(REFAUTO(R))<>0
+              FLDIF = 1
+            Endif
+          Next R
+        Endif
+
+      # Issue X3-51971 - 2017-08-09 by BEFOU : Add a parameter to trigger or not the new behavior
+      Elsif ( CURDEB<>0 & CURCRE<>0 ) &  [L]LOWMTCGEN=num$(G_OUI)
+
+        # Il n'y a pas d'équilibre => lettrage minuscule
+        # (pas d'écart de change si tous les mouvements sont dans le même sens)
+
+        LETTRE = tolower(LETTRE)
+        If FLECART=0 : # (Pas d'écart d'arrondi euro pour du lettrage minuscule)
+          If CURDEB>CURCRE
+            MONTDIF = (CURDEB-CURCRE)*(SOMDEB-MTCDEB)/CURDEB-(SOMDEB-MTCDEB-SOMCRE-MTCCRE)-MTCDEB-MTCCRE
+          Else
+            MONTDIF = -((CURCRE-CURDEB)*(SOMCRE-MTCCRE)/CURCRE-(SOMCRE-MTCCRE-SOMDEB-MTCDEB))+MTCCRE+MTCDEB
+          Endif
+          ## Bug V6
+          #Call LECTURE("TCU",DEVISE,"") From CONTOBJ
+          Call LECTURE("TCU",DEVLED,"") From CONTOBJ
+          MONTDIF = arr(MONTDIF,[F:TCU]CURRND)
+          If MONTDIF<>0
+            FLDIF = 1
+          Endif
+
+          If OPTRPT # Option écart d'arrondi pour reporting
+            For R=1 To NBREF
+              If CURDEB>CURCRE
+                MTAUTO(REFAUTO(R)) = (CURDEB-CURCRE)*(DEBAUTO(R)-MTCDEBAUTO(R))/CURDEB-(DEBAUTO(R)-MTCDEBAUTO(R)-CREAUTO(R)-MTCCREAUTO(R))-MTCDEBAUTO(R)-MTCCREAUTO(R)
+              Else
+                MTAUTO(REFAUTO(R)) =-((CURCRE-CURDEB)*(CREAUTO(R)-MTCCREAUTO(R))/CURCRE-(CREAUTO(R)-MTCCREAUTO(R)-DEBAUTO(R)-MTCDEBAUTO(R)))+MTCCREAUTO(R)+MTCDEBAUTO(R)
+              Endif
+              Call LECTURE("TCU",DEVAUTO(R),"") From CONTOBJ
+              MTAUTO(REFAUTO(R))= arr(MTAUTO(REFAUTO(R)),[F:TCU]CURRND)
+              If MTAUTO(REFAUTO(R))<>0
+                FLDIF = 1
+              Endif
+            Next R
+          Endif
+
+        Endif
+
+      Else
+
+        # Pas de mouvement en devise!! => Pas de différence
+        LETTRE = tolower(LETTRE) : # gh 8/9/99
+
+      Endif
+
+    Else
+
+      # Pas OK pour le lettrage en devise (lettrage multi-devise)
+      LETTRE = tolower(LETTRE)
+
+    Endif
+
+  Else
+
+    # Lettrage majuscule en devise société
+    #  peut ne pas être équilibré dans les référentiels autos
+    #  On ne sait pas s'il faut générer une pièce...
+
+    If OPTRPT
+      For R=1 To NBREF
+        MTAUTO(REFAUTO(R)) = CREAUTO(R)-DEBAUTO(R)
+        If MTAUTO(REFAUTO(R))<>0
+          FLDIF = 1
+          FLECART = 1 : # Ecart d'arrondi
+          #    Call ECR_TRACE(num$(R)-num$(MTAUTO(REFAUTO(R)))-num$(CREAUTO(R))-num$(DEBAUTO(R)),0) From GESECRAN
+        Endif
+      Next R
+    Endif
+
+  Endif
+
+  # Génération proprement dite
+
+  If FLDIF
+    IPCE += 1
+    # Différence de change ou écart d'arrondi
+    GPE = 0
+    Gosub PE_ENTREE
+    If !GPE
+      Call GEN_PIECE(SITE,REFERENTIEL,PLAN,COMPTE,TIERS,DATMAX,DEVISE,MONTDEV,DEVLED,MONTDIF,MTAUTO,FLECART
+&               ,XNBECH,XTBECR,XTBECH,XTBIPT,XTBIPT2,STAT,MESSA,PCETYP(IPCE),PCENUM(IPCE)) From LETTAUTO
+      If STAT
+        If GOK<0 : STA = 39 : Else STA = 35 : Endif
+        Goto FIN
+      Elsif TRACE
+        Gosub FLMES0
+        Call ECR_TRACE(mess(40,107,1)-PCETYP(IPCE)-PCENUM(IPCE),0) From GESECRAN
+      Endif
+    Endif
+
+    GPOINT = "AFTCREVCR" : Gosub ENTREE From EXEFNC
+    If GOK<1 : Goto FIN : Endif
+
+    If FLDAT
+      Update [DAE] Where TYP=PCETYP(IPCE) & NUM=PCENUM(IPCE) & LEDTYP=REFERENTIEL & MTC<>"" With MTCDAT=GBIDA1
+    Endif
+  Endif
+
+  # Lettrage demandé en devise de pièce et c'est possible,
+  # sinon, lettrage en devise de société (CAS=1)
+  If CAS=2
+    If OKDEV
+      For I=1 To XNBECH
+        XTBIPT(I) = XTBIPT2(I)
+      Next I
+    Else
+      CAS=1
+    Endif
+  Endif
+
+  ## Equilibrage des imputations
+  If TIERS<>"" & ECHEANCES & !MTCMAJ
+    For I=1 To XNBECH
+      Readlock [DAE]DAE2 = XTBECR(I)
+      If fstat=1
+        STA = 39 : GOK = -1 : GLOCK = "$GACCENTRYD"-num$(XTBECR(I)) : Break
+      Elsif fstat
+        STA = 32 : MESSA = num$(XTBECR(I)) : Break
+      Endif
+      If [F:HAE]TYP<>[F:DAE]TYP | [F:HAE]NUM<>[F:DAE]NUM
+        Read [HAE]HAE0 = [F:DAE]TYP;[F:DAE]NUM
+        If fstat : STA = 37 : MESSA = [F:DAE]TYP-[F:DAE]NUM : Break : Endif
+      Endif
+      If left$([F:HAE]REFINT,3)<>"MTC"
+        X_TBIPT(I) = XTBIPT(I)
+      Else
+        X_TBIPT(I) = 0
+      Endif
+    Next
+    If STA
+      Goto FIN
+    Endif
+
+    ECART = sum(X_TBIPT(1..XNBECH))
+
+    #ECART = sum(XTBIPT(1..XNBECH))
+    ## <Fin pp>
+    For I=1 To XNBECH
+      If sgn(ECART)=sgn(XTBIPT(I))
+        If abs(ECART)>abs(XTBIPT(I))
+          ECART    -= XTBIPT(I)
+          XTBIPT(I) = 0
+        Else
+          XTBIPT(I) -= ECART
+          ECART = 0
+          Break
+        Endif
+      Endif
+    Next I
+  Endif
+
+  ## Deuxième passe pour le lettrage
+  For I=1 To XNBECH
+    If I=1 | XTBECR(I)<>XTBECR(I-1)
+      #
+      # Mise à jour sur réf principal
+      #
+      Readlock [DAE]DAE2 = XTBECR(I)
+      If fstat=1
+        STA = 39 : GOK = -1 : GLOCK = "$GACCENTRYD"-num$(XTBECR(I)) : Break
+      Elsif fstat
+        STA = 32 : MESSA = num$(XTBECR(I)) : Break
+      Endif
+      If [F:HAE]TYP<>[F:DAE]TYP | [F:HAE]NUM<>[F:DAE]NUM
+        Read [HAE]HAE0 = [F:DAE]TYP;[F:DAE]NUM
+        If fstat : STA = 37 : MESSA = [F:DAE]TYP-[F:DAE]NUM : Break : Endif
+      Endif
+      [F:DAE]MTC       = LETTRE
+      If FLDAT
+        [F:DAE]MTCDAT    = GBIDA1
+      Else
+        [F:DAE]MTCDAT    = date$
+      Endif
+      [F:DAE]MTCDATMAX = DATMAX
+      [F:DAE]MTCDATMIN = DATMIN
+      GPOINT = "MAJLET" : Gosub ENTREE From EXEFNC
+      Rewrite [DAE]
+      If fstat
+        GOK=0 : Call FSTA("DAE") From GLOCK : Break
+      Endif
+      #
+      # Mise à jour sur réf autos
+      #
+      For R=1 To NBREF
+        For [DAE2]DAE7 Where TYP=[F:DAE]TYP & NUM=[F:DAE]NUM & IDTLIN=[F:DAE]IDTLIN & LEDTYP=REFAUTO(R)
+          Readlock [DAE2]Curr
+          If fstat=1
+            STA = 39 : GOK = -1 : GLOCK = "$GACCENTRYD"-num$([F:DAE2]ACCNUM) : Break 3
+          Endif
+          [F:DAE2]MTC       = [F:DAE]MTC
+          [F:DAE2]MTCDAT    = [F:DAE]MTCDAT
+          [F:DAE2]MTCDATMAX = [F:DAE]MTCDATMAX
+          [F:DAE2]MTCDATMIN = [F:DAE]MTCDATMIN
+          Rewrite [DAE2]
+          If fstat
+            GOK=0 : Call FSTA("DAE2") From GLOCK : Break 3
+          Endif
+        Next
+      Next R
+      #
+      If TRACE
+        Gosub FLMES0
+        Call ECR_TRACE(format$("K:6X",LETTRE)+format$("K:8X",[F:DAE]TYP)
+&   +format$("K:22X",[F:DAE]NUM)+num$([F:DAE]SNS*[F:DAE]AMTLED)
+&   ,0) From GESECRAN
+      Endif
+
+    Endif
+    If TIERS<>"" & ECHEANCES
+      Read [DUD]DUD1 = XTBECR(I);XTBECH(I) : # Echéances déjà lockées dans la première boucle
+      If fstat
+        STA = 34 : MESSA = num$(XTBECR(I))-num$(XTBECH(I)) : Break
+      Endif
+      If MTCMAJ                 : # Lettrage majuscule
+        [F:DUD]PAYLOC = [F:DUD]AMTLOC
+        [F:DUD]PAYCUR = [F:DUD]AMTCUR
+      Else                      : # Lettrage minuscule
+        Case CAS
+        When 1 : # Devise société
+          ## <ECHEANCES NEGATIVES>
+          #MTLOC = abs(XTBIPT(I))
+          MTLOC = XTBIPT(I)*XTBSNS(I)
+          ## <Fin ECHEANCES NEGATIVES>
+          If MTLOC=[F:DUD]AMTLOC    # cf Bug35685
+            MTCUR = [F:DUD]AMTCUR
+          Else
+            # F13016 : Prise en compte de la variation du taux lors du solde d'échéance
+            If [F:HAE]RATMLT([F:DAE]LEDTYP-1)=0
+              COURCPY=0
+            Else
+              COURCPY = [F:HAE]RATDIV([F:DAE]LEDTYP-1)/[F:HAE]RATMLT([F:DAE]LEDTYP-1)
+            Endif
+            Call CONVERT3([F:DAE]CURLED,[F:HAE]CUR,[F:DAE]CURLED,[F:HAE]TYPRAT,[F:HAE]RATDAT,MTLOC,MTCUR
+&                   ,COURCPY,STAT) From CPTSUB
+            If STAT : STA = 33 : MESSA = [F:DAE]CURLED-[F:HAE]CUR  : Break : Endif
+          Endif
+
+        When 2 : # Devise pièce
+          ## <ECHEANCES NEGATIVES>
+          #MTCUR = abs(XTBIPT(I))
+          MTCUR = XTBIPT(I)*XTBSNS(I)
+          ## <Fin ECHEANCES NEGATIVES>
+          If MTCUR=[F:DUD]AMTCUR
+            MTLOC = [F:DUD]AMTLOC
+          Else
+            # F13016 : Prise en compte de la variation du taux lors du solde d'échéance
+            If [F:HAE]RATDIV([F:DAE]LEDTYP-1)=0
+              COURCPY=0
+            Else
+              COURCPY = [F:HAE]RATMLT([F:DAE]LEDTYP-1)/[F:HAE]RATDIV([F:DAE]LEDTYP-1)
+            Endif
+            Call CONVERT3([F:HAE]CUR,[F:DAE]CURLED,[F:DAE]CURLED,[F:HAE]TYPRAT,[F:HAE]RATDAT,MTCUR,MTLOC
+&                   ,COURCPY,STAT) From CPTSUB
+            If STAT : STA = 33 : MESSA = [F:HAE]CUR-[F:DAE]CURLED  : Break : Endif
+          Endif
+        Endcase
+        [F:DUD]PAYLOC = MTLOC
+        [F:DUD]PAYCUR = MTCUR
+      Endif
+      Call SLDECH("DUD")From MODECHE
+      Local Decimal EXERCICE, PERIODE
+      Call GETPERSOC([F:DUD]CPY,[F:DAE]LEDTYP,[F:DUD]DUDDAT,EXERCICE,PERIODE) From CPTSUB
+      [F:DUD]FIY = EXERCICE
+      [F:DUD]PER = PERIODE
+      Rewrite [DUD]
+      If fstat
+        GOK=0 : Call FSTA("DUD") From GLOCK : Break
+      Endif
+      [L]EVTDAT = [L]DATMAX
+      GPOINT = "BEFHISDUD" : Gosub ENTREE From EXEFNC
+      Call HISTOECH("DUD",1,[L]EVTDAT)From MODECHE
+    Endif
+  Next I
+
+$FIN
+
+  If GOK<1 & !STA
+    STA = 39
+  Elsif STA & GOK>0
+    GOK = 0
+  Endif
+  Case STA
+    When 31 : MESSA = mess(32,110,1)                           : # Ecritures sur comptes différents
+    When 32 : MESSA = mess(33,110,1)-MESSA                     : # Ecriture inexistante
+    When 33 : MESSA = mess(34,110,1)-MESSA                     : # Erreur en conversion devise
+    When 34 : MESSA = mess(38,110,1)-MESSA                     : # Echéance inexistante
+    When 35 : # Erreur en génération de pièce par LETTAUTO
+    When 36 : MESSA = mess(36,110,1)-MESSA                     : # Compte non lettrable
+    When 37 : MESSA = mess(39,110,1)-MESSA                     : # Pièce inexistante
+    When 38 : MESSA = mess(50,119,1)-MESSA                     : # Echéance en cours de règlement
+    When 39 : If GOK<0 : MESSA = mess(20,100,1)-"|"+GLOCK      : # Erreur de verrouillage sur GLOCK
+              Else     : MESSA = mess(35,110,1)                : # Erreur transactionnelle
+              Endif
+    When 40 : # Erreur programme
+    When 41 : MESSA = mess(8,110,1)                            : # Imputations déséquilibrées
+  Endcase
+
+  If TRACE
+    If STA
+      K = 1
+      # Pour les erreurs "pas graves" on remet STA à 0 et GOK à 0 pour ne pas les garder
+      # Pour les erreurs de lock, idem mais GOK reste à -1 pour refaire une tentative + tard
+      If STA=36             : GOK = 1 : STA = 0 : K = 0
+      Elsif STA=39 & GOK<0            : STA = 0 : K = 0
+      Elsif STA=38 & !clalev([F:MTB]) : STA = 0 : K = 0 : # Lettrage automatique
+      Endif
+      If clalev([F:MTB]) & [F:MTB]MTCFLG=1 & GOK<1 & !STA
+        # Pour ne pas répéter indéfiniment les mêmes erreurs dans la trace
+        K = -1
+      Endif
+      Case K
+      When 0
+        Gosub FLMES0
+        Call ECR_TRACE(MESSA,0) From GESECRAN
+      When 1
+        Gosub FLMES1
+        Call ECR_TRACE(MESSA,1) From GESECRAN
+      Endcase
+    Else
+      Gosub FLMES0
+    Endif
+  Endif
+  Onerrgo
+
+End
+
+$FLMES0
+If !FLMES : Goto FLMES : Else : Return : Endif
+
+$FLMES1
+If !FLMES : FLMES=1 : Goto FLMES : Else : Return : Endif
+
+$FLMES
+If clalev([F:MTB])>0 & [F:MTB]MTCNUM<>0 : # Lettrage
+ Call ECR_TRACE(mess(30,110,1)-mess(REFERENTIEL,2644,1)-num$([F:MTB]MTCNUM),FLMES) From GESECRAN
+Else
+ Call ECR_TRACE(mess(30,110,1)-mess(REFERENTIEL,2644,1),FLMES) From GESECRAN
+Endif
+FLMES = 1
+Return
+
+$PE_ENTREE
+GPOINT = "DIFC" : Gosub ENTREE From EXEFNC
+Return
+
+$VERIF
+If COMPTE=""
+ SOCIETE = [F:DAE]CPY : SITE = [F:DAE]FCYLIN
+ REFERENTIEL = [F:DAE]LEDTYP : DEVLED = [F:DAE]CURLED
+ PLAN = [F:DAE]COA : COMPTE = [F:DAE]ACC : TIERS = [F:DAE]BPR
+ If clalev([F:MTB]) : # Le fichier MTBATCH est ouvert => on est en lettrage batch
+  SYMBOLE = "MTC"-SITE-COMPTE-TIERS
+  Lock =SYMBOLE
+  If fstat :  STA=39 : GOK=-1 : GLOCK="%"+SYMBOLE : Return : Endif
+ Endif
+ Call LECTURE("GAC",COMPTE,PLAN) From CONTOBJ
+ If fstat | [F:GAC]MTC<>2 : STA = 36 : MESSA = COMPTE-"("+[F:DAE]LED+")" : Return : Endif
+ If OKDEV & dim([F:GAC]DIFFLG)>0 & [F:GAC]DIFFLG<>2 : OKDEV = 0 : Endif
+ Call LECTURE("CPY",[F:DAE]CPY,"") From CONTOBJ
+ Call LECTURE("GCM",[F:CPY]ACM,"") From CONTOBJ
+ NBREF = 0
+ For R=1 To len(mess(0,2644,1))
+  If [F:GCM]CFMAUT(R-1)=2 & [F:GCM]ORILEDTYP(R-1)=REFERENTIEL
+   NBREF += 1
+   REFAUTO(NBREF) = R
+   DEVAUTO(NBREF) = [F:GCM]CUR(R-1)
+  Endif
+ Next R
+ If TIERS<>""
+  ECHEANCES = 0
+  If REFERENTIEL = [F:GCM]GENLEDTYP
+   ECHEANCES = 1
+  Endif
+ Endif
+Elsif REFERENTIEL<>[F:DAE]LEDTYP | SITE<>[F:DAE]FCYLIN | COMPTE<>[F:DAE]ACC | PLAN<>[F:DAE]COA | TIERS<>[F:DAE]BPR
+ STA = 31 : Return
+Endif
+Read [HAE]HAE0 = [F:DAE]TYP;[F:DAE]NUM
+If OKDEV
+ If DEVISE=""
+  If [F:HAE]CUR<>[F:DAE]CURLED
+   DEVISE = [F:HAE]CUR
+  Else
+   OKDEV = 0
+  Endif
+ Elsif DEVISE<>[F:HAE]CUR & [F:HAE]CUR<>[F:DAE]CURLED
+  OKDEV = 0 : # Devises différentes, on ne peut pas
+ Endif
+Endif
+DATMIN = min(DATMIN,[F:DAE]ACCDAT)
+DATMAX = max(DATMAX,[F:DAE]ACCDAT)
+If left$([F:HAE]REFINT,3)<>"MTC"
+ DATMAX2 = max(DATMAX2,[F:DAE]ACCDAT)
+Endif
+SYMBOLE = "HAE"+[F:DAE]NUM+"\"+[F:DAE]TYP
+Lock =SYMBOLE
+If fstat
+ STA=39 : GOK=-1 : GLOCK="%"+SYMBOLE : Return
+Endif
+Return
+
+$SOMME_TIERS
+If [F:DAE]SNS>0
+ SOMDEB  += [F:DUD]AMTLOC
+ If CAS=2 & [F:HAE]CUR=DEVISE
+  CURDEB += [F:DUD]AMTCUR
+ Endif
+Else
+ SOMCRE  += [F:DUD]AMTLOC
+ If CAS=2 & [F:HAE]CUR=DEVISE
+  CURCRE += [F:DUD]AMTCUR
+ Endif
+Endif
+Return
+
+$SOMME_GENE
+If [F:DAE]SNS>0
+ SOMDEB  += [F:DAE]AMTLED
+ If CAS=2 & [F:HAE]CUR=DEVISE
+  CURDEB += [F:DAE]AMTCUR
+ Endif
+Else
+ SOMCRE  += [F:DAE]AMTLED
+ If CAS=2 & [F:HAE]CUR=DEVISE
+  CURCRE += [F:DAE]AMTCUR
+ Endif
+Endif
+Gosub SOMME_AUTO
+Return
+
+$SOMME_AUTO
+If OPTRPT
+ For R=1 To NBREF
+  For [DAE2] Where TYP=[F:DAE]TYP & NUM=[F:DAE]NUM & LEDTYP=REFAUTO(R) & IDTLIN=[F:DAE]IDTLIN
+   If [F:DAE2]SNS>0
+    DEBAUTO(R) += [F:DAE2]AMTLED
+   Else
+    CREAUTO(R) += [F:DAE2]AMTLED
+   Endif
+   If FLGAUTO & left$([F:HAE3]REFINT,3)="MTC"
+    If [F:DAE2]SNS>0
+     MTCDEBAUTO(R) += [F:DAE2]AMTLED
+    Else
+     MTCCREAUTO(R) += [F:DAE2]AMTLED
+    Endif
+   Endif
+  Next
+ Next R
+Endif
+Return
+
+Subprog GETLET(PLAN,COMPTE,TIERS,LETTRE)
+Value    Char PLAN
+Value    Char COMPTE
+Value    Char TIERS
+Variable Char LETTRE()
+Readlock [MTC]MTC0 = PLAN;COMPTE;TIERS
+If fstat=1
+ GOK=-1 : GLOCK="$MATCHCODE"-PLAN-COMPTE-TIERS : End
+Elsif fstat
+ Raz [F:MTC]
+ [F:MTC]COA = PLAN
+ [F:MTC]ACC = COMPTE
+ [F:MTC]BPR = TIERS
+ [F:MTC]MTC = "B"
+ Write [MTC]
+ LETTRE = "A"
+Else
+ LETTRE = [F:MTC]MTC
+ Call INCLET([F:MTC]MTC,5)
+ Rewrite [MTC]
+Endif
+If fstat
+ GOK=0 : Call FSTA("MTC") From GLOCK : End
+Endif
+End
+
+Subprog INCLET(LETTRE,LMAX)
+Variable Char    LETTRE()
+Value    Integer LMAX
+Local Integer K , L
+L = len(LETTRE)
+K = L
+
+$CHLET
+If mid$(LETTRE,K,1)="Z"
+ If K=1
+  If L=LMAX : # Tour complet
+   LETTRE = "A"
+  Else
+   LETTRE = string$(L+1,"A")
+  Endif
+ Else
+  K -= 1
+  Goto CHLET
+ Endif
+Else
+ LETTRE =  left$(LETTRE,K-1)+chr$(ascii(mid$(LETTRE,K,1))+1)+string$(L-K,"A")
+Endif
+End
+
+$ERREUR
+GOK = 0 : STA = 40 : MESSA = trtcou-errmes$(errn)-num$(errl)-errm
+Goto FIN
+

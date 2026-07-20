@@ -1,0 +1,913 @@
+#<AdxTL>@(#)11.0.0.0 $Revision$
+#                       TRAITEMENTS ENCOURS X3                        #
+# ------------------------------------------------------------------- #
+#######################################################################
+# Subprog WIP                                                         #
+#      Idem ENCOURS      à partir du masque ORDK                      #
+#      Basculement à faire                                            #
+# Subprog PUR_WIP (XFCY, XITM, XTYP, XSTA, XRET)                      #
+#      Purge des encours par site/article                             #
+# Subprog COVER                                                       #
+#  Mise a jour du fichier ORDCOV (Historique prises en compte)        #
+# Subprog SUP_PEC(LTRS, LTYP, LNUM, LLIN, LSEQ, LSTA)                 #
+#  mise a jour du besoins PEC si suppression pièce destinataire       #
+# Subprog MOD_PEC                                                     #
+#      (LTRS, LTYP, LNUM, LLIN, LSEQ, LAVSTA, LAPSTA, LECART, LECART2)#
+#  mise a jour du besoins PEC si modification pièce destinataire      #
+# Subprog CUM_PEC(LTYP, LNUM, LLIN, LSEQ, LSTA, LQTY, LQTY2, LQTY3)   #
+#  recherche total PEC                                                #
+# Subprog CUM_COV(LTYP, LNUM, LLIN, LSEQ, LSTA, LQTY)                 #
+#  recherche total COV                                                #
+# Subprog REGEN(LMOD, LTRS, LTYP, LNUM, LLIN, LSEQ, LSTA, LECART)     #
+#  regénération quantités planifiées en suppression couverture        #
+# Subprog SHP_WIP()                                                   #
+#  affinage d'une POF en cours d'expédition pour exploitation         #
+#  dans le CBN                                                        #
+# Action POFSHIP pour visualiser les expéditions d'une POF            #
+#######################################################################
+
+#--- Issue 106506 by TS
+$ACTION
+#---------------------------------------------------------------------#
+# Actions sur la saisie de fenêtre (GSAISIE)                          #
+# POFSHIP : Visualisation des expéditions d'une POF                   #
+#---------------------------------------------------------------------#
+Case ACTION
+ When "OUVRE"       : Gosub OUVRE
+ When "DEBUT"       : Gosub DEBUT
+ When "FIN"         : Gosub FIN
+Endcase
+Return
+
+$OUVRE
+Local Char    LVCRNUM(GLONVCR)
+Local Integer LVCRLIN, LVCRSEQ, I
+Local Decimal LQTY
+Local Date    LENDDAT
+# Récupération des paramètres
+LVCRNUM    = PARAM(1)
+LVCRLIN    = val(PARAM(2))
+LVCRSEQ    = PARAM(3)
+LQTY       = PARAM(4)
+LENDDAT    = val(PARAM(5))
+Local File SHIPMENTD [SHD]
+Return
+
+$DEBUT
+[M:POSHP]POHNUM = LVCRNUM
+[M:POSHP]RMNQTY = LQTY
+[M:POSHP]ENDDAT = LENDDAT
+
+Filter [SHD] Where POHNUM=LVCRNUM & POPLIN=LVCRLIN & POQSEQ=LVCRSEQ & CLEFLG<>2
+For [SHD]SHD0
+  If I=0
+    [M:POSHP]ITMREF = [F:SHD]ITMREF
+    [M:POSHP]STU    = [F:SHD]STU
+  Endif
+  [M:POSHP]SHIPNUM(I) = [F:SHD]SHIPNUM
+  [M:POSHP]DAT(I)     = [F:SHD]EXTRCPDAT
+  # Quantité pré-réceptionnée ou expédiée, non réceptionnée
+  #--- Issue 111279
+  #If [F:SHD]PRCQTYSTU>0
+  If [F:SHD]PRCPQTYSTU>0
+    #[M:POSHP]QTY(I) = [F:SHD]PRCQTYSTU-[F:SHD]RCPQTYSTU
+    [M:POSHP]QTY(I) = [F:SHD]PRCPQTYSTU-[F:SHD]RCPQTYSTU
+    #---
+  Else
+    #--- Issue 111279
+    #[M:POSHP]QTY(I) = [F:SHD]EXPQTYSTU-[F:SHD]RCPQTYSTU
+    [M:POSHP]QTY(I) = [F:SHD]SHIQTYSTU-[F:SHD]RCPQTYSTU
+    #---
+  Endif
+  I+=1
+  [M:POSHP]NBLIG+=1
+  If [M:POSHP]NBLIG>50 : Break : Endif
+Next
+Filter [SHD]
+
+Affzo [M:POSHP]1-99
+Return
+
+$FIN
+Close Local File [SHD]
+Return
+#---
+
+########################################################################
+#                        WIP                                           #
+#  Mise a jour du fichier ORDERS (encours )                            #
+#   MAJ   : Type de traitement                                         #
+#           C = création ordre                                         #
+#           M = modification ordre                                     #
+#           A = suppression ordre                                      #
+#           P = consommation ordre (PEC)                               #
+#  GOK positionné à tester en retour ou pas                            #
+########################################################################
+Subprog WIP
+Local Integer STAT
+Local Decimal WRMNEXTQTY
+Local Char    WMAJCOD(1)
+Local Integer WOLDWIPSTA
+
+WMAJCOD = [M:ORDK]MAJCOD
+# FGR 12/11/2009 : X3SUIVI59780 : ouvrir la table en local. Si on vient de CONSORD
+#                  notamment, ça plante sur ORD0 inexistant parce qu'il y a un OrderBy sur le Filter
+#If clalev ([F:ORD]) = 0 : Local File ORDERS [ORD] : Endif
+# FQ 71164 GA 05/2011 ceci peut provoquer une régression au niveau des insertions d'encours => Table locale ORDW
+Local File ORDERS [ORDW]
+
+Case [M:ORDK]MAJCOD
+    When "C"     : Goto W_CREATION
+    When "M"     : Goto W_MODIFICATION
+    When "A"     : Goto W_SUPPRESSION
+    When "P"     : Goto W_CONSOMMATION
+    When Default : Goto W_FIN
+Endcase
+
+#--------------------------------------------------------------------------------------
+# Creation encours
+#--------------------------------------------------------------------------------------
+$W_CREATION
+
+WMAJCOD = "C"
+If [M:ORDK]WIPNUM = ""
+   Call NUMERO(GWIP,[M:ORDK]ORIFCY,[M:ORDK]STRDAT,"", [M:ORDK]WIPNUM,STAT) From SUBANM
+   If STAT <> 0 : GOK = 0 : Goto W_FIN : Endif
+Endif
+If num$([M:ORDK]WIPTYP) = "" : GOK = 0 : Goto W_FIN : Endif
+
+Raz [F:ORDW]
+[F:ORDW] = [M:ORDK]
+If [F:ORDW]ENDDAT = [0/0/0] : [F:ORDW]ENDDAT = [F:ORDW]STRDAT : Endif
+
+[F:ORDW]RMNEXTQTY  = [F:ORDW]EXTQTY
+[F:ORDW]RMNEXTQTY -= [F:ORDW]CPLQTY
+
+If [F:ORDW]RMNEXTQTY < 0 : [F:ORDW]RMNEXTQTY = 0 : Endif
+If [F:ORDW]OPTFLG = 0    : [F:ORDW]OPTFLG = 1    : Endif
+If ([M:ORDK]EXTQTY <= 0) | ([M:ORDK]EXTQTY <= [M:ORDK]CPLQTY) : Goto W_FIN : Endif
+
+[F:ORDW]CREDAT    = date$
+[F:ORDW]CREUSR    = GUSER
+[F:ORDW]EXPNUM    = [C]EXPORT
+
+# point d'entrée  pour récupération infos supplémentaires avant écriture ligne
+GPOINT = "ORDMAJ" : Gosub ENTREE From EXEFNC
+
+Write [ORDW]
+If fstat : GOK = 0 : Call FSTA("ORDW") From GLOCK : End : Endif
+
+GPOINT = "MAJITMMVT" : Gosub ENTREE From EXEFNC
+
+Goto W_FIN
+
+#----------------------------------------------------------------------------------------
+# Modification de l'en cours
+#----------------------------------------------------------------------------------------
+$W_MODIFICATION
+# si qté prévue = 0 ou qté restante = 0, on ne veut pas d'encours ...
+If ([M:ORDK]EXTQTY <= 0) | ([M:ORDK]EXTQTY <= [M:ORDK]CPLQTY) : Goto W_SUPPRESSION : Endif
+
+# si production et élément exclu (matière oou service sous-traitance, pas d'encours)
+If ([M:ORDK]VCRTYP = 10) & ([M:ORDK]WIPTYP <> 5) & ([M:ORDK]ORDSTA = 4) : Goto W_SUPPRESSION : Endif  # 12.04 26995
+
+Readlock [ORDW]ORD0=[M:ORDK]WIPTYP;[M:ORDK]WIPNUM;[M:ORDK]ITMREF
+If fstat = 1
+      GOK = -1
+      GLOCK = "$ORDERS"-num$([M:ORDK]WIPTYP)-[M:ORDK]WIPNUM-[M:ORDK]ITMREF
+      End
+Elsif fstat Goto W_CREATION
+Endif
+
+WOLDWIPSTA = [F:ORDW]WIPSTA
+
+WRMNEXTQTY = [F:ORDW]RMNEXTQTY
+[F:ORDW] = [M:ORDK]
+If [F:ORDW]ENDDAT = [0/0/0] : [F:ORDW]ENDDAT = [F:ORDW]STRDAT : Endif
+[F:ORDW]RMNEXTQTY  = [F:ORDW]EXTQTY
+[F:ORDW]RMNEXTQTY -= [F:ORDW]CPLQTY
+If [F:ORDW]RMNEXTQTY < 0 : [F:ORDW]RMNEXTQTY = 0 : Endif
+If [F:ORDW]OPTFLG = 0 : [F:ORDW]OPTFLG = 1 : Endif
+If [F:ORDW]RMNEXTQTY = 0 : Goto W_SUPP_S : Endif
+
+[F:ORDW]UPDDAT    = date$
+[F:ORDW]UPDUSR    = GUSER
+[F:ORDW]EXPNUM    = [C]EXPORT
+
+# point d'entrée
+GPOINT = "ORDMAJ" : Gosub ENTREE From EXEFNC
+
+Rewrite [ORDW]
+If fstat : GOK = 0 : Call FSTA("ORDW") From GLOCK : End : Endif
+
+GPOINT="MAJITMMVT" : Gosub ENTREE From EXEFNC
+
+Goto W_FIN
+
+#---------------------------------------------------------------------------------------
+# Suppression de l'en cours
+#---------------------------------------------------------------------------------------
+$W_SUPPRESSION
+Readlock[ORDW]ORD0=[M:ORDK]WIPTYP;[M:ORDK]WIPNUM;[M:ORDK]ITMREF
+If fstat = 1
+      GOK = -1
+      GLOCK = "$ORDERS"-num$([M:ORDK]WIPTYP)-[M:ORDK]WIPNUM-[M:ORDK]ITMREF
+      End
+Elsif fstat : Goto W_FIN
+Endif
+
+$W_SUPP_S
+WMAJCOD = "A"
+Delete [ORDW]
+
+GPOINT = "MAJITMMVT" : Gosub ENTREE From EXEFNC
+
+Goto W_FIN
+
+#---------------------------------------------------------------------------------------
+# Consommation de l'en cours
+#---------------------------------------------------------------------------------------
+$W_CONSOMMATION
+Readlock [ORDW]ORD0=[M:ORDK]WIPTYP;[M:ORDK]WIPNUM;[M:ORDK]ITMREF
+If fstat = 1
+      GOK = -1
+      GLOCK = "$ORDERS"-num$([M:ORDK]WIPTYP)-[M:ORDK]WIPNUM-[M:ORDK]ITMREF
+      End
+Elsif fstat
+      [M:ORDK]CPLQTY = 0 : Goto W_FIN
+Endif
+
+# si qté rest > qté à conso., mise à jour
+If [F:ORDW]RMNEXTQTY > [M:ORDK]CPLQTY
+      [F:ORDW]CPLQTY     += [M:ORDK]CPLQTY
+      [F:ORDW]RMNEXTQTY   = [F:ORDW]EXTQTY
+      [F:ORDW]RMNEXTQTY  -= [F:ORDW]CPLQTY
+      If [F:ORDW]RMNEXTQTY < 0 : [F:ORDW]RMNEXTQTY = 0 : Endif
+      [F:ORDW]UPDDAT      = date$
+      [F:ORDW]UPDUSR      = GUSER
+      [F:ORDW]EXPNUM      = [C]EXPORT
+      Rewrite [ORDW]
+      If fstat GOK = 0 : Call FSTA("ORDW") From GLOCK : End : Endif
+      Goto W_FIN
+Endif
+
+# si qté rest <= qté à conso., suppression
+[M:ORDK]CPLQTY = [F:ORDW]RMNEXTQTY
+Delete [ORDW]
+
+$W_FIN
+Close Local File [ORDW]   # Issue 88058 GA 02/2013
+End
+
+#######################################################################
+# Subprog PUR_WIP                                                     #
+# & (XFCY, XITM, XTYP, XSTA, XRET)                                    #
+#      Purge des encours par site/article                             #
+#######################################################################
+#------------------------------------------#
+# Purge encours site/art  llc juin 1998    #
+# si art    = "":tous les articles         #
+# si type   = 0 :tous les ordres           #
+# si statut = 0 :tous les types            #
+#------------------------------------------#
+Subprog PUR_WIP (XFCY, XITM, XTYP, XSTA, XRET)
+Value     Char    XFCY
+Value     Char    XITM
+Value     Integer XTYP
+Value     Integer XSTA
+Variable  Integer XRET
+Local     Integer XTRT
+
+If XFCY = "" : XRET = 9 : Goto FIN_PUR : Endif
+If clalev ([F:ORDW]) = 0 : Local File   ORDERS [ORDW] : Endif
+If clalev ([M:ORDK]) = 0 : Local Mask   ORDK   [ORDK] : Endif
+
+XRET    = 0
+XTRT     = 0
+If XITM <> "" : XTRT += 1 : Endif
+If XTYP <> 0  : XTRT += 2 : Endif
+If XSTA <> 0  : XTRT += 4 : Endif
+
+Case XTRT
+    When 0 : Filter [ORDW] Where [F:ORDW]ORIFCY=XFCY Order By Key ORD3
+    When 1 : Filter [ORDW] Where [F:ORDW]ORIFCY=XFCY & [F:ORDW]ITMREF=XITM Order By Key ORD3
+    When 2 : Filter [ORDW] Where [F:ORDW]ORIFCY=XFCY & [F:ORDW]WIPTYP=XTYP Order By Key ORD0
+    When 3 : Filter [ORDW] Where [F:ORDW]ORIFCY=XFCY & [F:ORDW]ITMREF=XITM
+&                              & [F:ORDW]WIPTYP=XTYP                       Order By Key ORD0
+    When 4 : Filter [ORDW] Where [F:ORDW]ORIFCY=XFCY & [F:ORDW]WIPSTA=XSTA Order By Key ORD3
+    When 5 : Filter [ORDW] Where [F:ORDW]ORIFCY=XFCY & [F:ORDW]ITMREF=XITM
+&                              & [F:ORDW]WIPSTA=XSTA                       Order By Key ORD3
+    When 6 : Filter [ORDW] Where [F:ORDW]ORIFCY=XFCY & [F:ORDW]WIPTYP=XTYP
+&                              & [F:ORDW]WIPSTA=XSTA                       Order By Key ORD0
+    When 7 : Filter [ORDW] Where [F:ORDW]ORIFCY=XFCY & [F:ORDW]ITMREF=XITM
+&                              & [F:ORDW]WIPTYP=XTYP & [F:ORDW]WIPSTA=XSTA Order By Key ORD0
+Endcase
+
+For [ORDW]
+    If fstat : XRET = fstat : Goto FIN_PUR : Endif
+    [M:ORDK]MAJCOD     = "A"
+    [M:ORDK]           = [F:ORDW]
+    Call WIP
+Next
+Filter [ORDW]
+$FIN_PUR
+End
+
+########################################################################
+#                        COVER                                         #
+#  Mise a jour du fichier ORDCOV (Historique prises en compte)         #
+#   MAJ   : Type de traitement                                         #
+#           C = création historique                                    #
+#           M = modification historique                                #
+#           A = suppression historique                                 #
+########################################################################
+Subprog COVER
+Local Integer STAT
+Local Integer WFOUND
+Local Decimal WQTY
+Local Integer IERROR  # FGR 09/02/2010 : X3SUIVI60986
+
+IERROR = 0  # FGR 09/02/2010 : X3SUIVI60986
+#
+If clalev ([F:ORDW]) = 0 : Local File ORDERS [ORDW] : Endif
+If clalev ([F:ORC])  = 0 : Local File ORDCOV [ORC]  : Endif
+#
+Case [M:ORCK]MAJCOD
+    When "C"     : Goto C_CREATION
+    When "M"     : Goto C_MODIFICATION
+    When "A"     : Goto C_SUPPRESSION
+    When Default : Goto C_FIN
+Endcase
+
+$C_CREATION
+Read [ORDW]ORD0=[M:ORCK]WIPTYP;[M:ORCK]WIPNUM;[M:ORCK]ITMREF
+If fstat : End : Endif
+#------------------------------#
+# creation histo.              #
+#------------------------------#
+WFOUND = 0
+For [ORC]ORC0 Where VCRTYP   =[F:ORDW]VCRTYP    & VCRNUM   =[F:ORDW]VCRNUM &
+&                   VCRLIN   =[F:ORDW]VCRLIN    & VCRSEQ   =[F:ORDW]VCRSEQ &
+&                   VCRTYPDST=[M:ORCK]VCRTYPDST & VCRNUMDST=[M:ORCK]VCRNUMDST &
+&                   VCRLINDST=[M:ORCK]VCRLINDST & VCRSEQDST=[M:ORCK]VCRSEQDST With Lock
+    [F:ORC]COVQTY += [M:ORCK]COVQTY
+    Rewrite [ORC]
+    # FGR 09/02/2010 : X3SUIVI60986
+    #If fstat : End : Endif
+    If fstat Then
+      IERROR = 1
+      Break
+    Endif
+    WFOUND = 1
+    Break
+Next
+If IERROR = 1 Then
+  # FGR 09/02/2010 : X3SUIVI60986
+  End
+Endif
+If WFOUND <> 0 : Goto C_FIN : Endif
+
+# création
+Raz [F:ORC]
+[F:ORC]             = [F:ORDW]
+[F:ORC]COVQTY       = [M:ORCK]COVQTY
+[F:ORC]VCRTYPDST    = [M:ORCK]VCRTYPDST
+[F:ORC]VCRNUMDST    = [M:ORCK]VCRNUMDST
+[F:ORC]VCRLINDST    = [M:ORCK]VCRLINDST
+[F:ORC]VCRSEQDST    = [M:ORCK]VCRSEQDST
+[F:ORC]WIPSTADST    = [M:ORCK]WIPSTADST
+[F:ORC]WIPTYPDST    = [M:ORCK]WIPTYPDST
+[F:ORC]ROUNUM       = [M:ORCK]ROUNUM
+[F:ORC]ROUALT       = [M:ORCK]ROUALT
+Write [ORC]
+If fstat : End : Endif
+
+Goto C_FIN
+
+$C_MODIFICATION
+#--------------------------------#
+# Modification histo.            #
+#--------------------------------#
+
+Filter [ORC] Where (VCRTYP=2 | VCRTYP=7) &
+&                  VCRTYPDST=[M:ORCK]VCRTYPDST &
+&                  VCRNUMDST=[M:ORCK]VCRNUMDST &
+&                  VCRLINDST=[M:ORCK]VCRLINDST &
+&                  VCRSEQDST=[M:ORCK]VCRSEQDST &
+&                  WIPSTADST=[M:ORCK]WIPSTAAV
+&            Order By ENDDAT Desc
+
+WQTY = [M:ORCK]COVQTY
+For [ORC] With Lock
+    [F:ORC]WIPSTADST = [M:ORCK]WIPSTADST
+    If WQTY <> 0
+        If [F:ORC]COVQTY <= WQTY
+            Delete [ORC]
+            # FGR 09/02/2010 : X3SUIVI60986
+            #If fstat : End : Endif
+            If fstat Then
+              IERROR = 1
+              Break
+            Endif
+            WQTY -= [F:ORC]COVQTY
+        Else
+            [F:ORC]COVQTY -= WQTY
+            WQTY = 0
+            Rewrite [ORC]
+            # FGR 09/02/2010 : X3SUIVI60986
+            #If fstat : End : Endif
+            If fstat Then
+              IERROR = 1
+              Break
+            Endif
+        Endif
+    Else
+        Rewrite [ORC]
+    Endif
+Next
+Filter [ORC]
+If IERROR = 1 Then
+  # FGR 09/02/2010 : X3SUIVI60986
+  End
+Endif
+Goto C_FIN
+
+$C_SUPPRESSION
+#--------------------------------#
+# Suppression histo.             #
+#--------------------------------#
+For [ORC]ORC0 Where VCRTYPDST=[M:ORCK]VCRTYPDST &
+&                   VCRNUMDST=[M:ORCK]VCRNUMDST &
+&                   VCRLINDST=[M:ORCK]VCRLINDST &
+&                   VCRSEQDST=[M:ORCK]VCRSEQDST &
+&                   WIPSTADST=[M:ORCK]WIPSTADST
+&             With Lock
+    Delete [ORC]
+Next
+Goto C_FIN
+
+$C_FIN
+End
+
+########################################################################
+#  mise a jour du besoins PEC si suppression pièce destinataire        #
+Subprog SUP_PEC(LTRS, LTYP, LNUM, LLIN, LSEQ, LSTA)
+Value Integer LTRS
+Value Integer LTYP
+Value Char    LNUM
+Value Integer LLIN
+Value Integer LSEQ
+Value Integer LSTA
+Local Integer WRET
+
+If clalev([F:ORC])   = 0 : Local File ORDCOV     [ORC]   : Endif
+If clalev([F:ORC1])  = 0 : Local File ORDCOV     [ORC1]  : Endif
+Local File MFGHEAD [MFG]
+Local File MFGITM  [MFI]
+
+If clalev([M:ORCK])  = 0 : Local Mask ORCK       [ORCK]  : Endif
+If clalev([M:MFGK])  = 0 : Local Mask MFGK       [MFGK]  : Endif
+
+# maj besoins initiaux (SOF/TWF)
+For [ORC]ORC0 Where  VCRTYPDST=10 &
+&                    VCRNUMDST=LNUM &
+&                    VCRLINDST=LLIN &
+&                    VCRSEQDST=LSEQ &
+&                    WIPSTADST=LSTA
+    If find([F:ORC]VCRTYP,2,7)
+       If [F:ORC]FMI = 5
+           Call MAJFMISOQ([F:ORC]VCRNUM, [F:ORC]VCRLIN, [F:ORC]VCRSEQ,
+&                         [F:ORC]VCRNUMDST, [F:ORC]VCRLINDST, 0, 2, WRET) From TRTVENMAJ
+       Endif
+   Else # GH 13/06/2014 bug 97471 cas d'un OF planifé affermi
+       For [ORC1] ORC0 Where VCRTYPDST=[F:ORC]VCRTYP &
+&                            VCRNUMDST=[F:ORC]VCRNUM &
+&                            VCRLINDST=[F:ORC]VCRLIN &
+&                            VCRSEQDST=[F:ORC]VCRSEQ &
+&                            WIPSTADST=[F:ORC]WIPSTA &
+&                            find(VCRTYP,2,7)<>0 & FMI=5
+           Call MAJFMISOQ([F:ORC1]VCRNUM, [F:ORC1]VCRLIN, [F:ORC1]VCRSEQ,
+&                         [F:ORC1]VCRNUMDST, [F:ORC1]VCRLINDST, 0, 2, WRET) From TRTVENMAJ
+       Next
+    Endif
+Next
+
+Call REGEN(1, LTRS, LTYP, LNUM, LLIN, LSEQ, LSTA, 0)
+
+# suppression historique
+Raz [M:ORCK]
+[M:ORCK]MAJCOD = "A"
+[M:ORCK]VCRTYPDST = LTYP
+[M:ORCK]VCRNUMDST = LNUM
+[M:ORCK]VCRLINDST = LLIN
+[M:ORCK]VCRSEQDST = LSEQ
+[M:ORCK]WIPSTADST = LSTA
+Call COVER From TRTWIP
+
+# remise à état initial CODTRS
+[M:MFGK]CODTRS = LTRS
+
+End
+
+########################################################################
+#  mise a jour du besoins PEC si modification pièce destinataire       #
+Subprog MOD_PEC(LTRS, LTYP, LNUM, LLIN, LSEQ, LAVSTA, LAPSTA, LECART, LECART2)
+Value Integer LTRS
+Value Integer LTYP
+Value Char    LNUM
+Value Integer LLIN
+Value Integer LSEQ
+Value Integer LAVSTA
+Value Integer LAPSTA
+Value Decimal LECART
+Value Decimal LECART2
+
+Local Decimal WECART : WECART = LECART
+Local Integer WRET
+
+If clalev([F:ORC])   = 0 : Local File ORDCOV     [ORC]   : Endif
+Local File MFGHEAD [MFG]
+Local File MFGITM  [MFI]
+
+If clalev([M:ORCK])  = 0 : Local Mask ORCK       [ORCK]  : Endif
+If clalev([M:MFGK])  = 0 : Local Mask MFGK       [MFGK]  : Endif
+
+If LECART2 <> 0
+    Call REGEN(2, LTRS, LTYP, LNUM, LLIN, LSEQ, LAVSTA, LECART2)
+Endif
+
+# modification historique
+Raz [M:ORCK]
+[M:ORCK]MAJCOD = "M"
+[M:ORCK]VCRTYPDST = LTYP
+[M:ORCK]VCRNUMDST = LNUM
+[M:ORCK]VCRLINDST = LLIN
+[M:ORCK]VCRSEQDST = LSEQ
+[M:ORCK]COVQTY    = LECART
+[M:ORCK]WIPSTADST = LAPSTA
+[M:ORCK]WIPSTAAV  = LAVSTA
+Call COVER From TRTWIP
+
+If LAVSTA <> 1 | LAPSTA <> 2 : Goto F_MODPEC : Endif
+
+# maj OF initiaux (WOP/WOF) dans cas particulier descente statut (WOF vers WOP)
+Filter [ORC] Where VCRTYP=10 &
+&                  VCRTYPDST=10 &
+&                  VCRNUMDST=LNUM &
+&                  VCRLINDST=LLIN &
+&                  VCRSEQDST=LSEQ &
+&                  WIPSTADST=LAVSTA
+
+For [ORC] With Lock
+    If find([F:ORC]VCRTYP, 2, 7)
+        [F:ORC]WIPSTADST = LAPSTA
+        Rewrite [ORC]
+    Else
+        Delete [ORC]
+    Endif
+Next
+Filter [ORC]
+
+$F_MODPEC
+# remise à état initial CODTRS
+[M:MFGK]CODTRS = LTRS
+
+End
+
+########################################################################
+#  recherche total PEC                                                 #
+Subprog CUM_PEC(LTYP, LNUM, LLIN, LSEQ, LSTA, LQTY, LQTY2, LQTY3)
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LSTA
+Variable Decimal LQTY
+Variable Decimal LQTY2
+Variable Decimal LQTY3
+
+If clalev([F:ORC])   = 0 : Local File ORDCOV     [ORC]   : Endif
+If clalev([F:ORC1])  = 0 : Local File ORDCOV     [ORC1]  : Endif
+If clalev([M:ORCK])  = 0 : Local Mask ORCK       [ORCK]  : Endif
+
+Filter [ORC] Where VCRTYPDST=LTYP &
+&                  VCRNUMDST=LNUM &
+&                  VCRLINDST=LLIN &
+&                  VCRSEQDST=LSEQ &
+&                  WIPSTADST=LSTA
+LQTY = 0
+LQTY2 = 0
+LQTY3 = 0
+For [ORC]
+    If find(2,7,[F:ORC]VCRTYP)
+        LQTY += [F:ORC]COVQTY
+    Else
+        LQTY2 += [F:ORC]COVQTY
+        Filter [ORC1] Where VCRTYPDST=[F:ORC]VCRTYP &
+&                           VCRNUMDST=[F:ORC]VCRNUM &
+&                           VCRLINDST=[F:ORC]VCRLIN &
+&                           VCRSEQDST=[F:ORC]VCRSEQ &
+&                           WIPSTADST=[F:ORC]WIPSTA
+        For [ORC1]
+            If find(2,7,[F:ORC1]VCRTYP)
+                LQTY     += [F:ORC1]COVQTY
+                LQTY3    += [F:ORC1]COVQTY
+            Endif
+        Next
+        Filter [ORC1]
+    Endif
+Next
+Filter [ORC]
+
+End
+
+########################################################################
+#  recherche total COV                                                 #
+Subprog CUM_COV(LTYP, LNUM, LLIN, LSEQ, LSTA, LQTY)
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LSTA
+Variable Decimal LQTY
+
+If clalev([F:ORC])   = 0 : Local File ORDCOV     [ORC]   : Endif
+If clalev([M:ORCK])  = 0 : Local Mask ORCK       [ORCK]  : Endif
+
+Filter [ORC] Where VCRTYP=10   &
+&                  VCRNUM=LNUM &
+&                  VCRLIN=LLIN &
+&                  VCRSEQ=LSEQ &
+&                  WIPSTA=LSTA &
+&                  VCRTYPDST=10
+&            Order By Key ORC1
+
+LQTY = 0
+For [ORC]
+    LQTY += [F:ORC]COVQTY
+Next
+Filter [ORC]
+
+End
+
+########################################################################
+#  regénération quantités planifiées en suppression couverture         #
+#  LMOD = 1, suppression
+#  LMOD = 2, modification
+Subprog REGEN(LMOD, LTRS, LTYP, LNUM, LLIN, LSEQ, LSTA, LECART)
+Value Integer LMOD
+Value Integer LTRS
+Value Integer LTYP
+Value Char    LNUM
+Value Integer LLIN
+Value Integer LSEQ
+Value Integer LSTA
+Value Decimal LECART
+Local Integer WRET, I, OK, WREGEN
+Local Decimal WQTY, WQTY2
+
+If clalev([F:ORC])   = 0 : Local File ORDCOV     [ORC]   : Endif
+If clalev([F:ORC1])  = 0 : Local File ORDCOV     [ORC1]  : Endif
+If clalev([F:ORD1])  = 0 : Local File ORDERS     [ORD1]  : Endif   # FQ 49889 utiliser [F:ORD1] plutôt que [F:ORD]
+If clalev([M:ORCK])  = 0 : Local Mask ORCK       [ORCK]  : Endif
+If clalev([M:MFGK])  = 0 : Local Mask MFGK       [MFGK]  : Endif
+WREGEN = GREGENPLN
+If LTRS = 0 & WREGEN = 2 : WREGEN = 1 : Endif
+I = 0
+If LMOD = 2 : WQTY2 = LECART : Endif
+# lecture des WOP d'origine
+Filter [ORC] Where VCRTYP=10 &
+&                  VCRTYPDST=10 &
+&                  VCRNUMDST=LNUM &
+&                  VCRLINDST=LLIN &
+&                  VCRSEQDST=LSEQ &
+&                  WIPSTADST=LSTA
+&            Order By ENDDAT Desc
+For [ORC] With Lock
+    If WQTY2 = 0 & LMOD = 2 : Break : Endif
+    Case LMOD
+        When 1: WQTY  = [F:ORC]COVQTY
+                WQTY2 = [F:ORC]COVQTY
+        When 2: WQTY = LECART
+    Endcase
+    # demande de confirmation si interactif
+    If I = 0 & WREGEN = 2
+        OK=1
+        Call OUINON(mess(93,190,1),OK) From GESECRAN
+        If OK = 2
+            WREGEN = 3
+        Else
+            WREGEN = 1
+        Endif
+        I += 1
+    Endif
+    # regénération quantités planifiées
+    If WREGEN <> 1
+        # test existence WOP
+        Read [MFG]MFG0 = [F:ORC]VCRNUM
+        If fstat | ([F:MFG]MFGSTA = LSTA)
+
+            # 56756
+            Read [MFI] = [F:ORC]VCRNUM;[F:ORC]VCRLIN
+            If fstat : Raz [MFI] : Endif
+
+            # regénération WOP
+            Raz [M:MFGK]
+            [M:MFGK]CODMAJ = "C"
+            [M:MFGK]CODTRS = 0
+            [M:MFGK]MFGNUM = ""
+            If [F:MFG]MFGSTA = LSTA
+                [M:MFGK]RMFGNUM = ""
+            Else
+                [M:MFGK]RMFGNUM = [F:ORC]VCRNUM
+            Endif
+            [M:MFGK]MFGLIN = 0
+            [M:MFGK]MFGFCY = [F:ORC]STOFCY
+            [M:MFGK]MFGSTA = 2
+            [M:MFGK]ITMREF = [F:ORC]ITMREF
+            [M:MFGK]PRVQTY = 0
+            [M:MFGK]EXTQTY = WQTY
+            [M:MFGK]STRDAT = [F:ORC]STRDAT
+            [M:MFGK]ENDDAT = [F:ORC]ENDDAT
+            [M:MFGK]BOMALT = [F:ORC]BOMALT
+            [M:MFGK]ROUNUM = [F:ORC]ROUNUM
+            [M:MFGK]ROUALT = [F:ORC]ROUALT
+            [M:MFGK]PJT    = [F:ORC]PJT
+            [M:MFGK]FMI    = [F:ORC]FMI
+            # 56756
+            If [F:MFI]BPCTYPDEN <> 0 : [M:MFGK]BPCTYPDEN = [F:MFI]BPCTYPDEN : Else : [M:MFGK]BPCTYPDEN = 1 : Endif
+
+            [M:MFGK]BPRNUM = [F:ORC]BPRNUM
+            [M:MFGK]PIO    = [F:ORC]PIO
+            [M:MFGK]VCRTYPORI = [F:ORC]VCRTYPORI
+            [M:MFGK]VCRNUMORI = [F:ORC]VCRNUMORI
+            [M:MFGK]VCRLINORI = [F:ORC]VCRLINORI
+            [M:MFGK]VCRSEQORI = [F:ORC]VCRSEQORI
+            [M:MFGK]WIPTYP = 0
+            [M:MFGK]WIPNUM = ""
+            [M:MFGK]AUTOTRT = 2
+            [M:MFGK]CALCST  = 1                      # GH 09/04/2014 bug 99047
+            Call MAJ_OF From MFGAUTLIB
+            # si contremarque, modification n° contremarque (nouveau numéro WOP)
+            If [M:MFGK]FMI = 5
+                Call MAJFMISOQ([M:MFGK]VCRNUMORI, [M:MFGK]VCRLINORI, [M:MFGK]VCRSEQORI,
+&                              [M:MFGK]MFGNUM, [M:MFGK]MFGLIN, 0, 1, WRET)
+&                        From TRTVENMAJ
+            Endif
+
+            # si nouvelle WOP générée, mise à jour traçabilité ...
+            If [M:MFGK]RMFGNUM = ""
+                # lecture des PEC niveau précédent
+                Filter [ORC1]  Where (VCRTYP=2 | VCRTYP=7) &
+&                                    VCRTYPDST=10 &
+&                                    VCRNUMDST=[F:ORC]VCRNUM &
+&                                    VCRLINDST=[F:ORC]VCRLIN &
+&                                    VCRSEQDST=[F:ORC]VCRSEQ &
+&                                    WIPSTADST=[F:ORC]WIPSTA
+&                              Order By ENDDAT Desc
+                For [ORC1] With Lock
+                     Delete [ORC1]
+
+                     # écriture enr° avec nouveau numéro WOP
+                     [F:ORC1]VCRNUMDST = [M:MFGK]MFGNUM
+                     [F:ORC1]VCRLINDST = [M:MFGK]MFGLIN
+                     Write [ORC1]
+                Next
+                Filter [ORC1]
+            Endif
+        Else
+            # augmentation WOP
+            # llc 04.02 14054 Performances
+            For [ORD1]ORD3 Where  STOFCY=[F:ORC]STOFCY &
+&                                VCRTYP=[F:ORC]VCRTYP &
+&                                VCRNUM=[F:ORC]VCRNUM &
+&                                VCRLIN=[F:ORC]VCRLIN &
+&                                VCRSEQ=[F:ORC]VCRSEQ &
+&                                WIPSTA=[F:ORC]WIPSTA
+                Read [MFI]MFI0 = [F:ORD1]VCRNUM;[F:ORD1]VCRLIN
+                If fstat : Break : Endif
+            Next
+            Raz [M:MFGK]
+            [M:MFGK]CODMAJ = "M"
+            [M:MFGK]CODTRS = 0
+            [M:MFGK]MFGNUM = [F:MFI]MFGNUM
+            [M:MFGK]MFGLIN = [F:MFI]MFGLIN
+            [M:MFGK]MFGFCY = [F:MFI]MFGFCY
+            [M:MFGK]MFGSTA = [F:MFI]MFGSTA
+            [M:MFGK]ITMREF = [F:MFI]ITMREF
+            [M:MFGK]PRVQTY = [F:MFI]EXTQTY
+            [M:MFGK]EXTQTY = [F:MFI]EXTQTY + WQTY
+            [M:MFGK]STRDAT = [F:MFI]STRDAT
+            [M:MFGK]ENDDAT = [F:MFI]ENDDAT
+            [M:MFGK]BOMALT = [F:MFI]BOMALT
+            [M:MFGK]ROUNUM = [F:MFG]ROUNUM
+            [M:MFGK]ROUALT = [F:MFG]ROUALT
+            [M:MFGK]PJT    = [F:MFI]PJT
+            [M:MFGK]LOT    = [F:MFI]LOT
+            [M:MFGK]MAJPEC = 9
+            [M:MFGK]AUTOTRT = 2
+            [M:MFGK]CALCST  = 1                      # GH 09/04/2014 bug 99047
+            Call MAJ_OF From MFGAUTLIB
+        Endif
+    Else
+        # lecture des PEC niveau précédent
+        Filter [ORC1]  Where (VCRTYP=2 | VCRTYP=7) &
+&                            VCRTYPDST=10 &
+&                            VCRNUMDST=[F:ORC]VCRNUM &
+&                            VCRLINDST=[F:ORC]VCRLIN &
+&                            VCRSEQDST=[F:ORC]VCRSEQ &
+&                            WIPSTADST=[F:ORC]WIPSTA
+&                      Order By ENDDAT Desc
+        For [ORC1] With Lock
+            If WQTY <> 0
+                If [F:ORC1]COVQTY <= WQTY
+                    Delete [ORC1]
+                    WQTY -= [F:ORC1]COVQTY
+                Else
+                    [F:ORC1]COVQTY -= WQTY
+                    WQTY = 0
+                    Rewrite [ORC1]
+                Endif
+            Else
+                Rewrite [ORC1]   # pour libérer le Lock
+                Break
+            Endif
+        Next
+        Filter [ORC1]
+    Endif
+    If [F:ORC]COVQTY <= WQTY2
+        Delete [ORC]
+        WQTY2 -= [F:ORC]COVQTY
+    Else
+        [F:ORC]COVQTY -= WQTY2
+        WQTY2 = 0
+        Rewrite [ORC]
+    Endif
+Next
+Filter [ORC]
+
+End
+
+#--- Issue 106506 by TS
+##########################################################################
+# Subprog SHP_WIP()                                                      #
+#  affinage d'une POF en cours d'expédition pour exploitation            #
+#  dans le CBN                                                           #
+#------------------------------------------------------------------------#
+# Utilisation de l'écran de paramétrage ORDK pour les paramètres         #
+# Entrée : alimenter VCRNUM, VCRLIN et VCRSEQ :identification de la POF  #
+#                    EXTQTY : quantité prévue                            #
+#                    CPLQTY : quantité réalisée totale                   #
+#                    ENDDAT : date fin                                   #
+# Sortie : le résultat de l'affinage de la POF est stocké                #
+#          dans le bloc tableau de ORDK                                  #
+#          (zones WIPQTY, WIPDAT, SHDQTY et SHDDAT)                      #
+##########################################################################
+Subprog SHP_WIP
+Local Decimal WPOFQTY, WPOFQTYRES
+Local Decimal WSHDQTY
+Local Integer I
+I = 0
+[M:ORDK]NBLIG = 0
+WPOFQTY       = [M:ORDK]EXTQTY-[M:ORDK]CPLQTY
+WPOFQTYRES    = WPOFQTY
+
+Local File SHIPMENTD [SHD]
+
+Filter [SHD] Where POHNUM=[M:ORDK]VCRNUM & POPLIN=[M:ORDK]VCRLIN & POQSEQ=[M:ORDK]VCRSEQ & CLEFLG<>2
+For [SHD]SHD2
+  # Quantité pré-réceptionnée ou expédiée, non réceptionnée
+  #--- Issue 111279
+  #If [F:SHD]PRCQTYSTU>0
+  If [F:SHD]PRCPQTYSTU>0
+  #---
+    WSHDQTY = [F:SHD]PRCPQTYSTU-[F:SHD]RCPQTYSTU
+  Else
+    WSHDQTY = [F:SHD]SHIQTYSTU-[F:SHD]RCPQTYSTU
+  Endif
+
+  If WSHDQTY>0
+    [M:ORDK]SHIPNUM(I) = [F:SHD]SHIPNUM
+    [M:ORDK]SHIPLIN(I) = [F:SHD]SHIPLIN
+    [M:ORDK]SHDQTY(I)  = WSHDQTY
+    [M:ORDK]SHDDAT(I)  = [F:SHD]EXTRCPDAT
+    [M:ORDK]WIPDAT(I)  = [M:ORDK]ENDDAT
+    If WSHDQTY>WPOFQTYRES
+      [M:ORDK]WIPQTY(I) = -WPOFQTYRES
+      WPOFQTYRES = 0
+    Else
+      [M:ORDK]WIPQTY(I) = -WSHDQTY
+      WPOFQTYRES -= WSHDQTY
+    Endif
+    I+=1
+    [M:ORDK]NBLIG+=1
+    If [M:ORDK]NBLIG>50 : Break : Endif
+  Endif
+Next
+
+Filter [SHD]
+Close Local File [SHD]
+
+End
+#---
+

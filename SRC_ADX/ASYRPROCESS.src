@@ -1,0 +1,625 @@
+#<AdxTL>@(#)11.0.0.0 $Revision$
+Local Clbfile WCLOB(10)
+Local Char KEYS(100)
+KEYS="ASOUT003"
+#Gosub GET_PROTO
+Openo "#@D:\temp\protoproc.json",0
+Wrseq WCLOB
+Openo
+End
+
+#**
+#* Funprog HANDLER_GET()
+#*!
+Funprog HANDLER_GET(ACTX,ASWK,ARCV,PSYR,ASND)
+Variable Instance ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Variable Instance ASWK(1..) Using C_ASYRWRK
+Variable Instance ARCV Using C_ASYRRCV
+Variable Instance PSYR Using C_ASYR
+Variable Instance ASND Using C_ASYRSND
+
+Local Integer   ERROR : ERROR = [V]CST_AOK
+Local Integer   I
+Local Char      KEYS(50)(0..3)
+Local Char      STRING(250)
+
+STRING = right$(PSYR.CODREP,instr(1,PSYR.CODREP,'~')+1)
+I=func ASYRSUB.SPLIT1(KEYS,STRING,"~")
+
+ERROR = func GET_(ACTX,KEYS,ASND)
+
+End ERROR
+
+# Routines to manage visual processes
+# The resource file size is limited to 64K (today, the size is approximately 5K)
+
+Funprog GET_(ACTX,KEYS,ASND)
+Variable Instance ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Value Char KEYS()(1..)
+Variable Instance ASND Using  C_ASYRSND
+
+Local Integer   ERROR : ERROR = [V]CST_AOK
+
+ERROR=0
+Local Char LEGDEF(30) : LEGDEF = ""
+Local Char KEYPROC(30),MENUPROC(30)
+Local Char RESOURCE_FILE(250)
+Local Integer ITLD, LEGFOUND
+Local Clbfile RESOUR(7)
+
+# Declare the tables
+  If clalev([APR]) : LogicClose File [APR] : Endif : Local File APROCESSUS [APR]
+  If clalev([AXX]) : LogicClose File [AXX] : Endif : Local File ATEXTRA [AXX]
+  If clalev([ADS]) : LogicClose File [ADS] : Endif : Local File ADOSSIER [ADS]
+  If clalev([ACB]) : LogicClose File [ACB] : Endif : Local File ACLOB [ACB]
+  If clalev([ACC]) : LogicClose File [ACC] : Endif : Local File ACCES [ACC]
+  If clalev([AUS]) : LogicClose File [AUS] : Endif : Local File AUTILIS [AUS]
+
+  Read [AUS]CODUSR=ACTX.USER
+  If fstat :
+    ASND.DATA='{"$diagnoses": [{"$severity": "error","$message": "'-mess(141,100,1)-'"}]}' : # Code utilisateur inexistant
+    ERROR=0
+    End ERROR
+  Endif
+
+#Call PARSE_KEYS(KEYS, LEGDEF, KEYPROC ,MENUPROC)
+# KEYS can contain the decomposition of either LEG~PROCESSUS or PROCESSUS or also LEG~PROCESSUS~MENU or ~PROCESSUS~MENU
+  If KEYS(2)<>""
+    KEYPROC=KEYS(2)
+    LEGDEF=KEYS(1)
+    MENUPROC=KEYS(3)
+  Else
+    KEYPROC=KEYS(1)
+    Raz LEGDEF,MENUPROC
+  Endif
+
+  If LEGDEF = ""
+    LEGDEF=fmet ACTX.APARAM.AGETUSERVALCHAR("LEGFIL")
+    If LEGDEF=""
+     Local Integer MONOLEG
+     MONOLEG = 0
+     If clalev([ACV]) : LogicClose File [ACV] : Endif
+     Local File ACTIV [ACV]
+     Read [ACV]CODACT="LEG"
+     If fstat or [F:ACV]FLACT<>2
+      MONOLEG = 1
+     Endif
+     If MONOLEG
+      LEGDEF = fmet ACTX.APARAM.AGETVALCHAR(CST_ALEVFOLD,"","DOSLEG")
+     Endif
+    Endif
+  Endif
+
+  LEGFOUND = func READ_APR(ACTX,LEGDEF, KEYPROC)
+
+  If [AUS]ALLACS<>2 and [APR]CODACC<>"" : # 116079 Interactive dashboard processes : problems with access codes CCL
+      Read [ACC]CODACC=[AUS]USR;[APR]CODACC
+      If !(fstat=0 and [ACC]EXEC=2)
+       ASND.DATA='{"$diagnoses": [{"$severity": "info","$message": "'-KEYPROC-":"-mess(38,134,1)-'"}]}'
+       ERROR=0
+       End ERROR
+      Endif
+  Endif
+
+  # If not found, we send a "dummy process" with an error code displayed
+  If LEGFOUND=0
+    Gosub DUMMY_PROCESS
+    ERROR=0
+    End ERROR
+  Endif
+
+  # Read the resource file (UTF8) and skip the 3 first characters (BOM)
+  RESOURCE_FILE=filpath("X3_ROOT\X3CLI\XBLOCK\FLASH\FlowCharting\xtec\sage_libraries\sage_basic",
+&                       "sgx_libsinfo","txt","X3_PUB")
+
+  Openi RESOURCE_FILE,0 Using [RSF]
+  Iomode adxium 0 Using [RSF]
+  Iomode adxifs "" Using [RSF]
+  Iomode adxirs "" Using [RSF]
+
+  # Skip the BOM if it exists (Dominique BOPP, June 19, 2014)
+  # The only BOM considered is the 3 bytes one (UTF8)
+  Local Tinyint IFBOM(1..3)
+  Getseq 3,IFBOM Using [RSF]
+
+  If IFBOM(1)<>239 or IFBOM(2)<>187 or IFBOM(3)<>191
+     Seek First Using [RSF]
+  Endif
+  # End of modification(Dominique BOPP, June 19, 2014)
+
+  Rdseq RESOUR Using [RSF]
+
+  Openi Using [RSF]
+
+
+# At this point, if LEGFOUND is equal to 1, the current process is online
+ASND.DATA='{"description":"'+func T(ACTX.LAN,"APROCESSUS",KEYPROC,"INTIT1",0)+'",'
+Append ASND.DATA,'"process":{"$data":'
+
+# Modification May 24th : search if the process has been translated in Syracuse link
+Read [ACB]ACB0="APRJSON";[APR]CODPRO;[APR]CODLEG;""
+
+# Modification 18th of June
+If fstat=0
+  Call CREPRTEXT(ACTX,KEYPROC,[APR]CODLEG,ACTX.LAN,[ACB]CLOB)
+  Append ASND.DATA,[ACB]CLOB
+Else
+  Call CREPRTEXT(ACTX,KEYPROC,[APR]CODLEG,ACTX.LAN,[APR]CLOB)
+  Append ASND.DATA,[APR]CLOB
+Endif
+
+Append ASND.DATA,',"$info":'+RESOUR
+Append ASND.DATA,"}"
+Append ASND.DATA,"}"
+ERROR=0
+End ERROR
+
+$DUMMY_PROCESS
+ASND.DATA='{"$diagnoses": [{"$severity": "info","$message": "'-KEYPROC-":"-mess(52,127,1)-'"}]}'
+ERROR=0
+Return
+
+$DUMMY_PROCESS_OLD
+  # At this point, no process has been found
+  ASND.DATA='{"description":"No process found",'
+  Append ASND.DATA,'"process":{"$data":'
+  Append ASND.DATA, '{"acts":{},"layersArr":[{"xpropsArr":[],"alpha":100,"visible":true,"lock":false,"id":0},{"xpropsArr":[{"xstrokeProps":{"xtype":"nostroke",'
+  Append ASND.DATA, '"xthickness":1,"xcolor":null,"xalpha":100,"xstart":{"xtype":"none"},"xend":{"xtype":"none"}},"xfillProps":{"xtype":"solidfill","xcolor":'
+  Append ASND.DATA, '16777215,"xalpha":100,"xgtype":"linear"},"xactionProps":{"xtype":"none"},"xlinkProps":{"xtype":"none"},"xanchors":[{"type":null,"x":209,'
+  Append ASND.DATA, '"y":45},{"type":null,"x":646.5,"y":45},{"type":null,"x":646.5,"y":158},{"type":null,"x":209,"y":158}],"xtextFormat":{"letterSpacing":0,'
+  Append ASND.DATA, '"kerning":false,"display":"block","bullet":false,"tabStops":[],"blockIndent":0,"leading":0,"indent":0,"rightMargin":5,"leftMargin":5,'
+  Append ASND.DATA, '"align":"center","underline":false,"italic":false,"bold":false,"target":"","url":"","color":0,"size":30,"font":"Arial"},"xtext":'
+  Append ASND.DATA, '"<TEXTFORMAT LEFTMARGIN=\"5\" RIGHTMARGIN=\"5\"><P ALIGN=\"CENTER\"><FONT FACE=\"Arial\" SIZE=\"30\" COLOR=\"#000000\" LETTERSPACING=\"0\" KERNING=\"0\">'
+  Append ASND.DATA,'The process'-KEYPROC-'does not exist'
+  Append ASND.DATA, '</FONT></P></TEXTFORMAT>","xcaptionProps"'
+  Append ASND.DATA, ':{"xvertAlignMode":"middle","xsizingMode":"fit"},"xcaptionPos":{"xleft":209,"xtop":64.5},"xcaptionSize":{"xwidth":437.5,'
+  Append ASND.DATA, '"xheight":74},"xcaptionDeltaPos":{"x":0,"y":0},"xshadowProps":{"xtype":"none"},"group":null,"xdrawBehaviorCode":"K_API_RECT"'
+  Append ASND.DATA, ',"xlevel":0,"xshapeType":"apishape","uniqueID":"1372695414054220049"},{"xstrokeProps":{"xend":{"xtype":"none"},"xstart":{'
+  Append ASND.DATA, '"xtype":"none"},"xalpha":100,"xcolor":16711680,"xthickness":1,"xtype":"solidstroke"},"xfillProps":{"xgtype":"linear",'
+  Append ASND.DATA, '"xalpha":100,"xcolor":16711680,"xtype":"solidfill"},"xclosed":true,"xactionProps":{"xtype":"none"},"xlinkProps":{"xtype":"none"}'
+  Append ASND.DATA, ',"xanchors":[{"type":"cusp","x":125,"y":44.5,"c1x":125,"c1y":44.5,"c2x":125,"c2y":44.5},{"type":"cusp","x":185,"y":152.5,'
+  Append ASND.DATA, '"c1x":185,"c1y":152.5,"c2x":185,"c2y":152.5},{"type":"cusp","x":65,"y":152.5,"c1x":65,"c1y":152.5,"c2x":65,"c2y":152.5}],'
+  Append ASND.DATA, '"xtextFormat":{"letterSpacing":0,"kerning":false,"display":"block","bullet":false,"tabStops":[],"blockIndent":0,"leading":0,'
+  Append ASND.DATA, '"indent":0,"rightMargin":5,"leftMargin":5,"align":"center","underline":false,"italic":false,"bold":false,"target":"","url":"",'
+  Append ASND.DATA, '"color":16777215,"size":60,"font":"Arial"},"xtext":"<TEXTFORMAT LEFTMARGIN=\"5\" RIGHTMARGIN=\"5\"><P ALIGN=\"CENTER\"><FONT FACE=\"Arial\"'
+  Append ASND.DATA, 'SIZE=\"60\" COLOR=\"#FFFFFF\" LETTERSPACING=\"0\" KERNING=\"0\">!</FONT></P></TEXTFORMAT>","xcaptionProps":{"xsizingMode":"fit",'
+  Append ASND.DATA, '"xvertAlignMode":"bot"},"xcaptionPos":{"xleft":65,"xtop":81.5},"xcaptionSize":{"xwidth":120,"xheight":71},"xcaptionDeltaPos":'
+  Append ASND.DATA, '{"x":0,"y":0},"xshadowProps":{"xtype":"none"},"group":null,"xdrawBehaviorCode":"K_BZ_POLY","xlevel":4,"xshapeType":"beziershape",'
+  Append ASND.DATA, '"uniqueID":"1372699002017323108"}],"alpha":100,"visible":true,"lock":false,"id":1}],"reachedGroupNum":0,"contentSize":{"xheight":'
+  Append ASND.DATA, '165,"xwidth":653.5},"docDims":{"xheight":640,"xwidth":860,"xtop":0,"xleft":0},"currentLayerId":1}'
+
+  Append ASND.DATA,"}"
+
+  Append ASND.DATA,',"$info":'+RESOUR
+  Append ASND.DATA,"}"
+  ERROR=0
+
+Return
+
+
+# Get the prototype of a visual process
+# The resource file size is limited to 64K (today, the size is approximately 5K)
+Subprog PROTO_JSON(ACTX,PSYR,WCLOB,KEYS)
+Variable Instance ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Variable Instance  PSYR     Using C_ASYR
+Variable Clbfile   WCLOB
+Value Char KEYS()(1..)
+
+  Local Char LEGDEF(30), MENUPROC(30),KEYPROC(20)
+
+  If KEYS(2)<>""
+    LEGDEF=KEYS(1)
+    KEYPROC=KEYS(2)
+    MENUPROC=KEYS(3)
+  Else
+    KEYPROC=KEYS(1)
+    Raz LEGDEF,MENUPROC
+  Endif
+
+  If LEGDEF = ""
+    LEGDEF=fmet ACTX.APARAM.AGETUSERVALCHAR("LEGFIL")
+    If LEGDEF=""
+     Local Integer MONOLEG
+     MONOLEG = 0
+     If clalev([ACV]) : LogicClose File [ACV] : Endif
+     Local File ACTIV [ACV]
+     Read [ACV]CODACT="LEG"
+     If fstat or [F:ACV]FLACT<>2
+      MONOLEG = 1
+     Endif
+     If MONOLEG
+      LEGDEF = fmet ACTX.APARAM.AGETVALCHAR(CST_ALEVFOLD,"","DOSLEG")
+     Endif
+    Endif
+  Endif
+
+  # Open the files
+  If !clalev([AXX]) : Local File ATEXTRA [AXX] : Endif
+
+  # Fixing a bug related to base url for classic page Sept 22, 2014
+  Local Char TRANSURL(250)
+  Local Integer I
+  I=instr(1,PSYR.PREFIX,"/sdata/")
+  If I
+    TRANSURL=left$(PSYR.PREFIX,I-1)+"/trans/"+right$(PSYR.PREFIX,8)
+  Else
+    TRANSURL=PSYR.PREFIX : # What else ?
+  Endif
+  Append WCLOB,'{"$baseUrl":"'+PSYR.PREFIX+'",'
+
+  # Fix for classic pages links: a dedicated variable is necessary Dom Sept 18, 2014
+  Append WCLOB,'"$baseTrans":"'+TRANSURL+'",'
+  Append WCLOB,'"$baseType":"'+"application/json; vnd.sage=syracuse;representation="+PSYR.CNTPRE+'.'+nomap+'",'
+  Append WCLOB,'"$url":"'+"{$baseUrl}/PROCESS('"+KEYPROC+"')?representation=PROCESS.$details&role={$role}"+'",'
+  Append WCLOB,'"$title":"'+func T(ACTX.LAN,"APROCESSUS",KEYPROC,"INTIT1",0)+'",'
+  Append WCLOB,'"$type":"{$baseType}.PROCESS.$details",'
+  Append WCLOB,'"$methods":"GET",'
+  Append WCLOB,'"$properties":{"process":{"$type":"application/x-process"}}'
+  If MENUPROC <> ""
+    Append WCLOB, func GEN_MENUS_LINKS(ACTX,LEGDEF, MENUPROC)
+  Endif
+  Append WCLOB,'}'
+End
+
+# It should exist somewhere
+Funprog T(LANGUE,TABLE,CLE,CHAMP,INDEX)
+Value Char LANGUE(),TABLE(),CHAMP(),CLE()
+Value Integer INDEX
+Local Integer I,J,IM
+Local Char TEXTE(200)
+
+  Read [AXX]AXX0=TABLE;CHAMP;LANGUE;CLE;string$(INDEX<>0,num$(INDEX))
+  If fstat : End "" : Endif
+  End escJson([AXX]TEXTE)
+
+
+# Added by DOM the 18th of June 2013 // Modified By TCA on 16th of August 2013
+# Replacement of texts in a process
+# Copied from SUBAPR and modified because:
+#  1) the default language must first be English and only after French
+#  2) GLANDEF is no more used (TCA : Use LEGISLATION instead of LANG1)
+
+Subprog CREPRTEXT(ACTX,CODE,LEGISL,LANG1,CLBPR)
+Variable Instance ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Value Char CODE
+Value Char LEGISL
+Value Char LANG1
+Variable Clbfile CLBPR
+
+# Insert the right languages in the process
+Local File APROCTEXTE [AXP]
+Local Integer I,ERR,DELTAL,IND
+
+  Gosub RECHTXT
+  If ERR<>0 or ITXT=0 : End : Endif
+
+Local Clbfile CLBP(10)
+Local Integer IREPTXT(1..ITXT)
+
+  CLBP=CLBPR
+  Filter [AXP] Where CODPRO=CODE and CODLEG=LEGISL and LANG=LANG1
+  For [AXP]
+    IND=find([F:AXP]UNIQIDP,UNIQUEID(1..ITXT))
+    If IND<>0
+      IREPTXT(IND)=1
+      Read [ACB]ACB0="APRJSON";[APR]CODPRO+"~"+[APR]CODLEG;[AXP]UNIQIDP;[AXP]LANG
+      If fstat=0 : [F:AXP]CLBTEXT=[ACB]CLOB : Endif
+      CLBP=left$(CLBP,TDEB(IND)-1)+[F:AXP]CLBTEXT+right$(CLBP,TFIN(IND)+1)
+      # Shift the positions by taking in account the length differences
+      DELTAL=len([F:AXP]CLBTEXT)-(TFIN(IND)-TDEB(IND)+1)
+      If DELTAL<>0 : Gosub MOVEPOS : Endif
+    Endif
+  Next
+  Filter [AXP]
+
+# Replacement by English, finally by French if language not found
+  For IND=1 To ITXT
+    If IREPTXT(IND)=0
+      Read [AXP]AXP0=CODE;LEGISL;LEGISL;UNIQUEID(IND)
+      If fstat=0
+        Read [ACB]ACB0="APRJSON";[APR]CODPRO+"~"+[APR]CODLEG;[AXP]UNIQIDP;[AXP]LANG
+        If fstat=0 : [F:AXP]CLBTEXT=[ACB]CLOB : Endif
+        CLBP=left$(CLBP,TDEB(IND)-1)+[F:AXP]CLBTEXT+right$(CLBP,TFIN(IND)+1)
+        DELTAL=len([F:AXP]CLBTEXT)-(TFIN(IND)-TDEB(IND)+1)
+        If DELTAL<>0 : Gosub MOVEPOS : Endif
+      Elsif fstat<>0 and ACTX.LAN<>"ENG"
+        Read [AXP]AXP0=CODE;LEGISL;"ENG";UNIQUEID(IND)
+        If fstat=0
+          Read [ACB]ACB0="APRJSON";[APR]CODPRO+"~"+[APR]CODLEG;[AXP]UNIQIDP;[AXP]LANG
+          If fstat=0 : [F:AXP]CLBTEXT=[ACB]CLOB : Endif
+          CLBP=left$(CLBP,TDEB(IND)-1)+[F:AXP]CLBTEXT+right$(CLBP,TFIN(IND)+1)
+          DELTAL=len([F:AXP]CLBTEXT)-(TFIN(IND)-TDEB(IND)+1)
+          If DELTAL<>0 : Gosub MOVEPOS : Endif
+        Elsif ACTX.LAN<>"FRA"
+          Read [AXP]AXP0=CODE;LEGISL;"FRA";UNIQUEID(IND)
+          If fstat=0
+            Read [ACB]ACB0="APRJSON";[APR]CODPRO+"~"+[APR]CODLEG;[AXP]UNIQIDP;[AXP]LANG
+            If fstat=0 : [F:AXP]CLBTEXT=[ACB]CLOB : Endif
+            CLBP=left$(CLBP,TDEB(IND)-1)+[F:AXP]CLBTEXT+right$(CLBP,TFIN(IND)+1)
+            DELTAL=len([F:AXP]CLBTEXT)-(TFIN(IND)-TDEB(IND)+1)
+            If DELTAL<>0 : Gosub MOVEPOS : Endif
+          Endif
+        Endif
+      Endif
+    Endif
+  Next J
+  CLBPR=CLBP
+End
+
+$MOVEPOS
+  For I=1 To ITXT
+  If TDEB(I)>=TDEB(IND)
+    TDEB(I)+=DELTAL
+    TFIN(I)+=DELTAL
+  Endif
+  Next I
+Return
+
+
+# Algorithm used : search for uniqueid that follows, and then go back to search </TEXTFORMAT> or </P>
+$RECHTXT
+Local Integer DEB,DEBUN,DEBU1,FIN,FINP,FINUN,ITXT,IUNIQ,IND,TDEB(1..500),TFIN(1..500)
+Local Char UNIQUEID(30)(1..500),UNIQ1(30)
+  DEB=1
+  While DEB<>0
+    DEB=instr(DEB,CLBPR,'"xtext":"<TEXTFORMAT')
+    If DEB<>0
+      DEBUN=instr(DEB,CLBPR,'uniqueID":')
+      FIN=0 : FINP=0
+      If DEBUN<>0
+        FIN=instr(DEB+1,CLBPR,'</TEXTFORMAT>"')
+        If FIN=0 or FIN>DEBUN
+          FINP=1
+          FIN=instr(DEB+1,CLBPR,'</P>"')
+        Endif
+        If FIN>DEBUN : FIN=0 : Endif
+      Endif
+      If FIN<>0
+        ITXT+=1
+        TDEB(ITXT)=DEB+9
+        If FINP=0
+          TFIN(ITXT)=FIN+12
+        Else
+          TFIN(ITXT)=FIN+3
+        Endif
+        FINUN=instr(DEBUN,CLBPR,'"}')
+        UNIQUEID(ITXT)=mid$(CLBPR,DEBUN+11,FINUN-DEBUN-11)
+      Endif
+      DEB=DEBUN
+    Endif
+  Wend
+Return
+
+Funprog GEN_MENUS_LINKS(ACTX,LEGDEF, MENUCODE)
+Variable Instance ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Value Char LEGDEF, MENUCODE()
+
+  If clalev([APR]) : LogicClose File [APR] : Endif : Local File APROCESSUS [APR]
+  If clalev([AXX]) : LogicClose File [AXX] : Endif : Local File ATEXTRA [AXX]
+  If clalev([ACC]) : LogicClose File [ACC] : Endif : Local File ACCES [ACC]
+  If clalev([AUS]) : LogicClose File [AUS] : Endif : Local File AUTILIS [AUS]
+  If clalev([APO]) : LogicClose File [APO] : Endif : Local File APROMEN [APO]
+  If clalev([ADS]) : LogicClose File [ADS] : Endif : Local File ADOSSIER [ADS]
+
+  Local Integer I, J, MENU_FOUND, TYPEP, OPENED
+  Local Clbfile DATA(5) : DATA = ""
+  Local Clbfile LINKS(5) : LINKS = ""
+  Local Clbfile MENUS(5) : MENUS = ""
+  Local Clbfile MENU(5)
+
+  OPENED = 0 # No menu opened
+  # Search Menu
+  MENU_FOUND = func READ_APO(LEGDEF, MENUCODE)
+  If MENU_FOUND = 1
+
+    Local Char TITLEP(30)
+    Local Integer LEVELP
+    Local Integer PREV_TYPE : PREV_TYPE = 1 # Consider first type is processus
+    Local Integer PREV_LEVEL : PREV_LEVEL = 1
+    Local Integer TYPREP
+
+#   Added by DOM On september 25,2013
+#   Additional passes on the processes will purge the processes not available or not authorized
+#   as well as the intermediate menus that have no more sub menus
+    Read [AUS]CODUSR=ACTX.USER
+    If fstat : End : Endif
+
+#   First pass : apply a filter on the processes
+    I=1
+    While I<=[APO]NBPROC
+      TYPREP = func READ_APR(ACTX,LEGDEF, [APO]PROCESSUS(I-1))
+      If TYPREP<>0 and [AUS]ALLACS<>2 and [APR]CODACC<>""
+        Read [ACC]CODACC=[AUS]USR;[APR]CODACC
+        TYPREP=(fstat=0 and [ACC]EXEC=2)
+      Endif
+      If TYPREP=0
+        Gosub VIRE_PROC_I
+        I-=1
+      Endif
+      I+=1
+    Wend
+
+#   Second pass : apply a filter on the empty menus
+    I=1
+    While I<=[APO]NBPROC
+      TYPREP = func READ_APR(ACTX,LEGDEF, [APO]PROCESSUS(I-1))
+      If TYPREP=2
+        # Set TYPREP to 0 if the entry must be deleted
+        If I<[APO]NBPROC
+          TYPREP=func READ_APR(ACTX,LEGDEF, [APO]PROCESSUS(I))
+          # TYPREP will be 0 if the next entry is a menu at the same level (no more entries in between)
+          TYPREP=(TYPREP=1) or [APO]NIVEAU(I)<>[APO]NIVEAU(I-1)
+        Else
+          TYPREP=0
+        Endif
+        If TYPREP=0
+          Gosub VIRE_PROC_I
+          I-=1
+        Endif
+      Endif
+      I+=1
+    Wend
+
+$SUITE
+    # Iterate on each linked processus
+    For I=1 To [APO]NBPROC
+
+      TYPEP = func READ_APR(ACTX,LEGDEF, [APO]PROCESSUS(I-1))
+      Break (TYPEP = 0)
+      # Translate title
+      TITLEP = func LEC_TXT(ACTX,[APR]CODPRO,ACTX.LAN)
+      # Get Level
+
+      LEVELP = [APO]NIVEAU(I-1)
+      ###
+      # Write $links and $menus
+      ###
+      MENU = ""
+
+      If (MENUS <> "")
+        If (LEVELP = PREV_LEVEL and PREV_TYPE = 1)
+          Append MENU, ','
+        Elsif (LEVELP < PREV_LEVEL)
+          For J = 1 To (PREV_LEVEL - LEVELP)
+            OPENED -= 1
+            Append MENU, ']}}'
+          Next J
+          Append MENU, ','
+        Endif
+      Endif
+      If (TYPEP = 1)
+        If (LINKS <> "")
+          Append LINKS, ','
+        Endif
+
+        Append LINKS, '"$' + tolower([APR]CODPRO) + '": {'
+        Append LINKS, '"$title": "' + TITLEP + '",'
+        Append LINKS, '"$url": "{$baseUrl}/PROCESS(' + "'" + LEGDEF + "~" + [APR]CODPRO + "~" + [APO]CODMEN + "'" + ')?representation=PROCESS~~' + [APR]CODPRO + "~" + [APO]CODMEN + '.$details",'
+        Append LINKS, '"$method": "GET"'
+        Append LINKS, '}'
+
+        Append MENU, '{"$bind":"$' + tolower([APR]CODPRO) + '"}'
+      Else
+        OPENED += 1
+        Append MENU, '{"$title":"' + TITLEP + '",'
+        Append MENU, '"$layout":{'
+        Append MENU, '"$items":['
+      Endif
+
+      PREV_TYPE = TYPEP
+      PREV_LEVEL = LEVELP
+
+      Append MENUS, MENU
+
+    Next I
+      If OPENED > 0
+        For J = 1 To OPENED
+          Append MENUS, ']}}'
+        Next J
+      Endif
+    ###
+    # Build JSON entries
+    ###
+    # Here insert the links definition from menu code
+    Append DATA,',"$links":{'
+    Append DATA, LINKS
+    Append DATA,"}"
+    # Here insert the article definition from menu code
+    Append DATA,',"$menus":[{'
+    Append DATA,'"$skin": "s-mn-bar-business",'
+    Append DATA,'"$layout":{'
+    Append DATA,'"$items":['
+    Append DATA, MENUS
+    Append DATA,"]"
+    Append DATA,"}"
+    Append DATA,"}]"
+  Endif
+End DATA
+
+$VIRE_PROC_I
+  For J=I To [APO]NBPROC-1
+    [APO]PROCESSUS(J-1)=[APO]PROCESSUS(J)
+    [APO]NIVEAU(J-1)=[APO]NIVEAU(J)
+  Next J
+  [APO]NBPROC-=1
+Return
+
+
+Funprog LEC_TXT(ACTX,PROC_CODE,LAN)
+Variable Instance ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Value Char PROC_CODE(),LAN()
+  Read [AXX]AXX0="APROCESSUS";"INTIT1";LAN;PROC_CODE
+  If fstat
+    End PROC_CODE
+  Endif
+End [AXX]TEXTE
+
+Funprog READ_APR(ACTX,LEGDEF, KEYPROC)
+Variable Instance ACTX Using =[V]CST_C_NAME_CLASS_CONTEXT
+Value Char LEGDEF()
+Value Char KEYPROC()
+Local Integer TYPPROC , LEGFOUND
+LEGFOUND = 0
+  # Search the most suitable process : the one associated to the legislation by default first
+  If LEGDEF<>""
+    Read [APR]APR2=KEYPROC;LEGDEF
+    If fstat=0
+      TYPPROC = [F:APR]TYPEP
+      LEGFOUND = 1
+    Endif
+  Endif
+  If !LEGFOUND
+   # If not found, try the one with no legislation
+   # and if still not found, try the first one associated to a legislation managed in the folder
+   Read [APR]APR2=KEYPROC;""
+   If fstat=0
+    TYPPROC = [F:APR]TYPEP
+   Else
+    If clalev([ADS])=0 : Local File ADOSSIER [ADS] : Endif
+    #107271
+    #Read [ADS]DOSSIER=ACTX.AFOLDER
+    #If fstat=0
+    If func DOSSUB.FILL_ADS(ACTX.AFOLDER)
+      For [APR]APR2 Where CODPRO=KEYPROC and find(CODLEG,[ADS]DOSLEG)<>0
+       TYPPROC = [F:APR]TYPEP
+       Break
+      Next
+    Endif
+   Endif
+  Endif
+End TYPPROC
+
+Funprog READ_APO(LEGDEF, MENUCODE)
+Value Char LEGDEF()
+Value Char MENUCODE()
+Local Integer LEGFOUND
+# Search the most suitable process : the one associated to the legislation by default first
+  LEGFOUND=0
+  If LEGDEF<>""
+    Read [APO]APO2=MENUCODE;LEGDEF
+    If fstat=0
+      LEGFOUND=1
+    Endif
+  Endif
+
+# If not found, try the one with no legislation
+# and if still not found, try the first one associated to a legislation managed in the folder
+  If LEGFOUND=0
+    Read [APO]APO2=MENUCODE;""
+    If fstat=0
+      LEGFOUND=1
+    Else
+      If clalev([ADS])=0 : Local File ADOSSIER [ADS] : Endif
+      #107271
+      #Read [ADS]DOSSIER=GACTX.AFOLDER
+      #If fstat=0
+      If func DOSSUB.FILL_ADS(GACTX.AFOLDER)
+        For [APO]APO2 Where find(MENUCODE,[ADS]DOSLEG)<>0
+            LEGFOUND=1 : Break
+        Next
+      Endif
+    Endif
+  Endif
+
+End LEGFOUND
+

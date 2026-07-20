@@ -1,0 +1,674 @@
+#<AdxTL>@(#)7.0.0.0 $Revision$
+# GH 03/2015
+# Issue 111414/15 - 2016-02-09 by BAKHA : If end date is entered or changed, check Work orders
+# and sub-contract orders for consistency
+# Issue 111414/15/1 - 2016-02-19 by BAKHA - do not check semi finished used as components
+
+Local Char PARAM(20)(1..3), VALEUR(20)
+Local Char    TIT(GLONDES)
+Local Integer OK
+
+If !clalev([F:ATB]) : Local File ATABLE [ATB] : OK=1 : Endif
+Read [ATB]CODFIC="ECCVAL"
+If fstat=0
+ Call TEXTE([F:ATB]INTITFIC,TIT) From OBJDIV
+Endif
+If OK : Close Local File [ATB] : Endif
+
+PARAM(1) = "CYCLO"
+PARAM(2) = "0"
+PARAM(3) = ""
+OK=2
+Call SAICAR(PARAM(1),TIT,mess(27,159,1),"ITM",0,0,"",OK) From GESECRAN
+If OK=2
+   Call SAISIE_CHAR(VALEUR,PARAM,"FECCVAL","ECCVAL","") From GSAISIE
+Endif
+End
+
+$ACTION
+Case ACTION
+ When "OUVRE"          : Gosub OUVRE
+ When "DEBUT"          : Gosub DEBUT
+ When "SETBOUT"        : Gosub SETBOUT
+ When "APRES_MODIF"    : Gosub APRES_MODIF
+ When "ABA"            : Gosub ABANDON
+ When "ENR"            : Gosub VALIDE
+ When "RAF"            : Gosub ABANDON
+ When "END"            : Gosub FIN
+Endcase
+Return
+
+$OUVRE
+If !clalev([F:EVL])  : Local File ECCVAL    [EVL]  : Endif
+If !clalev([F:ITM])  : Local File ITMMASTER [ITM]  : Endif
+If find(val([L]PARAM(2)),1,2,3)
+   If !clalev([F:BOH])  : Local File BOM      [BOH]  : Endif
+   If !clalev([F:BOD])  : Local File BOMD     [BOD]  : Endif
+Endif
+If !clalev([F:EVL2]) : Local File ECCVAL   [EVL2] : Endif
+If !clalev([F:ECS])  : Local File ECCSTA   [ECS]  : Endif
+# optimisation
+If !clalev([F:STL]) : Local File STOLOT    [STL]  : Endif
+If !clalev([F:ORD]) : Local File ORDERS    [ORD]  : Endif
+
+Local Char    CRITERE(250), SYMBOLE(50)
+Local Char    ITM([V]GLONITM), VMAJ([V]GLONICVVAL), CONC(1+2*[V]GLONICVVAL)
+Local Char    ZTEX1([V]GLONDES), ZTEX2([V]GLONDES), ZTEX3([V]GLONDES)
+Local Char    ITMCUR([V]GLONITM), VMAJCUR([V]GLONICVVAL), VMINCUR([V]GLONICVVAL)
+Local Integer TYP, SEQMAX4, VERROU
+Local Integer I, J, I1, I2, MAJ
+
+# Item with versioning
+ITM  = [L]PARAM(1)
+If !func ECCLIB.NBRCPN(ITM)
+   # Parameter ITM ... Versions not managed on this product
+   GERR=1 : GMESSAGE = mess(81,123,1)-"ITM="+[L]ITM+"\"+mess(153,187,1)
+   FIN=1 : Return
+Endif
+
+# TYP = 1..3 Loading versions of commercial/production/SST BOM flow
+#            Only the ending date of the last version available to use can be changed
+#            if there is no version in devlopment
+# TYP = 4    Loading of versions of stock flow, lines for stock can be added/deleted
+# TYP = 0    Loading of versions of all flows, lines for stock can be added/deleted
+TYP  = val([L]PARAM(2))
+If !find(TYP,0,1,2,3,4)
+   # Parameter TYP ...Incorrect value
+   GERR=1 : GMESSAGE = mess(81,123,1)-"TYP="+num$([L]TYP)+"\"+mess(83,123,1)
+   FIN=1 : Return
+Endif
+
+# Major version
+# Filter loadings on this major version
+# If TYP=4 or 0, only the lines of this major version can be added / deleted
+VMAJ = [L]PARAM(3)
+Return
+
+$DEBUT
+Gosub CHARGE
+
+If TYP=4 : # asked by JAM (cf. mail 17/03/2015)
+   Chgfmt [M:EVL1]USESTA  With "-ML240:15X"
+   Chgfmt [M:EVL1]STRDAT  With "-"+GFMD
+   Chgfmt [M:EVL1]ENDDAT  With "-"+GFMD
+   # Issue 115311 : MAE, asked by JAM and ok with FRW
+   Chgfmt [M:EVL1]EXNDAT  With "-"+GFMD
+   Chgfmt [M:EVL1]EXNFLG  With "-ML1:4X"
+Endif
+Return
+
+$SETCRIT
+CRITERE="ITMREF='"+[L]ITM+"'"
+If [L]TYP
+   CRITERE-="& ECCTYP="+num$([L]TYP)
+Endif
+If [L]VMAJ<>""
+   CRITERE-="& ECCVALMAJ='"+[L]VMAJ+"'"
+Endif
+Return
+
+$CHARGE
+SYMBOLE="" : VERROU=0
+If find([L]TYP,1,2,3)
+   Filter [BOH] Where ITMREF=[L]ITM & BOMALTTYP=[L]TYP & USESTA=2
+   Read [BOH]BOH0 Last
+   If fstat<=2
+      SYMBOLE="BOH"+num$([F:BOH]BOMALT)+"\"+[L]ITM+"\"+num$([L]TYP)
+      If SYMBOLE<>""
+         Call TESTLOCK(SYMBOLE,VERROU) From GLOCKM
+         If VERROU
+            VERROU=2
+         Else
+            Lock =SYMBOLE With lockwait=0
+            VERROU=(!fstat)
+         Endif
+      Endif
+   Endif
+Endif
+
+Gosub SETCRIT
+Raz [M:EVL1]
+nolign=0
+If find([L]TYP,1,2,3)
+   Filter [EVL] Order By Key EVL0 Desc
+Else
+   Filter [EVL] Order By Key EVL1 Desc
+Endif
+For [EVL] Where evalue(CRITERE)
+  If nolign>=dim([M:EVL1]ECCVALMAJ) : Break : Endif
+  nolign+=1
+  [M:EVL1] = [F:EVL]
+  [M:EVL1]UPDFLG(nolign-1)=0
+  [M:EVL1]VERSION(nolign-1) = [F:EVL]ECCVALMAJ
+  If [F:EVL]ECCVALMIN<>"" : [M:EVL1]VERSION(nolign-1)-=[F:EVL]ECCVALMIN : Endif
+  If [M:EVL1]ECCTYP(nolign-1)=4
+     [M:EVL1]VERSION4(nolign-1)=[M:EVL1]VERSION(nolign-1)
+  Endif
+  [M:EVL1]VERSION(nolign-1)-=num$([F:EVL]ECCTYP)
+Next
+Filter [EVL]
+[M:EVL1]NBLIG=nolign
+
+[M:EVL1]ITMREF = [L]ITM
+[M:EVL1]TYP    = [L]TYP
+[M:EVL1]VALMAJ = [L]VMAJ
+Affzo
+Return
+
+$APRES_MODIF
+If COUZON<>"NBLIG"
+   If REP="" & find(TYP,1,2,3) & !VERROU
+     GERR=1 : FOK=0 : Return
+   Endif
+   REP="M" : [M]UPDFLG(nolign-1)=1
+Elsif find(status,65,83)
+   If REP="" & find(TYP,1,2,3) & !VERROU
+     GERR=1 : Return
+   Endif
+   REP="M"
+Endif
+Return
+
+$SETBOUT
+If find(TYP,1,2,3)
+   [L]IMGFLG(3) = (!VERROU & SYMBOLE<>"") : # yellow key
+Endif
+
+If REP="" : CHBOU+= "=" : Endif : # refresh
+Return
+
+$DEVERROU
+If VERROU=1 & SYMBOLE<>""
+   Unlock = SYMBOLE
+Endif
+SYMBOLE ="" : VERROU=0
+Return
+
+$ABANDON
+REP=""
+Gosub DEVERROU
+Gosub CHARGE
+Return
+
+$VALIDE
+Call DEBTRANS From GLOCK
+Gosub TR
+If GOK=1 : Goto ABANDON : Endif
+Return
+
+$FIN
+Gosub DEVERROU
+Return
+
+$TR
+GOK=1
+Trbegin [EVL]
+  Gosub SETCRIT
+  For [EVL] Where evalue(CRITERE) & ECCTYP=4
+     CONC = [F:EVL]ECCVALMAJ
+     If [F:EVL]ECCVALMIN<>"" : CONC-=[F:EVL]ECCVALMIN : Endif
+     CONC-=num$([F:EVL]ECCTYP)
+     If !find(CONC,[M:EVL1]VERSION(0..[M:EVL1]NBLIG-1))
+         ITMCUR  = [F:EVL]ITMREF
+         VMAJCUR = [F:EVL]ECCVALMAJ
+         VMINCUR = [F:EVL]ECCVALMIN
+         #
+         Delete [EVL] =
+         If fstat=1
+            GOK=-1 : GLOCK="$ECCVAL"-[M:EVL1]ITMREF-CONC : Break
+         Elsif fstat>5
+            GOK=0 : Call RSTA("EVL",[M:EVL1]ITMREF-CONC) From GLOCK : Break
+         Endif
+         #
+         If !find(VMAJCUR,[M:EVL1]ECCVALMAJ(0..[M:EVL1]NBLIG-1))
+&           & !func ECCLIB.TSTECSDEL(ITMCUR,VMAJCUR)
+            Delete [ECS] Where ITMREF=[L]ITMCUR & ECCVALMAJ=[L]VMAJCUR
+            If fstat=1
+              GOK=-1 : GLOCK="$ECCSTA"-[L]ITMCUR-[M]VMAJCUR : Break
+            Elsif fstat>5
+              GOK=0 : Call RSTA("ECS",[L]ITMCUR-[L]VMAJCUR) From GLOCK : Break
+            Endif
+         Endif
+     Endif
+  Next
+
+  If GOK=1
+    SEQMAX4=0
+    For I=0 To [M:EVL1]NBLIG-1
+      If [M:EVL1]UPDFLG(I)=1
+        Readlock [EVL]EVL1 = [M:EVL1]ITMREF;[M:EVL1]ECCVALMAJ(I);[M:EVL1]ECCVALMIN(I);[M:EVL1]ECCTYP(I)
+        If fstat=1
+          GOK=-1 : GLOCK="$ECCVAL"-[M:EVL1]ITMREF-[M:EVL1]ECCVALMAJ(I)-[M:EVL1]ECCVALMIN(I)-num$([M:EVL1]ECCTYP(I))
+          Break
+
+        Elsif fstat & [M:EVL1]ECCTYP(I)=4
+          nolign=I+1
+          [F:EVL]=[M:EVL1]
+          Gosub FIND_SEQ
+          Write [EVL]
+          If fstat : GOK=0 : Call FSTA("EVL") From GLOCK : Break : Endif
+
+        Elsif !fstat
+          If find([M:EVL1]TYP,1,2,3)
+             Gosub TR_BOM
+             If GOK<1 : Break : Endif
+          Endif
+          nolign=I+1
+          [F:EVL] = [M:EVL1]
+          Rewrite [EVL]
+          If fstat : GOK=0 : Call FSTA("EVL") From GLOCK : Break : Endif
+        Endif
+      Endif : # UPDFLG
+    Next I
+  Endif : # GOK
+
+  If GOK=1 & find([M:EVL1]TYP,1,2,3)
+     Gosub VERF_BOM
+  Endif
+
+If GOK=1
+   Commit
+Else
+   Rollback
+   If GOK=-1
+     Call ROLL From GLOCK
+     If GROLL : Return : Else Goto TR : Endif
+   Endif
+Endif
+Return
+
+$FIND_SEQ
+If [F:EVL]ECCSEQ<>0 : Return : Endif
+
+If SEQMAX4=0
+  If !clalev([F:EVL2]) : Local File ECCVAL [EVL2] : Endif
+  Filter [EVL2] Where ITMREF=[M:EVL1]ITMREF & ECCTYP=4
+  Read [EVL2]EVL0 Last
+  Filter [EVL2]
+  If fstat<=2 : SEQMAX4 = [F:EVL2]ECCSEQ : Endif
+Endif
+
+SEQMAX4+=1 : [F:EVL]ECCSEQ=SEQMAX4
+Return
+
+$TR_BOM
+Readlock [BOH]BOH0 = [F:EVL]ITMREF;[F:EVL]BOMALT;[F:EVL]ECCTYP
+If fstat=1
+   GOK=-1 : GLOCK="$BOM"-[F:EVL]ITMREF-num$([F:EVL]BOMALT)-num$([F:EVL]ECCTYP)
+Elsif fstat
+   GOK=0 : Call RSTA("BOH",[F:EVL]ITMREF-num$([F:EVL]BOMALT)-num$([F:EVL]ECCTYP)) From GLOCK
+Endif
+If GOK<1 : Return : Endif
+
+## Updating of BOM header
+MAJ=0
+If [F:EVL]STRDAT=[F:BOH]BOHSTRDAT & [F:BOH]BOHSTRDAT<>[M:EVL1]STRDAT(I)
+   [F:BOH]BOHSTRDAT = [M:EVL1]STRDAT(I) : MAJ=1
+Endif
+If [F:EVL]ENDDAT=[F:BOH]BOHENDDAT & [F:BOH]BOHENDDAT<>[M:EVL1]ENDDAT(I)
+   [F:BOH]BOHENDDAT = [M:EVL1]ENDDAT(I) : MAJ=1
+Endif
+If MAJ
+   Rewrite [BOH]
+   If fstat : GOK=0 :  Call FSTA("BOH") From GLOCK : Return : Endif
+Endif
+
+## Updating of BOM lines
+For [BOD] Where ITMREF=[F:EVL]ITMREF & BOMALT=[F:EVL]BOMALT & BOMALTTYP=[F:EVL]ECCTYP
+  I1 = ([F:BOD]BOMSTRDAT=[F:EVL]STRDAT & [F:EVL]STRDAT<>[M:EVL1]STRDAT(I))
+  I2 = ([F:BOD]BOMENDDAT=[F:EVL]ENDDAT & [F:EVL]ENDDAT<>[M:EVL1]ENDDAT(I))
+  If I1 | I2
+    Readlock [BOD] =
+    If !fstat
+      If I1 : [F:BOD]BOMSTRDAT = [M:EVL1]STRDAT(I) : Endif
+      If I2 : [F:BOD]BOMENDDAT = [M:EVL1]ENDDAT(I) : Endif
+      Rewrite [BOD]
+    Endif
+    If fstat : GOK=0 :  Call FSTA("BOD") From GLOCK : Break : Endif
+  Endif
+Next
+If GOK<1 : Return : Endif
+Return
+
+$VERF_BOM
+For [BOH] Where ITMREF=[M:EVL1]ITMREF & BOMALTTYP=[M:EVL1]TYP
+  If [F:BOH]BOHENDDAT<>[0/0/0] & [F:BOH]BOHSTRDAT>[F:BOH]BOHENDDAT
+     # Validy start ... Valididty end
+     Call TEXTFIC("BOMD","BOMALT",3,ZTEX1) From OBJDIV
+     GOK=0 : Call RSTA("BOH","#"+ZTEX1+"="+[F:BOH]BOMALT
+&                     -mess(27,2282,1)+"="+format$(GFMDAT4,[F:BOH]BOHSTRDAT)
+&                     -mess(28,2282,1)+"="+format$(GFMDAT4,[F:BOH]BOHENDDAT)) From GLOCK
+     Raz [F:BOH]
+     Break
+  Endif
+
+  For [BOD] Where ITMREF=[F:BOH]ITMREF & BOMALT=[F:BOH]BOMALT & BOMALTTYP=[F:BOH]BOMALTTYP
+    I1=0 : I2=0
+    If [F:BOH]BOHSTRDAT<>[0/0/0] & [F:BOD]BOMSTRDAT<[F:BOH]BOHSTRDAT
+       If [F:BOD]CPNTYP<>1 : I1=1
+       Else                : Gosub ERR_BOD : Break(2)
+       Endif
+    Endif
+    If [F:BOH]BOHENDDAT<>[0/0/0] & ([F:BOD]BOMENDDAT=[0/0/0] | [F:BOD]BOMENDDAT>[F:BOH]BOHENDDAT)
+       If [F:BOD]CPNTYP<>1 : I2=1
+       Else                : Gosub ERR_BOD : Break(2)
+       Endif
+    Endif
+    If I1 | I2
+       Readlock [BOD] =
+       If !fstat
+          If I1 : [F:BOD]BOMSTRDAT = [F:BOH]BOHSTRDAT : Endif
+          If I2 : [F:BOD]BOMENDDAT = [F:BOH]BOHENDDAT : Endif
+          Rewrite [BOD]
+       Endif
+       If fstat : GOK=0 :  Call FSTA("BOD") From GLOCK : Break(2) : Endif
+    Endif
+    If [F:BOD]BOMENDDAT<>[0/0/0] & [F:BOD]BOMSTRDAT>[F:BOD]BOMENDDAT
+        Gosub ERR_BOD : Break(2)
+    Endif
+  Next
+
+Next
+Return
+
+$ERR_BOD
+Call TEXTFIC("BOMD","BOMALT",3,ZTEX1) From OBJDIV
+Call TEXTFIC("BOMD","BOMSEQ",3,ZTEX2) From OBJDIV
+Call TEXTFIC("BOMD","CPNITMREF",3,ZTEX3) From OBJDIV
+# Caution! There are links with some dates not included in this range
+GOK=0 : Call RSTA("BOD","#"+ZTEX1+"="+num$([F:BOD]BOMALT)-ZTEX2+"="+num$([F:BOD]BOMSEQ)
+&                -ZTEX3+"="+[F:BOD]CPNITMREF+"\"+mess(70,199,1)) From GLOCK
+Raz [F:BOD]
+Return
+
+######################################################################################
+## Labels for screen ECCVAL1  06/03/2015 13:02:13 (GH)
+######################################################################################
+
+Subprog IB_NBLIG
+# Versions stocks
+If find("ECS",GPILCOD(1..GPILOBJ))
+   GBOUT1=""
+Else
+   Call TITFNC("GESECS",GBOUT1) From CONTOBJ
+   GBOUT1-= mess(7,14,1) : # stocks
+Endif
+
+GBOUT2 = "" : # Propagation
+
+# BOMs
+If [M:EVL1]ECCTYP(nolign-1)=4
+   GBOUT3=""
+Endif
+End
+
+Subprog C_NBLIG
+If find(status,73,82)             : # Insert line, Add in last line
+   If find([M:EVL1]TYP,1,2,3)
+      mkstat=2
+   Elsif [F:ITM]ECCSTO<2 | [F:ITM]PURFLG<2 : # in that case, stock lines are only managed through BOMs (cf. mail 25/03/2015 TS)
+     mkstat=2
+   Elsif [M:EVL1]VALMAJ<>"" & func ECCLIB.NBRCPN([M:EVL1]ITMREF)=1
+&    & find([M:EVL1]VALMAJ,[M:EVL1]VERSION4(0..[M:EVL1]NBLIG-1))
+      mkstat=2
+   Elsif [M:EVL1]VALMAJ<>""
+      Look [ECS]ECS0 = [M:EVL1]ITMREF;[M:EVL1]VALMAJ
+      If fstat
+         # Parameter ... Non existing version
+         GMESSAGE = mess(81,123,1)-"MAJEURE="+[M:EVL1]VALMAJ+"\"+mess(406,184,1)
+         mkstat=2
+       Endif
+   Endif
+Elsif find(status,65,83)          : # Delete line or lines
+   Local Integer I, J, K
+   Local Char    ZTEX(GLONDES)
+   If status=65 : J=nolign : Else J=nolign1-1 : Endif
+   For I=nolign To J
+       If [M:EVL1]ECCTYP(I-1)<>4
+          mkstat=2 : Break
+       Else
+          K=func ECCLIB.TSTEVL4DEL([M:EVL1]ITMREF,[M:EVL1]ECCVALMAJ(I-1),[M:EVL1]ECCVALMIN(I-1))
+          If K
+             If I<>J
+                GMESSAGE=""
+                Call TEXTFIC("ECCVAL","ECCVALMAJ",1,ZTEX) From OBJDIV
+                If ZTEX<>"" : GMESSAGE+= ZTEX-[M:EVL1]ECCVALMAJ(I-1)+"\" : Endif
+                If [M:EVL1]ECCVALMIN(I-1)<>""
+                   Call TEXTFIC("ECCVAL","ECCVALMIN",1,ZTEX) From OBJDIV
+                   If ZTEX<>"" : GMESSAGE+= ZTEX-[M:EVL1]ECCVALMIN(I-1)+"\" : Endif
+                Endif
+             Endif
+             Case K
+               When 1 : GMESSAGE+= mess(212,187,1) : # Existing BOM
+               When 2 : GMESSAGE+= mess(213,187,1) : # Existing stock
+               When 3 : GMESSAGE+= mess(214,187,1) : # Existing order
+             Endcase
+             mkstat=2 : Break
+          Endif
+       Endif
+   Next I
+Elsif status=75 & nolign<dim([M:EVL1]ECCTYP)  : # Modification
+   If [M:EVL1]ECCTYP(nolign-1)=4  : mkstat=2 : Endif
+Endif
+End
+
+Subprog AS_ECCVALMAJ(VALEUR)
+Variable Char    VALEUR()
+If VALEUR<>""
+   mkstat=2
+Else
+   [M:EVL1]ECCTYP(nolign-1)=4
+   [M:EVL1]USESTA(nolign-1)=2
+   [M:EVL1]EXNFLG(nolign-1)=1
+   [M:EVL1]EXNDAT(nolign-1)=[0/0/0]
+   [M:EVL1]ECCSEQ(nolign-1)=0
+   If [M:EVL1]VALMAJ<>"" : VALEUR= [M:EVL1]VALMAJ : mkstat=2 : Endif
+Endif
+End
+
+Subprog C_ECCVALMAJ(VALEUR)
+Variable Char    VALEUR()
+
+Look [ECS]ECS0 = [M:EVL1]ITMREF;VALEUR
+If fstat
+   GMESSAGE = mess(406,184,1) : mkstat=2 : End : # Non existing version
+Endif
+
+Local Char CONC(1+2*GLONICVVAL)
+CONC = VALEUR
+If [M:EVL1]ECCVALMIN(nolign-1)<>""
+   CONC-=[M:EVL1]ECCVALMIN(nolign-1)
+Endif
+Call UNICITE(CONC,[M:EVL1]VERSION4(0..[M:EVL1]NBLIG-1)) From OBJDIV
+If !mkstat : [M:EVL1]VERSION4(nolign-1)=CONC : [M:EVL1]VERSION(nolign-1)=CONC-"4" : Endif
+End
+
+Subprog AS_ECCVALMIN(VALEUR)
+Variable Char    VALEUR()
+If VALEUR<>""
+   mkstat=2
+Elsif [M:EVL1]ECCVALMAJ(nolign-1)="" | func ECCLIB.NBRCPN([M:EVL1]ITMREF)<2
+   mkstat=1
+Endif
+End
+
+Subprog C_ECCVALMIN(VALEUR)
+Variable Char    VALEUR()
+
+Local Char FMT(GLONICVVAL)
+If !func ECCLIB.CTLCPN([M:EVL1]ITMREF,2,VALEUR,FMT)
+   If FMT=""
+      GMESSAGE = mess(209,187,1)
+   Else
+      GMESSAGE = mess(209,187,1)-"("+FMT+")"+string$(GMESSAGE<>"","\")+GMESSAGE
+   Endif
+   mkstat=2 : End : # Incorrect format for version
+Endif
+
+Local Char CONC(1+2*GLONICVVAL)
+CONC = [M:EVL1]ECCVALMAJ(nolign-1)-VALEUR
+Call UNICITE(CONC,[M:EVL1]VERSION4(0..[M:EVL1]NBLIG-1)) From OBJDIV
+If !mkstat : [M:EVL1]VERSION4(nolign-1)=CONC : [M:EVL1]VERSION(nolign-1)=CONC-"4" : Endif
+End
+
+# The starting date of validity for a BOM with versioning can be
+# - changed in [M:BOH0] only for the first version in development
+# - set through function Revision for the next versions
+Subprog AS_STRDAT(VALEUR)
+Variable Date    VALEUR
+If [M:EVL1]ECCTYP(nolign-1)=4
+  mkstat=1
+Else
+  mkstat=2 : # maybe to open later ?
+Endif
+End
+
+# The ending date of validity for a BOM with versioning can be changed here
+# for the last version available to use if there is no version in development
+Subprog AS_ENDDAT(VALEUR)
+Variable Date    VALEUR
+If [M:EVL1]ECCTYP(nolign-1)=4
+   mkstat=1
+Elsif !find([M:EVL1]TYP,1,2,3)
+   mkstat=2
+Elsif nolign>1 | [M:EVL1]USESTA(nolign-1)<>2
+   mkstat=2
+Endif
+End
+
+Subprog AM_ENDDAT(VALEUR)
+Variable Date VALEUR
+If VALEUR=[0/0/0] : End : Endif
+
+# Issue 60919 GH 07/02/2018 - The entered end date will become the BOM end date
+#                             and should be greater or equal to all exemption dates
+Local Date MAXEXNDAT
+MAXEXNDAT = max([M:EVL1]EXNDAT(1..[M:EVL1]NBLIG-1))
+If VALEUR<MAXEXNDAT
+   GMESSAGE = mess(10,109,1)-"<"-format$("D:"+GFMDAT,MAXEXNDAT)
+   mkstat=2 : End
+Endif
+
+# Issue 111414/15 - If end date is entered or changed, check WO/EO for consistency
+If [M:EVL1]ENDDAT(nolign-1) = [0/0/0] | VALEUR <> [M:EVL1]ENDDAT(nolign-1)
+   Call CTLEXN([M:EVL1]ITMREF,
+&     [M:EVL1]ECCVALMAJ(nolign-1),
+&     [M:EVL1]ECCVALMIN(nolign-1),
+&     [M:EVL1]ECCTYP(nolign-1),
+&     VALEUR)
+Endif
+End
+
+######################################################################################
+## Management of exemption (flag Y/N + Date)
+######################################################################################
+
+Subprog AS_EXNFLG(VALEUR)
+Variable Integer VALEUR
+If [M:EVL1]ECCTYP(nolign-1)=4 | [M:EVL1]USESTA(nolign-1)=1 | [M:EVL1]ENDDAT(nolign-1)=[0/0/0]
+   VALEUR=1 : mkstat=2
+Else : # here, case of a BOM version available to use with an end date
+  # Issue 60919 GH 07/02/2018 - No exemption on the last version
+  #                             because the BOM end date is the last version end date
+  Local Date DAT1
+  Local Integer I, K
+  For I=0 To [M:EVL1]NBLIG-1
+    If [M:EVL1]ECCTYP(I)=[M:EVL1]ECCTYP(nolign-1) & [M:EVL1]USESTA(I)=2 & DAT1<[M:EVL1]STRDAT(I)
+       # The last version is the one avilable to use with the greatest start date
+       DAT1=[M:EVL1]STRDAT(I) : K=I+1
+    Endif
+  Next
+  If nolign=K
+     VALEUR=1 : mkstat=2
+  Endif
+Endif
+End
+
+Subprog AM_EXNFLG(VALEUR)
+Variable Integer VALEUR
+If VALEUR=1 : # exemption=yes -> exemption=no
+   Call CTLEXN([M:EVL1]ITMREF,[M:EVL1]ECCVALMAJ(nolign-1),[M:EVL1]ECCVALMIN(nolign-1),[M:EVL1]ECCTYP(nolign-1),[M:EVL1]ENDDAT(nolign-1))
+Endif
+End
+
+Subprog AS_EXNDAT(VALEUR)
+Variable Date    VALEUR
+If [M:EVL1]EXNFLG(nolign-1)<>2 : mkstat=1 : Endif
+End
+
+Subprog C_EXNDAT(VALEUR)
+Variable Date    VALEUR
+If VALEUR<>[0/0/0] & VALEUR<=[M:EVL1]ENDDAT(nolign-1)
+   GMESSAGE = mess(10,109,1)-"<="-format$("D:"+GFMDAT,[M:EVL1]ENDDAT(nolign-1)) : # invalide date
+   mkstat=2
+Endif
+End
+
+Subprog AM_EXNDAT(VALEUR)
+Variable Date    VALEUR
+
+# Issue 60919 GH 07/02/2018 - Exemption dates should be previous or equal to the BOM end date
+If VALEUR<>[0/0/0] & [M:EVL1]ECCTYP(nolign-1)<>4
+  Local Date DAT1, DAT2
+  Local Integer I
+  For I=0 To [M:EVL1]NBLIG-1
+    If [M:EVL1]ECCTYP(I)=[M:EVL1]ECCTYP(nolign-1) & [M:EVL1]USESTA(I)=2 & DAT1<[M:EVL1]STRDAT(I)
+       # The last version is the one with the greatest start date
+       DAT1=[M:EVL1]STRDAT(I) : DAT2=[M:EVL1]ENDDAT(I)
+    Endif
+  Next
+  If DAT2<>[0/0/0] & VALEUR>DAT2
+     GMESSAGE = mess(10,109,1)-">"-format$("D:"+GFMDAT,DAT2)
+     mkstat=2 : End
+  Endif
+Endif
+
+If [M:EVL1]EXNDAT(nolign-1)=[0/0/0] | (VALEUR<>[0/0/0] & VALEUR<[M:EVL1]EXNDAT(nolign-1))
+   Call CTLEXN([M:EVL1]ITMREF,[M:EVL1]ECCVALMAJ(nolign-1),[M:EVL1]ECCVALMIN(nolign-1),[M:EVL1]ECCTYP(nolign-1),VALEUR)
+Endif
+End
+
+Subprog CTLEXN(ITM,VMAJ,VMIN,TYP,DAT)
+Value Char    ITM(), VMAJ(), VMIN()
+Value Integer TYP
+Value Date    DAT
+
+Local Date DATMAX
+Local Char NUM(GLONVCR)
+
+# 111414/15/1 - setup WIPTYP instead of VCRTYP
+Case TYP
+  When 2 : TYP=5   : # Production     => WO  #111414/15/1
+  When 3 : TYP=13  : # Subcontracting => EO  #111414/15/1
+  #When 2 : TYP=10  : # Production     => WO  #111414/15/1
+  #When 3 : TYP=36  : # Subcontracting => EO  #111414/15/1
+  When Default : End
+Endcase
+
+If !clalev([F:ORD]) : Local File ORDERS [ORD] : Endif
+Columns [ORD] (STRDAT, VCRNUM)
+# 111414/15/1 - filter on WIPTYP instead of VCRTYP
+#For [ORD] Where ITMREF=[L]ITM & ECCVALMAJ=[L]VMAJ & ECCVALMIN=[L]VMIN & VCRTYP=[L]TYP
+For [ORD] Where ITMREF=[L]ITM & ECCVALMAJ=[L]VMAJ & ECCVALMIN=[L]VMIN & WIPTYP=[L]TYP
+&             & WIPSTA<>3 & STRDAT>[L]DAT
+    If [F:ORD]STRDAT>DATMAX
+       NUM=[F:ORD]VCRNUM : DATMAX=[F:ORD]STRDAT
+    Endif
+Next
+Columns [ORD]
+If NUM<>""
+   Call TEXTFIC("ORDERS","STRDAT",1,GMESSAGE) From OBJDIV
+   GMESSAGE=mess(TYP,701,1)-NUM+"\"+GMESSAGE+"="+format$("D:"+GFMDAT4,DATMAX)
+   mkstat=2
+Endif
+End
+
+######################################################################################
+## Section automatically added (screen ECCVAL1) 03/10/2016 14:08:49 (BAKHA)
+######################################################################################
+Subprog B2_NBLIG
+End
+
+
+######################################################################################
+

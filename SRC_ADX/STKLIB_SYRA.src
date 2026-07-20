@@ -1,0 +1,465 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+########################################################################
+# Traitement STKLIB - Librairie de composants stock
+########################################################################
+# Sous-programmes
+#-----------------------------------------------------------------------
+# LECSRU        Lecture règle de gestion d'E/S
+########################################################################
+########################################################################
+# LECSRU         Lecture de la règle de gestion d'E/S
+########################################################################
+# Paramètres E : LFCY    = Site
+#                LTCLCOD = Catégorie
+#                LTRSTYP = Type mouvement (M.704)
+#                LTRSCOD = Code mouvement
+#                LSUP    = Inutilisé (paramètre supplémentaire au cas où)
+#            S : LRET    = Code retour : 0 OK
+#                                        1 si pas de règle de gestion
+# Prérequis    : Ces tables doivent être ouvertes   TABSTORUL
+########################################################################
+Funprog LECSRU(CTX, LFCY, LTCLCOD, LTRSTYP, LTRSCOD, LSUP, SMESSAGE)
+Value    Instance CTX Using C_WMACONTEXT : # Référence sur le contexte
+Value    Char    LFCY
+Value    Char    LTCLCOD
+Value    Integer LTRSTYP
+Value    Char    LTRSCOD
+Value    Char    LSUP
+Variable Char SMESSAGE
+
+Local Integer LRET
+
+  # -------------------------------
+  LRET = [V]CST_AOK
+  Raz SMESSAGE
+  # -------------------------------
+  If !clalev([F:SRU]) Then
+    # Development bug case
+    SMESSAGE = mess(11,112,1) - "TABSTORUL"
+    LRET = [V]CST_AERROR
+    Goto LEC_SRU_FIN
+  Endif
+  # -------------------------------
+  Local File ITMCATEG [ITG]
+  If LTCLCOD<>""
+    #--- Lecture catégorie article/site
+    Read [ITG]ITG1=LTCLCOD;LFCY
+    If fstat
+      If LFCY=""
+        Goto LEC_SRU_GLO
+      Else
+        #--- Lecture catégorie article
+        Read [ITG]ITG1=LTCLCOD;""
+        If fstat Goto LEC_SRU_GLO Endif
+      Endif
+    Endif
+  Else
+    Goto LEC_SRU_GLO
+  Endif
+  # les mouvements d'inventaires n'ont pas de regle de gestion
+  If LTRSTYP = 13
+    Raz [F:SRU]
+    [F:SRU]AUZSST = "A*,Q*,R*"
+    Goto LEC_SRU_FIN
+  Endif
+  # Lecture règle de gestion de la catégorie/site pour le code mvt
+  If LTRSCOD<>""
+    Read [SRU]SRU0=LTCLCOD;[F:ITG]STOFCY;LTRSTYP;LTRSCOD
+    If !fstat Goto LEC_SRU_FIN Endif
+    Raz LTRSCOD
+  Endif
+  # Lecture règle de gestion de la catégorie/site
+  Read [SRU]SRU0=LTCLCOD;[F:ITG]STOFCY;LTRSTYP;""
+  If !fstat Goto LEC_SRU_FIN Endif
+  # Si la catégorie site existe et qu'on n'a pas trouvé de règle de gestion
+  If [F:ITG]STOFCY<>""
+    # Lecture règle de gestion de la catégorie pour le code mvt
+    If LTRSCOD<>""
+      Read [SRU]SRU0=LTCLCOD;"";LTRSTYP;LTRSCOD
+      If !fstat Goto LEC_SRU_FIN Endif
+      Raz LTRSCOD
+    Endif
+    # Lecture règle de gestion de la catégorie
+    Read [SRU]SRU0=LTCLCOD;"";LTRSTYP;""
+    If !fstat Goto LEC_SRU_FIN Endif
+  Endif
+  Goto LEC_SRU_FIN
+End LRET
+
+$LEC_SRU_GLO
+  #GPE=0
+  #GPOINT="SRU_GLO"
+  #Gosub ENTREE From EXEFNC
+  #If GPE=0
+    # Lecture règle de gestion de stock globale
+    Read [SRU]SRU0="";"";LTRSTYP;""
+    If !fstat Goto LEC_SRU_FIN Endif
+  #Else
+  #  Raz GPE
+  #Endif
+  # Il n'existe pas de règle de gestion de stock pour ce type de mvt
+  SMESSAGE = mess(362,199,1) - mess(LTRSTYP,704,1)
+  LRET = [V]CST_AERROR
+  Goto LEC_SRU_FIN
+End LRET
+
+$LEC_SRU_FIN
+End LRET
+
+#--- Issue X3-32344
+############################################################
+# CAL_FDMA   Calcul of first date material availability
+############################################################
+# Parameters Input  : LFCY = Site
+#                     LITM = Item
+#                     LTYP = Type pièce
+#                     LNUM = No pièce
+#                     LLIN = No ligne
+#                     LSEQ = No séquence
+#                     Ces 4 zones sont à alimentées si OF ou Cde
+#                     Elles correspondent aux identifiants du besoin
+#                     pour prendre en compte la quantité affectée
+#                     LALL = Déduction des allocations du stock départ (1:non/2:oui)
+#                     LQTY = Quantity required
+#            Output   LQTA = Quantity available at LDAT
+#                     LDAT = First date material availability
+#                         or date of last order, if quantity not available
+#                         or date of the day, if no order after
+############################################################
+Subprog CAL_FDMA(LFCY,LITM,LTYP,LNUM,LLIN,LSEQ,LALL,LQTY,LQTA,LDAT)
+Value     Char    LFCY
+Value     Char    LITM
+Value     Integer LTYP
+Value     Char    LNUM
+Value     Integer LLIN
+Value     Integer LSEQ
+Value     Integer LALL
+Value     Decimal LQTY
+Variable  Decimal LQTA
+Variable  Date    LDAT
+
+Local     Integer WNBL  : WNBL = 4 : # Nombre de lignes +1
+Local     Integer WNBT  : WNBT = 15 : # Nombre de types d'ordres +1
+Local     Integer ITYP
+Local     Integer ISTA
+Local     Integer ISIG
+Local     Decimal TCUM(WNBT,5,2)    : # Cumuls par type d'ordre, statut, signe
+Local     Decimal TLIG(WNBL)        : # Cumuls lignes
+Local     Char    TTAB(80)(WNBL)    : # Contenu des lignes
+Local     Char    WTAB(100)
+
+Local     Char    WPAR(1)
+Local     Char    WZON(5)
+Local     Integer WLIN
+Local     Integer WCOR, WSEM, WCOD
+Local     Decimal WDEL
+Local     Decimal WDMYI
+Local     Date    WDMYD
+Local     Date    WFOH
+Local     Date    WDAT, WENDDAT
+Local     Decimal WALL, WQTY, WCUMQTY
+Local     Integer WALLFLG, WGLOFLG, WSHRFLG
+
+Local Decimal ZSOF, ZSOS
+
+If clalev([F:ITM]) = 0 : Local File ITMMASTER  [ITM] : Endif
+If clalev([F:ITF]) = 0 : Local File ITMFACILIT [ITF] : Endif
+If clalev([F:ITV]) = 0 : Local File ITMMVT     [ITV] : Endif
+If clalev([F:TUN]) = 0 : Local File TABUNIT    [TUN] : Endif
+If clalev([F:ORD]) = 0 : Local File ORDERS     [ORD] : Endif
+If clalev([F:STA]) = 0 : Local File STOALL     [STA] : Endif
+If clalev([F:MLK]) = 0 : Local File MTOLINK    [MLK] : Endif
+
+If clalev([F:PCB]) = 0 : Local File PARMRP     [PCB] : Endif
+If dim(WHORDEM)<0        Local Integer WHORDEM       : Endif
+If dim(TALL)<0           Local Decimal TALL          : Endif
+If dim(ZALL)<0           Local Decimal ZALL          : Endif
+
+Raz LDAT, LQTA
+
+If [F:ITM]ITMREF<>LITM
+  Read [ITM]ITM0=LITM
+  If fstat
+    Raz [F:ITM] : End
+  Endif
+Endif
+If [F:ITF]ITMREF<>LITM | [F:ITF]STOFCY<>LFCY
+  Read [ITF]ITF1=LFCY;LITM
+  If fstat
+    Raz [F:ITF] : End
+  Endif
+Endif
+# Lecture cumuls stocks
+If [F:ITV]ITMREF<>LITM | [F:ITV]STOFCY<>LFCY
+  Read [ITV]ITV1=LFCY;LITM
+  If fstat
+    Raz [F:ITV] : End
+  Endif
+Endif
+# Lecture unité stock
+If [F:TUN]UOM<>[F:ITM]STU
+  Read [TUN]TUN0=[F:ITM]STU
+  If fstat
+    Raz [F:TUN]
+  Endif
+Endif
+
+WHORDEM=0
+If [F:PCB]STOFCY<>LFCY
+  Read [PCB]PCB0 = LFCY
+  If fstat : WHORDEM=1 : Endif
+Endif
+If WHORDEM=0
+  Case [F:ITF]REOMGTCOD
+    When 2       : WHORDEM = [F:PCB]MRPHORDEM
+    When 3       : WHORDEM = [F:PCB]MPSHORDEM
+    When Default : WHORDEM = 1
+  Endcase
+Endif
+
+#Call PARAM(LFCY,"FIRWRKDAY",WPAR) From ADOVAL
+
+WPAR = func ADP_TOOL.GET_PARAM(nomap,3,LFCY,"FIRWRKDAY")
+
+If val(WPAR)<1 | val(WPAR)>7
+  WSEM=1
+Else
+  WSEM=val(WPAR)
+Endif
+If WSEM=1
+  WCOR=7
+Else
+  WCOR=WSEM-1
+Endif
+# Calcul date fin horizon demande arrondi fin semaine
+If [F:ITF]FOH=0
+  WFOH=[0/0/0]
+Else
+  WCOD=[F:ITF]FOHUOT
+  WDEL=[F:ITF]FOH
+  WDAT= date$
+  Call CALDAT("+",WCOR,WDAT,WCOD,WDEL,WDMYI,WDMYD,WFOH) From CBNLIB
+Endif
+
+# Types d'ordres par ligne :
+# - Chiffres 1 et 2 = Type d'ordre (ML 306 : Cde cli, Cde fou, ..., Ordre SST)
+# - Chiffre 3       = Statut ordre (ML 317 : Ferme, Planifié, Suggéré, Clos)
+# - Chiffre 4       = Signe (0 : positif, 1 : négatif)
+TTAB(0)  = ""
+TTAB(1)  = "0110 0120 0130 0140 0310 0320 0330 0610 0620 0630 0611 0621 0631 0810 0820 0830 1230 1410 1411 1420 1421"
+TTAB(2)  = "0010 0020 0030 0040 "
+TTAB(3)  = "0210 0220 0230 0240 0510 0520 0530 0540 0710 0720 0730 0740 0910 0920 0930 0940 1310 1320 1330"
+
+
+# Déduction ou non des allocations détaillées du stock de départ
+WALLFLG=LALL
+# Déduction ou non des allocations globales du stock de départ
+WGLOFLG=LALL
+# On force la prise en compte du % de perte
+WSHRFLG=2
+
+# Stock de départ : Physique + en rangement + en transit - sorties en attente
+WCUMQTY = [F:ITV]PHYSTO+[F:ITV]PLFPHYSTO+[F:ITV]TRFSTO-[F:ITV]WAISTO
+# Déduction allocations si demandé
+If LALL=2
+  WCUMQTY -= [F:ITV]PHYALL + [F:ITV]GLOALL
+Endif
+
+# Si stock départ >= quantité requise alors FDMA = date du jour
+# Doit-on ???
+# - stopper, car on a le stock
+# - continuer, pour prendre en compte tous les ordres <= à la date du jour
+#If WCUMQTY>=LQTY
+#  LDAT=date$ : End
+#Endif
+
+WQTY=0
+WENDDAT=[0/0/0]
+# Si une pièce a été renseignée, est-elle couverte en totalité par des affectations
+If LTYP<>0 & LNUM<>"" & LLIN<>0
+  Filter [MLK] Where STOFCY=LFCY & ITMREF=LITM & DEMTYP=LTYP
+&                  & DEMNUM=LNUM & DEMLIN=LLIN & DEMSEQ=LSEQ
+  For [MLK]MLK0
+    For [ORD]ORD3 Where STOFCY=LFCY & VCRTYP=[F:MLK]RESSTYP & VCRNUM=[F:MLK]RESSNUM
+&                     & VCRLIN=[F:MLK]RESSLIN & VCRSEQ=[F:MLK]RESSSEQ
+      If [F:ORD]ENDDAT>WENDDAT
+        WENDDAT=[F:ORD]ENDDAT
+      Endif
+    Next
+    WQTY += [F:MLK]LIKQTY
+  Next
+  Filter [MLK]
+  # Si quantité affectée >= quantité besoin : c'est fini, alimentation date et quantité
+  If WQTY>=LQTY & WENDDAT<>[0/0/0]
+    LQTA = WQTY
+    LDAT = WENDDAT
+    End
+  # Si quantité affecté < quantité besoin : on fait un calcul de dispo pour la quantité restante
+  Elsif WQTY>0
+    WCUMQTY += WQTY
+  Endif
+Endif
+
+WDAT=date$
+If LNUM=""
+  Filter [ORD] Where STOFCY=LFCY & ITMREF=LITM & FMI<2
+&              Order By Key ORD1
+Else
+  Filter [ORD] Where STOFCY=LFCY & ITMREF=LITM & FMI<2 &
+&                    (VCRTYP<>LTYP | VCRNUM<>LNUM | VCRLIN<>LLIN | VCRSEQ<>LSEQ)
+&              Order By Key ORD1
+Endif
+For [ORD]
+  # En rupture de date, contrôle de la qté dispo
+  If [F:ORD]ENDDAT>WDAT
+    Gosub RUPT_WDAT
+
+    WCUMQTY += TLIG(2)
+    WCUMQTY -= TLIG(0)
+    WCUMQTY -= TLIG(1)
+
+    # Qté dispo > Qté besoin à WDAT --> c'est fini
+    If WCUMQTY>=LQTY
+      LDAT = WDAT
+      LQTA = WCUMQTY
+      Break
+    # Raz des tableaux pour traiter une nouvelle date
+    Else
+      Raz TCUM
+      Raz TLIG
+      Raz TALL
+    Endif
+  Endif
+  # Prise en compte de l'ordre dans le cumul qté à WDAT
+  If [F:ORD]ENDDAT<=WDAT
+    Gosub ALIM_WQTY
+  # Changement de date : alimentation de la nouvelle date dans WDAT
+  # et prise en compte de l'ordre dans le cumul qté à WDAT
+  Else
+    WDAT=[F:ORD]ENDDAT
+    Gosub ALIM_WQTY
+  Endif
+Next
+Filter [ORD]
+
+# Test final
+If LDAT=[0/0/0]
+  Gosub RUPT_WDAT
+  WCUMQTY += TLIG(2)
+  WCUMQTY -= TLIG(0)
+  WCUMQTY -= TLIG(1)
+  LDAT = WDAT
+  LQTA = WCUMQTY
+Endif
+
+# S'il y avait une affectation partielle, la FDMA est la date max entre
+# la date de dispo de la quantité restante et la date fin des affectations
+If WENDDAT<>[0/0/0]
+  LDAT=max(LDAT,WENDDAT)
+Endif
+
+End
+
+$RUPT_WDAT
+# Traitement horizon demande : effacement SOS dans horizon / + grande valeur au delà
+If WFOH<>[0/0/0]
+  If WDAT<=WFOH
+    TCUM(1,3,0)=0
+  Else
+    If TCUM(1,3,0)>TCUM(1,1,0)
+      TCUM(1,3,0)=TCUM(1,3,0)-TCUM(1,1,0)
+    Else
+      TCUM(1,3,0)=0
+    Endif
+  Endif
+Endif
+# Préparation du tableau
+For WLIN = 0 To WNBL-1
+  WTAB = TTAB(WLIN)
+  Gosub CUM_COL
+Next WLIN
+
+Return
+
+$CUM_COL
+ZSOF = 0
+ZSOS = 0
+
+While left$(WTAB,5) <> ""
+  WZON = left$(WTAB,5)
+  ITYP = val(mid$(WZON,1,2))
+  ISTA = val(mid$(WZON,3,1))
+  ISIG = val(mid$(WZON,4,1))
+  If dim(WHORDEM)>0 & WHORDEM=2 & WLIN=1 & ITYP=1     # Requirements line, Sales order, Forecast offset
+    If ISTA<3
+      ZSOF+=TCUM(ITYP,ISTA,ISIG)        # Firm or planned
+    Else
+      ZSOS+=TCUM(ITYP,ISTA,ISIG)        # Suggested
+    Endif
+  Else
+    TLIG(WLIN-1)+=TCUM(ITYP,ISTA,ISIG)
+  Endif
+  WTAB=mid$(WTAB,6,95)
+Wend
+
+If WLIN=1 & dim(TALL)>0
+  TLIG(0)+=max((ZSOF+TALL),ZSOS)-TALL   # Add max of Firm or suggested - Allocated
+Endif
+
+Return
+
+$ALIM_WQTY
+Raz WALL, WQTY
+# Si OF correction quantité restante par % perte
+If [F:ORD]WIPTYP = 5 & find([F:ORD]WIPSTA,1,2,3) & WSHRFLG = 2 & [F:ITF]SHR > 0
+  [F:ORD]EXTQTY    = arr(([F:ORD]EXTQTY*100)/(100+[F:ITF]SHR),10^-[F:TUN]UOMDEC)
+  [F:ORD]RMNEXTQTY = arr(([F:ORD]RMNEXTQTY*100)/(100+[F:ITF]SHR),10^-[F:TUN]UOMDEC)
+Endif
+
+If [F:ORD]RMNEXTQTY>=0
+  ISIG=0
+Else
+  ISIG=1
+Endif
+
+# Calcul de la quantité à prendre en compte et de la quantité allouée
+# Doit-on ajouter le type 8 : demande inter-sites
+Case [F:ORD]WIPTYP
+  When 1,3,6,12,14 : Gosub LEC_RER From CNSSDISTD
+  When Default     : WALL=0
+                     WQTY=[F:ORD]RMNEXTQTY-[F:ORD]MTOQTY
+                     # Si ressource avec qté affectée et identifiants besoin renseignés
+                     # on rajoute la quantité affectée
+                     #If find([F:ORD]WIPTYP,2,5) & [F:ORD]MTOQTY>0 & LNUM<>""
+                     #  Filter [MLK] Where STOFCY=LFCY & ITMREF=LITM
+#&                                       & RESSTYP=[F:ORD]VCRTYP & RESSNUM=[F:ORD]VCRNUM
+#&                                       & RESSLIN=[F:ORD]VCRLIN & RESSSEQ=[F:ORD]VCRSEQ
+                     #  For [MLK]MLK1
+                     #    If [F:MLK]DEMTYP=LTYP & [F:MLK]DEMNUM=LNUM & [F:MLK]DEMLIN=LLIN & [F:MLK]DEMSEQ=LSEQ
+                     #      WQTY+=[F:MLK]LIKQTY
+                     #    Endif
+                     #  Next
+                     #  Filter [MLK]
+                     #Endif
+Endcase
+# A conserver ou non ?
+If WQTY<0 : WQTY=0 : Endif
+
+ITYP=[F:ORD]WIPTYP
+ISTA=[F:ORD]WIPSTA
+
+TCUM(ITYP,ISTA,ISIG) += WQTY
+If WALL <> 0
+  TCUM(0,ISTA,ISIG)  += WALL
+Endif
+If dim(TALL)>0 & dim(ZALL)>0
+  TALL+=ZALL
+Endif
+
+Return
+#--- End issue X3-32344
+
+
+
+
+

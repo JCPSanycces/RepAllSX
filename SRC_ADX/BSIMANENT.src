@@ -1,0 +1,770 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+######################################################################################################
+# Project       : Bank statement import (MT940)
+# File          : BSIMANENT
+# Version       : 1.0
+# Authors       : U. Bader
+# Creation Date : 2016-07-29
+######################################################################################################
+# Module        : Finance
+# Description   : Bank statement import: manual entry of payments
+######################################################################################################
+# Updates       :
+# Date          | Author | Version | Description
+# 2016-08-17    | Bader  | U11     | Add field ACCSAC
+# 2016-08-22    | angre  | U11     | Treatment of VAT field depending on payment attribute added
+# 2016-08-24    | angre  | U11     | Additional controls for payment attribute added
+# 2016-08-25    | angre  | U11     | Additional controls for payment attribute added
+# 2016-08-29    | angre  | U11     | disable fields when transaction is validated
+# 2016-08-30    | angre  | U11     | Additional control on sign in payment entry type and sign in transaction
+# 2016-08-31    | angre  | U11     | Control account is now correctly set (D_BPRSAC)
+# 2016-11-11    | Bader  | U11_01  | X3-1501: Implementation of search term list
+# 2017-05-17    | Bader  | 2017.R3 | X3-35694: add payment reference to grid
+######################################################################################################
+
+
+$ACTION
+Case ACTION
+ When "INIT"        : Gosub INIT
+ When "INIT_DIA"    : Gosub INIT_DIA
+ When "CONTROLE"    : Gosub CONTROLE
+ When "EXEC"        : Gosub EXEC
+Endcase
+Return
+
+
+##############################################################################
+$INIT
+If !clalev([F:BPR])     Local File BPARTNER    [BPR]      Endif
+If !clalev([F:BPC])     Local File BPCUSTOMER  [BPC]      Endif
+If !clalev([F:BPS])     Local File BPSUPPLIER  [BPS]      Endif
+If !clalev([F:BSIIMP])  Local File BSIIMP      [BSIIMP]   Endif
+If !clalev([F:BSIIMPD]) Local File BSIIMPD     [BSIIMPD]  Endif
+If !clalev([F:BSIMAN])  Local File BSIMANENT   [BSIMAN]   Endif
+If !clalev([F:BAN])     Local File BANK        [BAN]      Endif
+If !clalev([F:GAC])     Local File GACCOUNT    [GAC]      Endif
+If !clalev([F:CAC])     Local File GACCCODE    [CAC]      Endif
+If !clalev([F:BPA])     Local File BPADDRESS   [BPA]      Endif
+If !clalev([F:CPY])     Local File COMPANY     [CPY]      Endif
+If !clalev([F:FCY])     Local File FACILITY    [FCY]      Endif
+If !clalev([F:CDA])     Local File GACCDENCOD  [CDA]      Endif
+# Bader: 2017-05-17 X3-35694
+If !clalev([F:PYH])     Local File PAYMENTH    [PYH]      Endif
+If !clalev([F:PYD])     Local File PAYMENTD    [PYD]      Endif
+# Bader: 2017-05-17 X3-35694 end
+
+Local Char LSTMCOD(GLONVCR) : LSTMCOD = PARAM(1)
+Local Integer LLIN          : LLIN = val(PARAM(2))
+Local Integer I, K, N, MANEXIST, LOK
+Return
+
+
+##############################################################################
+$INIT_DIA
+Local Integer ASTATUS
+Read [F:BSIIMP]BSIIMP0   =  LSTMCOD                # read bank statement header
+If !fstat
+    Read [F:BSIIMPD]BSIIMPD0 =  LSTMCOD;LLIN       # read bank statement transaction
+    If !fstat
+        Read [F:BSIMAN]BSIMAN0 = LSTMCOD;LLIN      # read manual entry
+        If !fstat
+           MANEXIST =1
+        Endif
+
+        [M:BSIMAN]FCYDSY = 2                       # FCY "Display only" = yes
+        If MANEXIST =1
+          [M:BSIMAN]FCY    = [F:BSIMAN]FCY
+        Else
+          [M:BSIMAN]FCY    = [F:BSIIMPD]FCYLIN
+          If [M:BSIMAN]FCY = ""
+              Call LEC_BAN([F:BSIIP]BAN) From CPTLEC    # try to find FCY of bank
+              If [F:BAN]FCY <> ""
+                  [M:BSIMAN]FCY = [F:BAN]FCY
+              Else                                      # not found
+                  Call LEC_CPY( [F:BSIIMPD]CPY ) From CPTLEC    # get main site of company
+                  If !fstat
+                      FCY = [F:CPY]MAIFCY
+                      [M:BSIMAN]FCYDSY = 1                      # FCY "Display only" = no
+                  Endif
+              Endif
+          Endif
+        Endif
+        [M:BSIMAN]ACCDAT   = [F:BSIIMPD]VALDAT
+        If [F:BSIIMPD]SNS="C" | [F:BSIIMPD]SNS="RD"
+           [M:BSIMAN]SNS = 2
+        Else #  D or RC
+           [M:BSIMAN]SNS = 1
+        Endif
+        [M:BSIMAN]AMTTRS   = [F:BSIIMPD]AMTCUR
+        [M:BSIMAN]CURTRS   = [F:BSIIMPD]CUR
+
+        Gosub INISTD
+
+        ASTATUS = func FINACC_SYRA.GET_COACOLHEA(GACTX, [F:BSIIP]COA, [M:BSIMAN]TITACC, GMESSAGE)
+        Titcol [M:BSIMAN]NBLIG [M:BSIMAN]TITACC For ACC
+
+# Bader: 2017-05-17 X3-35694
+        Gosub BUILD_PAYMENT_ARRAY
+# Bader: 2017-05-17 X3-35694 end
+
+        Raz N
+        For [F:BSIMAN]BSIMAN0 Where STMCOD = LSTMCOD and LIN = LLIN
+# Bader: 2017-05-17 X3-35694
+           Raz [L]K
+           If [F:BSIMAN]BPR <> ""
+               [L]K = find([F:BSIMAN]BPR,BPRARR)     # payment found for BP?
+               If [L]K > 0 and AMTARR([L]K-1) <> [F:BSIMAN]AMT  # found but wrong amount
+                  For I = K To dim(AMTARR)-1                    # loop over the rest of the array until found
+                      If BPRARR(I) = [F:BSIMAN]BPR and AMTARR(I) = [F:BSIMAN]AMT : K = I+1 : Break : Endif
+                  Next
+               Endif
+           Elsif [F:BSIMAN]ACC <> ""
+               [L]K = find([F:BSIMAN]ACC,GACARR)     # payment found for account?
+               If [L]K > 0 and AMTARR([L]K-1) <> [F:BSIMAN]AMT  # found but wrong amount
+                  For I = K To dim(AMTARR)-1                    # loop over the rest of the array until found
+                      If GACARR(I) = [F:BSIMAN]ACC and AMTARR(I) = [F:BSIMAN]AMT : K = I+1 : Break : Endif
+                  Next
+               Endif
+           Endif
+           If [L]K > 0
+               [M:BSIMAN]PYHNUM([L]N) = PYHARR([L]K-1)
+           Endif
+# Bader: 2017-05-17 X3-35694 end
+           [M:BSIMAN]DENCOD(N) = [F:BSIMAN]DENCOD
+           [M:BSIMAN]ACC(N)    = [F:BSIMAN]ACC
+           [M:BSIMAN]BPR(N)    = [F:BSIMAN]BPR
+           [M:BSIMAN]BPRSAC(N) = [F:BSIMAN]BPRSAC
+           [M:BSIMAN]ACCSAC(N) = [F:BSIMAN]ACCSAC
+           [M:BSIMAN]BPAINV(N) = [F:BSIMAN]BPAINV
+           [M:BSIMAN]REF(N)    = [F:BSIMAN]REF
+           [M:BSIMAN]AMT(N)    = [F:BSIMAN]AMT
+           [M:BSIMAN]VAT(N)    = [F:BSIMAN]VAT
+           [M:BSIMAN]DSP(N)    = [F:BSIMAN]DSP
+           [M:BSIMAN]DES(N)    = [F:BSIMAN]DES
+           N +=1
+        Next
+        [M:BSIMAN]NBLIG = N
+        Gosub RECALAMT
+
+    Else
+        Call ECR_TRACE(LSTMCOD + "~" + num$(LLIN) - mess(7,7703,1),1) From GESECRAN  : SAI = 1 : LOK = 0 # 'Transaction does not exist'
+    Endif
+
+Else
+    Call ECR_TRACE(LSTMCOD - mess(1,7703,1),1) From GESECRAN  : SAI = 1 : LOK = 0 # 'Statement does not exist'
+Endif
+Return
+
+
+##############################################################################
+$BUILD_PAYMENT_ARRAY
+Link [F:PYH] With [F:PYD]PYD0(1)=[F:PYH]NUM As [LPYH]
+&            Where [F:PYH]BSITRS = [F:BSIIMPD]STMCOD + "/" + num$([F:BSIIMPD]LIN)
+&            Order By Key LPYH = [F:PYD]BPRLIN Asc
+
+Local Integer CNT : CNT = rowcount([LPYH])
+Local Char BPRARR(GLONBPR) (CNT)   # array of BP numbers
+Local Char GACARR(GLONGAC) (CNT)   # array of G/L accounts
+Local Char PYHARR(GLONVCR) (CNT)   # array of payment numbers
+Local Integer AMTARR (CNT)         # array of amounts
+Local Integer IND : IND = 0
+Raz BPRARR, GACARR, PYHARR, AMTARR
+
+For [LPYH]
+    PYHARR(IND) = [F:PYD]NUM
+    BPRARR(IND) = [F:PYD]BPRLIN
+    GACARR(IND) = [F:PYD]ACC
+    AMTARR(IND) = [F:PYD]AMTLIN
+    IND += 1
+Next
+Return
+
+
+
+##############################################################################
+$CONTROLE
+LOK = 1
+Local Integer K1
+For K1=0 To [M]NBLIG-1
+   If [M]ACC(K1)="" & [M]BPRSAC(K1) = ""
+      Call ECR_TRACE(mess(115,106,1),1) From GESECRAN  : SAI =1 : LOK = 0 : Return  # At least one account must be entered
+   Endif
+Next
+
+If (left$([F:BSIIMPD]LET,1) ="A" and !find([F:BSIIMPD]LET,"AD","AS")) : LOK = 0 : Return  : Endif  # "A" hit
+If [M:BSIMAN]NBLIG <> 0
+   If [M:BSIMAN]RSTAMT <> 0
+     Call ECR_TRACE(mess(37,7703,1),1) From GESECRAN  : SAI =1 : LOK = 0  # 'The transaction amount is not completely allocated.'
+   Endif
+Endif
+Return
+
+
+##############################################################################
+$EXEC
+Local Integer HAS_CHANGED
+If LOK = 0  : Return  : Endif
+GOK = 1
+
+If [F:BSIIMPD]LET = "AS"                  # if "search term list" hit > check if something has changed
+    Gosub CHECK_IF_CHANGED                # if yes, set matching flag from "AS" to "AD"
+    If HAS_CHANGED : [M:BSIMTC0]LET = "AD" : Endif
+Endif
+
+Trbegin [F:BSIMAN], [F:BSIIMPD]
+Delete [F:BSIMAN] Where STMCOD = LSTMCOD and LIN = LLIN
+If !fstat
+    For I=0 To [M:BSIMAN]NBLIG-1
+        Gosub SET_BSIMAN
+        Write [F:BSIMAN]
+        If fstat
+            GOK=0 : Break : Goto LEAVE
+        Endif
+    Next
+
+    If [M:BSIMAN]NBLIG = 0
+        If find([F:BSIIMPD]LET,"AD","AS")           # previously with a manual entry that has now been removed
+            [M:BSIMTC0]LET = "C"
+        Endif
+    Else
+        If !find([F:BSIIMPD]LET,"AD","AS")          # previously not yet "AS" or "AD"
+            [M:BSIMTC0]LET = "AD"
+        Endif
+    Endif
+
+    [F:BSIIMPD]LET = [M:BSIMTC0]LET
+    Rewrite [F:BSIIMPD]
+    If fstat : GOK = 0 : Endif
+Else
+    GOK = 0
+Endif
+$LEAVE
+If GOK = 0
+   Rollback
+Else
+   Commit
+Endif
+Call BSI_UPDATE_STATEMENT_STATE(LSTMCOD) From BSILIBMTC
+Affzo [M:BSIMTC0]
+Return
+
+
+
+######################################################################################
+$CHECK_IF_CHANGED
+Local Integer COUNT, I
+HAS_CHANGED = 0
+
+Filter [F:BSIMAN] Where STMCOD = LSTMCOD and LIN = LLIN     # get original number of records
+COUNT = rowcount([F:BSIMAN])
+
+If [M:BSIMAN]NBLIG <> COUNT                                 # number has changed
+    HAS_CHANGED = 1
+Else                                                        # no change of number > check each line
+    I = 0
+    For [F:BSIMAN]
+        If [M:BSIMAN]DENCOD(I)    <> [F:BSIMAN]DENCOD   : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]AMT(I)       <> [F:BSIMAN]AMT      : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]ACC(I)       <> [F:BSIMAN]ACC      : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]ACCSAC(I)    <> [F:BSIMAN]ACCSAC   : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]BPR(I)       <> [F:BSIMAN]BPR      : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]BPRSAC(I)    <> [F:BSIMAN]BPRSAC   : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]BPAINV(I)    <> [F:BSIMAN]BPAINV   : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]VAT(I)       <> [F:BSIMAN]VAT      : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]DES(I)       <> [F:BSIMAN]DES      : HAS_CHANGED = 1 : Break : Endif
+        If [M:BSIMAN]DSP(I)       <> [F:BSIMAN]DSP      : HAS_CHANGED = 1 : Break : Endif
+    Next
+    I += 1
+Endif
+
+Filter [F:BSIMAN]
+Return
+
+
+######################################################################################
+$RECALAMT
+Local Integer MAXLIG
+MAXLIG = max(nolign,[M:BSIMAN]NBLIG)-1
+[M:BSIMAN]DTBAMT = sum([M:BSIMAN]AMT(0..MAXLIG))                   # calculate distributed amount
+[M:BSIMAN]RSTAMT = [M:BSIMAN]AMTTRS - [M:BSIMAN]DTBAMT             # set remaining amount
+
+Affzo DTBAMT , RSTAMT
+Return
+
+
+##############################################################################
+$INISTD
+Local Char    MODELE(GLONGCM)
+Global Integer GNBPLAN
+Global Integer GNBAXE
+Global Char    GPLAN(GLONCOA)(1..10)
+Global Char    GAXE(GLONDIE)(1..max(GOPTCANA,20))
+Global Integer GOBLIG(1..max(GOPTCANA,20))
+Global Integer GTYPLED(1..10)
+
+Call SETGCM([F:BSIIMP]CPY,MODELE) From CPTDIV
+Call SETPLAN2(MODELE,GNBPLAN,GPLAN,GTYPLED,GNBAXE,GAXE,GOBLIG) From CPTDIV
+GNBTYPLED = GNBPLAN
+If GTYPGEN=0 : Call SETMAINREF([F:BSIIMP]CPY,GTYPGEN,GTYPANA) From CPTDIV : Endif
+Return
+
+
+###################################################################################
+$SET_BSIMAN
+[F:BSIMAN]STMCOD = LSTMCOD
+[F:BSIMAN]LIN    = LLIN
+[F:BSIMAN]LIN1   = I+1
+[F:BSIMAN]FCY    = [M:BSIMAN]FCY
+[F:BSIMAN]DENCOD = [M:BSIMAN]DENCOD(I)
+[F:BSIMAN]ACC    = [M:BSIMAN]ACC(I)
+[F:BSIMAN]BPR    = [M:BSIMAN]BPR(I)
+[F:BSIMAN]BPRSAC = [M:BSIMAN]BPRSAC(I)
+[F:BSIMAN]ACCSAC = [M:BSIMAN]ACCSAC(I)
+[F:BSIMAN]BPAINV = [M:BSIMAN]BPAINV(I)
+[F:BSIMAN]REF    = [M:BSIMAN]REF(I)
+[F:BSIMAN]DES    = [M:BSIMAN]DES(I)
+[F:BSIMAN]AMT    = [M:BSIMAN]AMT(I)
+[F:BSIMAN]VAT    = [M:BSIMAN]VAT(I)
+[F:BSIMAN]DSP    = [M:BSIMAN]DSP(I)
+Return
+
+
+######################################################################################
+Subprog APRES_NBLIG
+Gosub RECALAMT
+End
+
+
+######################################################################################
+Subprog AM_AMT(VALEUR)
+Variable Decimal VALEUR
+[M:BSIMAN]AMT(nolign-1) = VALEUR
+Gosub RECALAMT
+End
+
+
+######################################################################################
+Subprog C_FCY(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> [M:BSIMAN]FCY and VALEUR <> ""
+    Call LEC_FCY(VALEUR) From CPTLEC    # read site
+    If !fstat                           # found
+        If [F:BSIIP]CPY <> [F:FCY]LEGCPY
+            mkstat = 2
+            GMESSAGE = func AFNC.MES1(mess(171,104,1),[F:BSIIP]CPY) # The site must belong to $1$ company
+        Endif
+    Else
+        mkstat = 2
+        GMESSAGE = mess(15,104,1)
+    Endif
+Endif
+End
+
+
+######################################################################################
+Subprog C_ACC(VALEUR)
+Variable Char    VALEUR()
+If VALEUR <> ""
+    Call LEC_GAC(VALEUR, [F:BSIIP]COA) From CPTLEC
+    If fstat
+        GMESSAGE = VALEUR-mess(38,106,1)      # Non existant account
+        mkstat = 2 : End
+    Else
+        If [F:GAC]SAC = 2                     # collective account
+            GMESSAGE = func AFNC.MES1(mess(353,107,1),VALEUR) # invalid account
+            mkstat = 2 : End
+        Endif
+    Endif
+Endif
+End
+
+
+######################################################################################
+Subprog C_BPRSAC(VALEUR)
+Variable Char    VALEUR()
+If [M:BSIMAN]BPR(nolign-1) <> ""       # when BP entered > BPRSAC must be entered
+    If VALEUR = ""
+        GMESSAGE = mess(10,123,1) # Mandatory field
+        mkstat = 2 : End
+    Else
+        If [F:GAC]ACCSHO<>VALEUR : Read [GAC]GAC1 = GPLAN(1);VALEUR : Else fstat=0 : Endif
+        If fstat | [F:GAC]SAC<>2
+            # Nonexistent account
+            GMESSAGE = mess(9,106,1)
+            mkstat = 2 : End
+        Else
+            Call CONTACC(GTYPGEN,GPLAN(1),[F:GAC]ACC,[M:BSIMAN]FCY,[M:BSIMAN]CURTRS,[M:BSIMAN]ACCDAT) From CPTCNT
+            If mkstat : End : Endif
+        Endif
+        Call LECTURE("BPR",[M:BSIMAN]BPR(nolign-1),"") From CONTOBJ
+        Gosub CONT_BPRACC From SUBPAY2 : If mkstat : End : Endif
+    Endif
+Else                         # when no BP entered > BPRSAC must be empty
+    If VALEUR <> "" : mkstat = 2 : Endif
+Endif
+End
+
+
+######################################################################################
+Subprog AS_VAT(VALEUR)
+Variable Char    VALEUR()
+Local Integer RPCVAT : RPCVAT = 0
+Local Char ACCBPR(10)
+
+If [M:BSIMAN]ACC(nolign-1) <> ""
+    If [M:BSIMAN]VAT(nolign-1) <> "" : End : Endif
+    Call LEC_GAC([M:BSIMAN]ACC(nolign-1), [F:BSIIP]COA) From CPTLEC
+    Call CDA_VAT_ACCBPR([F:BSIIP]LEG,[M:BSIMAN]DENCOD(nolign-1),RPCVAT,ACCBPR)
+
+    If [F:GAC]FLGVAT <> 1 and RPCVAT > 1
+        VALEUR = [F:GAC]VAT
+    Else
+        VALEUR = ""
+        mkstat = 2
+    Endif
+Else
+    VALEUR = ""
+    mkstat = 2
+Endif
+End
+
+
+######################################################################################
+Subprog C_VAT(VALEUR)
+Variable Char    VALEUR()
+If [M:BSIMAN]ACC(nolign-1) <> ""          # when G/L account entered > VAT must be entered if subjected to tax
+    Call LEC_GAC([M:BSIMAN]ACC(nolign-1), [F:BSIIP]COA) From CPTLEC
+    If VALEUR = "" and [F:GAC]FLGVAT > 1  # no entry but account is subjected to tax
+        GMESSAGE = mess(10,123,1)         # Mandatory field
+        mkstat = 2
+    Endif
+Else                                      # when no G/L account entered > VAT must be empty
+    If VALEUR <> "" : mkstat = 2 : Endif
+Endif
+End
+
+
+######################################################################################
+Subprog AS_BPAINV(VALEUR)
+Variable Char    VALEUR()
+If [M:BSIMAN]BPR(nolign-1)<>""
+  [M:BSIMAN]TYPADR = 1
+  [M:BSIMAN]BPRADR = [M:BSIMAN]BPR(nolign-1)  # BP for address selection
+  Call INIADR([M:BSIMAN]BPR(nolign-1),VALEUR) From SUBPAY
+Elsif [M:BSIMAN]BPR(nolign-1)="" & [M:BSIMAN]ACC(nolign-1)<>""
+  [M:BSIMAN]TYPADR = 5
+  [M:BSIMAN]BPRADR = [F:BSIIP]COA+[M:BSIMAN]ACC(nolign-1)  # BP for address selection
+  Call LECTURE("GAC",[M:BSIMAN]ACC(nolign-1),GPLAN(1)) From CONTOBJ
+  If fstat : End : Endif
+  VALEUR = [F:GAC]BPAADD
+Endif
+End
+
+
+######################################################################################
+Subprog C_BPAINV(VALEUR)
+Variable Char    VALEUR()
+Local Char BPA(GLONBPA)
+If VALEUR<>"" & VALEUR<>[M:BSIMAN]BPAINV(nolign-1)
+  If [M:BSIMAN]BPR(nolign-1)<> ""
+    Read [BPA]BPA0 = 1;[M:BSIMAN]BPR(nolign-1);VALEUR
+    If fstat # Nonexistent address
+      GMESSAGE = mess(10,119,1)
+      mkstat = 2 : End
+    Endif
+  Elsif [M:BSIMAN]ACC(nolign-1)<> ""
+    BPA = format$("K:3X",[F:BSIIP]COA)+[M:BSIMAN]ACC(nolign-1)
+    Read [BPA]BPA0 = 5;BPA;VALEUR
+    If fstat # Nonexistent address
+      GMESSAGE = mess(10,119,1)
+      mkstat = 2 : End
+    Endif
+  Endif
+Endif
+End
+
+
+######################################################################################
+Subprog D_BPRSAC(VALEUR)
+Variable Char    VALEUR()
+If [M:BSIMAN]BPR(nolign-1)="" : End : Endif
+#If [M:BSIMAN]BPRSAC(nolign-1) <> "" : End : Endif #angre outcomented 2016.08.25
+Local Integer I
+Local Char PRIO(2)
+Local Char CODCPT(GLONCAC)
+#test
+
+
+
+Call LECTURE("BPR",[M:BSIMAN]BPR(nolign-1),"") From CONTOBJ
+If fstat : End : Endif
+Call LEC_TPY_LEG([F:BSIIP]LEG,[F:BSIIP]PAYTYP) From CPTLEC
+#If [F:TPY]SNS=1 : PRIO="FC" : Else PRIO="CF" : Endif
+If [M:BSIMAN]SNS=1 : PRIO="FC" : Else PRIO="CF" : Endif
+For I=1 To 3
+ Case mid$(PRIO,I,1)
+  When "C" : # Client
+   If [F:BPR]BPCFLG=2
+    Call LECTURE("BPC",[M:BSIMAN]BPR(nolign-1),"") From CONTOBJ
+    #Call INIT_COMPTE([M:BSIMAN]BPR(nolign-1),[F:BSIIP]CPY,"C",CODCPT) From CPTSUB
+    [L]CODCPT = func FINCAC_SYRA.GET_ACCCOD_BPR(GACTX, [F:BSIIP]CPY, [M:BSIMAN]BPR(nolign-1), "C")
+    If [L]CODCPT<>"" & [F:BPC]BPCSTA=2
+     Call LECTURE("CAC",[L]CODCPT,"2~"+GPLAN(1)) From CONTOBJ
+     Call LECTURE("GAC",[F:CAC]ACC(0),GPLAN(1)) From CONTOBJ
+     If [F:GAC]AUZBPR(0)=2 : VALEUR=[F:GAC]ACCSHO : Break : Endif
+    Endif
+   Endif
+  When "F" : # Fournisseur
+   If [F:BPR]BPSFLG=2
+    Call LECTURE("BPS",[M:BSIMAN]BPR(nolign-1),"") From CONTOBJ
+    #Call INIT_COMPTE([M:BSIMAN]BPR(nolign-1),[F:BSIIP]CPY,"F",CODCPT) From CPTSUB
+    [L]CODCPT = func FINCAC_SYRA.GET_ACCCOD_BPR(GACTX, [F:BSIIP]CPY, [M:BSIMAN]BPR(nolign-1), "F")
+    If [L]CODCPT<>"" & [F:BPS]ENAFLG=2
+     Call LECTURE("CAC",[L]CODCPT,"3~"+GPLAN(1)) From CONTOBJ
+     Call LECTURE("GAC",[F:CAC]ACC(0),GPLAN(1)) From CONTOBJ
+     If [F:GAC]AUZBPR(1)=2 : VALEUR=[F:GAC]ACCSHO : Break : Endif
+    Endif
+   Endif
+  When Default
+   If [F:BPR]ACCCOD<>""
+    Call LECTURE("CAC",[F:BPR]ACCCOD,"17~"+GPLAN(1)) From CONTOBJ
+    Call LECTURE("GAC",[F:CAC]ACC(0),GPLAN(1)) From CONTOBJ
+    If [F:GAC]AUZBPR(5)=2 : VALEUR=[F:GAC]ACCSHO : Break : Endif
+   Endif
+ Endcase
+Next I
+End
+
+
+######################################################################################
+Subprog AS_BPRSAC(VALEUR)
+Variable Char    VALEUR()
+If [M:BSIMAN]ACC(nolign-1) <> ""
+    VALEUR = ""
+    [M:BSIMAN]ACCSAC = ""
+    Affzo [M:BSIMAN]ACCSAC
+    mkstat = 2
+Else
+    Call D_BPRSAC(VALEUR)
+Endif
+End
+
+
+######################################################################################
+Subprog AS_ACC(VALEUR)
+Variable Char    VALEUR()
+Local Integer RPCVAT : RPCVAT = 0
+Local Char ACCBPR(10)
+Call CDA_VAT_ACCBPR([F:BSIIP]LEG,[M:BSIMAN]DENCOD(nolign-1),RPCVAT,ACCBPR)
+If [M:BSIMAN]BPR(nolign-1) <> "" or ACCBPR <> ""
+    VALEUR = ""
+    mkstat = 2
+Endif
+End
+
+
+######################################################################################
+Subprog AS_BPR(VALEUR)
+Variable Char    VALEUR()
+If [M:BSIMAN]ACC(nolign-1) <> ""
+    VALEUR = ""
+    mkstat = 2
+Endif
+End
+
+
+######################################################################################
+Subprog AS_AMT(VALEUR)
+Variable Decimal VALEUR
+If [M:BSIMAN]AMT(nolign-1) = 0      # nothing entered so far?
+    VALEUR = [M:BSIMAN]RSTAMT       # init with "remaining amount"
+Endif
+End
+
+
+######################################################################################
+Subprog C_AMT(VALEUR)
+Variable Decimal VALEUR
+If VALEUR < 0                       # check negative amounts
+    mkstat = 2
+    GMESSAGE = mess(84,182,1)
+Endif
+End
+
+
+######################################################################################
+Subprog AS_FCY(VALEUR)
+Variable Char    VALEUR()
+Gosub CHECK_PAYMENT_ENTRY_SIGN
+If [F:BSIIMPD]FLGCRE=2           # validated? If yes, make screen "read only"
+   Diszo [M:BSIMAN]1-99
+   End
+Endif
+If [M:BSIMAN]FCYDSY = 2         # Display only
+   Diszo [M:BSIMAN]FCY
+Else                            # Enterable
+   Actzo [M:BSIMAN]FCY
+Endif
+End
+
+
+######################################################################################
+Subprog AM_BPRSAC(VALEUR)
+Variable Char    VALEUR()
+[M:BSIMAN]BPRSAC(nolign-1) = VALEUR
+Read [F:GAC]GAC1 = [F:BSIIP]COA;[M:BSIMAN]BPRSAC(nolign-1)
+If !fstat and [F:GAC]SAC=2
+    [M:BSIMAN]ACCSAC(nolign-1) = [F:GAC]ACC
+Else
+    [M:BSIMAN]ACCSAC(nolign-1) = ""
+    mkstat = 2
+    GMESSAGE = mess(9,106,1) # Nonexistent account
+Endif
+Affzo [M:BSIMAN]ACCSAC(nolign-1)
+End
+
+
+######################################################################################
+Subprog C_DENCOD(VALEUR)
+Variable Char    VALEUR()
+Call LEC_CDA_LEG([F:BSIIP]LEG,VALEUR) From CPTLEC
+If !fstat
+    If [F:CDA]ACCTYP = 3 or [F:CDA]ACCTYP = 2             # Acc <-> BP not allowed
+        GMESSAGE = VALEUR-mess(59,106,1)
+        mkstat = 2 : End
+    Endif
+    If [F:CDA]ACCSNS <> 1
+      If [M:BSIMAN]SNS <> [F:CDA]ACCSNS - 1
+        GMESSAGE = mess(68,7703,1)
+        mkstat = 2 : End
+      Endif
+    Endif
+Else
+    GMESSAGE = VALEUR-mess(23,100,1)
+    mkstat = 2 : End
+Endif
+End
+
+
+######################################################################################
+Subprog AM_ACC(VALEUR)
+Variable Char    VALEUR()
+Local Integer RPCVAT : RPCVAT = 0
+Local Char ACCBPR(10)
+Call LEC_GAC(VALEUR, [F:BSIIP]COA) From CPTLEC
+If [F:GAC]FLGVAT = 1                  # not sbjected
+    [M:BSIMAN]VAT(nolign-1) = ""
+Else
+  Call CDA_VAT_ACCBPR([F:BSIIP]LEG,[M:BSIMAN]DENCOD(nolign-1),RPCVAT,ACCBPR) #func CDA_NO_VAT([F:BSIIP]LEG,[M:BSIMAN]DENCOD(nolign-1)) > 1
+  If RPCVAT > 1
+    [M:BSIMAN]VAT(nolign-1) = [F:GAC]VAT
+  Endif
+Endif
+Affzo [M:BSIMAN]VAT
+End
+
+
+######################################################################################
+
+######################################################################################
+## Section automatically added (screen BSIMANENT) 08/22/2016 13:48:07 (ANGRE)
+######################################################################################
+Subprog AM_DENCOD(VALEUR)
+Variable Char    VALEUR()
+Local Integer RPCVAT : RPCVAT = 0
+Local Char ACCBPR(10)
+
+  Call CDA_VAT_ACCBPR([F:BSIIP]LEG,VALEUR,RPCVAT,ACCBPR)
+  If RPCVAT = 1    # no vatcode allowed
+    [M:BSIMAN]VAT(nolign-1) = ""
+  Else
+    If [M:BSIMAN]ACC(nolign-1) <> ""
+      Call AM_ACC([M:BSIMAN]ACC(nolign-1))
+    Endif
+  Endif
+  If ACCBPR <> ""
+    [M:BSIMAN]ACC = ""
+  Endif
+  Affzo [M:BSIMAN]VAT
+  Affzo [M:BSIMAN]ACC
+End
+
+
+######################################################################################
+
+Subprog CDA_VAT_ACCBPR(LEG,CDA,RPCVAT,ACCBPR)
+  Value Char LEG
+  Value Char CDA
+  Variable Integer RPCVAT
+  Variable Char ACCBPR
+  Call LEC_CDA_LEG(LEG,CDA) From CPTLEC
+  If !fstat
+      RPCVAT = [F:CDA]RPCVAT    # no vatcode allowed
+      ACCBPR = [F:CDA]ACCBPR
+  Else
+      GMESSAGE = VALEUR-mess(23,100,1)
+      mkstat = 2 : End
+  Endif
+End
+
+
+###########################################################################################
+$CHECK_PAYMENT_ENTRY_SIGN
+    Call LEC_TPY_LEG([F:BSIIP]LEG,[F:BSIIP]PAYTYP) From CPTLEC
+    If [M:BSIMAN]SNS <> [F:TPY]SNS and [F:TPY]SNS <> 3
+      GMESSAGE = mess(72,7703,1)
+      Diszo [M:BSIMAN]1-99
+      mkstat = 2 : End
+    Endif
+Return
+
+
+######################################################################################
+## Section automatically added (screen BSIMANENT) 26.09.2016 13:32:30 (DNE)
+######################################################################################
+
+Subprog AS_DSP(VALEUR)
+Variable Char VALEUR()
+    Local Char PRIO(2)
+    Local Integer I
+
+    If ( [M:BSIMAN]ACC(nolign-1) <> "" ) and ( dim( [F:GAC]DACDIENBR ) > 0 )
+        Call LEC_GAC( [M:BSIMAN]ACC(nolign-1), [F:BSIIP]COA ) From CPTLEC
+        If !fstat and ( [F:GAC]DACDIENBR <= 0 )
+            VALEUR = ""
+            mkstat = 2
+            End
+        Endif
+    Endif
+
+    If [M:BSIMAN]BPR(nolign-1) <> ""
+        Call LECTURE( "BPR", [M:BSIMAN]BPR(nolign-1), "" ) From CONTOBJ
+        If [M:BSIMAN]SNS = 1 : PRIO="SC" : Else PRIO="CS" : Endif
+        For I=1 To 2
+            Case mid$( PRIO, I, 1 )
+                When "C" : # Customer
+                    If ( [F:BPR]BPCFLG = 2 )
+                        Call LECTURE( "BPC", [M:BSIMAN]BPR(nolign-1), "" ) From CONTOBJ
+                        If ( dim( [F:BPC]CCE ) <= 0 ) or ( [F:BPC]CCE(0) = "" )
+                            VALEUR = ""
+                            mkstat = 2
+                            End
+                        Endif
+                    Endif
+                When "S" : # Supplier
+                    If ( [F:BPR]BPSFLG = 2 )
+                        Call LECTURE( "BPS", [M:BSIMAN]BPR(nolign-1), "" ) From CONTOBJ
+                        If ( dim( [F:BPS]CCE ) <= 0 ) or ( [F:BPS]CCE(0) = "" )
+                            VALEUR = ""
+                            mkstat = 2
+                            End
+                        Endif
+                    Endif
+            Endcase
+        Next I
+    Endif
+End
+
+
+######################################################################################
+

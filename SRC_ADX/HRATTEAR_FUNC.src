@@ -1,0 +1,689 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Attachable earnings functions
+
+#**
+#* Calculate Attachable earnings per payslip and update variables
+#* @param VREFNUM Local Char(GLONEML), Employee code
+#* @param VCTRNUM Local Char(GLONHRCTR), Contract number
+#* @param VCTRDAT Local Date, Contract date
+#* @param VBUL Char, Payslip
+#* @param VNETT Local Decimal, Nett pay
+#*!
+Funprog CALC_AE_PAYSLIP(VREFNUM, VCTRNUM, VCTRDAT, VBUL, VNETT)
+Value Char VREFNUM, VCTRNUM, VBUL
+Value Date VCTRDAT
+Value Decimal VNETT
+
+# Example of usage from payplan setup
+# func UK_FUNCTIONS.ATTEARCALC([F:CTRUKI]REFNUM,[F:CTRUKI]CTRNUM,[F:CTRUKI]CTRDAT, [F:VEP]BUL, C_NET_PAY)
+
+  #Local variables
+  Local Decimal WRET
+  Local Char VPERCOD(15)
+  Local Integer VPERYEA, VPERNUM
+  Local Date VPERSTR, VPEREND
+
+  # Actual installment paid from payslip
+  Local Decimal VINSPAID
+  # Installment underpaid
+  Local Decimal VUNDERPAID
+
+  Local Decimal BALPAY, NETTVAR, NETTPREV, INSPAY, INSCURR, ADMCOSTPAY, VINSPAY, VADMCOSTPAY, VBALPAY
+  Local Char AETYPCOD(GLONADI)
+  Local Char AEHCOD(30), HEACOD(GLONADI), VNETVAR(GLONADI), VAVAR(GLONADI), VBVAR(GLONADI)
+  Local Integer PERCOUNT, BALFLG, INDEX
+  Local Decimal PROTEARNAMOUNT, AVAILAMOUNT, PROTEARNLEAST
+  Local Date TERMDAT
+  Local Decimal NETTPER, PECREDIT, PECREDITUSED
+
+  PERCOUNT = 1
+  INDEX = func INIT_GAECOD()
+
+  #Open tables
+  If clalev([F:HRAEH])=0    : Local File HRAEHEADER  [HRAEH]    : Endif
+  If clalev([F:HRAED])=0    : Local File HRAEDETAIL  [HRAED]    : Endif
+  If clalev([F:HRAES])=0    : Local File HRAESUSPEND [HRAES]    : Endif
+  If clalev([F:HRAER])=0    : Local File HRATTEARRAT [HRAER]    : Endif
+  If clalev([F:HRAET])=0    : Local File HRATTEARTYP [HRAET]    : Endif
+  If clalev([F:HRCTR9])=0   : Local File EMPLOCTR    [HRCTR9]   : Endif
+  If clalev([F:CTRUKI9])=0  : Local File EMPLOCTRUKI [CTRUKI9]  : Endif
+  If clalev([F:HRVEP])=0    : Local File VALEMP      [HRVEP]    : Endif
+  If clalev([F:HRPEOD])=0   : Local File HRPEODET    [HRPEOD]   : Endif
+
+  # Get current payslip period details
+  Filter [HRVEP] Where BUL = VBUL
+  Read [HRVEP] First
+  If !fstat
+    VPERCOD = [F:HRVEP]PERCOD
+    VPERYEA = [F:HRVEP]PERYEA
+    VPERNUM = [F:HRVEP]PERNUM
+  Endif
+  Filter [HRVEP]
+
+  # Get employee termination date from contract
+  Filter [HRCTR] Where REFNUM = VREFNUM and CTRNUM = VCTRNUM and CTRDAT = VCTRDAT
+  Read [HRCTR] First
+  If !fstat
+    TERMDAT = [F:HRCTR]XITDAT
+  Endif
+  Filter [HRCTR]
+
+  NETTVAR = VNETT
+
+  # Reset Protected earings credits used, applicable for all AEs per contract
+  PECREDITUSED = 0
+
+  # Get lowest protected earning amount used to calc unused protected earnings
+  Link [HRAEH] With  [F:HRAED]HRAED0    = [F:HRAEH]AEHCOD,
+&                    [F:HRAET]HRAET0    = [F:HRAED]TYPCOD
+&              As [HRAE]
+&              Where REFNUM = VREFNUM and CTRNUM = VCTRNUM and CTRDAT = VCTRDAT
+&              Order By [F:HRAEH]DEDPRI
+  For [HRAEH]
+    # Get protected earnings for AE
+    If [F:HRAED]PROTEARNAMT <> 0
+      PROTEARNAMOUNT = [F:HRAED]PROTEARNAMT
+    Elsif [F:HRAED]PROTEARNPCT <> 0
+      PROTEARNAMOUNT = [F:HRAED]PROTEARNPCT / 100 * VNETT
+    Endif
+
+    If PROTEARNAMOUNT > 0
+      If PROTEARNLEAST = 0 | PROTEARNAMOUNT < PROTEARNLEAST
+        PROTEARNLEAST = PROTEARNAMOUNT
+      Endif
+    Endif
+  Next
+
+  # Select all Attachable earnings on the contract
+  Link [HRAEH] With  [F:HRAED]HRAED0    = [F:HRAEH]AEHCOD,
+&                    [F:HRAET]HRAET0    = [F:HRAED]TYPCOD
+&              As [HRAE]
+&              Where REFNUM = VREFNUM and CTRNUM = VCTRNUM and CTRDAT = VCTRDAT
+&              Order By [F:HRAEH]DEDPRI
+
+  # Iterate through Attachable earnings based on priority
+  For [HRAE]
+    # Get protected earnings for AE
+    If [F:HRAED]PROTEARNAMT <> 0
+      PROTEARNAMOUNT = [F:HRAED]PROTEARNAMT
+    Elsif [F:HRAED]PROTEARNPCT <> 0
+      PROTEARNAMOUNT = [F:HRAED]PROTEARNPCT / 100 * VNETT
+    Endif
+
+    If func HRATTEAR_FUNC.GET_VARIABLES(10610, [F:HRAET]CODAET, HEACOD, VNETVAR, VAVAR, VBVAR) <> 2
+      # Heading variables lookup for current type failed
+      Goto NEXT_RECORD
+    Endif
+
+    # AEHCOD - Key for header and details on attachable earning
+    AEHCOD = [F:HRAEH]AEHCOD
+
+    # Admin cost value from employee attachable earning
+    ADMCOSTPAY = [F:HRAED]ADMCOST
+
+    # Balance value from employee attachable earning
+    BALPAY = [F:HRAED]AEBAL
+    If  BALPAY > 0
+      BALFLG = 2
+    Else
+      BALFLG = 1
+    Endif # Indicating the use of a balance
+
+    If [F:HRAET]FIXEDAMT = 2
+      # Fixed installment value from employee attachable earning
+      INSCURR = [F:HRAED]MTHINS
+    Else
+      # Lookup installment for type based on Nett pay
+      INSCURR = func HRATTEAR_FUNC.LOOKUP_INSTALLMENT([F:HRAED]TYPCOD, NETTVAR)
+    Endif
+
+    # Get available amount after protected earnings
+    AVAILAMOUNT = NETTVAR - PROTEARNAMOUNT
+
+    # Reset Protected earings credits, to check for all periods applicable to current AE
+    # Credits used accumulates for all AEs, so that credit is only applied if there is more available than already used
+    PECREDIT = 0
+
+    If INSCURR = 0 | AVAILAMOUNT <= 0
+      Goto NEXT_RECORD
+    Endif
+
+    VUNDERPAID = 0
+
+    # Select periods from AE start date up to current payslip period
+    Filter [HRPEOD] Where PERCOD = VPERCOD &
+&                         PEREND >= [F:HRAED]STRDAT &
+&                         ((PERYEA = VPERYEA & PERNUM <= VPERNUM) | PERYEA < VPERYEA)
+
+    # Iterate pay periods and calc amounts due
+    For [HRPEOD]
+      # Check if employee terminated and period start date after termination date
+      If TERMDAT <> [0/0/0] & TERMDAT < [F:HRPEOD]PERSTR
+        Break
+      Endif
+
+      If BALFLG = 2 & BALPAY = 0
+        Break
+      Endif
+
+      # If not fixed amount and not current period, lookup previous installment from previous nett pay
+      If [F:HRAET]FIXEDAMT <> 2 & !([F:HRPEOD]PERYEA = VPERYEA & [F:HRPEOD]PERNUM = VPERNUM)
+        NETTPREV = func HRATTEAR_FUNC.GET_PAYSLIPVAL([F:HRPEOD]PERCOD, [F:HRPEOD]PERYEA, [F:HRPEOD]PERNUM, VREFNUM, VCTRNUM, VCTRDAT, VNETVAR, 6)
+        VINSPAY = func HRATTEAR_FUNC.LOOKUP_INSTALLMENT([F:HRAED]TYPCOD, NETTPREV)
+      Else
+        VINSPAY = INSCURR
+      Endif
+
+      VADMCOSTPAY = ADMCOSTPAY
+      VBALPAY = BALPAY
+      VPERSTR = [F:HRPEOD]PERSTR
+      VPEREND = [F:HRPEOD]PEREND
+
+      If func HRATTEAR_FUNC.CALC_AE_PERIOD(
+&                         VBUL, VPERSTR, VPEREND,
+&                         BALPAY, VINSPAY, VADMCOSTPAY,
+&                         VREFNUM, VCTRNUM, VCTRDAT, PERCOUNT, BALFLG,
+&                         HEACOD, AEHCOD
+&                       ) <> 1
+
+        # Set values for current payslip period
+        If [F:HRPEOD]PERYEA = VPERYEA & [F:HRPEOD]PERNUM = VPERNUM
+
+          # Finished with suspension write-off
+          If BALPAY = 0 & VINSPAY = 0
+            Break
+          Endif
+
+          # If underpaid to date
+          If VUNDERPAID > 0
+            VINSPAY += VUNDERPAID
+
+            # If new installment including underpayment is more than previous balance
+            If BALFLG = 2 & VINSPAY > VBALPAY
+              VINSPAY = VBALPAY
+              BALPAY = 0
+              If VINSPAY = 0
+                Break
+              Endif
+              BALPAY = VBALPAY - VINSPAY
+            Endif
+          Endif
+
+          # If overpaid to date
+          If VUNDERPAID < 0
+            VINSPAY += VUNDERPAID
+
+            If VINSPAY < 0
+              VINSPAY = 0
+              Break
+            Endif
+            If BALFLG = 2
+              BALPAY = VBALPAY - VINSPAY
+            Endif
+          Endif
+
+          # Check if any unused protected earnings credit from previous periods
+          If PECREDIT > PECREDITUSED
+            AVAILAMOUNT -= PECREDIT - PECREDITUSED
+            If AVAILAMOUNT < 0: AVAILAMOUNT = 0: Endif
+          Endif
+
+          # Check if calculated amount exceeds nett pay less protected earnings
+          If VINSPAY > AVAILAMOUNT
+            If BALFLG = 2
+              BALPAY = VBALPAY - VINSPAY
+            Endif
+            VINSPAY = AVAILAMOUNT
+            If VINSPAY = 0: VADMCOSTPAY = 0: Endif
+          Endif
+
+          INDEX = func SET_GAECOD(HEACOD, VINSPAY)
+          INDEX = func SET_GAECOD(VAVAR, VADMCOSTPAY)
+          INDEX = func SET_GAECOD(VBVAR, BALPAY)
+
+          Call SET_PAYSLIP_TOTAL(VBUL, VREFNUM, VCTRNUM, VNETVAR, NETTVAR)
+
+          WRET += VINSPAY + VADMCOSTPAY
+          NETTVAR -= VINSPAY
+
+          Break
+        Else
+          If VINSPAY > 0
+            # Get actual paid amount from previous payslip
+            VINSPAID = func HRATTEAR_FUNC.GET_PAYSLIPVAL([F:HRPEOD]PERCOD, [F:HRPEOD]PERYEA, [F:HRPEOD]PERNUM, VREFNUM, VCTRNUM, VCTRDAT, HEACOD, 1)
+
+            # If unpaid or underpaid, add to current installment
+            # This will also credit installment if overpaid because installment due changed on setup
+            If VINSPAID <> VINSPAY
+              If BALFLG = 2
+                BALPAY += VINSPAY - VINSPAID
+              Endif
+              VUNDERPAID += VINSPAY - VINSPAID
+
+              # Apply PE credits to underpayment
+              # Check if any unused protected earnings credit from previous periods
+              If PECREDIT > PECREDITUSED
+                If VUNDERPAID <= PECREDIT
+                  # Under payment less than credit
+                  PECREDITUSED += VUNDERPAID
+                Else
+                  # Under payment more than credit
+                  PECREDITUSED += PECREDIT - PECREDITUSED
+                Endif
+                If GUSER = 'PITRU': Infbox "Credits used in period " - num$([F:HRPEOD]PERNUM) - ": " - num$(PECREDITUSED) :Endif
+              Endif
+
+              # Get nett pay for the period and calc protected earings credits
+              NETTPER = func HRATTEAR_FUNC.GET_PAYSLIPVAL([F:HRPEOD]PERCOD, [F:HRPEOD]PERYEA, [F:HRPEOD]PERNUM, VREFNUM, VCTRNUM, VCTRDAT, "NET_PAY", 1)
+              # If Net pay is less than protected earings amount, add credit to current month
+              If NETTPER < PROTEARNLEAST
+                PECREDIT += PROTEARNLEAST - NETTPER
+              Endif
+            Endif
+          Endif
+        Endif
+      Endif
+
+      PERCOUNT += 1
+    Next # Iterate pay periods and calc amounts due
+
+    $NEXT_RECORD
+
+  Next # Iterate through Attachable earnings based on priority
+
+End WRET
+
+
+#**
+#* Get Period Payslip values for the heading
+#* @param FPERCOD Char, Period code
+#* @param FPERYEA Integer, Period year
+#* @param FPERNUM Integer, Period number
+#* @param FREFNUM Char, Employee ID
+#* @param FCTRNUM Char, Contract ID
+#* @param FCTRDAT Date, Contract start date
+#* @param FHEACOD Char, AE heading on payslip
+#* @return DRET Decimal, Returns the total payslip amount for previous periods from AE start date
+#*!
+Funprog GET_PAYSLIPVAL(FPERCOD, FPERYEA, FPERNUM, FREFNUM, FCTRNUM, FCTRDAT, FHEACOD, FTYP)
+Value Char FPERCOD, FREFNUM, FCTRNUM, FHEACOD
+Value Integer FPERYEA, FPERNUM, FTYP
+Value Date FCTRDAT
+
+  Local Decimal DRET
+
+  Local File VALEMP [VEP]
+  Local File HISTOPAYE [HSP]
+
+  Filter [F:VEP] Where EMP = FREFNUM & CTRNUM = FCTRNUM & CTRDAT = FCTRDAT &
+&                      PERCOD = FPERCOD & PERYEA = FPERYEA & PERNUM = FPERNUM
+
+  For [VEP]
+    Filter [F:HSP] Where [F:HSP]BUL = [F:VEP]BUL & RUB = FHEACOD & TYP = FTYP
+    Read [HSP] First
+    If !fstat
+      DRET += [F:HSP]AMT
+    Endif
+    Filter [HSP]
+  Next
+
+End DRET
+
+
+#**
+#* Set payslip total in HISTOPAYE
+#* @param VBUL Char, Payslip number
+#* @param VREFNUM Char, Employee code
+#* @param VCTRNUM Char, Contract code
+#* @param VCUMCOD Char, Total code
+#* @param VVAL Local Decimal, Value to set
+#*!
+Subprog SET_PAYSLIP_TOTAL(VBUL, VREFNUM, VCTRNUM, VCUMCOD, VVAL)
+Value Char VBUL, VREFNUM, VCTRNUM, VCUMCOD
+Value Decimal VVAL
+
+  If clalev([F:VEP])=0   : Local File VALEMP     [VEP]   : Endif
+  If clalev([F:CUM])=0   : Local File CUMUL      [CUM]   : Endif
+  If clalev([F:HSP])=0   : Local File HISTOPAYE  [HSP]   : Endif
+
+  Filter [F:VEP] Where BUL=VBUL
+  Read [F:VEP] First
+  If fstat
+    Return
+  Endif
+
+  Filter [F:CUM] Where LEG=[F:VEP]LEG & CUMCOD = VCUMCOD
+  Read [F:CUM] First
+  If fstat
+    Return
+  Endif
+
+  GOK=1
+
+  Readlock[HSP]HSP3= VBUL;VCUMCOD;6
+  If !fstat
+    [F:HSP]AMT=VVAL
+    Rewrite [F:VLA]
+  Else
+    Raz [F:HSP]
+    [F:HSP]BUL      = VBUL
+    [F:HSP]RUB      = VCUMCOD
+    [F:HSP]TYP      = 6
+    [F:HSP]ROW      = [F:CUM]CUMROW
+    [F:HSP]EMP      = VREFNUM
+    [F:HSP]CTRNUM   = VCTRNUM
+    [F:HSP]DAT      = [F:VEP]PYRDAT
+    [F:HSP]LEG      = [F:VEP]LEG
+    [F:HSP]AMT      = VVAL
+    Write [F:HSP]
+  Endif
+  If fstat<>0
+    GOK = 0 : Call FSTA("HSP") From GLOCK
+  Endif
+
+End
+
+
+#**
+#* Lookup the amount based on attachable earning type and nett pay
+#* @param VAETYPCOD Local Char, AE type code
+#* @param VNETTPAY Local Decimal, Nett pay before AE deductions
+#* @return WRET Local char, Installment from rates table
+#*!
+Funprog LOOKUP_INSTALLMENT(VAETYPCOD, VNETTPAY)
+Value Char VAETYPCOD
+Value Decimal VNETTPAY
+
+  Local Decimal VAMT, VRAT
+  Local Decimal WRET
+  Local Integer LINE
+
+  Local File HRATTEARRAT [HRAER]
+#MASHI - 2018-02-20 - X3-77112 START adding equals
+  Filter [F:HRAER]  Where AETYP = VAETYPCOD and AEFROM <= VNETTPAY and (AETO >= VNETTPAY or AETO = 0)
+#MASHI - 2018-02-20 - X3-77112 END
+  Read [HRAER] First
+  If !fstat
+    VAMT = [F:HRAER]AMOUNT
+    VRAT = [F:HRAER]DEDRAT
+    LINE = [F:HRAER]LIGNBR
+
+    If [F:HRAER]AETO = 0  # Check if last line, then calc up to previous line
+      Filter [F:HRAER]  Where AETYP = VAETYPCOD and LIGNBR = (LINE -1)
+      Read [HRAER] First
+      If !fstat
+        # Calc up to max line
+        If [F:HRAER]AMOUNT <> 0
+          WRET = [F:HRAER]AMOUNT
+        Else
+          WRET = [F:HRAER]DEDRAT / 100 * [F:HRAER]AETO
+        Endif
+
+        # Calc remainder according to max line
+        If VAMT <> 0
+          WRET =+ VAMT
+        Else
+        WRET += VRAT / 100 * (VNETTPAY - [F:HRAER]AETO)
+        Endif
+      Endif
+    Else
+      If VAMT <> 0
+        WRET = VAMT
+      Else
+        WRET = VRAT / 100 * VNETTPAY
+      Endif
+    Endif
+
+    WRET = ar2(WRET)
+  Endif
+
+End WRET
+
+
+#**
+#* Initialize global variables for use with Attachable earnings calculations
+#*!
+Funprog INIT_GAECOD()
+  Global Char     GAECOD(30)(0..200)  : # Attachable earnings code
+  Global Shortint GAEIND              : # Attachable earnings index
+  Global Decimal  GAEVAL(0..200)      : # Attachable earnings value
+
+  #Clear Global variables used to store calculated values
+  Raz GAECOD
+  Raz GAEVAL
+  GAEIND = 0
+End 0
+
+
+#**
+#* Set Attachable earning value in global array
+#* @param VAECOD Local Char(30), Attachable earning code
+#* @param VAEVAL Local Decimal, Attachable earning amount
+#* @return INDEX Local decimal, Index of value in array
+#*!
+Funprog SET_GAECOD(VAECOD, VAEVAL)
+Value Char VAECOD
+Value Decimal VAEVAL
+
+  Local Integer I, INDEX
+
+  For I = 1 To GAEIND
+    If GAECOD(I) = VAECOD
+      INDEX = I
+    Endif
+  Next
+
+  If INDEX = 0
+    GAEIND += 1
+    INDEX = GAEIND
+  Endif
+
+  GAECOD(INDEX) = VAECOD
+  GAEVAL(INDEX) += VAEVAL
+
+End INDEX
+
+
+#**
+#* Get Attachable earning value from global array
+#* @param VAECOD Local Char(30), Attachable earning code
+#* @return WRET Local decimal
+#*!
+Funprog GET_GAECODVAL(VAECOD)
+Value Char VAECOD
+
+  Local Decimal WRET
+  Local Integer I
+
+  For I = 1 To GAEIND
+    If GAECOD(I) = VAECOD
+      WRET = GAEVAL(I)
+      Break
+    Endif
+  Next
+
+End WRET
+
+
+#**
+#* Get the attachable earning type code linked to the heading
+#* @param ADITABLE Local Integer (GLONADV), contains the miscellaneous table number
+#* @param VHEACOD Local Char(GLONRUB), contains the heading code
+#* @return WRET Local char
+#*!
+Funprog GET_AETYPCOD(ADITABLE, VHEACOD)
+Value Char VHEACOD
+Value Integer ADITABLE
+
+  Local Char WRET(GLONADI)
+
+  Local File ATABDIV [ADI]
+  Filter [F:ADI]  Where NUMTAB = ADITABLE and A1 = VHEACOD
+  Read [ADI] First
+  If !fstat
+    WRET = [F:ADI]CODE
+  Endif
+
+End WRET
+
+
+#**
+#* Get the heading linked to an attachable earning type code
+#* @param ADITABLE Local Integer (GLONADV), contains the miscellaneous table number
+#* @param VAETYPCOD Local Char(GLONRUB), contains the heading code
+#* @return WRET Local char
+#*!
+Funprog GET_HEADING(ADITABLE, VAETYPCOD)
+Value Char VAETYPCOD
+Value Integer ADITABLE
+
+  Local Char WRET(GLONADI)
+
+  Local File ATABDIV [ADI]
+  Filter [F:ADI]  Where NUMTAB = ADITABLE and CODE = VAETYPCOD
+  Read [ADI] First
+  If !fstat
+    WRET = [F:ADI]A1
+  Endif
+
+End WRET
+
+
+#**
+#* Get headings linked to attachable earnings type
+#* @param ADITABLE Local Integer (GLONADV), contains the miscellaneous table number
+#* @param VAETYPCOD Local Char, AE type code
+#* @param VHEAD Local Char, Heading code
+#* @param VVAR Local Char, Variable code
+#* @param VAVAR Local Char, Admin cost code
+#* @param VBVAR Local Char, Balance code
+#* @return WRET Local char
+#*!
+Funprog GET_VARIABLES(ADITABLE, VAETYPCOD, VHEAD, VNET, VAVAR, VBVAR)
+Value Integer ADITABLE
+Value Char VAETYPCOD
+Variable Char VHEAD, VNET, VAVAR, VBVAR
+
+  Local Integer WRET: WRET = 2
+
+  Local File ATABDIV [ADI]
+  Filter [F:ADI]  Where NUMTAB = ADITABLE and CODE = VAETYPCOD
+  Read [ADI] First
+  If !fstat
+    VHEAD   = [F:ADI]A1
+    VNET    = [F:ADI]A2
+    VAVAR   = [F:ADI]A3
+    VBVAR   = [F:ADI]A4
+  Else
+    WRET = 1
+  Endif
+
+End WRET
+
+
+#**
+#* Attachable earnings calculation
+#* This function will take suspensions into account and return due amounts
+#*
+#* @param VBUL Value Char, Payslip ID
+#* @param VSTRDAT Value Date, Period start date
+#* @param VENDDAT Value Date, Period end date
+#*
+#* @param VBALPAY Variable Decimal, AE starting balance, returns current balance
+#* @param VINSPAY Decimal, Installment, returns installment due
+#* @param VADMCOSTPAY Decimal, Admin cost, returns admin cost due
+#*
+#* @param VREFNUM Value Char, Employee ID
+#* @param VCTRNUM Value Char, Contract ID
+#* @param VCTRDAT Value Date, Contract start date
+#*
+#* @param VPERCOUNT Integer, Period number
+#*
+#* @param BALFLG Integer, Balance flag: 2 = The AE has a running balance
+#*
+#* @param VHEACOD Char, Heading code
+#* @param VAEHCOD Char, AE Header code
+#*
+#* @return WRET Local Integer
+#*!
+Funprog CALC_AE_PERIOD(VBUL, VSTRDAT, VENDDAT,
+&               VBALPAY, VINSPAY, VADMCOSTPAY,
+&               VREFNUM, VCTRNUM, VCTRDAT, VPERCOUNT, BALFLG,
+&               VHEACOD, VAEHCOD)
+
+Value Char VBUL
+Value Date VSTRDAT, VENDDAT
+Variable Decimal VBALPAY, VINSPAY, VADMCOSTPAY
+Value Char VREFNUM, VCTRNUM
+Value Date VCTRDAT
+Value Integer VPERCOUNT, BALFLG
+Value Char VHEACOD, VAEHCOD
+
+Local Integer PINSFLGRET, PADMFLGRET, PWRITEFLGRET, WRET
+
+WRET = 2
+
+#Get the suspension settings for the period
+PWRITEFLGRET = func HRATTEAR_FUNC.GET_SUSPENSION(VSTRDAT, VENDDAT, VAEHCOD, PINSFLGRET, PADMFLGRET)
+
+# Apply suspension on admin cost - write-off when suspended
+If PADMFLGRET = 2
+  VADMCOSTPAY = 0
+Endif
+
+# Apply suspension on installment
+If PINSFLGRET = 2
+  # If write-off, reduce balance
+  If PWRITEFLGRET = 2 & BALFLG = 2
+    VBALPAY -= VINSPAY
+    If VBALPAY < 0: VBALPAY = 0: Endif
+  Endif
+  VINSPAY = 0
+  End WRET # Done if installment suspended
+Endif
+
+# Handle balance for installment
+If BALFLG = 2
+  # If balance already less than installment
+  If VBALPAY < VINSPAY
+    VINSPAY = VBALPAY
+  Endif
+
+  # Reduce balance
+  VBALPAY -= VINSPAY
+Endif
+
+End WRET
+
+
+#**
+#* Get suspension settings for the period
+#* @param VSTRDAT Local Date, Period start date
+#* @param VENDDAT Local Date, Period end date
+#* @param VEAHCOD Local Char, Unique AE header code for the employee link
+#* @param VINSFLG Local Integer, returns the suspension status of the installment amount for the period
+#* @param VADMFLG Local Integer, returns the suspension status of the administration amount for the period
+#* @return WRET Local Integer,returns the suspension status of the write-off for the period
+#*!
+Funprog GET_SUSPENSION(VSTRDAT, VENDDAT, VAEHCOD, VINSFLG, VADMFLG)
+Variable Integer VINSFLG, VADMFLG
+Value Date VSTRDAT, VENDDAT
+Value Char VAEHCOD
+
+  Local Integer WRET, VWRITEFLG
+  Local File HRAESUSPEND [HRAES]
+
+  VINSFLG = 1: VADMFLG = 1: VWRITEFLG = 1
+
+  # Select suspensions where start and end date overlap with payslip or open ended end date
+  Filter [F:HRAES] Where AEHCOD = VAEHCOD & STADAT <= VENDDAT & (ENDDAT = [0/0/0] | ENDDAT >= VSTRDAT)
+  For [HRAES]HRAES0
+    #Check which setting(s) and apply to the variables
+    If VINSFLG <> 2     : VINSFLG     = [F:HRAES]INSTALLMENT      : Endif
+    If VADMFLG <> 2     : VADMFLG     = [F:HRAES]ADMCOST          : Endif
+    If VWRITEFLG <> 2   : VWRITEFLG   = [F:HRAES]WRTOFF           : Endif
+    WRET = VWRITEFLG
+  Next
+
+End WRET
+

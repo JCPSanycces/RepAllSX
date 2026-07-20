@@ -1,0 +1,320 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+#########################################################################
+#                                                                       #
+#      TRAITEMENTS LIES au CREDIT CLIENT dans les VENTES                #
+#                                                                       #
+#########################################################################
+#                                                                       #
+# Subprog ALIOST(BPCINV, CURORD, DATORD, CHGTYP, OST, OSTAUZ)           #
+#      Alimentation de l'en-cours autorisé et de l'en-cours calculé     #
+#       dans la devise du document                                      #
+#                                                                       #
+# Subprog CALACO (NUMCDE,DAT,ACOMPTE)                                   #
+#      Calcul du montant non versé d'acompte sur une commande           #
+#                                                                       #
+# Subprog SDCDTSTA(NUMPIE, CLI, CHGTYP, DAT, MAJ,CDTSTA,OST,OSTAUZ)     #
+#      Calcul de l'état crédit                                          #
+#   ACTION : SDCDTSTA                                                   #
+#                                                                       #
+#########################################################################
+
+#------------------------------------------------------------------#
+# Alimentation de l'en-cours autorisé et de l'en-cours calculé     #
+# dans la devise du document                                       #
+# Appelé depuis la gestion des factures (SUBSIHA)                  #
+#------------------------------------------------------------------#
+# Entrée   CLIENT  : Client                                        #
+#          CURORD  : Devise du document                            #
+#          WCHGTYP : Type de cours                                 #
+#          WCHGRAT : Cours de la devise ou 0                       #
+#          DATORD  : Date du document                              #
+# Sortie   OST     : En-cours calculé                              #
+#          OSTAUZ  : En-cours autorisé                             #
+#------------------------------------------------------------------#
+Subprog ALIOST(CLIENT, CURORD, DATORD, WCHGTYP, WCHGRAT, OST, OSTAUZ)
+Value    Char    CLIENT
+Value    Char    CURORD
+Value    Date    DATORD
+Value    Libelle WCHGTYP
+Value    Decimal WCHGRAT
+Variable Decimal OST
+Variable Decimal OSTAUZ
+
+Local    Char    WBPCRSK(GLONBPC), WOSTCUR(GLONCUR), WPARAM(10)
+Local    Decimal MONTANT, ENCOURS, WCOURS
+Local    Integer SPSTAT
+Local    Date    WOSTDAT
+Local    Libelle WOSTCHGTYP
+
+# On recherche d'abord le tiers risque lié au client
+If [F:BPC]BPCNUM<>CLIENT
+    Read [BPC]BPC0 = CLIENT : If fstat Raz [F:BPC] Endif
+Endif
+If [F:BPC]BPCRSK="" End Endif
+# On lit le tiers risque
+If [F:BPC]BPCRSK<>CLIENT
+    Read [BPC]BPC0 = [F:BPC]BPCRSK : If fstat Raz [F:BPC] Endif
+Endif
+
+# Test si l'en-cours doit être contrôlé
+If [F:BPC]OSTCTL <> 1 OSTAUZ = 9999999999.99 : End : Endif
+
+# 99481 : Ctrl en-cours client : Pb conversion devise
+# (Paramètre au niveau société, il devrait être au niveau dossier (dde de modif créée))
+Call PARAML(GSOCIETE,"OSTCTL",WPARAM) From ADOVAL     : # Niveau ctrl en-cours client
+GOSTCTL= val(WPARAM)
+# 99481
+
+If GOSTCTL=1
+    WOSTCUR=GCURSHR    : # Ctrl niveau dossier : Devise : Devise dossier
+Else
+    WOSTCUR=GLOCALDEV  : # Ctrl niveau société : Devise : Devise société
+Endif
+If GOSTCHGTYP=2
+    # Si Origine cours pour contrôle en-cours = actualisé
+    WOSTDAT=datesyst                                        : # Date          : date du jour
+    Call PARAML(GSOCIETE,"OSTTYPCUR",WPARAM) From ADOVAL     : # Type de cours : Type de cours ctrl au cours actualisé      # FGR 28/07/2015 : X3SUIVI108078 : Plus Call PARAM (performances)
+    WOSTCHGTYP= val(WPARAM)
+Else
+    # Si Origine cours pour contrôle en-cours = historique
+    WOSTDAT=DATORD                                          : # Date          : date du document
+    WOSTCHGTYP=WCHGTYP                                      : # Type de cours : Type de cours du document
+Endif
+
+# Calcul de l'en-cours en devise dossier (GOSTCTL=1) ou société (GOSTCTL=2)
+Call CALENC([F:BPC]BPCRSK, WOSTDAT, ENCOURS) From TRTBPMVT
+
+# Conversion de l'en-cours autorisé devise dossier vers devise document
+# 99481 : Ctrl en-cours client : Pb conversion devise
+# L'en-cours autorisé est tjs dans la devise dossier
+#If WOSTCUR <> CURORD
+If GCURSHR <> CURORD
+   #Call COURMNT(WOSTCUR, CURORD, GLOCALDEV, WOSTCHGTYP, WOSTDAT, 1,[F:BPC]OSTAUZ, MONTANT, 0, SPSTAT) From TRTDEV
+   Call COURMNT(GCURSHR, CURORD, GLOCALDEV, WOSTCHGTYP, WOSTDAT, 1,[F:BPC]OSTAUZ, MONTANT, 0, SPSTAT) From TRTDEV
+# 99481
+   OSTAUZ  = MONTANT
+Else
+   OSTAUZ  = [F:BPC]OSTAUZ
+Endif
+
+# Conversion de l'en-cours devise dossier ou société vers devise document
+If WOSTCUR <> CURORD
+   # Si l'en-cours est en devise société il faut convertir avec le cours du document
+   If GOSTCTL=1 WCOURS=0 Else WCOURS=WCHGRAT Endif
+   Call COURMNT(WOSTCUR, CURORD, GLOCALDEV, WOSTCHGTYP, WOSTDAT, 1,ENCOURS, MONTANT, WCOURS, SPSTAT) From TRTDEV
+   OST     = MONTANT
+Else
+   OST     = ENCOURS
+Endif
+
+End
+
+#--------------------------------------
+# Calcul du montant d'acompte non versé
+#--------------------------------------
+# Entrée  NUMCDE   : Numéro commande
+#         DAT      : Date
+# Sortie  ACOMPTE  : Acompte non versé
+#---
+Subprog CALACO (NUMCDE,DAT,ACOMPTE)
+Value    Char    NUMCDE
+Value    Date    DAT
+Variable Decimal ACOMPTE
+
+If clalev([F:DUD])=0
+   Local File GACCDUDATE [DUD]
+Endif
+
+ACOMPTE = 0
+For [DUD]DUD0 Where TYP="*SO" & NUM=NUMCDE
+   If [F:DUD]SENINS = 2
+      If DAT >= [F:DUD]DUDDAT
+         ACOMPTE += [F:DUD]AMTCUR - [F:DUD]PAYCUR
+      Endif
+   Endif
+Next
+End
+
+#---------------------------------------------------------------#
+# Action D_CDTSTA : Calcul de l'état crédit                     #
+#---------------------------------------------------------------#
+# Entrée  NUMPIE   : Numero de pièce (Ex: n.cde)                #
+#         CLI      : Client                                     #
+#         CHGTYP   : Type de cours                              #
+#         WCHGRAT  : Cours de la devise ou 0                    #
+#         CUR      : Devise du document                         #
+#         DAT      : Date de référence                          #
+#         UNL      : Code déblocage                             #
+#         MAJ      : Flag de maj état crédit sur la cde         #
+# Sortie  CDTSTA   : Etat crédit calculé                        #
+#         OST      : En-cours calculé                           #
+#         OSTAUZ   : En-cours autorisé                          #
+#---------------------------------------------------------------#
+# NUMPIE <> "" --> contrôle versement acomptes                  #
+# CUR    <> "" --> alimentation param OST et OSTAUZ             #
+# MAJ    =  1  --> Calcul état crédit sans maj entête commande  #
+#           2  --> Calcul état crédit avec maj entête commande  #
+#---------------------------------------------------------------#
+Subprog SDCDTSTA(NUMPIE, CLI, CHGTYP, WCHGRAT, CUR, DAT, UNL, MAJ, CDTSTA, OST, OSTAUZ)
+Value    Char     NUMPIE
+Value    Char     CLI
+Value    Libelle  CHGTYP
+Value    Decimal  WCHGRAT
+Value    Char     CUR
+Value    Date     DAT
+Value    Libelle  UNL
+Value    Shortint MAJ
+Variable Integer  CDTSTA
+Variable Decimal  OST
+Variable Decimal  OSTAUZ
+
+Local    Date     WOSTDAT
+Local    Libelle  WOSTCHGTYP
+Local    Decimal  ENCOURS, ENCOURSSHR, MONT, WCOURS
+Local    Integer  ORICDTSTA, SPSTAT
+Local    Char     WOSTCUR, WORICLI
+Local    Integer  WTRBEGIN
+Local    Char     WPARAM(10)
+
+
+#-- X3Suivi 79222 : Encours max défini par client/société (Appel du point d'entrée) ------#
+Local    Decimal  WOSTAUZ
+
+GPOINT="CALCREDIT0" : Gosub ENTREE From EXEFNC
+
+ORICDTSTA = CDTSTA
+
+If clalev([F:BPC]) = 0 Local File BPCUSTOMER [BPC] : Else WORICLI=[F:BPC]BPCNUM Endif
+# On recherche d'abord le tiers risque lié au client
+If [F:BPC]BPCNUM<>CLI
+    Read [BPC]BPC0 = CLI : If fstat Raz [F:BPC] Endif
+Endif
+If [F:BPC]BPCRSK="" End Endif
+# On lit le tiers risque
+If [F:BPC]BPCRSK<>CLI
+    Read [BPC]BPC0 = [F:BPC]BPCRSK : If fstat Raz [F:BPC] Endif
+Endif
+
+# 99481 : Ctrl en-cours client : Pb conversion devise
+# (Paramètre au niveau société, il devrait être au niveau dossier (dde de modif créée))
+Call PARAML(GSOCIETE,"OSTCTL",WPARAM) From ADOVAL     : # Niveau ctrl en-cours client
+GOSTCTL= val(WPARAM)
+# 99481
+
+If GOSTCTL=1
+    WOSTCUR=GCURSHR    : # Ctrl niveau dossier : Devise : Devise dossier
+Else
+    WOSTCUR=GLOCALDEV  : # Ctrl niveau société : Devise : Devise société
+Endif
+If GOSTCHGTYP=2
+    # Si Origine cours pour contrôle en-cours = actualisé
+    WOSTDAT=datesyst                                        : # Date          : date du jour
+    Call PARAML(GSOCIETE,"OSTTYPCUR",WPARAM) From ADOVAL     : # Type de cours : Type de cours ctrl au cours actualisé      # FGR 28/07/2015 : X3SUIVI108078 : Plus Call PARAM (performances)
+    WOSTCHGTYP= val(WPARAM)
+Else
+    # Si Origine cours pour contrôle en-cours = historique
+    WOSTDAT=DAT                                             : # Date          : date du document
+    WOSTCHGTYP=CHGTYP                                       : # Type de cours : Type de cours du document
+Endif
+
+# Calcul de l'état crédit de la commande
+CDTSTA = 1
+
+# --> Bloqué : On bloque la commande sf si déblocage autorisé
+If [F:BPC]OSTCTL = 3 & UNL <> 2 CDTSTA = 2 : Endif
+
+#-- X3Suivi 79222 : Encours max défini par client/société (Appel du point d'entrée) ------#
+If [F:BPC]OSTCTL=1 :  WOSTAUZ=[F:BPC]OSTAUZ : Endif
+
+# --> Contrôlé : On contrôle l'en-cours sf si déblocage autorisé
+If [F:BPC]OSTCTL = 1 & UNL <> 2
+   # Calcul de l'en-cours en devise dossier (GOSTCTL=1) ou société (GOSTCTL=2)
+#   Call CALENC([F:BPC]BPCRSK, DAT, ENCOURS) From TRTBPMVT
+   Call CALENC([F:BPC]BPCRSK, WOSTDAT, ENCOURS) From TRTBPMVT
+   # Conversion de l'en-cours en devise dossier car l'en-cours autorisé est tjs stocké en devise dossier
+   If WOSTCUR<>GCURSHR
+       Call CONVERT(WOSTCUR, GCURSHR, GLOCALDEV, WOSTCHGTYP, WOSTDAT, ENCOURS, ENCOURSSHR, SPSTAT) From TRTDEV
+   Else
+       ENCOURSSHR = ENCOURS
+   Endif
+
+   #-- X3Suivi 79222 : Encours max défini par client/société (Appel du point d'entrée) ------#
+   GPOINT="CALCREDIT1" : Gosub ENTREE From EXEFNC
+
+   #-- Controle en-cours autorisé en devise dossier --#
+   If ENCOURSSHR > WOSTAUZ  : CDTSTA = 3 : Endif
+Endif
+# --> On vérifie si les acomptes ont bien été versés
+If NUMPIE<>"" & UNL<>2
+
+   # 87499 : Vérification avec date du jour et non date de la cde
+   #Call CALACO(NUMPIE, DAT, MONT)
+   Call CALACO(NUMPIE, date$, MONT)
+   # 87499
+#   If GLOKORD=2 | CDTSTA=1     # Si pas blocage (en cas d'acompte non versé) ou contrôle ok
+   If MONT<>0 CDTSTA = 4 Endif  # 90181 - Prepayment always overrides
+Endif
+
+# 78411 Sage Exchange
+If func AFNC.ACTIV("SEPP")
+  Gosub CDTSTA From SEPPCDT                                                         : #--- 5 = Sage Exchange ---#
+Endif
+
+GPOINT="CALCREDIT" : Gosub ENTREE From EXEFNC
+
+#--> maj état crédit dans la commande
+If   MAJ=2 & CDTSTA <> ORICDTSTA
+     Local File SORDER [SOH2]
+     If adxlog<>1
+         Trbegin [SOH2]
+         WTRBEGIN=1
+     Endif
+     Readlock [F:SOH2]SOH0 = NUMPIE
+     If fstat = 0
+        [F:SOH2]CDTSTA = CDTSTA
+        Rewrite [SOH2]
+     Endif
+     If WTRBEGIN=1
+         Commit
+     Endif
+Endif
+
+# Conversion de l'en-cours autorisé devise dossier vers devise commande
+# Conversion de l'en-cours          devise dossier ou societé vers devise commande
+# attention !! maj montant si devise renseignée dans param entrée
+If CUR <> ""
+# Si en-cours non contrôlé : Initialisation au maximum
+   If [F:BPC]OSTCTL <> 1
+       OSTAUZ = 9999999999.99
+   Else
+       # Conversion de l'en-cours autorisé devise dossier vers devise document
+       If GCURSHR <> CUR
+          #-- X3Suivi 79222 : Encours max défini par client/société (Appel du point d'entrée) ------#
+          Call COURMNT(GCURSHR, CUR, GLOCALDEV, WOSTCHGTYP, WOSTDAT, 1,WOSTAUZ, MONT, 0, SPSTAT) From TRTDEV
+          OSTAUZ  = MONT
+       Else
+          #-- X3Suivi 79222 : Encours max défini par client/société (Appel du point d'entrée) ------#
+          OSTAUZ = WOSTAUZ
+       Endif
+
+       # Conversion de l'en-cours          devise dossier ou societé vers devise document
+       If CUR <> WOSTCUR & CUR <> GCURSHR
+          # Si l'en-cours est en devise société il faut convertir avec le cours du document
+          If GOSTCTL=1 WCOURS=0 Else WCOURS=WCHGRAT Endif
+          Call COURMNT(WOSTCUR, CUR, GLOCALDEV, WOSTCHGTYP, WOSTDAT, 1, ENCOURS, MONT, WCOURS, SPSTAT) From TRTDEV
+          OST     = MONT
+       Elsif CUR = GCURSHR
+          OST    = ENCOURSSHR
+       Else
+          OST    = ENCOURS
+       Endif
+   Endif
+Endif
+
+# On repositionne si nécessaire sur le client d'origine
+If WORICLI<>"" & [F:BPC]BPCNUM<>WORICLI
+    Read [BPC]BPC0=WORICLI : If fstat Raz [F:BPC] Endif
+Endif
+
+End
+

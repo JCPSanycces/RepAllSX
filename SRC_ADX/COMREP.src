@@ -1,0 +1,252 @@
+#<AdxTL>@(#)12.0.0.0 $Revision$
+
+Local Char PARAM(10)(1..2) , VALEUR(10)
+Call TRAITE_CHAR(VALEUR,PARAM,"","COMREP","DCOMREP",3,"") From GTRAITE
+End
+
+$ACTION
+Case ACTION
+ When "CONTROLE" : Gosub CONTROLE
+ When "EXEC"     : Gosub EXEC
+Endcase
+Return
+
+$CONTROLE
+TMP = 1
+Return
+
+$EXEC
+Call MAJCOM([M:DIA]TOUSOC,[M:DIA]SOC,[M:DIA]DATDEB,[M:DIA]DATFIN)
+Return
+
+Subprog MAJCOM(TOUSOC,SOC,DATDEB,DATFIN)
+Value Integer TOUSOC
+Value Char    SOC
+Value Date    DATDEB
+Value Date    DATFIN
+
+If clalev([F:SIH])=0 : Local File SINVOICE   [SIH] : Endif   # En tête Factures (Tronc commun => vente/tiers)
+If clalev([F:SID])=0 : Local File SINVOICED  [SID] : Endif   # Détail facture de vente uniquement
+If clalev([F:DUD])=0 : Local File GACCDUDATE [DUD] : Endif   # Echéances (TC)
+If clalev([F:COM])=0 : Local File COMREP     [COM] : Endif   # Commissions représentants (KIT - Tronc commun)
+If clalev([F:CPY])=0 : Local File COMPANY    [CPY] : Endif   # Société (Supervieur)
+If clalev([F:CUR])=0 : Local File TABCUR     [TCU] : Endif   # Devise (Supervieur)
+If clalev([F:RTZ])=0 : Local File RITENZIONE [RTZ] : Endif   # Code Retenue (TC)
+If clalev([F:RTH])=0 : Local File RITHIS     [RTH] : Endif   # Historique retenues réglées (KIT - Tronc commun)
+
+If filinfo(filpath("FIL","PAYMENTH","fde",nomap),0)>0
+ If clalev([F:PYH])=0 : Local File PAYMENTH   [PYH] : Endif   # Règlement (Tiers)
+Endif
+
+Local Char    FILFAC(250) , FILRIT(250)
+Local Integer ANNEE , MOIS , PREM
+Local Char    DEVISE(GLONCUR) , SOCIETE(GLONCPY)
+Local Decimal ARODEV , SENS
+Local Decimal TTCCUR , TTCLOC , PAYCUR , PAYLOC
+Local Decimal BASECUR , MONTCUR , BASELOC , MONTLOC
+Local Char    REP(20)
+
+# Effacement préalable
+
+Call DEBTRANS From GLOCK
+Gosub TR2
+
+# Factures validées du module vente, pas de proforma
+FILFAC = "STA=3 & ORIMOD=5 & INVTYP<5"
+If DATDEB<>[0/0/0]
+ FILFAC -= "& ACCDAT>=["+format$(GFMD,DATDEB)+"]"
+Endif
+If DATFIN<>[0/0/0]
+ FILFAC -= "& ACCDAT<=["+format$(GFMD,DATFIN)+"]"
+Endif
+If TOUSOC<>2
+ FILFAC -= '& CPY="'+SOC+'"'
+Endif
+
+# Une clé sur ACCDAT améliorera les performances
+Filter [SIH] Where evalue(FILFAC) Order By Key CLE = ACCDAT;CPY;NUM
+
+For [SIH]CLE
+ ANNEE   = year([F:SIH]ACCDAT)
+ MOIS    = month([F:SIH]ACCDAT)
+ DEVISE  = [F:SIH]CUR
+ SOCIETE = [F:SIH]CPY
+ Call LECTURE("CPY",SOCIETE,"") From CONTOBJ
+ Call LECTURE("TCU",DEVISE,"")  From CONTOBJ
+ ARODEV = [F:TCU]CURRND
+ Case [F:SIH]INVTYP
+  When 1,3
+   SENS = +1
+  When 2,4
+   SENS = -1
+ Endcase
+
+# On calcule les montants ttc et payés en devise locale et en devise de facture
+ TTCLOC = 0
+ PAYLOC = 0
+ TTCCUR = 0
+ PAYCUR = 0
+ For [DUD]DUD1 Where ACCNUM=[F:SIH]ACCNUM
+  TTCLOC += [F:DUD]AMTLOC
+  PAYLOC += [F:DUD]PAYLOC : # + [F:DUD]TMPLOC si on doit prendre les règlts provisoires
+  TTCCUR += [F:DUD]AMTCUR
+  PAYCUR += [F:DUD]PAYCUR : # + [F:DUD]TMPLOC si on doit prendre les règlts provisoires
+ Next
+
+# On parcourt les lignes de factures
+
+ PREM = 1
+ For [SID]SID0 Where NUM=[F:SIH]NUM
+
+  If TTCCUR<>0 & TTCLOC<>0
+   REP     = [F:SID]REP1
+   BASECUR = [F:SID]REPBAS1
+   MONTCUR = [F:SID]REPAMT1
+   Gosub CALREP
+   PREM = 0
+   REP     = [F:SID]REP2
+   BASECUR = [F:SID]REPBAS2
+   MONTCUR = [F:SID]REPAMT2
+   Gosub CALREP
+  Endif
+
+ Next
+
+Next
+
+# Traitement du fichier historique RITENZIONE (à valider...)
+If clalev([F:PYH]) = 0 : End : Endif 
+Link [RTH] With [PYH]PYH0=[F:RTH]PAYNUM As [LNK]
+FILRIT = '[F:PYH]BPR<>""'
+If DATDEB<>[0/0/0]
+ FILRIT -= "& [F:PYH]ACCDAT>=["+format$(GFMD,DATDEB)+"]"
+Endif
+If DATFIN<>[0/0/0]
+ FILRIT -= "& [F:PYH]ACCDAT<=["+format$(GFMD,DATFIN)+"]"
+Endif
+If TOUSOC<>2
+ FILRIT -= '& [F:PYH]CPY="'+SOC+'"'
+Endif
+
+For [LNK] Where evalue(FILRIT)
+ Read [RTZ]RTZ0 = [F:RTH]RITCOD
+ If [F:RTZ]CAT>=2 & [F:RTZ]CAT<=4
+  ANNEE   = year([F:PYH]ACCDAT)
+  MOIS    = month([F:PYH]ACCDAT)
+  REP     = [F:PYH]BPR
+  SOCIETE = [F:PYH]CPY
+  Call DEBTRANS From GLOCK
+  Gosub TR3
+ Endif
+Next
+
+End
+
+$CALREP
+If REP="" or (BASECUR=0 and MONTCUR=0) : Return : Endif
+BASELOC = arr(BASECUR*TTCLOC/TTCCUR,ARODEV)
+MONTLOC = arr(MONTCUR*TTCLOC/TTCCUR,ARODEV)
+Call DEBTRANS From GLOCK
+Gosub TR1
+Return
+
+$TR1
+GOK = 1
+Trbegin [COM]
+ Readlock [COM]COM0 = REP;SOCIETE;ANNEE;MOIS
+ If fstat=1
+  GOK = -1 : GLOCK = "$COMREP"-REP-SOCIETE : Goto ROLL_TR1
+ Elsif fstat
+  Raz [F:COM]
+  [F:COM]REP = REP
+  [F:COM]CPY = SOCIETE
+  [F:COM]YEA = ANNEE
+  [F:COM]MON = MOIS
+  [F:COM]DAT = gdat$(1,MOIS,ANNEE)
+  [F:COM]CUR = DEVISE
+  Gosub MAJREP
+  Write [COM]
+ Else
+  Gosub MAJREP
+  Rewrite [COM]
+ Endif
+ If fstat
+  GOK = 0 : Call FSTA("COM") From GLOCK : Goto AB_TR1
+ Endif
+Commit
+Return
+
+$MAJREP
+[F:COM]BASCOM += SENS*BASELOC
+[F:COM]AMTCOM += SENS*MONTLOC
+If PREM
+ [F:COM]AMTINV += SENS*TTCLOC
+ [F:COM]AMTPAY += SENS*PAYLOC
+Endif
+Return
+
+$AB_TR1
+Rollback
+Return
+
+$ROLL_TR1
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR1 : Endif
+
+$TR2
+GOK = 1
+Trbegin [COM]
+ Delete [COM] Where DAT>=DATDEB & DAT<=DATFIN
+Commit
+Return
+
+$TR3
+GOK = 1
+Trbegin [COM]
+ Readlock [COM]COM0 = REP;SOCIETE;ANNEE;MOIS
+ If fstat=1
+  GOK = -1 : GLOCK = "$COMREP"-REP-SOCIETE : Goto ROLL_TR3
+ Elsif fstat
+  Raz [F:COM]
+  Gosub MAJRIT
+  Write [COM]
+ Else
+  Gosub MAJRIT
+  Rewrite [COM]
+ Endif
+ If fstat
+  GOK = 0 : Call FSTA("COM") From GLOCK : Goto AB_TR3
+ Endif
+Commit
+Return
+
+$MAJRIT 
+Case [F:RTZ]CAT
+ When 2 : [F:COM]INPS     += [F:RTH]AMT
+ When 3 : [F:COM]ENASARCO += [F:RTH]AMT
+ When 4 : [F:COM]FIRR     += [F:RTH]AMT
+Endcase
+Return
+
+$AB_TR3
+Rollback
+Return
+
+$ROLL_TR3
+Rollback
+Call ROLL From GLOCK
+If GROLL : Return : Else : Goto TR3 : Endif
+
+########################################################
+Subprog AS_SOC(VALEUR)
+Variable Char VALEUR()
+If [M]TOUSOC=2 : mkstat = 1 : End : Endif
+End
+
+
+
+
+
+
+

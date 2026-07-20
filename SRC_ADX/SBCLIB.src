@@ -1,0 +1,2392 @@
+#<AdxTL>@(#)10.0.0.0 $Revision$
+#-------------------------------------------------------------------------------------------
+# GA 30/08/2005 adaptations
+# 1) Pour appel en l'absence éventuelle du module GP (cas des Ordres sous-traitance)
+# 2) Traitement des encours SCX provenant des Ordres sous-traitance / Service
+# 3) Traitement des encours EOX provenant des Ordres sous-traitance / Article lancé
+#-------------------------------------------------------------------------------------------
+# Cas particulier pour les ordres de sous-traitance
+# 04/2006 si appel depuis les commandes d'achat avec un encours WIPSTA=2 Planifié (EOP ou SCP)
+#         l'EO change de statut WIPSTA=1 Ferme
+#-------------------------------------------------------------------------------------------
+# GA 15/09/2005 champs renommés dans le masque [M:SBCK] + idem dans les tables achats
+#    MFGNUM        => VCRNUMORI
+#    MFGITM        => ITMREFORI
+#    OPENUM        => VCRLINORI
+#    OPESPLNUM     => VCRSEQORI
+#-------------------------------------------------------------------------------------------
+# MAJ_SBC_OF : utilise les fonctions suivantes pour mettre à jour l'OF
+# -----------
+# CRE_SBC : en création    d'une ligne commande d'achat sur OF (consomme encours SCF)
+# SUP_SBC : en suppression d'une ligne commande d'achat sur OF (restaure encours SCF)
+# MOD_SBC : en maj         d'une ligne commande d'achat sur OF
+#        ou en réception   d'une ligne commande d'achat sur OF avec indicateur de solde
+# FAC_SBC : en création    d'une ligne facture  d'achat sur OF
+#-------------------------------------------------------------------------------------------
+# MAJ_SBC_SCO: mettre à jour l'ordre de sous-traitance => voir SCOSBCLIB
+# -----------
+#-------------------------------------------------------------------------------------------
+# Types d'accès [M:SBCK]MAJCOD
+# "G"    Recherche référence   de sous-traitance (OF ou EO)
+# "C"    Création commande     de sous-traitance
+# "M"    Modification commande de sous-traitance
+# "A"    Annulation commande   de sous-traitance
+# "F"    Facturation           de sous-traitance
+# "T"    Réception             de sous-traitance (avant: code "M" pour maj des OF)
+# "N"    Retour de réception   de sous-traitance (non traité dans les versions précédentes)
+#-------------------------------------------------------------------------------------------
+Local Mask SBCK [SBCK]        # pour passage paramètre
+Local Mask ORDK [ORDK]        # pour générer encours
+
+Global Char GOPS(GLONANM)
+
+If clalev ([F:TCA])<=0 : Local File TABCOUAFF [TCA] : Endif
+Local Integer WOK
+Call LECTCA(8,WOK) From SUBTCA
+If WOK=0 : Call ERREUR(mess(58,105,1)-mess(8,14,1)-":"-mess(250,199,1)) From GESECRAN : Return : Endif
+GOPS    = [F:TCA]CODNUM(4)   # compteur suggestion opérations
+
+[M:SBCK]MAJCOD = "G"
+[M:SBCK]WIPNUM = "1050000032968"
+Call MAJ_SBC
+#Infbox [M:SBCK]VCRNUMORI-[M:SBCK]ITMREFORI-num$([M:SBCK]VCRLINORI)-num$([M:SBCK]VCRSEQORI)
+End
+
+############################################################################################
+# Mise à jour de la production en commande de sous-traitance opérationnelle                #
+# Le masque [M:SBCK] doit être déclaré et chargé                                           #
+# [M:SBCK]MAJCOD = "C" si création commande sous-traitance                                 #
+#                  "M" si modification commande sous-traitance                             #
+#                  "A" si suppression commande sous-traitance                              #
+#                  "F" si facturation (mise à jour prix réel)                              #
+#                  "G" pour récupération référence OF ou SCO à partir des Achats           #
+#         ** V6 ** "T" Réception de sous-traitance (avant: code "M" pour maj des OF)       #
+#         ** V6 ** "N" Retour de réception (non traité dans les versions précédentes)      #
+############################################################################################
+#         WIPNUM = no encours (SC-F)                                                       #
+#         ITMREF = article (sous-traité ou service sous-traitance)                         #
+#         VCRNUM = no commande                                                             #
+#         VCRLIN = ligne commande                                                          #
+#         VCRSEQ = séquence commande                                                       #
+#         BPRNUM = tiers                                                                   #
+#         ORDQTY = quantité commandée US                                                   #
+#         ORDDAT = date de commande                                                        #
+#         RCPDAT = date réception prévue                                                   #
+#         EXTPRI = prix net                                                                #
+#         OFS    = délai                                                                   #
+#         CPLPRI = prix réel                                                               #
+#         CPLCRG = frais réel                                                              #
+#         INVQTY = quantité facture                                                        #
+#         RCPQTY = quantité réceptionnée/retournée US              ajout v150              #
+#         PTHNUM = no réception                                                            #
+#         PTDLIN = ligne réception                                                         #
+#         PNHNUM = no retour                                       ajout v150              #
+#         PNDLIN = ligne retour                                    ajout v150              #
+#         CLEFLG = solde                                                                   #
+#         VCRTYPORI = type ordre (10=OF ou 36=SCO)                                         #
+#         ITMREFORI = article sous-traité (lancé)                  avant: MFGITM           #
+#         VCRNUMORI = MFGNUM    (OF) ou SCONUM (SCO)               avant: MFGNUM           #
+#         VCRLINORI = OPENUM    (OF) ou SCILIN (SCO)               avant: OPENUM           #
+#         VCRSEQORI = OPESPLNUM (OF) ou SCSLIN (SCO)               avant: OPESPLNUM        #
+#         CODRET = 0 si ok                                                                 #
+#                = 1 si pb                                                                 #
+############################################################################################
+Subprog MAJ_SBC
+Local Integer WRET
+Local Integer WNOTFOUND
+Local Char    WPJT(GLONPJT)
+Local Integer WVCRTYP
+Local Char    WITMREF(GLONITM)
+#
+# ouverture tables si nécessaire
+If clalev([F:ITM]) = 0 : Local File ITMMASTER  [ITM] : Endif  # article
+If clalev([F:ORD]) = 0 : Local File ORDERS     [ORD] : Endif  # encours
+If clalev([F:MWI]) = 0 : Local File WIPCOST    [MWI] : Endif  # coût     # Issue 100967 GA 06/2014
+
+Raz [F:ORD] # Issue 87203 - 2013-01-16 by CCC
+Raz [F:MWI] # Issue 100967 GA 06/2014
+
+# un petit message pour patienter ...
+If [M:SBCK]MSGFLG = 2 : Call TEMPON(mess(49,190,1)) From GESECRAN : Endif
+#
+Raz mkstat
+Raz GMESSAGE
+GOK=1
+#
+WRET = 0
+WNOTFOUND = 0
+[M:SBCK]CODRET = 0
+
+# temporaire ???
+If [M:SBCK]WIPTYP=0 & [M:SBCK]WIPNUM<>""
+   [M:SBCK]WIPTYP=4 : # encours SCF par defaut
+Endif
+#
+
+#----------------------------------------------------------------------------
+# Relecture systématique de l'encours
+# - Besoin sous-traitance : SCx(4), EOx(13)
+# - Commande d'achat      : POx(2), TRx(7)
+#----------------------------------------------------------------------------
+If [M:SBCK]ITMREF<>"" & [M:SBCK]WIPNUM<>"" & find ([M:SBCK]WIPTYP,2,4,7,13)
+# lecture encours article SCx, EOx, POx, TRx
+  Read [ORD]ORD0=[M:SBCK]WIPTYP;[M:SBCK]WIPNUM;[M:SBCK]ITMREF
+  If fstat : Raz [ORD] : WNOTFOUND = 1 : Endif
+Else
+  WNOTFOUND = 1
+Endif
+If WNOTFOUND = 1
+# recherche encours article POF ou TRF d'après la réf commande
+  Filter [ORD] Where find(WIPTYP,2,7) & VCRTYP=14 & VCRNUM=[M:SBCK]VCRNUM
+&                    & VCRLIN=[M:SBCK]VCRLIN & VCRSEQ=[M:SBCK]VCRSEQ Order By Key ORD0
+  For [ORD]
+     # Issue 93515 GA 10/2013 ne pas changer d'article (si le BOMSEQ du Service = BOMSEQ d'une matière fournie par le sous-traitant)
+     # Issue 80335 GA 03/2012 ne pas changer d'OF !!!!!
+      If [F:ORD]VCRNUMORI = [M:SBCK]VCRNUMORI & [F:ORD]ITMREF = [M:SBCK]ITMREF
+        WNOTFOUND = 0
+        WVCRTYP = [F:ORD]VCRTYPORI   # Issue 84306 & 84500 GA 10/2012
+        Break
+      Endif
+  Next
+  Filter [ORD]
+Endif
+# FQ 56565 GA 07/2009 ajouté
+If WNOTFOUND = 1
+   If [M:SBCK]PTHNUM<>"" & [M:SBCK]PTDLIN<>0
+     # Facturation: si on n'a que la référence de réception, recherche de la ref commande
+       If clalev([F:PTDW]) = 0 : Local File PRECEIPTD     [PTDW] : Endif  # ligne de rcp
+       Read [PTDW]PTD0= [M:SBCK]PTHNUM;[M:SBCK]PTDLIN
+       If fstat Raz [F:PTDW] Endif
+
+       If [M:SBCK]VCRNUM=""  # Ref de la commande d'achat
+          [M:SBCK]VCRNUM = [F:PTDW]POHNUM
+          [M:SBCK]VCRLIN = [F:PTDW]POPLIN
+          [M:SBCK]VCRSEQ = [F:PTDW]POQSEQ
+       Endif
+       If find([F:PTDW]VCRTYPORI,10,36)
+          [M:SBCK]VCRTYPORI = [F:PTDW]VCRTYPORI
+          [M:SBCK]VCRNUMORI = [F:PTDW]VCRNUMORI
+          [M:SBCK]VCRLINORI = [F:PTDW]VCRLINORI
+          [M:SBCK]VCRSEQORI = [F:PTDW]VCRSEQORI
+       Endif
+   Elsif [M:SBCK]VCRNUM<>"" & [M:SBCK]VCRLIN<>0
+     # Facturation: si on n'a que la référence ref commande
+       If clalev([F:POQW]) = 0 : Local File PORDERQ     [POQW] : Endif  # ligne de cde
+       Read [POQW]POQ0= [M:SBCK]VCRNUM;[M:SBCK]VCRLIN
+       If fstat Raz [F:POQW] Endif
+       If find([F:POQW]VCRTYPORI,10,36)
+          [M:SBCK]VCRTYPORI = [F:POQW]VCRTYPORI
+          [M:SBCK]VCRNUMORI = [F:POQW]VCRNUMORI
+          [M:SBCK]VCRLINORI = [F:POQW]VCRLINORI
+          [M:SBCK]VCRSEQORI = [F:POQW]VCRSEQORI
+       Endif
+   Endif
+
+   For [ORD]ORD0 Where find(WIPTYP,2,7) & VCRTYP=14 & VCRNUM=[M:SBCK]VCRNUM
+&                        & VCRLIN=[M:SBCK]VCRLIN With Nohint
+     # Issue 93515 GA 10/2013 ne pas changer d'article (si le BOMSEQ du Service = BOMSEQ d'une matière fournie par le sous-traitant)
+     # Issue 80335 GA 03/2012 ne pas changer d'OF !!!!!
+       If [F:ORD]VCRNUMORI = [M:SBCK]VCRNUMORI & [F:ORD]ITMREF = [M:SBCK]ITMREF
+        WNOTFOUND = 0
+        WVCRTYP = [F:ORD]VCRTYPORI   # Issue 84306 & 84500 GA 10/2012
+        Break
+      Endif
+   Next
+Endif
+If WNOTFOUND = 1 & find([M:SBCK]VCRTYPORI,10,36)
+# Issue 86821 GA 12/2012 intersite/intersociété TRF/POF rattaché à la cde de vente
+#                        + VCRSEQ=[M:SBCK]VCRSEQORI & find(WIPTYP,4,5,13) sinon on trouve les MxF
+# recherche encours article EOx ou WOx ou SCx
+  For [ORD]ORD0 Where VCRTYP=[M:SBCK]VCRTYPORI & VCRNUM=[M:SBCK]VCRNUMORI
+&                   & VCRLIN=[M:SBCK]VCRLINORI & VCRSEQ=[M:SBCK]VCRSEQORI
+&                   & find(WIPTYP,4,5,13) With Nohint
+     # Issue 93515 GA 10/2013 ne pas changer d'article (si le BOMSEQ du Service = BOMSEQ d'une matière fournie par le sous-traitant)
+      If [F:ORD]VCRNUMORI = [M:SBCK]VCRNUMORI & [F:ORD]ITMREF = [M:SBCK]ITMREF
+      WNOTFOUND = 0
+      WVCRTYP = [M:SBCK]VCRTYPORI   # Issue 84306 & 84500 GA 10/2012
+      Break
+      Endif
+  Next
+Endif
+# Issue 81525 GA 05/2012 If [F:ORD]WIPTYP=13
+If find([F:ORD]WIPTYP,13,4)
+ # cas particulier: encours EOx ou SCx, le VCRTYPORI peut pointer sur une SOx
+   If [M:SBCK]VCRNUMORI=""                # FQ 54159 supp # FQ 66860 GA 01/2011 ne pas écraser si données renseignées
+      [M:SBCK]VCRTYPORI = [F:ORD]VCRTYP   # Modif MBT du 01/02/2006
+      [M:SBCK]VCRNUMORI = [F:ORD]VCRNUM
+      [M:SBCK]VCRLINORI = [F:ORD]VCRLIN
+      [M:SBCK]VCRSEQORI = [F:ORD]VCRSEQ
+   Endif
+Elsif [F:ORD]VCRTYPORI<> 0
+   If [M:SBCK]VCRNUMORI=""                # FQ 54159 supp # FQ 66860 GA 01/2011 ne pas écraser si données renseignées
+      [M:SBCK]VCRTYPORI = [F:ORD]VCRTYPORI
+      [M:SBCK]VCRNUMORI = [F:ORD]VCRNUMORI
+      [M:SBCK]VCRLINORI = [F:ORD]VCRLINORI
+      [M:SBCK]VCRSEQORI = [F:ORD]VCRSEQORI
+   Endif
+Endif
+If WVCRTYP=0 & find([M:SBCK]WIPTYP,13,4) WVCRTYP=[M:SBCK]VCRTYPORI Endif # Issue 88816 GA 04/2013
+If WVCRTYP=0 & find([M:SBCK]WIPTYP,13,4) WVCRTYP=[F:ORD]VCRTYP     Endif # Issue 81525 GA 05/2012
+If WVCRTYP=0 & WVCRTYP <>[M:SBCK]VCRTYPORI         # FQ 54444 code déplacé
+   WVCRTYP = [M:SBCK]VCRTYPORI
+Endif
+If WVCRTYP=0 & [M:SBCK]WIPTYP=13 WVCRTYP=36 Endif
+If WVCRTYP=0 & [M:SBCK]WIPTYP=4  WVCRTYP=10 Endif  # FQ 54444 avant WVCRTYP=4
+#
+# FQ 56565 GA 07/2009 facturation: pb on n'a retrouvé pas d'encours
+If WNOTFOUND = 1 & !find(WVCRTYP,10,36) # & [M:SBCK]MAJCOD<>"N"
+ # si aucun encours, pas de report de maj ???
+  WRET=0
+Else
+# 59054 mm 02.10
+# Vérif si OF bloqué logiquement avant de supprimer une commande de SST
+  If [F:POQ]VCRNUMORI<>""
+    #If [M:SBCK]VCRTYPORI=10 : # GH 28/02/2013 bug 88285
+    If [M:SBCK]VCRTYPORI=10 & !func GLOCK.LOKBYI("MFG"+[F:POQ]VCRNUMORI)
+      Lock="MFG"+[F:POQ]VCRNUMORI
+      If fstat
+        # Issue 98737 GA 04/2014 before WRET=1, but this error must be detected by SUBPOHA
+        Call MESSAGE("$MFGHEAD"-[F:POQ]VCRNUMORI-mess(10,100,1))From GESECRAN : WRET = 9 : Goto FIN
+      Endif
+      Unlock="MFG"+[F:POQ]VCRNUMORI
+    #Elsif [M:SBCK]VCRTYPORI=36 : # GH 28/02/2013 bug 88285
+    Elsif [M:SBCK]VCRTYPORI=36 & !func GLOCK.LOKBYI("SCO"+[F:POQ]VCRNUMORI)
+      Lock="SCO"+[F:POQ]VCRNUMORI
+      If fstat
+        # Issue 98737 GA 04/2014 before WRET=1, but this error must be detected by SUBPOHA
+        Call MESSAGE("$SCOHEAD"-[F:POQ]VCRNUMORI-mess(10,100,1))From GESECRAN : WRET = 9 : Goto FIN
+      Endif
+      Unlock="SCO"+[F:POQ]VCRNUMORI
+    Endif
+  Endif
+# selon provenance de l'encours SCF on utilise MAJ_SBC_OF ou MAJ_SBC_SCO
+# ----------------------------------------------------------------------
+  If    WVCRTYP = 10 : # encours SCF provenant d'un OF
+     Call MAJ_SBC_OF(WRET)  From SBCLIB
+  Elsif WVCRTYP = 36 : # encours SCF ou EOF provenant d'un SCO
+     If WNOTFOUND = 1 Raz [F:ORD] Endif # Issue 93515 GA 10/2013 no order if it doesn't match
+     Call MAJ_SBC_SCO(WRET) From SCOSBCLIB
+  Endif
+  If [M:SBCK]MAJCOD = "A" & WRET<>0
+  # ne pas planter en suppression si l'OF ou le SCO a déjà été suprimé
+     WRET=0
+  Endif
+Endif
+#
+$FIN
+If WRET > 0 & WRET < 5  # Issue 88018 GA 02/2013
+  If [M:SBCK]ITMREF<>"" & [M:SBCK]WIPNUM<>""
+     Call ECR_TRACE("MAJ_SBC: Pb "-num$(WRET)-" sur l'encours  ... WIP="-num$([M:SBCK]WIPNUM)
+&                     -" ITM="-[M:SBCK]ITMREF-" COD="-[M:SBCK]MAJCOD,-1 ) From GESECRAN
+  Else
+     Call ECR_TRACE("MAJ_SBC: pb "-num$(WRET)-" sur la commande  ... POH="-[M:SBCK]VCRNUM-"/"-num$([M:SBCK]VCRLIN)
+&                     -" ITM="-[M:SBCK]ITMREF-" COD="-[M:SBCK]MAJCOD,-1 ) From GESECRAN
+
+  Endif
+Endif
+[M:SBCK]CODRET = WRET
+If [M:SBCK]MSGFLG = 2 : Call TEMPOFF From GESECRAN : Endif
+End
+
+############################################################################################
+Subprog MAJ_SBC_OF (LRET)
+Variable Integer LRET
+Local Integer WOPE
+Local Integer WNBFR
+Local Integer WZERO
+Local Char    WPJT(GLONPJT)
+Local Integer WLASTOPE
+Local Integer WLASTOPESPL
+Local Integer WFIRSTSPL
+Local Integer WNEX
+Local Integer WSCDCOD
+Local Char    WMFGNUM(GLONVCR)
+Local Char    WITMREF(GLONITM)
+Local Integer WOPENUM
+Local Integer WOPESPLNUM
+Local Integer WCLEFLG
+Local Integer I
+#
+# GA 30/08/2005 Traitement màj des OF
+# ouverture masque si nécessaire
+If clalev([M:OPSK]) = 0: Local Mask OPSK [OPSK] : Endif     # pour générer encours opé
+If clalev([M:JALK]) = 0: Local Mask JALK [JALK] : Endif     # pour jalonnement
+# ouverture tables si nécessaire
+Gosub OPEN_FILES_MFG From MFGLIB
+#
+Case [M:SBCK]MAJCOD
+    When "C":  # lecture encours article
+               #GA déjà fait dans MAJ_SBC
+               #Read [ORD]ORD0=4;[M:SBCK]WIPNUM;[M:SBCK]ITMREF
+               #If fstat : LRET = 1 : Goto FIN_MAJ_SBC_OF : Endif
+
+               # Issue 85963 GA 12/2012 sauf si on est sur une POF/TRF, tester [F:ORD]WIPTYP
+               If [F:ORD]WIPTYP<>4 | [M:SBCK]VCRTYPORI=10
+                  For [MFO]MFO0 Where MFGNUM = [M:SBCK]VCRNUMORI & OPENUM = [M:SBCK]VCRLINORI
+                     WOPE = [F:MFO]OPENUM
+                  Next
+                  WMFGNUM = [F:MFO]MFGNUM
+                  WITMREF = [F:MFO]SCOITMREF
+                  WPJT    = [F:ORD]PJT
+               # FQ 53329 performances
+               #For [MFO]MFO0 Where WIPNUM = [M:SBCK]WIPNUM With Nohint        # 10.02 Performances
+               Elsif [F:ORD]VCRNUM<>""
+                  For [MFO]MFO0 Where MFGNUM = [F:ORD]VCRNUM & WIPNUM = [F:ORD]WIPNUM
+                     WOPE = [F:MFO]OPENUM
+                  Next
+                  WMFGNUM = [F:ORD]VCRNUM
+                  WITMREF = [F:ORD]ITMREF
+                  WPJT    = [F:ORD]PJT
+               Else
+                  For [MFO]MFO0 Where WIPNUM = [M:SBCK]WIPNUM With Nohint
+                     WOPE = [F:MFO]OPENUM
+                  Next
+                  WMFGNUM = [F:MFO]MFGNUM
+                  WITMREF = [F:MFO]SCOITMREF
+                  WPJT    = [F:ORD]PJT
+               Endif
+
+               Gosub ANA_NBFR
+
+              # filtre encours charge
+               Filter [OPS] Where MFGNUM = WMFGNUM & SCOITMREF = WITMREF &
+&                                 OPENUM = WOPE    & SCOFLG = 2
+&                           Order By Key OPS1
+               # calcul nombre fractions existantes
+               WZERO = 0
+               I = 0
+               For [OPS]
+                   If I = 0 : WFIRSTSPL = [F:OPS]OPESPLNUM : Endif
+                   WLASTOPE   = [F:OPS]OPENUM
+                   WLASTOPESPL= [F:OPS]OPESPLNUM
+                   If [F:OPS]OPESPLNUM = 0 : WZERO = 1 : Endif
+                   Read [SCH]SCH0=[F:OPS]MFGNUM;[F:OPS]OPENUM;[F:OPS]OPESPLNUM
+                   If fstat : LRET = 1 : Goto FIN_MAJ_SBC_OF: Endif
+                   If I = 0 : WSCDCOD    = [F:SCH]SCDCOD : Endif
+                   WNEX       = [F:SCH]NEXOPENUM
+                   I         += 1
+               Next
+               #
+               Filter [OPS]
+               #
+               If WZERO = 1
+                  Call CRE_SBC(WMFGNUM, WOPE, WPJT, WNBFR,
+&                              WLASTOPE, WLASTOPESPL, WFIRSTSPL, WNEX, WSCDCOD, LRET)
+
+               Endif
+    When "M","T":  # lecture encours charge (selon ref commande)
+               Read [OPS]OPS2=[M:SBCK]VCRNUM;[M:SBCK]VCRLIN;[M:SBCK]VCRSEQ
+               If fstat :            Goto FIN_MAJ_SBC_OF: Endif
+
+               WPJT       = [F:OPS]PJT
+               WMFGNUM    = [F:OPS]MFGNUM
+               WITMREF    = [F:OPS]SCOITMREF
+               WOPENUM    = [F:OPS]OPENUM
+               WOPESPLNUM = [F:OPS]OPESPLNUM
+
+               # filtre encours charge
+               Filter [OPS] Where MFGNUM = WMFGNUM & SCOITMREF = WITMREF &
+&                                 OPENUM = WOPENUM & SCOFLG = 2
+&                           Order By Key OPS1
+               # calcul nombre fractions existantes
+               LRET  = 1
+               WZERO = 0
+               I = 0
+               For [OPS]
+                   If I = 0 : WFIRSTSPL = [F:OPS]OPESPLNUM : Endif
+                   WLASTOPE   = [F:OPS]OPENUM
+                   WLASTOPESPL= [F:OPS]OPESPLNUM
+                   Read [SCH]SCH0=[F:OPS]MFGNUM;[F:OPS]OPENUM;[F:OPS]OPESPLNUM
+                   If fstat : LRET = 1 : Goto FIN_MAJ_SBC_OF: Endif
+                   If I = 0 : WSCDCOD    = [F:SCH]SCDCOD : Endif
+                   WNEX   = [F:SCH]NEXOPENUM
+                   I     += 1
+               Next
+               #
+               Filter [OPS]
+               #
+               Call MOD_SBC(WMFGNUM, WOPENUM, WOPESPLNUM, WPJT,
+&                           WLASTOPE, WLASTOPESPL, WFIRSTSPL, WNEX, WSCDCOD, WCLEFLG, LRET)
+    When "A":   # lecture encours charge (selon ref commande)
+               Read [OPS]OPS2=[M:SBCK]VCRNUM;[M:SBCK]VCRLIN;[M:SBCK]VCRSEQ
+               If fstat : Goto FIN_MAJ_SBC_OF: Endif
+
+               WPJT = [F:OPS]PJT
+               WMFGNUM = [F:OPS]MFGNUM
+               WITMREF = [F:OPS]SCOITMREF
+               WOPENUM = [F:OPS]OPENUM
+               WOPESPLNUM    = [F:OPS]OPESPLNUM
+
+               # filtre encours charge
+               Filter [OPS] Where MFGNUM = WMFGNUM & SCOITMREF = WITMREF &
+&                                 OPENUM = WOPENUM & SCOFLG = 2
+&                           Order By Key OPS1
+               # calcul nombre fractions existantes
+               LRET  = 1
+               WZERO = 0
+               I = 0
+               For [OPS]
+                   If I = 0 : WFIRSTSPL = [F:OPS]OPESPLNUM : Endif
+                   WLASTOPE   = [F:OPS]OPENUM
+                   WLASTOPESPL= [F:OPS]OPESPLNUM
+                   Read [SCH]SCH0=[F:OPS]MFGNUM;[F:OPS]OPENUM;[F:OPS]OPESPLNUM
+                   If fstat : LRET = 1 : Goto FIN_MAJ_SBC_OF: Endif
+                   If I = 0 : WSCDCOD    = [F:SCH]SCDCOD : Endif
+                   WNEX   = [F:SCH]NEXOPENUM
+                   I     += 1
+               Next
+               #
+               Filter [OPS]
+               #
+               Call SUP_SBC(WMFGNUM, WOPENUM, WOPESPLNUM, WPJT,
+&                           WLASTOPE, WLASTOPESPL, WFIRSTSPL, WNEX, WSCDCOD, LRET)
+    When "F":  Gosub ANA_NBFR
+               Call FAC_SBC(LRET)
+    When "G":  # lecture encours article        # FQ 55757 pb de lien en regroupement de SCF dans une commande
+               If [F:ORD]WIPNUM<>[M:SBCK]WIPNUM | [F:ORD]ITMREF<>[M:SBCK]ITMREF
+                  Read [ORD]ORD0=4;[M:SBCK]WIPNUM;[M:SBCK]ITMREF
+                  If fstat : WRET = 1 : Goto FIN : Endif
+               Endif
+
+               # lecture opération
+               # FQ 53329 performances
+               #For [MFO]MFO0 Where WIPNUM = [M:SBCK]WIPNUM With Nohint        # 10.02 Performances
+               If [F:ORD]VCRNUM<>""
+                  For [MFO]MFO0 Where MFGNUM = [F:ORD]VCRNUM & WIPNUM = [F:ORD]WIPNUM
+                     If fstat : LRET = 1 : Goto FIN_MAJ_SBC_OF: Endif
+                     Break
+                  Next
+               Else
+                  For [MFO]MFO0 Where WIPNUM = [M:SBCK]WIPNUM With Nohint
+                     If fstat : LRET = 1 : Goto FIN_MAJ_SBC_OF: Endif
+                     Break
+                  Next
+               Endif
+               [M:SBCK]VCRTYPORI = 10      : # GA 01/09/2005 identifier le fait qu'on soit sur un OF
+               [M:SBCK]VCRNUMORI = [F:MFO]MFGNUM
+               [M:SBCK]VCRLINORI = [F:MFO]OPENUM
+               [M:SBCK]VCRSEQORI = [F:MFO]OPESPLNUM
+               [M:SBCK]BPAADD    = [F:MFO]BPAADD    # FQ 73618 GA 05/2011 Adresse de rcp choisie
+
+               For [MFI]MFI0 Where MFGNUM = [F:MFO]MFGNUM
+                  If fstat : LRET = 1 : Goto FIN_MAJ_SBC_OF: Endif
+                  [M:SBCK]ITMREFORI = [F:MFI]ITMREF
+                  Break
+               Next
+    When "N":  Call RET_SBC(LRET)
+    When Default:
+Endcase
+$FIN_MAJ_SBC_OF
+End
+
+############################################################################################
+$ANA_NBFR
+# recherche n° opération
+WNBFR = 0
+Filter [MFO] Where MFGNUM=WMFGNUM & OPENUM=WOPE
+Read [MFO]MFO0 Last
+If !fstat :  WNBFR     = [F:MFO]OPESPLNUM + 1 : Endif
+Filter [MFO]
+Return
+
+############################################################################################
+Subprog CRE_SBC(LMFGNUM, LOPENUM, LPJT, LNBFR, LLASTOPE, LLASTOPESPL, LFIRSTSPL,
+&               LNEX, LSCDCOD, LRET)
+Value    Char      LMFGNUM
+Value    Integer   LOPENUM
+Value    Char      LPJT
+Value    Integer   LNBFR
+Value    Integer   LLASTOPE
+Value    Integer   LLASTOPESPL
+Value    Integer   LFIRSTSPL
+Value    Integer   LNEX
+Value    Integer   LSCDCOD
+Variable Integer   LRET
+Local    Decimal   WWRK, WDIFF
+Local    Integer   I
+Local    Date      TODAY
+Local    Integer   WNEWBPS : WNEWBPS = 0
+Local    Char      WMAT(250)
+TODAY=date$
+
+LRET = 0
+
+# lecture opération
+Read [MFO]MFO0=LMFGNUM;LOPENUM;0
+If fstat : LRET = 1 : End : Endif
+
+# test changement fournisseur
+If [F:MFO]BPRNUM <> [M:SBCK]BPSNUM | [F:MFO]BPAADD <> [M:SBCK]BPAADD : WNEWBPS = 1 : Endif
+
+# si opération déjà commandée, retour
+If [F:MFO]OPESTA > 3 : LRET = 1 : End : Endif
+
+If [F:MFO]OPESTRCOE=0 [F:MFO]OPESTRCOE=1 Endif
+
+# Issue 80045 qté US convert with [F:MFO]OPESTRCOE
+# si quantité commandée > quantité prévue
+If [M:SBCK]ORDQTY * [F:MFO]OPESTRCOE > [F:MFO]EXTSTRQTY
+      # lecture et mise à jour opération
+      Readlock [MFO] Curr
+      If fstat : LRET = 1 : End : Endif
+
+       # Issue 85878 - 2012-11-23 by CCC : Pour éviter d'avoir une qté nulle
+      If [F:MFO]OPESTRCOE=0 [F:MFO]OPESTRCOE=1 Endif
+
+     # mise à jours encours
+      Call UPDATE_OWX("SA", LPJT) From MFGLIBO
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # suppression fraction 0
+      Delete [MFO]
+      If fstat : LRET = 1 : End : Endif
+
+      # chargement enr°
+      Call FILL_BUF_MFO
+      [F:MFO]OPESPLNUM = LNBFR
+
+      # augmentation quantité opération en US
+      # Issue 85813 & 86889 GA 01/2013  ([M:SBCK]ORDQTY * [F:MFO]OPESTRCOE)
+      WWRK    = [M:SBCK]ORDQTY
+      WDIFF   = WWRK - [F:MFO]EXTQTY
+      Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+      Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+      [F:MFO]EXTQTY    = WWRK
+      Call QTEARR([F:MFO]EXTQTY,[F:MFO]OPEUOM) From TRTDIV
+
+      # mise à jour encours charge + SC-X
+      Call UPDATE_OWX("P", LPJT) From MFGLIBO
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # mise à jour opération
+      Call CRE_MFO(LMFGNUM, LRET)
+      If LRET = 1 : End : Endif
+
+      # Issue 104346 GA 02/2015 Missing deletion of CAL rows with OPESPLNUM=0 after copy by CRE_MFO
+      Delete [CAL] Where ABRFIC="MFO" & VCRTYP=0 & VCRNUM=[F:MFO]MFGNUM & VCRLIN=[F:MFO]OPENUM & VCRSEQ=0
+      If fstat=1
+        GLOCK="$CPTANALIN MFO 0"-[F:MFO]MFGNUM-num$([F:MFO]OPENUM)-"0"
+      Endif
+      If fstat=1 | fstat>5 : LRET=1 : End : Endif
+
+      # mise à jour scheduling
+      Readlock [SCH]SCH0=LMFGNUM;[F:MFO]OPENUM;0
+      If fstat : LRET = 1 : End : Endif
+
+      # suppression fraction 0
+      Delete [SCH]
+      If fstat : LRET = 1 : End : Endif
+
+      # préparation nouvelle fraction
+      [F:SCH]OPESPLNUM = LNBFR
+      If LLASTOPESPL <> 0
+          [F:SCH]NEXOPENUM = LNEX
+          [F:SCH]SCDCOD    = 8
+      Endif
+      [F:SCH]CREDAT=date$
+      [F:SCH]CREUSR=GUSER
+      If dim([F:SCH]CRETIM) > 0 : [F:SCH]CRETIM = time : Endif            # 01.05 27567
+      [F:SCH]EXPNUM=[C]EXPORT
+      # écriture nouvelle fraction
+      Write [SCH]
+      If fstat : LRET = 1 : Endif
+
+      # mise à jour avant dernière fraction
+      If LLASTOPESPL <> 0
+          I = 0
+          # lecture premier enr°
+          For [SCH]SCH0 Where MFGNUM=LMFGNUM & OPENUM=LOPENUM
+              If I = 0
+                  Readlock [SCH] Curr
+                  If fstat : LRET = 1 : Endif
+                  # mise à jour enr°
+                  [F:SCH]SCDCOD    = LSCDCOD
+                  [F:SCH]UPDDAT    = date$
+                  [F:SCH]UPDUSR    = GUSER
+                  If dim([F:SCH]UPDTIM) > 0 : [F:SCH]UPDTIM = time : Endif            # 01.05 27567
+                  [F:SCH]EXPNUM    = [C]EXPORT
+                  # réécriture
+                  Rewrite [SCH]
+                  If fstat : LRET = 1 : Endif
+              Endif
+              Break
+          Next
+      Endif
+
+      # mise à jour entête OF
+      Call MAJ_OF(LMFGNUM, LRET)
+
+      Goto FIN_CRE
+Endif
+
+# Issue 80045 qté US convert with [F:MFO]OPESTRCOE
+# si quantité commandée = quantité prévue, mise à jour fraction 0
+If [M:SBCK]ORDQTY * [F:MFO]OPESTRCOE = [F:MFO]EXTSTRQTY
+      # lecture et mise à jour opération
+      Readlock [MFO] Curr
+      If fstat : LRET = 1 : End : Endif
+
+      # mise à jours encours
+      Call UPDATE_OWX("SA", LPJT) From MFGLIBO
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # suppression fraction 0
+      Delete [MFO]
+      If fstat : LRET = 1 : End : Endif
+
+      # chargement enr°
+      Call FILL_BUF_MFO
+      [F:MFO]OPESPLNUM = LNBFR
+
+      # mise à jour encours charge + SC-X
+      Call UPDATE_OWX("P", LPJT) From MFGLIBO
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # mise à jour opération
+      Call CRE_MFO(LMFGNUM, LRET)
+      If LRET = 1 : End : Endif
+
+      # Issue 104346 GA 02/2015 Missing deletion of CAL rows with OPESPLNUM=0 after copy by CRE_MFO
+      Delete [CAL] Where ABRFIC="MFO" & VCRTYP=0 & VCRNUM=[F:MFO]MFGNUM & VCRLIN=[F:MFO]OPENUM & VCRSEQ=0
+      If fstat=1
+        GLOCK="$CPTANALIN MFO 0"-[F:MFO]MFGNUM-num$([F:MFO]OPENUM)-"0"
+      Endif
+      If fstat=1 | fstat>5 : LRET=1 : End : Endif
+
+      # mise à jour scheduling
+      Readlock [SCH]SCH0=LMFGNUM;[F:MFO]OPENUM;0
+      If fstat : LRET = 1 : End : Endif
+
+      # suppression fraction 0
+      Delete [SCH]
+      If fstat : LRET = 1 : End : Endif
+
+      # préparation nouvelle fraction
+      [F:SCH]OPESPLNUM = LNBFR
+      If LLASTOPESPL <> 0
+          [F:SCH]NEXOPENUM = LNEX
+          [F:SCH]SCDCOD    = 8
+      Endif
+      [F:SCH]CREDAT=date$
+      [F:SCH]CREUSR=GUSER
+      If dim([F:SCH]CRETIM) > 0 : [F:SCH]CRETIM = time : Endif            # 01.05 27567
+      [F:SCH]EXPNUM=[C]EXPORT
+      # écriture nouvelle fraction
+      Write [SCH]
+      If fstat : LRET = 1 : Endif
+
+      # mise à jour avant dernière fraction
+      If LLASTOPESPL <> 0
+          I = 0
+          # lecture premier enr°
+          For [SCH]SCH0 Where MFGNUM=LMFGNUM & OPENUM=LOPENUM
+              If I = 0
+                  Readlock [SCH] Curr
+                  If fstat : LRET = 1 : Endif
+                  # mise à jour enr°
+                  [F:SCH]SCDCOD    = LSCDCOD
+                  [F:SCH]UPDDAT    = date$
+                  [F:SCH]UPDUSR    = GUSER
+                  If dim([F:SCH]UPDTIM) > 0 : [F:SCH]UPDTIM = time : Endif            # 01.05 27567
+                  [F:SCH]EXPNUM    = [C]EXPORT
+                  # réécriture
+                  Rewrite [SCH]
+                  If fstat : LRET = 1 : Endif
+              Endif
+              Break
+          Next
+      Endif
+
+      # mise à jour entête OF
+      Call MAJ_OF(LMFGNUM, LRET)
+      Goto FIN_CRE
+Endif
+
+# Issue 80045 qté US convert with [F:MFO]OPESTRCOE
+# si quantité commandée < quantité prévue, splittage opération
+If [M:SBCK]ORDQTY * [F:MFO]OPESTRCOE < [F:MFO]EXTSTRQTY
+      # lecture opération
+      Readlock [MFO] Curr
+      If fstat : LRET = 1 : End : Endif
+
+      # recalcul opération avec quantité restante en US
+      # Issue 85813 & 86889 GA 01/2013  ([M:SBCK]ORDQTY * [F:MFO]OPESTRCOE)
+      WWRK             = [F:MFO]EXTQTY - [M:SBCK]ORDQTY
+      Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+      Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+      [F:MFO]EXTQTY = WWRK
+
+
+      # mise à jours encours
+      Call UPDATE_OWX("SM", LPJT) From MFGLIBO
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # mise à jour opération
+      Call MAJ_MFO(LMFGNUM, LRET)
+      If LRET = 1 : End : Endif
+
+      # mise à jour scheduling
+      Readlock [SCH]SCH0=LMFGNUM;[F:MFO]OPENUM;0
+      If fstat : LRET = 1 : End : Endif
+
+      #
+      [F:SCH]UPDDAT=date$
+      [F:SCH]UPDUSR=GUSER
+      If dim([F:SCH]UPDTIM) > 0 : [F:SCH]UPDTIM = time : Endif            # 01.05 27567
+      [F:SCH]EXPNUM=[C]EXPORT
+      [F:SCH]NEXOPENUM = LNEX
+      #
+      Rewrite [SCH]
+      If fstat : LRET = 1 : Endif
+
+      # calcul nouvelle opération
+      [F:MFO]WIPNUM = ""
+      [F:MFO]OPSNUM = ""
+      # Issue 85813 & 86889 GA 01/2013  ([M:SBCK]ORDQTY * [F:MFO]OPESTRCOE)
+      WWRK    = [M:SBCK]ORDQTY
+      Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+      Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+      [F:MFO]EXTQTY = WWRK
+
+      # mise à jour enr°
+      Call FILL_BUF_MFO
+      [F:MFO]OPESPLNUM = LNBFR
+
+      # création encours
+      Call UPDATE_OWX("P", LPJT) From MFGLIBO
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # mise à jour opération
+      Call CRE_MFO(LMFGNUM, LRET)
+      If LRET = 1 : End : Endif
+
+      # génération scheduling
+      [F:SCH]MFGNUM       = [F:MFO]MFGNUM
+      [F:SCH]PLNFCY       = [F:MFO]PLNFCY
+      [F:SCH]MFGFCY       = [F:MFO]MFGFCY
+      [F:SCH]OPENUM       = [F:MFO]OPENUM
+      [F:SCH]OPESPLNUM    = [F:MFO]OPESPLNUM
+      [F:SCH]NEXOPENUM    = LNEX
+      [F:SCH]SCDCOD       = 8 # synchro sous-traitance
+
+      #
+      [F:SCH]CREDAT=date$
+      [F:SCH]CREUSR=GUSER
+      If dim([F:SCH]CRETIM) > 0 : [F:SCH]CRETIM = time : Endif            # 01.05 27567
+      [F:SCH]EXPNUM=[C]EXPORT
+      Write [SCH]
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # mise à jour entête OF
+      Call MAJ_OF(LMFGNUM, LRET)
+Endif
+
+$FIN_CRE
+# CCC (16/11/07) Bug 43982 Mise à jour des coûts prévisionnels de l'OF car la quantité d'article sous-traité a été modifié
+If GOK
+  # Issue 84830 GA 10/2012: création de commande, ajustement de la référence "fraction d'opération"
+  If [F:MFO]POHNUM=[F:POQ]POHNUM & [F:MFO]POPLIN=[F:POQ]POPLIN
+&  & [F:POQ]VCRNUMORI=[F:MFO]MFGNUM  & [F:POQ]VCRLINORI=[F:MFO]OPENUM
+&  & [F:POQ]VCRSEQORI<>[F:MFO]OPESPLNUM
+    [F:POQ]VCRSEQORI=[F:MFO]OPESPLNUM
+  Endif
+
+  If GCLCWOCAUT = 3
+
+      # Issue 84830 GA 10/2012 need to save current [F:MFO]
+     If clalev([F:MFOW]) = 0 : Local File MFGOPE [MFOW] : Endif
+     [F:MFOW] = [F:MFO]
+
+      # appel direct possible car la boite de dlg ne s'ouvre pas
+      # charger les paramètres.   # FQ 47987 avant PARAM, VALEUR
+      Read [MFG]MFG0=LMFGNUM
+      Local Char PARAM_CLC(250)(1..14) , VAL_CLC(250)
+      PARAM_CLC(1)  = [F:MFG]MFGFCY
+      PARAM_CLC(2)  = LMFGNUM
+      PARAM_CLC(4)  = "1"
+      PARAM_CLC(5)  = "4"
+      # positionner PARAM_CLC(9) à "1" SI ON NE VEUT PAS l'édition du calcul
+      # positionner PARAM_CLC(13) à "2" si on veut la trace
+      PARAM_CLC(9)  = "1"     # GH 09/04/2014 bug 99047 # PARAM_CLC(12) = "2"
+      PARAM_CLC(13) = "0"   # Issue 89622 - 2013-06-05 by CCC
+      PARAM_CLC(14) = "10"    # OF
+
+      Call TRAITE_CHAR(VAL_CLC,PARAM_CLC,"","SUBMCC","",3,"") From GTRAITE
+
+      # Issue 84830 GA 10/2012 need to restore current [F:MFO]
+      [F:MFO] = [F:MFOW]
+  Endif
+Endif
+
+If LRET = 0 & WNEWBPS
+    Call VERIF_MAT(LMFGNUM, LOPENUM, WMAT)
+    If WMAT <> ""
+         # FQ 55325 ajout du n° OF dans le message
+         If !GBROWS : Call MESSAGE(mess(156,190,1)+"("+LMFGNUM-WMAT+")") From GESECRAN : Endif
+    Endif
+Endif
+End
+############################################################################################
+Subprog MOD_SBC(LMFGNUM, LOPENUM, LOPESPLNUM, LPJT, LLASTOPE, LLASTOPESPL, LFIRSTSPL,
+&               LNEX, LSCDCOD, LCLEFLG, LRET)
+Value    Char      LMFGNUM
+Value    Integer   LOPENUM
+Value    Integer   LOPESPLNUM
+Value    Char      LPJT
+Value    Integer   LLASTOPE
+Value    Integer   LLASTOPESPL
+Value    Integer   LFIRSTSPL
+Value    Integer   LNEX
+Value    Integer   LSCDCOD
+Value    Integer   LCLEFLG
+Variable Integer   LRET
+Local    Decimal   WDIFF
+Local    Decimal   WWRK
+Local    Integer   WSTAT
+Local    Date      TODAY
+Local    Integer   WOPECLENBR : WOPECLENBR = 0
+Local    Integer   WNEWBPS : WNEWBPS = 0
+Local    Char      WMAT(250)
+TODAY=date$
+#
+LRET = 0
+# lecture opération
+Read [MFO]MFO0=LMFGNUM;LOPENUM;LOPESPLNUM
+If fstat : LRET = 1 : End : Endif
+#
+# Test changement adresse
+If [F:MFO]BPRNUM <> [M:SBCK]BPSNUM | [F:MFO]BPAADD <> [M:SBCK]BPAADD : WNEWBPS = 1 : Endif
+
+If [F:MFO]OPESTRCOE=0 [F:MFO]OPESTRCOE=1 Endif
+
+# Issue 80045 qté US convert with [F:MFO]OPESTRCOE
+# si quantité commandée > quantité prévue
+If [M:SBCK]ORDQTY * [F:MFO]OPESTRCOE > [F:MFO]EXTSTRQTY
+      # calcul écart en US
+      # Issue 85813 & 86889 GA 01/2013  ([M:SBCK]ORDQTY * [F:MFO]OPESTRCOE)
+      WDIFF   = [M:SBCK]ORDQTY - [F:MFO]EXTQTY
+      Call QTEARR(WDIFF,[F:MFO]OPEUOM) From TRTDIV
+
+      # reste-t-il une opération non commandée (fraction 0) ?
+      Read [MFO]MFO0=LMFGNUM;LOPENUM;0
+      WSTAT = fstat
+      Case WSTAT
+         When 1: # lock, on peut rien faire de plus ...
+                 LRET = 1
+                 End
+         When 0: # opération fraction 0 existante
+                 Readlock [MFO]MFO0=LMFGNUM;LOPENUM;0
+                 If fstat : LRET = 1 : End : Endif
+
+                 # y en a-t-il suffisament mais pas plus ?
+                 If [F:MFO]EXTQTY <= WDIFF
+                     # mise à jours encours
+                     Call UPDATE_OWX("SA", LPJT) From MFGLIBO
+                     If GOK <= 0 : LRET = 1 : End : Endif
+
+                     # suppression fraction 0
+                     Delete [MFO]
+                     If fstat : LRET = 1 : End : Endif
+
+                     # Issue 38555 GH 18/10/2017 - Missing deletion of CAL rows with OPESPLNUM=0
+                     Delete [CAL] Where ABRFIC="MFO" & VCRTYP=0 & VCRNUM=LMFGNUM & VCRLIN=LOPENUM & VCRSEQ=0
+                     If fstat=1
+                       GLOCK="$CPTANALIN MFO 0"-LMFGNUM-num$(LOPENUM)-"0"
+                     Endif
+                     If fstat=1 | fstat>5 : LRET=1 : End : Endif
+                 Endif
+                 # si il y en a moins ?
+                 If [F:MFO]EXTQTY > WDIFF
+                     # recalcul quantité fraction 0
+                     WWRK    = [F:MFO]EXTQTY - WDIFF
+                     Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+                     Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+                     [F:MFO]EXTQTY = WWRK
+
+                     # mise à jours encours
+                     Call UPDATE_OWX("SM", LPJT) From MFGLIBO
+                     If GOK <= 0 : LRET = 1 : End : Endif
+
+                     # mise à jour opération
+                     Call MAJ_MFO(LMFGNUM, LRET)
+                     If LRET = 1 : End : Endif
+                 Endif
+      Endcase
+
+      # ajout de la différence à l'opération commandée
+      # relecture opération commandée
+      Readlock [MFO]MFO0=LMFGNUM;LOPENUM;LOPESPLNUM
+      If fstat : LRET = 1 : End : Endif
+
+      WWRK = [F:MFO]EXTQTY
+      WWRK    += WDIFF
+      Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+      Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+      [F:MFO]EXTQTY = WWRK
+
+      # FQ 77397 GA 10/2011 maj de la date fin Opération
+      [F:MFO]OPEEND = [M:SBCK]RCPDAT
+      Call CALC_DAT_FCY([F:MFO]OPEEND,[M:SBCK]OFS,[F:MFO]MFGFCY,1,[F:MFO]OPESTR) From TRTACHDAT
+
+      # mise à jour encours
+      Call UPDATE_OWX("PM", LPJT) From MFGLIBO
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # mise à jour opération
+      Call MAJ_MFO(LMFGNUM, LRET)
+      If LRET = 1 : End : Endif
+
+      # mise à jour entête OF
+      Call MAJ_OF(LMFGNUM, LRET)
+
+      Goto FIN_MOD
+
+Endif
+# Issue 80045 qté US convert with [F:MFO]OPESTRCOE
+# si quantité commandée = quantité prévue, mise à jour (date, prix ...)
+If [M:SBCK]ORDQTY * [F:MFO]OPESTRCOE = [F:MFO]EXTSTRQTY
+    # lecture opération
+    Readlock [MFO] Curr
+    If fstat : LRET = 1 : End : Endif
+    #
+    [F:MFO]OPEEND = [M:SBCK]RCPDAT
+    # GA 27/09/2005: calculer selon dispo
+    #[F:MFO]OPESTR = [F:MFO]OPEEND - [M:SBCK]OFS
+    Call CALC_DAT_FCY([F:MFO]OPEEND,[M:SBCK]OFS,[F:MFO]MFGFCY,1,[F:MFO]OPESTR) From TRTACHDAT
+    [F:MFO]SCOLTI = [M:SBCK]OFS
+    [F:MFO]BPRNUM = [M:SBCK]BPSNUM
+    [F:MFO]BPAADD = [M:SBCK]BPAADD
+# Issue 90333 06/2013
+#    [F:MFO]EXTPRI = [M:SBCK]EXTPRI / [F:MFO]OPESTUCOE # Issue 89563 GA 05/2013 # * [F:MFO]OPESTRCOE
+    [F:MFO]EXTPRI = [M:SBCK]EXTPRI
+
+    If [M:SBCK]CLEFLG = 2 & GSTRCLEMOD = 2 : Goto SOLDE_OPE : Endif
+
+    # mise à jour opération
+    Call MAJ_MFO(LMFGNUM, LRET)
+    If LRET = 1 : End : Endif
+
+    # mise à jour entête OF
+    Call MAJ_OF(LMFGNUM, LRET)
+
+    Goto FIN_MOD
+Endif
+
+# Issue 80045 qté US convert with [F:MFO]OPESTRCOE
+# si quantité commandée < quantité prévue
+If [M:SBCK]ORDQTY * [F:MFO]OPESTRCOE < [F:MFO]EXTSTRQTY
+
+      # lecture opération
+      Readlock [MFO] Curr
+      If fstat : LRET = 1 : End : Endif
+
+      If [M:SBCK]CLEFLG = 2 & GSTRCLEMOD = 2 : Goto SOLDE_OPE : Endif
+
+      # recalcul opération avec quantité restante
+      # Issue 80045 qté US
+      # WDIFF = [F:MFO]EXTSTRQTY - [M:SBCK]ORDQTY
+      # Issue 85813 & 86889 GA 01/2013
+      # [F:MFO]EXTSTRQTY - ([M:SBCK]ORDQTY * [F:MFO]OPESTRCOE)
+      WDIFF = [F:MFO]EXTQTY - [M:SBCK]ORDQTY
+      WWRK  = [F:MFO]EXTQTY - WDIFF
+      Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+      Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+      [F:MFO]EXTQTY = WWRK
+
+      # si diminution et qté réceptionnée <> 0, test seuil solde
+      If [F:MFO]CPLQTY <> 0
+          Read [MWS]WST0=[F:MFO]EXTWST;[F:MFO]MFGFCY
+          If !fstat
+              LRET = 0
+              Call CONT_SOLDE_OPE([F:MFO]MFGFCY,[F:MFO]EXTWST, [F:MFO]CPLQTY , [F:MFO]EXTQTY, LRET) From MFGLIBO
+              If LRET = 1
+                  [F:MFO]OPESTA = 5
+                  [F:MFO]MFOTRKFLG = 5
+                  WOPECLENBR = 1
+                  # passer l'info aux achats que l'opé est soldée
+                  If [M:SBCK]CLEFLG = 1 : [M:SBCK]CLEFLG = 2 : Endif
+              Endif
+          Endif
+      Endif
+
+      # mise à jour encours
+      Call UPDATE_OWX("PM", LPJT) From MFGLIBO
+      If GOK <= 0 : LRET = 1 : End : Endif
+
+      # mise à jour opération
+      Call MAJ_MFO(LMFGNUM, LRET)
+      If LRET = 1 : End : Endif
+
+      # mise à jour scheduling
+      Readlock [SCH]SCH0=LMFGNUM;LOPENUM;LOPESPLNUM
+      If fstat : LRET = 1 : End : Endif
+
+      #
+      [F:SCH]UPDDAT=date$
+      [F:SCH]UPDUSR=GUSER
+      If dim([F:SCH]UPDTIM) > 0 : [F:SCH]UPDTIM = time : Endif            # 01.05 27567
+      [F:SCH]EXPNUM=[C]EXPORT
+      [F:SCH]SCDCOD = 8
+      #
+      Rewrite [SCH]
+      If fstat : LRET = 1 : Endif
+
+      # reste-t-il une opération non commandée (fraction 0) ?
+      Read [MFO]MFO0=LMFGNUM;LOPENUM;0
+      WSTAT = fstat
+      Case WSTAT
+         When 1: # lock, on peut rien faire de plus ...
+                 LRET = 1
+                 End
+         When 0: # opération existante, on l'incrémente
+                 Readlock [MFO]MFO0=LMFGNUM;LOPENUM;0
+                 If fstat : LRET = 1 : End : Endif
+
+                 # recalcul opération # Issue 87591 GA 02/2013
+                 #WWRK     = [F:MFO]EXTQTY + (WDIFF * [F:MFO]OPESTRCOE)
+                 WWRK     = [F:MFO]EXTQTY + WDIFF
+                 Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+                 Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+                 [F:MFO]EXTQTY = WWRK
+
+                 [F:MFO]POHNUM = ""
+                 [F:MFO]POPLIN = 0
+                 [F:MFO]POPSEQ = 0
+
+                 # mise à jours encours
+                 Call UPDATE_OWX("SM", LPJT) From MFGLIBO
+                 If GOK <= 0 : LRET = 1 : End : Endif
+
+                 # mise à jour opération
+                 Call MAJ_MFO(LMFGNUM, LRET)
+                 If LRET = 1 : End : Endif
+         When 5: # opération inexistante, il faut la recréer
+                 # recalcul opération # Issue 87591 GA 02/2013
+                 #WWRK     = (WDIFF * [F:MFO]OPESTRCOE)
+                 WWRK     = WDIFF
+                 Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+                 Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+                 [F:MFO]EXTQTY = WWRK
+
+                 # mise à jours encours
+                 [F:MFO]WIPNUM = ""
+                 [F:OPS]OPSNUM = ""
+                 [F:MFO]OPESPLNUM = 0
+                 [F:MFO]OPESTA    = 1
+                 [F:MFO]POHNUM = ""
+                 [F:MFO]POPLIN = 0
+                 [F:MFO]POPSEQ = 0
+
+                 # raz zones réalisé
+                 [F:MFO]CPLCRG = 0
+                 [F:MFO]CPLOPETIM = 0
+                 [F:MFO]CPLPRI = 0
+                 [F:MFO]CPLQTY = 0
+                 [F:MFO]CPLSETTIM = 0
+                 [F:MFO]CPLUNTTIM = 0
+                 [F:MFO]CPLWST = ""
+                 [F:MFO]CPLWSTNBR = 0
+                 [F:MFO]CPLQTY = 0
+                 [F:MFO]REJCPLQTY = 0
+                 [F:MFO]QUACPLQTY = 0
+                 [F:MFO]MFOTRKFLG = 1                # 02.06 demande 35051
+
+                 Call UPDATE_OWX("SC", LPJT) From MFGLIBO
+                 If GOK <= 0 : LRET = 1 : End : Endif
+
+                 # mise à jour opération
+                 LRET = LOPESPLNUM : # Issue 38555 GH 18/10/2017 - to set analytical dimensions from the ordered operation
+                 Call CRE_MFO(LMFGNUM, LRET)
+                 If LRET = 1 : End : Endif
+
+                 # génération scheduling
+                 [F:SCH]MFGNUM       = [F:MFO]MFGNUM
+                 [F:SCH]PLNFCY       = [F:MFO]PLNFCY
+                 [F:SCH]MFGFCY       = [F:MFO]MFGFCY
+                 [F:SCH]OPENUM       = [F:MFO]OPENUM
+                 [F:SCH]OPESPLNUM    = [F:MFO]OPESPLNUM
+                 [F:SCH]NEXOPENUM    = LNEX
+                 [F:SCH]SCDCOD       = LSCDCOD
+
+                 # écriture
+                 [F:SCH]CREDAT=date$
+                 [F:SCH]CREUSR=GUSER
+                 If dim([F:SCH]CRETIM) > 0 : [F:SCH]CRETIM = time : Endif            # 01.05 27567
+                 [F:SCH]EXPNUM=[C]EXPORT
+                 Write [SCH]
+                 If GOK <= 0 : LRET = 1 : End : Endif
+
+                 # maj code jalonnement deuxième fraction
+                 Readlock [SCH]SCH0=LMFGNUM;LOPENUM;LFIRSTSPL
+                 If GOK <= 0 : LRET = 1 : End : Endif
+
+                 # modif code jalonnement
+                 [F:SCH]SCDCOD=8
+                 [F:SCH]UPDDAT=date$
+                 [F:SCH]UPDUSR=GUSER
+                 If dim([F:SCH]UPDTIM) > 0 : [F:SCH]UPDTIM = time : Endif            # 01.05 27567
+                 [F:SCH]EXPNUM=[C]EXPORT
+                 Rewrite [SCH]
+                 If fstat : LRET = 1 : End : Endif
+      Endcase
+
+           # mise à jour entête OF
+      Call MAJ_OF(LMFGNUM, LRET)
+      Goto FIN_MOD
+Endif
+
+$SOLDE_OPE
+# recalcul opération avec quantité restante
+# Issue 80045 qté US convert with [F:MFO]OPESTRCOE
+# si quantité commandée > quantité prévue
+# Issue 85813 & 86889 GA 01/2013
+# [F:MFO]EXTSTRQTY - ([M:SBCK]ORDQTY * [F:MFO]OPESTRCOE)
+WDIFF = [F:MFO]EXTQTY - [M:SBCK]ORDQTY
+WWRK  = [F:MFO]EXTQTY - WDIFF
+Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+[F:MFO]EXTQTY = WWRK
+
+[F:MFO]OPESTA    = 5
+[F:MFO]MFOTRKFLG = 5
+# CCC (10/01/08) DM 44021
+#If [F:MFO]TRKFIRST = [0/0/0] : [F:MFO]TRKFIRST = date$ : Endif
+#[F:MFO]TRKLAST = date$
+If [F:MFO]TRKLAST<date$
+    [F:MFO]TRKLAST   = date$
+Endif
+If [F:MFO]TRKLASTC<date$
+    [F:MFO]TRKLASTC  = date$
+Endif
+If [F:MFO]TRKFIRST>date$ | [F:MFO]TRKFIRST = "00/00/00"
+    [F:MFO]TRKFIRST = date$
+Endif
+If [F:MFO]TRKFIRSTC>date$ | [F:MFO]TRKFIRSTC = "00/00/00"
+    [F:MFO]TRKFIRSTC = date$
+Endif
+
+# mise à jour encours
+Call UPDATE_OWX("PM", LPJT) From MFGLIBO
+If GOK <= 0 : LRET = 1 : End : Endif
+
+# mise à jour opération
+Call MAJ_MFO(LMFGNUM, LRET)
+If LRET = 1 : End : Endif
+
+# maj opération suivante
+Gosub MAJ_SUIVANTE From SUBMTKC
+If GOK < 1 : LRET = 1 : End : Endif
+
+# mise à jour entête OF
+Call MAJ_OF(LMFGNUM, LRET)
+
+# pour incrémenter le nbre d'opérations soldées
+WOPECLENBR = 1
+
+$FIN_MOD
+# CCC (16/11/07) Bug 43982 Mise à jour des coûts prévisionnels de l'OF car la quantité d'article sous-traité a été modifié
+If GOK
+  If GCLCWOCAUT = 3
+      # Issue 84830 GA 10/2012 need to save current [F:MFO]
+      If clalev([F:MFOW]) = 0 : Local File MFGOPE [MFOW] : Endif
+      [F:MFOW] = [F:MFO]
+
+      # appel direct possible car la boite de dlg ne s'ouvre pas
+      # charger les paramètres.   # FQ 47987 avant PARAM, VALEUR
+      Read [MFG]MFG0=LMFGNUM
+      Local Char PARAM_CLC(250)(1..14) , VAL_CLC(250)
+      PARAM_CLC(1)  = [F:MFG]MFGFCY
+      PARAM_CLC(2)  = LMFGNUM
+      PARAM_CLC(4)  = "1"
+      PARAM_CLC(5)  = "4"
+      # positionner PARAM_CLC(12) à "2" SI ON NE VEUT PAS l'édition du calcul
+      # positionner PARAM_CLC(13) à "2" si on veut la trace
+      PARAM_CLC(12) = "2"
+      PARAM_CLC(13) = "0"   # Issue 89622 - 2013-06-05 by CCC
+      PARAM_CLC(14) = "10"    # OF
+
+      Call TRAITE_CHAR(VAL_CLC,PARAM_CLC,"","SUBMCC","",3,"") From GTRAITE
+
+      # Issue 84830 GA 10/2012 need to restore current [F:MFO]
+      [F:MFO] = [F:MFOW]
+  Endif
+Endif
+
+If WOPECLENBR
+    Readlock [MFG]MFG0=LMFGNUM
+    If fstat : LRET = 1 : End : Endif
+    [F:MFG]OPECLENBR += 1
+
+    Rewrite [MFG]
+    If fstat : LRET = 1 : End : Endif
+Endif
+
+# si changement adresse, vérification matières
+If LRET = 0 & WNEWBPS
+    Call VERIF_MAT(LMFGNUM, LOPENUM, WMAT)
+    If WMAT <> ""
+         # FQ 55325 ajout du n° OF dans le message
+         If !GBROWS : Call MESSAGE(mess(229,190,1)+"("+LMFGNUM-WMAT+")") From GESECRAN : Endif
+    Endif
+Endif
+End
+
+
+############################################################################################
+Subprog SUP_SBC(LMFGNUM, LOPENUM, LOPESPLNUM, LPJT, LLASTOPE, LLASTOPESPL, LFIRSTSPL,
+&               LNEX, LSCDCOD,LRET)
+Value    Char      LMFGNUM
+Value    Integer   LOPENUM
+Value    Integer   LOPESPLNUM
+Value    Char      LPJT
+Value    Integer   LLASTOPE
+Value    Integer   LLASTOPESPL
+Value    Integer   LFIRSTSPL
+Value    Integer   LNEX
+Value    Integer   LSCDCOD
+Variable Integer   LRET
+Local    Decimal   WDIFF
+Local    Decimal   WWRK
+Local    Integer   WSTAT
+Local    Date      TODAY
+TODAY=date$
+#
+LRET = 0
+# lecture opération
+Read [MFO]MFO0=LMFGNUM;LOPENUM;LOPESPLNUM
+If fstat : LRET = 1 : End : Endif
+# mémorisation quantité
+WDIFF = [F:MFO]EXTQTY     # Issue 85813 & 86889 GA 01/2013
+
+#  suppression encours
+Call UPDATE_OWX("SP", LPJT) From MFGLIBO
+If GOK <= 0 : LRET = 1 : End : Endif
+
+# suppression opération
+Delete [MFO]
+If fstat : LRET = 1 : End : Endif
+
+# lecture scheduling
+Readlock [SCH]SCH0=LMFGNUM;LOPENUM;LOPESPLNUM
+If fstat : LRET = 1 : End : Endif
+
+# suppression scheduling
+Delete [SCH]
+If fstat : LRET = 1 : Endif
+
+# reste-t-il une opération non commandée (fraction 0) ?
+Read [MFO]MFO0=LMFGNUM;LOPENUM;0
+WSTAT = fstat
+If [F:MFO]OPESTRCOE = 0 : [F:MFO]OPESTRCOE = 1 : Endif
+Case WSTAT
+    When 1: # lock, on peut rien faire de plus ...
+            LRET = 1
+            End
+    When 0: # opération existante, on l'incrémente
+            Readlock [MFO]MFO0=LMFGNUM;LOPENUM;0
+            If fstat : LRET = 1 : End : Endif
+
+            # recalcul opération
+            WWRK    = [F:MFO]EXTQTY + WDIFF
+            Call QTEARR(WWRK,[F:MFO]OPEUOM) From TRTDIV
+            Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+            [F:MFO]EXTQTY = WWRK
+
+            [F:MFO]POHNUM = ""
+            [F:MFO]POPLIN = 0
+            [F:MFO]POPSEQ = 0
+
+            # mise à jours encours
+            Call UPDATE_OWX("SM", LPJT) From MFGLIBO
+            If GOK <= 0 : LRET = 1 : End : Endif
+
+            # mise à jour opération
+            Call MAJ_MFO(LMFGNUM, LRET)
+            If LRET = 1 : End : Endif
+    When 5: # opération inexistante, il faut la recréer
+            # recalcul opération
+            [F:MFO]EXTQTY    = WDIFF
+            Call QTEARR([F:MFO]EXTQTY,[F:MFO]OPEUOM) From TRTDIV
+            WWRK = [F:MFO]EXTQTY
+            Call UPD_OPE_UNI(2, "MFO", 0, WWRK) From MFGLIBO
+
+            # mise à jours encours
+            [F:MFO]WIPNUM = ""
+            [F:OPS]OPSNUM = ""
+            [F:MFO]OPESPLNUM = 0
+            [F:MFO]OPESTA    = 1
+            # mise à jour opération
+
+            [F:MFO]POHNUM = ""
+            [F:MFO]POPLIN = 0
+            [F:MFO]POPSEQ = 0
+
+            # raz zones réalisé
+            [F:MFO]CPLCRG = 0
+            [F:MFO]CPLOPETIM = 0
+            [F:MFO]CPLPRI = 0
+            [F:MFO]CPLQTY = 0
+            [F:MFO]CPLSETTIM = 0
+            [F:MFO]CPLUNTTIM = 0
+            [F:MFO]CPLWST = ""
+            [F:MFO]CPLWSTNBR = 0
+            [F:MFO]MFOTRKFLG = 1                # 02.06 demande 35051
+
+            Call UPDATE_OWX("SC", LPJT) From MFGLIBO
+            If GOK <= 0 : LRET = 1 : End : Endif
+
+            # mise à jour opération
+            LRET = LOPESPLNUM : # Issue 38555 GH 18/10/2017 - to set analytical dimensions from the ordered operation
+            Call CRE_MFO(LMFGNUM, LRET)
+            If LRET = 1 : End : Endif
+
+            # génération scheduling
+            [F:SCH]MFGNUM       = [F:MFO]MFGNUM
+            [F:SCH]PLNFCY       = [F:MFO]PLNFCY
+            [F:SCH]MFGFCY       = [F:MFO]MFGFCY
+            [F:SCH]OPENUM       = [F:MFO]OPENUM
+            [F:SCH]OPESPLNUM    = [F:MFO]OPESPLNUM
+            [F:SCH]NEXOPENUM    = LNEX
+            [F:SCH]SCDCOD       = LSCDCOD
+
+            # écriture
+            [F:SCH]CREDAT=date$
+            [F:SCH]CREUSR=GUSER
+            If dim([F:SCH]CRETIM) > 0 : [F:SCH]CRETIM = time : Endif            # 01.05 27567
+            [F:SCH]EXPNUM=[C]EXPORT
+            Write [SCH]
+            If GOK <= 0 : LRET = 1 : End : Endif
+
+            If LFIRSTSPL <> LOPESPLNUM
+                # maj code jalonnement deuxième fraction
+                Readlock [SCH]SCH0=LMFGNUM;LOPENUM;LFIRSTSPL
+                If GOK <= 0 : LRET = 1 : End : Endif
+
+                # modif code jalonnement
+                [F:SCH]SCDCOD=8
+                [F:SCH]UPDDAT=date$
+                [F:SCH]UPDUSR=GUSER
+                If dim([F:SCH]UPDTIM) > 0 : [F:SCH]UPDTIM = time : Endif            # 01.05 27567
+                [F:SCH]EXPNUM=[C]EXPORT
+                Rewrite [SCH]
+                If fstat : LRET = 1 : End : Endif
+            Endif
+Endcase
+
+# Issue 38555 GH 18/10/2017 - Missing deletion of CAL rows with OPESPLNUM=LOPESPLNUM
+Delete [CAL] Where ABRFIC="MFO" & VCRTYP=0 & VCRNUM=LMFGNUM & VCRLIN=LOPENUM & VCRSEQ=LOPESPLNUM
+If fstat=1
+   GLOCK="$CPTANALIN MFO 0"-LMFGNUM-num$(LOPENUM)-num$(LOPESPLNUM)
+Endif
+If fstat=1 | fstat>5 : LRET=1 : End : Endif
+
+# mise à jour entête OF
+Call MAJ_OF(LMFGNUM, LRET)
+#
+# CCC (16/11/07) Bug 43982 Mise à jour des coûts prévisionnels de l'OF car la quantité d'article sous-traité a été modifié
+If GOK
+  If GCLCWOCAUT = 3
+    # Issue 84830 GA 10/2012 need to save current [F:MFO]
+    If clalev([F:MFOW]) = 0 : Local File MFGOPE [MFOW] : Endif
+    [F:MFOW] = [F:MFO]
+
+    # appel direct possible car la boite de dlg ne s'ouvre pas
+    # charger les paramètres.   # FQ 47987 avant PARAM, VALEUR
+    Read [MFG]MFG0=LMFGNUM
+    Local Char PARAM_CLC(250)(1..14) , VAL_CLC(250)
+    PARAM_CLC(1)  = [F:MFG]MFGFCY
+    PARAM_CLC(2)  = LMFGNUM
+    PARAM_CLC(4)  = "1"
+    PARAM_CLC(5)  = "4"
+    # positionner PARAM_CLC(12) à "2" SI ON NE VEUT PAS l'édition du calcul
+    # positionner PARAM_CLC(13) à "2" si on veut la trace
+    PARAM_CLC(12) = "2"
+    PARAM_CLC(13) = "0"   # Issue 89622 - 2013-06-05 by CCC
+    PARAM_CLC(14) = "10"    # OF
+
+    Call TRAITE_CHAR(VAL_CLC,PARAM_CLC,"","SUBMCC","",3,"") From GTRAITE
+
+    # Issue 84830 GA 10/2012 need to restore current [F:MFO]
+    [F:MFO] = [F:MFOW]
+  Endif
+Endif
+End
+
+############################################################################################
+Subprog FILL_BUF_MFO
+#
+[F:MFO]OPESTA = 7
+[F:MFO]POHNUM = [M:SBCK]VCRNUM
+[F:MFO]POPLIN = [M:SBCK]VCRLIN
+[F:MFO]POPSEQ = [M:SBCK]VCRSEQ
+[F:MFO]OPEEND = [M:SBCK]RCPDAT
+#[F:MFO]OPESTR = [F:MFO]OPEEND - [M:SBCK]OFS
+[F:MFO]OPESTR = [M:SBCK]ORDDAT
+[F:MFO]SCOLTI = [M:SBCK]OFS
+[F:MFO]BPRNUM = [M:SBCK]BPSNUM
+[F:MFO]BPAADD = [M:SBCK]BPAADD
+[F:MFO]EXTPRI = [M:SBCK]EXTPRI # Issue 89563 GA 05/2013 avant * [F:MFO]OPESTRCOE
+#
+End
+
+############################################################################################
+Subprog RET_SBC(LRET)
+Variable Integer LRET
+If LRET = 1 : End : Endif
+End
+
+############################################################################################
+Subprog FAC_SBC(LRET)
+Variable Integer LRET
+Local    Char    WMFGTRKNUM(GLONVCR)
+Local    Integer WOPETRKLIN
+Local    Integer NBOPE
+Local    Decimal WRKPRI, WRKCRG, WRKQTY, WPRIUO, WQTYUO, WCRGUO
+Local    Decimal W_MNT,W_MNTCRG :# pour l'agrégation opératoire
+
+Local Decimal W_INVDTA, PRIINVDTA, WRKINVDTA
+# Issue 102605 GA 12/2014 + W_RCP, PRIRCP
+# Issue 99332 GA 05/2014 additional invoice/credit memo
+Local Decimal W_RCPFC, PRIRCPFC, W_RCP, PRIRCP
+Raz W_RCPFC, PRIRCPFC, W_RCP, PRIRCP
+
+# CCC (2009-08-07) Bug 57039
+If !clalev([M:SDP]) : Local Mask SAIDECPRI [SDP] : Endif
+Raz [M:SDP]
+
+NBOPE     = 0
+WPRIUO    = 0
+WRKPRI    = 0
+WRKCRG    = 0
+WRKQTY    = 0
+
+# recherche suivi concerné
+Call LEC_MKO(WMFGTRKNUM, WOPETRKLIN)
+If WMFGTRKNUM = "" | WOPETRKLIN = 0 : LRET = 1 : End : Endif
+
+Readlock [MKO]MKO0=WMFGTRKNUM;WOPETRKLIN
+If fstat : LRET = 1 : End : Endif
+
+# message d'erreur permettant de savoir quelle opération pose problème
+Read [MFO]MFO0=[F:MKO]MFGNUM;[F:MKO]OPENUM;[F:MKO]OPESPLNUM
+If fstat : GMESSAGE = mess(161,193,1) - ":" - [F:MKO]MFGNUM +"/" + num$([F:MKO]OPENUM)    # 09.04 24812
+           LRET = 1
+           End
+Endif
+
+W_INVDTA = 0
+
+# Issue 102605 GA 12/2014
+W_RCP  = func SBCLIB.SUMRCP(10,[F:MKO]MFGNUM,[F:MKO]POHNUM, [F:MKO]POPLIN)
+If [F:MKO]CPLQTY<>0
+    PRIRCP = W_RCP / [F:MKO]CPLQTY
+Else
+    PRIRCP = 0
+Endif
+Gosub READ_MWI_MKO
+
+# Issue 119759 - 2017-01-06 by CCC
+W_INVDTA = -func MWIPLIB.SUMINVDTA(10,[F:MKO]MFGNUM,WMFGTRKNUM, WOPETRKLIN)
+W_MNT += W_INVDTA   # W_MNT = total of the subcontracting cost (service + invoicing elements)
+PRIINVDTA = -W_INVDTA / [F:MKO]CPLQTY
+
+
+If W_MNT<>0  # Issue 102605 GA 12/2014 actual cost was read from MWI
+
+Elsif ([F:MKO]CPLPRI + [F:MKO]CPLCRG)=0
+    W_MNT -= [F:MKO]EXTPRI * [F:MKO]CPLQTY
+Else
+    W_MNT -= ([F:MKO]CPLPRI + [F:MKO]CPLCRG) * [F:MKO]CPLQTY
+    If [F:MKO]CPLQTY=0
+        PRIINVDTA=0
+        PRIRCPFC=0 # Issue 99332 GA 05/2014
+# Issue 119759 - 2017-07-20 by CCC
+#    Else
+#        W_INVDTA = -func MWIPLIB.SUMINVDTA(10,[F:MKO]MFGNUM,WMFGTRKNUM, WOPETRKLIN)
+#        PRIINVDTA = -W_INVDTA / [F:MKO]CPLQTY
+    Endif
+Endif
+# Issue 99332 GA 06/2014
+W_RCPFC  = func SBCLIB.SUMRCPFC(10,[F:MKO]MFGNUM,[F:MKO]POHNUM,[F:MKO]POPLIN)
+If [F:MKO]CPLQTY=0 # Issue 119326 GH 29/11/16 - test added not to crash for a division by 0
+   PRIRCPFC = 0
+Else
+   PRIRCPFC = W_RCPFC / [F:MKO]CPLQTY
+Endif
+
+# Issue 89563 - 2013-05-06 by GA selon CCC : Qté UO = OPESTUCOE * Qté US produit lancé
+#                                   [M:SBCK]INVQTY = qté en US produit lancé
+#WQTYUO = [M:SBCK]INVQTY / [F:MFO]OPESTUCOE # / [F:MFO]OPESTRCOE
+#Call QTEARR(WQTYUO,[F:MFO]OPEUOM) From TRTDIV
+#WPRIUO = [M:SBCK]CPLPRI * [F:MFO]OPESTUCOE # * [F:MFO]OPESTRCOE
+#WCRGUO = [M:SBCK]CPLCRG * [F:MFO]OPESTUCOE # * [F:MFO]OPESTRCOE
+# Issue 90333 06/2013
+WQTYUO = [M:SBCK]INVQTY
+Call QTEARR(WQTYUO,[F:MFO]OPEUOM) From TRTDIV
+WPRIUO = [M:SBCK]CPLPRI
+WCRGUO = [M:SBCK]CPLCRG
+
+If [F:MKO]INVQTY = 0
+    If WQTYUO<>0
+    # Case 1: first standard invoice
+        # CCC (09/06/08) Bug 47814 : Lors de la 1ère facturation, [F:MKO]CPLPRI est nul, il faut prendre EXTPRI
+        W_MNT = -[F:MKO]EXTPRI * [F:MKO]CPLQTY + W_INVDTA - W_RCPFC  # Issue 99967 GA 06/2014 additionnal invoice ?
+        # CCC (05/05/08) Bug 47214
+        #[F:MKO]INVQTY += WQTYUO
+        #[F:MKO]CPLPRI += WPRIUO
+        #[F:MKO]CPLCRG += WCRGUO
+        [F:MKO]INVQTY = WQTYUO
+        [F:MKO]CPLPRI = WPRIUO  + PRIRCPFC # Issue 99967 GA 06/2014
+        [F:MKO]CPLCRG = WCRGUO
+        PRIINVDTA = [M:SBCK]INVDTACST / WQTYUO   # Issue 119759 - 2017-01-06 by CCC
+    Else
+   # Case 2: first invoice is an additional invoice, have to keep standard qty & cost
+   # Issue 99332 GA 05/2014: case WQTYUO=0
+   # W_RCPFC contains all additional invoices including the current one
+        WRKQTY         = [F:MKO]CPLQTY
+        WRKPRI         = ([F:MKO]CPLQTY * [F:MKO]EXTPRI) + W_RCPFC
+        WRKCRG         = ([F:MKO]CPLQTY * [F:MKO]CPLCRG) + WCRGUO
+        WRKINVDTA      = ([F:MKO]CPLQTY * PRIINVDTA) + [M:SBCK]INVDTACST
+        If WRKQTY<>0
+            [F:MKO]CPLPRI  = WRKPRI / WRKQTY
+            [F:MKO]CPLCRG  = WRKCRG / WRKQTY
+            PRIINVDTA = WRKINVDTA / WRKQTY
+        Endif
+    Endif
+Else
+    If WQTYUO <> 0
+   # Case 3: next invoice(s)/credit memo
+        WRKQTY         = [F:MKO]INVQTY + WQTYUO
+        WRKPRI         = ([F:MKO]INVQTY * [F:MKO]CPLPRI) + (WQTYUO * WPRIUO)
+        WRKCRG         = ([F:MKO]INVQTY * [F:MKO]CPLCRG) + (WQTYUO * WCRGUO)
+        WRKINVDTA      = ([F:MKO]INVQTY * PRIINVDTA) + [M:SBCK]INVDTACST
+
+        # si avoir total, les quantités et prix facture/avoir s'annulent
+        # le prix unitaire doit redevenir le prix prévu,la quantité facturée et les frais réels repassent à 0
+        If WRKQTY = 0
+           [F:MKO]CPLPRI = [F:MFO]EXTPRI + PRIRCPFC # Issue 99967 GA 06/2014
+           [F:MKO]CPLCRG = 0
+           [F:MKO]INVQTY = 0
+           PRIINVDTA = 0
+        Elsif WRKQTY<>0
+            [F:MKO]CPLPRI  = WRKPRI / WRKQTY
+            [F:MKO]CPLCRG  = WRKCRG / WRKQTY  # Appliqué à la qté totale
+            [F:MKO]INVQTY += WQTYUO
+            PRIINVDTA = WRKINVDTA / WRKQTY
+        Endif
+    Else
+    # Case 4: additionnal invoice(s)/credit memo
+        WRKQTY         = [F:MKO]INVQTY
+        WRKPRI         = (WRKQTY * [F:MKO]CPLPRI) + WPRIUO
+        WRKCRG         = (WRKQTY * [F:MKO]CPLCRG) + WCRGUO
+        WRKINVDTA      = (WRKQTY * PRIINVDTA) + [M:SBCK]INVDTACST
+        [F:MKO]CPLPRI  = WRKPRI / WRKQTY
+        [F:MKO]CPLCRG  = WRKCRG / WRKQTY
+        PRIINVDTA      = WRKINVDTA / WRKQTY
+    Endif
+Endif
+
+# Issue 119759 - 2017-07-20 by CCC
+## Issue 99967 GA 06/2014 credit invoice in Qty
+#If [F:MKO]INVQTY<>0 & [F:MKO]INVQTY<>[F:MKO]CPLQTY
+#   W_MNT += [F:MKO]CPLPRI * [F:MKO]INVQTY
+#   W_MNT += [F:MKO]CPLCRG * [F:MKO]INVQTY  # delta à compter pour l'agrégation (interface tps)
+#   W_INVDTA += PRIINVDTA * [F:MKO]INVQTY
+#Else
+   W_MNT += [F:MKO]CPLPRI * [F:MKO]CPLQTY
+   W_MNT += [F:MKO]CPLCRG * [F:MKO]CPLQTY  # delta à compter pour l'agrégation (interface tps)
+   W_INVDTA += PRIINVDTA * [F:MKO]CPLQTY
+#Endif
+
+[F:MKO]UPDDAT = date$
+[F:MKO]UPDUSR = GUSER
+[F:MKO]EXPNUM = [C]EXPORT
+Rewrite [MKO]
+If fstat : LRET = 1 : End : Endif
+
+[M:SDP]AMTTOT = W_MNT
+#[M:SDP]INVDTACST = [M:SBCK]INVDTACST
+[M:SDP]INVDTACST = arr(W_INVDTA,10^-8)
+[M:SDP]SCOTOT = W_MNT-[M:SDP]INVDTACST
+
+# mise à jour Wipcost - Ctrl de code GA 22/04/2009 suppression du 1er param (10,
+Call SCEOPEPRI_MOD([F:MKO]MFGTRKNUM,[F:MKO]OPETRKLIN,[F:MKO]CPLWST,LRET) From MWIPLIB
+If LRET = 1 : End : Endif
+
+# Issue 89758 ctrl du lock
+Readlock [MFO] Curr
+If fstat : LRET = 1 : End : Endif
+
+# mise à jour données opération
+If [F:MFO]INVQTY = 0
+    [F:MFO]INVQTY += WQTYUO
+    [F:MFO]CPLPRI += WPRIUO
+    [F:MFO]CPLCRG += WCRGUO
+Else
+    If WQTYUO <> 0
+        WRKQTY         = [F:MFO]INVQTY + WQTYUO
+        WRKPRI         = ([F:MFO]INVQTY * [F:MFO]CPLPRI) + (WQTYUO * WPRIUO)
+        WRKCRG         = ([F:MFO]INVQTY * [F:MFO]CPLCRG) + (WQTYUO * WCRGUO)
+        If WRKQTY <> 0
+            [F:MFO]CPLPRI  = WRKPRI / WRKQTY
+            [F:MFO]CPLCRG  = WRKCRG / WRKQTY
+            [F:MFO]INVQTY += WQTYUO
+        Else
+            [F:MFO]CPLPRI  = [F:MFO]EXTPRI
+            [F:MFO]CPLCRG  = 0
+            [F:MFO]INVQTY  = 0
+        Endif
+    Else
+        WRKPRI         = ([F:MFO]INVQTY * [F:MFO]CPLPRI) + [M:SBCK]CPLPRI
+        [F:MFO]CPLPRI  = WRKPRI / [F:MFO]INVQTY
+        [F:MFO]CPLCRG  = WRKCRG / [F:MFO]INVQTY
+    Endif
+Endif
+
+# mise à jour opération
+Call MAJ_MFO([F:MKO]MFGNUM, LRET)
+If LRET = 1 : End : Endif
+End
+
+############################################################
+# SUMRCPFC : Total amount of additionnal invoice on currect receipt line
+############################################################
+# Parametres E : PVCRTYP = document type (10=WO, 36=EO)
+#              : PVCRNUM = document id
+#              : LPOHNUM = order id
+#              : LPOPLIN = order line number
+############################################################
+Funprog SUMRCPFC(PVCRTYP, PVCRNUM, LPOHNUM, LPOPLIN)
+Value Integer PVCRTYP
+Value Char PVCRNUM
+Value Char LPOHNUM
+Value Integer LPOPLIN
+
+Local Decimal L_MTFC, W_MTFC
+Local Integer WSTAT
+
+Local Char    WPTHNUM(GLONVCR) : WPTHNUM=[F:PTD]PTHNUM
+Local Integer WPTDLIN : WPTDLIN=[F:PTD]PTDLIN
+
+If !clalev([F:PIDW]) : Local File PINVOICED [PIDW] : Endif
+If !clalev([F:PIDX]) : Local File PINVOICED [PIDX] : Endif
+If !clalev([F:PIDZ]) : Local File PINVOICED [PIDZ] : Endif
+
+# Issue 100967 GA 06/2014 check if invoice is posted eg [F:PIHY]STA=3
+If !clalev([F:PIHY]) : Local File PINVOICE [PIHY] : Endif
+# Issue X3-25003 - 2018-02-19 by SR :
+If [F:POH]POHNUM <> LPOHNUM
+  Read [F:POH]POH0 = LPOHNUM
+  If fstat : Raz [F:POH] : Endif
+Endif
+
+Case PVCRTYP
+    When 10 :
+    # ----------------------------------------
+    # Additionnal invoice on receipt/on order
+    # ----------------------------------------
+    # Issue X3-75854-25003 - 2018-02-05 by SR : Don't Take into account complementary invoices posted on others receipt
+    # No complementay invoices posted on purchase orders for sub contract process
+      For [PIDW] Where POHNUM = LPOHNUM
+&                    & POPLIN = LPOPLIN
+&                    & PIHTYP = 2
+&                    & (TYPORI =1 | (TYPORI = 2 & NUMORI = WPTHNUM & LINORI = WPTDLIN))
+         Read [PIHY]=[F:PIDW]NUM  : If fstat Raz [F:PIHY] Endif
+         If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2) # Issue 100967 GA 06/2014
+             # Additionnal invoice
+             #If [F:PIDW]QTYSTU=0                 # Issue 102605 GA 11/2014 [F:PIDX]CPR may be wrong
+             #   W_MTFC += [F:PIDW]CPR
+             #Else
+             #   W_MTFC += [F:PIDW]CPR * [F:PIDW]QTYSTU
+             #Endif
+             GBIDD1=[F:PIDW]AMTNOTLIN
+             Call CONVERT_PIHY(GBIDD1,W_MTFC) From SBCLIB
+             # Issue X3-25003 - 2018-02-19 by SR : nouvelle méthode  :pour les FCC autres que celle en cours de validation,ne prendre que les FCC déjà rapprochées
+             If [F:PIHY]STA = 3 & GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+                Read [F:PSV]PSV0=[F:PIDW]NUM;[F:PIDW]PIDLIN;WPTHNUM;WPTDLIN
+                If !fstat : L_MTFC+=W_MTFC : Endif
+             Else
+                L_MTFC+=W_MTFC
+             Endif
+
+             For [PIDX] Where INVNUM = [F:PIDW]NUM
+&                           & INVLIN = [F:PIDW]PIDLIN
+&                           & PIHTYP = 3
+               Read [PIHY]=[F:PIDX]NUM : If fstat Raz [F:PIHY] Endif
+               If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+                 # Credit invoice on this invoice
+                 #If [F:PIDX]QTYSTU=0                 # Issue 102605 GA 11/2014 [F:PIDX]CPR may be wrong
+                 #   W_MTFC -= [F:PIDX]CPR
+                 #Else
+                 #   W_MTFC -= [F:PIDX]CPR * [F:PIDX]QTYSTU
+                 #Endif
+                 GBIDD1=[F:PIDX]AMTNOTLIN
+                 Call CONVERT_PIHY(GBIDD1,W_MTFC) From SBCLIB
+                 # Issue X3-25003 - 2018-02-19 by SR :  nouvelle méthode:pour les avoirs autres que celui en cours de validation,ne prendre que les avoirs déjà rapprochés
+                 If [F:PIHY]STA = 3 & GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+                    Read [F:PSV]PSV0=[F:PIDX]NUM;[F:PIDX]PIDLIN;WPTHNUM;WPTDLIN
+                    If !fstat :  L_MTFC-=W_MTFC : Endif
+                 Else
+                    L_MTFC-=W_MTFC
+                 Endif
+               Endif
+             Next
+          Endif
+      Next
+    # ------------------------------
+    # Additionnal invoice on invoice
+    # ------------------------------
+    # Issue X3-75854-25003 - 2018-02-05 by SR : don't Take into account complementary invoices posted on invoices of others receipt
+      For [PIDZ] Where POHNUM = LPOHNUM & POPLIN = LPOPLIN
+&                    & PIHTYP = 1
+&                    & (TYPORI =1 | (TYPORI = 2 & NUMORI = WPTHNUM & LINORI = WPTDLIN))
+        Read [PIHY]=[F:PIDZ]NUM  : If fstat Raz [F:PIHY] Endif
+        If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+          For [PIDW] Where INVNUM = [F:PIDZ]NUM & INVLIN = [F:PIDZ]PIDLIN
+&                        & PIHTYP = 2
+&                        & TYPORI = 4
+             Read [PIHY]=[F:PIDW]NUM  : If fstat Raz [F:PIHY] Endif
+             If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+               #If [F:PIDW]QTYSTU=0                 # Issue 102605 GA 11/2014 [F:PIDX]CPR may be wrong
+               #   L_MTFC += [F:PIDW]CPR
+               #Else
+               #   L_MTFC += [F:PIDW]CPR * [F:PIDW]QTYSTU
+               #Endif
+               GBIDD1=[F:PIDW]AMTNOTLIN
+               Call CONVERT_PIHY(GBIDD1,W_MTFC) From SBCLIB
+               # Issue X3-25003 - 2018-02-19 by SR : nouvelle méthode  :pour les FCC autres que celle en cours de validation,ne prendre que les FCC déjà rapprochées
+               If [F:PIHY]STA=3 & GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+                  Read [F:PSV]PSV0=[F:PIDW]NUM;[F:PIDW]PIDLIN;WPTHNUM;WPTDLIN
+                  If !fstat : L_MTFC+=W_MTFC : Endif
+               Else
+                  L_MTFC+=W_MTFC
+               Endif
+
+               For [PIDX] Where INVNUM = [F:PIDW]NUM
+&                           & INVLIN = [F:PIDW]PIDLIN
+&                           & PIHTYP = 3
+                 Read [PIHY]=[F:PIDX]NUM  : If fstat Raz [F:PIHY] Endif
+                 If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+                   # Credit invoice on this Additionnal invoice
+                   #If [F:PIDX]QTYSTU=0                 # Issue 102605 GA 11/2014 [F:PIDX]CPR may be wrong
+                   #   W_MTFC -= [F:PIDX]CPR
+                   #Else
+                   #   W_MTFC -= [F:PIDX]CPR * [F:PIDX]QTYSTU
+                   #Endif
+                   GBIDD1=[F:PIDX]AMTNOTLIN
+                   Call CONVERT_PIHY(GBIDD1,W_MTFC) From SBCLIB
+                   # Issue X3-25003 - 2018-02-19 by SR : nouvelle méthode  :pour les avoirs autres que celui en cours de validation,ne prendre que les acoirs déjà rapprochés
+                   If [F:PIHY]STA=3 & GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+                      Read [F:PSV]PSV0=[F:PIDX]NUM;[F:PIDX]PIDLIN;WPTHNUM;WPTDLIN
+                      If !fstat : L_MTFC-=W_MTFC : Endif
+                   Else
+                      L_MTFC-=W_MTFC
+                   Endif
+                 Endif
+               Next
+             Endif
+          Next
+         Endif
+       Next
+
+    When 36 :
+    # ----------------------------------------
+    # Additionnal invoice on receipt/on order
+    # ----------------------------------------
+    # Issue X3-75854-25003 - 2018-02-05 by SR : Don't Take into account complementary invoices posted on others receipt
+    # No complementay invoices posted on purchase orders for sub contract process
+    # Subcontract with EO: [F:PIDW]CPR=0 on detailed lines when LINTYP=3 (Service) or 4 (Components)
+#      For [PIDW] Where POHNUM = LPOHNUM & POPLIN = LPOPLIN
+#&                    & PIHTYP = 2
+#&                    & TYPORI <> 4
+#&                    & LINTYP > 2
+      For [PIDW] Where POHNUM = LPOHNUM & POPLIN = LPOPLIN
+&                    & PIHTYP = 2
+&                    & (TYPORI =1 | (TYPORI = 2 & NUMORI = WPTHNUM & LINORI = WPTDLIN))
+&                    & LINTYP > 2
+         Read [PIHY]=[F:PIDW]NUM  : If fstat Raz [F:PIHY] Endif
+         If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+           # Additionnal invoice
+           # L_MTFC += [F:PIDW]AMTNOTLIN     # Issue 102605 GA 11/2014 immediate conversion needed
+           GBIDD1=[F:PIDW]AMTNOTLIN
+           Call CONVERT_PIHY(GBIDD1,W_MTFC) From SBCLIB
+           # Issue X3-25003 - 2018-02-19 by SR : nouvelle méthode  :pour les FCC autres que celle en cours de validation,ne prendre que les FCC déjà rapprochées
+           If [F:PIHY]STA=3 &  GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+            Read [F:PSV]PSV0=[F:PIDW]NUM;[F:PIDW]PIDLIN;WPTHNUM;WPTDLIN
+            If !fstat : L_MTFC+=W_MTFC : Endif
+           Else
+            L_MTFC+=W_MTFC
+           Endif
+
+         # Issue 102605 GA 12/2014 acces to credit invoice rechecked
+           For [PIDX] Where INVNUM = [F:PIDW]NUM
+&                         & INVLIN = [F:PIDW]PIDLIN
+&                         & PIHTYP = 3
+             Read [PIHY]=[F:PIDX]NUM  : If fstat Raz [F:PIHY] Endif
+             If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+               # Credit invoice on this Additionnal invoice
+               # L_MTFC -= [F:PIDX]AMTNOTLIN     # Issue 102605 GA 11/2014 immediate conversion needed
+               GBIDD1=[F:PIDX]AMTNOTLIN
+               Call CONVERT_PIHY(GBIDD1,W_MTFC) From SBCLIB
+               # Issue X3-25003 - 2018-02-19 by SR : nouvelle méthode  :pour les avoirs autres que celui en cours de validation,ne prendre que les avoirs déjà rapprochés
+               If [F:PIHY]STA=3 & GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+                Read [F:PSV]PSV0=[F:PIDX]NUM;[F:PIDX]PIDLIN;WPTHNUM;WPTDLIN
+                 If !fstat : L_MTFC-=W_MTFC : Endif
+               Else
+                 L_MTFC-=W_MTFC
+               Endif
+             Endif
+           Next
+         Endif
+      Next
+    # ------------------------------
+    # Additionnal invoice on invoice
+    # ------------------------------
+    # Issue X3-75854-25003 - 2018-02-05 by SR : don't Take into account complementary invoices posted on invoices of others receipt
+      For [PIDZ] Where POHNUM = LPOHNUM & POPLIN = LPOPLIN
+&                    & PIHTYP = 1
+&                    & LINTYP > 2
+&                    & (TYPORI =1 | (TYPORI = 2 & NUMORI = WPTHNUM & LINORI = WPTDLIN))
+        Read [PIHY]=[F:PIDZ]NUM  : If fstat Raz [F:PIHY] Endif
+        If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+          For [PIDW] Where INVNUM = [F:PIDZ]NUM & INVLIN = [F:PIDZ]PIDLIN
+&                        & PIHTYP = 2
+&                        & TYPORI = 4
+&                        & LINTYP > 2
+             Read [PIHY]=[F:PIDW]NUM  : If fstat Raz [F:PIHY] Endif
+             If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+               # Additionnal invoice
+               # L_MTFC += [F:PIDW]AMTNOTLIN     # Issue 102605 GA 11/2014 immediate conversion needed
+               GBIDD1=[F:PIDW]AMTNOTLIN
+               Call CONVERT_PIHY(GBIDD1,W_MTFC) From SBCLIB
+               # Issue X3-25003 - 2018-02-19 by SR : nouvelle méthode  :pour les FCC autres que celle en cours de validation,ne prendre que les FCC déjà rapprochées
+               If [F:PIHY]STA=3 & GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+                  Read [F:PSV]PSV0=[F:PIDW]NUM;[F:PIDW]PIDLIN;WPTHNUM;WPTDLIN
+                  If !fstat : L_MTFC+=W_MTFC : Endif
+               Else
+                  L_MTFC+=W_MTFC
+               Endif
+               For [PIDX] Where INVNUM = [F:PIDW]NUM
+&                             & INVLIN = [F:PIDW]PIDLIN
+&                             & PIHTYP = 3
+                 Read [PIHY]=[F:PIDX]NUM  : If fstat Raz [F:PIHY] Endif
+                 If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+                   # Credit invoice on this Additionnal invoice
+                   # L_MTFC -= [F:PIDX]AMTNOTLIN     # Issue 102605 GA 11/2014 immediate conversion needed
+                   GBIDD1=[F:PIDX]AMTNOTLIN
+                   Call CONVERT_PIHY(GBIDD1,W_MTFC) From SBCLIB
+                   # Issue X3-25003 - 2018-02-19 by SR : nouvelle méthode  :pour les avoirs autres que celui en cours de validation,ne prendre que les avoirs déjà rapprochés
+                   If [F:PIHY]STA=3 & GPRIFLG = 2 & GPSVSTRDAT <= [F:POH]CREDAT
+                      Read [F:PSV]PSV0=[F:PIDX]NUM;[F:PIDX]PIDLIN;WPTHNUM;WPTDLIN
+                      If !fstat : L_MTFC-=W_MTFC : Endif
+                   Else
+                      L_MTFC-=W_MTFC
+                   Endif
+                 Endif
+               Next
+             Endif
+           Next
+         Endif
+      Next
+    # Issue 102605 GA 11/2014 immediate conversion needed: already done
+    # Check currency because using [F:PIDW]AMTNOTLIN
+    #  If L_MTFC<>0 & [F:PIDW]CPRCUR<>[F:PIH]CUR  # need to convert calculated amount ?
+    #     GBIDD1=L_MTFC
+    #     Call CONVERT_PIH(GBIDD1,L_MTFC) From SBCLIB
+    #  Endif
+
+Endcase
+
+End L_MTFC
+
+############################################################
+# SUMRCP : Total amount of additionnal invoice on currect receipt line
+############################################################
+# Parametres E : PVCRTYP = document type (10=WO, 36=EO)
+#              : PVCRNUM = document id
+#              : LPOHNUM = order id
+#              : LPOPLIN = order line number
+############################################################
+Funprog SUMRCP(PVCRTYP, PVCRNUM, LPOHNUM, LPOPLIN)
+Value Integer PVCRTYP
+Value Char    PVCRNUM
+Value Char    LPOHNUM
+Value Integer LPOPLIN
+
+Local Decimal L_MTFA, W_MTFA
+Local Integer WSTAT
+
+Local Char    WPTHNUM(GLONVCR) : WPTHNUM=[F:PTD]PTHNUM
+Local Integer WPTDLIN : WPTDLIN=[F:PTD]PTDLIN
+
+If !clalev([F:PIDW]) : Local File PINVOICED [PIDW] : Endif
+If !clalev([F:PIDX]) : Local File PINVOICED [PIDX] : Endif
+If !clalev([F:PIDZ]) : Local File PINVOICED [PIDZ] : Endif
+
+# Issue 100967 GA 06/2014 check if invoice is posted eg [F:PIHY]STA=3
+If !clalev([F:PIHY]) : Local File PINVOICE [PIHY] : Endif
+
+Case PVCRTYP
+    When 10 :
+    # ------------------------------
+    # Normal invoice(s) - Credit invoice(s)
+    # ------------------------------
+      If LPOHNUM<>""
+        Filter [PIDZ] Where POHNUM = LPOHNUM & POPLIN = LPOPLIN
+&                         & PIHTYP = 1
+      Else
+        Filter [PIDZ] Where PTHNUM = WPTHNUM & PTDLIN = WPTDLIN
+&                         & PIHTYP = 1
+      Endif
+      For [PIDZ]
+        Read [PIHY]=[F:PIDZ]NUM  : If fstat Raz [F:PIHY] Endif
+        If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+          # Normal invoice
+          #If [F:PIDZ]QTYSTU=0
+          #   L_MTFA -= [F:PIDZ]CPR
+          #Else
+          #   L_MTFA -= [F:PIDZ]CPR * [F:PIDZ]QTYSTU
+          #Endif
+          GBIDD1=[F:PIDZ]AMTNOTLIN
+          Call CONVERT_PIHY(GBIDD1,W_MTFA) From SBCLIB
+          L_MTFA+=W_MTFA
+
+         # Issue 102605 GA 12/2014 acces to credit invoice rechecked + use AMTNOTLIN
+          Filter [PIDW] Where INVNUM = [F:PIDZ]NUM
+&                           & INVLIN = [F:PIDZ]PIDLIN
+&                           & PIHTYP = 3
+          For [PIDW]
+             Read [PIHY]=[F:PIDW]NUM  : If fstat Raz [F:PIHY] Endif
+             If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+               # Credit invoice on current invoice
+               #If [F:PIDW]QTYSTU=0
+               #   L_MTFA -= [F:PIDW]CPR
+               #Else
+               #   L_MTFA -= [F:PIDW]CPR * [F:PIDW]QTYSTU
+               #Endif
+               GBIDD1=[F:PIDW]AMTNOTLIN
+               Call CONVERT_PIHY(GBIDD1,W_MTFA) From SBCLIB
+               L_MTFA-=W_MTFA
+             Endif
+          Next
+          Filter [PIDW]
+        Endif
+      Next
+      Filter [PIDZ]
+
+    When 36 :
+    # ------------------------------
+    # Normal invoice(s) - Credit invoice(s)
+    # ------------------------------
+      If LPOHNUM<>""
+        Filter [PIDZ] Where POHNUM = LPOHNUM & POPLIN = LPOPLIN
+&                         & PIHTYP = 1
+&                         & LINTYP > 2
+      Else
+        Filter [PIDZ] Where PTHNUM = WPTHNUM & PTDLIN = WPTDLIN
+&                         & PIHTYP = 1
+&                         & LINTYP > 2
+      Endif
+      For [PIDZ]
+        Read [PIHY]=[F:PIDZ]NUM  : If fstat Raz [F:PIHY] Endif
+        If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+          # Normal invoice
+          # L_MTFA += [F:PIDZ]AMTNOTLIN     # Issue 102605 GA 11/2014 immediate conversion needed
+          GBIDD1=[F:PIDZ]AMTNOTLIN
+          Call CONVERT_PIHY(GBIDD1,W_MTFA) From SBCLIB
+          L_MTFA+=W_MTFA
+
+         # Issue 102605 GA 12/2014 acces to credit invoice rechecked
+          Filter [PIDW] Where INVNUM = [F:PIDZ]NUM
+&                           & INVLIN = [F:PIDZ]PIDLIN
+&                           & PIHTYP = 3
+          For [PIDW]
+             Read [PIHY]=[F:PIDW]NUM  : If fstat Raz [F:PIHY] Endif
+             If [F:PIHY]STA=3 | ([F:PIHY]NUM = [F:PIH]NUM & [F:PIHY]STA=2)   # Issue 100967 GA 06/2014
+               # Credit invoice on current invoice
+               # L_MTFA -= [F:PIDW]AMTNOTLIN     # Issue 102605 GA 11/2014 immediate conversion needed
+               GBIDD1=[F:PIDW]AMTNOTLIN
+               Call CONVERT_PIHY(GBIDD1,W_MTFA) From SBCLIB
+               L_MTFA-=W_MTFA
+             Endif
+          Next
+          Filter [PIDW]
+        Endif
+      Next
+      Filter [PIDZ]
+    # Issue 102605 GA 11/2014 immediate conversion needed: already done
+    # Check currency because using [F:PIDW]AMTNOTLIN
+    #  If L_MTFA<>0 & [F:PIDW]CPRCUR<>[F:PIH]CUR  # need to convert calculated amount ?
+    #     GBIDD1=L_MTFA
+    #     Call CONVERT_PIH(GBIDD1,L_MTFA) From SBCLIB
+    #  Endif
+
+Endcase
+
+End L_MTFA
+
+
+############################################################################################
+Subprog LEC_MKO(LMFGTRKNUM, LOPETRKLIN)
+Variable    Char    LMFGTRKNUM
+Variable    Integer LOPETRKLIN
+
+LMFGTRKNUM = ""
+LMFGTRKLIN = 0
+
+### # FQ 64413 pb de perf: relecture des suivis d'un OF donné
+###   # lecture table suiv opération
+###   Link [MKO] With [MWS]WST0=[F:MKO]CPLWST;[F:MKO]MFGFCY As [OPK]
+### &            Where [F:MKO]PTHNUM = [M:SBCK]PTHNUM &
+### &                  [F:MKO]PTDLIN = [M:SBCK]PTDLIN &
+### &                  [F:MWS]WSTTYP = 3
+### &            Order By Key MKO0
+###
+### For [OPK] Where [F:MKO]PTHNUM = [M:SBCK]PTHNUM &
+### &               [F:MKO]PTDLIN = [M:SBCK]PTDLIN &
+### &               [F:MWS]WSTTYP = 3
+###     LMFGTRKNUM = [F:MKO]MFGTRKNUM
+###     LOPETRKLIN = [F:MKO]OPETRKLIN
+###   Next
+### FQ 65591 Pb de report correction V5 [F:PTDW]MFGNUM =>[F:PTDW]VCRNUM & [F:PTDW]VCRTYP=10
+  Local File PRECEIPTD [PTDW]
+  Read [PTDW]PTD0=[M:SBCK]PTHNUM;[M:SBCK]PTDLIN
+  If !fstat
+    Filter [MKO] Where [F:MKO]MFGNUM = [F:PTDW]VCRNUMORI &
+&                      [F:MKO]PTHNUM = [F:PTDW]PTHNUM &
+&                      [F:MKO]PTDLIN = [F:PTDW]PTDLIN
+&                Order By Key MKO1
+    For [MKO]
+        Read [MWS]WST0=[F:MKO]CPLWST;[F:MKO]MFGFCY
+        If !fstat & [F:MWS]WSTTYP = 3
+            LMFGTRKNUM = [F:MKO]MFGTRKNUM
+            LOPETRKLIN = [F:MKO]OPETRKLIN
+            Break
+        Endif
+    Next
+    Filter [MKO]
+  Endif
+  Close Local File [PTDW]
+
+End
+
+
+############################################################################################
+Subprog MAJ_MFO(LMFGNUM, LRET)
+Value     Char     LMFGNUM
+Variable  Integer  LRET
+
+# écriture opération
+[F:MFO]UPDDAT=date$
+[F:MFO]UPDUSR=GUSER
+[F:MFO]EXPNUM=[C]EXPORT
+Rewrite [MFO]
+If fstat : LRET = 1 : End : Endif
+
+# GA 05/2008 V6 ---- Ecriture des sections de la ligne operation -----#
+Call UPDMFO_CPTANALIN(LRET) From MFGLIBO
+If LRET = 1 : End : Endif
+
+LRET = 0
+End
+
+############################################################################################
+Subprog CRE_MFO(LMFGNUM, LRET)
+Value     Char     LMFGNUM
+Variable  Integer  LRET
+
+# écriture opération
+[F:MFO]CREDAT=date$
+[F:MFO]CREUSR=GUSER
+[F:MFO]EXPNUM=[C]EXPORT
+Write [MFO]
+If fstat : LRET = 1 : End : Endif
+
+# GA 05/2008 V6 ---- Ecriture des sections de la ligne operation -----#
+Call UPDMFO_CPTANALIN(LRET) From MFGLIBO
+If LRET = 1 : End : Endif
+
+LRET = 0
+End
+
+############################################################################################
+Subprog MAJ_OF(LMFGNUM, LRET)
+Value     Char     LMFGNUM
+Variable  Integer  LRET
+Local     Date     TODAY
+Local     Integer  WWIP
+Local     Integer  WPRN
+TODAY = date$
+
+LRET = 0
+
+Read [MFG]MFG0=LMFGNUM
+If fstat : LRET = 1 : End : Endif
+
+If find([F:MFG]SCDFLG,2,4)
+    Raz [M:JALK]
+    [M:JALK]CODORI = 1
+    [M:JALK]CODMAJ = 0
+    [M:JALK]CODTRS = 0
+    [M:JALK]MFGFCY = [F:MFG]MFGFCY
+    [M:JALK]MFGNUM = [F:MFG]MFGNUM
+    [M:JALK]MFGSTA = [F:MFG]MFGSTA
+    If [F:PJA]MFGFCY <> [F:MFG]MFGFCY
+        Read [PJA]PJA0=[F:MFG]MFGFCY
+        If !fstat : [M:JALK]JAVFLG = [F:PJA]AUTFRWSCD : Endif
+    Endif
+    Call DEJALONNE From JALLIBA
+    If [M:JALK]CODRET = 0
+        Call JALONNE From JALLIB
+    Endif
+Endif
+
+Call UPDATE_MFGTRKFLG(LMFGNUM, LRET) From MFGLIB
+
+End
+
+############################################################################################
+# FQ 60622 & 60379 GA 12/2009                            revu selon ANALYSE_LOC de MFGLIBM #
+############################################################################################
+# Ce sous-programme n'est appelé que si on a changé de fournisseur
+# par rapport à ce que contient MFGOPE ...
+############################################################################################
+Subprog VERIF_MAT(LMFGNUM, LOPENUM, LMAT)
+Value     Char     LMFGNUM
+Value     Integer  LOPENUM
+Variable  Char  LMAT
+Local     Integer TROUVE
+Local     Char    WBPRNUM (GLONBPR): WBPRNUM = [M:SBCK]BPSNUM
+Local     Char    WBPAADD (GLONBPA): WBPAADD = [M:SBCK]BPAADD
+Local     Char    WLOC    (GLONLOC): WLOC    = ""
+
+If clalev([F:BPS])   = 0 : Local File BPSUPPLIER    [BPS]   : Endif
+
+LMAT = ""
+
+If [F:MFG]MFGNUM<>LMFGNUM
+  Read [MFG]MFG0=LMFGNUM
+  If fstat : End : Endif
+Endif
+If [F:MFO]MFGNUM<>LMFGNUM | [F:MFO]OPENUM<>LOPENUM    # Issue 84830 GA 10/2012 si opé splittée, on perd la fraction courante
+  Read [MFO]MFO0=LMFGNUM;LOPENUM
+  If fstat : End : Endif
+Endif
+
+For [MFM]MFM0 Where MFGNUM = LMFGNUM & BOMOPE = LOPENUM
+    If [F:MFM]MATSTA < 3
+     # FQ 60622 & 60379 GA 12/2009 Emplacement sous-traitance ?
+       If [F:MFO]SCOWST<>"" & [F:MFM]LOC=""
+           Read [MWS]WST0=[F:MFO]SCOWST;[F:MFG]MFGFCY
+           If !fstat
+               If [F:MWS]STOLOC <> "" : WLOC = [F:MWS]STOLOC : Endif
+           Endif
+       Endif
+       If WBPRNUM<>"" & WBPAADD<>""
+          Call FIND_SCOLOC([F:MFO]BPRNUM, [F:MFO]BPAADD, WLOC, GBIDC1, GBIDC2) From BPRLIB
+       Endif
+       If WLOC <> "" & [F:MFM]LOC <> WLOC
+          # si matière allouée détail, message
+          If [F:MFM]ALLSTA > 3 : LMAT = [F:MFM]ITMREF : Endif
+          [F:MFM]LOC = WLOC
+          Rewrite [MFM]
+       Endif
+    Endif
+Next
+
+End
+
+############################################################################################
+Subprog OLD_VERIF_MAT(LMFGNUM, LOPENUM, LMAT)  ####### OBSOLETE ##########
+Value     Char     LMFGNUM
+Value     Integer  LOPENUM
+Variable  Char  LMAT
+Local     Integer TROUVE
+Local     Char    WBPRNUM(GLONBPR) : WBPRNUM = [M:SBCK]BPSNUM
+Local     Char    WBPAADD(GLONBPD) : WBPAADD = [M:SBCK]BPAADD
+
+If clalev([F:BPS])   = 0 : Local File BPSUPPLIER    [BPS]   : Endif
+
+LMAT = ""
+
+Read [MFG]MFG0=LMFGNUM
+If fstat : End : Endif
+
+For [MFM]MFM0 Where MFGNUM = LMFGNUM
+    If [F:MFM]BOMOPE = LOPENUM
+        If [F:MFM]MATSTA < 3
+            TROUVE = 0       # FQ 60622 GA 12/2009 Champ LOC n'est pas renseigné sur toutes les matières
+            # FQ 55325 message seult si maj
+            # si matière allouée détail, message
+            # If [F:MFM]ALLSTA > 3 : LMAT = [F:MFM]ITMREF : Endif
+            # Recherche de l'emplacement du client livré
+            If WBPRNUM <> "" & WBPAADD <> ""
+                If clalev([F:BPD])   = 0 : Local File BPDLVCUST   [BPD]   : Endif
+                Read [BPD]BPD0=WBPRNUM;WBPAADD
+                If fstat : Raz [BPD] : Endif                # 05.05 30221
+                If [F:BPD]SCOLOC <> ""
+                    If [F:MFM]LOC <> [F:BPD]SCOLOC   # FQ 55325 message seult si maj
+                       [F:MFM]LOC = [F:BPD]SCOLOC
+                       # si matière allouée détail, message
+                       If [F:MFM]ALLSTA > 3 : LMAT = [F:MFM]ITMREF : Endif
+                    Endif
+                    TROUVE = 1
+                Endif
+            Endif
+            # Recherche de l'emplacement du fournisseur
+            If TROUVE =0
+                If WBPRNUM <> ""
+                    If clalev([F:BPS])   = 0 : Local File BPSUPPLIER    [BPS]   : Endif
+                    Read [BPS]BPS0=WBPRNUM
+                    If !fstat
+                        If [F:BPS]LOC <> ""
+                            If [F:MFM]LOC <> [F:BPS]LOC   # FQ 55325 message seult si maj
+                               [F:MFM]LOC = [F:BPS]LOC
+                               # si matière allouée détail, message
+                               If [F:MFM]ALLSTA > 3 : LMAT = [F:MFM]ITMREF : Endif
+                            Endif
+                            TROUVE = 1
+                        Endif
+                    Endif
+                Endif
+            Endif
+            If TROUVE : Rewrite [MFM] : Endif
+        Endif
+    Endif
+Next
+
+End
+
+# Issue 100967 GA 06/2014
+#####################################################################
+#  4 - Coût sous-traitance
+#  8 - Frais sous-traitance
+#####################################################################
+$READ_MWI_MKO
+Raz [F:MWI]
+W_MNT    -= func SBCLIB.SUMTXNTYP(10,[F:MKO]MFGNUM,0,0,[F:MKO]MFGTRKNUM, [F:MKO]OPETRKLIN,4)
+W_MNTCRG -= func SBCLIB.SUMTXNTYP(10,[F:MKO]MFGNUM,0,0,[F:MKO]MFGTRKNUM, [F:MKO]OPETRKLIN,8)
+Return
+# Issue 100967 GA 06/2014
+############################################################
+# SUMTXNTYP : Retourne le montant total pour une entrée donnée
+############################################################
+# Parametres E : PVCRTYP = type document (10=OF, 36=EO)
+#              : PVCRNUM = n° de document
+#              : PVCRLIN = ligne de document
+#              : PVCRSEQ = sequence de document
+#              : PTRKNUM = n° document d'entrée
+#              : PTRKLIN = ligne document d'entrée
+#              : PTXNTYP = type de coût
+#                  1 - Coût matière
+#                  2 - Coût main d'oeuvre
+#                  3 - Coût machine
+#                  4 - Coût sous-traitance
+#                  5 - Frais matière
+#                  6 - Frais main d'oeuvre
+#                  7 - Frais machine
+#                  8 - Frais sous-traitance
+#                  9 - Ecart matière
+#                  10 - Ecart main d'oeuvre
+#                  11 - Ecart machine
+#                  12 - Ecart sous-traitance
+#                  13 - Ecart frais généraux
+#                  14 - Déclaration production
+#                  15 - Solde d'encours
+#                  16 - Rebut opératoire
+#                  17 - Régularisation
+#                  18 - Solde suivi sans OF
+#                  19 - Elément facturation
+############################################################
+Funprog SUMTXNTYP(PVCRTYP, PVCRNUM,PVCRLIN,PVCRSEQ, PTRKNUM, PTRKLIN, PTXNTYP)
+Value Integer PVCRTYP
+Value Char    PVCRNUM
+Value Integer PVCRLIN
+Value Integer PVCRSEQ
+Value Char    PTRKNUM
+Value Integer PTRKLIN
+Value Integer PTXNTYP
+
+Local Decimal LINV : LINV=0
+
+If PVCRSEQ>0
+  Filter [MWI] Where VCRTYP    = PVCRTYP
+&                  & VCRNUM    = PVCRNUM
+&                  & BOMSEQ    = PVCRSEQ
+&                  & MFGTRKNUM = PTRKNUM
+&                  & MFGTRKLIN = PTRKLIN
+&                  & TXNTYP    = PTXNTYP
+Else
+  Filter [MWI] Where VCRTYP    = PVCRTYP
+&                  & VCRNUM    = PVCRNUM
+&                  & MFGTRKNUM = PTRKNUM
+&                  & MFGTRKLIN = PTRKLIN
+&                  & TXNTYP    = PTXNTYP
+Endif
+For [MWI]
+    # Issue 102605 GA 01/2015 only direct cost has to be corrected
+    If [F:MWI]TXNTYP=4 & [F:MWI]CSTELM(2)<>0
+      LINV += [F:MWI]CSTELM(3)
+    Else
+      LINV += [F:MWI]AMOUNT
+    Endif
+Next
+Filter [MWI]
+
+End LINV
+# Issue 101179 & 100967 GA 07/2014
+############################################################
+# CONVERT_PIH :
+# According to TRTACHFAC1: check currency rate
+# and use [F:PIH] informations to convert an amount or price
+############################################################
+Subprog CONVERT_PIH(MTORG,MTDES)
+Value    Decimal MTORG            : # Montant origine
+Variable Decimal MTDES            : # Montant destination
+
+Local Integer WI,WSTAT: WSTAT=0
+Local Decimal WRATCUR : WRATCUR=0
+  #----- Prix net exprimé en devise société -----#
+  WI=find(GLOCALDEV,[F:PIH]CURLED)
+  If WI & [F:PIH]RATDIV(WI-1)<>0
+    WRATCUR=[F:PIH]RATMLT(WI-1)/[F:PIH]RATDIV(WI-1)
+  Else
+    WRATCUR=0
+  Endif
+  If WRATCUR=0
+    Call CONVERT2([F:PIH]CUR,GCUR,GCUR,[F:PIH]CURTYP,[F:PIH]RATDAT,MTORG,MTDES,
+&                 WSTAT) From TRTDEV
+  Else
+    MTDES=MTORG*WRATCUR
+  Endif
+End
+############################################################
+# CONVERT_PIHY :           # Issue 102605 GA 11/2014
+# !!! currency rate may change for each invoice !!!
+############################################################
+Subprog CONVERT_PIHY(MTORG,MTDES)
+Value    Decimal MTORG            # Orignal amount
+Variable Decimal MTDES            # Converted amount
+
+Local Integer WI,WSTAT: WSTAT=0
+Local Decimal WRATCUR : WRATCUR=0
+
+If [F:PIHY]CUR=GCUR
+  MTDES=MTORG
+Else
+  #----- Prix net exprimé en devise société -----#
+  WI=find(GLOCALDEV,[F:PIHY]CURLED)
+  If WI & [F:PIHY]RATDIV(WI-1)<>0
+    WRATCUR=[F:PIHY]RATMLT(WI-1)/[F:PIHY]RATDIV(WI-1)
+  Else
+    WRATCUR=0
+  Endif
+  If WRATCUR=0
+    Call CONVERT2([F:PIHY]CUR,GCUR,GCUR,[F:PIHY]CURTYP,[F:PIHY]RATDAT,MTORG,MTDES,
+&                 WSTAT) From TRTDEV
+  Else
+    MTDES=MTORG*WRATCUR
+  Endif
+Endif
+End
+

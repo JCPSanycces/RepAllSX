@@ -1,0 +1,848 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#111269 RBU - Salesforce integration
+# X3 to Salesforce integration - uses rest and json
+# Requires Salesforce-auth module in syracuse
+# Called from SUBBPC and SUBBPR - MODIF action
+
+$SF_UPDATE
+
+# Check parameter, no activity code for Salesforce integration - parameter is also checked in calling scripts
+# but add here as other scripts may be added to call this routine in the future
+Local Char SFCRM(2)
+Call PARAM("","SFCRM", SFCRM) From ADOVAL
+If val(SFCRM)<>[V]CST_AYES : Return : Endif
+If dim(GWEBSERV)>0 and GWEBSERV=[V]CST_ATRUE : Return : Endif   # Soap update - update from SF calling  X3 thru soap
+If instr(1,GACTX.ASOLUTION,"CLOUD")=0 Return : Endif            # Runs only on cloud
+
+Local Integer MY_STATUS, SF_FOUND
+Local Char TOKEN(250),ENDPOINTURL(250),MESSAGE(250)
+Local Char ADDRESS_PROP(50)(1..100,1..2),ADDRESS_VAL(100)(1..100,1..2)
+Local Char BPCNUM(GLONBPC)
+Local Char SF_ID(50), SF_CONTACT_LIST(50)(1..100,1..2), X3_CONTACT_LIST(50)(1..100,1..2)
+
+Gosub GET_BPCNUM
+
+If [L]MY_STATUS <> [V]CST_AOK                     # Do not process SF update based on GES function
+  [L]MY_STATUS = [V]CST_AOK
+  # X3-62503 begin
+  #  Goto FINISH
+  Return
+  # X3-62503 end
+Endif
+
+If [L]BPCNUM=""
+  # Unable to update Salesforce customer from X3 [x3 customer number]
+  [L]MESSAGE = func ASYRFNC.MES2(mess(5001,7719,1), "X34005001", [L]BPCNUM)
+  [L]MY_STATUS = [V]CST_AERROR
+Endif
+
+If find([L]MY_STATUS, [V]CST_AOK, [V]CST_AINFO, [V]CST_AWARNING)
+  [L]MY_STATUS = func GET_SF_TOKEN(TOKEN,ENDPOINTURL,MESSAGE)
+  If [L]MY_STATUS = 500                           # 500 means user does not have access to salesforce - allow save to continue
+    Return
+  Endif
+Endif
+
+#TODO: remove line if clause when salesforce-auth node module installed on gx3app and aveng solution
+If [L]MY_STATUS <> [V]CST_AOK & instr(1,MESSAGE,"X34005011")<>0
+  Return
+Endif
+#End todo
+
+
+If find([L]MY_STATUS, [V]CST_AOK, [V]CST_AINFO, [V]CST_AWARNING)
+  [L]MY_STATUS = func GET_SF_X3_DATA([L]TOKEN, [L]ENDPOINTURL, [L]BPCNUM, [L]ADDRESS_PROP, [L]ADDRESS_VAL, [L]SF_ID, MESSAGE)
+Endif
+
+If find([L]MY_STATUS, [V]CST_AOK, [V]CST_AINFO, [V]CST_AWARNING) and [L]SF_ID<>AVOID.ACHAR
+  [L]MY_STATUS = func SF_UPDATE_ACCOUNT([L]TOKEN, [L]ENDPOINTURL, [L]BPCNUM, [L]ADDRESS_PROP, [L]ADDRESS_VAL, MESSAGE)
+Endif
+
+If find([L]MY_STATUS, [V]CST_AOK, [V]CST_AINFO, [V]CST_AWARNING) and [L]SF_ID<>AVOID.ACHAR
+  [L]MY_STATUS = func SF_GET_CONTACT_LIST([L]TOKEN, [L]ENDPOINTURL, [L]BPCNUM, [L]SF_ID, [L]SF_CONTACT_LIST, [L]MESSAGE)
+Endif
+
+# Set GOK/GMESSAGE for classic code - abort the update
+If [L]MY_STATUS = [V]CST_AERROR
+  GOK=[V]CST_AFALSE
+  GMESSAGE = [L]MESSAGE
+Endif
+Return
+
+# Determine BPCNUM
+$GET_BPCNUM
+Case GFONCTION
+  When "GESBPC"     : [L]BPCNUM=[M:BPC0]BPCNUM : [L]MY_STATUS = [V]CST_AOK
+  When "GESBPR"     : [L]BPCNUM=[M:BPR0]BPRNUM : Gosub GET_BPC_BY_BPR
+Endcase
+
+Return
+
+$GET_BPC_BY_BPR
+If [F:BPR]BPCFLG = [V]CST_AYES
+  Local File BPCUSTOMER [BPC]
+  Read [F:BPC]BPC0 = [L]BPCNUM
+  If fstat
+    [L]MY_STATUS = -1                   # No BPC then No update
+  Else
+    [L]MY_STATUS = [V]CST_AOK
+  Endif
+Else
+  [L]MY_STATUS = -1                     # Partner is not customer
+Endif
+Return
+
+
+# Get Token
+Funprog GET_SF_TOKEN(TOKEN,ENDPOINTURL,MESSAGE)
+Variable Char TOKEN(),ENDPOINTURL(),MESSAGE()
+Local Integer MY_STATUS
+[L]MY_STATUS = func MY_SF_TOKEN(TOKEN,ENDPOINTURL,MESSAGE)
+End [L]MY_STATUS
+
+Funprog GET_SF_X3_DATA(TOKEN, ENDPOINTURL, BPCNUM, ADDRESS_PROP, ADDRESS_VAL, SF_ID, MESSAGE)
+Value Char TOKEN()
+Value Char ENDPOINTURL()
+Value Char BPCNUM()
+Variable Char ADDRESS_PROP()(1..100,1..2)
+Variable Char ADDRESS_VAL()(1..100,1..2)
+Variable Char SF_ID(),MESSAGE()
+
+
+Local Integer HTTP_STATUS, MY_STATUS
+Local Char URL(250),ARGUMENTS(250)
+Local Clbfile RESHEAD(1),RESBODY(1)
+Local Datetime SF_UPDDATTIM
+
+# Read SF account by X3Id (BPCNUM)
+[L]URL = "sobjects/Account/sagex3s__X3CustomerNumber__c/"+[L]BPCNUM #+ (BPUNUM)
+[L]ARGUMENTS = '"'+TOKEN+'","'+ENDPOINTURL+'","GET", "'+URL+'","{}"'
+
+[L]HTTP_STATUS  = func ASYRWEBSER.EXEC_JS("salesforce-auth", "querySFData", "wait", [L]ARGUMENTS, '', 0, '', '0', [L]RESHEAD, [L]RESBODY)
+[L]MY_STATUS  = func GET_RESBODY_STATUSCODE([L]RESBODY)
+If [L]HTTP_STATUS <> 200 | [L]MY_STATUS<>200
+  [L]MY_STATUS = [V]CST_AINFO
+  # "Cannot find X3 customer in SF= resbody
+  [L]MESSAGE = func ASYRFNC.MES2(mess(5002,7719,1),"X34005002",[L]RESBODY)
+  Goto FINISH
+Else
+  Call REPLACE_NULL([L]RESBODY)                                # Change null to avoid.achar
+  [L]MY_STATUS = func GET_ADDRESS_PROPERTIES(ADDRESS_PROP)              # Set properties wanted from SF info
+  [L]MY_STATUS = func GET_ADDRESS_VALUES([L]BPCNUM,ADDRESS_PROP,RESBODY,ADDRESS_VAL,MESSAGE)
+  [L]SF_ID = func AJSONLIB.GET_PROP(RESBODY,"Id")             # For use on contact updates
+Endif
+
+$FINISH
+End [L]MY_STATUS
+
+#**
+#*
+#* REPLACE_NULL = Remove nulls from json string
+#*
+#* @param TMPCLB - Input and returned as clbfile with nulls replaced as ""
+#*!
+Subprog REPLACE_NULL(TMPCLB)
+Variable Clbfile TMPCLB
+Local Integer I
+[L]I=instr(1,[L]TMPCLB,"null")
+While [L]I<>0
+  [L]TMPCLB=left$([L]TMPCLB,I-1)+'""'+right$(TMPCLB,I+4)
+  [L]I=instr(1,[L]TMPCLB,"null")
+Wend
+End
+
+Funprog GET_ADDRESS_PROPERTIES(ADDRESS_PROP)
+Variable Char ADDRESS_PROP()(1..100,1..2)
+Local Integer I
+
+# property sequence for SF and X3 must match
+# SF properties
+I+=1 : ADDRESS_PROP(I,1)="AccountNumber"            # SF Account number
+I+=1 : ADDRESS_PROP(I,1)="Name"                     # SF Name
+I+=1 : ADDRESS_PROP(I,1)="BillingStreet"            # Billing street
+I+=1 : ADDRESS_PROP(I,1)="BillingCity"              # Billing City
+I+=1 : ADDRESS_PROP(I,1)="BillingStateCode"         # Billing State/province
+I+=1 : ADDRESS_PROP(I,1)="BillingPostalCode"        # Billing Zip/Postal code
+#I+=1 : ADDRESS_PROP(I,1)="BillingCountry"          # Billing country
+I+=1 : ADDRESS_PROP(I,1)="BillingCountryCode"       # Billing country
+I+=1 : ADDRESS_PROP(I,1)="Website"                  # Billing Website
+I+=1 : ADDRESS_PROP(I,1)="Phone"                    # Billing Phone
+I+=1 : ADDRESS_PROP(I,1)="Fax"                      # Fax Phone
+I+=1 : ADDRESS_PROP(I,1)="CreatedDate"              # Billing create datetime in milliseconds - assume UTC
+I+=1 : ADDRESS_PROP(I,1)="LastModifiedDate"         # Billing last update datetime in milliseconds - assume UTC
+I+=1 : ADDRESS_PROP(I,1)="ShippingStreet"           # Shipping street
+I+=1 : ADDRESS_PROP(I,1)="ShippingCity"             # Shipping City
+I+=1 : ADDRESS_PROP(I,1)="ShippingStateCode"        # Shipping State/province
+I+=1 : ADDRESS_PROP(I,1)="ShippingPostalCode"       # Shipping Zip/Postal code
+#I+=1 : ADDRESS_PROP(I,1)="ShippingCountry"         # Shipping country - use country code, not country name
+I+=1 : ADDRESS_PROP(I,1)="ShippingCountryCode"      # Shipping country
+I+=1 : ADDRESS_PROP(I,1)="CreatedDate"              # Shipping create datetime = Billing create datetime in SF
+I+=1 : ADDRESS_PROP(I,1)="LastModifiedDate"         # Shipping last update datetime = Billing last update datetime in SF
+
+# X3 Properties
+I=0
+I+=1 : ADDRESS_PROP(I,2)="[F:BPC]BPCNUM"            # X3 does not have the SF account number
+I+=1 : ADDRESS_PROP(I,2)="[F:BPC]BPCNAM"            # X3 Name = BPCNAM(0)
+I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]BPAADDLIG"      # Billing street
+I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]CTY"            # Billing City
+I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]SAT"            # Billing State/province
+I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]POSCOD"         # Billing Zip/Postal code
+#I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]CRYNAM"        # Billing country - use country code, not country name
+I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]CRY"            # Billing country
+I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]FCYWEB"         # Billing Website
+I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]TEL"            # Billing Phone
+I+=1 : ADDRESS_PROP(I,2)="[F:BPASF1]FAX"            # Billing Fax
+I+=1 : ADDRESS_PROP(I,2)="num$([F:BPA]CREDATTIM)"   # Billing create datetime no milliseconds - in UTC
+I+=1 : ADDRESS_PROP(I,2)="num$([F:BPA]UPDDATTIM)"   # Billing address last update datetime no milliseconds - in UTC
+I+=1 : ADDRESS_PROP(I,2)="[F:BPA]BPAADDLIG"         # Shipping street - different address record
+I+=1 : ADDRESS_PROP(I,2)="[F:BPA]CTY"               # Shipping City
+I+=1 : ADDRESS_PROP(I,2)="[F:BPA]SAT"               # Shipping State/province
+I+=1 : ADDRESS_PROP(I,2)="[F:BPA]POSCOD"            # Shipping Zip/Postal code
+#I+=1 : ADDRESS_PROP(I,2)="[F:BPA]CRYNAM"           # Shipping country - use country code, not country name
+I+=1 : ADDRESS_PROP(I,2)="[F:BPA]CRY"               # Shipping country
+I+=1 : ADDRESS_PROP(I,2)="num$([F:BPA]CREDATTIM)"   # Shipping create datetime no milliseconds - in UTC - for reference
+I+=1 : ADDRESS_PROP(I,2)="num$([F:BPA]UPDDATTIM)"   # Shipping address last update datetime no milliseconds - in UTC - for reference
+
+End [V]CST_AOK
+
+#**
+#* GET_ADDRESS_VALUES - Resolves the values associated to the properties for both Salesforce and X3
+#*
+#* @param BPCNUM        - X3 customer id
+#* @param ADDRESS_PROP  - Salesforce and X3 property names
+#* @param RESBODY       - Data retrieved from X3 (JSON clob)
+#* @param ADDRESS_VAL   - Returned values
+#* @param MESSAGE       - Returned message
+#* @return MY_STATUS    - [V]CST values
+#*!
+Funprog GET_ADDRESS_VALUES(BPCNUM,ADDRESS_PROP,RESBODY,ADDRESS_VAL,MESSAGE)
+Value Char BPCNUM()
+Value Char ADDRESS_PROP()(1..100,1..2)
+Value Clbfile RESBODY
+Variable Char ADDRESS_VAL()(1..100,1..2)
+Variable Char MESSAGE()
+
+Local Integer I, MY_STATUS,CNT
+Local Char BPCINV(GLONBPC), BPAINV(GLONADR)
+
+# Customer name required for Salesforce
+If [L]MY_STATUS = [V]CST_AOK
+  If vireblc([F:BPC]BPCNAM(0),2)=AVOID.ACHAR
+    [L]MY_STATUS = [V]CST_AERROR
+    # Customer name is required for Salesforce
+    [L]MESSAGE =  func ASYRFNC.MES1(mess(5015,7719,1),"X34005015")
+    End [L]MY_STATUS
+  Endif
+Endif
+
+# find last entry in properties
+[L]CNT = find("",ADDRESS_PROP(1..100,1))-1
+
+# GET SF properties from the result body
+For I=1 To [L]CNT
+  ADDRESS_VAL(I,1)=func AJSONLIB.GET_PROP(RESBODY,ADDRESS_PROP(I,1))
+Next
+
+Local File BPADDRESS [BPASF1]             # Bill to address
+Local File BPADDRESS [BPA]                # Ship to address (default address)
+#Local File BPARTNER [BPR]                 # Customer name
+
+[L]BPCINV = [F:BPC]BPCINV
+[L]BPAINV = [F:BPC]BPAINV
+
+# Lookup bill to address
+Read [F:BPASF1]BPA0=1;[L]BPCINV;[L]BPAINV
+If fstat
+  # -No X3 bill to address found
+  [L]MESSAGE = func ASYRFNC.MES2(mess(5003,7719,1),"X34005003",[L]BPCNUM)
+  [L]MY_STATUS = [V]CST_AERROR
+  Goto FINISH_ADDRESS
+Endif
+
+# Lookup ship to address as default address from BPCUSTOMER even BPARTNER modified
+Filter [F:BPA] Where [F:BPA]BPATYP=1 and [F:BPA]BPANUM=[L]BPCNUM and [F:BPA]BPAADD=[F:BPC]BPDADD
+Read [F:BPA]First
+If fstat
+  # No X3 ship to address found
+  [L]MESSAGE = func ASYRFNC.MES2(mess(5004,7719,1), "X34005004",[L]BPCNUM)
+  [L]MY_STATUS = [V]CST_AERROR
+  Goto FINISH_ADDRESS
+Endif
+
+#Compare Dates-no longer comparing dates
+  Local Char TMP_ADDRESS(250),FMT_PHONE(50)
+  For I=1 To [L]CNT
+    If instr(1,ADDRESS_PROP(I,2),"[F:BPASF1]BPAADDLIG")
+      Call SET_X3_ADDRESS([F:BPASF1]BPAADDLIG,TMP_ADDRESS)
+      ADDRESS_VAL(I,2)=[L]TMP_ADDRESS
+    Elsif instr(1,ADDRESS_PROP(I,2),"[F:BPA]BPAADDLIG")
+      Call SET_X3_ADDRESS([F:BPA]BPAADDLIG,TMP_ADDRESS)
+      ADDRESS_VAL(I,2)=[L]TMP_ADDRESS
+    Else
+      ADDRESS_VAL(I,2) = evalue([L]ADDRESS_PROP(I,2))
+    Endif
+  Next
+#Endif
+
+$FINISH_ADDRESS
+LogicClose File [F:BPA],[F:BPR],[F:BPASF1]
+End [L]MY_STATUS
+
+
+
+
+#**
+#* SET_X3_TEL - format the phone according to the country on the address
+#*
+#* @param TEL - unformatted phone number
+#* @param CRY - country code
+#* @param TMP_PHONE - formatted phone number. If no format found, returned as unformatted phone number
+#*!
+Subprog SET_X3_TEL(TEL,CRY,TMP_PHONE)
+Value Char TEL()
+Value Char CRY()
+Variable Char TMP_PHONE()
+
+Call FMTTELPAY([L]CRY) From TRTDIV
+If GFMT<>""
+ TMP_PHONE = format$("K:"+GFMT,[L]TEL)
+Else
+ TMP_PHONE = TEL
+Endif
+End
+
+#**
+#* SET_X3_ADDRESS - Converts array address to SF address with carriage return and line feed in a single char
+#*
+#* @param BPA_ADDRESS - address from X3 tables
+#* @param TMP_ADDRESS - address returned in a char
+#*!
+Subprog SET_X3_ADDRESS(BPA_ADDRESS,TMP_ADDRESS)
+Value Char BPA_ADDRESS()()
+Variable Char TMP_ADDRESS
+Local Integer I
+Raz TMP_ADDRESS
+
+For I=0 To dim(BPA_ADDRESS)-1
+  BPA_ADDRESS(I)=escJson(BPA_ADDRESS(I))
+Next
+
+[L]TMP_ADDRESS = BPA_ADDRESS(0)
+
+If BPA_ADDRESS(1)<>""
+  If [L]TMP_ADDRESS<>""
+    [L]TMP_ADDRESS=[L]TMP_ADDRESS+'\r\n'+BPA_ADDRESS(1)
+  Endif
+Endif
+
+If BPA_ADDRESS(2)<>""
+  If [L]TMP_ADDRESS<>""
+    [L]TMP_ADDRESS=[L]TMP_ADDRESS+'\r\n'+BPA_ADDRESS(2)
+  Endif
+Endif
+End
+
+#**
+#* SF_UPDATE_ACCOUNT - Send X3 customer information to Salesforce account
+#*
+#* @param TOKEN - assigned by salesforce-auth module
+#* @param ENDPOINTURL - assigned by salesforce-auth module
+#* @param BPCNUM - X3 customer number
+#* @param ADDRESS_PROP - X3 and SF property names
+#* @param ADDRESS_VAL - X3 and SF property values
+#* @param MESSAGE - messages returned from update
+#*
+#* MY_STATUS = return value
+#*!
+Funprog SF_UPDATE_ACCOUNT(TOKEN, ENDPOINTURL, BPCNUM, ADDRESS_PROP, ADDRESS_VAL, MESSAGE)
+Value Char TOKEN()
+Value Char ENDPOINTURL()
+Value Char BPCNUM()
+Value Char ADDRESS_PROP()(1..100,1..2)
+Value Char ADDRESS_VAL()(1..100,1..2)
+Variable Char MESSAGE()
+
+Local Clbfile JSON(1),RESHEAD(1),RESBODY(1),ARGUMENTS(1)
+Local Integer I,CNT,LAST_ENTRY,MY_STATUS,HTTP_STATUS
+Local Char URL(250)
+
+[L]LAST_ENTRY = find("",[L]ADDRESS_PROP(1..100,1))-1     # find last entry in properties
+
+# Build JSON Body
+# Start with index 2 - index 1 is the account number and skip datetimes
+For I=2 To [L]LAST_ENTRY
+If instr(1,[L]ADDRESS_PROP(I,2),"DATTIM")=0
+  If [L]ADDRESS_VAL(I,1)<>[L]ADDRESS_VAL(I,2)         # X3 is different than SF
+    [L]CNT+=1
+    If [L]CNT=1                                       # Set leading {
+      [L]JSON="{"
+      If instr(1,tolower([L]ADDRESS_PROP(I,1)),"street")
+        [L]JSON +='"'+[L]ADDRESS_PROP(I,1)+'":"'+[L]ADDRESS_VAL(I,2)+'"'
+      Else
+        [L]JSON +='"'+[L]ADDRESS_PROP(I,1)+'":"'+escJson([L]ADDRESS_VAL(I,2))+'"'
+      Endif
+    Else
+      If instr(1,tolower([L]ADDRESS_PROP(I,1)),"street")
+        [L]JSON += ',"'+[L]ADDRESS_PROP(I,1)+'":"'+[L]ADDRESS_VAL(I,2)+'"'
+      Else
+        [L]JSON += ',"'+[L]ADDRESS_PROP(I,1)+'":"'+escJson([L]ADDRESS_VAL(I,2))+'"'
+      Endif
+    Endif
+  Endif
+Endif
+Next
+
+
+If [L]CNT<>0
+  # Update SF account by X3Id (BPCNUM)
+  [L]JSON += "}"
+  [L]URL = "sobjects/Account/sagex3s__X3CustomerNumber__c/"+[L]BPCNUM
+  [L]ARGUMENTS = '"'+TOKEN+'","'+ENDPOINTURL+'","PATCH", "'+URL+'",'+JSON
+  [L]HTTP_STATUS  = func ASYRWEBSER.EXEC_JS("salesforce-auth", "querySFData", "wait", [L]ARGUMENTS, '', 0, '', '0', RESHEAD, RESBODY)
+  [L]MY_STATUS  = func GET_RESBODY_STATUSCODE([L]RESBODY)
+  If [L]HTTP_STATUS <> 200 | [L]MY_STATUS<>204            # 204 = update was successful
+    [L]MY_STATUS = [V]CST_AERROR
+    #  Cannot update SF account by X3 customer
+    [L]MESSAGE = func ASYRFNC.MES3(mess(5005,7719,1),"X34005005",[L]BPCNUM,RESBODY)
+  Else
+    [L]MY_STATUS = [V]CST_AOK
+  Endif
+Endif
+
+$FINISH_UPDATE
+End [L]MY_STATUS
+
+#**
+#*
+#* SF_GET_CONTACT_LIST - get and update contacts
+#*
+#* @param TOKEN - assigned by salesforce-auth module
+#* @param ENDPOINTURL - assigned by salesforce-auth module
+#* @param BPCNUM - X3 customer number
+#* @param SF_ID - SF  account number
+#* @param SF_CONTACT_LIST - List of contacts for SF and X3
+#* @param MESSAGE - messages returned from X3
+#*
+#* MY_STATUS - return value of the function
+#*!
+Funprog  SF_GET_CONTACT_LIST(TOKEN, ENDPOINTURL, BPCNUM, SF_ID, SF_CONTACT_LIST, MESSAGE)
+Value Char TOKEN(),ENDPOINTURL(),BPCNUM(),SF_ID()
+Variable Char SF_CONTACT_LIST()(1..100,1..2),MESSAGE()
+
+Local Char URL(200),SF_CONTACTID(50),TMP_STRING(70),DUP_CONTACT_MESSAGE(250)
+Local Integer HTTP_STATUS, MY_STATUS,COUNT,I
+Local Clbfile RESHEAD(1), RESBODY(3), ARGUMENTS(1)
+
+Raz SF_CONTACT_LIST
+[L]URL = "query/?q=SELECT+id,sagex3s__X3ContactNumber__c+from+Contact+where+AccountId="+"'"+[L]SF_ID+"'"
+[L]ARGUMENTS = '"'+TOKEN+'","'+ENDPOINTURL+'","GET", "'+URL+'","{}"'
+[L]HTTP_STATUS  = func ASYRWEBSER.EXEC_JS("salesforce-auth", "querySFData", "wait", [L]ARGUMENTS, '', 0, '', '0', [L]RESHEAD, [L]RESBODY)
+[L]MY_STATUS  = func GET_RESBODY_STATUSCODE([L]RESBODY)
+If ([L]HTTP_STATUS <> [V]CST_AOK and [L]HTTP_STATUS<>200) |  [L]MY_STATUS<>200
+  MY_STATUS = [V]CST_AERROR
+  # Cannot retrieve contacts
+  MESSAGE = func ASYRFNC.MES3(mess(5005,7719,1),"X34005005", [L]BPCNUM, [L]RESBODY)
+  Goto FINISH_LIST_CONTACTS
+Else
+  # Retrieve contacts from SF
+  SF_CONTACTID = func AJSONLIB.GET_PROP(RESBODY,"Id")
+  While SF_CONTACTID<>AVOID.ACHAR and [L]COUNT<100
+    # Determine if sagex3s__X3ContactNumber__c=null and skip if it is null
+    I=instr(1,RESBODY,"Id")
+    If I<>0
+      TMP_STRING=right$(RESBODY,I)            # Truncate RESBODY to length of TMP_STRING
+    Endif
+    If instr(1,TMP_STRING,"null")
+      [L]RESBODY = right$(RESBODY,instr(1,RESBODY,"sagex3s__X3ContactNumber__c")+3)
+      [L]SF_CONTACTID = func AJSONLIB.GET_PROP(RESBODY,"Id")
+    Else
+      [L]COUNT+=1
+      [L]SF_CONTACT_LIST(COUNT,1)=SF_CONTACTID                                                  # Salesforce contact id
+      [L]SF_CONTACT_LIST(COUNT,2)=func AJSONLIB.GET_PROP(RESBODY,"sagex3s__X3ContactNumber__c") # X3 Contact id
+      [L]RESBODY = right$(RESBODY,instr(1,RESBODY,"sagex3s__X3ContactNumber__c")+3)
+      [L]SF_CONTACTID = func AJSONLIB.GET_PROP(RESBODY,"Id")
+    Endif
+  Wend
+Endif
+
+Local Integer INDEX
+Local File CONTACT [CNT]
+Local File CONTACTCRM [AIN]
+Local File BPADDRESS [BPA]
+Raz [L]DUP_CONTACT_MESSAGE      # Clear duplicate contacts
+MY_STATUS = [V]CST_AOK
+
+Raz [L]MESSAGE            # Clear message as a list of shared contacts may be returned that are not permitted on salesforce
+# Get X3 contacts
+Link [CNT] With [AIN]AIN0=[CNT]CCNCRM, [BPA]BPA0=1;[L]BPCNUM;[CNT]BPAADD As [LNKSF] Where [CNT]BPATYP=1 and [CNT]BPANUM=[L]BPCNUM
+
+For [LNKSF]
+  [L]INDEX = find([F:CNT]CCNCRM,[L]SF_CONTACT_LIST(1..COUNT,2))
+  If [L]INDEX=0
+    Gosub SF_CONTACT_INSERT
+  Else
+    Gosub SF_CONTACT_UPDATE
+  Endif
+  If !find([L]MY_STATUS, [V]CST_AOK,[V]CST_AINFO,[V]CST_AWARNING)
+    Break
+  Endif
+Next
+
+$FINISH_LIST_CONTACTS
+Close File [LNKSF]
+# Set message if duplicates are found
+# Shared contacts xxx, yyy not allowed in Salesforce. Use different contact codes.
+If [L]DUP_CONTACT_MESSAGE <> AVOID.ACHAR
+  # X34005016"-"Shared contacts not allowed in Salesforce. Use different contact codes
+  [L]MESSAGE = func ASYRFNC.MES2(mess(5016,7719,1),"X34005016",[L]DUP_CONTACT_MESSAGE)
+  [L]MY_STATUS = [V]CST_AERROR
+Endif
+
+End [L]MY_STATUS
+
+#**
+#* SF_CONTACT_INSERT - insert new contacts only. That is contacts just added to X3 customer. Existing X3 contacts that are missing
+#*      from SF are skipped
+#*!
+$SF_CONTACT_INSERT
+# Check to see if contact is a new X3 contact - only insert new X3 contacts to SF
+Local Integer MASK_INDEX_CNT
+Case GFONCTION
+  When "GESBPC"       : MASK_INDEX_CNT = find([F:CNT]CCNCRM,[M:CNTC]CCNCRM(0..[M:CNTC]NBCNT))-1  # Returns 1 or greater if found, so MASK_INDEX_CNT is off by 1
+                      : If MASK_INDEX_CNT>=0                                        # Should never be less than 0 but check anyway
+                      :   If [M:CNTC]FLNEW(MASK_INDEX_CNT)                          # FLNEW = 0 if new contact - Skip if FLNEW=1
+                      :    Return
+                      :  Endif
+                      : Endif
+  When "GESBPR"       : MASK_INDEX_CNT = find([F:CNT]CCNCRM,[M:CNTB]CCNCRM(0..[M:CNTB]NBCNT))-1  # same for bpr but different mask
+                      : If MASK_INDEX_CNT>=0
+                      :   If [M:CNTB]FLNEW(MASK_INDEX_CNT)
+                      :    Return
+                      :   Endif
+                      : Endif
+  When Default : Return
+Endcase
+
+
+# End of new contact in X3 test
+Local Clbfile JSON(1)
+Local Char TMP_ADDRESS(250),TMP_PHONE(100)
+Raz RESHEAD,RESBODY,JSON
+  [L]JSON="{"
+  [L]JSON += '"AccountId"'+":"+'"'+[L]SF_ID+'"'
+  [L]JSON += ',"LastName"'+":"+'"'+escJson([F:AIN]CNTLNA)+'"'
+  [L]JSON += ',"FirstName"'+":"+'"'+escJson([F:AIN]CNTFNA)+'"'
+  [L]JSON += ',"Title"'+":"+'"'+escJson(func GET_APLSTD(941,[F:AIN]CNTTTL,GACTX.LAN))+'"'
+  [L]JSON += ',"Phone"'+":"+'"'+escJson([F:CNT]TEL)+'"'           # do not format phone number
+  If ([F:CNT]WEB=AVOID.ACHAR) | ([F:CNT]WEB<>AVOID.ACHAR & pat([F:CNT]WEB,"?*@?*")) # SF requires "@" in email address unless it is blank
+    [L]JSON += ',"Email"'+":"+'"'+escJson([F:CNT]WEB)+'"'
+  Else
+    [L]MY_STATUS = [V]CST_AERROR
+    [L]MESSAGE = "Error on contact ["+[F:CNT]CCNCRM+"] – email address ["+[F:CNT]WEB+"] Salesforce requires valid email address or blank email address"
+    Return
+  Endif
+  Call SET_X3_ADDRESS([F:BPA]BPAADDLIG,TMP_ADDRESS)
+  [L]JSON += ',"MailingStreet"'+":"+'"'+[L]TMP_ADDRESS+'"'
+  [L]JSON += ',"MailingCity"'+":"+'"'+escJson([F:BPA]CTY)+'"'
+  [L]JSON += ',"MailingStateCode"'+":"+'"'+escJson([F:BPA]SAT)+'"'   # Send state code not state name
+  [L]JSON += ',"MailingPostalCode"'+":"+'"'+escJson([F:BPA]POSCOD)+'"'
+  [L]JSON += ',"MailingCountryCode"'+":"+'"'+[F:BPA]CRY+'"'
+  [L]JSON += ',"sagex3s__X3ContactNumber__c"'+":"+'"'+[F:CNT]CCNCRM+'"'
+  [L]JSON += ',"sagex3s__X3MailingAddressCode__c"'+":"+'"'+[F:CNT]BPAADD+'"'
+  [L]JSON += "}"
+
+  [L]URL = "sobjects/Contact"
+  [L]ARGUMENTS = '"'+TOKEN+'","'+ENDPOINTURL+'","POST", "'+URL+'",'+JSON
+  [L]HTTP_STATUS  = func ASYRWEBSER.EXEC_JS("salesforce-auth", "querySFData", "wait", [L]ARGUMENTS, '', 0, '', '0', [L]RESHEAD, [L]RESBODY)
+  [L]MY_STATUS  = func GET_RESBODY_STATUSCODE([L]RESBODY)
+  # Handle duplicates not allowed in Salesforce
+  If instr(1,RESBODY,"DUPLICATE")<>0
+    [L]MY_STATUS = [V]CST_AOK
+    If [L]DUP_CONTACT_MESSAGE<>AVOID.ACHAR
+       [L]DUP_CONTACT_MESSAGE +=", "+[F:CNT]CCNCRM
+    Else
+      [L]DUP_CONTACT_MESSAGE = [F:CNT]CCNCRM
+    Endif
+    Return
+  Endif
+
+  If ([L]HTTP_STATUS <> [V]CST_AOK and [L]HTTP_STATUS<>200) |  [L]MY_STATUS<>201 #201 = success on insert
+    # -"Cannot insert contact
+    [L]MESSAGE = func ASYRFNC.MES2(mess(5007,7719,1),"X34005007",[L]RESBODY)
+    [L]MY_STATUS = [V]CST_AERROR
+  Endif
+  If func AJSONLIB.GET_PROP(RESBODY,"errorCode")<>""
+    # -"Cannot insert contact
+    [L]MESSAGE = func ASYRFNC.MES2(mess(5007,7719,1),"X34005007",func AJSONLIB.GET_PROP(RESBODY,"message"))
+    [L]MY_STATUS = [V]CST_AERROR
+  Endif
+  If [L]MY_STATUS=201
+    [L]MY_STATUS = [V]CST_AOK
+  Else
+    [L]MY_STATUS = [V]CST_AERROR
+    # -"Cannot insert contact
+    [L]MESSAGE = func ASYRFNC.MES2(mess(5007,7719,1),"X34005007",[L]RESBODY)
+  Endif
+Return
+
+
+$SF_CONTACT_UPDATE
+Local Integer MY_STATUS,HTTP_STATUS
+Local Clbfile JSON(1),MSG(1)
+Local Char TMP_ADDRESS(250),TMP_PHONE(100)
+
+    # Update salesforce
+    Raz RESHEAD,RESBODY
+    [L]JSON="{"
+    [L]JSON += '"LastName"'+":"+'"'+escJson([F:AIN]CNTLNA)+'"'
+    [L]JSON += ',"FirstName"'+":"+'"'+escJson([F:AIN]CNTFNA)+'"'
+    [L]JSON += ',"Title"'+":"+'"'+escJson(func GET_APLSTD(941,[F:AIN]CNTTTL,GACTX.LAN))+'"'
+    #Call SET_X3_TEL([F:CNT]TEL,[F:BPA]CRY,TMP_PHONE)           # x3 Phone format
+    [L]TMP_PHONE = [F:CNT]TEL                                   # send unformatted phone number
+    [L]JSON += ',"Phone"'+":"+'"'+escJson([L]TMP_PHONE)+'"'
+    If ([F:CNT]WEB=AVOID.ACHAR) | ([F:CNT]WEB<>AVOID.ACHAR & pat([F:CNT]WEB,"?*@?*")) # SF requires "@" in email address unless it is blank
+      [L]JSON += ',"Email"'+":"+'"'+escJson([F:CNT]WEB)+'"'
+    Else
+      [L]MY_STATUS = [V]CST_AERROR
+      # -Error on contact email address Salesforce requires valid email address or blank email address
+      [L]MESSAGE = func ASYRFNC.MES3(mess(5014,7719,1),"X34005014",-[F:CNT]CCNCRM,[F:CNT]WEB)
+      Return
+    Endif
+    [L]JSON += ',"Email"'+":"+'"'+escJson([F:CNT]WEB)+'"'
+    Call SET_X3_ADDRESS([F:BPA]BPAADDLIG,TMP_ADDRESS)
+    [L]JSON += ',"MailingStreet"'+":"+'"'+[L]TMP_ADDRESS+'"'
+    [L]JSON += ',"MailingCity"'+":"+'"'+escJson([F:BPA]CTY)+'"'
+    [L]JSON += ',"MailingStateCode"'+":"+'"'+escJson([F:BPA]SAT)+'"'
+    [L]JSON += ',"MailingPostalCode"'+":"+'"'+escJson([F:BPA]POSCOD)+'"'
+    [L]JSON += ',"MailingCountryCode"'+":"+'"'+escJson([F:BPA]CRY)+'"'
+    [L]JSON += ',"sagex3s__X3MailingAddressCode__c"'+":"+'"'+[F:CNT]BPAADD+'"'
+    [L]JSON += "}"
+
+    [L]URL = "sobjects/Contact/"+[L]SF_CONTACT_LIST([L]INDEX,1)
+    [L]ARGUMENTS = '"'+TOKEN+'","'+ENDPOINTURL+'","PATCH", "'+URL+'",'+JSON         # Use "PATCH" for update
+    [L]HTTP_STATUS  = func ASYRWEBSER.EXEC_JS("salesforce-auth", "querySFData", "wait", [L]ARGUMENTS, '', 0, '', '0', [L]RESHEAD, [L]RESBODY)
+    [L]MY_STATUS  = func GET_RESBODY_STATUSCODE([L]RESBODY)
+    If ([L]HTTP_STATUS <> [V]CST_AOK and [L]HTTP_STATUS<>200) |  [L]MY_STATUS<>204 #204 = success on update
+      # Cannot update contact
+      [L]MESSAGE = func ASYRFNC.MES2(mess(5008,7719,1),"X34005008",[L]RESBODY)
+      [L]MY_STATUS = [V]CST_AERROR
+    Endif
+    If func AJSONLIB.GET_PROP(RESBODY,"errorCode")<>""
+      # Cannot update contact
+      [L]MESSAGE = func ASYRFNC.MES2(mess(5008,7719,1),"X34005008",func AJSONLIB.GET_PROP(RESBODY,"message"))
+      [L]MY_STATUS = [V]CST_AERROR
+    Endif
+    If [L]MY_STATUS = 204
+      [L]MY_STATUS = [V]CST_AOK
+    Else
+      [L]MY_STATUS = [V]CST_AERROR
+      # Cannot update contact
+      [L]MESSAGE = func ASYRFNC.MES2(mess(5008,7719,1),"X34005008",[L]RESBODY)
+    Endif
+Return
+
+Funprog GET_APLSTD(LANCHP,LANNUM,LAN)
+Value Shortint LANCHP,LANNUM
+Value Char LAN
+Local Char MENU_TEXT(50)
+
+# if message number is 0 return blank - otherwise the read will return the list of codes assigned to the menu
+If [L]LANNUM<>0
+  Local File APLSTD [ASTSF]
+  Read [ASTSF]CLE = LANCHP;LANNUM;LAN
+  If fstat=[V]CST_AOK
+    [L]MENU_TEXT=[F:ASTSF]LANMES
+  Endif
+Else
+  [L]MENU_TEXT = AVOID.ACHAR
+Endif
+End [L]MENU_TEXT
+
+#**
+#* MY_SF_TOKEN - Get salesforce access token
+#*              - return [V]CST_AOK or [V]CST_AERROR
+#*
+#* @param TOKEN - Access token
+#* @param ENDPOINTURL - Endpoint URL where token is valid
+#* @param MESSAGE - message in event of error
+#*!
+Funprog MY_SF_TOKEN(TOKEN,ENDPOINTURL,MESSAGE)
+Variable Char TOKEN
+Variable Char ENDPOINTURL
+Variable Char MESSAGE
+Local Integer HTTP_STATUS, MY_STATUS
+Local Clbfile TOKEN_BODY
+
+Raz MESSAGE,ENDPOINTURL,TOKEN
+
+[L]HTTP_STATUS = func GET_TOKEN(TOKEN_BODY)
+If HTTP_STATUS = 200
+  [L]TOKEN = func AJSONLIB.GET_PROP(TOKEN_BODY,"accessToken")              #accessToken
+  [L]ENDPOINTURL = func AJSONLIB.GET_PROP(TOKEN_BODY,"endpointUrl")        #endpointUrl
+  If [L]TOKEN=""
+    # Cannot access salesforce - Token is blank"
+    [L]MESSAGE= func ASYRFNC.MES1(mess(5009,7719,1),"X34005009")
+    [L]MY_STATUS = [V]CST_AERROR
+  Elsif [L]ENDPOINTURL = ""
+    # Cannot access salesforce - End point is blank
+    [L]MESSAGE= func ASYRFNC.MES1(mess(5010,7719,1),"X34005010")
+    [L]MY_STATUS = [V]CST_AERROR
+  Endif
+Elsif HTTP_STATUS = 500                                                   # User is not associated to salesforce-invalid access
+  [L]MY_STATUS=HTTP_STATUS                                                # Allow X3 user to proceed with SF integraiton
+Else
+  [L]MESSAGE = func AJSONLIB.GET_PROP(TOKEN_BODY,"message")
+  If instr(1,toupper([L]MESSAGE),"SALESFORCE-AUTH")
+    # Salesforce integration not configured
+    [L]MESSAGE= func ASYRFNC.MES1(mess(5011,7719,1),"X34005011")
+  Elsif instr(1,toupper([L]MESSAGE),"USER HASN'T")
+    # Salesforce username is not properly configured
+    [L]MESSAGE=func ASYRFNC.MES1(mess(5012,7719,1),"X34005012")
+  Else
+    # Error on get token
+    [L]MESSAGE=func ASYRFNC.MES2(mess(5013,7719,1),"X34005013",[L]TOKEN_BODY)
+  Endif
+  [L]MY_STATUS = [V]CST_AERROR
+Endif
+
+End MY_STATUS
+
+
+#**
+#* GET_TOKEN - HTTP call to get salesforce access token
+#*
+#* @param RESBODY - if success, contains the token and endpointurl otherwise an error
+#*!
+Funprog GET_TOKEN(RESBODY)
+Variable Clbfile RESBODY
+Local Integer HTTP_STATUS,STATUS_CODE
+Local Clbfile RESHEAD
+
+[L]HTTP_STATUS = func ASYRWEBSER.EXEC_JS("salesforce-auth", "getSFAccessToken", "wait", '"_"', '', 0, '', '0', [L]RESHEAD, [L]RESBODY)
+[L]STATUS_CODE = func GET_RESBODY_STATUSCODE([L]RESBODY)
+If [L]STATUS_CODE <> 200
+  [L]HTTP_STATUS = [L]STATUS_CODE
+Endif
+End HTTP_STATUS
+
+Funprog GET_RESBODY_STATUSCODE(RESBODY)
+Variable Clbfile RESBODY
+Local Integer MY_STATUSCODE, IDX
+Local Char RESBODY_STATUSCODE(50)
+
+
+Raz MY_STATUSCODE
+[L]IDX = instr(1, [L]RESBODY, 'statusCode')
+If [L]IDX<>0
+  [L]RESBODY_STATUSCODE = right$([L]RESBODY,[L]IDX+12)
+  [L]IDX = instr(1, [L]RESBODY_STATUSCODE, ",")
+  [L]RESBODY_STATUSCODE = ctrans(left$([L]RESBODY_STATUSCODE,[L]IDX-1),'"','')
+  [L]MY_STATUSCODE = val([L]RESBODY_STATUSCODE)
+Endif
+
+# Force statusCode to 403 in case of not found
+If [L]MY_STATUSCODE = 0
+  [L]MY_STATUSCODE = 403
+  [L]RESBODY = num$([L]MY_STATUSCODE)+": Unable to resolve connection to Salesforce"-[L]RESBODY
+Endif
+
+End [L]MY_STATUSCODE
+
+#**
+#* SF_CONTACT_DELETE - To be invoked from SF_CONTACT_LIST - Currently not used but tested
+#* sobjects/Contact/{ContactID}
+#* Pass Method “DELETE”
+#*!
+$SF_CONTACT_DELETE
+  [L]URL = "sobjects/Contact/"+[L]SF_CONTACT_LIST([L]INDEX,1)
+  [L]ARGUMENTS = '"'+TOKEN+'","'+ENDPOINTURL+'","DELETE", "'+URL+'",'+'{}'         # Use "DELETE" for delete
+  [L]HTTP_STATUS  = func ASYRWEBSER.EXEC_JS("salesforce-auth", "querySFData", "wait", [L]ARGUMENTS, '', 0, '', '0', [L]RESHEAD, [L]RESBODY)
+  [L]MY_STATUS  = func GET_RESBODY_STATUSCODE([L]RESBODY)
+  If ([L]HTTP_STATUS <> [V]CST_AOK and [L]HTTP_STATUS<>200) |  [L]MY_STATUS<>204 #204 = success on delete
+    [L]MESSAGE = "Salesforce-CRM: Cannot update contact ["+[L]RESBODY+"]"
+    [L]MY_STATUS = [V]CST_AERROR
+  Endif
+  If func AJSONLIB.GET_PROP(RESBODY,"errorCode")<>""
+    [L]MESSAGE = "Salesforce-CRM:"-func AJSONLIB.GET_PROP(RESBODY,"message")
+    [L]MY_STATUS = [V]CST_AERROR
+  Endif
+  If [L]MY_STATUS = 204
+    [L]MY_STATUS = [V]CST_AOK
+  Else
+    [L]MY_STATUS = [V]CST_AERROR
+    [L]MESSAGE = "Salesforce-CRM: ["+[L]RESBODY+"]"
+    Endif
+Return
+
+#**
+#* COMPARE_DATES - used to compare the SF update date to the X3 dates - no longer used
+#*          SF has 1 date while X3 has multiple dates, comparing not possible
+#*          In any case, if SF to X3 is working correctly, all will be in sync
+#*
+#*
+#* @param SF_DATE - date last modified from Salesforce
+#* @param BPR_DATETIME - BPartner date last modified from X3
+#* @param BPA_DATETIME - BPADDRESS bill to adddress last modified from X3
+#* @param BPASF1_DATETIME - BPADDRESS bill to adddress last modified from X3
+#* @param RESBODY
+#*!
+Funprog COMPARE_DATES(SF_DATE, BPR_DATETIME, BPA_DATETIME, BPASF1_DATETIME,MESSAGE)
+Value Char SF_DATE
+Value Datetime BPR_DATETIME,BPA_DATETIME, BPASF1_DATETIME
+Variable Char MESSAGE
+Local Integer MY_STATUS
+Local Char BPR_DATE(19),BPA_DATE(19),BPASF1_DATE(19), X3_MAXDATE(19)          # Drop 'Z' from X3 datetime
+Local Char SF_X3DATE(19)                                                      # Drop millisec
+
+# Convert X3 dates to string
+[L]BPR_DATE    = num$([L]BPR_DATETIME)
+[L]BPA_DATE    = num$([L]BPA_DATETIME)
+[L]BPASF1_DATE = num$([L]BPASF1_DATETIME)
+[L]X3_MAXDATE  = max([L]BPR_DATE,[L]BPA_DATE,[L]BPASF1_DATE)
+
+# Convert SF date to drop millisec
+[L]SF_X3DATE = [L]SF_DATE
+
+# Find max SF or X3 date
+If SF_X3DATE>X3_MAXDATE
+  [L]MY_STATUS = -1               # Means do not update SF with X3 data
+  [L]MESSAGE   = "Do not update SF with X3 data"
+Else
+  [L]MY_STATUS = [V]CST_AOK       # Means update SF with X3 data
+Endif
+End [L]MY_STATUS
+
+
+#**
+#* Log exchange between SF and X3 - currently nt used
+#*
+#*!
+$LOG_SF_X3_EXCHANGE
+If dim(GSALESFORCE)>[V]CST_ATRUE and GSALESFORCE=[V]CST_ATRUE
+# Log messages
+  If GTRACE=""
+    Call OUVRE_TRACE("Salesforce CRM data") From LECFIC
+  Endif
+  If dim(LOG_SECTION)>0 and LOG_SECTION<>AVOID.ACHAR
+    Call ECR_TRACE("",0) From GESECRAN
+    Call ECR_TRACE(LOG_SECTION,0) From GESECRAN
+    Call ECR_TRACE("",0) From GESECRAN
+  Endif
+  Local Char TEXT(250)(1..100)
+  Local Integer CNT,IDX,J
+  CNT=find("",[L]ADDRESS_PROP(1..100,1))
+  Call ECR_TRACE("X3 Customer =["+[L]BPCNUM+"]",0) From GESECRAN
+  If [L]TOKEN<>AVOID.ACHAR
+    Call ECR_TRACE("SF Token =[Token exists but not shown]",0) From GESECRAN
+  Else
+    Call ECR_TRACE("No SF TOKEN !!!!",1) From GESECRAN
+  Endif
+  Call ECR_TRACE("SF Endpoint =["+[L]ENDPOINTURL+"]",0) From GESECRAN
+  For J=1 To CNT
+    Call ECR_TRACE("SF address property =["+[L]ADDRESS_PROP(J,1)+"] SF address value=["+[L]ADDRESS_VAL(J,1)+"]",0) From GESECRAN
+    Call ECR_TRACE("....X3 address property =["+[L]ADDRESS_PROP(J,2)+"] X3 address value=["+[L]ADDRESS_VAL(J,2)+"]",0) From GESECRAN
+  Next
+  Call FERME_TRACE From LECFIC
+  Call LEC_TRACE From LECFIC
+Endif
+

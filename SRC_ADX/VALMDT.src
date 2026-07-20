@@ -1,0 +1,470 @@
+#<AdxTL>@(#)8.0.0.0 $Revision$
+# ##########    SUBJECT :    SEPA SDD - Mandate validation (batch task enabled)                            #
+# ##########                                                                                               #
+# ##########    AUTHOR  :    DNE                                                                           #
+# ##########    DATE    :    2013-06-21                                                                    #
+# ##########    UPDATES :    2014-01-30 DNE - Correct handling for inactive activity code LEG (SAM #95451) #
+# ##########                 2014-04-15 DNE - Fields are emptied if ALL... is checked (SAM #99267)         #
+# ##########                                                                                               #
+# ######################################################################################################## #
+
+# < DEBUG> ############################################################################################### #
+Local Char PARAM(10)(1..2), VALEUR(10) : Call TRAITE_CHAR(VALEUR, PARAM, "", "VALMDT","VALMDT", 4, "SPEVALMDT" ) From GTRAITE : End
+# </DEBUG> ############################################################################################### #
+
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  ACTION
+#*
+#* Purpose:    Standard action dispatcher.
+#*
+#*
+#* Parameters (as variables in the main chunk):
+#*
+#* @param ACTION      Name of the event (action).
+#*
+#*! #####################################################################################
+
+$ACTION
+    If GSERVEUR
+        # Batch server mode
+        Case ACTION
+            When "INIT"        : Gosub BATCH_INIT
+            When "EXEC"        : Gosub BATCH_EXEC
+        Endcase
+    Else
+        # Interactive mode
+        Case ACTION
+            When "OUVRE"       : Gosub OUVRE
+            When "DEBUT"       : Gosub DEBUT
+            When "OK"          : If !GBATCH : Gosub OK : Endif # Do not execute while batch parameterization.
+        Endcase
+    Endif
+Return
+
+
+#** #####################################################################################
+#*
+#* Sub chunk:  OUVRE
+#*
+#* Purpose:    Handles OURVE event from supervisor. Intodruces process's static variables
+#*             and opens additional tables.
+#*
+#*! #####################################################################################
+
+$OUVRE
+    If !clalev([F:CPY]) : Local File COMPANY [CPY] : Endif
+    If !clalev([F:MDT]) : Local File MANDATE [MDT] : Endif
+
+    Local Integer B_LOG            : B_LOG = 1                  # Flag: Log data?
+    Local Integer B_SIM            : B_SIM = 0                  # Flag: Simulation only?
+    Local Integer N_NBPROCESSED    : N_NBPROCESSED = 0          # Number of successfully validated mandates
+    Local Integer N_NBNOTPROCESSED : N_NBNOTPROCESSED = 0       # Number of not sucessfully validated mandates
+    Local Char MESSA(255)                                       # Contains messages to log.
+    Local Char MANDATEINFO(255)                                 # Contains the mandate's short information (key)
+    Local Char SYMBOLE(255)                                     # Contains the symbol to lock while updates are in progress.
+    Local Char WFILCPY(255)        : WFILCPY        = "1=1"     # Company filter
+    Local Char WFILLEG(255)        : WFILLEG        = "1=1"     # Legislation filter
+    Local Char WFILBPC(255)        : WFILBPC        = "1=1"     # Customer filter
+    Local Char WFILUMRNUM(255)     : WFILUMRNUM     = "1=1"     # Mandate reference filter
+    Local Char WFILTYP(255)        : WFILTYP        = "1=1"     # Mandate type (CORE/B2B) filter
+    Local Char WFILSIGDAT(255)     : WFILSIGDAT     = "1=1"     # Last signiture date filter
+    Local Char WFILGEN(255)        : WFILGEN        = "1=1"     # General filter (from PRD)
+    Local Char WFILOPT(255)        : WFILOPT        = "1=1"     # Optional filter (e. g. for entry points)
+    Local Char    VALPAR(10): # Value of the OPTBICSTR parameter
+    Local Date    DATBICSTR : # Stores OPTBICSTR in a date variable
+    Local Integer OPTBICSTR : # Indicates if the BICCOD is optional(=1) or not
+
+    If GFONCTION = "" : GFONCTION = "VALMDT" : Endif
+Return
+
+#** #####################################################################################
+#*
+#* Sub chunk:  DEBUT
+#*
+#* Purpose:    Handler for the DEBUT event. Initializes field states (enabling and
+#*             disabling).
+#*
+#*! #####################################################################################
+
+$DEBUT
+    # Initialize the fields's grayed/disabled states.
+    Call AM_ALLCPY(    [M]ALLCPY    )
+    Call AM_ALLBPC(    [M]ALLBPC    )
+    Call AM_ALLUMRNUM( [M]ALLUMRNUM )
+    Call AM_ALLTYP(    [M]ALLTYP    )
+
+    # In batch parameterization mode empty the end date to prevent the user from
+    # entering a fixed date for recurring tasks. In addition this field is grayed.
+    #
+    # Note: In batch mode an empty end date will be replaced by the current date
+    #       of the running task.
+    #
+    If GBATCH
+        [M]SIGDAT = [0/0/0]
+        Grizo [M]SIGDAT
+    Endif
+
+    # 2014-01-30 DNE SAM #95451 BEGIN
+    #
+    # Remove legislation field if activity code LEG is set to inactive.
+    If !func AFNC.ACTIV( "LEG" )
+        Chgfmt [M]LEG  With "-K:20"
+        Chgfmt [M]ZLEG With "-K:20"
+    Endif
+    # 2014-01-30 DNE SAM #95451 END
+
+    # Update screen.
+    Affzo [M]1-99
+Return
+
+#** #####################################################################################
+#*
+#* Sub chunk:  OK
+#*
+#* Purpose:    Handler for the OK button. Does all the validation work.
+#*
+#* NOTE:       OK is called from the BATCH_EXEC handler in batch mode, too.
+#*
+#*! #####################################################################################
+
+$OK
+    B_LOG = [M]FLGLOG - 1
+    B_SIM = [M]FLGSIM - 1
+
+    # Open a log file and export the screen fields to the log file.
+    If B_LOG
+        Gosub OPEN_LOG
+    Endif
+
+    # If in interactive mode open a "Wait..." box.
+    If !GSERVEUR
+        Call TEMPON("V") From GESECRAN
+    Endif
+
+    # Do the validation.
+    Gosub SETUP_FILTER
+    Gosub QUERY
+    Gosub VALMDT
+
+    # If in interactive close the previously opened "Wait..." box.
+    If !GSERVEUR
+        Call TEMPOFF From GESECRAN
+    Endif
+
+    # Close the log file.
+    If B_LOG
+        Gosub CLOSE_LOG
+    Endif
+Return
+
+#** #####################################################################################
+#*
+#* Sub chunk:  BATCH_INIT
+#*
+#* Purpose:    Handler for the INIT event in batch mode. Initializes VALMDT mask.
+#*
+#*! #####################################################################################
+
+$BATCH_INIT
+    # Open the dialog window's screen:
+    #
+    # Note: - We do this because we need the mask accessible in batch tasks.
+    #       - I noticed that the mask itself is filled with the values in the
+    #         parameterization session of the task.
+    #
+    If clalev([M:VALMDT])=0 : Local Mask VALMDT [VALMDT] : Endif
+Return
+
+#** #####################################################################################
+#*
+#* Sub chunk:  BATCH_EXEC
+#*
+#* Purpose:    Handler for the EXEC event in batch mode. Starts the validation process.
+#*
+#*! #####################################################################################
+
+$BATCH_EXEC
+    # Initialize
+    Gosub OUVRE
+    Gosub DEBUT
+
+    # In batch parameterization mode empty the end date to prevent the user
+    # from entering a fixed date for recurring tasks.
+    #
+    # Note: In batch mode an empty end date will be replaced by the current date
+    #       of the running task.
+    #
+    If [M]SIGDAT = [0/0/0]
+        [M]SIGDAT = date$
+        MESSA = func AFNC.MES1( mess(310,117,1), format$( "D:YYYY[-]MM[-]DD", date$ ) ) : Gosub LOGMESS # "Correction in batch mode: Signature date until $1$"
+    Endif
+
+    # Start mandate validation.
+    Gosub OK
+Return
+
+# ############################################################################################# #
+# ##########                                                                                    #
+# ########## Screen/Window handling                                                             #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ############################################################################################# #
+
+Subprog AM_ALLCPY(VALEUR)
+Variable Integer VALEUR
+
+    If VALEUR - 1
+        [M]CPY = ""
+        Grizo [M]CPY
+        Actzo [M]LEG
+    Else
+        Actzo [M]CPY
+        Grizo [M]LEG
+    Endif
+End
+
+Subprog AM_CPY(VALEUR)
+Variable Char VALEUR()
+
+    If VALEUR <> ""
+        Read [F:CPY]CPY0 = VALEUR
+        If !fstat
+            [M]LEG = [F:CPY]LEG
+        Endif
+    Endif
+End
+
+Subprog AM_ALLBPC(VALEUR)
+Variable Integer VALEUR
+
+    If VALEUR - 1
+# 2014-04-15 DNE MODIF INSERTED (SAM #99267)
+        [M]BPCSTR = ""
+        [M]BPCEND = ""
+# 2014-04-15 DNE MODIF END
+        Grizo [M]BPCSTR
+        Grizo [M]BPCEND
+    Else
+        Actzo [M]BPCSTR
+        Actzo [M]BPCEND
+    Endif
+End
+
+Subprog AM_ALLUMRNUM(VALEUR)
+Variable Integer VALEUR
+
+    If VALEUR - 1
+# 2014-04-15 DNE MODIF INSERTED (SAM #99267)
+        [M]UMRNUMSTR = ""
+        [M]UMRNUMEND = ""
+# 2014-04-15 DNE MODIF END
+        Grizo [M]UMRNUMSTR
+        Grizo [M]UMRNUMEND
+    Else
+        Actzo [M]UMRNUMSTR
+        Actzo [M]UMRNUMEND
+    Endif
+End
+
+Subprog AM_ALLTYP(VALEUR)
+Variable Integer VALEUR
+
+    If VALEUR - 1
+# 2014-04-15 DNE MODIF INSERTED (SAM #99267)
+        [M]TYP = 1
+# 2014-04-15 DNE MODIF END
+        Grizo [M]TYP
+    Else
+        Actzo [M]TYP
+    Endif
+End
+
+# ############################################################################################# #
+# ##########                                                                                    #
+# ########## Mass validation tool kit                                                           #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ############################################################################################# #
+
+$SETUP_FILTER
+    WFILCPY    = "1=1"    # Company filter
+    WFILLEG    = "1=1"    # Legislation filter
+    WFILBPC    = "1=1"    # Customer filter
+    WFILUMRNUM = "1=1"    # Mandate reference filter
+    WFILTYP    = "1=1"    # Mandate type (CORE/B2B) filter
+    WFILSIGDAT = "1=1"    # Last signiture date filter
+    WFILGEN    = "1=1"    # General filter
+    WFILOPT    = "1=1"    # Optional filter
+
+    If [M]ALLCPY = 1
+        WFILCPY = "[F:MDT]CPY = [M]CPY"
+        Call PARAML([M]CPY, "OPTBICSTR", VALPAR) From ADOVAL
+        DATBICSTR = VALPAR
+        If date$>=DATBICSTR & DATBICSTR<>[0/0/0]
+         OPTBICSTR = 1
+        Else
+         OPTBICSTR = 0
+        Endif
+    Else
+        WFILLEG = "[F:CPY]LEG = [M]LEG"
+    Endif
+    If [M]ALLBPC = 1
+        WFILBPC = "([F:MDT]BPCNUM >= [M]BPCSTR and [F:MDT]BPCNUM <= [M]BPCEND)"
+    Endif
+    If [M]ALLUMRNUM = 1
+        WFILUMRNUM = "([F:MDT]UMRNUM >= [M]UMRNUMSTR and [F:MDT]UMRNUM <= [M]UMRNUMEND)"
+    Endif
+    If [M]ALLTYP = 1
+        WFILTYP = "[F:MDT]TYP = [M]TYP"
+    Endif
+    If [M]SIGDAT <> [0/0/0]
+        WFILSIGDAT = "[F:MDT]SIGDAT <= [M]SIGDAT"
+    Endif
+    WFILGEN = "[F:MDT]STA = 1"
+Return
+
+$QUERY
+    Link [F:MDT] With
+&      [F:CPY]CPY0 ~= [F:MDT]CPY
+&       As [LNK]
+&       Where evalue(WFILCPY)
+&           & evalue(WFILLEG)
+&           & evalue(WFILBPC)
+&           & evalue(WFILUMRNUM)
+&           & evalue(WFILTYP)
+&           & evalue(WFILSIGDAT)
+&           & evalue(WFILGEN)
+&           & evalue(WFILOPT)
+&           & 1=1
+&       Order By Key CLE = [F:MDT]CPY; [F:MDT]BPCNUM; [F:MDT]UMRNUM
+Return
+
+$VALMDT
+    If rowcount( [LNK] ) = 0
+        MESSA = mess(299,117,1) : Gosub LOGINFO # "No items to be processed"
+    Else
+        N_NBPROCESSED= 0
+        N_NBNOTPROCESSED= 0
+
+        For [LNK]
+            N_NBNOTPROCESSED += 1
+            MANDATEINFO = [F:MDT]CPY + "/" + [F:MDT]BPCNUM + "/" + [F:MDT]UMRNUM
+            If [F:MDT]DES <> ""
+                MANDATEINFO -= "(" + [F:MDT]DES + ")"
+            Endif
+
+            If [M]ALLCPY = 2
+             Call PARAML([F:CPY]CPY, "OPTBICSTR", VALPAR) From ADOVAL
+             DATBICSTR = VALPAR
+             If date$>=DATBICSTR & DATBICSTR<>[0/0/0]
+              OPTBICSTR = 1
+             Else
+              OPTBICSTR = 0
+             Endif
+            Endif
+
+            # Test the emptiness of some essential fields and if not validate.
+            If [F:MDT]CPYADD = ''
+                MESSA = MANDATEINFO - "-" - mess(300,117,1) - "-" - mess(301,117,1) : Gosub LOGERR # "This mandate cannot be validated: Missing company address"
+            Elsif [F:MDT]BPCADD = ''
+                MESSA = MANDATEINFO - "-" - mess(300,117,1) - "-" - mess(302,117,1) : Gosub LOGERR # "This mandate cannot be validated: Missing customer address"
+            Elsif [F:MDT]IBACOD = ''
+                MESSA = MANDATEINFO - "-" - mess(300,117,1) - "-" - mess(303,117,1) : Gosub LOGERR # "This mandate cannot be validated: Missing IBAN"
+            Elsif OPTBICSTR=0 & ([F:MDT]BICCOD = '')
+                MESSA = MANDATEINFO - "-" - mess(300,117,1) - "-" - mess(304,117,1) : Gosub LOGERR # "This mandate cannot be validated: Missing BIC"
+            Elsif [F:MDT]SIGDAT = [0/0/0]
+                MESSA = MANDATEINFO - "-" - mess(300,117,1) - "-" - mess(305,117,1) : Gosub LOGERR # "This mandate cannot be validated: Missing signature date"
+            Elsif [F:MDT]SIGCTY = ''
+                MESSA = MANDATEINFO - "-" - mess(300,117,1) - "-" - mess(306,117,1) : Gosub LOGERR # "This mandate cannot be validated: Missing signature place"
+            Else
+                # Try to lock the current MDT object.
+                SYMBOLE = "MDT" + [F:MDT]UMRNUM +"\" + [F:MDT]CPY
+                Lock =SYMBOLE With lockwait = 0
+                If fstat
+                    # Locking was not possible.
+                    MESSA = MANDATEINFO - "-" - mess(124,187,1) : Gosub LOGERR # "Locked document: update is impossible "
+                Else
+                    If B_SIM
+                        # Simulate the validation.
+                        N_NBPROCESSED += 1
+                        MESSA = MANDATEINFO : Gosub LOGMESS
+                    Else
+                        # Real validation
+                        [F:MDT]STA = 2 # Status "Approved" (ENG)
+                        Rewrite [F:MDT]
+                        If fstat
+                            # Update failed.
+                            MESSA = MANDATEINFO - "-" - mess(300,117,1) - "-" - mess(27,125,1) : Gosub LOGERR # "This mandate cannot be validated: Re-write Error"
+                        Else
+                            # Update was successful: Increase the counter.
+                            N_NBPROCESSED += 1
+                            MESSA = MANDATEINFO : Gosub LOGMESS
+                        Endif
+                    Endif
+                    Unlock =SYMBOLE
+                Endif
+            Endif
+        Next
+
+        # Output a small summary.
+        N_NBNOTPROCESSED -= N_NBPROCESSED
+        MESSA = string$( 115, "-" ): Gosub LOGMESS
+        MESSA = mess(307,117,1) - num$( N_NBPROCESSED )    : Gosub LOGMESS # "Validated items"
+        MESSA = mess(308,117,1) - num$( N_NBNOTPROCESSED ) : Gosub LOGMESS # "Non-validated items"
+    Endif
+Return
+
+# ############################################################################################# #
+# ##########                                                                                    #
+# ########## Tool kit (small helpers)                                                           #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ##########                                                                                    #
+# ############################################################################################# #
+
+$OPEN_LOG
+    # Open X3 log file (on dialog usage).
+    If !GSERVEUR
+        Call OUVRE_TRACE( GFONCTION ) From LECFIC
+        Call TRACE_MASQUE( GFONCTION, GFONCTION, nomap ) From GTRAITE
+    Endif
+Return
+
+$CLOSE_LOG
+    # Close X3 log/trace file and show it on screen (on dialog usage).
+    If !GSERVEUR
+        Call FERME_TRACE From LECFIC
+        Call LEC_TRACE From LECFIC
+    Endif
+Return
+
+$LOGMESS
+      If B_LOG
+          Call ECR_TRACE( MESSA, 0 ) From GESECRAN
+      Endif
+Return
+
+$LOGWARN
+      If B_LOG
+          Call ECR_TRACE( MESSA, -1 ) From GESECRAN
+      Endif
+Return
+
+$LOGERR
+      If B_LOG
+          Call ECR_TRACE( MESSA, 1 ) From GESECRAN
+      Endif
+Return
+
+$LOGINFO
+      If B_LOG
+          Call ECR_TRACE( MESSA, 0 ) From GESECRAN
+      Else
+          Call MESSAGE( MESSA ) From GESECRAN
+      Endif
+Return

@@ -1,0 +1,970 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+##########################################################################
+# UUMGTRTSTO03   Migration de la table ITMMVT                Module STO   #
+##########################################################################
+# Initialisation du détail des prix (PMP et dernier prix)
+##########################################################################
+
+Local Char DOSSIER(30) : DOSSIER = nomap
+If !GSERVEUR
+  #--- Issue 108760 by TS
+  #Call SAIDOS(DOSSIER,"") From SAIDOS
+  Call SAIDOSHIS(DOSSIER,"") From SAIDOSHIS
+  #---
+Endif
+If DOSSIER <> ""
+  If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+  #--- Issue 108760 By TS
+  #Read [ADS] DOSSIER=[L]DOSSIER : If fstat Raz [F:ADS] : Endif
+  If func DOSSUB.FILL_ADS([L]DOSSIER)=0 : End : Endif
+  #---
+  #Call ACTIVE From TIMING
+  If !GSERVEUR
+    Call TEMPON("O") From GESECRAN
+    Call OUVRE_TRACE("UUMGTRTSTO03") From LECFIC
+  Endif
+
+#  Call RAZ_UUMGTRTSTO03(DOSSIER)
+  Call MAJ_UUMGTRTSTO03(DOSSIER)
+
+  If !GSERVEUR
+    Call TEMPOFF     From GESECRAN
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+  Endif
+  #Call ARRET From TIMING
+Endif
+End
+
+Subprog MAJ_UUMGTRTSTO03(DOSSIER)
+Value Char DOSSIER
+
+Local Integer ERR
+
+If [F:ADS]MODULE(6)<>2 : : # 6=Stock
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO03",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+Local File =DOSSIER+".ACTIV"   [ACV]
+Read [ACV]CODACT="SPD"
+If !fstat & [F:ACV]FLACT=2
+    GACTDECCST=1
+Else
+    GACTDECCST=0
+Endif
+
+#--- Issue 108760 by TS
+#adxftl=10
+#adxwrb=10
+#NEWMOTEUR=1
+#---
+
+Local Char WNAMITVM
+Call MIGTABNAME (DOSSIER,"ITMMVT",WNAMITVM,ERR) From TRTMIG
+Local Char WNAMSTPM
+Call MIGTABNAME (DOSSIER,"STOCOST",WNAMSTPM,ERR) From TRTMIG
+
+If ERR
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO03",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+#----- Présence des fichiers renommées...  -----#
+If filinfo(filpath("FIL",WNAMITVM,"fde",DOSSIER),0) < 0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO03",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+If filinfo(filpath("FIL",WNAMSTPM,"fde",DOSSIER),0) < 0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO03",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+##2 - Traitements en cours
+####################
+
+Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO03",2,ERR) From TRTMIG : #2=En cours
+
+Call ECR_TIME("UTISTO03 tables STO Process : Update ITMMVT & STOCOST") From DOSSUB
+Call ECR_TRACE("UTISTO03 : Process Start on : "+DOSSIER,0) From GESECRAN
+
+#----- Modification des fichiers où on va inserer -----#
+Gosub MIG_OUVRE From TRTMIG
+Call MIGTABINIT (DOSSIER,"ITMMVT",ERR) From TRTMIG
+Call MIGTABINIT (DOSSIER,"STOCOST",ERR) From TRTMIG
+
+#----- Ouverture des fichiers -----#
+If clalev([F:ITV])  = 0 : Local File =DOSSIER+".ITMMVT"    [ITV]  : Endif   # Fichier X3 "Vide"
+If clalev([F:STP])  = 0 : Local File =DOSSIER+".STOCOST"   [STP]  : Endif   # Fichier X3 "Vide"
+If clalev([F:ITC])  = 0 : Local File =DOSSIER+".ITMCOST"   [ITC]  : Endif   # Fichier des coûts standard déjà migrés
+If clalev([F:ITM])  = 0 : Local File =DOSSIER+".ITMMASTER" [ITM]  : Endif   # Fichier des articles
+
+If clalev([F:ITVM]) = 0 : Local File =DOSSIER+"."+WNAMITVM   [ITVM] : Endif   # Fichier X3 renommé Avant Migration
+If clalev([F:STPM]) = 0 : Local File =DOSSIER+"."+WNAMSTPM   [STPM] : Endif   # Fichier X3 renommé Avant Migration
+
+#-----  Déclaration des variables -----#
+# Déclaration des variables pour gérer les ruptures (évite les snapshot too old)
+Local Integer STOP, NB, ISVALID, NBCOMMIT, NBLUS
+Local Char CRITERE(250),CRITERESPE(250), HINTSPE(30)
+Local Integer NBMIGKEY : NBMIGKEY=3
+Local Char TABMIGKEY(30)(1..NBMIGKEY)
+
+# pour les WriteB des tables détails
+Local Char WTAB_ITV (100) (adxwrb)
+Local Shortint WCPT_ITV
+Local Char WTAB_STP (100) (adxwrb)
+Local Shortint WCPT_STP
+
+Raz STOP, CRITERE, NBCOMMIT, NBLUS
+
+Local Integer LACTMAT, LACTMAC, LACTLAB
+
+LACTLAB = func AFNC.ACTIVDOS(DOSSIER,"LAB")
+LACTMAC = func AFNC.ACTIVDOS(DOSSIER,"MAC")
+LACTMAT = func AFNC.ACTIVDOS(DOSSIER,"MAT")
+
+Local Decimal LTOT, LMAX, LCOE
+Local Char LZON(50)
+Local Integer WCSTTYP   # Type de coût standard à utiliser pour alimenter les détails
+WCSTTYP = 1
+
+Local Char REQ(250)(5)
+Local Integer ICRIT
+Local Decimal LQTYSTOACT, LQTYSTPACTTOT, LCUMQTYSTPACT
+Local Decimal LMAXQTYSTP, LARRSTU
+Local Char LCSTTIM(GLONHS)
+Local Integer LCSTCOU
+Local Date LCSTDAT
+Local Integer ISVALID
+
+# Déclaration des variables communes de travail
+Local Integer I, J
+
+#-----  Lecture des clés -----#
+# Read de la table AMIGKEY "index migration" pour alimenter ACLE1/ACLE2/ACLE3/STOP
+Call MIGGETKEY (DOSSIER,"UUMGTRTSTO03",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT,ERR) From TRTMIG
+STOP=val(TABMIGKEY(3))
+
+Gosub OUVRE_STO From UUMGTRTSTO00
+Gosub INIT_TUN From UUMGTRTSTO00
+
+#-----  Lien des tables "entête & lignes" -----#
+Link [ITVM] With [STPM]STP0(2)=[ITVM]ITMREF;[ITVM]STOFCY,
+&                [ITM]ITM0~=[ITVM]ITMREF
+&    As [LNK]
+&    Order By Key CLE = [ITVM]ITMREF;[ITVM]STOFCY
+
+# PE pour ajout clause where
+Local Char FLUX
+Local Integer FILTRELIN
+FLUX="UUMGTRTSTO03" : FILTRELIN=0 : Raz HINTSPE : Raz CRITERESPE : Gosub PE_CRITSEL From TRTMIG
+If CRITERESPE="" : CRITERESPE="1=1" : Endif
+
+Call DEBTRANS From GLOCK
+Gosub SET_FIRST From TRTFIRST
+
+$LOOP_STO03
+Raz NB
+If STOP = 1
+ STOP = 2
+ CRITERE = "[F:ITVM]ITMREF=TABMIGKEY(1) & [F:ITVM]STOFCY>TABMIGKEY(2)"
+Elsif STOP=2
+ STOP = 0
+ CRITERE = "[F:ITVM]ITMREF>TABMIGKEY(1)"
+Else
+ CRITERE = "1=1"
+Endif
+
+Trbegin [ITV]
+GOK = 1
+
+For [LNK]CLE(2) Hint Key=HINTSPE Where evalue(CRITERE) & evalue(CRITERESPE)
+  NBLUS+=1
+
+  # PE pour exclure ligne
+  If FILTRELIN
+      FLUX="UUMGTRTSTO03" : ISVALID=1 : Gosub PE_VERIFSEL From TRTMIG
+      If ISVALID=0 : Goto SUITE_BOUCLE : Endif
+  Endif
+
+  Raz [F:ITV]
+  [F:ITV] = [F:ITVM]
+
+  If [F:ITM]STOMGTCOD>1
+      #Appel proc de migration sur entete
+      Gosub MAJ30_ITV
+
+      If WTUNUOMOLD<>[F:ITM]STU
+          WTUNUOMOLD=[F:ITM]STU
+          WJTUN=find([F:ITM]STU,WTUNUOM)
+      Endif
+
+        ISVALID=1
+        If [F:STPM]ITMREF<>""   # Elément de pile FIFO existant
+            Gosub AMAJ30_STP
+        Endif
+      For [LNK]CLE
+        If !ISVALID or [F:STPM]ITMREF=""   # Pas d'élément de pile
+            If ISVALID<=0
+                #Call ECR_TRACE("File STOCOST(ITMREF/STOFCY/CSTDAT/CSTTIM/CSTCOU) is not valid"-num$(ISVALID)
+#&                             -" :"-[F:STPM]ITMREF+"/"+[F:STPM]STOFCY+"/"+num$([F:STPM]CSTDAT)+"/"+[F:STPM]CSTTIM+"/"+num$([F:STPM]CSTCOU),1) From GESECRAN
+            Endif
+            Break
+        Endif
+
+        Raz [F:STP]     # Issue 91893 - 2013-08-20 by CCC
+        [F:STP] = [F:STPM]
+
+        #Appel proc de migration sur detail
+        Gosub MAJ30_STP
+
+        #--- Issue 108760 by TS
+        #If NEWMOTEUR
+        #    Gosub STP_STK : # pour stocker ref
+        #    WriteB [STP]
+        #Else
+        #    Write [STP]
+        #Endif
+        #If fstat
+        #    If NEWMOTEUR & adxwrb>1
+        #      Call ECR_TRACE("File STOCOST, Error ="-num$(fstat),1) From GESECRAN
+        #      Gosub STP_ERRTRA : # pour afficher les ref
+        #    Else
+        #      Call ECR_TRACE("File STOCOST(ITMREF/STOFCY/CSTDAT/CSTTIM/CSTCOU)"-[F:STPM]ITMREF+"/"+[F:STPM]STOFCY+"/"+num$([F:STPM]CSTDAT)+"/"+[F:STPM]CSTTIM+"/"+num$([F:STPM]CSTCOU)+", ERROR ="
+#&                           -num$(fstat),1) From GESECRAN
+        #    Endif
+        #    GOK=0 : Break
+        #Endif
+        Gosub STP_STK : # pour stocker ref
+        WriteB [STP]
+        If fstat
+            Call ECR_TRACE("File STOCOST, Error ="-num$(fstat),1) From GESECRAN
+            Gosub STP_ERRTRA : # pour afficher les ref
+            GOK=0 : Break
+        Endif
+        #---
+      Next
+
+      If GOK<1 : Break : Endif
+      If [F:STPM]ITMREF<>""
+          Gosub BMAJ30_STP
+      Endif
+  Endif
+
+  # --- alimentation des champs et écriture enreg
+  #--- Issue 108760 by TS
+  #If NEWMOTEUR
+  #    Gosub ITV_STK : # pour stocker ref
+  #    WriteB [F:ITV]
+  #Else
+  #    Write [F:ITV]
+  #Endif
+  #If fstat
+  #  If NEWMOTEUR & adxwrb>1
+  #    Call ECR_TRACE("File ITMMVT, Error ="-num$(fstat),1) From GESECRAN
+  #    Gosub ITV_ERRTRA : # pour afficher les ref
+  #  Else
+  #    Call ECR_TRACE("File ITMMVT(ITMREF/STOFCY)"-[F:ITV]ITMREF-'/'-[F:ITV]STOFCY+", Error ="-num$(fstat),1) From GESECRAN
+  #  Endif
+  #  GOK=0 : Break
+  #Endif
+  Gosub ITV_STK : # pour stocker ref
+  WriteB [F:ITV]
+  If fstat
+    Call ECR_TRACE("File ITMMVT, Error ="-num$(fstat),1) From GESECRAN
+    Gosub ITV_ERRTRA : # pour afficher les ref
+    GOK=0 : Break
+  Endif
+  #---
+
+  NB+=1
+  If NB>GMAXUPDTRS
+    TABMIGKEY(1) = [F:ITVM]ITMREF
+    TABMIGKEY(2) = [F:ITVM]STOFCY
+    STOP=1
+    Break
+  Endif
+$SUITE_BOUCLE
+Next
+
+$FIN_BOUCLE
+If GOK<1
+  Rollback
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO03",7,ERR) From TRTMIG : #7=Erreur
+Else
+  #--- Issue 108760 by TS
+  #If NEWMOTEUR & adxwrb>1
+  #---
+    Flush [F:ITV]
+    If fstat
+        Call ECR_TRACE("File ITMMVT, Error ="-num$(fstat),1) From GESECRAN
+        Gosub ITV_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+    Flush [F:STP]
+    If fstat
+        Call ECR_TRACE("File STOCOST, Error ="-num$(fstat),1) From GESECRAN
+        Gosub STP_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+  #--- Issue 108760 by TS
+  #  Endif
+  #---
+  # Stocker les valeurs de ACLE1/ACLE2/ACLE3/STOP dans la table AMIGKEY.
+  If STOP
+    TABMIGKEY(3)=num$(STOP)
+  Else
+    Raz TABMIGKEY
+  Endif
+  Call MIGSTKKEY (DOSSIER,"UUMGTRTSTO03",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT+NB,ERR) From TRTMIG
+  If ERR
+   GOK=-1 : Goto FIN_BOUCLE
+  Endif
+  NBCOMMIT+=NB
+  Commit
+  Call MIGSTKPROGRESS (DOSSIER,"UUMGTRTSTO03",STOP,ERR) From TRTMIG
+  If STOP
+    Goto LOOP_STO03
+  Endif
+Endif
+
+Gosub UNSET_FIRST From TRTFIRST
+
+Close Local File [ITV], [STP]
+Close Local File [ITVM], [STPM]
+#----- Remise en état des fichiers où on a inseré -----#
+Call MIGTABEND (DOSSIER,"ITMMVT",ERR) From TRTMIG
+Call MIGTABEND (DOSSIER,"STOCOST",ERR) From TRTMIG
+Call MIGTRTEND (DOSSIER,"UUMGTRTSTO03") From TRTMIG
+Call ECR_TIME("UUMGTRTSTO03 : "+num$(NBLUS)+" records read,"-num$(NBCOMMIT)+" records processed") From DOSSUB
+End
+
+$MAJ30_ITV
+
+LERR = 0
+
+If GACTDECCST
+    Gosub GETPRISTD
+    Gosub LOAD_AMTCST
+    Gosub LOAD_AVCCST
+    Gosub LOAD_LASTCST
+Endif
+
+Return
+
+$AMAJ30_STP
+Raz LQTYSTOACT, LQTYSTPACTTOT
+#---- Quantité active en stock ----#
+Raz REQ
+REQ(0) = "SELECT sum(QTYSTUACT_0)"
+REQ(0)-= "From "+DOSSIER+".STOCK"
+REQ(0)-= "Where ITMREF_0 = '"+[F:ITV]ITMREF+"'"
+REQ(0)-= "and STOFCY_0 = '"+[F:ITV]STOFCY+"'"
+For (Decimal QTYSTOACT) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+    LQTYSTOACT = [F:SQLX]QTYSTOACT
+Next
+If LQTYSTOACT=0
+    ISVALID=0
+Else
+#Call ORATRA From ORATRA
+    Gosub $AMAJ30_STP3
+#Call ORATRA From ORATRA
+#ORASTOP=1
+
+Endif
+Return
+
+$AMAJ30_STP2
+#---- Quantité active totale des mouvements qui ont créé les STP restants ---#
+Raz REQ
+REQ(0) = "SELECT sum("
+REQ(0)-= "Case"
+REQ(0)-= "When ACTQTY_0 = 0 and POT_0 = 0 Then STJ.QTYSTU_0"
+REQ(0)-= "When ACTQTY_0 = 0 and POT_0 <> 0 Then STJ.QTYSTU_0 * POT_0"
+REQ(0)-= "Else ACTQTY_0"
+REQ(0)-= "End) QJA,"
+REQ(0)-= "sum(STJ.QTYSTU_0) QJP, "
+REQ(0)-= "sum(STP.QTYSTU_0) QPP"
+REQ(1) = " From "+DOSSIER+".STOJOU STJ"
+REQ(1)-= "INNER JOIN "+DOSSIER+"."+WNAMSTPM+" STP"
+REQ(1)-= "   ON STP.ITMREF_0=STJ.ITMREF_0"
+REQ(1)-= "  and STP.STOFCY_0=STJ.STOFCY_0"
+REQ(1)-= "  and STP.VCRTYP_0=STJ.VCRTYP_0"
+REQ(1)-= "  and STP.VCRNUM_0=STJ.VCRNUM_0"
+REQ(1)-= "  and STP.VCRLIN_0=STJ.VCRLIN_0"
+REQ(2) = " Where STJ.STOFCY_0 = '"+[F:ITV]STOFCY+"'"
+REQ(2)-= " and STJ.ITMREF_0 = '"+[F:ITV]ITMREF+"'"
+REQ(2)-= " and STJ.UPDCOD_0=2"
+For (Decimal QTYSTJACT, Decimal QTYSTJPHY, Decimal QTYSTPPHY) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+    If [F:SQLX]QTYSTJPHY=0
+        ISVALID=-1
+    Else
+        LQTYSTPACTTOT = [F:SQLX]QTYSTPPHY * [F:SQLX]QTYSTJACT/[F:SQLX]QTYSTJPHY
+    Endif
+Next
+Raz LCUMQTYSTPACT
+Raz LMAXQTYSTP, LCSTDAT, LCSTTIM, LCSTCOU
+Return
+
+$AMAJ30_STP3
+#---- Quantité active totale des mouvements qui ont créé les STP restants ---#
+If [F:ITM]STOMGTCOD=2
+    Raz REQ
+    REQ(0) = "SELECT sum(STP.QTYSTU_0)"
+    REQ(1) = " From "+DOSSIER+"."+WNAMSTPM+" STP"
+    REQ(2) = " Where STP.STOFCY_0 = '"+[F:ITV]STOFCY+"'"
+    REQ(2)-= " and STP.ITMREF_0 = '"+[F:ITV]ITMREF+"'"
+    For (Decimal QTYSTPPHY) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+        LQTYSTPACTTOT = [F:SQLX]QTYSTPPHY
+    Next
+Else
+    Raz REQ
+    REQ(0) = "SELECT sum("
+    REQ(0)-= "Case"
+    REQ(0)-= "When ACTQTY_0 = 0 and POT_0 = 0 Then STJ.QTYSTU_0"
+    REQ(0)-= "When ACTQTY_0 = 0 and POT_0 <> 0 Then STJ.QTYSTU_0 * POT_0"
+    REQ(0)-= "Else ACTQTY_0"
+    REQ(0)-= "End) QJA,"
+    REQ(0)-= "sum(STJ.QTYSTU_0) QJP, "
+    REQ(0)-= "sum(STP.QTYSTU_0) QPP"
+    REQ(1) = " From "+DOSSIER+".STOJOU STJ"
+    REQ(1)-= "INNER JOIN "+DOSSIER+"."+WNAMSTPM+" STP"
+    REQ(1)-= "   ON STP.ITMREF_0=STJ.ITMREF_0"
+    REQ(1)-= "  and STP.STOFCY_0=STJ.STOFCY_0"
+    REQ(1)-= "  and STP.VCRTYP_0=STJ.VCRTYP_0"
+    REQ(1)-= "  and STP.VCRNUM_0=STJ.VCRNUM_0"
+    REQ(1)-= "  and STP.VCRLIN_0=STJ.VCRLIN_0"
+    REQ(2) = " Where STJ.STOFCY_0 = '"+[F:ITV]STOFCY+"'"
+    REQ(2)-= " and STJ.ITMREF_0 = '"+[F:ITV]ITMREF+"'"
+    REQ(2)-= " and STJ.UPDCOD_0=2"
+    For (Decimal QTYSTJACT, Decimal QTYSTJPHY, Decimal QTYSTPPHY) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+        If [F:SQLX]QTYSTJPHY=0
+            ISVALID=-1
+        Else
+            LQTYSTPACTTOT = [F:SQLX]QTYSTPPHY * [F:SQLX]QTYSTJACT/[F:SQLX]QTYSTJPHY
+        Endif
+    Next
+Endif
+
+Raz LCUMQTYSTPACT
+Raz LMAXQTYSTP, LCSTDAT, LCSTTIM, LCSTCOU
+Return
+
+$MAJ30_STP
+
+If GACTDECCST
+    Gosub LOAD_STPCST
+Endif
+Gosub MAJ_QTYACT
+
+Return
+
+$BMAJ30_STP
+If LCUMQTYSTPACT <> 0 & LQTYSTOACT<>LCUMQTYSTPACT
+  #--- Issue 108760 by TS
+  #If NEWMOTEUR & adxwrb>1
+  #---
+    Flush [F:STP]
+    If fstat
+        Call ECR_TRACE("File STOCOST, Error ="-num$(fstat),1) From GESECRAN
+        Gosub STP_ERRTRA : # pour afficher les ref
+        GOK=0 : Return
+    Endif
+  #--- Issue 108760 by TS
+  #Endif
+  #---
+  Read [STP]STP0=[F:ITV]ITMREF;[F:ITV]STOFCY;LCSTDAT;LCSTTIM;LCSTCOU
+  [F:STP]QTYSTUACT += LQTYSTOACT - LCUMQTYSTPACT
+  Rewrite [F:STP]
+Endif
+Return
+################################################
+$GETPRISTD
+Raz [F:ITC]
+If WCSTTYP=0
+    Return
+Endif
+
+    Filter [ITC] Where STOFCY = [F:ITVM]STOFCY
+&                    & ITMREF = [F:ITVM]ITMREF
+&                    & CSTTYP = WCSTTYP
+&                    & ITCSTRDAT<= date$ & date$<=ITCENDDAT
+&                    & UID    = 0
+&                Order By Key ITC0 Desc
+    Read [ITC] First
+
+If fstat    # Si le prix standard de l'année de la fin d'exercice en cours n'est pas trouvé, on essaie avec l'année précédente
+
+    Filter [ITC] Where STOFCY = [F:ITVM]STOFCY
+&                    & ITMREF = [F:ITVM]ITMREF
+&                    & CSTTYP = WCSTTYP
+&                    & ITCSTRDAT<= date$
+&                    & UID    = 0
+&                Order By Key ITC2 Desc
+
+    Read [ITC] First
+Endif
+Filter [ITC]
+
+Return
+
+################################################
+$LOAD_AMTCST
+LTOT = 0
+LMAX = 0
+LZON = "[F:ITV]AMATCST("+num$(max(0,[F:ITM]BRDCOD-1))+")"
+If [F:ITC]VLTTOT=0
+    LCOE = 0
+Else
+    LCOE = [F:ITV]AVCBASAMT/[F:ITC]VLTTOT
+Endif
+#---- Matière ----#
+For I=0 To LACTMAT-1
+    [F:ITV]AMATCST(I) = [F:ITC]MATCST(I)*LCOE
+    LTOT += [F:ITV]AMATCST(I)
+    If LMAX<[F:ITV]AMATCST(I)
+        LZON = "[F:ITV]AMATCST("+num$(I)+")"
+        LMAX=[F:ITV]AMATCST(I)
+    Endif
+Next
+[F:ITV]AOVEMATCST = [F:ITC]OVEMATCST*LCOE
+LTOT += [F:ITV]AOVEMATCST
+If LMAX<[F:ITV]AOVEMATCST
+    LZON = "[F:ITV]AOVEMATCST"
+    LMAX=[F:ITV]AOVEMATCST
+Endif
+
+#---- Machine ----#
+For I=0 To LACTMAC-1
+    [F:ITV]AMACCST(I) = [F:ITC]MACCST(I)*LCOE
+    LTOT += [F:ITV]AMACCST(I)
+    If LMAX<[F:ITV]AMACCST(I)
+        LZON = "[F:ITV]AMACCST("+num$(I)+")"
+        LMAX=[F:ITV]AMACCST(I)
+    Endif
+Next
+[F:ITV]AOVEMACCST = [F:ITC]OVEMACCST*LCOE
+LTOT += [F:ITV]AOVEMACCST
+If LMAX<[F:ITV]AOVEMACCST
+    LZON = "[F:ITV]AOVEMACCST"
+    LMAX=[F:ITV]AOVEMACCST
+Endif
+
+#---- Main d'oeuvre ----#
+For I=0 To LACTLAB-1
+    [F:ITV]ALABCST(I) = [F:ITC]LABCST(I)*LCOE
+    LTOT += [F:ITV]ALABCST(I)
+    If LMAX<[F:ITV]ALABCST(I)
+        LZON = "[F:ITV]ALABCST("+num$(I)+")"
+        LMAX=[F:ITV]ALABCST(I)
+    Endif
+Next
+[F:ITV]AOVELABCST = [F:ITC]OVELABCST*LCOE
+LTOT += [F:ITV]AOVELABCST
+If LMAX<[F:ITV]AOVELABCST
+    LZON = "[F:ITV]AOVELABCST"
+    LMAX=[F:ITV]AOVELABCST
+Endif
+
+#---- /s-traitance ----#
+[F:ITV]ASCOCST = [F:ITC]SCOCST*LCOE
+LTOT += [F:ITV]ASCOCST
+If LMAX<[F:ITV]ASCOCST
+    LZON = "[F:ITV]ASCOCST"
+    LMAX=[F:ITV]ASCOCST
+Endif
+[F:ITV]AOVESCOCST = [F:ITC]OVESCOCST*LCOE
+LTOT += [F:ITV]AOVESCOCST
+If LMAX<[F:ITV]AOVESCOCST
+    LZON = "[F:ITV]AOVESCOCST"
+    LMAX=[F:ITV]AOVESCOCST
+Endif
+
+#---- éléments de facturation ----#
+[F:ITV]AINVDTACST = 0
+
+If LTOT-[F:ITV]AVCBASAMT<>0
+    Assign LZON With evalue(LZON)+[F:ITV]AVCBASAMT-LTOT
+Endif
+Return
+
+
+################################################
+$LOAD_AVCCST
+LTOT = 0
+LMAX = 0
+LZON = "[F:ITV]AMATAVC("+num$(max(0,[F:ITM]BRDCOD-1))+")"
+If [F:ITC]VLTTOT=0
+    LCOE = 0
+Else
+    LCOE = [F:ITV]AVC/[F:ITC]VLTTOT
+Endif
+#---- Matière ----#
+For I=0 To LACTMAT-1
+    [F:ITV]AMATAVC(I) = [F:ITC]MATCST(I)*LCOE
+    LTOT += [F:ITV]AMATAVC(I)
+    If LMAX<[F:ITV]AMATAVC(I)
+        LZON = "[F:ITV]AMATAVC("+num$(I)+")"
+        LMAX = [F:ITV]AMATAVC(I)
+    Endif
+Next
+[F:ITV]AOVEMATAVC = [F:ITC]OVEMATCST*LCOE
+LTOT += [F:ITV]AOVEMATAVC
+If LMAX<[F:ITV]AOVEMATAVC
+    LZON = "[F:ITV]AOVEMATAVC"
+    LMAX=[F:ITV]AOVEMATAVC
+Endif
+
+#---- Machine ----#
+For I=0 To LACTMAC-1
+    [F:ITV]AMACAVC(I) = [F:ITC]MACCST(I)*LCOE
+    LTOT += [F:ITV]AMACAVC(I)
+    If LMAX<[F:ITV]AMACAVC(I)
+        LZON = "[F:ITV]AMACAVC("+num$(I)+")"
+        LMAX=[F:ITV]AMACAVC(I)
+    Endif
+Next
+[F:ITV]AOVEMACAVC = [F:ITC]OVEMACCST*LCOE
+LTOT += [F:ITV]AOVEMACAVC
+If LMAX<[F:ITV]AOVEMACAVC
+    LZON = "[F:ITV]AOVEMACAVC"
+    LMAX=[F:ITV]AOVEMACAVC
+Endif
+
+#---- Main d'oeuvre ----#
+For I=0 To LACTLAB-1
+    [F:ITV]ALABAVC(I) = [F:ITC]LABCST(I)*LCOE
+    LTOT += [F:ITV]ALABAVC(I)
+    If LMAX<[F:ITV]ALABAVC(I)
+        LZON = "[F:ITV]ALABAVC("+num$(I)+")"
+        LMAX=[F:ITV]ALABAVC(I)
+    Endif
+Next
+[F:ITV]AOVELABAVC = [F:ITC]OVELABCST*LCOE
+LTOT += [F:ITV]AOVELABAVC
+If LMAX<[F:ITV]AOVELABAVC
+    LZON = "[F:ITV]AOVELABAVC"
+    LMAX=[F:ITV]AOVELABAVC
+Endif
+
+#---- /s-traitance ----#
+[F:ITV]ASCOAVC = [F:ITC]SCOCST*LCOE
+LTOT += [F:ITV]ASCOAVC
+If LMAX<[F:ITV]ASCOAVC
+    LZON = "[F:ITV]ASCOAVC"
+    LMAX=[F:ITV]ASCOAVC
+Endif
+[F:ITV]AOVESCOAVC = [F:ITC]OVESCOCST*LCOE
+LTOT += [F:ITV]AOVESCOAVC
+If LMAX<[F:ITV]AOVESCOAVC
+    LZON = "[F:ITV]AOVESCOAVC"
+    LMAX=[F:ITV]AOVESCOAVC
+Endif
+
+#---- éléments de facturation ----#
+[F:ITV]AINVDTAAVC = 0
+
+If LTOT-[F:ITV]AVC<>0
+    Assign LZON With evalue(LZON)+[F:ITV]AVC-LTOT
+Endif
+Return
+
+################################################
+$LOAD_LASTCST
+LTOT = 0
+LMAX = 0
+LZON = "[F:ITV]LMATCST("+num$(max(0,[F:ITM]BRDCOD-1))+")"   #
+If [F:ITC]VLTTOT=0
+    LCOE = 0
+Else
+    LCOE = [F:ITV]LASRCPPRI/[F:ITC]VLTTOT
+Endif
+#---- Matière ----#
+For I=0 To LACTMAT-1
+    [F:ITV]LMATCST(I) = [F:ITC]MATCST(I)*LCOE
+    LTOT += [F:ITV]LMATCST(I)
+    If LMAX<[F:ITV]LMATCST(I)
+        LZON = "[F:ITV]LMATCST("+num$(I)+")"
+        LMAX=[F:ITV]LMATCST(I)
+    Endif
+Next
+[F:ITV]LOVEMATCST = [F:ITC]OVEMATCST*LCOE
+LTOT += [F:ITV]LOVEMATCST
+If LMAX<[F:ITV]LOVEMATCST
+    LZON = "[F:ITV]LOVEMATCST"
+    LMAX=[F:ITV]LOVEMATCST
+Endif
+
+#---- Machine ----#
+For I=0 To LACTMAC-1
+    [F:ITV]LMACCST(I) = [F:ITC]MACCST(I)*LCOE
+    LTOT += [F:ITV]LMACCST(I)
+    If LMAX<[F:ITV]LMACCST(I)
+        LZON = "[F:ITV]LMACCST("+num$(I)+")"
+        LMAX=[F:ITV]LMACCST(I)
+    Endif
+Next
+[F:ITV]LOVEMACCST = [F:ITC]OVEMACCST*LCOE
+LTOT += [F:ITV]LOVEMACCST
+If LMAX<[F:ITV]LOVEMACCST
+    LZON = "[F:ITV]LOVEMACCST"
+    LMAX=[F:ITV]LOVEMACCST
+Endif
+
+#---- Main d'oeuvre ----#
+For I=0 To LACTLAB-1
+    [F:ITV]LLABCST(I) = [F:ITC]LABCST(I)*LCOE
+    LTOT += [F:ITV]LLABCST(I)
+    If LMAX<[F:ITV]LLABCST(I)
+        LZON = "[F:ITV]LLABCST("+num$(I)+")"
+        LMAX=[F:ITV]LLABCST(I)
+    Endif
+Next
+[F:ITV]LOVELABCST = [F:ITC]OVELABCST*LCOE
+LTOT += [F:ITV]LOVELABCST
+If LMAX<[F:ITV]LOVELABCST
+    LZON = "[F:ITV]LOVELABCST"
+    LMAX=[F:ITV]LOVELABCST
+Endif
+
+#---- /s-traitance ----#
+[F:ITV]LSCOCST = [F:ITC]SCOCST*LCOE
+LTOT += [F:ITV]LSCOCST
+If LMAX<[F:ITV]LSCOCST
+    LZON = "[F:ITV]LSCOCST"
+    LMAX=[F:ITV]LSCOCST
+Endif
+[F:ITV]LOVESCOCST = [F:ITC]OVESCOCST*LCOE
+LTOT += [F:ITV]LOVESCOCST
+If LMAX<[F:ITV]LOVESCOCST
+    LZON = "[F:ITV]LOVESCOCST"
+    LMAX=[F:ITV]LOVESCOCST
+Endif
+
+#---- éléments de facturation ----#
+[F:ITV]LINVDTACST = 0
+
+If [F:ITV]LASRCPPRI-LTOT<>0
+    Assign LZON With evalue(LZON)+[F:ITV]LASRCPPRI-LTOT
+Endif
+Return
+
+################################################
+$LOAD_STPCST
+LTOT = 0
+LMAX = 0
+LZON = "[F:STP]MATCST("+num$(max(0,[F:ITM]BRDCOD-1))+")"
+If [F:ITC]VLTTOT=0
+    LCOE = 0
+Else
+    LCOE = [F:STP]CST/[F:ITC]VLTTOT
+Endif
+#---- Matière ----#
+For I=0 To LACTMAT-1
+    [F:STP]MATCST(I) = [F:ITC]MATCST(I)*LCOE
+    LTOT += [F:STP]MATCST(I)
+    If LMAX<[F:STP]MATCST(I)
+        LZON = "[F:STP]MATCST("+num$(I)+")"
+        LMAX=[F:STP]MATCST(I)
+    Endif
+Next
+[F:STP]OVEMATCST = [F:ITC]OVEMATCST*LCOE
+LTOT += [F:STP]OVEMATCST
+If LMAX<[F:STP]OVEMATCST
+    LZON = "[F:STP]OVEMATCST"
+    LMAX=[F:STP]OVEMATCST
+Endif
+
+#---- Machine ----#
+For I=0 To LACTMAC-1
+    [F:STP]MACCST(I) = [F:ITC]MACCST(I)*LCOE
+    LTOT += [F:STP]MACCST(I)
+    If LMAX<[F:STP]MACCST(I)
+        LZON = "[F:STP]MACCST("+num$(I)+")"
+        LMAX=[F:STP]MACCST(I)
+    Endif
+Next
+[F:STP]OVEMACCST = [F:ITC]OVEMACCST*LCOE
+LTOT += [F:STP]OVEMACCST
+If LMAX<[F:STP]OVEMACCST
+    LZON = "[F:STP]OVEMACCST"
+    LMAX=[F:STP]OVEMACCST
+Endif
+
+#---- Main d'oeuvre ----#
+For I=0 To LACTLAB-1
+    [F:STP]LABCST(I) = [F:ITC]LABCST(I)*LCOE
+    LTOT += [F:STP]LABCST(I)
+    If LMAX<[F:STP]LABCST(I)
+        LZON = "[F:STP]LABCST("+num$(I)+")"
+        LMAX=[F:STP]LABCST(I)
+    Endif
+Next
+[F:STP]OVELABCST = [F:ITC]OVELABCST*LCOE
+LTOT += [F:STP]OVELABCST
+If LMAX<[F:STP]OVELABCST
+    LZON = "[F:STP]OVELABCST"
+    LMAX=[F:STP]OVELABCST
+Endif
+
+#---- /s-traitance ----#
+[F:STP]SCOCST = [F:ITC]SCOCST*LCOE
+LTOT += [F:STP]SCOCST
+If LMAX<[F:STP]SCOCST
+    LZON = "[F:STP]SCOCST"
+    LMAX=[F:STP]SCOCST
+Endif
+[F:STP]OVESCOCST = [F:ITC]OVESCOCST*LCOE
+LTOT += [F:STP]OVESCOCST
+If LMAX<[F:STP]OVESCOCST
+    LZON = "[F:STP]OVESCOCST"
+    LMAX=[F:STP]OVESCOCST
+Endif
+
+#---- éléments de facturation ----#
+[F:STP]INVDTACST = 0
+
+If LTOT-[F:STP]CST<>0
+    Assign LZON With evalue(LZON)+[F:STP]CST-LTOT
+Endif
+Return
+
+################################################
+$MAJ_QTYACT
+    If [F:ITM]STOMGTCOD=2
+        [F:STP]QTYSTUACT = [F:STPM]QTYSTU
+    Elsif [F:ITM]STOMGTCOD>2
+        If dim([L]LCOEF)<=0 : Local Decimal LCOEF : Endif
+        LCOEF = 1
+
+        Raz REQ, ICRIT
+        Call ADDCRIT(REQ, ICRIT,"", "SELECT sum(", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", "Case", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "When ACTQTY_0 = 0 and POT_0 = 0 and STJ.QTYSTU_0>0 Then STJ.QTYSTU_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "When ACTQTY_0 = 0 and POT_0 <> 0 and STJ.QTYSTU_0>0 Then STJ.QTYSTU_0 * POT_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "When ACTQTY_0>0 Then ACTQTY_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "Else 0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", "End) QJA,", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", "sum(CASE", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "WHEN STJ.QTYSTU_0>0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "THEN STJ.QTYSTU_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "Else 0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", "END) QJP,", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", "sum(Case", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "When ACTQTY_0 = 0 and POT_0 = 0 and STJ.REGFLG_0=1 Then STJ.QTYSTU_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "When ACTQTY_0 = 0 and POT_0 <> 0 and STJ.REGFLG_0=1 Then STJ.QTYSTU_0 * POT_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "When STJ.REGFLG_0=1 Then ACTQTY_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "Else 0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "End) QJA_R1,", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", "sum(CASE", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "WHEN STJ.REGFLG_0=1", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "THEN STJ.QTYSTU_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "Else 0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", "END) QJP_R1", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", "From "+DOSSIER+".STOJOU STJ", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"", " INNER JOIN "+DOSSIER+"."+WNAMSTPM+" STP", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   " ON STP.ITMREF_0=STJ.ITMREF_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "and STP.STOFCY_0=STJ.STOFCY_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "and STJ.UPDCOD_0=2", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "and STP.VCRTYP_0=STJ.VCRTYP_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "and STP.VCRNUM_0=STJ.VCRNUM_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   "and STP.VCRLIN_0=STJ.VCRLIN_0", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",  " Where STP.STOFCY_0='"+[F:STPM]STOFCY+"'", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   " and STP.ITMREF_0='"+[F:STPM]ITMREF+"'", " ") From GOBJSUB
+        Case GTYPDBA
+            When 1 : LDAT = "TO_DATE('"+format$("D:DD[/]MM[/]YYYY",[F:STPM]CSTDAT)+"','DD/MM/YYYY')"
+            When 2 : LDAT = "CONVERT(datetime,'"+format$("D:YYYYMMDD",[F:STPM]CSTDAT)+"',112)"
+        Endcase
+        Call ADDCRIT(REQ, ICRIT,"",   " and STP.CSTDAT_0="+LDAT, " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   " and STP.CSTTIM_0='"+[F:STPM]CSTTIM+"'", " ") From GOBJSUB
+        Call ADDCRIT(REQ, ICRIT,"",   " and STP.CSTCOU_0="+num$([F:STPM]CSTCOU), " ") From GOBJSUB
+
+        For (Decimal QTYSTJACT, Decimal QTYSTJPHY, Decimal QTYSTJACT_R1, Decimal QTYSTJPHY_R1) From num$(GTYPDBA*2+1) Sql REQ As [SQLX]
+            If [F:SQLX]QTYSTJPHY_R1<>0
+                LCOEF = [F:SQLX]QTYSTJACT_R1 / [F:SQLX]QTYSTJPHY_R1
+            Elsif [F:SQLX]QTYSTJPHY<>0
+                LCOEF = [F:SQLX]QTYSTJACT / [F:SQLX]QTYSTJPHY
+            Endif
+            Break
+        Next
+        [F:STP]QTYSTUACT = arr([F:STPM]QTYSTU * LCOEF, WTUNUOMDEC(WJTUN))
+        If [F:STP]QTYSTUACT>LMAXQTYSTP
+            LMAXQTYSTP = [F:STP]QTYSTUACT
+            LCSTDAT = [F:STPM]CSTDAT
+            LCSTTIM = [F:STPM]CSTTIM
+            LCSTCOU = [F:STPM]CSTCOU
+        Endif
+        LCUMQTYSTPACT += [F:STP]QTYSTUACT
+
+    Endif
+Return
+
+################################################
+$ITV_STK
+Call STK (WTAB_ITV,WCPT_ITV,[F:ITV]ITMREF-"/"-[F:ITV]STOFCY) From TRTMIG
+Return
+##############################################################################################
+$ITV_ERRTRA
+Call ERRTRA (WTAB_ITV,WCPT_ITV,"File ITMMVT(ITMREF/STOFCY)=") From TRTMIG
+Return
+
+################################################
+$STP_STK
+#--- Bug 83424
+#Call STK (WTAB_ITV,WCPT_ITV,[F:STP]ITMREF+"/"+[F:STP]STOFCY+"/"+num$([F:STP]CSTDAT)+"/"+[F:STP]CSTTIM+"/"+num$([F:STP]CSTCOU)) From TRTMIG
+Call STK (WTAB_STP,WCPT_STP,[F:STP]ITMREF+"/"+[F:STP]STOFCY+"/"+num$([F:STP]CSTDAT)+"/"+[F:STP]CSTTIM+"/"+num$([F:STP]CSTCOU)) From TRTMIG
+#---
+Return
+##############################################################################################
+$STP_ERRTRA
+#--- Bug 83424
+#Call ERRTRA (WTAB_ITV,WCPT_ITV,"File STOCOST(ITMREF/STOFCY/CSTDAT/CSTTIM/CSTCOU)=") From TRTMIG
+Call ERRTRA (WTAB_STP,WCPT_STP,"File STOCOST(ITMREF/STOFCY/CSTDAT/CSTTIM/CSTCOU)=") From TRTMIG
+#---
+Return
+
+##########################################################################
+Subprog RAZ_UUMGTRTSTO03(DOSSIER)
+Value Char DOSSIER
+
+Local Integer ERR
+Local Char WNAMITVM,WNAMSTPM
+Call MIGTABNAME (DOSSIER,"ITMMVT",WNAMITVM,ERR) From TRTMIG
+Call MIGTABNAME (DOSSIER,"STOCOST",WNAMSTPM,ERR) From TRTMIG
+
+If ERR : End : Endif
+
+#----- Présence des fichiers renommées...  -----#
+If filinfo(filpath("FIL",WNAMITVM,"fde",DOSSIER),0) < 0 End Endif
+If filinfo(filpath("FIL",WNAMSTPM,"fde",DOSSIER),0) < 0 End Endif
+
+Call MIGTABRAZ (DOSSIER,"ITMMVT",ERR) From TRTMIG
+Call MIGTABRAZ (DOSSIER,"STOCOST",ERR) From TRTMIG
+
+Call MIGRAZKEY (DOSSIER,"UUMGTRTSTO03",ERR) From TRTMIG
+
+End
+########################################################################
+# Pour exécution automatique  en gestion de patch                      #
+########################################################################
+Subprog PATCH(APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 : End : Endif
+If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+#--- Issue 108760 by TS
+#Read [ADS] DOSSIER=APPLI : If fstat Raz [F:ADS] : Endif
+If func DOSSUB.FILL_ADS(APPLI)=0 : End : Endif
+#---
+Call MAJ_UUMGTRTSTO03(APPLI)
+End
+
+#######################################################################
+# Pour exécution depuis dosmaj (validation dossier)
+########################################################################
+Subprog UTI_MOUL (APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 End : Endif
+
+Call MAJ_UUMGTRTSTO03(APPLI)
+End
+

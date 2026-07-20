@@ -1,0 +1,1216 @@
+#<AdxTL>@(#)10.0.0.0 $Revision$
+# Issue X3-83862 - 2018-06-26 by RAFAX : Project code at the G/L line - Automatic journals
+
+
+###############################################################
+## Evaluation compte d'après les codes comptables            ##
+###############################################################
+Subprog CPTNAT(NBREF,REFTYP,TPLAN,TCOMPTE,TSAC,TIERS,CRE,IDENT,DAT,STAT,MESSA)
+Value    Integer NBREF             : # Nb de référentiels
+Value    Integer REFTYP(1..)       : # Types référentiels
+Variable Char    TPLAN()(1..)      : # Tableau des codes plans
+Variable Char    TCOMPTE()(1..)    : # Tableau des comptes
+Variable Char    TSAC()(1..)       : # Tableau des collectifs
+Variable Char    TIERS()
+Value    Integer CRE
+Value    Char    IDENT
+Value    Date    DAT
+Variable Integer STAT
+Variable Char    MESSA()
+
+If clalev([F:CAC])=0 : Local File GACCCODE             [CAC] : Endif
+If clalev([F:COA])=0 : Local File =GTABCPT+"GCOA"      [COA] : Endif
+If clalev([F:GAC])=0 : Local File =GTABCPT+"GACCOUNT"  [GAC] : Endif
+
+Local Integer I, J, K, L, OK, ERR, QUINZE, ILED, OKCPTINI
+Local Integer COMPTE_OK
+Local Char    CLECPT(30), CODCPT(GLONCAC), MSKCPT(GLONGAC), TAXE(5)
+Local Char    CLECPT1(30), CLECPT2(30) # pour lecture table à 2 parties de clé
+Local Char    ZONE(10)
+Local Char    PLAN(GLONCOA)                        : # Plan de compte
+Local Char    COMPTE(GLONGAC)                      : # Compte
+Local Char    COLLEC(GLONGAC)                      : # Collectif
+Local Integer NBPLAN                               : # Nb de plan de comptes
+Local Integer NBDIE                                : # Nb d'axes à saisir (max 20)
+Local Char    TDIE(GLONDIE)(1..max(GOPTCANA,20))   : # Axes (DIE)
+Local Integer TOBLIG(1..max(GOPTCANA,20))          : # Obligatoire (O/N)
+Local Integer OBLIG                                : # Imputation obligatoire (propagation des comptes)
+Local Char    PROJECT(GLONPJT)
+
+Raz TPLAN, TCOMPTE, TSAC, TIERS
+
+$LIGCPTANA
+Call SETPLANAXE(GSOCIETE,NBREF,REFTYP,NBPLAN,TPLAN,NBDIE,TDIE,TOBLIG) From CPTDIV
+Call SETMAINREF(GSOCIETE,GTYPGEN,GTYPANA) From CPTDIV
+
+Raz COLLEC
+##########################################################
+# Initialisation comptes des NBREF types référentiels
+##########################################################
+## Pré-requis : on cherche à initialiser le compte du type référentiel TYPREF ssi les comptes des types
+## référentiels précédemment initialisés peuvent avoir une imputation sur le plan de compte associé
+## au type référentiel TYPREF
+## EX : on a renseigné les types référentiels suivants sur la ligne de pièce auto : social (plan SOC)
+##      IAS (plan IAS), analytique (plan ANA) => on initialisera le compte analytique ssi les comptes
+##      social et IAS peuvent avoir une imputation sur le plan de compte ANA (=le plan de compte ANA
+##      est référencé dans le tableau des comptes par défaut pour le compte social et le compte IAS)
+
+## Pour chaque type de référentiel, on initialise le compte du réferentiel
+## 1°) en évaluant ce qui a été paramétré dans la formule compte, en appliquant éventuellement les
+##     modificateurs mois/quinzaine
+## 2°) si pas de compte trouvé, on applique les codes comptables
+## 3°) si pas de compte trouvé, on essaye d'initialiser le compte du référentiel TYPREF par rapport aux comptes
+##     des référentiels précédemment initialisés (application des comptes par défaut)
+##     EX : on a renseigné les types référentiels suivants sur la ligne de pièce auto : social, ias, analytique
+##     => lorsqu'on cherchera à initialiser le compte analytique, si celui ci n'a pas été initialisé en 1°)
+##     et 2°), on va chercher à l'initialiser en prenant :
+##        a) le compte par défaut type 'Analytique' du compte social
+##        b) si pas de compte analytique trouvé, le compte par défaut type 'Analytique' du compte IAS
+## 4°) si pas de compte trouvé, on prend le compte par défaut du code plan du référentiel TYPREF
+## 5°) si pas de compte trouvé, on renvoie un message d'erreur compte inexistant
+
+## NB : dans la formule ACC1 de la ligne de pièce auto, on a paramétré le compte du 1er type de référentiel
+## ASSOCIE A LA LIGNE DE PIECE AUTOMATIQUE.
+## Par contre, plus tard dans le masque [M:HAE2], dans [M:HAE2]ACC1 on aura le compte du 1er type de référentiel
+## du menu local 2644 (c'est le seul moyen qu'on a pour que tous les comptes contenus dans [M:HAE2]ACCx
+## correspondent au même type de référentiel (et il le faut pour pouvoir faire des regroupements de lignes...)
+For TYPREF=1 To NBREF
+ Gosub INICPT
+ If OKINICPT
+  PLAN   = TPLAN(TYPREF)
+  COMPTE = TCOMPTE(TYPREF)
+  COMPTE_OK = 0
+  If COMPTE = ""
+   ZONE = "ACC"+num$(REFTYP(TYPREF))
+   Call EVAL_CHAR(COMPTE,ZONE,2,0,"",STAT) From CPTAUTO
+   If STAT : MESSA = "GAC"-"("+TPLAN(TYPREF)+")" : Break : Endif
+  Endif
+
+  # Si le compte existe et qu'il est compatible par rapport aux comptes précédemment saisis, on
+  # n'applique pas les modificateurs (bug 8919)
+  Read [GAC]GAC0 = PLAN;COMPTE
+  If !fstat
+   Gosub COMPTE_OK
+   If STAT=98 : GMESSAGE = MESSA : Break : Endif
+  Endif
+  # Sinon on essaye le code court
+  If !COMPTE_OK & COMPTE<>""
+   Read [GAC]GAC1 = PLAN;COMPTE
+   If !fstat
+    COMPTE=[F:GAC]ACC
+    Gosub COMPTE_OK
+    If STAT=98 : GMESSAGE = MESSA : Break : Endif
+   Endif
+  Endif
+
+  # Modificateur par mois
+  If !COMPTE_OK
+   K = instr(1,COMPTE,"mm")
+   If K=0 : K = instr(1,COMPTE,"MM") : Endif
+   If K
+    COMPTE = left$(COMPTE,K-1)+format$("N0:2#",month(DAT))+right$(COMPTE,K+2)
+   Endif
+   # Modificateur par quinzaine
+   K = instr(1,COMPTE,"qq")
+   If K=0 : K = instr(1,COMPTE,"QQ") : Endif
+   If K
+    QUINZE = 2*month(DAT)-(day(DAT)<16)
+    COMPTE = left$(COMPTE,K-1)+format$("N0:2#",QUINZE)+right$(COMPTE,K+2)
+   Endif
+   # Modificateur code comptable
+   If COMPTE="" | instr(1,COMPTE,"x")
+    COMPTE = left$(COMPTE+string$(GLONGAC,"x"),GLONGAC)
+    For K=0 To [F:GAD]NBRTYP-1
+     OK = 1
+     If [F:GAD]ACCCND(K)<>""
+      Onerrgo ERREUR
+      OK = evalue([F:GAD]ACCCND(K))
+      Onerrgo
+      If ERR : MESSA = [F:GAD]ACCCND(K) : STAT = 6 : Break 2 : Endif
+     Endif
+     If OK
+      Call EVAL_CHAR(CLECPT,num$(K),3,0,"",STAT) From CPTAUTO
+      If STAT : MESSA = "CAC" : Break 2 : Endif
+      CODCPT = ""
+      If left$(CLECPT,1)="~" : # nom de la zone à évaluer
+       If evalue("dim([F:TB1]"+right$(CLECPT,2)+")")>0
+        CODCPT = evalue("[F:TB1]"+right$(CLECPT,2))
+       Elsif evalue("dim([F:TB0]"+right$(CLECPT,2)+")")>0
+        CODCPT = evalue("[F:TB0]"+right$(CLECPT,2))
+       Else
+        CODCPT = ""
+       Endif
+       CLECPT = ""
+      Endif
+      If CLECPT<>""
+       Gosub CODE_COMPTABLE
+      Elsif CODCPT="" : # Si la clé est vide on va voir dans la table déclenchante elle-même
+       If dim([F:TB1]ACCCOD)>0
+        CODCPT = [F:TB1]ACCCOD
+       Elsif dim([F:TB0]ACCCOD)>0
+        CODCPT = [F:TB0]ACCCOD
+       Endif
+      Endif
+      If CODCPT<>""
+       Read [CAC]CAC0 = [F:GAD]TYPACCCOD(K);CODCPT;PLAN
+       If fstat : STAT = 11 : MESSA = CODCPT : Break 2 : Endif
+       MSKCPT = [F:CAC]ACC([F:GAD]ACCNUM(K)-1)
+       For J=1 To len(MSKCPT)
+        If mid$(MSKCPT,J,1)<>"x" & mid$(COMPTE,J,1)="x"
+         COMPTE = left$(COMPTE,J-1)+mid$(MSKCPT,J,1)+right$(COMPTE,J+1)
+        Endif
+       Next J
+       ## Demande 59598 : s'il n'y a pas de "x" à la fin du compte de type modificateur paramatré dans la ligne de code comptable
+       ## et que le compte défini dans la variable COMPTE existe à ce niveau, on s'arrête (=on n'applique pas les autres modificateurs)
+       If right$(MSKCPT,len(MSKCPT))<>"x"
+        Read [GAC]GAC0 = PLAN;vireblc(ctrans(COMPTE,"x"," "),1)
+        If !fstat
+         Break
+        Endif
+       Endif
+       ## Fin demande 59598
+      Endif
+     Endif
+    Next K
+    # Elimination des "x" de fin
+    COMPTE = vireblc(ctrans(COMPTE,"x"," "),1)
+    # Remplacement des "x" devenus " " par des "0"
+    COMPTE = ctrans(COMPTE," ","0")
+   Endif
+   Read [GAC]GAC0 = PLAN;COMPTE
+   If !fstat
+    Gosub COMPTE_OK
+    If STAT=98 : GMESSAGE = MESSA : Break : Endif
+   Endif
+   # Sinon on essaye le code court
+   If !COMPTE_OK & COMPTE<>""
+    Read [GAC]GAC1 = PLAN;COMPTE
+    If !fstat
+     COMPTE=[F:GAC]ACC
+     Gosub COMPTE_OK
+     If STAT=98 : GMESSAGE = MESSA : Break : Endif
+    Endif
+   Endif
+
+   # Compte vide ou nul
+   If !COMPTE_OK & COMPTE=string$(len(COMPTE),"0")
+    Read [GAC]GAC0 = PLAN;COMPTE
+    If !fstat
+     Gosub COMPTE_OK
+     If STAT=98 : GMESSAGE = MESSA : Break : Endif
+    Endif
+    If !COMPTE_OK & COMPTE<>""
+     Read [GAC]GAC1 = PLAN;COMPTE
+     If !fstat
+      Gosub COMPTE_OK
+      If STAT=98 : GMESSAGE = MESSA : Break : Endif
+     Endif
+    Endif
+
+    # Propagation : si le compte du référentiel TYPREF n'a toujours pas été initialisé, on essaye de
+    # l'initialiser par les autres référentiels
+    If !COMPTE_OK & TYPREF>1
+     Gosub INI_OTHACC
+     If STAT : Break : Endif
+     Read [GAC]GAC0 = PLAN;COMPTE
+     If !fstat
+      Gosub COMPTE_OK
+      If STAT=98 : GMESSAGE = MESSA : Break : Endif
+     Endif
+    Endif
+
+    ## Dernier recours : le compte par défaut : si aucun compte des autres référentiels n'est paramétré
+    ## "Imputation obligatoire" sur le plan de compte du type référentiel courant (OBLIG=0) , on initialise
+    ## le compte du référentiel courant par le compte par défaut
+    ## Si tjs pas de compte trouvé, on bloque mais toujours ssi au moins un compte des référentiels
+    ## précédemment initialisés est flagué "Imputation obligatoire" à 'Oui' sur le plan de compte du
+    ## référentiel courant
+    If !COMPTE_OK & !OBLIG
+     Call LEC_COA(TPLAN(TYPREF)) From CPTLEC
+     COMPTE = [F:COA]ACCMIS(1)
+     Read [GAC]GAC0 = PLAN;COMPTE
+     If !fstat
+      Gosub COMPTE_OK
+      If STAT=98 : GMESSAGE = MESSA : Break : Endif
+     Endif
+    Endif
+
+
+    ## Ajout du TYPREF>1 car OBLIG est toujours à 0 dans le cas où le 1ère référentiel n'est pas initalisé
+    ##  (Cas  d'une pièce mono-référentiel avec un type de pièce multi-référentiel
+    ##        où le référentiel n'est pas mouvementé en 1ère colonne)
+    If !COMPTE_OK & !OBLIG & COMPTE=string$(len(COMPTE),"0") & TYPREF>1
+     STAT = 29 : MESSA = mess(REFTYP(TYPREF),2644,1)-COMPTE : Break
+    Endif
+   Endif
+
+
+   # Existence et collectif
+   # Le compte existe-t-il tel quel ?
+   If COMPTE<>"" : # A ce niveau on peut ne pas avoir de compte et que cela soit normal (si OBLIG=0)
+    Read [GAC]GAC0 = PLAN;COMPTE
+    If fstat
+     # Sinon on essaye le code court
+     Read [GAC]GAC1 = PLAN;COMPTE
+     If !fstat
+      COMPTE = [F:GAC]ACC : Gosub COMPTE_OK
+      If STAT=98 : GMESSAGE = MESSA : Break : Endif
+     Elsif fstat
+      # Option longueur fixe
+      Call LEC_COA(PLAN) From CPTLEC
+      If [F:COA]FXDLEN = 2
+       COMPTE = left$(COMPTE+string$(GLONGAC,"0"),[F:COA]ACCLEN)
+      Endif
+      Read [GAC]GAC0 = PLAN;COMPTE
+      If !fstat
+       Gosub COMPTE_OK
+       If STAT=98 : GMESSAGE = MESSA : Break : Endif
+      Else
+       # Sinon on le crée si l'option est positionnée
+       Call LEC_COA(PLAN) From CPTLEC
+       If [F:COA]CREAUT=2
+        Call EVAL_CHAR(TAXE,"TAX",2,0,"",STAT) From CPTAUTO
+        Call CRECPT(PLAN,COMPTE,"XXX"-IDENT-"XXX",TAXE,OK) From CPTAUTO
+        If !OK : STAT = 27 : MESSA = GMESSAGE : Endif
+        Gosub COMPTE_OK
+        If STAT=98 : GMESSAGE = MESSA : Break : Endif
+       Else
+        STAT = 27 : MESSA = COMPTE-"("+mess(134,107,1)-PLAN+")" : Break
+       Endif
+      Endif
+     Endif
+    Endif
+   Endif
+  Endif
+ Endif
+Next
+
+If STAT
+ End
+Endif
+
+# Tiers
+If sigma(1,NBREF,TSAC(indcum)<>"")<>0
+ Call EVAL_CHAR(TIERS,"BPR",2,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "BPR" : End : Endif
+Else
+ TIERS = ""
+Endif
+End
+
+$COMPTE_OK
+## On vérifie la compatibilité avec les comptes des autres types référentiels précédemment initialisés
+TCOMPTE(TYPREF) = COMPTE
+
+## Performances when creating accounting entries
+#  (save the 20 first keys to control Compatible Accounts - see $COMPTE_OK From TRTCPE)
+If dim(GCNTKEY)>0
+ WCNTKEY=""
+ For I=1 To TYPREF
+  WCNTKEY+=num$(I)+"/"+TPLAN(I)+"/"+TCOMPTE(I)+"/"
+ Next
+ INDCNT=find(WCNTKEY,GCNTKEY(0..GCNTKEYNBR))
+ If INDCNT=0 & GCNTKEYNBR<dim(GCNTKEY)-1
+  Call CNTIPTACC(TYPREF,TPLAN,TCOMPTE,MESSA,STAT) From CPTCNT
+  GCNTKEY(GCNTKEYNBR)  = WCNTKEY
+  GCNTSTAT(GCNTKEYNBR) = STAT
+  GCNTKEYNBR+=1
+  INDCNT=GCNTKEYNBR
+ Endif
+Endif
+
+If dim(GCNTKEY)>0 & INDCNT>0
+ STAT=GCNTSTAT(INDCNT-1)
+Else
+ Call CNTIPTACC(TYPREF,TPLAN,TCOMPTE,MESSA,STAT) From CPTCNT
+Endif
+If !STAT
+ COMPTE_OK = 1
+ If [F:GAC]SAC=2
+  COMPTE = [F:GAC]ACC
+  COLLEC = [F:GAC]ACCSHO
+ Else
+  COMPTE = [F:GAC]ACC
+  COLLEC = ""
+ Endif
+ TCOMPTE(TYPREF) = COMPTE
+ TSAC(TYPREF) = COLLEC
+Else
+ TCOMPTE(TYPREF) = ""
+ TSAC(TYPREF) = ""
+Endif
+Return
+
+$INI_OTHACC
+Local Char    CRIBLE(20)
+Local Char    ACCORG(GLONGAC), ACCDES(GLONGAC)
+Local Integer IREF
+OBLIG = 0
+For IREF=1 To NBREF
+ If IREF<>TYPREF
+  [L]ACCORG = evalue("TCOMPTE("+num$(IREF)+")")
+  If [L]ACCORG<>""
+   If !OBLIG
+    Call CNTIPTACC(TPLAN(IREF),[L]ACCORG,TPLAN(TYPREF),OBLIG)
+   Endif
+   Call INIACC(TPLAN(IREF),[L]ACCORG,TPLAN(TYPREF),ACCDES,[L]CRIBLE) From CPTINI
+   If [L]ACCDES<>""
+    Call LEC_GAC(ACCDES,TPLAN(TYPREF)) From CPTLEC
+    If fstat
+     ## Compte inexistant
+     STAT = 97 : MESSA = TPLAN(TYPREF)-ACCDES-":"-mess(38,106,1) : Break
+    Else
+     ## Le compte du type référentiel TYPREF a été initialisé par le type référentiel IREF -> On sort
+     Break
+    Endif
+   Endif
+  Endif
+ Endif
+Next
+If STAT : Return : Endif
+If ACCDES<>""
+
+ COMPTE = ACCDES : TCOMPTE(TYPREF) = ACCDES
+ Call CNTIPTACC(TYPREF,TPLAN,TCOMPTE,MESSA,STAT) From CPTCNT
+ If STAT : STAT = 98 : GMESSAGE = MESSA : Return : Endif
+Endif
+Return
+
+$INICPT
+If TPLAN(TYPREF)<>""
+ Local Integer FLGAUT
+ #Call LEDTYPAUT(GSOCIETE,TYPREF,FLGAUT) From CPTDIV #F57763
+ Call LEDTYPAUT(GSOCIETE,REFTYP(TYPREF),FLGAUT) From CPTDIV
+ If FLGAUT<>2
+  OKINICPT = 1
+  If TYPREF>1
+   For ILED=1 To TYPREF-1
+    If TPLAN(ILED) = TPLAN(TYPREF) : # Demande 55712
+     TCOMPTE(TYPREF) = TCOMPTE(ILED) : Break
+    Endif
+    If TCOMPTE(ILED)<>""
+     Call LEC_GAC(TCOMPTE(ILED),TPLAN(ILED)) From CPTLEC
+     If fstat | !find(TPLAN(TYPREF),[F:GAC]OTHCOA(0..dim([F:GAC]OTHCOA)-1))
+      OKINICPT = 0 : Break
+     Endif
+    Endif
+   Next
+  Endif
+ Else
+  TPLAN(TYPREF) = ""
+  OKINICPT = 0 : Return
+ Endif
+Else
+ OKINICPT = 0 : Return
+Endif
+Return
+
+$ERREUR
+ERR = errn
+Resume
+
+##################################################################
+## Détermination du code comptable en fonction du type
+##################################################################
+$CODE_COMPTABLE
+Local Integer PSUBB
+Call EXISTE_ADX("","","TRTPCEB",PSUBB) From ORDSYS
+If PSUBB
+ Gosub CODE_COMPTABLE From TRTPCEB
+Else
+ Case GPRODUIT
+  When 0 : Gosub CODE_X3
+  When 2 : Gosub CODE_PAYE
+  When 3 : Gosub CODE_ABELX3
+ Endcase
+Endif
+Return
+
+## Pour X3
+
+$CODE_X3
+##################################################################
+## Utiliser désormais TRTPCEB
+##################################################################
+Return
+
+$CODE_PAYE
+##################################################################
+## Utiliser désormais TRTPCEB
+##################################################################
+Return
+
+$CODE_ABELX3
+ Case [F:GAD]TYPACCCOD(K)
+  When 1 : # Devise
+   If clalev([F:TCU])=0 : Local File TABCUR [TCU] : Endif
+   Call LEC_TCU(CLECPT) From CPTLEC
+   If fstat : CODCPT = "" : Else : CODCPT = [F:TCU]ACCCOD : Endif
+  When 2 : # Site
+   If clalev([F:FCY])=0 : Local File FACILITY [FCY] : Endif
+   Call LEC_FCY(CLECPT) From CPTLEC
+   If fstat : CODCPT = "" : Else : CODCPT = [F:FCY]ACCCOD : Endif
+  When 3 : # Société
+   If clalev([F:CPY])=0 : Local File COMPANY [CPY] : Endif
+   Call LEC_CPY(CLECPT) From CPTLEC
+   If fstat : CODCPT = "" : Else : CODCPT = [F:CPY]ACCCOD : Endif
+  When 4 : # Utilisateur
+   If clalev([F:AUS])=0 : Local File AUTILIS [AUS] : Endif
+   Call LECTURE("AUS",CLECPT,"") From CONTOBJ
+   If fstat : CODCPT = "" : Else : CODCPT = [F:AUS]ACCCOD : Endif
+  When 5 : # Immos
+   # Affectation directe : code comptable non associé à un objet
+   CODCPT=CLECPT
+ Endcase
+Return
+
+#############################################################
+## Remplissage standard de l'en-tête                       ##
+#############################################################
+Subprog TETE(STAT,MESSA)
+Variable Integer STAT
+Variable Char    MESSA
+
+Local Char    CODLED(GLONLED), DEVLED(GLONCUR)
+Local Decimal COURSTYP , EXERCICE , PERIODE , MTDES
+Local Decimal ETAT , CATEG
+Local Integer TYPCOURS
+
+Default Mask [HAE1]
+Default Mask [HAE0]
+mkstat = 0 : GREP = "C"
+
+If GCOMPTA<>3   :# Compta
+ If clalev([F:GDE])=0  : Local File =GTABCPT+"GDIAENTRY"     [GDE]  : Endif
+ If clalev([F:PER2])=0 : Local File =GTABCPT+"PERIOD"        [PER2] : Endif
+Endif
+
+# Site
+If [M]FCY=""
+ Call EVAL_CHAR([M]FCY,"FCY",1,0,GFCYDEF,STAT) From CPTAUTO
+ If STAT : MESSA = "FCY" :  End : Endif
+Endif
+Read [FCY]FCY0 = [M]FCY
+If fstat : MESSA = [M]FCY : STAT = 14 : End : Endif
+If [F:FCY]FINFLG<>2
+ [M]FCY = [F:FCY]FINRSPFCY : # Site financier
+ Read [FCY]FCY0 = [M]FCY
+ If fstat : MESSA = [M]FCY : STAT = 14 : End : Endif
+Endif
+Filter [F:CPY]
+Read [CPY]CPY0 = [F:FCY]LEGCPY
+If fstat : MESSA = [F:FCY]LEGCPY : STAT = 15 : End : Endif
+[M]CPY = [F:FCY]LEGCPY
+Call GETSOC([M]FCY) From DEVSUB
+
+If clalev([TCY])<>0  & dim([F:GAU]COD)>0 & find([F:GAU]COD,"MTC","MTE","MTP","MTR")
+ Call LEC_CPY([M]CPY) From CPTLEC
+ Call LEC_TCY([F:CPY]CRY) From CPTLEC
+ messname(0) = [F:TCY]LAN
+Endif
+
+# Type de pièce  +
+If [M]TYP=""
+ Call EVAL_CHAR([M]TYP,"GTE",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "GTE" : End : Endif
+Endif
+If dim([F:GTE]TYP)>0
+ Call LEC_GTE_LEG(GCURLEG,[M]TYP) From CPTLEC
+ If fstat : MESSA = [M]TYP : STAT = 17 : End : Endif
+Endif
+
+
+# Date comptable
+If [M]ACCDAT=[0/0/0]
+ Call EVAL_DATE([M]ACCDAT,"DAT",1,0,datesyst,STAT) From CPTAUTO
+ If STAT : MESSA = "ACCDAT" : End : Endif
+Endif
+If GCOMPTA<>3
+ Call GETPERSOC([M]CPY,GTYPGEN,[M]ACCDAT,EXERCICE,PERIODE) From CPTSUB
+ If (EXERCICE=0 | PERIODE=0 | [PER]PERSTA=3) & [F:GAU]DATFLG=2
+  Call PREMEX([M]CPY,GTYPGEN,[M]ACCDAT) From CPTSUB : # Première date valable
+ Elsif EXERCICE=0 | PERIODE=0
+  # Date incorrecte
+  MESSA = mess(1,104,1) : STAT = 97 : End
+ Endif
+ [M]FIY    = EXERCICE
+ [M]PER    = PERIODE
+Endif
+
+# Numéro pièce
+If [M]NUM=""
+ Call EVAL_CHAR([M]NUM,"NUM",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "NUM" : End : Endif
+Endif
+
+# Journal
+If [M]JOU="" & dim([F:GTE]DEFJOU)>0
+ Call EVAL_CHAR([M]JOU,"JOU",1,0,[F:GTE]DEFJOU,STAT) From CPTAUTO
+ If STAT : MESSA = "JOU" : End : Endif
+Elsif [M]JOU=""
+ Call EVAL_CHAR([M]JOU,"JOU",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "JOU" : End : Endif
+Endif
+
+# Catégorie
+If [M]CAT=0 : # Réel par défaut
+ Call EVAL_NUM(CATEG,"CAT",1,0,1,STAT) From CPTAUTO
+ If STAT : MESSA = "CAT" : End : Endif
+ [M]CAT = CATEG
+Endif
+
+# Etat
+If [M]STA=0 : # Provisoire par défaut
+ Call EVAL_NUM(ETAT,"STA",1,0,1,STAT) From CPTAUTO
+ If STAT : MESSA = "STA" : End : Endif
+ [M]STA = ETAT
+Endif
+
+# Project header
+PROJECT = ""
+If [M]PJT=""
+ Call EVAL_CHAR(PROJECT,"PJT",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "PJT" : End : Endif
+Endif
+
+If (PROJECT <> "")
+  If (instr(1,PROJECT,"!") > 0)
+    [M]PJT = left$(PROJECT,instr(1,PROJECT,"!")-1 )
+  Else
+    [M]PJT = PROJECT
+  Endif
+Endif
+
+# Module
+[M]ORIMOD = [F:GAU]MODULE
+If GPRODUIT<>0
+ [M]ORIMOD = 4
+Endif
+
+# Code pièce auto (champ invisible)
+[M]AUTACE = [F:GAU]COD
+
+# Dates
+If [M]DUDDAT=[0/0/0]
+ Call EVAL_DATE([M]DUDDAT,"DUD",1,0,[M]ACCDAT,STAT) From CPTAUTO
+ If STAT : MESSA = "DUDDAT" : End : Endif
+Endif
+If [M]ENTDAT=[0/0/0]
+ Call EVAL_DATE([M]ENTDAT,"ENT",1,0,[M]ACCDAT,STAT) From CPTAUTO
+ If STAT : MESSA = "ENTDAT" : End : Endif
+Endif
+If dim([M]BANDAT)>0 & [M]BANDAT=[0/0/0]
+ Call EVAL_DATE([M]BANDAT,"BAN",1,0,[M]ACCDAT,STAT) From CPTAUTO
+ If STAT : MESSA = "BANDAT" : End : Endif
+Endif
+If [M]VALDAT=[0/0/0]
+ Call EVAL_DATE([M]VALDAT,"VAL",1,0,[M]DUDDAT,STAT) From CPTAUTO
+ If STAT : MESSA = "VALDAT" : End : Endif
+Endif
+
+
+
+# Libellé
+If [M]DESVCR=""
+ Call EVAL_CHAR([M]DESVCR,"VCR",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "VCR" : End : Endif
+Endif
+
+# Référence simulation
+If [M]REFSIM="" & ([M]CAT=2 | [M]CAT=3)
+ Call EVAL_CHAR([M]REFSIM,"SIM",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "SIM" : End : Endif
+Endif
+
+# Document origine
+If [M]BPRVCR=""
+ Call EVAL_CHAR([M]BPRVCR,"BVC",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "BVC" : End : Endif
+Endif
+If [M]BPRDATVCR=[0/0/0]
+ Call EVAL_DATE([M]BPRDATVCR,"BVD",1,0,[0/0/0],STAT) From CPTAUTO
+ If STAT : MESSA = "BVD" : End : Endif
+Endif
+
+# Devise
+If [M]CUR=""
+ Call LECLED([M]CPY,GTYPGEN,CODLED,DEVLED) From CPTDIV
+ Call EVAL_CHAR([M]CUR,"CUR",1,0,DEVLED,STAT) From CPTAUTO
+ If STAT : MESSA = "CUR" : End : Endif
+Endif
+
+# Date de cours
+If dim([F:GTE]RATDAT)>0 & [F:GTE]RATDAT=2 & [M]BPRDATVCR<>[0/0/0]
+ [M]RATDAT = [M]BPRDATVCR
+Else
+ [M]RATDAT = [M]ACCDAT
+Endif
+
+# Type de cours
+If [M]TYPRAT=0
+ If dim([F:GTE]TYPRAT)>0
+  Call EVAL_NUM(COURSTYP,"TCR",1,0,[F:GTE]TYPRAT,STAT) From CPTAUTO
+  If STAT : MESSA = "TYPRAT" : End : Endif
+ Endif
+ If COURSTYP=0 : COURSTYP = 1 : Endif
+ [M]TYPRAT = COURSTYP
+Endif
+
+Gosub COURS
+If STAT : MESSA="RAT" : End : Endif
+
+# Référence pièce
+If [M]REF=""
+ Call EVAL_CHAR([M]REF,"REF",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "REF" : End : Endif
+Endif
+
+# Das2
+If dim([M]FLGDAS)>0
+ If dim([F:GTE]DAS2)>0 & ([F:GTE]DAS2<>2 or ([M]CAT<>1 and [M]CAT<>5))
+  [M]FLGDAS = 1
+ Elsif [M]FLGDAS=0
+  Call EVAL_INT([M]FLGDAS,"DAS",1,0,1,STAT) From CPTAUTO
+  If STAT : MESSA = "DAS" : End : Endif
+ Endif
+Endif
+
+# Code interbancaire
+If [M]BANCIB=""
+ Call EVAL_CHAR([M]BANCIB,"CIB",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "CIB" : End : Endif
+Endif
+
+# Extourne
+If [M]RVS=0
+ Call EVAL_DATE([M]RVSDAT,"RVS",1,0,[0/0/0],STAT) From CPTAUTO
+ If STAT : MESSA = "RVS" : End : Endif
+ If [M]RVSDAT<>[0/0/0]
+  [M]RVS = 2
+ Else
+  [M]RVS = 1
+ Endif
+Endif
+
+# Relance
+Local Decimal FLGDIV
+If dim([F:GTE]FUP)>0 and ([F:GTE]FUP<>2 or ([M]CAT<>1 and [M]CAT<>5))
+ [M]FLGFUP = 1
+Elsif [M]FLGFUP=0
+ Call EVAL_NUM(FLGDIV,"FUP",1,0,0,STAT) From CPTAUTO
+ If STAT : MESSA = "FUP" : End : Endif
+ [M]FLGFUP = FLGDIV
+ If [M]FLGFUP=0 : [M]FLGFUP = 2 : Endif
+Endif
+
+# Bon à payer
+If [M]FLGPAZ=0
+ Call EVAL_NUM(FLGDIV,"PAZ",1,0,len(mess(0,510,1)),STAT) From CPTAUTO
+ If STAT : MESSA = "PAZ" : End : Endif
+ [M]FLGPAZ = FLGDIV
+Endif
+
+# Code transaction
+If GCOMPTA<>3 & dim([F:GDE]DIA)>0 & [M]DACDIA=""
+ Call EVAL_CHAR([M]DACDIA,"DIA",1,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "DIA" : End : Endif
+ If [M]DACDIA<>""
+  Read [GDE]DIA = [M]DACDIA
+  If fstat : MESSA = [M]DACDIA : STAT = 32 : End : Endif
+ Endif
+Endif
+If [M]DACDIA="" : [M]DACDIA = GSCHSTDC : Endif # Schéma de saisie standard - transaction colonne
+If [M]DACDIA="" : STAT = 32 : End : Endif
+GSCHEMA = [M]DACDIA
+
+# Zones spécifiques
+Onerrgo RIEN
+Gosub SPE0 From ="WMGAU"+[F:GAU]COD
+Onerrgo
+End
+
+$COURS
+Local Char CODLED(GLONLED)
+Local Char DEVLED(GLONCUR)
+Local Integer I, J, TYPCOURS
+# Position des devises par rapport à l'Euro
+Call SETFLGDEV([M]CUR,[M]CPY,[M]RATDAT) From CPTDIV
+For J=1 To len(mess(0,2644,1)) : # parcours type référentiel
+ If [M]RATMLT(J-1)=0
+  Call EVAL_NUM([M]RATMLT(J-1),"MLT"+num$(J),1,0,0,STAT) From CPTAUTO
+  If STAT : MESSA = "MLT"+num$(J) : Break : Endif
+ Endif
+ If [M]RATDIV(J-1)=0
+  Call EVAL_NUM([M]RATDIV(J-1),"DIV"+num$(J),1,0,0,STAT) From CPTAUTO
+  If STAT : MESSA = "DIV"+num$(J) : Break : Endif
+ Endif
+ # Initialisation du cours si pas initialisé
+ Call LECLED([M]CPY,J,CODLED,DEVLED) From CPTDIV
+ [M]LED(J-1) = CODLED
+ [M]CURLED(J-1) = DEVLED
+ If DEVLED=[M]CUR
+  [M]RATDIV(J-1) = 1
+  [M]RATMLT(J-1) = 1
+ Elsif DEVLED<>"" & DEVLED<>[M]CUR & ([M]RATMLT(J-1)=0 | [M]RATDIV(J-1)=0)
+  Gosub INIT_COURS_LED
+  If STAT : Break : Endif
+ Endif
+Next
+Return
+
+
+$INIT_COURS_LED
+If [M]CURLED(J-1)="" | ([M]RATMLT(J-1)<>0 & [M]RATDIV(J-1)<>0) : Return : Endif
+
+Local Decimal COURMUL , COURDIV
+
+If [F:GCM]FLGVCRRAT(J-1)=2
+ TYPCOURS = [M]TYPRAT
+Else
+ TYPCOURS = [F:GCM]TYPRAT(J-1)
+Endif
+
+Call INI_COURS2([M]CUR,[M]CURLED(J-1),TYPCOURS,[M]RATDAT,COURDIV,COURMUL,STAT) From SUBSCL
+If STAT
+ Raz STAT : Return
+Elsif STAT
+ Raz STAT
+Endif
+
+#Issue 31729 – 2017-04-12  by MADOR - As a user I want to be able to compute
+#payments with the new rate currency field
+COURMUL = func CHECK_CURRAT(COURMUL, 0)
+#Issue end
+
+Case [F:GCM]DACRAT(J-1)
+ When 1 : # Multiplicateur
+  If [M]RATDIV(J-1)=0 : [M]RATDIV(J-1)=1 : Endif
+  If [M]RATMLT(J-1)=0 : [M]RATMLT(J-1) = arr(COURMUL/COURDIV,10^-GDECRCU) : Endif
+ When 2 : # Diviseur
+  If [M]RATDIV(J-1)=0 : [M]RATDIV(J-1) = arr(COURDIV/COURMUL,10^-GDECRCU) : Endif
+  If [M]RATMLT(J-1)=0 : [M]RATMLT(J-1) = 1 : Endif
+ When 3 : # Les 2
+  If [M]RATDIV(J-1)=0 : [M]RATDIV(J-1) = COURDIV : Endif
+  If [M]RATMLT(J-1)=0 : [M]RATMLT(J-1) = COURMUL : Endif
+Endcase
+Return
+$RIEN
+Resume
+
+
+
+############################################################
+## Remplissage standard d'une ligne                       ##
+############################################################
+Subprog LIGNE(NOL,IDENT,STAT,MESSA)
+Value    Integer NOL
+Value    Char    IDENT
+Variable Integer STAT
+Variable Char    MESSA()
+
+Local Char    UNITE(GLONUOM)
+Local Decimal SENS , COEFF
+Local Integer AXE, INDAXE, AX
+Local Char AXEANA(GLONDIE), SECTION(GLONCCE)
+
+Local Integer TLEDTYP(1..len(mess(0,2644,1)))
+Local Integer NBLEDTYP
+Local Decimal MONTLIG , QTELIG , MONTANA , QTEANA
+Local Decimal TMONTFORCE(1..len(mess(0,2644,1)))
+Local Char    TCOMPTE(GLONGAC)(1..len(mess(0,2644,1))), TPLAN(GLONCOA)(1..len(mess(0,2644,1)))
+Local Char    TSAC(GLONSAC)(1..len(mess(0,2644,1)))
+Local Char    TIERS(GLONBPR), LIBEL(80)
+Local Char    CLECPT(30) , CODCPT(30) , MSKCPT(10)
+Local Char    PLGEN(GLONCOA), PLANA(GLONCOA)
+Local Char    CPTGEN(GLONGAC), CPTANA(GLONGAC)
+Local Char    OFFACC(30)
+
+Local Integer NBPLAN                               : # Nb de plan de comptes
+Local Integer NBDIE                                : # Nb d'axes à saisir (max 20)
+Local Char    TDIE(GLONDIE)(1..max(GOPTCANA,20))   : # Axes (DIE)
+Local Integer TOBLIG(1..max(GOPTCANA,20))          : # Obligatoire (O/N)
+Local Integer OBLIG                                : # Imputation obligatoire (propagation des comptes)
+
+Local Integer FLGDEM : FLGDEM = 0
+Call FLGDEM([M]CPY,FLGDEM) From CPTDIV
+
+
+Raz TLEDTYP, NBLEDTYP
+For I=1 To [F:GAD]NBRLED
+ If find([F:GAD]LEDTYP(I-1),[M:HAEF]LEDTYP(0..[M:HAEF]NBRLED-1))
+  NBLEDTYP += 1
+  TLEDTYP(NBLEDTYP) = [F:GAD]LEDTYP(I-1)
+ Endif
+Next
+
+Raz TPLAN, TCOMPTE, TSAC, TIERS, PLGEN, PLANA, CPTGEN, CPTANA
+Call SETPLANAXE([M]CPY,NBLEDTYP,TLEDTYP,NBPLAN,TPLAN,NBDIE,TDIE,TOBLIG) From CPTDIV
+
+For I=1 To NBLEDTYP
+ INDREF = find(TLEDTYP(I),[M:HAEF]LEDTYP(0..[M:HAEF]NBRLED-1))
+ If INDREF
+  TCOMPTE(I) = evalue("[M]ACC"+num$(INDREF)+"("+num$(NOL)+")")
+  TSAC(I)    = evalue("[M]SAC"+num$(INDREF)+"("+num$(NOL)+")")
+ Endif
+Next
+
+Call CPTNAT2(NBLEDTYP,TLEDTYP,TPLAN,TCOMPTE,TSAC,TIERS,1,[M:HAE0]TYP-[M:HAE0]NUM,[M:HAE1]DUDDAT,STAT,MESSA) From TRTPCE
+If STAT
+ Gosub MESSAGE From CPTAUTO
+ If MESSA<>""
+  MESSA = "GAC"-":"-MESSA
+ Else
+  MESSA = "GAC"
+ Endif
+Endif
+Call RECH_ACC(1,[M]CPY,TLEDTYP,NBLEDTYP,TPLAN,TCOMPTE,PLGEN,CPTGEN) From CPTDIV
+Call RECH_ACC(2,[M]CPY,TLEDTYP,NBLEDTYP,TPLAN,TCOMPTE,PLANA,CPTANA) From CPTDIV
+
+For I=1 To NBLEDTYP
+ INDREF = find(TLEDTYP(I),[M:HAEF]LEDTYP(0..[M:HAEF]NBRLED-1))
+ If INDREF
+  Assign "[M]ACC"+num$(INDREF)+"("+num$(NOL)+")" With TCOMPTE(I)
+  Assign "[M]SAC"+num$(INDREF)+"("+num$(NOL)+")" With TSAC(I)
+ Endif
+Next
+
+# Site à la ligne
+If [M]FCYLIN(NOL)=""
+ Call EVAL_CHAR([M]FCYLIN(NOL),"FCY",2,0,[M]FCY,STAT) From CPTAUTO
+ If STAT : MESSA = "FCYLIN" : End : Endif
+ Call LECTURE("FCY",[M]FCYLIN(NOL),"") From CONTOBJ
+ If fstat : MESSA = [M]FCYLIN(NOL) : STAT = 14 : End : Endif
+ If [F:FCY]FINFLG<>2
+  [M]FCYLIN(NOL) = [F:FCY]FINRSPFCY : # Site financier
+ Endif
+Endif
+
+# Taxe
+Call LEC_GAC(CPTGEN,PLGEN) From CPTLEC
+If !fstat & dim([F:GAC]FLGVAT)>0 & dim([F:GAC]VAT)>0
+ If [F:GAC]FLGVAT<2
+  [M]TAX(NOL) = ""
+ Elsif [M]TAX(NOL)=""
+  Call EVAL_CHAR([M]TAX(NOL),"TAX",2,0,"",STAT) From CPTAUTO
+  If STAT : MESSA = "TAX" : End : Endif
+  If [M]TAX(NOL)="" : [M]TAX(NOL) = [F:GAC]VAT : Endif
+ Endif
+Endif
+
+# Sens et montant
+If [M]DEB(NOL)=0 & [M]CDT(NOL)=0
+ Call EVAL_NUM(SENS,"SNS",2,0,1,STAT) From CPTAUTO
+ If STAT : MESSA = "SNS" : End : Endif
+ MONTLIG = 0
+ Call EVAL_NUM(MONTLIG,"AMT",2,0,0,STAT) From CPTAUTO
+ If STAT : MESSA = "AMT" : End : Endif
+ If SENS>0
+  [M]DEB(NOL) = MONTLIG
+ Else
+  [M]CDT(NOL) = MONTLIG
+ Endif
+Endif
+
+# Libellé
+If [M]DES(NOL)=""
+ Call EVAL_CHAR([M]DES(NOL),"DES",2,0,[M]DESVCR,STAT) From CPTAUTO
+ If STAT : MESSA = "DES" : End : Endif
+Endif
+
+# Stats
+If GCOMPTA<>3
+ If [M]STT1(NOL)=""
+  Call EVAL_CHAR([M]STT1(NOL),"ST1",2,0,"",STAT) From CPTAUTO
+  If STAT : MESSA = "ST1" : End : Endif
+ Endif
+ If [M]STT2(NOL)=""
+  Call EVAL_CHAR([M]STT2(NOL),"ST2",2,0,"",STAT) From CPTAUTO
+  If STAT : MESSA = "ST2" : End : Endif
+ Endif
+ If [M]STT3(NOL)=""
+  Call EVAL_CHAR([M]STT3(NOL),"ST3",2,0,"",STAT) From CPTAUTO
+  If STAT : MESSA = "ST3" : End : Endif
+ Endif
+Endif
+
+# Contrepartie
+For TYPREF=1 To NBLEDTYP
+ ZONE_A = "CPA"+num$(TLEDTYP(TYPREF))
+ INDREF = find(TLEDTYP(TYPREF),[M:HAEF]LEDTYP(0..[M:HAEF]NBRLED-1))
+ Call EVAL_CHAR([L]OFFACC,ZONE_A,2,0,"",STAT) From CPTAUTO
+ If STAT : MESSA = "CPA"-mess(TLEDTYP(TYPREF),2644,1) : Return : Endif
+ If INDREF
+  Assign "[M]CPA"+num$(INDREF)+"("+num$(NOL)+")" With [L]OFFACC
+ Endif
+Next
+
+# Consolidation : Partenaire
+Call EVAL_CHAR([M]CSLCOD(NOL),"CSLC",2,0,"",STAT) From CPTAUTO
+If STAT : MESSA = "CSLCOD" : Return : Endif
+
+# Consolidation : Flux
+Call EVAL_CHAR([M]CSLFLO(NOL),"CSLF",2,0,"",STAT) From CPTAUTO
+If STAT : MESSA = "CSLFLO" : Return : Endif
+
+# Référence libre
+Call EVAL_CHAR([M]FREREF(NOL),"FREREF",2,0,"",STAT) From CPTAUTO
+If STAT : MESSA = "FREREF" : End : Endif
+
+# Quantité, répartition, sections
+If CPTANA<>""
+ If [M]QTY(NOL)=0
+  Call EVAL_NUM([M]QTY(NOL),"QTY",2,0,0,STAT) From CPTAUTO
+  If STAT : MESSA = "QTY" : End : Endif
+  If [M]QTY(NOL)<>0
+   Call LEC_GAC(CPTANA,PLANA) From CPTLEC
+   If !fstat & [F:GAC]UOM<>""
+    Call EVAL_CHAR(UNITE,"UNT",2,0,"",STAT) From CPTAUTO
+    If UNITE<>"" & UNITE<>[F:GAC]UOM
+     Call CALCUL_QTY([M]QTY(NOL),UNITE,[M]QTY(NOL),[F:GAC]UOM,COEFF) From TRTX3
+    Endif
+   Else
+    [M]QTY(NOL) = 0
+   Endif
+  Endif
+ Endif
+ If [M]DSP(NOL)=""
+  Call EVAL_CHAR([M]DSP(NOL),"DSP",2,0,[F:GAC]DSP,STAT) From CPTAUTO
+  If STAT : MESSA = "DSP" : End : Endif
+ Endif
+ If [M]DSP(NOL)=""
+  #For AXE=1 To max(GOPTCANA,20)
+  # Call EVAL_CHAR(AXEANA,"DIE"+num$(AXE),2,0,"",STAT) From CPTAUTO
+  # If STAT : MESSA = "DIE"+num$(AXE) : Break : Endif
+  # Call EVAL_CHAR(SECTION,"CCE"+num$(AXE),2,0,"",STAT) From CPTAUTO
+  # If STAT : MESSA = "CCE"+num$(AXE) : Break : Endif
+  # INDAXE = find(AXEANA,[M:HAEF]DIE(0..GOPTCANA-1))
+  # If INDAXE
+  #  For AX = 1 To [M:HAEF]NBRLED
+  #   If evalue("[M]CCE"+num$(INDAXE)+"("+num$(NOL)+")")=""
+  #    Call LECTURE("GAC",evalue("[M]ACC"+num$(AX)+"("+num$(NOL)+")"),[M:HAEF]COA(AX-1)) From CONTOBJ
+  #    If find([L]AXEANA,[F:GAC]DIE(0..[F:GAC]DACDIENBR-1))
+  #     Assign "[M]CCE"+num$(INDAXE)+"("+num$(NOL)+")" With SECTION : Break
+  #    Endif
+  #   Endif
+  #  Next
+  # Endif
+  #Next AXE
+ Else
+  For AX = 1 To [M:HAEF]NBRLED
+   Assign "[M]CCE"+num$(AX)+"("+num$(NOL)+")" With ""
+  Next
+ Endif
+Else
+ [M]DSP(NOL) = ""
+ [M]QTY(NOL) = 0
+  For AX = 1 To [M:HAEF]NBRLED
+   Assign "[M]CCE"+num$(AX)+"("+num$(NOL)+")" With ""
+  Next
+Endif
+
+# Russe
+If FLGDEM=2 & dim([M]CPALIN)>0
+ [M]LIGPCEAUTO(NOL) = [F:GAD]LINNUM
+ [M]CPALIN(NOL) = [F:GAD]CPALIN
+Endif
+
+
+
+# Zones spécifiques
+Onerrgo RIEN
+Gosub SPE1 From ="WMGAU"+[F:GAU]COD
+Onerrgo
+End
+
+Subprog CPTNAT2(NBREF,REFTYP,TPLAN,TCOMPTE,TSAC,TIERS,CRE,IDENT,DAT,STAT,MESSA)
+Value    Integer NBREF             : # Nb de référentiels
+Value    Integer REFTYP(1..)       : # Types référentiels
+Variable Char    TPLAN()(1..)      : # Tableau des codes plans
+Variable Char    TCOMPTE()(1..)    : # Tableau des comptes
+Variable Char    TSAC()(1..)       : # Tableau des collectifs
+Variable Char    TIERS()
+Value    Integer CRE
+Value    Char    IDENT
+Value    Date    DAT
+Variable Integer STAT
+Variable Char    MESSA()
+
+If clalev([F:CAC])=0 : Local File GACCCODE             [CAC] : Endif
+If clalev([F:COA])=0 : Local File =GTABCPT+"GCOA"      [COA] : Endif
+If clalev([F:GAC])=0 : Local File =GTABCPT+"GACCOUNT"  [GAC] : Endif
+
+Local Integer I, J, K, L, OK, ERR, QUINZE, ILED, OKCPTINI
+Local Integer COMPTE_OK
+Local Char    CLECPT(30), CODCPT(GLONCAC), MSKCPT(GLONGAC), TAXE(5)
+Local Char    CLECPT1(30), CLECPT2(30) # pour lecture table à 2 parties de clé
+Local Char    ZONE(10)
+Local Char    PLAN(GLONCOA)                        : # Plan de compte
+Local Char    COMPTE(GLONGAC)                      : # Compte
+Local Char    COLLEC(GLONGAC)                      : # Collectif
+Local Integer NBPLAN                               : # Nb de plan de comptes
+Local Integer NBDIE                                : # Nb d'axes à saisir (max 20)
+Local Char    TDIE(GLONDIE)(1..max(GOPTCANA,20))   : # Axes (DIE)
+Local Integer TOBLIG(1..max(GOPTCANA,20))          : # Obligatoire (O/N)
+Local Integer OBLIG                                : # Imputation obligatoire (propagation des comptes)
+
+Gosub LIGCPTANA
+End
+
+
+############################################################
+## Remplissage standard d'une ligne analytique            ##
+############################################################
+Subprog LIGANA(NOL,STAT,MESSA)
+Value    Integer NOL
+Variable Integer STAT
+Variable Char    MESSA()
+
+
+Local Integer I , VENT , V , AXE , VD , VF , PTVA
+Local Char    GRPVENT(250) , GRPSEC(250)
+Local Integer AXE, INDAXE, AX
+Local Decimal MONTANA , QTEANA , SENS
+Local Char    DIE1(GLONCCE), DIE2(GLONCCE), DIE3(GLONCCE), DIE4(GLONCCE), DIE5(GLONCCE)
+Local Char    DIE6(GLONCCE), DIE7(GLONCCE), DIE8(GLONCCE), DIE9(GLONCCE), DIE10(GLONCCE)
+Local Char    DIE11(GLONCCE), DIE12(GLONCCE), DIE13(GLONCCE), DIE14(GLONCCE), DIE15(GLONCCE)
+Local Char    DIE16(GLONCCE), DIE17(GLONCCE), DIE18(GLONCCE), DIE19(GLONCCE), DIE20(GLONCCE)
+Local Char    SEC1(GLONCCE), SEC2(GLONCCE), SEC3(GLONCCE), SEC4(GLONCCE), SEC5(GLONCCE)
+Local Char    SEC6(GLONCCE), SEC7(GLONCCE), SEC8(GLONCCE), SEC9(GLONCCE), SEC10(GLONCCE)
+Local Char    SEC11(GLONCCE), SEC12(GLONCCE), SEC13(GLONCCE), SEC14(GLONCCE), SEC15(GLONCCE)
+Local Char    SEC16(GLONCCE), SEC17(GLONCCE), SEC18(GLONCCE), SEC19(GLONCCE), SEC20(GLONCCE)
+Local Char    SECTION(GLONCCE)
+Local Char    AXI1(GLONDIE), AXI2(GLONDIE), AXI3(GLONDIE), AXI4(GLONDIE), AXI5(GLONDIE)
+Local Char    AXI6(GLONDIE), AXI7(GLONDIE), AXI8(GLONDIE), AXI9(GLONDIE), AXI10(GLONDIE)
+Local Char    AXI11(GLONDIE), AXI12(GLONDIE), AXI13(GLONDIE), AXI14(GLONDIE), AXI15(GLONDIE)
+Local Char    AXI16(GLONDIE), AXI17(GLONDIE), AXI18(GLONDIE), AXI19(GLONDIE), AXI20(GLONDIE)
+Local Char    AXEANA(GLONDIE)
+
+
+Local Integer NBLEDTYP
+Local Integer TLEDTYP(1..len(mess(0,2644,1)))
+Local Integer NBPLAN                               : # Nb de plan de comptes
+Local Char    TPLAN(GLONCOA)(1..len(mess(0,2644,1)))
+Local Integer NBDIE                                : # Nb d'axes à saisir (max 20)
+Local Char    TDIE(GLONDIE)(1..max(GOPTCANA,20))   : # Axes (DIE)
+Local Integer TOBLIG(1..max(GOPTCANA,20))          : # Axes obligatoires (O/N)
+Raz TLEDTYP, NBLEDTYP
+For I=1 To [F:GAD]NBRLED
+ If find([F:GAD]LEDTYP(I-1),[M:HAEF]LEDTYP(0..[M:HAEF]NBRLED-1))
+  NBLEDTYP += 1
+  TLEDTYP(NBLEDTYP) = [F:GAD]LEDTYP(I-1)
+ Endif
+Next
+Call SETPLANAXE([M]CPY,NBLEDTYP,TLEDTYP,NBPLAN,TPLAN,NBDIE,TDIE,TOBLIG) From CPTDIV
+
+
+Gosub CHERCHE_VENT From CPTAUTO
+If STAT : End : Endif
+
+# Sens
+If [M]DEB(NOL)<>0
+ SENS = +1
+Else
+ SENS = -1
+Endif
+SENS = +1
+
+# Montant
+Call EVAL_NUM(MONTANA,"AMTA",2,I,0,STAT) From CPTAUTO
+If STAT : MESSA = "TBAMT" : End : Endif
+[M:VT2]TBAMT(VENT) += SENS*MONTANA
+
+# Quantité
+Call EVAL_NUM(QTEANA,"QTYA",2,I,0,STAT) From CPTAUTO
+If STAT : MESSA = "TBQTY" : End : Endif
+[M:VT2]TBQTY(VENT) += SENS*QTEANA
+
+End
+
+
+
+######################################################
+Subprog FINREP(NOL)
+Value Integer NOL
+Local Integer VENT , AXE
+
+If [M]PTF(NOL)=[M]PTV(NOL) : # 1 seule ligne
+ VENT = [M]PTV(NOL)
+ For AXE=1 To [M:HAEF]NBRAXI
+  Assign "[M]CCE"+num$(AXE)+"("+num$(NOL)+")" With evalue("[M:VT2]TBCCE"+num$(AXE)+"("+num$(VENT)+")")
+ Next AXE
+ [M]PTV(NOL) = 0 : [M]PTF(NOL) = 0
+Elsif [M]PTF(NOL)>[M]PTV(NOL)
+ [M]DSP(NOL) = "$"
+Endif
+End
+
+
+###########################################################################################################
+## Vérifie si l'imputation sur le plan de compte destination COADES est obligatoire ou pas
+Subprog CNTIPTACC(COAORG,ACCORG,COADES,OBLIG)
+Value    Char    COAORG()    : # Plan compte origine
+Value    Char    ACCORG()    : # Compte origine
+Value    Char    COADES()    : # Plan compte destination
+Variable Integer OBLIG       : # 0:Imputation non obligatoire  1:Imputation obligatoire
+Local Integer VU
+If COAORG = COADES
+ ACCDES = ACCORG
+Endif
+Call LEC_GAC(ACCORG,COAORG) From CPTLEC
+If !fstat
+ VU = find(COADES,[F:GAC]OTHCOA(0..[F:GAC]COANBR-1))
+ If VU
+  OBLIG    = [F:GAC]OBYIPT(VU-1)
+ Endif
+Endif
+End
+
+Funprog CHECK_USED_CURRENCY(DEVSOC, DEVDES, DEVBAN, MTORG, DEVCHK, SKPUSECUR)
+#Issue 31729 – 2017-06-13  by MADOR - As a user I want to be able to compute
+#payments with the new rate currency field
+Value    Char    DEVSOC           : # Company Currency
+Value    Char    DEVDES           : # Currency of destination
+Value    Char    DEVBAN           : # Bank Currency
+Value    Decimal MTORG            : # Original Amount
+Value    Char    DEVCHK           : # Currency to check
+Value    Integer SKPUSECUR        : # Skip checking used currency
+
+Local    Char    DEVSHO(4)        : # Currency that should be
+
+If SKPUSECUR = 1
+    End 1
+Endif
+
+If (DEVBAN = DEVSOC or MTORG = 0) and DEVSOC <> DEVDES
+    DEVSHO = DEVSOC
+Else
+    DEVSHO = DEVBAN
+Endif
+
+If DEVSHO = DEVCHK
+    End 1
+Endif
+#Issue end
+End 0
+
+Funprog CHECK_CURRAT(CURRATUSR, SKPUSECUR)
+Value Decimal CURRATUSR
+Value Integer SKPUSECUR      : # Skip checking used currency
+#Issue 31729 – 2017-06-13  by MADOR - As a user I want to be able to compute
+#payments with the new rate currency field
+If dim([F:BAN]CUR) > 0
+    If dim([F:PYH]CURRAT) > 0 and [F:PYH]CURRAT <> 0 and
+&      func CHECK_USED_CURRENCY([F:PYH]CUR, [M]CURLED(0), [F:BAN]CUR, [F:PYH]AMTBAN, [M]CUR, SKPUSECUR)
+
+        End [F:PYH]CURRAT
+
+    Elsif dim([F:PYH2]CURRAT) > 0 and [F:PYH2]CURRAT <> 0 and
+&      func CHECK_USED_CURRENCY([F:PYH2]CUR, [M]CURLED(0), [F:BAN]CUR, [F:PYH2]AMTBAN, [M]CUR, SKPUSECUR)
+
+        End [F:PYH2]CURRAT
+
+    Endif
+Endif
+#Issue end
+End CURRATUSR
+

@@ -1,0 +1,501 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#########################################################################
+# BONLIV  : Impression : Bon de livraison Ventes                        #
+# --------------------------------------------------------------------- #
+# Chargement des paramètres et mise à jour de l'indicateur d'impression #
+#########################################################################
+#**********************************************************************#
+#    Modification                                                      #
+# XXXXX XX.XX.XXXX xxxxxx_x : XXXXXXXXXXXXXXXXXXXXXXXXXXXX             #
+# FPE     13.07.2018 X3-99832 : PT certification: Reports linked to    #
+#                               function GESSDH.                       #
+########################################################################
+
+###########################################
+# Appelé par le Call ETAT from AIMP3      #
+# --------------------------------------- #
+# Le Call ETAT effectue dans l'ordre :    #
+#   - Un Gosub ACTION  (ACTION="EXEC")    #
+#   - Un Call  IMPRIME (NBPAR,PARAMETRE)  #
+###########################################
+$ACTION
+Case ACTION
+  When "CONTPRT" : Gosub CONTPRT
+  When "EXEC"    : Gosub EXEC
+Endcase
+Return
+
+
+###########################################
+# Contrôle destination (choix imprimante) #
+# --------------------------------------- #
+#  Préchargement du nombre de copies      #
+#  Par défaut provient des destinations   #
+###########################################
+$CONTPRT
+#------ Préchargement si contexte gestion des livraisons commandes -----#
+If GFONCTION="GESSDH" & clalev([M:SDH0])
+  If !find([M:RPT]IMPRIME,0,1,3,4)
+    # FGR 24/03/2014 : X3SUIVI97819 (début)
+    If [M:SDH0]BPCORD <> [F:BPC]BPCNUM Then
+     Read [F:BPC]BPC0=[M:SDH0]BPCORD
+    Endif
+    # FGR 24/03/2014 : X3SUIVI97819 (début)
+    #Fq73266-Gbn-uniquement s'il y a un modèle d'impression sur le tiers
+    If [F:BPC]TPMCOD<>""
+     [M:RPT]NBRCPY=max([M:SDH0]COPNBR,1) : # Nombre de copies
+     Affzo [M:RPT]NBRCPY   # FGR 24/03/2014 : X3SUIVI97819
+    Endif
+  Else
+    [M:RPT]NBRCPY=0 : # pas de copie pour prévisu, message, fichier
+    Grizo [M:RPT]NBRCPY : Affzo [M:RPT]NBRCPY #Fq73266
+  Endif
+Endif
+#-----
+Return
+
+############################################################################
+# Avant l'impression du document, chargement paramètres si impression auto #
+# ------------------------------------------------------------------------ #
+# Nota : On force le nombre de copies à 1 car on a écrit dans la table     #
+#        AREPORTM, les enregistrements en fonction du nombre de copie.     #
+############################################################################
+$EXEC
+#----- Ne rien faire si pas impression auto, cela se fera par le Call IMPRIME -----#
+If dim([V]GWNUMREQ)<1 | dim([V]GWSEQREQ)<1 | dim([V]GWTRTAUTO)<1 | [V]GWTRTAUTO<>1
+  Return
+Endif
+#-----
+If dim(I)<1       Local Integer I             : Endif
+If dim(J)<1       Local Integer J             : Endif
+If dim([L]ETAT)<1 Local Char    ETAT(GLONARP) : Endif
+
+#-----
+For I=1 To [L]NBPAR
+  J=instr(1,[L]PARAMETRE(I),"=")
+  If J
+    [L]PARAM=left$([L]PARAMETRE(I),J-1)
+    Case [L]PARAM
+      When "X3ETA"          : Call GETPARAM([L]PARAM,[L]NBPAR,[L]PARAMETRE,[L]ETAT) From ETAT
+      When "__REQUETE"      : [L]PARAMETRE(I) = "__REQUETE="+num$([V]GWNUMREQ)
+      When "_PrinterCopies" : [L]PARAMETRE(I) = "_PrinterCopies="+chr$(1)+"1"
+      When "numedt"         : [L]PARAMETRE(I) = "numedt="+num$([V]GWNUMREQ)
+      When "seqedt"         : [L]PARAMETRE(I) = "seqedt="+num$([V]GWSEQREQ)
+      When "usr"            : [L]PARAMETRE(I) = "usr="+GUSER
+      When "etat"           : [L]PARAMETRE(I) = "etat="+[L]ETAT
+      When "euro"           : [L]PARAMETRE(I) = "euro="+GEURO
+      When "traitauto"      : [L]PARAMETRE(I) = "traitauto=1"
+    Endcase
+  Endif
+Next I
+#-----
+Return
+
+
+####################################
+# Appelé par le Call ETAT          #
+#   après l'action EXEC            #
+#   avant l'impression du document #
+####################################
+Subprog IMPRIME(NBPAR,PARAMETRE)
+Value    Integer NBPAR
+Variable Char    PARAMETRE()()
+#----- Si impression auto ne rien faire AREPORTM est déjà chargé -----#
+If dim([V]GWTRTAUTO)>0 & [V]GWTRTAUTO=1  End : Endif
+#----- Ouverture des tables -----#
+Local File AREPORTM  [ARM]
+Local File SDELIVERY [SDH]
+## BRBAN 25/11/2014 - 97101
+Local File TMPSRPT    [TSRPT]
+
+#----- Déclaration des variables locales -----#
+Local Char    CRITERE(255), CRITERE2(255), PARAM(30) , VALEUR(30) , ETAT(GLONARP)
+Local Integer NUMREQ, IMPR, I, J
+
+# -- BONLIV2
+Local Date    DATREF
+#RMA * 11-07-2012 * 75916 - multicopy priting
+Local Char MULCOPPAR(1)
+Local Integer KPOACT, GLBDOCFLG # Issue 18041 - 2017-02-03 by VAVIL : Original\Duplicate\Triplicate transport docs
+
+#----- Chargement des paramètres et du filtre -----#
+[L]CRITERE = "1=1"
+# -- BONLIV2
+[L]CRITERE2 = "1=1"
+
+#-----
+For I=1 To [L]NBPAR
+  J=instr(1,[L]PARAMETRE(I),"=")
+  If J
+    [L]PARAM  = left$([L]PARAMETRE(I),J-1)
+    Call GETPARAM ([L]PARAM,[L]NBPAR,[L]PARAMETRE,VALEUR) From ETAT
+    Case [L]PARAM
+      When "X3ETA"         : [L]ETAT     = [L]VALEUR
+      When "__REQUETE"     : [L]NUMREQ   = val([L]VALEUR)
+      When "sitedeb"       : [L]CRITERE -= "& STOFCY>='"+[L]VALEUR+"'"
+      When "sitefin"       : [L]CRITERE -= "& STOFCY<='"+[L]VALEUR+"'"
+      When "clientdeb"     : [L]CRITERE -= "& BPCORD>='"+[L]VALEUR+"'"
+      When "clientfin"     : [L]CRITERE -= "& BPCORD<='"+[L]VALEUR+"'"
+      When "livraisondeb"  : [L]CRITERE -= "& SDHNUM>='"+[L]VALEUR+"'"
+      When "livraisonfin"  : [L]CRITERE -= "& SDHNUM<='"+[L]VALEUR+"'"
+      When "codimp"        : [L]CRITERE -= "& PRNNDE="+num$([L]VALEUR)
+                             [L]IMPR     = val([L]VALEUR)
+# -- BONLIV2
+      When "datedeb"       : [L]DATREF   =  gdat$(val(right$([L]VALEUR,7)),
+&                                          val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+                             [L]CRITERE -= "& SHIDAT >=["+format$(GFMD,[L]DATREF)+']'
+      When "datefin"       : [L]DATREF   =  gdat$(val(right$([L]VALEUR,7)),
+&                                          val(seg$([L]VALEUR,5,6)),val(left$([L]VALEUR,4)))
+                             [L]CRITERE -= "& SHIDAT <=["+format$(GFMD,[L]DATREF)+']'
+      When "devdeb"        : [L]CRITERE -= "& CUR>='"+[L]VALEUR+"'"
+      When "devfin"        : [L]CRITERE -= "& CUR<='"+[L]VALEUR+"'"
+
+# -- Trop de critères passage de CRITERE (250) à (250)(1..2)
+      #--CPO 75115 Nouveau type de livraison et utilisation de la catégorie livraison
+      #When "typedeb"        : [L]CRITERE2 -= "& LND>="+num$([L]VALEUR)
+      #When "typefin"        : [L]CRITERE2 -= "& LND<="+num$([L]VALEUR)
+      When "categlivdeb"    : [L]CRITERE2 -= "& SDHCAT>="+num$([L]VALEUR)
+      When "categlivfin"    : [L]CRITERE2 -= "& SDHCAT<="+num$([L]VALEUR)
+      When "typedeb"        : [L]CRITERE2 -= "& SDHTYP>='"+[L]VALEUR+"'"
+      When "typefin"        : [L]CRITERE2 -= "& SDHTYP<='"+[L]VALEUR+"'"
+      #--/CPO
+      When "valdeb"         : [L]CRITERE2 -= "& CFMFLG>="+num$(val([L]VALEUR)+1)
+      When "valfin"         : [L]CRITERE2 -= "& CFMFLG<="+num$(val([L]VALEUR)+1)
+      When "facdeb"         : [L]CRITERE2 -= "& INVFLG>="+num$(val([L]VALEUR)+1)
+      When "facfin"         : [L]CRITERE2 -= "& INVFLG<="+num$(val([L]VALEUR)+1)
+
+      When "numedt"         : [L]PARAMETRE(I) = "numedt="+num$([L]NUMREQ)
+      When "seqedt"         : [L]PARAMETRE(I) = "seqedt=0"
+      When "usr"            : [L]PARAMETRE(I) = "usr="+GUSER
+      When "etat"           : [L]PARAMETRE(I) = "etat="+[L]ETAT
+      When "euro"           : [L]PARAMETRE(I) = "euro="+GEURO
+      When "_PrinterCopies" : [L]PARAMETRE(I) = "_PrinterCopies="+chr$(1)+"1"       #Gbn-Fq75916
+    Endcase
+  Endif
+Next
+#------------------------------------------------------------------#
+#  - Création d'un seul enregistrement dans AREPORTM               #
+#  - Mise à jour indicateur d'impression sur l'entête de livraison #
+#------------------------------------------------------------------#
+# Issue X3-36921 - 2017-05-12 by CPO : (SAM 120227) Error when printing 3 reports - BONLIV
+#--Moved after the look and exit test
+#Call DEBTRANS From GLOCK
+#Trbegin [ARM], [SDH], [TSRPT]
+# End issue X3-36921
+
+# ACA (2010-05-04) Bug 57111 : Si enchaine
+Look [ARM]ARM0 = [L]NUMREQ;GUSER;[F:ARP]RPTCOD;1
+If !fstat
+  # Enreg trouvé, car lancement enchainé
+  # On bloque la boucle
+  End
+  #[L]CRITERE="1=2"
+  #[L]CRITERE2=""
+  #On laisse GOK=1 sinon l'état ne sort pas
+Endif
+
+# Issue X3-36921 - 2017-05-12 by CPO : (SAM 120227) Error when printing 3 reports - BONLIV
+#--Moved after the look and exit test
+Call DEBTRANS From GLOCK
+Trbegin [ARM], [SDH], [TSRPT]
+# End issue X3-36921
+
+#----- Chargement buffer AREPORTM -----#
+Raz [F:ARM]
+[F:ARM]USR    = GUSER
+[F:ARM]RPTCOD = [F:ARP]RPTCOD
+[F:ARM]NUMREQ = [L]NUMREQ
+[F:ARM]CREDAT = date$
+#-----
+For [SDH]SDH0 Where evalue([L]CRITERE) & evalue([L]CRITERE2)
+ #RMA * 75916
+ Call PARAML([F:SDH]CPY,"MULCOPRINT",MULCOPPAR) From ADOVAL      # FGR 28/07/2015 : X3SUIVI108078 : Plus Call PARAM (performances)
+ #----- Création d'un enregistrement par copie dans AREPORTM -----#
+ #Gbn-Fq75916
+ Local Integer INBCOP, LNBCOP : Raz [F:ARM]NUMCOP
+ If MULCOPPAR="2"
+  LNBCOP = max(1,[M:RPT]NBRCPY, [F:SDH]COPNBR)
+ Else
+  LNBCOP = max(1,[M:RPT]NBRCPY)
+ Endif
+
+ # Issue 18041 - 2017-02-03 by VAVIL : Original\Duplicate\Triplicate transport docs
+ [L]KPOACT = func AFNC.ACTIV("KPO")
+ [L]GLBDOCFLG = 1
+ If [L]KPOACT
+   [L]GLBDOCFLG = [F:SDH]GLBDOC
+   If  [L]GLBDOCFLG = 2 : LNBCOP = 3 : Endif
+ Endif
+
+ For INBCOP=1 To LNBCOP
+  [F:ARM]NUMLIG+= 1
+  #Set the param in Crystal Report : fill in by default by No if the parameter is empty
+  If MULCOPPAR="2" or [L]GLBDOCFLG = 2  [F:ARM]NUMCOP+= 1 : Else : [F:ARM]NUMCOP = 0 : Endif #RMA * 75916
+  [F:ARM]CLEA1  = [F:SDH]SDHNUM
+  Gosub ALIMETAT_PE From ETAT
+  Write [ARM]
+  If fstat  GOK=0 : Call FSTA("ARM") From GLOCK : Break : Endif
+ Next
+
+ #----- Mise à jour table entête livraison si demande d'impression -----#
+ If [L]IMPR=1
+   Update [SDH] Where SDHNUM=[F:ARM]CLEA1 With PRNNDE=2
+   If fstat  GOK=0 : Call FSTA("SDH") From GLOCK : Break : Endif
+ Endif
+ #-----
+ #RMA * 110704
+ #Issue 18041 - 2017-02-03 by VAVIL : Original\Duplicate\Triplicate transport docs
+ If [L]KPOACT :  Gosub ALIM_TMPSRPT :  Endif
+
+ ##X3-26017_Support_for_REX_identification_for_export_out_of_EU/X3-29161 JUCON:26/12/17)
+ Gosub GET_REXNUM
+
+ If WREXNUM<>""
+   Update [ARM] Where NUMREQ= [L]NUMREQ  and USR=GUSER and RPTCOD=[F:ARP]RPTCOD and CLEA1=[F:SDH]SDHNUM
+&              With  CLEA2 = WREXNUM
+ Endif
+
+Next
+If GOK<1  Rollback  Else  Commit : Endif
+# Issue X3-99832
+Local Integer MAXSOC : MAXSOC = 1000
+Local Integer NBRLEG : NBRLEG = 0
+Local Char    TBSOC(GLONCPY)(1..MAXSOC)
+Local Char    TABLEG(GLONADI)(1..GNBSOC)
+Local Integer K : K = [F:ARM]NUMLIG
+TBSOC(1) = [F:SDH]CPY
+Call LEGCPY(TBSOC,NBRLEG,TABLEG) From CPTDIV
+Gosub TRT_TVT From RPTLEG
+# End issue X3-99832
+End
+
+
+###########################################################################
+# Appelé par Gosub depuis le traitement TRTX3ETA                          #
+# ----------------------------------------------------------------------- #
+#   - Création d'un enregistrement par copie désirée dans AREPORTM        #
+#   - Mise à jour indicateur d'impression sur l'entête du document        #
+# ----------------------------------------------------------------------- #
+# Les variables locales suivantes sont disponibles :                      #
+#     WADXLOG  = Indicateur transaction (0 = pas de transaction en cours) #
+#     ETAT     = Code de l'état                                           #
+#     REQUETE  = Numéro de requête                                        #
+#     LIGNE    = Numéro de ligne de AREPORTM                              #
+#     SEQUENCE = Numéro de séquence de AREPORTM                           #
+# Le buffer [F:SDH] est chargé et l'entête est écrite                     #
+###########################################################################
+$ALIM_ETAT
+
+#RMA * 110704
+If clalev([TSRPT]) = 0 : Local File TMPSRPT    [TSRPT] : Endif
+#RM * 75916
+Local Char MULCOPPAR(1)
+Local Integer KPOACT, GLBDOCFLG # Issue 18041 - 2017-02-13 by VAVIL : Original\Duplicate\Triplicate transport docs
+Call PARAML([F:SDH]CPY,"MULCOPRINT",MULCOPPAR) From ADOVAL      # FGR 28/07/2015 : X3SUIVI108078 : Plus Call PARAM (performances)
+
+#-----
+If [L]WADXLOG=0
+  GOK=1
+  Trbegin [ARM], [SDH],[TSRPT]
+Endif
+#----- Création des enregistrements dans la table AREPORTM -----#
+Raz [F:ARM]
+[F:ARM]NUMREQ = REQUETE
+[F:ARM]USR    = GUSER
+[F:ARM]RPTCOD = ETAT
+[F:ARM]NUMLIG = LIGNE
+[F:ARM]SEQREQ = SEQUENCE
+[F:ARM]CLEA1  = [F:SDH]SDHNUM
+[F:ARM]CREDAT = date$
+#-----
+# Issue 18041 - 2017-02-03 by VAVIL : Original\Duplicate\Triplicate transport docs
+# Issue 18041
+[L]KPOACT = func AFNC.ACTIV("KPO")
+[L]GLBDOCFLG = 1
+If [L]KPOACT
+  [L]GLBDOCFLG = [F:SDH]GLBDOC
+  If  [L]GLBDOCFLG = 2 : NBRCOPIE = 3 : Endif
+Endif
+
+For I=1 To max(NBRCOPIE,1)
+  [F:ARM]NUMLIG+=1
+  #[F:ARM]NUMCOP+=1 #gbn-Fq75916
+  # Issue 18041 - 2017-02-03 by VAVIL : Original\Duplicate\Triplicate transport docs
+  If MULCOPPAR="2" or [L]GLBDOCFLG = 2 : [F:ARM]NUMCOP+= 1 : Else : [F:ARM]NUMCOP = 0 : Endif #RMA * 75916
+  Gosub ALIMETAT_PE From ETAT
+  Write [ARM]
+  If fstat  GOK=0 : Call FSTA("ARM") From GLOCK : Break : Endif
+Next I
+#-----
+If fstat  Goto AB_ALIM_ETAT : Endif
+LIGNE   =[F:ARM]NUMLIG
+SEQUENCE=[F:ARM]SEQREQ
+#----- Mise à jour indicateur d'impression de l'entête commande -----#
+Update [SDH] Where SDHNUM=[F:ARM]CLEA1 With PRNNDE=2
+If fstat  GOK=0 : Call FSTA("SDH") From GLOCK : Goto AB_ALIM_ETAT : Endif
+[F:SDH]PRNNDE=2 : # La classe [F] n'est pas màj par l'Update
+#-----
+#RMA * 110704
+#Issue 18041 - 2017-02-03 by VAVIL : Original\Duplicate\Triplicate transport docs
+
+##X3-26017_Support_for_REX_identification_for_export_out_of_EU/X3-29161 JUCON:26/12/17)
+Gosub GET_REXNUM
+If WREXNUM<>""
+  Update [ARM] Where NUMREQ= REQUETE and USR=GUSER and RPTCOD=[F:ARP]RPTCOD and CLEA1=[F:SDH]SDHNUM
+&              With  CLEA2 = WREXNUM
+Endif
+If fstat  GOK=0 : Call FSTA("SDH") From GLOCK : Goto AB_ALIM_ETAT : Endif
+##X3-26017_Support_for_REX_identification_for_export_out_of_EU/X3-29161 JUCON:26/12/17)
+
+
+If [L]KPOACT :  Gosub ALIM_TMPSRPT :  Endif
+
+# Issue X3-99832
+Local Integer MAXSOC : MAXSOC = 1000
+Local Integer NBRLEG : NBRLEG = 0
+Local Char    TBSOC(GLONCPY)(1..MAXSOC)
+Local Char    TABLEG(GLONADI)(1..GNBSOC)
+Local Integer K : K = LIGNE
+TBSOC(1) = [F:SDH]CPY
+Call LEGCPY(TBSOC,NBRLEG,TABLEG) From CPTDIV
+Gosub TRT_TVT
+# End issue X3-99832
+
+If [L]WADXLOG=0
+  Commit
+Endif
+Return
+
+# Issue X3-99832
+$TRT_TVT
+
+Raz [F:ARM]
+For I=1 To NBRLEG
+  Filter [TVT] Where LEG=[L]TABLEG(I) | LEG="" Order By Key CLE=VAT Asc ; LEG Desc
+  For [TVT]CLE(1)
+    K += 1
+    [F:ARM]RPTCOD = ETAT
+    [F:ARM]USR    = GUSER
+    [F:ARM]NUMREQ = REQUETE
+    [F:ARM]NUMLIG = K
+    [F:ARM]CLEA1 = [F:TVT]VAT
+    [F:ARM]CLEA2 = [F:TVT]LEG
+    [F:ARM]CLEA3 = [L]TABLEG(I)
+    [F:ARM]CLEA4 = "TABVAT"
+    Write [F:ARM]
+    If fstat
+      GOK = 0 : Call FSTA("ARM") From GLOCK : Break 2
+    Endif
+  Next
+Next
+Filter [TVT]
+If !GOK : Goto AB_ALIM_ETAT : Endif
+Return
+# End issue X3-99832
+
+#-----
+$AB_ALIM_ETAT
+If [L]WADXLOG=0
+  Rollback
+Endif
+Return
+###########################################################################
+$ALIM_TMPSRPT
+
+Raz [F:TSRPT]
+
+[F:TSRPT] = [F:ARM]
+[F:TSRPT]VCRNUM = [F:SDH]SDHNUM
+
+Write [F:TSRPT]
+If fstat : GOK=0 : Call FSTA("TSRPT") From GLOCK : Endif
+
+Return
+#########################################################################
+
+$GET_REXNUM
+  Local Char WREXNUM(30)
+  ## Controls to print REX number
+  ##X3-26017_Support_for_REX_identification_for_export_out_of_EU/X3-29161 JUCON:26/12/17)
+  # REX activity code has to be “On”
+  If func AFNC.ACTIV("REX")>0
+    Local Char WREXNUMFCY(30), WCRY(5), WFCY(5)
+    Local Integer WORICER
+    Local File COMPANY [CPYX]
+    Read [CPYX]CPY0=[F:SDH]CPY
+    If fstat=[V]CST_AOK
+      #(ORICERFLG=2) at company level or at least at financial site level.
+      # If the company indicator is “Yes” the site indication also should be considered as “Yes” (even with “No” value).
+      # The financial site indication is tested only when the company indication is “No”.
+      If [F:CPYX]ORICERFLG=2
+        WREXNUM=[F:CPYX]REXNUM
+        WCRY=[F:CPYX]CRY
+        Gosub CHECK_SITE
+      Else
+        WORICER=1
+        Gosub CHECK_SITE
+      Endif
+      #Company/Financial site and customer have the same country the REX rule processing should be ignored.
+#      If WCRY=[F:SDH]BPDCRY :  Raz WREXNUM:  Return: Endif
+      If WCRY=[F:SDH]BPDCRY :  Raz WREXNUM:  Goto EXIT: Endif #X3-90915 Error printing with REX activity code (JUCON 20/05/18)
+      If WORICER=2: Raz WREXNUM
+      Else
+        # REX number is taken first form the site, otherwise from the company
+        If WREXNUMFCY<>WREXNUM and WREXNUMFCY<>"" : WREXNUM=WREXNUMFCY: Endif
+        Local File TABCOUNTRY [TCYX]
+        Local Integer WGSP(2), WEEC(2)
+        #(GSPFLG=2) for the company or financial site country default address &
+        #(EECFLG=2) for the customer country delivery address
+
+        Read [TCYX]TCY0=WCRY # Reading company/site country data
+        If fstat=[V]CST_AOK
+          WGSP(0)=[F:TCYX]GSPFLG: WEEC(0)=[F:TCYX]EECFLG
+        Endif
+        #(GSPFLG=2) for the customer country delivery address and the European country flag &
+        #(EECFLG=2) for the company or financial default address
+        Read [TCYX]TCY0=[F:SDH]BPDCRY  # Reading customer country data
+        If fstat=[V]CST_AOK
+          WGSP(1)=[F:TCYX]GSPFLG: WEEC(1)=[F:TCYX]EECFLG
+        Endif
+        LogicClose File [TCYX]
+
+        If (WGSP(0)=2 and WEEC(1)=2) or (WGSP(1)=2 and WEEC(0)=2) #OK- noting to do
+        Else  Raz WREXNUM
+        Endif
+      Endif
+    Endif
+    $EXIT
+    LogicClose File [CPYX]
+  Endif
+  ##End X3-26017_Support_for_REX_identification_for_export_out_of_EU/X3-29161 JUCON:26/12/17)
+
+Return
+
+##X3-26017_Support_for_REX_identification_for_export_out_of_EU/X3-29161 JUCON:26/12/17)
+$CHECK_SITE
+  Local File FACILITY [FCYX]
+  Read [FCYX]FCY0=[F:SDH]SALFCY
+  If fstat<>[V]CST_AOK : Raz [F:FCYX] : Endif
+  If [F:FCYX]FINFLG=2
+    WREXNUMFCY=[F:FCYX]REXNUM
+    WFCY=[F:FCYX]FCY
+  Elsif [F:FCYX]FINRSPFCY<>""
+    Read [FCYX]FCY0=[F:FCYX]FINRSPFCY
+    If fstat=[V]CST_AOK
+      WREXNUMYCY=[F:FCYX]REXNUM
+      WFCY=[F:FCYX]FCY
+    Else : Raz [F:FCYX]
+    Endif
+  Endif
+  If  [F:FCYX]ORICERFLG<>2 and WORICER=1: WORICER=2: Endif
+  LogicClose File [FCYX]
+  If WORICER=2 or WFCY="" : Return : Endif
+
+  Local File BPADDRESS [BPAX]
+  Filter [BPAX] Where BPANUM=WFCY and BPAADDFLG=2
+  Read  [BPAX] First
+  If fstat=[V]CST_AOK:  WCRY= [F:BPAX]CRY:  Endif
+  LogicClose File [BPAX]
+Return
+## End X3-26017_Support_for_REX_identification_for_export_out_of_EU/X3-29161 JUCON:26/12/17)
+

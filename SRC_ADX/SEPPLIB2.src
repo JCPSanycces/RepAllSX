@@ -1,0 +1,548 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ 
+#<AdxTL>@(#)0.0.0.0 $Revision$
+####################################################################################
+# Called when an invoice (sales and customer inv) or payment is being validated
+####################################################################################
+Subprog DOC_VALIDATION(VCRTYP,VCRNUM)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+
+Local Integer FND
+
+If !clalev([F:SER])  : Local File SEPRC      [SER]  : Endif
+If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+
+# Skip if no remaining amount
+If func SEPPLIB.GET_REMAIN_AMT_NMU([L]VCRTYP)=0 : End : Endif
+
+#Fail if not SEPP_OK on a manual auth
+If !func SEPPCDT.SEPP_OK([L]VCRTYP, [L]VCRNUM, 0) & [F:SEU]MANAUT=2
+  GMESSAGE = mess(51,2092,1) : GOK=0 : End
+Endif
+
+#Loop the Auth record(s)
+For [SEU] Where VCRNUM=[L]VCRNUM
+&   & (find(STAFLG,3,8) | ([F:SEU]STAFLG<3 & find([F:SEU]VCRTYP,18,41,51)))
+  FND = 1
+  Call CAPTURE([F:SEU]VCRTYP,[F:SEU]VCRNUM,[F:SEU]VCRSEQ,GERR,GMESSAGE) From SEPPLIB
+  If GERR : GOK=0 : Break : Endif
+Next
+If !GOK : End : Endif
+
+# Check for already captured records
+If !FND & [L]VCRTYP>=50
+  Filter [SEU] Where VCRTYP=[L]VCRTYP & VCRNUM=[L]VCRNUM & find(STAFLG,6,7)
+  Look [SEU] First
+  If !fstat : FND=1 : Endif
+  Filter [SEU]
+Endif
+
+If !FND : GOK=0 : GMESSAGE = mess(35,2092,1) : Endif
+
+Close Local File [SER],[SEU]
+
+End
+
+####################################################################################
+Subprog AUTO_PAYMENT(VCRTYP,VCRNUM,NUMPAYMENTS)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+Variable  Integer NUMPAYMENTS
+
+If !clalev([F:SER])  : Local File SEPRC      [SER]  : Endif
+If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+If !clalev([F:PYH])  : Local File PAYMENTH   [PYH]  : Endif
+If !clalev([F:TPY])  : Local File TABPAYTYP  [TPY]  : Endif
+If !clalev([F:TPT])  : Local File TABPAYTERM [TPT]  : Endif
+
+Local Char    PAYTYP
+Local Integer SE_AUTO_PAY : SE_AUTO_PAY = 1
+Local Integer WTRBEGIN : WTRBEGIN=adxlog  # 112898.n
+
+# Issue 116638 - 2016-06-01 by ERMIL : Return the number of payments created
+# Default the count to 0
+NUMPAYMENTS = 0
+
+If !WTRBEGIN : Trbegin [SEU] : Endif  # 112898.n
+
+For [SEU] Where VCRNUM=[L]VCRNUM & STAFLG=6 & PAYNUM=""
+  Call GET_SER([F:SEU]PRCCOD) From SEPPLIB
+  If [L]VCRTYP<50
+    Gosub VALIDATE_TABPAYTERM
+    Gosub VALIDATE_TABPAYTYP
+  Endif
+  Gosub VALIDATE_OTHERPAYDATA
+  If !GOK : Break : Endif
+
+  If [L]VCRTYP<50  # Payment already created
+    Gosub CRE_PAYMENT
+    If !GOK : Break : Endif
+
+    If find([F:SEU]VCRTYP,18,41)  # Credit
+      [F:SEU]VCRTYP = 51  # Payment
+    Else
+      [F:SEU]VCRTYP = 50  # Receipt
+    Endif
+    [F:SEU]VCRNUM = [F:PYH]NUM
+  Endif
+  [F:SEU]PAYNUM = [F:PYH]NUM
+  Rewrite [SEU]
+  If fstat
+    Call FSTA("SEU") From GLOCK
+    GOK=0 : Break
+  Endif
+  NUMPAYMENTS+=1  # 116638.n
+Next
+
+If !GOK
+  If [F:PYH]NUM<>""
+    Call ECR_TRACE([F:PYH]NUM-mess(17,107,1),1) From GESECRAN
+  Endif
+  Unlock [DUD]
+  If !WTRBEGIN : Rollback : Endif   # 112898.n
+Else
+  If !WTRBEGIN : Commit   : Endif   # 112898.n
+Endif
+
+End
+####################################################################################
+$VALIDATE_TABPAYTERM
+
+Filter [F:TPT] Where PTE=[F:SIH]PTE & PAMTYP=1
+Read [F:TPT] First
+Filter [F:TPT]
+If fstat
+  Call ECR_TRACE(mess(44,2092,1)-[F:SIH]PTE,1) From GESECRAN
+  # Cannot determine payment method for payment terms
+  GOK=0
+  Return
+Endif
+
+Return
+####################################################################################
+$VALIDATE_TABPAYTYP
+
+# For Credit Memos, use the Credit Type, otherwise Payment Type
+If find([F:SEU]VCRTYP,18,41)
+  If [F:SER]CDTTYP=""
+    # Credit type undefined for Sage Exchange processing code
+    Call ECR_TRACE(func AFNC.MES1(mess(41,2092,1),mess([F:SER]PAYPRC,2098,1))-[F:SEU]PRCCOD,1) From GESECRAN # 109253 - Parameterize Local Message
+    GOK=0
+    Return
+  Endif
+  PAYTYP = [F:SER]CDTTYP
+Else
+  If [F:SER]PAYTYP=""
+    # Payment Type undefined for Sage Exchange processing code
+    Call ECR_TRACE(func AFNC.MES1(mess(42,2092,1),mess([F:SER]PAYPRC,2098,1))-[F:SEU]PRCCOD,1) From GESECRAN # 109253 - Parameterize Local Message
+    GOK=0
+    Return
+  Endif
+  PAYTYP = [F:SER]PAYTYP
+Endif
+Call LEC_TPY_LEG(GCURLEG,[L]PAYTYP) From CPTLEC
+If fstat | [F:TPY]ENAFLG<>2
+  # Invalid payment type for Sage Exchange processing code
+  Call ECR_TRACE(func AFNC.MES1(mess(43,2092,1),mess([F:SER]PAYPRC,2098,1))-[F:SEU]PRCCOD,1) From GESECRAN # 109253 - Parameterize Local Message
+  GOK=0
+  Return
+Endif
+
+Return
+####################################################################################
+$VALIDATE_OTHERPAYDATA
+
+# Must have a bank
+If [F:SER]BAN=""
+ Call ECR_TRACE(mess(216,192,1),1) From GESECRAN
+ GOK=0
+ Return
+Endif
+
+# Credit card number obligatory
+If [F:SEU]ACCL4D="" & [F:TPY]DACCRDNUM=1
+ Call ECR_TRACE(mess(217,192,1),1) From GESECRAN
+ GOK=0
+ Return
+Endif
+
+# Check card dates, card numbers, and card types.
+If  ([F:SEU]ACCL4D <> "" & ([F:SEU]CRDTYP="" | [F:SEU]EXPDAT=[0/0/0])) |
+&   ([F:SEU]CRDTYP <> "" & ([F:SEU]ACCL4D="" | [F:SEU]EXPDAT=[0/0/0])) |
+&   ([F:SEU]EXPDAT <> [0/0/0] & ([F:SEU]ACCL4D="" | [F:SEU]CRDTYP=""))
+ Call ECR_TRACE(mess(221,192,1),1) From GESECRAN
+ GOK=0
+ Return
+Endif
+
+Return
+####################################################################################
+# Logic from TRTVENFACP
+# Simulates loading up the screen and pressing Ok
+####################################################################################
+$CRE_PAYMENT
+
+If !clalev([M:IVPY]) : Local Mask SINVPAY    [IVPY] : Endif
+If !clalev([M:SIH0]) : Local Mask SIH0       [SIH0] : Endif
+If !clalev([F:ADI])  : Local File ATABDIV    [ADI]  : Endif
+
+#If we are coming from GESBIC - need to initialize SIH prior to creating payment
+If find([F:SEU]VCRTYP,40,41)
+  If !clalev([M:SIH1]) : Local Mask SIH1       [SIH1] : Endif
+  If !clalev([M:SIH2]) : Local Mask SIH2       [SIH2] : Endif
+
+  [M:SIH0]=[F:SIH]
+  [M:SIH0]INVDAT  = [F:SIH]ACCDAT
+  [M:SIH0]SALFCY  = [F:SIH]FCY
+  [M:SIH1]BPRPAY  = [F:SIH]BPR
+  [M:SIH2]PTE     = [F:SIH]PTE
+  [M:SIH2]BPRSAC  = [F:SIH]BPRSAC
+Endif
+
+Gosub OUV_SAIREGSIH From TRTVENFACP
+If GERR
+  Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+  GOK=0 : Raz GMESSAGE : Return
+Endif
+
+# OUV_SAIREGSIH can change the payment type based on other parameters.
+# Reset afer to ensure we have the right one.
+Call LEC_TPY_LEG(GCURLEG,[L]PAYTYP) From CPTLEC
+
+WDUDLIG=[F:DUD]DUDLIG
+
+# Populate the screen
+Raz [M:IVPY]
+[M:IVPY]PAYTYP    = [F:TPY]PAYTYP
+[M:IVPY]INVNUM    = [F:SIH]NUM
+
+[M:IVPY]CURINV    = [F:SIH]CUR
+[M:IVPY]FCY       = [F:SIH]FCY
+[M:IVPY]PAYMOD    = [F:TPT]PAM
+[M:IVPY]DATPAY    = date$
+[M:IVPY]BANK      = [F:SER]BAN
+[M:IVPY]RATTYP    = [F:TPY]RATTYP
+[M:IVPY]BANCSH    = [F:TPY]BANCSH
+[M:IVPY]CASH      = ""
+[M:IVPY]CUR       = [F:SIH]CUR
+[M:IVPY]CHQNUM    = ""
+[M:IVPY]NETT      = 0
+
+[M:IVPY]AMTINV    = [F:SEU]PAYAMT
+[M:IVPY]AMOUNT    = [F:SEU]PAYAMT
+[M:IVPY]OAMOUNT   = [F:SEU]PAYAMT
+[M:IVPY]AMTLIN    = [F:SEU]PAYAMT
+
+# DEPCOD refers back to Misc Table 314
+Read [F:ADI]CODE=398;[F:SEU]CRDTYP
+If !fstat & [F:ADI]DEPCOD<>""
+  [M:IVPY]CRDTYP = [F:ADI]DEPCOD
+Else
+  [M:IVPY]CRDTYP = [F:SEU]CRDTYP
+Endif
+
+[M:IVPY]CRDNUM    = [F:SEU]ACCL4D
+[M:IVPY]CRDEXYDAT = [F:SEU]EXPDAT
+
+[M:IVPY]CRDAUZ    = [F:SEU]PAYID      # Screen field was added specifically for SEPP
+
+If [F:TPY]DACBAN=1 : [M:IVPY]BANOBL=2 : Else : [M:IVPY]BANOBL=1 : Endif
+
+If !adxlog
+  Gosub OK_SAIREGSIH From TRTVENFACP
+Else
+  Gosub DECLARE From TRTVENFACP
+  Gosub TR1     From TRTVENFACP
+Endif
+
+If GERR
+  Call ECR_TRACE(GMESSAGE,1) From GESECRAN
+  GOK=0 : Return
+Endif
+
+If dim(GSEPAYLOT)>0   # This global should only be defined for Auto Invoice Validation
+  Gosub PAYLOT
+Endif
+
+Return
+#############################################################################################
+$PAYLOT
+
+If !clalev([F:PYL])  : Local File PAYLOT     [PYL]  : Endif
+If !clalev([M:PAY4]) : Local Mask PAY4       [PAY4] : Endif
+If !clalev([M:PAY0]) : Local Mask PAY0       [PAY0] : Endif
+
+# Reset default mask to IVPY - it gets reset to PAY0
+Default Mask [IVPY]                           #103027.n
+
+#Local Char    COMPTLOT(3)                    #103027.o
+Local Char    COMPTLOT(GLONANM)               #103027.n
+Local Char    MESSA(255)                      #103027.n
+Local Integer FLGLOT,OKTCA
+Local Decimal MT
+
+FLGLOT = ([F:TPY]DACPYL=2)   # TPY (payment entry trans) already read above
+If !FLGLOT : Return : Endif  # skip if "Entry Batch" not active
+
+LNUM = [F:PYH]NUM
+Read [PYH]PYH0=LNUM
+If fstat : GOK=0 : Call RSTA("PYH",LNUM) From GLOCK : Return : Endif
+
+#If GSEPAYLOT=""                                        # 111836.o
+If GSEPAYLOT="" | GSENBRPAY>=dim([M:PAY4]PAYNUM)        # 111836.n
+  [F:PYH]PAYLOT = "*"         # Create a new PAYLOT
+  GSENBRPAY     = 1                                     # 111836.n
+Else
+  [F:PYH]PAYLOT = GSEPAYLOT   # PAYLOT already created for the Inv Val batch
+  GSENBRPAY     +=1                                     # 111836.n
+Endif
+
+Gosub CRELOT From SUBPAY5
+GSEPAYLOT = [F:PYH]PAYLOT     # save off PAYLOT for other Payment in batch
+
+Return
+#############################################################################################
+# 119503 JOBRO
+# Check for a valid authorization so we can skip the posting of the invoice.
+# This check will NOT try to call Sage exchange since it will be done within a transaction
+ ########################################################################
+ Funprog INVOICE_AUTH_CHECK(INUM)
+ Value Char INUM
+
+ If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+
+ Filter [SEU] Where VCRNUM=INUM & (find(STAFLG,3,8) | ([F:SEU]STAFLG<3 & find([F:SEU]VCRTYP,18,41,51)))
+ Read [F:SEU] First
+ Filter [F:SEU]
+ If fstat
+   End 0
+ Endif
+
+ End 1
+ #End Issue 119503
+#######################################################################################
+#122614 - JOBRO - rework of SE transaction management in Deliveries GESSDH
+$SEPP_SDH_MOD
+Local Integer SESDHTRBEGIN
+If !clalev([F:SEU]) : Local File SEAUTH [SEU] : Endif
+
+#122614.sn - JOBRO - rework of SE transaction management
+SESDHTRBEGIN = 0
+If adxlog<>1
+  Trbegin [SEU]
+  SESDHTRBEGIN=1
+Endif
+If func SEPPLIB.SEPP_DOC([M:SDH2]PTE)
+  Call AUTH_CHK(4,[M:SDH0]SDHNUM,GERR,GMESSAGE) From SEPPLIB
+  If GERR : GOK=0 : Return : Endif
+  If !func SEPPCDT.SEPP_OK(4,[M:SDH0]SDHNUM,1)
+    # 122614 - JOBRO - rework of SE transaction management
+    # The following CALL is interactive and may or may not start its own transaction
+    # therefore we need to end ours if we started one
+    If adxlog=1 and SESDHTRBEGIN=1 : Commit : SESDHTRBEGIN=0 : Endif
+    Call CALL_SEAUTH(4,[M:SDH0]SDHNUM) From TRTSEAUTH
+  Endif
+Elsif func SEPPCDT.SEPP_OK(4,[M:SDH0]SDHNUM,1)
+  Local Integer SERR
+  Local Char    SEMESSAGE(150)
+  Call VOID_ALL(4,[M:SDH0]SDHNUM,SERR,SEMESSAGE) From SEPPLIB
+  If SERR : Call ERREUR (SEMESSAGE) From GESECRAN : Endif
+Endif
+$SE_TRANS_SDH_MOD
+  If adxlog=1 and SESDHTRBEGIN=1
+    If GOK<1
+      Rollback
+    Else
+      Commit
+    Endif
+  Endif
+Return
+#######################################################################################
+#122614 - JOBRO - rework of SE transaction management in Deliveries GESSDH
+$SEPP_SDH_CRE
+#122614.sn - JOBRO - rework of SE transaction management
+WRET = 0
+SESDHTRBEGIN = 0
+If adxlog<>1
+  If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+  Trbegin [SEU]
+  SESDHTRBEGIN=1
+Endif
+#122614.en - JOBRO - rework of SE transaction management
+# Issue 116640 - 2016-06-17 by ERMIL : Move WS calls out of transactions
+Call TRANSFER(2,[F:SDH]SOHNUM,4,[F:SDH]SDHNUM,WRET) From SEPPLIB
+Call AUTH_CHK(4,[F:SDH]SDHNUM,GERR,GMESSAGE) From SEPPLIB
+If GERR
+  Call ERREUR(GMESSAGE) From GESECRAN
+  Raz GMESSAGE : Raz GERR
+  WRET = 1    # TODAN-118776: Error so we need to set WRET to 1 so it can call the CREDITCARD_ERROR to delete the shipment.
+Endif
+
+$SE_TRANS_SDH_CRE
+If adxlog=1 and SESDHTRBEGIN=1
+  If GOK<1
+    Rollback
+  Else
+    Commit
+  Endif
+Endif
+# If there was an error during Auth, now we need to delete the shipment
+If WRET : Goto CREDITCARD_ERROR  : Endif
+
+Return
+#######################################################################################
+$CREDITCARD_ERROR
+
+  # Issue 116640 An error occurred with SE.
+  # Since those calls are outside of the transaction, can't just do a rollback
+  # Have to delete the shipment here
+  Local Integer OK
+  Local Char PARAM2(10)(1), SAVREP(1)
+
+  SAVREP=GREP : GREP="A": DELSDHNUM = [F:SDH]SDHNUM
+  [L]OK=-9 : Raz [L]PARAM2 : # Don't ask for confirmation
+  Call ANUCOD("SDH",[F:SDH]SDHNUM,PARAM2,OK) From GOBJACT
+  GREP=SAVREP
+
+Return
+#######################################################################################
+#122614 - JOBRO - rework of SE transaction management in Sales Invoices GESSIH
+$SEPP_SIH_MOD
+# 78411 Sage Exchange
+If func AFNC.ACTIV("SEPP") & [M:SIH0]INVTYP<>5
+  Local Integer SEVCRTYP
+  Local Integer SESIHTRBEGIN
+  If !clalev([F:SEU]) : Local File SEAUTH [SEU] : Endif
+
+  #122614.sn - JOBRO - rework of SE transaction management
+  SESIHTRBEGIN = 0
+  If adxlog<>1
+    Trbegin [SEU]
+    SESIHTRBEGIN=1
+  Endif
+  #122614.en - JOBRO - rework of SE transaction management
+  If find([M:SIH0]INVTYP,2,4) : SEVCRTYP = 18 : Else : SEVCRTYP = 5 : Endif
+  If func SEPPLIB.SEPP_DOC([M:SIH2]PTE)
+    Call AUTH_CHK(SEVCRTYP,[F:SIV]NUM,GERR,GMESSAGE) From SEPPLIB
+    If GERR
+      If [F:SEU]MANAUT=2 : Call MESSAGE(mess(48,2092,1)) From GESECRAN : Endif
+#     GOK=0 : Return #49547.o
+      Goto SE_TRANS_SIH_MOD #49547.n - JOBRO
+    Endif
+    If !func SEPPCDT.SEPP_OK(SEVCRTYP,[F:SIV]NUM,1)
+      # 122614 - JOBRO - rework of SE transaction management
+      # The following CALL is interactive and may or may not start its own transaction
+      # therefore we need to end ours if we started one
+      If adxlog=1 and SESIHTRBEGIN=1 : Commit : SESIHTRBEGIN=0 : Endif
+      Call CALL_SEAUTH(SEVCRTYP,[F:SIV]NUM) From TRTSEAUTH
+    Endif
+  Elsif func SEPPCDT.SEPP_OK(5,[F:SIV]NUM,1)
+    Local Integer SERR
+    Local Char    SEMESSAGE(150)
+    Call VOID_ALL(SEVCRTYP,[F:SIV]NUM,SERR,SEMESSAGE) From SEPPLIB
+    If SERR : Call ERREUR (SEMESSAGE) From GESECRAN : Endif
+  Endif
+$SE_TRANS_SIH_MOD
+  If adxlog=1 and SESIHTRBEGIN=1
+    If GOK<1
+      Rollback
+    Else
+      Commit
+    Endif
+  Endif
+Endif
+Return
+
+#######################################################################################
+#122614 - JOBRO - rework of SE transaction management in Sales Invoices GESSIH
+$SEPP_SIH_CRE
+  # Issue 117130 - 2016-06-22 by ERMIL : Move webservice calls out of transactions
+  # 78411 Sage Exchange
+
+    Local Integer OLDVCRTYP,NEWVCRTYP
+    Local Integer SESIHTRBEGIN
+
+    #122614.sn - JOBRO - rework of SE transaction management
+    WRET = 0
+    SESIHTRBEGIN = 0
+    If adxlog<>1
+      If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+      Trbegin [SEU]
+      SESIHTRBEGIN=1
+    Endif
+    #122614.en - JOBRO - rework of SE transaction management
+    If find([M:SIH0]INVTYP,2,4) : NEWVCRTYP = 18 : Else : NEWVCRTYP = 5 : Endif
+    Case [F:SIV]SIHORI
+      When 2 : OLDVCRTYP = 2    # Order
+      When 3 : OLDVCRTYP = 4    # Shipment
+      When 4 : OLDVCRTYP = 5    # Invoice
+      When 6 : OLDVCRTYP = 6    # Return
+              # Issue 107888 - 2015-09-28 by CPO : Scheduled invoices (New component) #
+              # SIHORI=10 Schedule invoice with direct line
+              #TODO 107888 CPO CPO Add also the SIHORI=10 ?
+    Endcase
+    If OLDVCRTYP>0
+      Call TRANSFER(OLDVCRTYP,[F:SIV]SIHORINUM,NEWVCRTYP,[F:SIV]NUM,WRET) From SEPPLIB
+      # TODAN-118639.n - The TRANSFER call has updated the VCRNUM and the VCRTYP fields
+      # with the invoice and invoice type # on the SEAUTH table.
+      # Therefore, we need to pass in the new # to verify in the SEPPCDT.SEPP_OK function
+      # and properly updated the Credit and the CC transaction statuses bases on the result.
+      Call POST_AUTH(5,[F:SIV]NUM,GERR,GMESSAGE) From SEPPLIB
+#     Call POST_AUTH(2,[F:SIV]SIHORINUM,GERR,GMESSAGE) From SEPPLIB  # TODAN-118639.o
+      If WRET : Goto SE_TRANS_SIH_CRE: Endif
+    Endif
+    Call AUTH_CHK(NEWVCRTYP,[F:SIV]NUM,GERR,GMESSAGE) From SEPPLIB
+    If !func SEPPCDT.SEPP_OK(NEWVCRTYP,[F:SIV]NUM,1)
+      # 122614 - JOBRO - rework of SE transaction management
+      # The following CALL is interactive and may or may not start its own transaction
+      # therefore we need to end ours if we started one
+      If adxlog=1 and SESIHTRBEGIN=1 : Commit : SESIHTRBEGIN=0 : Endif
+      Call CALL_SEAUTH(NEWVCRTYP,[F:SIV]NUM) From TRTSEAUTH
+    Endif
+
+$SE_TRANS_SIH_CRE
+  If adxlog=1 and SESIHTRBEGIN=1
+    If GOK<1
+      Rollback
+    Else
+      Commit
+    Endif
+  Endif
+  If WRET Goto WEBSERVICE_ERROR  : Endif  # Delete the invoice
+
+Return
+##########################################################################################################
+$WEBSERVICE_ERROR
+
+  # Issue 117130 An error occurred with either SE or SST.
+  # Since those calls are outside of the transaction, can't just do a rollback
+  # Have to delete the invoice here
+  Local Integer OK
+  Local Char PARAM2(10)(1), SAVREP(1), DELSIHNUM(20), WSMESS(255)
+
+  WSMESS=GMESSAGE
+  SAVREP=GREP : GREP="A" : DELSIHNUM = [F:SIH]NUM
+  [L]OK=-9 : Raz [L]PARAM2 : # Don't ask for confirmation
+  Call ANUCOD("SIH",DELSIHNUM,PARAM2,OK) From GOBJACT
+  GREP=SAVREP
+
+  #Clear the screens
+  Raz [M:SIH0], [M:SIH1], [M:SIH2], [M:SIH4], [M:SIHV]
+  Affzo [M:SIH0]
+  Affzo [M:SIH1]
+  Affzo [M:SIH2]
+  Affzo [M:SIH4]
+  Affzo [M:SIHV]
+
+  GOK = 0
+
+  # did we come from SST or SE?
+  If dim([L]SSTERR)>0 & [L]SSTERR
+    WSMESS = func AFNC.MES2(mess(524,192,1),mess(45,109,1),DELSIHNUM)-WSMESS
+  Else
+    WSMESS = func AFNC.MES2(mess(59,2092,1),mess(45,109,1),DELSIHNUM)-WSMESS
+  Endif
+  Call ECR_TRACE(WSMESS, 1) From GESECRAN
+
+Return
+

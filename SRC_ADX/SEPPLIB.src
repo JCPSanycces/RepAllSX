@@ -1,0 +1,1397 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Syrapedia compatible in treatment SEPPCDT_SYRA : FGR 19/06/2013
+######################################################################################
+Subprog TST_JAVSRV(JAVIP,JAVPRT)
+Value Char    JAVIP
+Value Integer JAVPRT
+
+Local Char    JAVSRV(40)
+Local Integer ERR
+
+JAVSRV = JAVIP + ":" + num$(JAVPRT)
+
+######## Java server connection test
+Onerrgo ERR_PING
+Opadxd JAVSRV With 7,nomap,GLANGUE,adxusr,password Using [SEPP]
+If ERR
+  Onerrgo
+  Call ECR_TRACE(mess(2,2092,1)-JAVSRV,1) From GESECRAN
+  End
+Endif
+
+######## Java server disconnection test
+Opadxd Using [SEPP]
+Onerrgo
+If ERR
+  Call ECR_TRACE(mess(3,2092,1)-JAVSRV,1) From GESECRAN
+  End
+Endif
+
+# Successful connect and disconnect
+Call ECR_TRACE(mess(4,2092,1)-JAVSRV,0) From GESECRAN
+
+End
+
+$ERR_PING
+ERR = errn
+Resume
+
+######################################################################################
+Subprog TST_MERCHANT(MERID,MERKEY,STAT)
+Value    Char    MERID
+Value    Char    MERKEY
+Variable Integer STAT
+
+STAT = 1
+
+If MERID="" | MERKEY="" : End : Endif
+
+Local Integer ERR
+Local Char    ERRMSG(250),RESP,ACTIVE
+
+Call ACCOUNT_QRY(MERID,MERKEY,RESP,ACTIVE,ERR,ERRMSG) From SEPPXML
+If ERR | RESP<>"A"
+  Call ECR_TRACE(mess(6,2092,1)-ERRMSG,1) From GESECRAN
+  STAT = 0 : End
+Elsif tolower(ACTIVE)<>"true"
+  Call ECR_TRACE(mess(7,2092,1),1) From GESECRAN
+  STAT = 0 : End
+Endif
+
+Call ECR_TRACE(mess(8,2092,1),0) From GESECRAN
+
+End
+
+####################################################################################
+# Create an entry in the vault
+####################################################################################
+Subprog VAULT_CRE(BPCNUM,ACCNCKNAM,PRCCOD,LUUID,ERR,ERRMSG)
+Value    Char    BPCNUM
+Value    Char    ACCNCKNAM
+Value    Char    PRCCOD
+Value    Char    LUUID
+Variable Integer ERR
+Variable Char    ERRMSG
+
+Local Integer ERR2
+Local Char    MSGTMP(255)  # 109253 - Parameterize local messages
+
+# If !clalev([F:SEP])  : Local File SEPAR      [SEP]  : Endif   # 101091.o
+If !clalev([F:SEB])  : Local File SEBPC      [SEB]  : Endif
+
+#Check the processing code - SE or SP?
+Call GET_SER([L]PRCCOD)
+
+Case [F:SER]PAYPRC
+  When 1    # Sage Exchange
+
+		# Processing Sage Exchange Vault Entry
+    MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+    Call TEMPON(MSGTMP-mess(21,2092,1)) From GESECRAN
+
+		# Call Sage Exchange to capture account information and send to vault
+		Call VAULT_CRE(PRCCOD,LUUID,ERR,ERRMSG) From SEPPXML
+		If ERR
+		  Goto ERR_RSP
+		Endif
+
+		# Query the Vault for a response and update account table with details
+		Call VAULT_QUERY(BPCNUM,ACCNCKNAM,PRCCOD,LUUID,1,ERR,ERRMSG)
+
+		# Delete temp file - no longer needed
+		Call EFFACE(filpath(nomap+"\TMP",LUUID,"html","X3_PUB"),ERR2) From ORDSYS
+  When 2    # Sage Pay
+    # 109253.sn - Sage Pay integration
+
+    # Processing Sage Exchange Vault Entry
+    MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))
+    Call TEMPON(MSGTMP-mess(21,2092,1)) From GESECRAN
+
+    # Call Sage Pay to capture and store card information
+    Call TOKEN_CRE(PRCCOD, LUUID, ERR, ERRMSG) From SEPPXML2
+    If ERR
+      Goto ERR_RSP
+    Endif
+
+    # 109253.en
+Endcase
+
+Call TEMPOFF From GESECRAN
+
+End
+
+####################################################################################
+# Delete a vaulted card
+####################################################################################
+Subprog VAULT_DEL(PRCCOD,ERR,ERRMSG)
+  Value    Char     PRCCOD
+  Variable Integer  ERR
+  Variable Char     ERRMSG
+
+#Check the processing code - SE or SP?
+Call GET_SER([L]PRCCOD)
+
+Case [F:SER]PAYPRC
+  When 1    # Sage Exchange
+    Local Char RESP
+
+    # Call Sage Exchange to delete the vaulted card
+    Call VAULT_DEL(RESP,GERR,GMESSAGE) From SEPPXML
+    If RESP<>"A" & GMESSAGE=""
+      If !GERR : GERR=1 : Endif
+      GMESSAGE = func AFNC.MES1(mess(31,2092,1),mess([F:SER]PAYPRC,2098,1))  # Timed out or interrupted
+    Endif
+  When 2    # Sage Pay
+    # Call Sage Pay to remove the token
+    Call TOKEN_DEL(GERR,GMESSAGE) From SEPPXML2
+    If GERR & ERRMSG=""
+      ERRMSG = func AFNC.MES1(mess(31,2092,1),mess([F:SER]PAYPRC,2098,1))  # Timed out or interrupted
+    Endif
+Endcase
+
+End
+####################################################################################
+# Query the Vault
+####################################################################################
+Subprog VAULT_QUERY(BPCNUM,ACCNCKNAM,PRCCOD,VLTID,ISILENT,ERR,ERRMSG)
+Value    Char    BPCNUM
+Value    Char    ACCNCKNAM
+Value    Char    PRCCOD
+Value    Char    VLTID
+Value    Integer ISILENT
+Variable Integer ERR
+Variable Char    ERRMSG
+
+If !clalev([F:SEP])  : Local File SEPAR      [SEP]  : Endif
+If !clalev([F:SEB])  : Local File SEBPC      [SEB]  : Endif
+
+Local Char    RESP,PAYDES,PAYTYP
+Local Char    GUID(50)
+Local Date    EXPDAT
+Local Integer VLT_FND,ISLP,SLP_TIME,MAX_WAIT
+
+Call GET_SEP()
+If fstat : ERR=1 : End : Endif
+
+If !ISILENT
+  # Retrieving Sage Exhange vault information
+  Call TEMPON(mess(25,2092,1)) From GESECRAN
+Endif
+
+SLP_TIME = 5  # sleep for 5 seconds at a time
+MAX_WAIT = [F:SEP]POLL/SLP_TIME
+
+Onintgo END_VAULT_QUERY
+For ISLP=1 To MAX_WAIT
+  # Issue 116439 - 2016-05-16 by ERMIL : SE performance enhancements
+  If ISLP=1
+    Sleep 1
+  Else
+    Sleep SLP_TIME
+  Endif
+  Call VAULT_QRY(PRCCOD,VLTID,RESP,GUID,EXPDAT,PAYDES,PAYTYP,ERR,ERRMSG) From SEPPXML
+  If RESP="A"
+    Gosub VAULT_RSP
+    Break
+  Endif
+Next
+Onintgo
+
+If RESP<>"A" & ERRMSG=""
+  ERR=99
+  ERRMSG = func AFNC.MES1(mess(31,2092,1),mess([F:SER]PAYPRC,2098,1))  # Timed out or interrupted
+Endif
+
+If !ISILENT : Call TEMPOFF From GESECRAN  : Endif
+
+End
+
+$END_VAULT_QUERY
+ISLP = MAX_WAIT
+Resume
+
+####################################################################################
+# Process the vault response
+####################################################################################
+$VAULT_RSP
+
+If BPCNUM="" or ACCNCKNAM="" : Return : Endif
+
+If [L]GUID="" : ERR=1 : ERRMSG = mess(28,2092,1) : Return : Endif
+
+[F:SEB]VLTGUID  = [L]GUID
+[F:SEB]CRDTYP   = [L]PAYTYP
+[F:SEB]VLTID    = [L]VLTID
+[F:SEB]EXPDAT   = [L]EXPDAT
+If len([L]PAYDES)>3
+  [F:SEB]ACCL4D = right$([L]PAYDES,len([L]PAYDES)-3)
+Endif
+Return
+
+####################################################################################
+# Authorization check
+####################################################################################
+Subprog AUTH_CHK(VCRTYP,VCRNUM,ERR,ERRMSG)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+Variable Integer ERR
+Variable Char    ERRMSG
+
+Gosub OUVRE
+If ERR : End : Endif
+
+If func SEPPCDT.SEPP_OK([L]VCRTYP,[L]VCRNUM,0)
+  Call POST_AUTH([L]VCRTYP,[L]VCRNUM,ERR,ERRMSG)
+  End
+Endif
+
+# Re-authorization
+Filter [SEU] Where VCRTYP=[L]VCRTYP & VCRNUM=[L]VCRNUM & STAFLG<>4
+Read [SEU] Last
+Filter [SEU]
+If fstat
+  ERRMSG = [L]VCRNUM - mess(35,2092,1)
+  ERR = 1 : End
+Endif
+
+# Sage Pay does not have a function like this.
+# Only check the transaction in Sage Exchange
+Local Char RESP,TXNTYP,STLTYP
+If [F:SER]PAYPRC=1
+	Call TXN_QRY([F:SEU]TXNID,RESP,TXNTYP,STLTYP,ERR,ERRMSG) From SEPPXML
+	If ERR : End : Endif
+Elsif left$(GFONCTION,3)="FUN"
+  #If we are in an automatic function - don't try to re-auth for Sage Pay
+  ERRMSG = [L]VCRNUM - mess(35,2092,1)
+  ERR = 1 : End
+Endif
+
+# Settle_type=1 means transaction is still valid, or VOID in SPS
+If [F:SEU]STAFLG=8
+  # If manual, we do not want it to try to re-auth, just fail.
+  ERR=1 : End
+Elsif STLTYP<>"1" | TXNTYP="04" | ([F:SEU]STAFLG=3 & [F:SEU]VCRSEQ>0)
+  Call VOID([F:SEU]VCRTYP,[F:SEU]VCRNUM,[F:SEU]VCRSEQ,1,ERR,ERRMSG)
+  If ERR : End : Endif
+  Call AUTH([F:SEU]VCRTYP,[F:SEU]VCRNUM,[F:SEU]VCRSEQ,ERR,ERRMSG)
+Elsif STLTYP="1" & right$(TXNTYP,1)<>"2"  # Txn still valid and not authorized
+    Call AUTH([F:SEU]VCRTYP,[F:SEU]VCRNUM,[F:SEU]VCRSEQ,ERR,ERRMSG)
+Endif
+
+End
+
+####################################################################################
+# Authorize the card for the amount in SEU record
+# Called from TRTSEAUTH
+####################################################################################
+Subprog AUTH(VCRTYP,VCRNUM,VCRSEQ,ERR,ERRMSG)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+Value    Integer VCRSEQ
+Variable Integer ERR
+Variable Char    ERRMSG
+
+Gosub OUVRE
+If ERR : End : Endif
+
+Local Char TXNID,RESP
+Local Char VPSTXID(38),SPSTATUS(15),SPSECKEY(10)
+Local Char MSGTMP(255)  # 109253 - Parameterize local messages
+
+Call GET_REMAIN_AMT_TAX(VCRTYP,[F:SEU]AUTAMT,[F:SEU]TAXAMT,1)
+
+Gosub VALIDATE
+If ERR=1 : End
+Elsif ERR=2
+  TXNID = "ERR" + uuid$
+Else
+  # 109235.n - Added case statement and Sage Pay option
+  Case [F:SER]PAYPRC
+    When 1  #Sage Exchange
+		  # Processing Sage Exchange Authorization
+      MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+      Call TEMPON(MSGTMP-mess(22,2092,1)) From GESECRAN
+  		Call AUTH(TXNID,RESP,ERR,ERRMSG) From SEPPXML
+		  If ERR | RESP=""
+		    Goto ERR_RSP
+		  Endif
+		  If find(RESP,"E","X")
+		    ERR=2
+        MSGTMP = func AFNC.MES1(mess(37,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+        ERRMSG = MSGTMP + ":" - [F:SEX]RSPMSG
+		  Endif
+    When 2 # Sage Pay
+      # Processing Sage Exchange Authorization
+      MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+      Call TEMPON(MSGTMP-mess(22,2092,1)) From GESECRAN
+
+      Call DEFERRED(TXNID,VPSTXID,SPSTATUS,SPSECKEY,ERR,ERRMSG) From SEPPXML2
+      If ERR | VPSTXID=""
+        Goto ERR_RSP
+      Endif
+      If SPSTATUS<>"OK"
+        ERR=2
+        MSGTMP = func AFNC.MES1(mess(37,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+        ERRMSG = MSGTMP + ":" - [F:SEX]RSPMSG
+      Endif
+  Endcase
+Endif
+
+# Save off Response
+If [F:SEU]POSTAUT=2 & [F:SEU]STAFLG<3
+  Global Char GTXNID : GTXNID = [L]TXNID
+  Global Char GVPSTXID(38)  : GVPSTXID  = [L]VPSTXID
+  Global Char GSPSECKEY(10) : GSPSECKEY = [L]SPSECKEY
+Else
+  Gosub AUTH_RSP
+Endif
+
+Call TEMPOFF From GESECRAN
+End
+
+####################################################################################
+# Post-order Auth for the card for the amount in SEU record
+# Called from TRTSEAUTH
+####################################################################################
+Subprog POST_AUTH(VCRTYP,VCRNUM,ERR,ERRMSG)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+Variable Integer ERR
+Variable Char    ERRMSG
+
+Gosub OUVRE
+If ERR : End : Endif
+
+If !func SEPPCDT.SEPP_OK([L]VCRTYP,[L]VCRNUM,0) : End : Endif
+Local Integer VCRSEQ : VCRSEQ = [F:SEU]VCRSEQ
+
+If [F:SEU]POSTAUT=2 & [F:SEU]STAFLG<3
+  Case [F:SER]PAYPRC
+    When 1
+		  # Save off Response
+		  Call SAVE_TXN(ERR) From SEPPXML
+    When 2
+      # Save off Response
+      Call SAVE_TXN(ERR) From SEPPXML2
+  Endcase
+  If [F:SEU]STAFLG<3 & dim(GTXNID)>0
+    Local Char TXNID,RESP
+    Local Char VPSTXID(38),SPSECKEY(10)
+    [L]TXNID = GTXNID : Kill GTXNID
+    [L]VPSTXID  = GVPSTXID  : Kill GVPSTXID
+    [L]SPSECKEY = GSPSECKEY : Kill GSPSECKEY
+    Gosub AUTH_RSP
+  Endif
+  # handle backorders
+  Gosub BKOPRC
+Endif
+
+End
+
+####################################################################################
+# Process the auth response
+####################################################################################
+$AUTH_RSP
+Local Integer WTRBEGIN : WTRBEGIN=adxlog  # 108099.n
+
+If left$([L]TXNID,3)="ERR"
+  [L]TXNID = right$([L]TXNID,4)
+  Raz [F:SEX]
+  [F:SEX]RSPMSG = mess(1,8,1)  # Inactive
+Else
+  # read from txn table and save to auth table
+  Filter [SEX] Where TXNID=[L]TXNID & REQRSP=2
+  Read [SEX] Last
+  Filter [SEX]
+  If fstat
+    Call RSTA("SEX",[L]TXNID-num$(2)) From GLOCK
+    ERR=1 : Return
+  Endif
+Endif
+
+If !WTRBEGIN : Trbegin [SEU] : Endif  # 108099.n
+
+Readlock [SEU]SEU0=[L]VCRTYP;[L]VCRNUM;[L]VCRSEQ
+If fstat
+  Call RSTA("SEU",num$([L]VCRTYP)-[L]VCRNUM-num$([L]VCRTYP)) From GLOCK
+  If !WTRBEGIN : Rollback : Endif  # 108099.n
+  ERR=1 : Return
+Endif
+
+[F:SEU]TXNID     = [L]TXNID
+[F:SEU]AUTDAT    = date$
+[F:SEU]AUTID     = [F:SEX]RSPCOD
+[F:SEU]VANREF    = [F:SEX]VANREF
+[F:SEU]AUTAMT    = [F:SEX]AMT
+If [F:SEU]VCRTYPORI=0 : [F:SEU]VCRTYPORI = [L]VCRTYP  : Endif
+If [F:SEU]ORIGAUTH=0  : [F:SEU]ORIGAUTH  = [F:SEX]AMT : Endif
+
+Case [F:SER]PAYPRC
+  When 1  #Sage Exchange
+		If [F:SEX]RESP="A"      # Successful auth
+		  If [F:SEU]POSTAUT=3
+		    [F:SEU]STAFLG  = 2  # Validated
+		    [F:SEU]POSTAUT = 2
+		  Else
+		    [F:SEU]STAFLG  = 3  # Authorized
+		    [F:SEU]POSTAUT = 1
+		  Endif
+		Else                    # Declined
+		  [F:SEU]AUTAMT   = 0
+		  [F:SEU]STAFLG   = 4   # Rejected
+		  [F:SEU]AUTMSG   = [F:SEX]RSPMSG
+		Endif
+  When 2 # Sage Pay
+    If [F:SEX]RESP="OK" # Successful auth
+      [F:SEU]VPSTXID  = [L]VPSTXID
+      [F:SEU]SPSECKEY = [L]SPSECKEY
+      If [F:SEU]POSTAUT=3
+        [F:SEU]STAFLG  = 2  # Validated
+        [F:SEU]POSTAUT = 2
+      Else
+        [F:SEU]STAFLG  = 3  # Authorized
+        [F:SEU]POSTAUT = 1
+      Endif
+    Else                    # Declined
+      [F:SEU]AUTAMT   = 0
+      [F:SEU]STAFLG   = 4   # Rejected
+      [F:SEU]AUTMSG   = [F:SEX]RSPMSG
+    Endif
+Endcase
+
+Rewrite [SEU]
+If fstat
+  Call FSTA("SEU") From GLOCK
+  If !WTRBEGIN : Rollback : Endif  # 108099.n
+  ERR=1 : Return
+Endif
+
+If !WTRBEGIN : Commit : Endif  # 108099.n
+
+# For verify, void the auth
+If !ERR & [F:SEU]STAFLG=2
+  Case [F:SER]PAYPRC
+    When 1
+		  Call VOID([L]TXNID,RESP,ERR,ERRMSG) From SEPPXML
+		  If ERR | RESP<>"A"
+		    ERRMSG = mess(24,2092,1)-mess(290,196,1)+":"-ERRMSG
+		    ERR = 1
+		  Endif
+    When 2
+      Local Char SPSTATUS(15)
+      Call ABORT([L]VPSTXID,SPSTATUS,ERR,ERRMSG) From SEPPXML2
+      If ERR | SPSTATUS<>"OK"
+        ERRMSG = mess(24,2092,1)-mess(290,196,1)+":"-ERRMSG
+        ERR = 1
+      Endif
+  Endcase
+Endif
+
+Return
+
+####################################################################################
+# Capture the funds
+####################################################################################
+Subprog CAPTURE(VCRTYP,VCRNUM,VCRSEQ,ERR,ERRMSG)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+Value    Integer VCRSEQ
+Variable Integer ERR
+Variable Char    ERRMSG
+
+Local Integer WTRBEGIN : WTRBEGIN=adxlog
+
+Gosub OUVRE
+If ERR : End : Endif
+
+Local Char TXNID,RESP
+Local Char SPSTATUS(15)
+Local Char MSGTMP(255)  # 109253 - Parameterize local messages
+
+Call GET_REMAIN_AMT_TAX(VCRTYP,[F:SEU]AUTAMT,[F:SEU]TAXAMT,0)
+
+If find([F:SEU]VCRTYP,18,41,51) & [SEU]STAFLG<>8  # Credit/Payment
+  Case [F:SER]PAYPRC
+    When 1
+      # Processing Sage Exchange Credit
+      MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+      Call TEMPON(MSGTMP-mess(297,107,1)) From GESECRAN
+      Call CREDIT([L]TXNID,RESP,ERR,ERRMSG) From SEPPXML
+    When 2
+      # Process Sage Pay Credit
+      MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+      Call TEMPON(MSGTMP-mess(297,107,1)) From GESECRAN
+      Call REFUND([L]TXNID,SPSTATUS,ERR,ERRMSG) From SEPPXML2
+  Endcase
+Elsif [F:SEU]STAFLG=3
+  Case [F:SER]PAYPRC
+    When 1
+      # Processing Sage Exchange Capture
+      MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+      Call TEMPON(MSGTMP-mess(23,2092,1)) From GESECRAN
+      Call CAPTURE([L]TXNID,RESP,ERR,ERRMSG) From SEPPXML
+    When 2
+      # Process Sage Pay RELEASE
+      MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+      Call TEMPON(MSGTMP-mess(23,2092,1)) From GESECRAN
+      Call RELEASE([L]TXNID,SPSTATUS,ERR,ERRMSG) From SEPPXML2
+  Endcase
+Elsif [F:SEU]STAFLG=8
+  # Manual auth - just write out needed info to Auth record
+  MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+  Call TEMPON(MSGTMP-mess(23,2092,1)) From GESECRAN
+Else : ERR = 1 : ERRMSG = mess(35,2092,1)
+Endif
+
+Case [F:SER]PAYPRC
+  When 1  # Sage Exchange error handling
+    If ERR | (RESP="" & [SEU]STAFLG<>8)
+      Goto ERR_RSP
+    Endif
+    If find(RESP,"E","X")
+      ERR=2
+      MSGTMP = func AFNC.MES1(mess(37,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+      ERRMSG = MSGTMP + ":" - [F:SEX]RSPMSG
+    Endif
+  When 2 # Sage Pay error handling
+    If SPSTATUS<>"OK" & [F:SEU]STAFLG<>8
+      ERR=2
+      MSGTMP = func AFNC.MES1(mess(37,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+      ERRMSG = MSGTMP + ":" - [F:SEX]RSPMSG
+      End
+    Elsif ERR | (SPSTATUS="" & [SEU]STAFLG<>8)
+      Goto ERR_RSP
+    Endif
+Endcase
+
+# Save off Response
+Gosub CAPTURE_RSP
+Call TEMPOFF From GESECRAN
+If ERR : End : Endif
+
+# Delete one time use card from vault
+If [F:SEB]ONETIME=2 & [F:SEU]MANAUT<>2
+  Call VAULT_DEL([F:SER]PRCCOD,ERR,ERRMSG)
+  If ERR
+    Goto ERR_RSP
+  Endif
+Else
+  # handle backorders
+  Gosub BKOPRC
+Endif
+
+End
+
+####################################################################################
+# Process the capture response
+####################################################################################
+$CAPTURE_RSP
+
+If [F:SEU]MANAUT<>2
+  # read from txn table and save to auth table
+  Filter [SEX] Where TXNID=[L]TXNID & REQRSP=2
+  Read [SEX] Last
+  Filter [SEX]
+  If fstat
+    Call RSTA("SEX",[L]TXNID-num$(2)) From GLOCK
+    Return
+  Endif
+Endif
+
+If !WTRBEGIN : Trbegin [SEU] : Endif
+
+Readlock [SEU]SEU0=[L]VCRTYP;[L]VCRNUM;[L]VCRSEQ
+If fstat
+  Call RSTA("SEU",num$([L]VCRTYP)-[L]VCRNUM-num$([L]VCRTYP)) From GLOCK
+  Rollback : ERR=1 : Return
+Endif
+
+If [F:SEU]MANAUT<>2
+  [F:SEU]TXNID  = [L]TXNID
+  [F:SEU]PAYID  = [F:SEX]RSPCOD
+  [F:SEU]PAYAMT = [F:SEX]AMT
+Else
+  [F:SEU]PAYAMT = [F:SEU]AUTAMT
+Endif
+[F:SEU]PAYDAT = date$
+[F:SEU]STAFLG = 6   # Captured
+Rewrite [SEU]
+If fstat
+  Call FSTA("SEU") From GLOCK
+  If !WTRBEGIN : Rollback : Endif
+  ERR=1 : Return
+Endif
+
+If !WTRBEGIN : Commit : Endif
+Return
+
+####################################################################################
+$ERR_RSP
+Call TEMPOFF From GESECRAN
+Call ECR_TRACE(mess(6,123,1)+":"-ERRMSG,1) From GESECRAN
+Raz ERRMSG  # clear so the message isn't displayed twice
+End
+
+####################################################################################
+$VALIDATE
+Call GET_SEB([F:SEU]BPCNUM,[F:SEU]ACCNCKNAM)
+If !fstat & [F:SEB]FLACT<>2
+  ERRMSG = mess(6,103,1)-[F:SEB]BPCNUM-[F:SEB]ACCNCKNAM
+  ERR = 2 : Return
+Endif
+Call GET_SER([F:SEU]PRCCOD)
+If !fstat
+  If [F:SER]FLACT<>2
+    ERRMSG = mess(6,103,1)-[F:SER]PRCCOD
+    ERR = 2 : Return
+  Endif
+  If [F:SER]CUR<>[F:SEU]CUR | (dim([F:PYH]BAN)>0 & [F:SER]BAN<>[F:PYH]BAN)
+    ERRMSG = mess(47,2092,1)
+    ERR = 1 : Return
+  Endif
+Endif
+If [F:SEU]AUTAMT=0 | ([F:SEU]AUTAMT<[F:SER]MINAMT & [F:SEU]AUTAMT<>[F:SER]VERIFAMT)
+  ERRMSG = func AFNC.MES3(mess(33,2092,1),mess([F:SER]PAYPRC,2098,1),format$("N:####.##",[F:SER]MINAMT),[F:SER]PRCCOD)
+&        - func AFNC.MES1(mess(34,2092,1),format$("N:####.##",[F:SEU]AUTAMT))
+  ERR = 1 : Return
+Endif
+Return
+
+####################################################################################
+$BKOPRC
+
+# Backorder flag must be set to Yes
+If [F:SER]BKO<>2 : Return : Endif
+
+If !clalev([F:SEU2]) : Local File SEAUTH     [SEU2] : Endif
+If !clalev([F:SOH2]) : Local File SORDER     [SOH2] : Endif
+
+If !find([F:SEU]STAFLG,3,6) | [F:SEU]SOHNUM="" : Return : Endif
+
+# Make sure the record doesn't already exist
+Look [SEU2]SEU0=2;[F:SEU]SOHNUM;[F:SEU]VCRSEQ+1
+If !fstat : Return : Endif
+
+# Read Sales Order record
+Read [SOH2]SOH0=[F:SEU]SOHNUM
+If fstat : Return : Endif
+
+# Skip if order closed, fully shipped, or invoiced
+If [F:SOH2]ORDSTA=2 | [F:SOH2]DLVSTA=3 | [F:SOH2]INVSTA=3 : Return : Endif
+
+WTRBEGIN2 = adxlog
+If !WTRBEGIN2 : Trbegin [SEU2] : Endif
+
+# For backorders - clone exist Auth record
+Raz [F:SEU2]
+[F:SEU2]VCRTYP    = 2
+[F:SEU2]VCRNUM    = [F:SEU]SOHNUM
+[F:SEU2]VCRSEQ    = [F:SEU]VCRSEQ + 1  # increment sequence number
+[F:SEU2]STAFLG    = 1  # Selected
+[F:SEU2]VCRTYPORI = 2
+[F:SEU2]SOHNUM    = [F:SEU]SOHNUM
+[F:SEU2]BPCNUM    = [F:SEU]BPCNUM
+[F:SEU2]ACCNCKNAM = [F:SEU]ACCNCKNAM
+[F:SEU2]PRCCOD    = [F:SEU]PRCCOD
+[F:SEU2]ACCL4D    = [F:SEU]ACCL4D
+[F:SEU2]CRDTYP    = [F:SEU]CRDTYP
+[F:SEU2]EXPDAT    = [F:SEU]EXPDAT
+[F:SEU2]POSTAUT   = [F:SER]AUTSTP
+[F:SEU2]CUR       = [F:SER]CUR
+Write [SEU2]
+If fstat
+  Call FSTA("SEU2") From GLOCK
+  If !WTRBEGIN2 : Rollback : Endif
+  ERR=1 : Return
+Endif
+
+If !WTRBEGIN2 : Commit : Endif
+
+Return
+
+####################################################################################
+# Automatically authorize backorders
+####################################################################################
+Subprog AUTH_BKO(NUM)
+Value    Char    NUM
+Local Integer ERR
+Local Char    ERRMSG(250)
+
+If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+If !clalev([F:SEU2]) : Local File SEAUTH     [SEU2] : Endif
+If !clalev([F:SOH])  : Local File SORDER     [SOH]  : Endif
+
+Filter [SEU2] Where SIHNUM=[L]NUM & STAFLG=6
+Read [SEU2] Last
+Filter [SEU2]
+If fstat : End : Endif
+
+# just created for backorder(s)
+For [SEU] Where VCRTYP=2 & VCRNUM=[F:SEU2]SOHNUM & STAFLG=1 & POSTAUT=1
+  Read [SOH]SOH0=[F:SEU2]SOHNUM
+  If !fstat
+    Call AUTH(2,[F:SEU]VCRNUM,[F:SEU]VCRSEQ,ERR,ERRMSG)
+    If ERR
+      Call ECR_TRACE(ERRMSG,1) From GESECRAN : Break
+    Endif
+  Endif
+Next
+
+End
+
+####################################################################################
+# Void all open auths
+####################################################################################
+Subprog VOID_ALL(VCRTYP,VCRNUM,ERR,ERRMSG)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+Variable Integer ERR
+Variable Char    ERRMSG
+If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+If !clalev([F:SER])  : Local File SEPRC      [SER]  : Endif
+For [SEU] Where VCRTYP=[L]VCRTYP & VCRNUM=[L]VCRNUM & STAFLG<=3
+  Call GET_SER([F:SEU]PRCCOD)
+  Call VOID([F:SEU]VCRTYP,[F:SEU]VCRNUM,[F:SEU]VCRSEQ,0,ERR,ERRMSG)
+Next
+End
+
+####################################################################################
+# Void the transaction
+####################################################################################
+Subprog VOID(VCRTYP,VCRNUM,VCRSEQ,ISILENT,ERR,ERRMSG)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+Value    Integer VCRSEQ
+Value    Integer ISILENT
+Variable Integer ERR
+Variable Char    ERRMSG
+
+Local Char    TXNID,RESP
+Local Char SPSTATUS(15)
+Local Char MSGTMP(255)  # 109253 - Parameterize local messages
+
+Call GET_SEU([L]VCRTYP,[L]VCRNUM,[L]VCRSEQ)
+If fstat : ERR=1 : End
+Elsif [F:SEU]STAFLG=5 : End  # already void
+Elsif [F:SEU]STAFLG>3 & [F:SEU]STAFLG<>8
+  ERRMSG = mess(26,2092,1)
+  ERR = 1 : End
+Endif
+
+## TODAN-119614.n: The pick ticket message only apply to the 2-Sales order entry type
+## and the call come from GESSOH-Sales orders function
+#If VCRTYP = 2 & GFONCTION = "GESSOH"
+##TTD-117171.sn: Check if pick ticket has been created for this order.
+## If VCRTYP = 2 # Sales order                          # TODAN-119614.o
+#  If clalev([F:PRE]) = 0 Local File STOPRED     [PRE]  : Endif # Pick ticket detail
+#
+#  Filter [PRE] Where ORINUM = VCRNUM & PRHNUM <> AVOID.ACHAR
+#  Look [PRE] First
+#  Filter [PRE]
+#  If !fstat   # Yes, pick ticket has been created. Display message and get out.
+#    ERRMSG = mess(61,2092,1)  # Pick ticket(s) have been created for this order. Please delete the pick ticket(s) before voiding credit card transaction.
+#    ERR = 1
+#    Close Local File [PRE]
+#    End
+#  Endif
+#  Close Local File [PRE]
+#Endif
+##TTD-117171.en
+
+If !ISILENT
+  # Processing Sage Exhange Void
+  MSGTMP = func AFNC.MES1(mess(20,2092,1),mess([F:SER]PAYPRC,2098,1))  # 109253 - Parameterize Local Message
+  Call TEMPON(MSGTMP-mess(24,2092,1)) From GESECRAN
+Endif
+
+If [F:SEU]STAFLG=3
+  Case [F:SER]PAYPRC
+    When 1
+      # Void the auth in SPS
+      If [F:SEU]VANREF<>""
+		  Call VOID([F:SEU]TXNID,RESP,ERR,ERRMSG) From SEPPXML
+		  If ERR
+		    ERRMSG = mess(24,2092,1)-mess(290,196,1)+":"-ERRMSG
+		  Endif
+		  If ISILENT & RESP="X" : Raz ERRMSG : Endif  # ITEM NOT FOUND
+Endif
+    When 2
+      # Void the auth in Sage Pay
+      If [F:SEU]VPSTXID<>""
+        Call ABORT([F:SEU]TXNID,SPSTATUS,ERR,ERRMSG) From SEPPXML2
+        If ERR
+          ERRMSG = mess(24,2092,1)-mess(290,196,1)+":"-ERRMSG
+        Endif
+      Endif
+  Endcase
+Endif
+
+If ([F:SER]PAYPRC=1 & RESP<>"E") | ([F:SER]PAYPRC=2 & SPSTATUS="OK") | [F:SEU]STAFLG=8
+  WTRBEGIN = adxlog
+  If !WTRBEGIN : Trbegin [SEU] : Endif
+  [F:SEU]STAFLG  = 5
+  Raz [F:SEU]AUTAMT
+  Rewrite [SEU]
+  If fstat
+    Call FSTA("SEU") From GLOCK : ERR=1
+    If !WTRBEGIN : Rollback : Endif
+  Else
+    If !WTRBEGIN : Commit : Endif
+  Endif
+Endif
+
+If !ISILENT : Call TEMPOFF From GESECRAN  : Endif
+End
+
+# Assume transaction already in progress
+####################################################################################
+Subprog TRANSFER(OLDVCRTYP,OLDVCRNUM,NEWVCRTYP,NEWVCRNUM,ERR)
+Value    Integer OLDVCRTYP
+Value    Char    OLDVCRNUM
+Value    Integer NEWVCRTYP
+Value    Char    NEWVCRNUM
+Variable Integer ERR
+
+If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+If !clalev([F:SER])  : Local File SEPRC      [SER]  : Endif
+If !clalev([F:SEB])  : Local File SEBPC      [SEB]  : Endif
+
+# Credit from Invoice or Return
+If [L]NEWVCRTYP=18
+  Call CREDIT_COPY(OLDVCRTYP,OLDVCRNUM,NEWVCRTYP,NEWVCRNUM,ERR) : End
+Endif
+
+Local Char ERRMSG(250)
+Filter [SEU] Where VCRTYP=[L]OLDVCRTYP & VCRNUM=[L]OLDVCRNUM & PAYNUM=""
+Read [SEU] Last
+Filter [SEU]
+If fstat : End  # nothing to transfer
+Elsif [L]NEWVCRTYP<[L]OLDVCRTYP & [F:SEU]VCRTYPORI=OLDVCRTYP  # deleting, originated here
+  Call VOID_ALL(OLDVCRTYP,OLDVCRNUM,ERR,ERRMSG) : End
+Endif
+
+# Issue 116439 - 2016-05-11 by ERMIL : This change no longer needed due to changes in FUNPREDLV
+# 108099.n
+# When called from GFONCTION, this gets called twice. On the second pass, the new and old records exist.
+# If this is the case, don't want to try to transfer again.
+#If GFONCTION="FUNPREDLV"
+#  Filter [SEU] Where VCRTYP=[L]NEWVCRTYP & VCRNUM=[L]NEWVCRNUM & PAYNUM=""
+#  Read [SEU] Last
+#  Filter [SEU]
+#  If !fstat
+#    End
+#  Endif
+#Endif
+
+For [SEU] Where VCRTYP=[L]OLDVCRTYP & VCRNUM=[L]OLDVCRNUM & PAYNUM=""
+  [F:SEU]VCRTYP = NEWVCRTYP
+  [F:SEU]VCRNUM = NEWVCRNUM
+  If [L]NEWVCRTYP>=[L]OLDVCRTYP
+    Call SET_SEUDOC(NEWVCRTYP,NEWVCRNUM)
+  Else  # transfer back - blank current doc & reset POSTAUT
+    Call SET_SEUDOC(OLDVCRTYP,"")
+    If [L]NEWVCRTYP=2 : [F:SEU]POSTAUT=[F:SER]AUTSTP : Endif
+  Endif
+  Rewrite [SEU]
+  If fstat
+    Call FSTA("SEU") From GLOCK
+    ERR = 1 : End
+  Endif
+Next
+
+If [L]OLDVCRTYP=2  # Order
+  Local Integer SEPP_OK #TODAN-118776.n
+  SEPP_OK = func SEPPCDT.SEPP_OK([L]NEWVCRTYP,[L]NEWVCRNUM,0) #TODAN-118776.n
+
+  # Issue 116439 - 2016-05-11 by ERMIL : change the order of the conditions for performance reasons
+  #If func SEPPCDT.SEPP_OK([L]NEWVCRTYP,[L]NEWVCRNUM,0) & [F:SEU]POSTAUT=2
+#  If [F:SEU]POSTAUT=2 & func SEPPCDT.SEPP_OK([L]NEWVCRTYP,[L]NEWVCRNUM,0)
+
+  If ([F:SEU]POSTAUT=2 & SEPP_OK) | !SEPP_OK #TODAN-118776.n
+    If [F:SEU]STAFLG=3
+      Call AUTH_CHK([F:SEU]VCRTYP,[F:SEU]VCRNUM,ERR,ERRMSG)
+    Elsif [F:SEU]STAFLG<3
+      Call AUTH([F:SEU]VCRTYP,[F:SEU]VCRNUM,[F:SEU]VCRSEQ,ERR,ERRMSG)
+    Elsif [F:SEU]STAFLG=4                                                 # 103163.n
+      Call GET_SER([F:SEU]PRCCOD)
+      ERR = 1 : ERRMSG = func AFNC.MES1(mess(37,2092,1),mess([F:SER]PAYPRC,2098,1))
+    Endif
+#If GUSER="TODAN" : Call FERME_TRACE From LECFIC : Endif
+    If ERR : Call ECR_TRACE(ERRMSG,1) From GESECRAN : End : Endif
+  Endif
+Endif
+
+End
+
+####################################################################################
+# Copy correct card info for credit memo/note
+####################################################################################
+Subprog CREDIT_COPY(OLDVCRTYP,OLDVCRNUM,NEWVCRTYP,NEWVCRNUM,ERR)
+Value    Integer OLDVCRTYP
+Value    Char    OLDVCRNUM
+Value    Integer NEWVCRTYP
+Value    Char    NEWVCRNUM
+Variable Integer ERR
+
+#If !find(NEWVCRTYP,18,41) : End : Endif
+If NEWVCRTYP<>18 & NEWVCRTYP<>41 : End : Endif
+
+If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+If !clalev([F:SEU2]) : Local File SEAUTH     [SEU2] : Endif
+If !clalev([F:SEB])  : Local File SEBPC      [SEB]  : Endif
+If !clalev([F:SER])  : Local File SEPRC      [SER]  : Endif
+
+Case [L]OLDVCRTYP
+ When 5,40:  # Sales/customer credit
+  If dim([F:SID]SIHORINUM)>0 & [F:SID]SIHORINUM<>""
+    [L]OLDVCRNUM = [F:SID]SIHORINUM
+  Endif
+  Filter [SEU2] Where SIHNUM=[L]OLDVCRNUM & find(STAFLG,3,6,7,8)
+  Read [SEU2] Last
+  Filter [SEU2]
+  If fstat : End : Endif
+ When 6 :  # Return
+  Link [SRD] With [SEU2]SEU3=[SRD]SDHNUM As [LSRD]
+&   Where [SRD]SRHNUM=[F:SID]SRHNUM & find([SEU2]STAFLG,3,6,7,8)
+  Read [LSRD] Last
+  If fstat : End : Endif
+  If [F:SRD]SDHNUM = AVOID.ACHAR : End : Endif # TTD-118121. Get out if no delivery # found.
+  [L]OLDVCRTYP = 4
+  [L]OLDVCRNUM = [F:SRD]SDHNUM
+ When Default: End
+Endcase
+
+# make sure the record does not already exist
+Look [SEU]SEU0=[L]NEWVCRTYP;[L]NEWVCRNUM;1
+If !fstat : End : Endif
+
+#If this was a manual or one time card, they will need to select a new card
+Call GET_SEB([F:SEU2]BPCNUM,[F:SEU2]ACCNCKNAM)
+If [F:SEB]ONETIME=2 | [F:SEU2]MANAUT=2 : End : Endif
+
+Call GET_SER([F:SEU2]PRCCOD)
+
+# Create a new auth record
+Raz [F:SEU]
+[F:SEU]VCRTYP    = [L]NEWVCRTYP
+[F:SEU]VCRNUM    = [L]NEWVCRNUM
+Call SET_SEUDOC([L]OLDVCRTYP,[L]OLDVCRNUM)
+[F:SEU]VCRSEQ    = 1
+[F:SEU]STAFLG    = 1  # Selected
+[F:SEU]VCRTYPORI = [F:SEU2]VCRTYP
+[F:SEU]SIHNUM    = [L]NEWVCRNUM
+[F:SEU]BPCNUM    = [F:SEU2]BPCNUM
+[F:SEU]ACCNCKNAM = [F:SEU2]ACCNCKNAM
+[F:SEU]PRCCOD    = [F:SEU2]PRCCOD
+[F:SEU]ACCL4D    = [F:SEU2]ACCL4D
+[F:SEU]CRDTYP    = [F:SEU2]CRDTYP
+[F:SEU]EXPDAT    = [F:SEU2]EXPDAT
+[F:SEU]VANREF    = [F:SEU2]VANREF
+[F:SEU]CUR       = [F:SEU2]CUR
+If [F:SER]PAYPRC=2
+  [F:SEU]ORIGAUTID    = [F:SEU2]AUTID
+  [F:SEU]ORIGTXNID    = [F:SEU2]TXNID
+  [F:SEU]ORIGVPSTXID  = [F:SEU2]VPSTXID
+  [F:SEU]SPSECKEY     = [F:SEU2]SPSECKEY
+Endif
+Write [SEU]
+If fstat
+  Call FSTA("SEU") From GLOCK
+  ERR=1 : End
+Endif
+
+End
+
+####################################################################################
+$OUVRE
+
+Raz ERR,fstat
+# If !clalev([F:SEP])  : Local File SEPAR      [SEP]  : Endif   # 101091.so
+# Call GET_SEP()
+# If fstat : ERR=1 : Return : Endif                             # 101091.eo
+
+If !clalev([F:SEU])  : Local File SEAUTH     [SEU]  : Endif
+If !clalev([F:SEU2]) : Local File SEAUTH     [SEU2] : Endif
+If dim([L]VCRTYP)>0 & dim([L]VCRNUM)>0 & dim([L]VCRSEQ)>0
+  Call GET_SEU([L]VCRTYP,[L]VCRNUM,[L]VCRSEQ)
+  If fstat : ERR=1 : Return : Endif
+Endif
+
+If !clalev([F:SEB])  : Local File SEBPC      [SEB]  : Endif
+If [F:SEU]BPCNUM<>"" & [F:SEU]ACCNCKNAM<>""
+  Call GET_SEB([F:SEU]BPCNUM,[F:SEU]ACCNCKNAM)
+  If fstat : ERR=1 : Return : Endif
+Endif
+
+If !clalev([F:SER])  : Local File SEPRC      [SER]  : Endif
+If [F:SEU]PRCCOD<>""
+  Call GET_SER([F:SEU]PRCCOD)
+  If fstat : ERR=1 : Return : Endif
+Endif
+
+If !clalev([F:SEX])  : Local File SETXN      [SEX]  : Endif
+If !clalev([M:SEX1]) : Local Mask SETXN      [SEX1] : Endif
+
+Return
+
+####################################################################################
+Subprog GET_SEP()
+Read [SEP] First
+If fstat
+	Call DEFAULT_RECORD() From SUBSEP
+  Call RSTA("SEP","") From GLOCK : End
+Endif
+End
+
+####################################################################################
+Subprog GET_SER(PRCCOD)
+Value Char PRCCOD
+If [F:SER]PRCCOD<>[L]PRCCOD
+  Read [SER]SER0=[L]PRCCOD
+  If fstat
+    Call RSTA("SER",[L]PRCCOD) From GLOCK : End
+  Endif
+Else
+  # TODAN-120949. Since there is no read, therefore, reset the fstat variable
+  # to make sure it does not carry the value from other CRUD.
+  fstat = 0
+Endif
+End
+
+####################################################################################
+Subprog GET_SEB(BPCNUM,ACCNCKNAM)
+Value Char BPCNUM
+Value Char ACCNCKNAM
+If [F:SEB]BPCNUM<>[L]BPCNUM | [F:SEB]ACCNCKNAM<>[L]ACCNCKNAM
+  Read [SEB]SEB0=[L]BPCNUM;[L]ACCNCKNAM
+  If fstat
+    Call RSTA("SEB",[L]BPCNUM-[L]ACCNCKNAM) From GLOCK : End
+  Endif
+Endif
+End
+
+####################################################################################
+Subprog GET_SEU(VCRTYP,VCRNUM,VCRSEQ)
+Value Integer VCRTYP
+Value Char    VCRNUM
+Value Integer VCRSEQ
+If [F:SEU]VCRTYP<>[L]VCRTYP | [F:SEU]VCRNUM<>[L]VCRNUM | [F:SEU]VCRSEQ<>[L]VCRSEQ
+  Read [SEU]SEU0=[L]VCRTYP;[L]VCRNUM;[L]VCRSEQ
+  If fstat
+    Call RSTA("SEU",num$([L]VCRTYP)-[L]VCRNUM-num$([L]VCRSEQ)) From GLOCK : End
+  Endif
+Endif
+End
+
+####################################################################################
+Funprog GET_SEUAMT(VCRTYP,VCRNUM,STAFLG)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+Value    Integer STAFLG
+If !clalev([F:SEU2]) : Local File SEAUTH     [SEU2] : Endif
+Local Decimal AMT
+If [L]STAFLG<3 : [L]STAFLG = 3 : Endif
+For [SEU2] Where VCRTYP=[L]VCRTYP & VCRNUM=[L]VCRNUM & STAFLG=[L]STAFLG
+  If find([L]STAFLG,3,8)
+    AMT += [F:SEU2]AUTAMT
+  Elsif STAFLG=6
+    AMT += [F:SEU2]PAYAMT
+  Endif
+Next
+Filter [SEU2]
+End AMT
+
+# find amount against original document, not including current doc
+####################################################################################
+Funprog GET_SEUAMT2(VCRNUM)
+Value    Char    VCRNUM
+If !clalev([F:SEU2]) : Local File SEAUTH     [SEU2] : Endif
+Local Decimal AMT
+
+# TODAN-119472. Performance improvement
+If VCRNUM = AVOID.ACHAR : End 0 : Endif   # Get out if the VCRNUM is blank. Nothing to get.
+
+For [SEU2] Where (STAFLG=6 | STAFLG=7) & (VCRNUM=[L]VCRNUM | SOHNUM=[L]VCRNUM | SDHNUM=[L]VCRNUM | SIHNUM=[L]VCRNUM)
+  AMT += [F:SEU2]PAYAMT
+Next
+
+# 104015.so
+#For [SEU2] Where find(STAFLG,6,7) & find([L]VCRNUM,SOHNUM,SDHNUM,SIHNUM,VCRNUM)
+#  AMT += [F:SEU2]PAYAMT
+#Next
+# TODAN-119472.so
+# 104015.eo
+## 104015.sn - Split the query to remove the FIND for VCRNUM - Performance issue.
+#For [SEU2] Where [L]VCRNUM=SOHNUM & find(STAFLG,6,7)
+#  AMT += [F:SEU2]PAYAMT
+#Next
+#For [SEU2] Where [L]VCRNUM=SDHNUM & find(STAFLG,6,7)
+#  AMT += [F:SEU2]PAYAMT
+#Next
+#For [SEU2] Where [L]VCRNUM=SIHNUM & find(STAFLG,6,7)
+#  AMT += [F:SEU2]PAYAMT
+#Next
+#For [SEU2] Where [L]VCRNUM=VCRNUM & find(STAFLG,6,7)
+#  AMT += [F:SEU2]PAYAMT
+#Next
+## 104015.en
+# TODAN-119472.eo
+End AMT
+
+####################################################################################
+# Subroutine : GET_REMAIN_AMT
+#
+# Description : Calculates the amount and tax left on the order
+#
+# Called from : XFUNAUTINVD, XFUNAUTINVO, SPVSDH, SPVSIH
+#
+# NOTE: Assume document record already open and read
+####################################################################################
+Funprog GET_REMAIN_AMT(VCRTYP)
+Value Integer VCRTYP
+Local Decimal AMT,TAXAMT
+Call GET_REMAIN_AMT_TAX(VCRTYP,AMT,TAXAMT,1)
+End AMT
+
+# Remaining amount, sans markup
+####################################################################################
+Funprog GET_REMAIN_AMT_NMU(VCRTYP)
+Value Integer VCRTYP
+Local Decimal AMT,TAXAMT
+Call GET_REMAIN_AMT_TAX(VCRTYP,AMT,TAXAMT,0)
+End AMT
+
+####################################################################################
+Subprog GET_REMAIN_AMT_TAX(VCRTYP,AMT,TAXAMT,MARKUP)
+Value    Integer VCRTYP
+Variable Decimal AMT
+Variable Decimal TAXAMT
+Value    Integer MARKUP
+
+# If verifying card, set auth amt as verif amt
+If [F:SEU]POSTAUT=3
+  AMT    = [F:SER]VERIFAMT
+  TAXAMT = 0
+  End
+Endif
+
+# Local menu 2097
+Case VCRTYP
+  When 2  # Order
+    # Order amount
+    AMT  = [F:SOH]ORDINVATI - func GET_SEUAMT2([F:SOH]SOHNUM)
+    If MARKUP : AMT += func AUTH_MARKUP([F:SOH]ORDINVNOT) : Endif
+    If [F:SEU]SOHNUM="" : [F:SEU]SOHNUM = [F:SOH]SOHNUM : Endif
+    If TAXAMT=0 : TAXAMT = [F:SOH]ORDATI - [F:SOH]ORDNOT : Endif
+  When 4  # Shipment
+    AMT  = [F:SDH]DLVINVATI - func GET_SEUAMT2([F:SDH]SDHNUM)
+    If MARKUP : AMT += func AUTH_MARKUP([F:SDH]DLVINVNOT) : Endif
+    If [F:SEU]SOHNUM="" : [F:SEU]SOHNUM = [F:SDH]SOHNUM : Endif
+    If TAXAMT=0 : TAXAMT = [F:SDH]DLVATI - [F:SDH]DLVNOT : Endif
+  When 5,18,40,41  # Sales or Customer - Invoice or Credit
+    # TTD - 118121. Read the current record if it haven't read yet to get
+    # correct amount for calculation.
+    If [F:SIH]NUM = AVOID.ACHAR and GFONCTION = "GESSIH" and VCRTYP = 18 # Sales credit
+      Read [SIH]SIH0=[M]DVCRNUM
+    Endif
+
+    AMT = [F:SIH]AMTATI - func GET_SEUAMT2([F:SIH]NUM)
+    # add markup for post-order auth
+    If [F:SEU]POSTAUT=2 & [F:SEU]STAFLG<3
+      If MARKUP : AMT += func AUTH_MARKUP([F:SIH]AMTNOT) : Endif
+    Endif
+    If [F:SEU]SOHNUM="" & find(VCRTYP,5,18) : [F:SEU]SOHNUM = [F:SID]SOHNUM : Endif
+    If TAXAMT=0 : TAXAMT = [F:SIH]AMTATI - [F:SIH]AMTNOT : Endif
+  When 50,51 # Payment or Receipt
+    AMT = [F:PYH]AMTCUR - func GET_SEUAMT2([F:PYH]NUM)
+Endcase
+If [F:SEU]SOHNUM<>""  # Subtract amount of prepayments
+  AMT -= func CALPRE()
+Endif
+
+End
+
+# Authorization Markup
+####################################################################################
+Funprog AUTH_MARKUP(IAMT)
+Value Decimal IAMT
+End ar2(IAMT * [F:SER]AUTPCT / 100)  # Round to 2 decimal places
+
+# Calculate Prepayment amount
+####################################################################################
+Funprog CALPRE()
+If !clalev([F:DUD])  : Local File GACCDUDATE [DUD]  : Endif
+If !clalev([F:PYO])  : Local File PAYORDER   [PYO]  : Endif
+Local Decimal PREAMT
+For [DUD]DUD0 Where TYP="*SO" & NUM=[F:SEU]SOHNUM & SENINS=2 & DUDDAT<=date$
+  For [PYO] Where DUDNUM=[F:DUD]ACCNUM & DUDLIG=[F:DUD]DUDLIG
+    PREAMT += [F:PYO]DUDPAYAMT
+  Next
+Next
+If dim([F:SIH]ACCNUM)>0
+  For [PYO] Where INVNUM=[F:SIH]ACCNUM
+    PREAMT += [F:PYO]DUDPAYAMT
+  Next
+Endif
+End PREAMT
+
+# Assume string coming in is in format M/D/YY to MM/DD/YYYY HH:MM:SS AM
+####################################################################################
+Funprog GET_DATE(ISTR)
+Value Char ISTR
+If ISTR="" End Endif
+# cut off HMS (if they exist)
+SP = instr(1,ISTR," ")
+If SP>0 : ISTR = left$(ISTR,SP-1) : Endif
+# find position of slashes
+S1 = instr(1,ISTR,"/")
+S2 = instr(S1+1,ISTR,"/")
+# build date based on slash positions
+M = left$(ISTR,S1-1)
+D = seg$(ISTR,S1+1,S2)
+Y = right$(ISTR,S2+1)
+End gdat$(val(D),val(M),val(Y))
+
+####################################################################################
+Funprog GET_SEUDOC(VCRTYP)
+Value    Integer VCRTYP
+Case VCRTYP
+  When 2          : End [F:SEU]SOHNUM
+  When 4          : End [F:SEU]SDHNUM
+  When 5,18,40,41 : End [F:SEU]SIHNUM
+Endcase
+End [F:SEU]VCRNUM
+
+####################################################################################
+Subprog SET_SEUDOC(VCRTYP,VCRNUM)
+Value    Integer VCRTYP
+Value    Char    VCRNUM
+
+Case VCRTYP
+  When 2          : [F:SEU]SOHNUM = VCRNUM
+  When 4          : [F:SEU]SDHNUM = VCRNUM
+  When 5,18,40,41 : [F:SEU]SIHNUM = VCRNUM
+Endcase
+End
+
+# Determine if the document payment terms are linked to a payment method marked
+#  for Sage Exchange processing
+####################################################################################
+Funprog SEPP_DOC(PTE)
+Value Char PTE
+If !clalev([F:TPT])  : Local File TABPAYTERM [TPT]  : Endif
+If !clalev([F:TAM])  : Local File TABPAM     [TAM]  : Endif
+#Link [TPT] With [TAM]TAM0=PAM;LEG As [LTPT]                            # 104156.so
+#& Where PTE=[L]PTE & (LEG=GCURLEG | LEG="") & PAMTYP=1 & [TAM]SEPFLG=2
+#Look [LTPT] First
+#End !fstat                                                             # 104156.eo
+Local Integer ISSEPP                                                    # 104156.sn
+Link [TPT] With [TAM]TAM0=PAM;LEG As [LTPT]
+& Where PTE=[L]PTE & (LEG=GCURLEG | LEG="") & PAMTYP=1
+& Order By Key KEY1=[TAM]LEG
+Read [LTPT] KEY1=GCURLEG
+If !fstat
+  ISSEPP = [TAM]SEPFLG=2
+Else
+  Read [LTPT] KEY1=""
+  ISSEPP = !fstat & [TAM]SEPFLG=2
+Endif
+End ISSEPP                                                              # 104156.en
+
+# Determine if the associated shipment is Sage Exchange
+####################################################################################
+Funprog SEPP_DOC_SRH()
+If !clalev([F:SEU2]) : Local File SEAUTH     [SEU2] : Endif
+If !clalev([F:SIH2]) : Local File SINVOICE   [SIH2] : Endif
+ #For I=0 To [M:SRH1]NBLIG-1  ## 101049.o
+ # If [M:SRH1]RTNCNOFLG(I)=2  # Credit Memo  ## 101049.o
+  ## 101049.n  This invoice check only needs to be performed once per entry if any line is returned, not for each line
+  If find(2,[M:SRH1]RTNCNOFLG(0..[M:SRH1]NBLIG-1))  # Credit Mem  ## 101049.n
+    Filter [SIH2] Where INVNUM=[F:SRH]SRHNUM & find(INVTYP,2,4)
+    Read [SIH2] First
+    Filter [SIH2]
+    If !fstat
+      Look [SEU2]SEU4=[F:SIH2]NUM
+      If !fstat : End 1 : Endif
+    Endif
+  Endif
+ For I=0 To [M:SRH1]NBLIG-1  ## 101049.n - moved line down to here
+  If [M:SRH1]DETSDHNUM(I)<>""  # Credit memo not found, check shipment
+    Filter [SEU2] Where SDHNUM=[M:SRH1]DETSDHNUM(I) & find(STAFLG,3,6,7)
+    Look [SEU2] First
+    Filter [SEU2]
+    If !fstat : End 1 : Endif
+  Endif
+ Next
+End 0
+# Determine if any of the payment methods on the payment transaction are marked
+#  for Sage Exchange processing
+####################################################################################
+Funprog SEPP_DOC_PAY()
+# 101031.sn
+Local Char LEG(20)
+If GFONCTION = "GESSER" : LEG = [M:SER1]LEG : Endif
+If LEG = "" : LEG = GCURLEG : Endif
+# 101031.en
+
+If !clalev([F:TAM])  : Local File TABPAM     [TAM]  : Endif
+For I=0 To dim([F:TPY]PAM)-1
+  If [F:TPY]PAM(I)="" : Break : Endif
+  #Call LEC_TAM(GCURLEG,[F:TPY]PAM(I)) From CPTLEC # 101031.o
+  Call LEC_TAM(LEG,[F:TPY]PAM(I)) From CPTLEC # 101031.n
+  If !fstat & [F:TAM]SEPFLG=2 : End 1 : Endif
+Next
+End 0
+# 112898 - Determine if any of the payment methods on the payment transaction are marked
+#  for Sage Exchange processing - only to be called from GESTPY
+####################################################################################
+Funprog SEPP_DOC_PAY_TYP()
+If !clalev([F:TAM])  : Local File TABPAM     [TAM]  : Endif
+For I=0 To dim([M:TPY1]PAM)-1
+  If [M:TPY1]PAM(I)="" : Break : Endif
+  Call LEC_TAM(GCURLEG,[M:TPY1]PAM(I)) From CPTLEC
+  If !fstat & [F:TAM]SEPFLG=2 : End 1 : Endif
+Next
+End 0
+# Verify that names are formatted correctly and don't contain any unwanted characters
+####################################################################################
+Funprog VALID_NAME(INAME)
+Value Char INAME
+# 111621.n - Verify only valid characters are used.
+Local Integer I, J, CODE, OK
+Local Char    TEST(1)
+
+  # Check for invalid characters
+  J = len(INAME)
+  For I = 1 To J
+    TEST = mid$(INAME,I,1)
+    CODE = ascii(TEST)
+
+    # Default to fail
+    OK=0
+
+    # Verify that this is a valid character
+    If    CODE  = 32                : OK=1  # Space
+    Elsif CODE >= 38  & CODE <= 39  : OK=1  # & and '
+    Elsif CODE >= 44  & CODE <= 57  : OK=1  # , - . / and 0-9
+    Elsif CODE >= 65  & CODE <= 90  : OK=1  # A-Z
+    #Elsif CODE  = 92                : OK=1  # \
+    Elsif CODE >= 97  & CODE <= 122 : OK=1  # a-z
+    Elsif CODE  = 193               : OK=1  # Á
+    Elsif CODE  = 201               : OK=1  # É
+    Elsif CODE  = 205               : OK=1  # Í
+    Elsif CODE  = 211               : OK=1  # Ó
+    Elsif CODE  = 218               : OK=1  # Ú
+    Elsif CODE  = 225               : OK=1  # á
+    Elsif CODE  = 233               : OK=1  # é
+    Elsif CODE  = 237               : OK=1  # í
+    Elsif CODE  = 243               : OK=1  # ó
+    Elsif CODE  = 250               : OK=1  # ú
+    Endif
+
+    # If this character is not OK - return failure
+    If !OK : End 0 : Endif
+  Next
+
+End 1
+

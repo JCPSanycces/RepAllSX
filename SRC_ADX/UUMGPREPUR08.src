@@ -1,0 +1,416 @@
+#<AdxTL>@(#)2.0.0.0 $Revision$
+############################################################################
+# UUMGPREPUR08   Pre-migration Factures                      Module Achats #
+############################################################################
+
+Local Char DOSSIER(30) : DOSSIER = nomap
+If !GSERVEUR
+  Call SAIDOSHIS(DOSSIER,"") From SAIDOSHIS  # Issue 108760 - 2015-06-12 by SR : Adaptation
+Endif
+If DOSSIER <> ""
+  If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+ # Issue 108760 - 2015-06-12 by SR : adaptation
+   #Read [ADS] DOSSIER=[L]DOSSIER : If fstat Raz [F:ADS] : Endif
+  If func DOSSUB.FILL_ADS([L]DOSSIER)=0 : End : Endif
+
+  #Call ACTIVE From TIMING
+  If !GSERVEUR
+    Call TEMPON("O") From GESECRAN
+    Call OUVRE_TRACE("UUMGPREPUR08") From LECFIC
+  Endif
+
+  Call MAJ_UUMGPREPUR08(DOSSIER)
+
+  If !GSERVEUR
+    Call TEMPOFF     From GESECRAN
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+  Endif
+  #Call ARRET From TIMING
+Endif
+End
+
+
+###################################################################################
+Subprog MAJ_UUMGPREPUR08(DOSSIER)
+Value Char DOSSIER
+
+##1 - verifications
+####################
+
+If [F:ADS]MODULE(5)<>2 : : # N= no module
+  End
+Endif
+# Issue 108760 - 2015-06-12 by SR : adaptation
+If func DOSSUB.ISHISTFOLD(DOSSIER) : End : Endif
+
+Call ECR_TIME("UUMGPREPUR08 Purchase Invoices Process : Update PINVOICE-D") From DOSSUB
+Call ECR_TRACE("UUMGPREPUR08 : Process Start on : "+DOSSIER,0) From GESECRAN
+# Issue 386 - 2013-04-29 by MAE : prise en compte des versions
+#----- Récupération du n° de version
+Local Char VERSION
+Call VERSION (DOSSIER,VERSION) From DOSSUB
+If val(VERSION)=0
+  # N° de version incorrecte
+  Call ECR_TRACE("UUMGPREPUR08 : Error on release number : "+VERSION,0) From GESECRAN
+  End
+Endif
+#----- Avoir les globales pour tester les versions
+Gosub DEF_VERSIONSX3 From TRTMIGTABX3
+#Fin MAE 386
+
+Local Integer ERR
+# Issue 386 - 2013-04-29 by MAE : prise en compte des versions
+# Passage en V6
+If val(VERSION)<GMIGX3VER60
+  # ----------------------------------------
+  # 1- ajouter les colonnes dans la table POH
+  # ----------------------------------------
+  Gosub ADDCOLV6
+  If ERR : Goto FIN : Endif
+
+  Gosub TRT_X3_V6
+  #--------------- Suppression index ----------#
+  Call MIGINDDEL (DOSSIER,"PINVOICE",ERR) From TRTMIG
+  If ERR : Goto FIN : Endif
+Endif
+# Passage en V7
+If val(VERSION)<GMIGX3VER70
+  # ----------------------------------------
+  # 1- ajouter les colonnes dans la table POH
+  # ----------------------------------------
+  Gosub ADDCOLV7
+  If ERR : Goto FIN : Endif
+
+  Gosub TRT_X3_V7
+
+  #--------------- Suppression index ----------#
+  #Call MIGINDDEL (DOSSIER,"PORDER",ERR) From TRTMIG
+  #If ERR : Goto FIN : Endif
+Endif
+#Fin MAE 386
+
+$FIN
+Call ECR_TIME("UUMGPREPUR08 : Purchase Orders Process END.")  From DOSSUB
+End
+############################################################
+# Issue 386 - 2013-04-29 by MAE : prise en compte des versions
+$ADDCOLV7
+Return
+############################################################
+$TRT_X3_V7
+Return
+############################################################
+$ADDCOLV6
+  #1- ajouter la colonne dans la table POH
+  Call MIGADDCOL (DOSSIER,"PINVOICE","FFWADD","A",5,1,ERR) From TRTMIG
+  If ERR : Goto FIN : Endif
+  Call MIGADDCOL (DOSSIER,"PINVOICE","EECNUM","A",20,1,ERR) From TRTMIG
+  If ERR : Goto FIN : Endif
+
+  #2- ajouter un index unique
+  #--------------- INDEX ADDITION  ----------#
+  Call MIGINDCRE (DOSSIER,"PINVOICE","","BPAPAY","A",5,ERR) From TRTMIG
+  If ERR : Goto FIN : Endif
+
+  Call MIGINDCRE (DOSSIER,"PINVOICED","","CMMNUM","A",20,ERR) From TRTMIG
+  If ERR : Goto FIN : Endif
+
+Return
+############################################################
+$TRT_X3_V6
+Local Integer COMPTEUR
+
+Gosub OUVRE_PUR06
+
+#2- alimenter la nouvelle colonne si vide
+#----- Ouverture des fichiers -----#
+If clalev([F:PIH]) : Close File [PIH] : Endif
+Local File =DOSSIER+".PINVOICE"   [PIH]
+Local File =DOSSIER+".PINVOICED"  [PID]
+Local File =DOSSIER+".BPARTNER"   [BPR]
+Local File =DOSSIER+".BPSUPPLIER" [BPS]
+Local File =DOSSIER+".BPADDRESS"  [BPA]
+Local File =DOSSIER+".ACTIV"      [ACV]
+
+If dim(GACTDEB)<1  Global Libelle  GACTDEB : Endif
+#----- Code activité "DEB" Déclaration échange de biens CEE -----#
+Read [ACV] CODACT="DEB"
+If !fstat
+  GACTDEB=[F:ACV]FLACT
+Else
+  GACTDEB=2
+Endif
+
+#-----  Déclaration des variables -----#
+# Déclaration des variables pour gérer les ruptures (évite les snapshot too old)
+Local Integer STOP, NB
+Local Char CRITERE(250)
+Local Char ACLE1, ACLE2
+Raz COMPTEUR, STOP, CRITERE
+
+Call DEBTRANS From GLOCK
+Gosub SET_FIRST From TRTFIRST
+
+$LOOP_PUR06
+Raz NB
+If STOP=1
+ STOP = 0
+ CRITERE = "[F:PIH]NUM>ACLE1"
+Else
+ CRITERE = "1=1"
+Endif
+
+Trbegin [PIH]
+GOK = 1
+
+For [PIH] Where evalue(CRITERE)
+
+  # --- alimentation des champs et écriture enreg
+  Gosub MAJ30_PIH
+  If GOK<1 : Break : Endif
+
+  # Issue 80341 - 2012-02-23 by VPO
+  #For [PID] Where NUM=[F:PID]NUM
+  For [PID] Where NUM=[F:PIH]NUM
+    Gosub MAJ30_PID
+    If GOK<1 : Break : Endif
+    Rewrite [F:PID]
+    If fstat
+      Call ECR_TRACE("File PINVOICED(NUM/PIDLIN)"-[F:PID]NUM-num$([F:PID]PIDLIN)+", Error ="-num$(fstat),1) From GESECRAN
+      GOK=0 : Break
+    Endif
+  Next
+  If GOK<1 : Break : Endif
+
+  Rewrite [F:PIH]
+  If fstat
+    Call ECR_TRACE("File PINVOICE(NUM)"-[F:PIH]NUM+", Error ="-num$(fstat),1) From GESECRAN
+    GOK=0 : Break
+  Endif
+
+  COMPTEUR += 1
+  NB+=1
+  If NB>GMAXUPDTRS
+    ACLE1 = [F:PIH]NUM
+    STOP=1
+    Break
+  Endif
+Next
+
+If GOK<1
+  Rollback
+Else
+  Commit
+  If STOP
+    Goto LOOP_PUR06
+  Endif
+Endif
+
+$FIN_1
+Gosub UNSET_FIRST From TRTFIRST
+Close Local File [PIH],[PID],[ACV],[BPS],[BPR],[BPA]
+Call ECR_TIME("UUMGPREPUR08 : "+num$(COMPTEUR)+" records processed.")  From DOSSUB
+Return
+
+################################################
+$OUVRE_PUR06
+Local File =DOSSIER+".GACCDUDATE" [DUD]
+Local Libelle  WTRACE : WTRACE=1
+
+Local Char WBPS(GLONBPS),WBPR(GLONBPR),WPOH(GLONVCR),WITM(GLONITM)
+
+Local Decimal  WQTE, WCOE, WCOURS
+
+
+# ------------UTIACH23--------------#
+Local Char     WMSG(100)
+Local Char     WCMMNUM(GLONVCR)
+Local Decimal  WAMTCUR
+Local Char     WPIHNUM(GLONPIH)
+Local Integer  WPIDLIN
+Local Char     WTAB_CMMNUM(GLONVCR)(max(func AFNC.ACTIV("PIH"),100))
+Local Integer  WTAB_NBLIG
+Local Char     WTAB_CMMNUM2(GLONVCR)(max(func AFNC.ACTIV("POH"),100))
+Local Integer  WTAB_NBLIG2
+
+If !clalev([F:ITP])  Local File  =DOSSIER+".ITMBPS"    [ITP]  : Endif
+
+If !clalev([F:POH])  Local File =DOSSIER+".PORDER"    [POH]  : Endif
+If !clalev([F:POQ])  Local File =DOSSIER+".PORDERQ"   [POQ]  : Endif
+If !clalev([F:POP])  Local File =DOSSIER+".PORDERP"   [POP]  : Endif
+If !clalev([F:CMM])  Local File =DOSSIER+".GCOMMIT"   [CMM]  : Endif
+If !clalev([F:CMD])  Local File =DOSSIER+".GCOMMITD"  [CMD]  : Endif
+If !clalev([F:CMM2]) Local File =DOSSIER+".GCOMMIT"   [CMM2] : Endif
+If !clalev([F:CMD2]) Local File =DOSSIER+".GCOMMITD"  [CMD2] : Endif
+# Issue 79435 - 2012-01-20 by VPO : perf
+#Link [CMD2] With [CMM2] CMM0=[F:CMD2]NUM As [CMX2]
+Link [CMM2] With [CMD2] CMD0~=[F:CMM2]NUM As [CMX2]
+
+Return
+###################################################################################
+$MAJ30_PIH
+        #----- Alimentation code adresse transitaire -----#
+        If dim([F:PIH]FFWNUM)>0 & [F:PIH]FFWNUM<>"" & [F:PIH]FFWADD=""
+          Gosub LECT_BPRFFW
+          [F:PIH]FFWADD=[F:BPR]BPAADD
+        Endif
+        #----- Passage de la nature transaction CEE à 2 caractères -----#
+        If len([F:PIH]EECNAT)>2 & left$([F:PIH]EECNAT,1)="0"
+          [F:PIH]EECNAT=right$([F:PIH]EECNAT,2)
+        Endif
+        #----- Alimentation de l'identification CEE -----#
+        If GACTDEB=2 & [F:PIH]EECNUM=""
+          Gosub LECT_BPRPIH
+          [F:PIH]EECNUM=[F:BPR]EECNUM
+        Endif
+        #----- Alimentation code adresse fournisseur payé -----#
+        If [F:PIH]BPAPAY=""
+          Gosub LECT_BPSBPR
+          If [F:BPS]BPRPAY=[F:PIH]BPRPAY
+            [F:PIH]BPAPAY=[F:BPS]BPAPAY
+          Else
+            Gosub LECT_BPSPAY
+            [F:PIH]BPAPAY=[F:BPS]BPAADD
+          Endif
+        Endif
+Return
+
+########################################################################
+$LECT_BPRFFW
+  If [F:BPR]BPRNUM<>[F:PIH]FFWNUM
+    WBPR=[F:PIH]FFWNUM
+    Gosub LECT_BPR
+  Endif
+Return
+
+$LECT_BPRPIH
+  If [F:BPR]BPRNUM<>[F:PIH]BPR
+    WBPR=[F:PIH]BPR
+    Gosub LECT_BPR
+  Endif
+Return
+
+$LECT_BPR
+    Read [BPR] BPR0=WBPR : If fstat  Raz [F:BPR] : Endif
+Return
+
+$LECT_BPSBPR
+  If [F:BPS]BPSNUM<>[F:PIH]BPR
+    WBPS=[F:PIH]BPR
+    Gosub LECT_BPS
+  Endif
+Return
+
+$LECT_BPSPAY
+  If [F:BPS]BPSNUM<>[F:PIH]BPRPAY
+    WBPS=[F:PIH]BPRPAY
+    Gosub LECT_BPS
+  Endif
+Return
+
+$LECT_BPS
+    Read [BPS] BPS0=WBPS : If fstat  Raz [F:BPS] : Endif
+Return
+
+########################################################################
+$MAJ30_PID
+        If [F:PID]POHNUM<>"" & [F:PID]CMMNUM=""
+          Gosub MAJ30_UTIACH23
+        Endif
+Return
+
+########################################################################
+$MAJ30_UTIACH23
+    #----- Effacement des numéros d'engagement pris si autre facture -----#
+    If [F:PID]NUM<>WPIHNUM
+      Raz WTAB_CMMNUM, WTAB_NBLIG
+    Endif
+    #-----
+    WPIHNUM=[F:PID]NUM
+    WPIDLIN=[F:PID]PIDLIN
+
+    #----- Lecture entête de commande -----#
+    If [F:POH]POHNUM<>[F:PID]POHNUM
+      Read [POH] POH0=[F:PID]POHNUM
+      If fstat
+        If WTRACE=2
+          WMSG=[F:PID]POHNUM-mess(359,197,1)
+          Call ECR_TRACE(WMSG,-1) From GESECRAN
+        Endif
+        Raz [F:POH]
+        Return
+      Else
+        #----- Chargement des numéros d'engagement des lignes de la commande -----#
+        Raz WTAB_CMMNUM2, WTAB_NBLIG2
+        For [POQ] POQ0 Where POHNUM=[F:POH]POHNUM
+          If [F:POQ]CMMNUM<>""
+            WTAB_CMMNUM2(WTAB_NBLIG2)=[F:POQ]CMMNUM : WTAB_NBLIG2+=1
+          Endif
+        Next
+      Endif
+    Endif
+
+    #----- Lecture ligne de commande -----#
+    Read [POQ] POQ0=[F:PID]POHNUM;[F:PID]POPLIN;[F:PID]POQSEQ
+    If fstat
+      If WTRACE=2
+        WMSG=[F:PID]POHNUM-num$([F:PID]POPLIN)-num$([F:PID]POQSEQ)-mess(360,197,1)
+        Call ECR_TRACE(WMSG,-1) From GESECRAN
+      Endif
+      Return
+    Elsif [F:POQ]CMMNUM<>""
+      WCMMNUM=[F:POQ]CMMNUM
+      #----- Lecture ligne prix de commande -----#
+      If [F:POQ]POHTYP=1
+        Read [POP] POP0=[F:POQ]POHNUM;[F:POQ]POPLIN;[F:POQ]POQSEQ
+        If fstat Raz [F:POP] : Endif
+      Else
+        Filter [POP] Where POHNUM=[F:POQ]POHNUM & POPLIN=[F:POQ]POPLIN &
+&                          POPDAT>=[F:POQ]DEMRCPDAT
+        Read [POP] POP1 First
+        If fstat : Raz [F:POP] : Endif
+        Filter [POP]
+      Endif
+      #-----
+      WAMTCUR=-[F:PID]QTYBUDLIN*[F:POP]NETPRI/[F:POQ]UOMPUUCOE
+      Call ARRDEV(WAMTCUR,[F:POH]CUR) From TRTDIV
+      #-----
+      Read [CMM] CMM0=[F:POQ]CMMNUM
+      If fstat
+        If WTRACE=2
+          WMSG=[F:POQ]CMMNUM-"Engagement introuvable !"
+          Call ECR_TRACE(WMSG,-1) From GESECRAN
+        Endif
+        Return
+      Else
+        If [F:PIH]STA=3
+          #----- Recherche engagements pointés par la facture -----#
+          # Issue 79435 - 2012-01-20 by VPO : perf : ajout hint key CMM1
+          For [CMX2] Hint Key CMM1 Where [F:CMM2]TYP   =[F:CMM]TYP
+&                        & [F:CMM2]FCY   =[F:CMM]FCY
+&                        & [F:CMM2]BPR   =[F:CMM]BPR
+&                        & [F:CMM2]CUR   =[F:CMM]CUR
+&                        & [F:CMM2]NUMREF=[F:PID]NUM
+&                        & [F:CMM2]TYPORG=[F:CMM]TYPORG
+&                        & [F:CMM2]NUMORG=[F:CMM]NUMORG
+&                        & [F:CMD2]AMTCUR=WAMTCUR
+            If find([F:CMM2]NUM,WTAB_CMMNUM (0..WTAB_NBLIG ))=0
+&            & find([F:CMM2]NUM,WTAB_CMMNUM2(0..WTAB_NBLIG2))=0
+              WTAB_CMMNUM(WTAB_NBLIG)=[F:CMM2]NUM : WTAB_NBLIG+=1
+              WCMMNUM=[F:CMM2]NUM
+              Break
+            Endif
+          Next
+        Endif
+        #-----
+      Endif
+      #----- Mise à jour de la ligne de facture si nécessaire -----#
+      [F:PID]CMMNUM=WCMMNUM
+      #-----
+    Else
+      # Ligne commande sans engagement !
+    Endif
+
+Return
+

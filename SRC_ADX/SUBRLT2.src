@@ -1,0 +1,534 @@
+#<AdxTL>@(#)6.0.0.0 $Revision$
+Local Char PARAM(10)(1..2) , VALEUR(10)
+Call TRAITE_CHAR(VALEUR,PARAM,"","SUBRLT","FRELMT940",3,"") From GTRAITE
+End
+
+##########################################################################################
+## Localisations Allemandes :
+## **************************
+## Traitement d'importation du fichier MT940. 
+## Ce traitement permet de décoder le fichier émis par la banque et d'alimenter
+## les tables RELMT940 et RELMT940D qui seront exploitées par la fonction qui permet
+## la création automatique des règlements à partir du fichier MT940
+##########################################################################################
+
+Subprog IMPMT940(FICHIER)
+Variable Char FICHIER()
+
+If clalev([F:RLT])=0  : Local File RELMT940     [RLT]  : Endif : # Table de travail en-tête
+If clalev([F:RLD])=0  : Local File RELMT940D    [RLD]  : Endif : # Table de travail ligne
+If clalev([F:ABN])=0  : Local File ABANK        [ABN]  : Endif
+If clalev([F:BAN])=0  : Local File BANK         [BAN]  : Endif
+If clalev([F:CPY])=0  : Local File COMPANY      [CPY]  : Endif : # Sociétés
+If clalev([F:BID])=0  : Local File BID          [BID]  : Endif
+If clalev([F:RLT2])=0 : Local File RELMT940     [RLT2] : Endif
+
+Local Integer I,J,K,STAT, OKLEC
+Local Integer LONG, OK, LIN, IND, NB86, NB61, NBENR
+Local Char    FICDON(GDIMFIC)
+Local Char    RECTYP(3)(1..9)
+Local Char    CUR(GLONCUR)
+Local Char    INDIC(4), ZONE(255), MNT(15), TAG25(30), TAG25_1(30),TAG25_2(30)
+Local Schar   CTEST(1)
+Local Char    MESSAGE(255), MESSA(255), TAG86(255)(0..65), TAG61(255)(0..65)
+
+# Initialisation du compteur
+Local Char    COMPTREG(GLONANM)
+COMPTREG = ""
+#  Call LECTURE("TCA","3","") From CONTOBJ
+# If !fstat : COMPTREG = [F:TCA]CODNUM(5) : Endif
+If COMPTREG="" : COMPTREG = "RLT" : Endif
+
+# Gestion de la trace
+Local Integer TRC
+[L]TRC=0
+If GTRACE<>"" : [L]TRC=2 : Endif
+
+Trbegin [RLT], [RLD]
+
+FICDON=FICHIER
+
+Openi FICDON,0
+
+# Caractères pourris du début
+J=0 : Gosub LECTEST
+While ascii(CTEST)<32 & !fstat
+ J +=1 : Gosub LECTEST
+Wend
+
+RECTYP(1)=":20"
+RECTYP(2)=":25"
+RECTYP(3)=":28"
+RECTYP(4)=":60"
+RECTYP(5)=":61"
+RECTYP(6)=":86"
+RECTYP(7)=":62"
+RECTYP(8)=":64"
+RECTYP(9)=":65"
+
+[L]LONG=69
+
+Openi FICDON,J
+Local Schar FILLER([L]LONG)
+Gosub LECTURE
+
+[L]OK=1 
+Raz [L]NBENR
+
+While fstat=0
+
+ [L]OKLEC = 1 
+ Case left$([L]FILLER,3)
+
+  When [L]RECTYP(1)                 :  # Ligne en-tête (Tag 20)
+
+   Raz [F:RLT]
+
+   [F:RLT]TRFNUM  = mid$([L]FILLER,5,16)
+   [L]INDIC       = [L]RECTYP(1)
+   [L]MESSAGE     = [L]FILLER
+
+  When [L]RECTYP(2)                 :  # Ligne banque (Tag 25)
+   If find([L]INDIC,[L]RECTYP(1)) :# OK 
+ 
+    # Affiche le contenus des tags 20 & 25
+    If [L]TRC=2 : Call ECR_TRACE([L]MESSAGE+"-"+FILLER,0) From GESECRAN   : Endif
+
+    [F:RLT]REFBAN = mid$([L]FILLER,5,30)
+
+    # Recherche Code banque X3
+    # Le tag 25 est composé de 2 éléments :  xxxx/nnnaccount 
+    #   - Le 1er élément avant le "/" peut être de 2 natures différentes : soit le BIC soit le Code Banque
+    #   Sous X3, la table ABANK des "banque/guichet" liste les codes BIC pour un Pays + Code banque
+    #   - Le 2ème élément est le numéro de compte. Si ce compte est > 10, supprimer les 3 premiers caractères 
+    #   et compléter par zéro au cas où... le compte doit être sur 10 caractères.
+    #
+    #   Exemple : DE1234567890, zone de 12 cacractères, le numéro sera 0234567890
+
+    [L]OK = 1
+    J= instr(1,[F:RLT]REFBAN,"/")
+    [L]TAG25_1 = left$([F:RLT]REFBAN,J-1)
+    # Si le 1er élément est un Code Banque, récupération du code BIC
+    Read [F:ABN]ABN0 = "DE";[L]TAG25_1
+    If fstat
+     # Si le 1er élément est un Code BIC, récupération du code Banque
+     Filter [ABN] Where CRY="DE" and BIC=[L]TAG25_1
+     Read [ABN]First
+     If fstat 
+      # Banque/guichet inexistants
+      If [L]TRC=2 : Call ECR_TRACE(mess(173,133,1)-[F:RLT]REFBAN-"(Tag25)",1) From GESECRAN   : Endif
+      [L]OK =0
+     Endif
+    Endif
+    
+    # Réconstitution du BID (=RIB) : Code Banque + N°Compte
+    If [L]OK
+     Raz [L]TAG25_2
+     [L]TAG25 = right$([F:RLT]REFBAN,J+1)
+     For I=1 To len([L]TAG25)
+      [L]ZONE = mid$([L]TAG25,[L]I,1)
+      If (ascii([L]ZONE)>47 and ascii([L]ZONE)<58)
+       [L]TAG25_2 += mid$([L]TAG25,[L]I,1)
+      Endif
+     Next
+  
+     # 2ème élément nnnaccount dans le cas d'un longueur > à 10 caractère, il faut supprimer les tros premiers caractères.
+     If len([L]TAG25_2)>10
+      [L]TAG25_2 = right$([L]TAG25_2,4)
+     Endif
+
+     # Compte bancaire est sur 10 caractères... ajout de "0" en début de zone.
+     If len([L]TAG25_2)<10
+      For I=len([L]TAG25_2)+1 To 10
+       [L]TAG25_2 ="0"+[L]TAG25_2
+      Next
+     Endif 
+
+     # Recherche du RIB dans le ficher BANK
+     Filter [F:BAN] Where BIDNUM=[F:ABN]BAN+[L]TAG25_2
+     Read [BAN]First
+     If fstat
+      # Rib du relevé inexistant dans fichier BANK
+      If [L]TRC=2 : Call ECR_TRACE(mess(5,120,1)-[F:RLT]REFBAN-"(Tag25)",1) From GESECRAN   : Endif
+      [L]OK =0
+     Endif
+    Endif
+     
+    If [L]OK
+     [F:RLT]BAN    = [F:BAN]BAN
+     [F:RLT]FCY    = [F:BAN]FCY
+     [F:RLT]CPY    = [F:BAN]CPY
+
+     If [F:BAN]FCY<>""
+      Call NUMERO(COMPTREG,[F:BAN]FCY,datesyst,"",[F:RLT]FILNUM,STAT) From SUBANM
+     Else
+      Read [CPY]CPY0 = [F:BAN]CPY
+      Call NUMERO(COMPTREG,[F:CPY]MAIFCY,datesyst,"",[F:RLT]FILNUM,STAT) From SUBANM
+     Endif
+
+     If STAT
+      # Problème lors de la récupération du compteur
+      Gosub MESSAGE From SUBANM
+      If [L]TRC=2 : Call ECR_TRACE(mess(104,117,1)-"("+COMPTREG+") : "-MESSA,1) From GESECRAN  : Endif
+      [L]OK = 0  
+     Endif
+
+     Raz [L]LIN
+     [L]INDIC = [L]RECTYP(2)
+    Endif
+
+   Else  
+    If [L]INDIC="" : 
+     # Pas d'enregistrement émetteur  
+     If [L]TRC=2 : Call ECR_TRACE(mess(161,117,1),1) From GESECRAN   : Endif
+    Else
+     # Struture de lignes incorrect
+     If [L]TRC=2 : Call ECR_TRACE(mess(15,173,1),1) From GESECRAN  : Endif
+    Endif 
+    [L]OK=0 
+   Endif
+
+  When [L]RECTYP(3)                  :  # Séquence (Tag 28)
+   If find([L]INDIC,[L]RECTYP(2))  :# OK 
+
+    [F:RLT]SEQNUM  = mid$([L]FILLER,6,11)
+    [L]INDIC  = [L]RECTYP(3)
+
+    If [L]TRC=2
+     Read [RLT2]RLT3 = [F:RLT]BAN;[F:RLT]TRFNUM;[F:RLT]SEQNUM
+     If !fstat
+       # Cet enregistrement existe déjà
+      Call ECR_TRACE(mess(197,133,1)-[F:RLT]SEQNUM,0) From GESECRAN
+     Endif
+    Endif
+  
+   Else 
+    If [L]INDIC="" : 
+     # Pas d'enregistrement émetteur  
+     If [L]TRC=2 : Call ECR_TRACE(mess(161,117,1),1) From GESECRAN   : Endif
+    Else
+     # Struture de lignes incorrect
+     If [L]TRC=2 : Call ECR_TRACE(mess(15,173,1),1) From GESECRAN  : Endif
+    Endif 
+    [L]OK=0 
+   Endif
+
+  When [L]RECTYP(4)                 :  # Devise & Solde (Tag 60)
+   If find([L]INDIC,[L]RECTYP(3)) 
+    
+    [L]CUR= vireblc(mid$([L]FILLER,13,3),2)
+    Call LECTURE("TCU",[L]CUR,"") From CONTOBJ
+    If fstat
+     # Devise inexistante
+     If [L]TRC=2 : Call ECR_TRACE(mess(151,105,1),1) From GESECRAN   : Endif
+     [L]OK=0
+#    Elsif [L]CUR<>[F:BAN]CUR
+     # Devise incompatible
+#     If [L]TRC=2 : Call ECR_TRACE(mess(90,103,1)-[L]CUR,1) From GESECRAN   : Endif
+#     [L]OK=0
+    Endif
+    [F:RLT]CUR =[L]CUR
+    [L]INDIC = [L]RECTYP(4)
+
+    # Enregistrement de l'en-tête
+    If [L]OK
+     [F:RLT]CREUSR = GUSER
+     [F:RLT]CREDAT = date$
+     [F:RLT]CRETIM = time
+     Write [RLT]
+     If fstat
+      GOK=0 : Call FSTA("RLT") From GLOCK : [L]OK=0 : Break
+     Endif
+    Endif
+
+   Else 
+    If [L]INDIC="" : 
+     # Pas d'enregistrement émetteur  
+     If [L]TRC=2 : Call ECR_TRACE(mess(161,117,1),1) From GESECRAN   : Endif
+    Else
+     # Struture de lignes incorrect
+     If [L]TRC=2 : Call ECR_TRACE(mess(15,173,1),1) From GESECRAN  : Endif
+    Endif 
+    [L]OK=0 
+   Endif
+
+  When [L]RECTYP(5)                :     # Ligne => Sns & Mnt (Tag 61)
+
+   If find([L]INDIC,[L]RECTYP(5))  
+    # Il n'y a pas eu de tag 86...
+    Gosub WRITE_FIC
+    If ![L]OK  : Break : Endif
+    [L]INDIC = [L]RECTYP(4)
+   Endif
+
+   If find([L]INDIC,[L]RECTYP(4))  
+
+    # Si Tag 61, Lecture de l'ensemble du tag.
+    Gosub LECT61
+    [L]OKLEC = 0 
+    
+    Raz [RLD]
+    [F:RLD]FILNUM = [F:RLT]FILNUM
+    [F:RLD]TRFNUM = [F:RLT]TRFNUM
+    [F:RLD]SEQNUM = [F:RLT]SEQNUM
+    [F:RLD]BAN    = [F:RLT]BAN
+    [F:RLD]CUR    = [F:RLT]CUR
+    [F:RLD]CPY    = [F:RLT]CPY
+
+    [L]LIN+=1
+    [F:RLD]LIN = [L]LIN
+
+    [L]ZONE= mid$([L]TAG61,5,6)
+    [F:RLD]VALDAT = gdat$(val(mid$([L]ZONE,5,2)),val(mid$([L]ZONE,3,2)),val(left$([L]ZONE,2)))
+
+    # La date sur 4 caratères est facultative...
+    # Evaluation de l'indice 11 : 
+    [L]ZONE = mid$([L]TAG61,11,1)
+    If ascii([L]ZONE)>47 and ascii([L]ZONE)<58  # L'indice 11 est un chiffre
+     [L]IND=15
+    Else
+     [L]IND=11
+    Endif
+
+    # Sens : "C", "D", "RC" ou "RD"... à récupérer (ascii de 0 = 48 & ascii de 9 = 57)
+    # Mais également "Dx" ou "Cx" (récupère que le 1er caractère)
+    [L]ZONE = mid$([L]TAG61,[L]IND,1)
+    If [L]ZONE = "R"
+     [F:RLD]SNS = mid$([L]TAG61,[L]IND,2) : [L]IND+=2
+    Else
+     [F:RLD]SNS = mid$([L]TAG61,[L]IND,1) : [L]IND+=1
+    Endif
+
+    # Montant sur maximum 15 indices... (la virgule est ascii de 44 et le point est ascii de 46)
+    Raz MNT
+    For I=1 To 16
+     [L]ZONE = mid$([L]TAG61,[L]IND,1)
+     If (ascii([L]ZONE)>47 and ascii([L]ZONE)<58)
+      [L]MNT += mid$([L]TAG61,[L]IND,1)
+     Elsif ascii([L]ZONE)=44 or ascii([L]ZONE)=46
+      [L]MNT += "."
+     Elsif len([L]MNT)>0
+      Break
+     Endif
+     [L]IND+=1
+    Next
+    [F:RLD]AMTCUR = val([L]MNT)
+
+    [L]INDIC = [L]RECTYP(5)
+
+   Else
+    If [L]INDIC="" 
+     # Pas d'enregistrement émetteur 
+     If [L]TRC=2 : Call ECR_TRACE(mess(161,117,1),1) From GESECRAN  : Endif
+    Else
+     # Struture de lignes incorrect
+     If [L]TRC=2 : Call ECR_TRACE(mess(15,173,1),1) From GESECRAN  : Endif
+    Endif 
+    [L]OK=0 
+   Endif
+
+  When [L]RECTYP(6)              :   #  Ligne détail (Tag 86)
+
+   If find([L]INDIC,[L]RECTYP(5))  :# OK 
+    # Si Tag 86, Lecture de l'ensemble du tag.
+    Gosub LECT86
+    [L]OKLEC = 0 
+
+    For K=1 To [L]NB86  
+     Case left$([L]TAG86(K),3)
+      When "?00" : [F:RLD]DES        = right$([L]TAG86(K),4)
+      When "?10" : 
+      When "?20" : [F:RLD]FREREF(0)  = right$([L]TAG86(K),4)
+      When "?21" : [F:RLD]FREREF(1)  = right$([L]TAG86(K),4)
+      When "?22" : [F:RLD]FREREF(2)  = right$([L]TAG86(K),4)
+      When "?23" : [F:RLD]FREREF(3)  = right$([L]TAG86(K),4)
+      When "?24" : [F:RLD]FREREF(4)  = right$([L]TAG86(K),4)
+      When "?25" : [F:RLD]FREREF(5)  = right$([L]TAG86(K),4)
+      When "?26" : [F:RLD]FREREF(6)  = right$([L]TAG86(K),4)
+      When "?27" : [F:RLD]FREREF(7)  = right$([L]TAG86(K),4)
+      When "?28" : [F:RLD]FREREF(8)  = right$([L]TAG86(K),4)
+      When "?29" : [F:RLD]FREREF(9)  = right$([L]TAG86(K),4)
+      When "?30" : [F:RLD]BPRREF(0)  = right$([L]TAG86(K),4)
+      When "?31" : [F:RLD]BPRREF(1)  = right$([L]TAG86(K),4)
+      When "?32" : [F:RLD]BPRREF(2)  = right$([L]TAG86(K),4)
+      When "?33" : [F:RLD]BPRREF(3)  = right$([L]TAG86(K),4)
+      When "?34" :
+      When "?60" : 
+      When "?61" : 
+      When "?62" : 
+      When "?63" : 
+      When Default
+     Endcase
+    Next
+
+    # Recherche Code Tiers X3 via son RIB
+    # Prise en compte des éléments :
+    #   - "?30" : comme la 1er partie du tag 25... peut être de 2 natures différentes : soit le BIC soit le Code Banque
+    #   Sous X3, la table ABANK des "banque/guichet" liste les codes BIC pour un Pays + Code banque
+    #
+    #   ------------ 17/07/2008 : cette zone est un Code Banque -------------------------------------------------
+    #
+    #   - "?31" : compte bancaire
+    # 
+
+    # Recherche RIB => Code Tiers X3
+    [L]OK = 1
+    # Si Code Banque, récupération du code BIC
+    #Read [F:ABN]ABN0 = "DE";[F:RLD]BPRREF(0)
+    #If fstat
+     # Si Code BIC, récupération du code Banque
+     #Filter [ABN] Where CRY="DE" and BIC=[F:RLD]BPRREF(0)
+     # Banque/guichet inexistants
+     # If [L]TRC=2 : Call ECR_TRACE(mess(173,133,1)-[F:RLD]BPRREF(0)-"(Tag86)",1) From GESECRAN   : Endif
+     # [L]OK =0
+     #Endif
+    #Endif
+    # Réconstitution du BID (=RIB) : Code Banque + N°Compte
+    #If [L]OK
+    #Filter [F:BID] Where BPATYP=1& BIDNUM=[F:ABN]BAN+[F:RLD]BPRREF(1)
+ 
+    Filter [F:BID] Where BPATYP=1& BIDNUM=[F:RLD]BPRREF(0)+[F:RLD]BPRREF(1)
+    Read [BID]First
+    If !fstat 
+     [F:RLD]BPRPAY = [F:BID]BPANUM
+     [F:RLD]BIDNUM = [F:BID]BIDNUM
+    Else
+     # Rib du relevé inexistant dans fichier BID
+     If [L]TRC=2 : Call ECR_TRACE(left$(mess(5,120,1),38)-"BID"-[F:RLD]BPRREF(0)+[F:RLD]BPRREF(1)-"(Tag86)",-1) From GESECRAN   : Endif
+    Endif
+
+    If [L]OK
+     Gosub WRITE_FIC
+     If ![L]OK  : Break : Endif
+     [L]INDIC = [L]RECTYP(4)
+    Endif
+
+   Else
+
+     If [L]INDIC="" 
+      # Pas d'enregistrement émetteur 
+      If [L]TRC=2 : Call ECR_TRACE(mess(161,117,1),1) From GESECRAN  : Endif
+     Else
+      # Struture de lignes incorrect
+      If [L]TRC=2 : Call ECR_TRACE(mess(15,173,1),1) From GESECRAN  : Endif
+     Endif 
+     [L]OK=0 
+    Endif
+
+  When [L]RECTYP(7),[L]RECTYP(8),[L]RECTYP(9)          :     # Ligne Total (Tag 62,64,65)
+    
+   If [L]INDIC="" 
+    # Pas d'enregistrement émetteur 
+    If [L]TRC=2 : Call ECR_TRACE(mess(161,117,1),1) From GESECRAN  : Endif : OK=0 : Break
+   Elsif !find([L]INDIC,[L]RECTYP(4),[L]RECTYP(5))
+    # Struture de lignes incorrect
+    If [L]TRC=2 : Call ECR_TRACE(mess(15,173,1),1) From GESECRAN  : Endif : OK=0 : Break
+   Endif 
+
+  When Default 
+   # Code enregistrement inexistant
+   If [L]TRC=2 : Call ECR_TRACE(mess(170,117,1)-left$([L]FILLER,4),1) From GESECRAN : Endif
+   [L]OK=0
+ Endcase
+
+ If ![L]OK : Break : Endif
+ If [L]OKLEC : Gosub LECTURE : Endif
+
+Wend
+
+If ![L]NBENR or ![L]OK
+ OK=0
+ # Fichier non importé
+ If [L]TRC=2 : Call ECR_TRACE(mess(14,173,1),1) From GESECRAN : Endif
+ Rollback
+Else
+ If [L]TRC=2 
+  # Fichier importé
+  Call ECR_TRACE(mess(13,173,1),0) From GESECRAN
+  # Enregistrements crées
+  Call ECR_TRACE(num$([L]NBENR)-mess(103,141,1),0) From GESECRAN
+ Endif
+ Commit
+Endif
+End
+
+$WRITE_FIC
+# Enregistrement de détail
+If [L]OK
+ [L]NBENR+=1
+ Write [RLD]
+ If fstat
+  GOK=0 : Call FSTA("RLD") From GLOCK : [L]OK=0
+ Endif
+Endif
+Return
+
+
+$LECTURE
+Raz FILLER 
+
+# Caractères pourris du début ou caractère "-" à la fin : code ascii(45)
+Gosub LECTEST
+While !fstat & (ascii(CTEST)<32 or ascii(CTEST)=45)
+ Gosub LECTEST
+Wend
+
+#While ascii(CTEST)>31 & ascii(CTEST)<90 & !fstat
+While ascii(CTEST)>31 & !fstat
+
+ FILLER += CTEST
+ Gosub LECTEST
+Wend
+
+# Fin de fichier
+If mid$(FILLER,len(FILLER),1)="" : fstat = 4 : Endif
+Return
+
+$LECTEST
+Getseq 1, CTEST
+Return
+
+
+$LECT86
+    
+# FILLER contient la première ligne.
+Raz [L]NB86, TAG86
+
+While left$([L]FILLER,3)<>":62" and left$([L]FILLER,3)<>":61"
+
+ For I=1 To len(FILLER)
+  If mid$(FILLER,I,1)="?"
+   [L]NB86+=1
+   If [L]NB86>dim(TAG86) : Break : Endif
+  Endif
+  TAG86([L]NB86) += mid$(FILLER,I,1)
+ Next 
+
+ Gosub LECTURE
+ If mid$(FILLER,len(FILLER),1)="" : Break : Endif
+Wend
+Return
+
+
+$LECT61
+
+# FILLER contient la première ligne.
+Raz [L]NB61, TAG61
+
+While left$([L]FILLER,3)<>":86"
+
+ For I=1 To len(FILLER)
+  If I>dim(TAG61)
+   [L]NB61+=1
+   If [L]NB61>dim(TAG61) : Break : Endif
+  Endif
+  TAG61([L]NB61) += mid$(FILLER,I,1)
+ Next 
+
+ Gosub LECTURE
+ If mid$(FILLER,len(FILLER),1)="" : Break : Endif
+Wend
+Return
+
+
+

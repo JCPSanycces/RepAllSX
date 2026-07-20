@@ -1,0 +1,1600 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+################################################################################
+#    SOUS-PROGRAMME DE GESTION DE LA TABLE DES FLUX
+#    GLE
+#    Création le : 30/08/2007
+#    Modification le : --/--/----
+#-------------------------------------------------------------------------------
+#    Modification
+# MDJ - 20.04.2017 122072    X3-33122-Flux incorrects si bien déprécié et sorti
+#    GLE - 30.06.2015 FQ108383: Correction dans un des critères permettant de savoir si un flux période doit être généré pour le bien
+#    GLE - 19.01.2014 FQ105454: Problème de récupération du site financier à date
+#    MDJ - 28.11.2013 FQ92637 : Génération flux périodes cumulées : uniquement  pour les états FAS2054 et FAS2055
+#    GLE - 04.07.2013 FQ91058 : Message pour signaler une erreur de lecture sur les DEPREC
+#    GLE - 07.01.2013 FQ85936 : Réévaluation fin d'exercice par coefficients
+#    GLE - 19.09.2012 FQ79819 : Réévaluation fin d'exercice par valeur marché
+#    CBO - 10.05.2012 FQ82075 : Linéaire espagnol jour
+#    GLE - 16.02.2012 FQ75615 : Flux IAS
+#    GLE - 19.07.2011 FQ75129 : Gestion correcte des mouvements dans la période de création du bien
+#    GLE - 02.02.2011 FQ71294 : Erreur "[F:FLU] : Classe inexistante" lors de la clôture
+#    GLE - 20.01.2011 FQ68038 : Gestion de l'actualisation de la base dans la première période de vie des biens repris
+#    GLE - 13.01.2011 FQ70743 : Correction du cas "annulation d'une sortie ayant eu lieu dans la période immédiatement précédente"
+#    GLE - 10.12.2010 FQ69885 : On supprime tous les flux des biens dont le type de détention est "Annulé"
+#    GLE - 06.12.2010 FQ69641 : Les immobilisations issus d'une CIG doivent figurer en acquisition ou augmentation de l'exercice dans lequel se fait la CIG
+#                               Prise en compte des cumuls d'amortissement début de période et début d'exercice lors des reprises
+#    GLE - 15.11.2010 FQ66894 : Optimisation
+#    GLE - 18.03.2010 FQ63381 : le montant de réévaluation RVAAMT ne doit pas être intégré dans le calcul de la valeur bilan fin de période / exercice
+#    GLE - 18.03.2010 FQ63390 : mauvaise alimentation du compte GAC du flux exercice
+#    GLE - 02.02.2010 FQ60745 : ajout du type de détention pour filtrage dans les 2054/2055
+#    GLE - 20.11.2009 FQ60202 : les flux n'étaient pas générés pour les plans avec origine base amortissement "à saisir"
+#    GLE - 08.10.2009 FQ58522 : optimisation du traitement
+################################################################################
+Local Char VALBOUT(30)
+Local Char PARBOUT(250)(1..10)
+VALBOUT = "12"
+Call TRAITE_CHAR(VALBOUT,PARBOUT,"","FASFLXM","DFASCLO",3, "") From GTRAITE
+End
+########################################
+
+# FQ66894
+#**
+#* Génération de tous les flux d'un bien comptable de l'exercice courant
+#*
+#* @param PCPY   : société
+#* @param PFAS   : référence du bien
+#* @param PSTA   : Statut provisoire (GVML_TXSPRO) ou définitif (GVML_TXSDEF)
+#* @param RERROR : code retour (0 = OK)
+#*!
+Subprog GEN_FLUX_BIEN (PCPY, PFAS, PSTA, RERROR)
+Value    Char    PCPY
+Value    Char    PFAS
+Value    Integer PSTA
+Variable Integer RERROR
+
+  Local Shortint N_PLAN
+  Local Shortint TRANSAC
+
+  If !clalev([F:CNX]) : Local File CONTEXT  [CNX] : Endif
+  If !clalev([F:FIS]) : Local File FISCYEAR [FIS] : Endif
+  If !clalev([F:DEP]) : Local File DEPREC   [DEP] : Endif
+
+  If !adxlog : Trbegin [F:FAS] : TRANSAC = 1 : Endif
+
+  For [CNX]CNX0 Where CPY = PCPY
+    Read [F:FIS]FIY1=[F:CNX]CPY;[F:CNX]CNX;GVML_TECOURA
+    For N_PLAN = 1 To [F:CNX]NBPLC
+      Read [F:DEP]DEP0=PFAS;[F:CNX]PLNCAA(N_PLAN-1);[F:FIS]DATENDFIY;[F:FIS]DATENDPER([F:FIS]INDCURPER-1)
+      If fstat : # FQ91058
+        RERROR = -12 : # Erreur en lecture de l'enregistrement d'amortissement
+        Break
+      Endif
+      If [F:CNX]FLUTRATXS(N_PLAN-1) <> ""
+        Call GENERE_FLUX([F:CNX]PLNCAA(N_PLAN-1), GML_TFPLIASS, [F:CNX]FLUTRATXS(N_PLAN-1), PSTA, RERROR)
+        If RERROR : Break : Endif
+      Endif
+      If [F:CNX]FLUTRAACC(N_PLAN-1) = G_OUI
+        Call GENERE_FLUX([F:CNX]PLNCAA(N_PLAN-1), GML_TFCOMPTE, "", PSTA, RERROR)
+        If RERROR : Break : Endif
+      Endif
+    Next
+    Call MAJFLGCNXFLX("[F:FAS]","[F:CNX]",[F:CNX]CNX,num$(GVML_FLXGENE)) From TRTFAS
+  Next
+
+  Rewrite [F:FAS] Curr
+
+  If TRANSAC
+    If !RERROR
+      Commit
+    Else
+      Rollback
+    Endif
+  Endif
+End
+
+########################################
+# GENERE_FLUX
+#
+# Création des flux périodes et du flux exercice à partir de la période courante
+# La classe [F:FAS] doit être ouvertes sur le bien et le plan courant
+# Les classes [F:CNX] et [F:FIS] doivent être ouvertes sur le contexte courant
+#
+# Cinématique du sous-programme :
+#   1- boucle sur chaque période jusqu'à la fin de l'exercice
+#   2- génération du flux exercice
+########################################
+Subprog GENERE_FLUX (PPLN, PTYP, PFLUTRATXS, PSTA, RERROR)
+Value    Integer PPLN         : # Numéro du plan
+Value    Integer PTYP         : # Type de flux à générer, liasse (GML_TFPLIASS) ou compte (GML_TFCOMPTE)
+Value    Char    PFLUTRATXS() : # Code liasse si flux liasse
+Value    Integer PSTA         : # Statut provisoire (GVML_TXSPRO) ou définitif (GVML_TXSDEF)
+Variable Integer RERROR       : # Code erreur en retour, à exploiter avec la fonction GERE_MSG_ERREUR_FLUX
+                                # =0 : OK
+                                # <0 : Erreur
+
+Local Integer CURPER
+
+  #-------------
+  # DECLARATIONS
+  #-------------
+  If !clalev([F:FLU])  : Local File FXDLIFL    [FLU]  : Endif
+  If !clalev([F:FLUP]) : Local File FXDLIFL    [FLUP] : Endif : # FQ58522
+  If !clalev([F:DEPF]) : Local File DEPREC     [DEPF] : Endif : # Plans d'amortissements pour les flux
+  If !clalev([F:DEPP]) : Local File DEPREC     [DEPP] : Endif : # Plans d'amortissements période précédente FQ58522
+  If !clalev([F:DEP9]) : Local File DEPREC     [DEP9] : Endif : # Plan de subvention FQ75615
+  If !clalev([F:E28])  : Local File EFASREEVAL [E28]  : Endif : # FQ75615
+  If !clalev([F:DEPN]) : Local File DEPREC     [DEPN] : Endif : # Plans d'amortissements période suivante FQ85936
+
+  #------------------------
+  # EXCLUSION DU TRAITEMENT
+  #------------------------
+  # On ne traite pas les biens sortis dans un exercice antérieur
+  If [F:FAS]ISSDAT<>[0/0/0] and [F:FAS]EXTISSFLG=G_NON and [F:FAS]ISSDAT<[F:FIS]DATSTRFIY
+    End
+  Endif
+
+  #-----------------------
+  # SAUVEGARDE DES CLASSES
+  #-----------------------
+  [F:DEPF] = [F:DEP]
+
+  #--------------------------------------------
+  # SUPPRESSION DES FLUX COURANTS DE L'EXERCICE
+  #--------------------------------------------
+  If [F:FAS]OWNTYP = GVML_TDANNUL : # FQ69885 : On supprime tous les flux des biens annulés
+    Delete [FLU] Where AASREF=[F:FAS]AASREF and DPRPLN=[F:DEPF]DPRPLN and TYP=PTYP and FIYSTRDAT=[F:DEPF]FIYSTRDAT
+  Else
+    Delete [FLU] Where AASREF=[F:FAS]AASREF and DPRPLN=[F:DEPF]DPRPLN and TYP=PTYP and FIYSTRDAT=[F:DEPF]FIYSTRDAT and FLGSTATXS=GVML_TXSPRO
+  Endif
+
+  #----------------------
+  # FLUX PERIODE COURANTE
+  #----------------------
+  Raz [F:FLUP], [F:DEPP], [F:DEP9] : # FQ58522
+
+  Call GENERE_FLUX_PERIODE (PTYP, PFLUTRATXS, PSTA, RERROR)
+  If RERROR < 0 : End : Endif
+
+  #------------------------
+  # FLUX PERIODES SUIVANTES
+  #------------------------
+
+  For CURPER = [F:FIS]INDCURPER+1 To [F:FIS]NBRPER
+    # Sauvegarde du DEPREC courant qui devient le DEPREC précédent FQ58522
+    [F:DEPP]=[F:DEPF]
+    # Lecture du DEPREC de la période
+    Read [F:DEPF]DEP0=[F:FAS]AASREF;PPLN;[F:FIS]DATENDFIY;[F:FIS]DATENDPER(CURPER-1)
+    If fstat : # FQ91058
+      RERROR = -12 : # Erreur en lecture de l'enregistrement d'amortissement
+      Break
+    Endif
+    # Lecture du DEPREC de la période du plan de subvention FQ75615
+    If find(G301SUB,[F:CNX]PLNCAA)
+      If PPLN = G301SUB
+        [F:DEP9] = [F:DEPF]
+      Else
+        Read [F:DEP9]DEP0=[F:FAS]AASREF;G301SUB;[F:FIS]DATENDFIY;[F:FIS]DATENDPER(CURPER-1)
+        If fstat : Raz [F:DEP9] : Endif
+      Endif
+    Endif
+    #
+    Call GENERE_FLUX_PERIODE (PTYP, PFLUTRATXS, GVML_TXSPRO, RERROR)
+    If RERROR < 0 : Break : Endif
+  Next
+  If RERROR < 0 : End : Endif : # FQ91058
+
+  #--------------
+  # FLUX EXERCICE
+  #--------------
+
+  # ici, la classe [F:DEPF] est sur le dernier DEPREC de l'exercice
+  #*FQ92637   Call GENERE_FLUX_EXERCICE (PTYP, PSTA, RERROR)
+  Call GENERE_FLUX_EXERCICE (PTYP, PSTA, 0, 0,  RERROR)
+  If RERROR < 0 : End : Endif
+
+  #-------------
+  # FERMETURE DES CLASSES
+  #-------------
+  #If clalev([F:FLU])  : Close File [FLU]  : Endif : # FQ71294 : il ne faut pas fermer cette classe car GLOCLOT s'en sert
+  If clalev([F:FLUP]) : Close File [FLUP] : Endif
+  If clalev([F:DEPF]) : Close File [DEPF] : Endif
+  If clalev([F:DEPP]) : Close File [DEPP] : Endif
+  If clalev([F:E28])  : Close File [E28]  : Endif : # FQ75615
+  If clalev([F:DEPN]) : Close File [DEPN] : Endif : # FQ85936
+End
+
+########################################
+# GENERE_FLUX_PERIODE
+#
+# Création du flux période pour la période courante
+# Les classes [F:FAS] et [F:DEPF] doivent être ouvertes sur le bien et le plan courant
+# Les classes [F:CNX] et [F:FIS] doivent être ouvertes sur le contexte courant
+#
+# Cinématique du sous-programme :
+#   1- suppression de l'enregistrement période
+#   2- récupération du flux période précédant ou initialisation
+#   3- détermination des valeurs début de période
+#   4- transfert éventuel
+#   5- détermination des valeurs fin de période
+#   6- enregistrement
+########################################
+Subprog GENERE_FLUX_PERIODE (PTYP, PFLUTRATXS, PSTA, RERROR)
+Value    Integer PTYP         : # Type de flux à générer, liasse (GML_TFPLIASS) ou compte (GML_TFCOMPTE)
+Value    Char    PFLUTRATXS() : # Code liasse si flux liasse
+Value    Integer PSTA         : # Statut provisoire (GVML_TXSPRO) ou définitif (GVML_TXSDEF)
+Variable Integer RERROR       : # Code erreur en retour, à exploiter avec la fonction GERE_MSG_ERREUR_FLUX
+                                # =0 : OK
+                                # <0 : Erreur
+
+# Variables locales
+Local Char     LTXSCAT(15) : # Compte si flux compte ou liasse si flux liasse
+Local Char     LTXSCLA(2)  : # Classe de flux liasse (incorporel, corporel, en cours)
+Local Char     CODTXS(5)   : # Code du flux liasse
+Local Decimal  LBSEVAL     : # Valeur bilan initiale début de période
+Local Decimal  LDPRBAS     : # Valeur bilan réévaluée début de période
+Local Char     LFCY        : # Site financier du bien dans la période de génération du flux
+Local Integer  LORIBASDPR  : # Origine base d'amortissement
+Local Char     COA(3)      : # Plan de compte du plan d'amortissement
+
+# Indicateurs
+Local Shortint INDIC_INIT  : # Indique si le flux période doit être initialisé (pas de flux précédent)
+Local Shortint INDIC_ACTU  : # Indique s'il y a une actualisation dans la période
+
+  RERROR = 0
+
+  #---------------------
+  # OUVERTURE DES TABLES
+  #---------------------
+
+  If clalev([F:PFL])   = 0 : Local File PARFLUX             [PFL]   : Endif : # Paramétrage des flux (entête)
+  If clalev([F:PFD])   = 0 : Local File PARFLUXDET          [PFD]   : Endif : # Paramétrage des flux (détail)
+  If clalev([F:FLUP])  = 0 : Local File FXDLIFL             [FLUP]  : Endif : # Flux période courante
+  If clalev([F:DEPP])  = 0 : Local File DEPREC              [DEPP]  : Endif : # Plans d'amortissements secondaire
+  If clalev([F:GAC])   = 0 : Local File =GTABCPT+"GACCOUNT" [GAC]   : Endif : # Tables des comptes généraux
+  If clalev([F:DEFI])  = 0 : Local File DEPREC              [DEFI]  : Endif : # Plans d'amortissements plan fiscal FQ58522
+
+  #------------------------------------------------------------------
+  # DETERMINATION DES CAS NE DONNANT PAS LIEU A LA GENERATION DE FLUX
+  #------------------------------------------------------------------
+
+  # Pas de flux pour les biens dont le type de détention est Annulé ou En modèle FQ60745
+  If ([F:FAS]OWNTYP = GVML_TDANNUL) or ([F:FAS]OWNTYP = GVML_TDMODEL) : End : Endif
+
+  # Pas de flux pour les biens dont la nature n'est pas "En cours" ou "En service"
+  [L]LORIBASDPR = [F:CNX]ORIBASDPR(find([F:DEPF]DPRPLN,[F:CNX]PLNCAA)-1)
+
+  # FQ60202 : ajout du cas "A saisir"
+  If  !(([L]LORIBASDPR=GVML_OBPCG and ([F:FAS]GACACN=GVML_NIENCOU or [F:FAS]GACACN=GVML_NIENSER))
+&   or  ([L]LORIBASDPR=GVML_OBIAS and ([F:FAS]IASACN=GVML_NIENCOU or [F:FAS]IASACN=GVML_NIENSER))
+&   or  ([L]LORIBASDPR=GVML_OBSAI and ([F:FAS]GACACN=GVML_NIENCOU or [F:FAS]GACACN=GVML_NIENSER))) Then
+    End
+  Endif
+
+  # Pas de flux pour les biens sortis dans une période antérieure à la période courante et dont la sortie
+  # n'a pas été faite dans la période courante
+  If  [F:FAS]ISSDAT<>[0/0/0] and [F:FAS]EXTISSFLG=G_NON and [F:FAS]ISSDAT<[F:DEPF]PERSTRDAT
+& and [F:DEPF]FLGUPDISS <> G_OUI Then
+    End
+  Endif
+
+  # Pas de flux pour les biens saisis en prévisionnel
+  # FQ108383 : prise en compte de la présence d'un cumul d'amortissement fin de période
+  #            pour le test relatif à STRDPRDAT
+  #If ([F:FAS]AASIPTDAT > [F:DEPF]PERENDDAT) and ([F:DEPF]STRDPRDAT > [F:DEPF]PERENDDAT) Then
+  If  (([F:FAS]AASIPTDAT  > [F:DEPF]PERENDDAT)
+& and (([F:DEPF]STRDPRDAT > [F:DEPF]PERENDDAT) or ([F:DEPF]DPRCUM+[F:DEPF]PERCLOCUM+[F:DEPF]PERENDDPE = 0)))
+    End
+  Endif
+
+  # Pas de flux pour les biens issus d'une CIG prévisionnelle FQ69641
+  If (find([F:FAS]ETRNAT,GVML_NEAPPOR,GVML_NEFUSIO,GVML_NESCISS,GVML_NEVTEIG) <> 0) and ([F:FAS]GRUEFFDAT > [F:DEPF]PERENDDAT) Then
+    End
+  Endif
+
+  If find(G301SUB,[F:CNX]PLNCAA) : # FQ75615
+    If [F:DEPF]DPRPLN = G301SUB
+      [F:DEP9] = [F:DEPF]
+    Else
+      Read [F:DEP9]DEP0=[F:FAS]AASREF;G301SUB;[F:DEPF]FIYENDDAT;[F:DEPF]PERENDDAT
+      If fstat : Raz [F:DEP9] : Endif
+    Endif
+  Endif
+
+  #----------------------------------------------
+  # RECHERCHE D'UNE ACTUALISATION DANS LA PERIODE
+  #----------------------------------------------
+  # La recherche est faite très tôt car on doit avoir les valeurs avant actualisation pour initialiser
+  # le flux période
+
+  LBSEVAL    = [F:DEPF]BSEVAL
+  LDPRBAS    = [F:DEPF]DPRBAS
+  INDIC_ACTU = G_NON
+
+  # FQ58522
+  If [F:DEPP]AASREF=""
+    # On lit le DEPREC précédent dans [DEPP] pour constater une augmentation ou une diminution de la base d'amortissement.
+    If [F:DEPF]PERSTRDAT=[F:DEPF]FIYSTRDAT
+      Read [DEPP]DEP0=[F:DEPF]AASREF;[F:DEPF]DPRPLN;[F:DEPF]FIYSTRDAT-1;[F:DEPF]PERSTRDAT-1
+    Else
+      Read [DEPP]DEP0=[F:DEPF]AASREF;[F:DEPF]DPRPLN;[F:DEPF]FIYENDDAT;[F:DEPF]PERSTRDAT-1
+    Endif
+  Else
+    fstat = 0
+  Endif
+
+  If !fstat
+    If [F:DEPF]DPRBAS <> [F:DEPP]DPRBAS
+      # On constate une variation, on stocke les bases avant actualisation
+      LBSEVAL     = [F:DEPP]BSEVAL
+      LDPRBAS     = [F:DEPP]DPRBAS
+      INDIC_ACTU  = G_OUI
+
+      # FQ79819 : Cas particulier de la réévaluation fin d'exercice. On a déjà constaté la variation
+      #           sur le dernier flux de l'exercice précédent
+      If ([F:DEPP]RVATIADAT = GVML_ERENDEX)
+        LDPRBAS += func TRTFLUX.CUMUL_REEVAL([F:DEPP]AASREF, [F:DEPP]DPRPLN, [F:DEPP]PERSTRDAT, [F:DEPP]PERENDDAT)
+      Endif
+    Endif
+  Else
+    # FQ75129
+    # Pour traiter correctement les variations de base et les transferts dans la première période de vie
+    # d'un bien repris dans l'application, on essaye de lire un flux précédent spécial généré lors de la création du bien
+    Filter [F:FLUP] Where PERENDDAT=[F:DEPF]PERSTRDAT-1 and FLGSTATXS = GVML_TXSNON
+    Read [FLUP]FLU0(3)=[F:FAS]AASREF;[F:DEPF]DPRPLN;PTYP
+    Filter
+    If !fstat and [F:DEPF]DPRBAS <> [F:FLUP]DPRBASEND
+      # On constate une variation, on stocke les bases avant actualisation
+      LBSEVAL     = [F:FLUP]BSEVALEND
+      LDPRBAS     = [F:FLUP]DPRBASEND
+      INDIC_ACTU  = G_OUI
+    Endif
+    # FIN FQ75129
+  Endif
+
+  #-----------------------------------------
+  # INITIALISATION DE LA CATEGORIE/DU COMPTE
+  #-----------------------------------------
+  # FQ58522
+  # FQ60202 : ajout du cas "A saisir"
+  If ([L]LORIBASDPR = GVML_OBPCG and [F:GAC]ACC<>[F:FAS]GAC)
+& or ([L]LORIBASDPR = GVML_OBIAS and [F:GAC]ACC<>[F:FAS]IASACC)
+& or ([L]LORIBASDPR = GVML_OBSAI and [F:GAC]ACC<>[F:FAS]GAC) Then
+    If [L]LORIBASDPR = GVML_OBPCG or [L]LORIBASDPR = GVML_OBSAI Then
+      [L]COA = [M:FPC]COA([M:FPC]GENLEDTYP-1)
+      Read[GAC]GAC0=[L]COA;[F:FAS]GAC
+    Else
+      [L]COA = [M:FPC]COA([M:FPC]IASLEDTYP-1)
+      Read[GAC]GAC0=[L]COA;[F:FAS]IASACC
+    Endif
+    If fstat Then
+      RERROR = -6 : # Compte inexistant !
+     End
+    Endif
+  Endif
+
+  If PTYP = GML_TFPLIASS Then
+    # Poste de liasse
+    # FQ58522
+    If !([F:PFD]CODTXS=PFLUTRATXS and [F:PFD]GAC=[F:GAC]ACC)
+      Read[PFD]PFD1=PFLUTRATXS;[L]COA;[F:GAC]ACC
+      If fstat Then
+        RERROR = -8 : # Compte non défini dans le paramétrage des flux par liasse
+        End
+      Else
+        Read[PFL]PFL0=[F:PFD]CODTXS;[F:PFD]COA;[F:PFD]POSTXS
+      Endif
+    Endif
+    LTXSCAT = num$([F:PFD]POSTXS)
+    LTXSCLA = num$([F:PFL]CLATXS)
+    LCODTXS = [F:PFD]CODTXS
+  Elsif PTYP = GML_TFCOMPTE Then
+    # Compte
+    LTXSCAT = [F:GAC]ACC
+    LTXSCLA = ""
+    LCODTXS = ""
+  Endif
+
+  #----------------------------------------------
+  # ALIMENTATION DE LA SITUATION DEBUT DE PERIODE
+  #----------------------------------------------
+
+  INDIC_INIT  = G_NON
+
+  # FQ58522
+  If [F:FLUP]AASREF=""
+    # Recherche du flux de la période précédente pour détecter un changement de compte ou de site
+    Filter [F:FLUP] Where PERENDDAT=[F:DEPF]PERSTRDAT-1 and (TXSCATORI<>"" or FCYORI<>"")
+    Read [FLUP]FLU0(3)=[F:FAS]AASREF;[F:DEPF]DPRPLN;PTYP
+    Filter
+
+    If fstat Then
+      # Pas de transferts sur la période précédente, on cherche le flux hors transferts
+      Filter [F:FLUP] Where PERENDDAT=[F:DEPF]PERSTRDAT-1
+      Read [FLUP]FLU0(3)=[F:FAS]AASREF;[F:DEPF]DPRPLN;PTYP
+      Filter
+
+      If fstat Then
+        # Pas d'enregistrement de flux sur la période précédente, on doit être dans le cas d'une reprise ou d'une
+        # saisie initiale.
+        Raz [F:FLUP]
+
+        [F:FLUP]CPY       = [F:FAS]CPY
+        #[F:FLUP]FCY       = [F:FAS]FCY : # FQ105454 L'initialisation du site doit se faire par rapport à l'imputation du bien
+                                          #          dans la période traitée
+        [F:FLUP]FCY       = func TRTFASTRF.GET_FCY("[F:FAS]",[F:DEPF]PERENDDAT)
+        [F:FLUP]COA       = [L]COA
+        [F:FLUP]AASREF    = [F:FAS]AASREF
+        [F:FLUP]DPRPLN    = [F:DEPF]DPRPLN
+        [F:FLUP]TYP       = PTYP
+        [F:FLUP]TXSCAT    = LTXSCAT
+        [F:FLUP]CODTXS    = LCODTXS
+        [F:FLUP]TXSCLA    = LTXSCLA
+        [F:FLUP]GAC       = [F:GAC]ACC
+
+        INDIC_INIT = G_OUI
+      Endif
+    Endif
+  Endif
+
+  # FQ70743 : Si le flux précédent constatait une sortie et qu'on est ici, c'est que la sortie a été annulée. Il faut
+  #           réinitialiser le flux à partir des DEPREC car les valeurs à fin de période précédente sont fausses, on met
+  #           donc INDIC_INIT à Oui
+  If INDIC_INIT = G_NON & ([F:FLUP]DCRSAL <> 0 or [F:FLUP]DCRDPEOUT <> 0)
+    INDIC_INIT = G_OUI
+    Gosub INIT_ZON_FINPER
+  Endif
+
+  # Initialisation du flux de la période courante
+  #----------------------------------------------
+
+  [F:FLUP]FIYSTRDAT = [F:DEPF]FIYSTRDAT
+  [F:FLUP]FIYENDDAT = [F:DEPF]FIYENDDAT
+  [F:FLUP]PERSTRDAT = [F:DEPF]PERSTRDAT
+  [F:FLUP]PERENDDAT = [F:DEPF]PERENDDAT
+  [F:FLUP]CNX       = [F:DEPF]CNX
+  [F:FLUP]FLGSTATXS = PSTA
+  [F:FLUP]OWNTYP    = [F:FAS]OWNTYP      : # FQ60745
+
+  # Alimentation des zones pour l'Italie
+  [F:FLUP]ACGGRP    = [F:FAS]ACGGRP
+  [F:FLUP]ACCCOD    = [F:FAS]ACCCOD
+  [F:FLUP]STRDPRDAT = [F:DEPF]STRDPRDAT
+  [F:FLUP]PURDAT    = [F:FAS]PURDAT
+
+  # Alimentation des zones pour l'IAS FQ75615
+  [F:FLUP]ETRNAT    = [F:FAS]ETRNAT
+  [F:FLUP]PURNAT    = [F:FAS]PURNAT
+
+  # Valorisation début de période
+  #------------------------------
+  If INDIC_INIT = G_OUI
+    # L'alimentation des zones début de période se fait à partir de DEPREC puisqu'il n'y a pas de flux précédents
+
+    # Il faut distinguer deux cas : saisie rétroactive ou acquisition dans la période
+    # FQ69641
+    #If  ([F:FAS]AASIPTDAT >= [F:DEPF]FIYSTRDAT) and (([F:DEPF]STRDPRDAT >= [F:DEPF]FIYSTRDAT) or ([F:DEPF]DPRCUM =  0)) Then
+    If  (([F:FAS]AASIPTDAT >= [F:DEPF]FIYSTRDAT) and (([F:DEPF]STRDPRDAT >= [F:DEPF]FIYSTRDAT) or ([F:DEPF]DPRCUM =  0)))
+&   or    ((find([F:FAS]ETRNAT,GVML_NEAPPOR,GVML_NEFUSIO,GVML_NESCISS,GVML_NEVTEIG)<>0)
+&      and (([F:FAS]GRUEFFDAT>=[F:DEPF]FIYSTRDAT) and ([F:FAS]GRUEFFDAT<=[F:DEPF]FIYENDDAT))) Then
+      # Trois cas :
+      #   1- si les dates de comptabilisation et de début d'amortissement sont supérieures ou égales à la date
+      #      de début d'exercice, on considère  le bien en augmentation sur l'exercice et sur la période courante.
+      #   2- si le cumul d'amortissement en début de période égal à zéro et que la date de comptabilisation
+      #      est supérieure ou égales à la date de début d'exercice, on considère le bien en augmentation sur
+      #      l'exercice et sur la période courante.
+      #   3- si la nature d'entrée est Fusion, Scission, Apport partiel ou Vente Intra-groupe ET que la date d'effet de l'opération
+      #      est dans l'exercice (FQ69641)
+      [F:FLUP]INCBUY    = [F:DEPF]DPRBAS
+      INDIC_ACTU        = G_NON : # FQ68038 : on ne constatera pas d'actualisation dans ce cas car [F:FLUP]INCBUY contient déjà
+                                  #           la base actualisée
+    Else
+      # Acquisition antérieure à la période
+      #[F:FLUP]BSEVALSTR = [F:DEPF]BSEVAL
+      #[F:FLUP]DPRBASSTR = [F:DEPF]DPRBAS
+      [F:FLUP]BSEVALSTR = LBSEVAL : # FQ68038
+      [F:FLUP]DPRBASSTR = LDPRBAS : # FQ68038
+    Endif
+    [F:FLUP]DPRCUMSTR = [F:DEPF]DPRCUM + [F:DEPF]PERCLOCUM : # FQ69641 : permet de gérer la saisie rétroactive ou l'activation des flux
+                                                             #          en cours de route
+    # Alimentation des zones pour l'IAS FQ75615
+    # VN début période   = DPRBAS - DPRCUM - PERCLOCUM - PERCLOEXC - IMLBLC
+    [F:FLUP]NBVSTR       = LDPRBAS - [F:DEPF]DPRCUM    - [F:DEPF]IMLBLC
+&                                  - [F:DEPF]PERCLOCUM - [F:DEPF]PERCLOEXC
+    [F:FLUP]NSPVALSTR    = [F:DEPF]NSPVAL
+    [F:FLUP]SALCLSDATSTR = [F:FAS]SALCLSDAT
+    [F:FLUP]IMLCUMSTR    = [F:DEPF]IMLBLC
+    [F:FLUP]RVACUMSTR    = [F:DEPF]EXERVADEV+[F:DEPF]PERRVACUM
+    [F:FLUP]AASTYPSTR    = [F:FAS]AASTYP
+    Case [L]LORIBASDPR
+      When GVML_OBPCG, GVML_OBSAI
+        [F:FLUP]ACNSTR = [F:FAS]GACACN
+      When GVML_OBIAS
+        [F:FLUP]ACNSTR = [F:FAS]IASACN
+    Endcase
+    [F:FLUP]GRACUMSTR  = [F:DEP9]DPRCUM    + [F:DEP9]PERCLOCUM
+  Else
+    # L'alimentation des zones début de période se fait à partir du flux précédent.
+
+    [F:FLUP]BSEVALSTR = [F:FLUP]BSEVALEND
+    [F:FLUP]DPRBASSTR = [F:FLUP]DPRBASEND
+    # Fq-122072 [F:FLUP]DPRCUMSTR = [F:DEPF]DPRCUM + [F:DEPF]PERCLOCUM : # FQ75129
+    [F:FLUP]DPRCUMSTR = [F:DEPF]DPRCUM + [F:DEPF]PERCLOCUM +  [F:DEPF]PERCLOEXC # Fq-122072
+
+    # Alimentation des zones pour l'IAS FQ75615
+    [F:FLUP]SALCLSDATSTR = [F:FLUP]SALCLSDATEND
+    [F:FLUP]AASTYPSTR    = [F:FLUP]AASTYPEND
+    [F:FLUP]ACNSTR       = [F:FLUP]ACNEND
+    [F:FLUP]NBVSTR       = [F:FLUP]NBVEND
+
+    [F:FLUP]NSPVALSTR    = [F:FLUP]NSPVALEND
+    [F:FLUP]IMLCUMSTR    = [F:FLUP]IMLCUMEND
+    [F:FLUP]RVACUMSTR    = [F:FLUP]RVACUMEND
+    [F:FLUP]GRACUMSTR    = [F:FLUP]GRACUMEND
+
+    [F:FLUP]NBVSTR       = [F:DEPF]DPRBAS - [F:DEPF]DPRCUM - [F:DEPF]PERCLOCUM - [F:DEPF]PERCLOEXC - [F:DEPF]IMLBLC
+    [F:FLUP]IMLCUMEND    = [F:DEPF]IMLBLC
+    [F:FLUP]RVACUMEND    = [F:DEPF]EXERVADEV
+
+    [F:FLUP]GRACUMEND    = [F:DEP9]DPRCUM + [F:DEP9]PERCLOCUM
+
+    # Initialisation des zones "situation fin de période" issues du flux précédent
+    Gosub INIT_ZON_FINPER  : # FQ70743
+  Endif
+
+  # Alimentation des zones pour l'IAS FQ75615
+  Case [L]LORIBASDPR
+    When GVML_OBPCG, GVML_OBSAI
+      [F:FLUP]ACNEND = [F:FAS]GACACN
+    When GVML_OBIAS
+      [F:FLUP]ACNEND = [F:FAS]IASACN
+  Endcase
+
+  #-------------------
+  # TRANSFERT EVENTUEL
+  #-------------------
+  # Récupération du site financier du bien pour la période concernée
+  #[L]LFCY = func TRTFASTRF.GET_FCY("[F:FAS]",[F:FLUP]PERSTRDAT) : # FQ105454
+  [L]LFCY = func TRTFASTRF.GET_FCY("[F:FAS]",[F:FLUP]PERENDDAT)
+
+  If [F:FLUP]FCY<>[L]LFCY or [F:FLUP]TXSCAT<>LTXSCAT
+    # Solde du flux origine
+    Gosub SOLDE_FLUX_ORIGINE_PERIODE
+  Endif
+
+  #--------------------------------------------
+  # ALIMENTATION DE LA SITUATION FIN DE PERIODE
+  #--------------------------------------------
+
+  [F:FLUP]GAC    = [F:GAC]ACC
+
+  # Dépreciation FQ75615
+  [F:FLUP]IML       = [F:DEPF]IML
+  [F:FLUP]IMLRVE    = [F:DEPF]IMLRVE
+  [F:FLUP]IMLRVEISS = [F:FAS]IMLRVEISS([F:DEPF]DPRPLN-1)
+
+  # Réévaluation FQ75615
+  [F:FLUP]RVAAMT = [F:DEPF]RVAAMT
+  [F:FLUP]RVARVEDPE = [F:DEPF]DPET - [F:DEPF]DPEI
+  [F:FLUP]RVARVEIML = func TRTFASIML.GET_RVARVE([F:DEPF]IML, [F:DEPF]EXERVADEV+[F:DEPF]PERRVADEV-[F:DEPF]RVACRB)
+
+  # Dotation
+  [F:FLUP]DPE    = [F:DEPF]PERENDDPE
+  # FQ69641
+  # Si la nature d'entrée est Fusion, Scission, Apport partiel ou Vente Intra-groupe ET que la date d'effet de l'opération
+  # est dans l'exercice, on ajoute le cumul de reprise à la dotation (VINCI)
+  If  (INDIC_INIT = G_OUI) and (find([F:FAS]ETRNAT,GVML_NEAPPOR,GVML_NEFUSIO,GVML_NESCISS,GVML_NEVTEIG)<>0)
+& and ([F:FAS]GRUEFFDAT>=[F:DEPF]FIYSTRDAT) and ([F:FAS]GRUEFFDAT<=[F:DEPF]FIYENDDAT)
+    [F:FLUP]DPE      += [F:FLUP]DPRCUMSTR
+    [F:FLUP]DPRCUMSTR = 0
+  Endif
+
+  # FQ82075 G_DPMSL
+  If [F:DEPF]DPM = G_DPMLP or [F:DEPF]DPM = G_DPMRE or (dim(G_DPMSL) > 0 and [F:DEPF]DPM = G_DPMSL) Then
+    [F:FLUP]DPRLIN  = [F:FLUP]DPE
+  Elsif [F:DEPF]DPM =G_DPMDF Then
+    [F:FLUP]DPRDEG  = [F:FLUP]DPE
+  Else
+    [F:FLUP]DPROTH  = [F:FLUP]DPE
+  Endif
+
+  # Amortissement exceptionnel
+  [F:FLUP]EXCDPR = [F:DEPF]PEREXCDPR
+
+  # Dérogatoire
+  If [F:DEPF]DPRPLN=G301CPT or [F:DEPF]DPRPLN=G301FIS Then
+    # sur le plan comptable, LEG et LEGRVE contiennent les informations concernant le dérogatoire
+    # sur le plan fiscal, LEG et LEGRVE contiennent les informations concernant la réintégration fiscale
+    [F:FLUP]DERDPR  = [F:DEPF]LEG    : # provision dérogatoire
+    [F:FLUP]DERRVE  = [F:DEPF]LEGRVE : # reprise dérogatoire
+
+    # Alimentation des flags permettant de distinguer pour la liasse 2055 les différents cas de dérogatoire
+    If ([F:DEPF]DPRPLN=G301CPT) and (([F:FLUP]DERDPR <> 0) or ([F:FLUP]DERRVE <> 0)) Then
+      # On va lire le DEPREC du plan fiscal pour connaitre son mode et sa règle particulière
+      # FQ58522 : utilisation d'un FOR car un READ ne permet pas l'utilisation de l'instruction COLUMNS
+      #Read [DEPP]DEP0=[F:DEPF]AASREF;G301FIS;[F:DEPF]FIYENDDAT;[F:DEPF]PERENDDAT
+      Columns [F:DEFI](DPM,ALWAMT,ALWCUM,DPRDUR)
+      For [F:DEFI]DEP0 Where AASREF=[F:DEPF]AASREF and DPRPLN=G301FIS and FIYENDDAT=[F:DEPF]FIYENDDAT and PERENDDAT=[F:DEPF]PERENDDAT
+        If [F:DEFI]DPM = G_DPMDF Then
+          [F:FLUP]DERFLGDF  = G_OUI
+        Else
+          [F:FLUP]DERFLGDF  = G_NON
+        Endif
+
+        If ([F:DEFI]ALWAMT + [F:DEFI]ALWCUM > 0) or (([F:DEFI]DPRDUR <> [F:DEPF]DPRDUR) and ([F:DEFI]DPRDUR=1))
+          [F:FLUP]DERFLGEXC = G_OUI
+        Else
+          [F:FLUP]DERFLGEXC = G_NON
+        Endif
+        Columns [F:DEFI]
+      Next
+    Endif
+  Else
+    [F:FLUP]DERDPR  = 0
+    [F:FLUP]DERRVE  = 0
+  Endif
+
+  # Alimentation des zones pour l'Italie
+  [F:FLUP]DPRRAT    = [F:DEPF]DPRRAT
+  [F:FLUP]DPRRAT2   = [F:DEPF]DPRRAT2
+
+  # Actualisation
+  # -------------
+  If INDIC_ACTU = G_OUI
+    # On constate la variation
+    [F:FLUP]INCBUY = [F:DEPF]DPRBAS - [L]LDPRBAS
+  Endif
+
+  # Sortie
+  # ------
+  [F:FLUP]ISSAMT = 0 : # zone Italie
+  [F:FLUP]GAL    = 0 : # zone Italie
+
+  If (([F:DEPF]FLGUPDISS = G_OUI ) and ([F:FAS]ISSDAT <= [F:DEPF]PERENDDAT) and ([F:FAS]ISSDAT<>[0/0/0]))
+& or (([F:FAS]ISSDAT >= [F:DEPF]PERSTRDAT) and ([F:FAS]ISSDAT <= [F:DEPF]PERENDDAT))
+    # Deux cas à traiter :
+    # 1- le flag FLGUPDISS est à OUI, ce qui indique qu'une action de sortie ou d'annulation de sortie
+    #    a eu lieu dans la période courante. On traite si la date de sortie est nulle (annulation de sortie)
+    #    ou antérieure à la date de fin de période, pour ne pas s'occuper des sorties dans le futur.
+    # 2- le flag FLGUPDISS est à NON mais la date de sortie est dans la période courante. Ce cas peut
+    #    arriver lorsqu'on a fait une sortie dans une période future et qu'à la suite
+    #    des clôtures on arrive sur la période de sortie. Il faut prendre en compte la sortie
+    #    sur le flux de cette période.
+    If  [F:FAS]EXTISSFLG=G_NON
+      # C'est une sortie, rétroactive ou pas
+      [F:FLUP]DCRSAL    = [F:FLUP]DPRBASSTR + [F:FLUP]INCBUY
+&                       + (max(abs([F:FLUP]INCTRF),abs([F:FLUP]INCFCY))*sgn([F:FLUP]INCTRF+[F:FLUP]INCFCY))
+      [F:FLUP]DCRDPEOUT = [F:FLUP]DPRCUMSTR + [F:FLUP]DPE + [F:FLUP]EXCDPR
+&                       + (max(abs([F:FLUP]INCDPRTRF),abs([F:FLUP]INCDPRFCY))*sgn([F:FLUP]INCDPRTRF+[F:FLUP]INCDPRFCY))
+
+      [F:FLUP]ISSAMT    = [F:FAS]ISSAMT                : # zone Italie
+      [F:FLUP]GAL       = [F:FAS]GAL([F:FLUP]DPRPLN-1) : # zone Italie
+      [F:FLUP]ISSTYP    = [F:FAS]ISSTYP                : # FQ75615
+      [F:FLUP]RVARVEISS = [F:DEPF]RVACRB               : # FQ75615
+
+      # Reprise de dérogatoire sur sortie pour le plan comptable
+      # Reprise de réintégration fiscale sur sortie pour le plan fiscal
+      If [F:DEPF]DPRPLN=G301CPT or [F:DEPF]DPRPLN=G301FIS Then
+        [F:FLUP]DERISS = [F:DEPF]LEGCUM    + [F:DEPF]PERLEGCUM + [F:DEPF]LEG
+&                      - [F:DEPF]LEGRVECUM - [F:DEPF]PERLEGRVE - [F:DEPF]LEGRVE
+      Endif
+
+      # On en profite pour supprimer d'éventuels flux dans l'exercice suivant, dans le cas où il y ait eu
+      # génération des flux sur l'exercice suivant (ceux de l'exercice courant ont déjà été supprimés)
+      Delete [FLU] Where AASREF=[F:FAS]AASREF and DPRPLN=[F:DEPF]DPRPLN and TYP=PTYP and FIYSTRDAT>[F:DEPF]FIYENDDAT and FLGSTATXS=GVML_TXSPRO
+    Endif
+  Endif
+
+  # Rubriques calculées
+  # -------------------
+  # Début FQ63381 : RVAAMT ne doit pas être pris en compte dans le calcul des valeurs bilan fin de période
+  #[F:FLUP]DPRBASEND =  [F:FLUP]DPRBASSTR + [F:FLUP]RVAAMT + [F:FLUP]INCBUY + (max(abs([F:FLUP]INCTRF),abs([F:FLUP]INCFCY))*sgn([F:FLUP]INCTRF+[F:FLUP]INCFCY))
+#&                                                         - [F:FLUP]DCRSAL - (max(abs([F:FLUP]DCRTRF),abs([F:FLUP]DCRFCY))*sgn([F:FLUP]DCRTRF+[F:FLUP]DCRFCY))
+  #[F:FLUP]BSEVALEND =  [F:FLUP]DPRBASEND - [F:FLUP]RVAAMT
+  [F:FLUP]DPRBASEND =  [F:FLUP]DPRBASSTR + [F:FLUP]INCBUY + (max(abs([F:FLUP]INCTRF),abs([F:FLUP]INCFCY))*sgn([F:FLUP]INCTRF+[F:FLUP]INCFCY))
+&                                        - [F:FLUP]DCRSAL - (max(abs([F:FLUP]DCRTRF),abs([F:FLUP]DCRFCY))*sgn([F:FLUP]DCRTRF+[F:FLUP]DCRFCY))
+  [F:FLUP]BSEVALEND =  [F:FLUP]DPRBASEND
+  # Fin FQ63381
+  [F:FLUP]DPRCUMEND =  [F:FLUP]DPRCUMSTR + (max(abs([F:FLUP]INCDPRTRF),abs([F:FLUP]INCDPRFCY))*sgn([F:FLUP]INCDPRTRF+[F:FLUP]INCDPRFCY)) + [F:FLUP]DPE + [F:FLUP]EXCDPR
+&                    - [F:FLUP]DCRDPEOUT - (max(abs([F:FLUP]DCRDPRTRF),abs([F:FLUP]DCRDPRFCY))*sgn([F:FLUP]DCRDPRTRF+[F:FLUP]DCRDPRFCY))
+
+  # Alimentation des zones pour l'IAS FQ75615
+  [F:FLUP]NBVEND       = [F:DEPF]NBV
+  [F:FLUP]NSPVALEND    = [F:DEPF]NSPVAL
+  [F:FLUP]RVACUMEND    = [F:FLUP]RVACUMSTR + [F:FLUP]RVAAMT - [F:FLUP]RVARVEDPE - [F:FLUP]RVARVEIML - [F:FLUP]RVARVEISS
+  [F:FLUP]IMLCUMEND    = [F:FLUP]IMLCUMSTR + [F:FLUP]IML    - [F:FLUP]IMLRVE    - [F:FLUP]IMLRVEISS
+  [F:FLUP]SALCLSDATEND = [F:FAS]SALCLSDAT
+  [F:FLUP]AASTYPEND    = [F:FAS]AASTYP
+  [F:FLUP]GRACUMEND    = [F:FLUP]GRACUMSTR + [F:DEP9]PERENDDPE
+
+  If [F:FLUP]SALCLSDATSTR <> [F:FLUP]SALCLSDATEND
+    If [F:FLUP]SALCLSDATEND = [0/0/0]
+      [F:FLUP]SALCLSVAR = [F:FLUP]NBVEND * -1
+    Else
+      [F:FLUP]SALCLSVAR = [F:FLUP]NBVEND
+    Endif
+  Endif
+
+  If [F:DEPF]RVAAMT <> 0
+    [F:FLUP]DPRBASRVA = func TRTFLUX.CUMUL_REEVAL([F:FLUP]AASREF, [F:FLUP]DPRPLN, [F:FLUP]PERSTRDAT, [F:FLUP]PERENDDAT)
+  Endif
+
+  # FQ79819 : Cas particulier de la réévaluation fin d'exercice
+  If ([F:DEPF]RVATIADAT = GVML_ERENDEX)
+    If ([F:DEPF]RVATYP = GVML_MODVMA)
+      # Par valeur marché. On doit solder le cumul d'amortissement dans la période et l'exercice
+      [F:FLUP]DCRDPERVA  = [F:FLUP]DPRCUMEND
+      [F:FLUP]DPRCUMEND  = 0
+      [F:FLUP]DPRBASEND += [F:FLUP]DPRBASRVA
+    Endif
+    If ([F:DEPF]RVATYP = GVML_MODCOE) or ([F:DEPF]RVATYP = GVML_MODIND) : # FQ85936
+      # Par valeur coefficient
+      [F:FLUP]DPRBASEND += [F:FLUP]DPRBASRVA
+      # If faut déterminer la sur-dotation liée à la réévaluation, et pour cela lire le DEPREC suivant qui doit
+      # correspondre à la première période du prochain exercice
+      Filter [F:DEPN] Where PERSTRDAT = [F:DEPF]PERENDDAT+1
+      Read   [F:DEPN]DEP0(2)=[F:DEPF]AASREF;[F:DEPF]DPRPLN
+      If fstat : Raz [F:DEPN] : Endif
+      Filter [F:DEPN]
+      # Attention : la champ DCRDPERVA marque une diminution, il faut que la valeur soit négative si c'est une augmentation
+      [F:FLUP]DCRDPERVA  = ([F:FLUP]DPRCUMSTR + [F:FLUP]DPE + [F:FLUP]EXCDPR) - [F:DEPN]DPRCUM
+      [F:FLUP]DPRCUMEND -= [F:FLUP]DCRDPERVA
+    Endif
+  Endif
+
+  [F:FLUP]NSPVALVAR = [F:FLUP]NSPVALEND - [F:FLUP]NSPVALSTR
+
+  # Point d'entrée avant création du flux période
+  # ---------------------------------------------
+  GPOINT="CREAT_FLUP" : Gosub ENTREE From EXEFNC
+
+  #-------------------------------
+  # ENREGISTREMENT DU FLUX PERIODE
+  #-------------------------------
+
+  Write [FLUP]
+  If fstat Then
+    Call ECR_TRACE("GENERE_FLUX_PERIODE 1"-[F:FLUP]CPY-num$([F:FLUP]TYP)-[F:FLUP]TXSCAT-num$([F:FLUP]DPRPLN)-[F:FLUP]AASREF-format$("DD2",[F:FLUP]FIYSTRDAT)-format$("DD2",[F:FLUP]PERSTRDAT)-num$(fstat
+& ),1) From GESECRAN
+    RERROR = -10 : # Erreur en écriture de flux
+    End
+  Endif
+End
+
+######################################## FQ70743
+# INIT_ZON_FINPER
+#
+# Initialisation des zones "situation fin de période" issues du flux précédent
+########################################
+$INIT_ZON_FINPER
+  [F:FLUP]BSEVALEND = 0
+  [F:FLUP]DCRDPEOUT = 0
+  [F:FLUP]DCRDPRFCY = 0
+  [F:FLUP]DCRDPRTRF = 0
+  [F:FLUP]DCRFCY    = 0
+  [F:FLUP]DCRSAL    = 0
+  [F:FLUP]DCRTRF    = 0
+  [F:FLUP]DERDPR    = 0
+  [F:FLUP]DERRVE    = 0
+  [F:FLUP]DPE       = 0
+  [F:FLUP]DCRDPRFCY = 0
+  [F:FLUP]DCRDPRTRF = 0
+  [F:FLUP]DPRBASEND = 0
+  [F:FLUP]DPRCUMEND = 0
+  [F:FLUP]DPRDEG    = 0
+  [F:FLUP]DPRLIN    = 0
+  [F:FLUP]DPROTH    = 0
+  [F:FLUP]DPRRAT    = 0
+  [F:FLUP]DPRRAT2   = 0
+  [F:FLUP]EXCDPR    = 0
+  [F:FLUP]FCYORI    = ""
+  [F:FLUP]INCBUY    = 0
+  [F:FLUP]INCDPRFCY = 0
+  [F:FLUP]INCDPRTRF = 0
+  [F:FLUP]INCFCY    = 0
+  [F:FLUP]INCTRF    = 0
+  [F:FLUP]RVAAMT    = 0
+  [F:FLUP]TXSCATORI = ""
+
+  # Zones ajoutées pour l'IAS FQ75615
+  [F:FLUP]SALCLSVAR   = 0
+
+  [F:FLUP]IML         = 0
+  [F:FLUP]IMLRVE      = 0
+  [F:FLUP]IMLRVEISS   = 0
+  [F:FLUP]IMLRVETRF   = 0
+  [F:FLUP]IMLCUMEND   = 0
+
+  [F:FLUP]NBVEND      = 0
+  [F:FLUP]NSPVALEND   = 0
+
+  [F:FLUP]RVARVEDPE   = 0
+  [F:FLUP]RVARVEIML   = 0
+  [F:FLUP]RVARVEISS   = 0
+  [F:FLUP]RVACUMEND   = 0
+  [F:FLUP]DPRBASRVA   = 0
+
+  [F:FLUP]GRACUMEND   = 0
+
+  [F:FLUP]DCRDPERVA   = 0
+Return
+
+########################################
+# SOLDE_FLUX_ORIGINE_PERIODE
+#
+# Lors d'un transfert, solde et enregistre le flux origine
+# et prépare le flux destination
+########################################
+$SOLDE_FLUX_ORIGINE_PERIODE
+
+  # SOLDE DU FLUX ORIGINE
+  # ---------------------
+
+  # Transfert de compte
+  If [F:FLUP]TXSCAT <> LTXSCAT
+    [F:FLUP]DCRDPRTRF = [F:FLUP]DPRCUMSTR +                  [F:FLUP]INCDPRTRF
+    [F:FLUP]DCRTRF    = [F:FLUP]DPRBASSTR + [F:FLUP]INCBUY + [F:FLUP]INCTRF
+  Endif
+
+  # Transfert de site financier
+  If [F:FLUP]FCY <> [L]LFCY
+    [F:FLUP]DCRDPRFCY = [F:FLUP]DPRCUMSTR +                  [F:FLUP]INCDPRFCY
+    [F:FLUP]DCRFCY    = [F:FLUP]DPRBASSTR + [F:FLUP]INCBUY + [F:FLUP]INCFCY
+  Endif
+
+  # Point d'entrée avant solde du flux période origine
+  # --------------------------------------------------
+  GPOINT="SOLDE_FLUP" : Gosub ENTREE From EXEFNC
+
+  Write [FLUP]
+  If fstat Then
+    Call ECR_TRACE("SOLDE_FLUX_ORIGINE_PERIODE 1"-[F:FLUP]CPY-num$([F:FLUP]TYP)-[F:FLUP]TXSCAT-num$([F:FLUP]DPRPLN)-[F:FLUP]AASREF-format$("DD2",[F:FLUP]FIYSTRDAT)-format$("DD2",[F:FLUP]PERSTRDAT)-
+& num$(fstat),1) From GESECRAN
+    RERROR = -10 : # Erreur en écriture de flux
+    End
+  Endif
+
+  # INITIALISATION DU FLUX DESTINATION
+  # ----------------------------------
+
+  # Transfert de compte
+  If [F:FLUP]TXSCAT <> LTXSCAT
+    [F:FLUP]TXSCATORI = [F:FLUP]TXSCAT
+    [F:FLUP]TXSCAT    = [L]LTXSCAT
+
+    [F:FLUP]INCDPRTRF = [F:FLUP]DCRDPRTRF
+    [F:FLUP]INCTRF    = [F:FLUP]DCRTRF
+    [F:FLUP]DCRDPRTRF = 0
+    [F:FLUP]DCRTRF    = 0
+  Endif
+
+  # Transfert de site financier
+  If [F:FLUP]FCY <> [L]LFCY
+    [F:FLUP]FCYORI    = [F:FLUP]FCY
+    [F:FLUP]FCY       = [L]LFCY
+
+    [F:FLUP]INCDPRFCY = [F:FLUP]DCRDPRFCY
+    [F:FLUP]INCFCY    = [F:FLUP]DCRFCY
+    [F:FLUP]DCRDPRFCY = 0
+    [F:FLUP]DCRFCY    = 0
+  Endif
+
+  [F:FLUP]BSEVALSTR   = 0
+  [F:FLUP]DPRBASSTR   = 0
+  [F:FLUP]INCBUY      = 0
+  [F:FLUP]DPRCUMSTR   = 0
+Return
+
+########################################
+# GENERE_FLUX_EXERCICE
+#
+# Création du flux exercice pour l'exercice courant
+# Les classes [F:FAS] et [F:DEPF] doivent être ouvertes sur le bien et le plan courant
+# Les classes [F:CNX] et [F:FIS] doivent être ouvertes sur le contexte courant
+#
+# Cinématique du sous-programme :
+#   1- récupération du flux période début et fin exercice
+#   2- détermination des valeurs début d'exercice
+#   3- transfert éventuel
+#   4- détermination des valeurs fin d'exercice
+#   5- enregistrement
+########################################
+#**
+#*
+#*
+#* @param PTYP     : Type de flux à générer : GML_TFPLIASS ou GML_TFCOMPTE
+#* @param PSTA     : Statut provisoire (GVML_TXSPRO) ou définitif (GVML_TXSDEF)
+#* @param PRPT     : Génération des flux  (PRPT=0), Edition des états flux périodes cumulées (PRPT=1)
+#* @param PRPTPLN  : Plan traité issu des PREP2054 et PREP2055, sinon= 0
+#* @param RERROR   : Code erreur en retour, à exploiter avec la fonction GERE_MSG_ERREUR_FLUX
+#*!
+Subprog GENERE_FLUX_EXERCICE (PTYP, PSTA, PRPT, PRPTPLN, RERROR)
+Value    Integer PTYP     : # Type de flux à générer : GML_TFPLIASS ou GML_TFCOMPTE
+Value    Integer PSTA     : # Statut provisoire (GVML_TXSPRO) ou définitif (GVML_TXSDEF)
+Value    Integer PRPT     : #*FQ92637  Génération des flux  (PRPT=0), Edition des états flux périodes cumulées (PRPT=1)
+Value    Integer PRPTPLN  : #*FQ92637 Plan traité
+Variable Integer RERROR   : # Code erreur en retour, à exploiter avec la fonction GERE_MSG_ERREUR_FLUX
+                            # =0 : OK
+                            # <0 : Erreur
+
+  Local Decimal  L_DPRBAS    : # base d'amortissement d'origine
+  Local Integer  LORIBASDPR  : # Origine base d'amortissement
+
+  RERROR = 0
+
+  #---------------------
+  # OUVERTURE DES TABLES
+  #---------------------
+
+  If clalev([F:FLUP])  = 0 : Local File FXDLIFL [FLUP]  : Endif
+  If clalev([F:FLUE])  = 0 : Local File FXDLIFL [FLUE]  : Endif : # Flux exercice
+  If clalev([F:FLUD])  = 0 : Local File FXDLIFL [FLUD]  : Endif : # Flux période début d'exercice FQ58522
+  #If clalev([F:DEPP])  = 0 : Local File DEPREC  [DEPP]  : Endif : # Plans d'amortissements secondaire FQ58522
+  If clalev([F:DEFI])  = 0 : Local File DEPREC  [DEFI]  : Endif : # Plans d'amortissements plan fiscal FQ58522
+
+  #------------------------------------------------------------------
+  # DETERMINATION DES CAS NE DONNANT PAS LIEU A LA GENERATION DE FLUX
+  #------------------------------------------------------------------
+
+  # Pas de flux exercice pour les biens dont le type de détention est Annulé ou En modèle FQ69885
+  If ([F:FAS]OWNTYP = GVML_TDANNUL) or ([F:FAS]OWNTYP = GVML_TDMODEL) : End : Endif
+
+  #------------------------------------------------
+  # RECHERCHE DU PREMIER FLUX PERIODE DE L'EXERCICE
+  #------------------------------------------------
+
+  If  !PRPT #*FQ92637
+    # On cherche le flux avant un éventuel transfert, d'où les conditions sur TXSCATORI et FCYORI
+    Filter [F:FLUD] Where AASREF=[F:FAS]AASREF & DPRPLN=[F:DEPF]DPRPLN & TYP=PTYP
+&                     and FIYSTRDAT=[F:DEPF]FIYSTRDAT & TXSCATORI="" & FCYORI=""
+    Read [FLUD]FLU0 First
+    Filter [F:FLUD]
+    If fstat
+      # Pas de flux période, donc pas de flux exercice. C'est un cas qui peut être normal.
+      End
+    Endif
+  Else
+    #*FQ92637 On est positionné sur le 1er flux à traiter [FLUD]
+    Read[FAS]FAS0= [F:FLUD]AASREF
+    # lecture du DEPREC de la dernière période à éditer [DEPF]
+    Read[DEPF]DEP0= [F:FLUD]AASREF;PRPTPLN; [F:FIS]DATENDFIY; G_FLUENDDAT
+  Endif #*FQ92637 END
+
+  #----------------------------------------------
+  # ALIMENTATION DE LA SITUATION DEBUT D'EXERCICE
+  #----------------------------------------------
+  [L]LORIBASDPR = [F:CNX]ORIBASDPR(find([F:DEPF]DPRPLN,[F:CNX]PLNCAA)-1)
+
+  [F:FLUE] = [F:FLUD]
+
+  [F:FLUE]DPRCUMSTR = [F:DEPF]DPRCUM : # FQ69641 : en cas de génération ititiale au-delà de la première période, [F:FLUD]DPRCUMSTR
+                                       #           contient également le cumul période close -> il faut prendre le cumul sur le DEPREC
+
+  # Initialisation des zones "initiales" issues du flux période
+  [F:FLUE]PERSTRDAT = [0/0/0]
+  [F:FLUE]PERENDDAT = [0/0/0]
+
+  If !PRPT #*FQ9263
+  If [F:FIS]DATENDPER([F:FIS]INDCURPER-1) = [F:FIS]DATENDFIY Then
+    [F:FLUE]FLGSTATXS = PSTA
+  Else
+    [F:FLUE]FLGSTATXS = GVML_TXSPRO
+  Endif
+  Else #*FQ9263
+      [F:FLUE]FLGSTATXS = GVML_TXSPRO
+  Endif
+
+  # Initialisation des zones "situation fin de période" issues du flux période
+  [F:FLUE]BSEVALEND = 0
+  [F:FLUE]DCRDPEOUT = 0
+  [F:FLUE]DCRDPRFCY = 0
+  [F:FLUE]DCRDPRTRF = 0
+  [F:FLUE]DCRFCY    = 0
+  [F:FLUE]DCRSAL    = 0
+  [F:FLUE]DCRTRF    = 0
+  [F:FLUE]DERDPR    = 0
+  [F:FLUE]DERRVE    = 0
+  [F:FLUE]DPE       = 0
+  [F:FLUE]DCRDPRFCY = 0
+  [F:FLUE]DCRDPRTRF = 0
+  [F:FLUE]DPRBASEND = 0
+  [F:FLUE]DPRCUMEND = 0
+  [F:FLUE]DPRDEG    = 0
+  [F:FLUE]DPRLIN    = 0
+  [F:FLUE]DPROTH    = 0
+  [F:FLUE]DPRRAT    = 0
+  [F:FLUE]DPRRAT2   = 0
+  [F:FLUE]EXCDPR    = 0
+  [F:FLUE]FCYORI    = ""
+  [F:FLUE]INCDPRFCY = 0
+  [F:FLUE]INCDPRTRF = 0
+  [F:FLUE]INCFCY    = 0
+  [F:FLUE]INCTRF    = 0
+  [F:FLUE]RVAAMT    = 0
+  [F:FLUE]TXSCATORI = ""
+
+  # Zones ajoutées pour l'IAS
+  [F:FLUE]SALCLSVAR   = 0
+
+  [F:FLUE]IML         = 0
+  [F:FLUE]IMLRVE      = 0
+  [F:FLUE]IMLRVEISS   = 0
+  [F:FLUE]IMLRVETRF   = 0
+  [F:FLUE]IMLCUMEND   = 0
+
+  [F:FLUE]NBVEND      = 0
+  [F:FLUE]NSPVALEND   = 0
+
+  [F:FLUE]RVARVEDPE   = 0
+  [F:FLUE]RVARVEIML   = 0
+  [F:FLUE]RVARVEISS   = 0
+  [F:FLUE]RVACUMEND   = 0
+  [F:FLUE]DPRBASRVA   = 0
+
+  [F:FLUE]GRACUMEND   = 0
+
+  [L]L_DPRBAS       = [F:FLUE]DPRBASSTR + [F:FLUE]INCBUY
+
+  #------------------------------------------------
+  # RECHERCHE DU DERNIER FLUX PERIODE DE L'EXERCICE
+  #------------------------------------------------
+
+  # FQ58522
+  If [F:FLUP]AASREF=""
+    If !PRPT #FQ92637
+      # On cherche le dernier flux période origine généré (on ne se base pas sur la dernière période de l'exercice
+      # car en cas de sortie les flux ne sont plus générés).
+      Filter [F:FLUP] Where AASREF=[F:FAS]AASREF & DPRPLN=[F:DEPF]DPRPLN & TYP=PTYP
+&                       and FIYSTRDAT=[F:DEPF]FIYSTRDAT and TXSCATORI="" & FCYORI=""
+      Read [FLUP]FLU0 Last
+      Filter [F:FLUP]
+    Else #* FQ92637 ==>  On cherche le dernier flux des périodes cumulées à éditer
+      Filter [F:FLUP] Where AASREF=[F:FAS]AASREF & DPRPLN=[F:DEPF]DPRPLN & TYP=PTYP
+&                       and FIYSTRDAT=[F:DEPF]FIYSTRDAT and PERENDDAT <= G_FLUENDDAT and TXSCATORI="" & FCYORI=""
+      Read [FLUP]FLU0 Last
+      Filter [F:FLUP] #FQ92637
+    Endif
+
+    If fstat
+      If !PRPT #FQ92637
+        # Pas de flux période, c'est anormal.
+        Call ECR_TRACE("GENERE_FLUX_EXERCICE 1"-[F:FLUE]CPY-num$([F:FLUE]TYP)-[F:FLUE]TXSCAT-num$([F:FLUE]DPRPLN)-[F:FLUE]AASREF-format$("DD2",[F:FLUE]FIYSTRDAT)-format$("DD2",[F:FLUE]PERSTRDAT)-
+&                      num$(fstat),1) From GESECRAN
+      Endif
+      RERROR = -11 : # Erreur en lecture de flux
+      End
+    Endif
+
+    Local Date L_PERSTRDAT : L_PERSTRDAT = [F:FLUP]PERSTRDAT
+
+    # On cherche le flux après un éventuel transfert sur la période, d'où les conditions sur TXSCATORI et FCYORI
+    Filter [F:FLUP] Where AASREF=[F:FAS]AASREF & DPRPLN=[F:DEPF]DPRPLN & TYP=PTYP
+&                     and FIYSTRDAT=[F:DEPF]FIYSTRDAT & PERSTRDAT=L_PERSTRDAT & (TXSCATORI<>"" | FCYORI<>"")
+    Look [F:FLUP] First
+
+    If !fstat
+      # Il y a eu transfert, on lit le flux destination
+      Read [FLUP] First
+    Endif
+
+    Filter [F:FLUP]
+  Endif
+
+  #-------------------
+  # TRANSFERT EVENTUEL
+  #-------------------
+
+  If [F:FLUP]FCY<>[F:FLUE]FCY or [F:FLUP]TXSCAT<>[F:FLUE]TXSCAT
+    # Solde du flux origine
+    Gosub SOLDE_FLUX_ORIGINE_EXERCICE
+  Endif
+
+  #--------------------------------------------
+  # ALIMENTATION DE LA SITUATION FIN D'EXERCICE
+  #--------------------------------------------
+
+  #[F:FLUE]GAC    = [F:FAS]GAC : # FQ63390
+  [F:FLUE]GAC    = [F:FLUP]GAC
+
+  # Dépreciation FQ75615
+  [F:FLUE]IML       = [F:DEPF]PERIMLCUM + [F:DEPF]IML
+  [F:FLUE]IMLRVE    = [F:DEPF]PERRVECUM + [F:DEPF]IMLRVE
+  [F:FLUE]IMLRVEISS = [F:FLUP]IMLRVEISS
+
+  # Réévaluation FQ75615
+  [F:FLUE]RVAAMT = [F:DEPF]RVAAMT + [F:DEPF]PERRVACUM : # FQ63381
+  [F:FLUE]RVARVEDPE = [F:DEPF]ENDDPET - [F:DEPF]ENDDPEI
+  [F:FLUE]RVARVEIML = func TRTFASIML.GET_RVARVE([F:FLUE]IML, [F:DEPF]EXERVADEV+[F:DEPF]PERRVADEV-[F:DEPF]RVACRB)
+  [F:FLUE]RVARVEISS = [F:FLUP]RVARVEISS
+
+  # Dotation
+  # #FQ92637 quand on édite une liasse fiscale en période cumulées,
+  # la dotation de la période cumulée = dotation de la dernière période traitée + cumul dotation des périodes clôturées
+  If !PRPT
+    [F:FLUE]DPE = [F:DEPF]ENDDPE
+  Else
+    [F:FLUE]DPE = [F:DEPF]PERENDDPE + [F:DEPF]PERCLOCUM #*FQ92637
+  Endif
+
+  # FQ69641
+  # Si la nature d'entrée est Fusion, Scission, Apport partiel ou Vente Intra-groupe ET que la date d'effet de l'opération
+  # est dans l'exercice, on ajoute le cumul de reprise à la dotation (VINCI)
+  If  (find([F:FAS]ETRNAT,GVML_NEAPPOR,GVML_NEFUSIO,GVML_NESCISS,GVML_NEVTEIG)<>0)
+& and ([F:FAS]GRUEFFDAT>=[F:DEPF]FIYSTRDAT) and ([F:FAS]GRUEFFDAT<=[F:DEPF]FIYENDDAT)
+    [F:FLUE]DPE      += [F:FLUE]DPRCUMSTR
+    [F:FLUE]DPRCUMSTR = 0
+  Endif
+
+  # FQ82075 G_DPMSL
+  If [F:DEPF]DPM = G_DPMLP or [F:DEPF]DPM = G_DPMRE or (dim(G_DPMSL)>0 and [F:DEPF]DPM = G_DPMSL) Then
+    [F:FLUE]DPRLIN  = [F:FLUE]DPE
+  Elsif [F:DEPF]DPM=G_DPMDF Then
+    [F:FLUE]DPRDEG  = [F:FLUE]DPE
+  Else
+    [F:FLUE]DPROTH  = [F:FLUE]DPE
+  Endif
+
+  # Amortissement exceptionnel
+  [F:FLUE]EXCDPR = [F:DEPF]EXCDPR
+
+  # Dérogatoire
+  If [F:DEPF]DPRPLN=G301CPT or [F:DEPF]DPRPLN=G301FIS Then
+    # sur le plan comptable, LEG et LEGRVE contiennent les informations concernant le dérogatoire
+    # sur le plan fiscal, LEG et LEGRVE contiennent les informations concernant la réintégration fiscale
+    [F:FLUE]DERDPR  = [F:DEPF]LEG    + [F:DEPF]PERLEGCUM : # provision dérogatoire
+    [F:FLUE]DERRVE  = [F:DEPF]LEGRVE + [F:DEPF]PERLEGRVE : # reprise dérogatoire
+
+    # Alimentation des flags permettant de distinguer pour la liasse 2055 les différents cas de dérogatoire
+    If ([F:DEPF]DPRPLN=G301CPT) and (([F:FLUP]DERDPR <> 0) or ([F:FLUP]DERRVE <> 0)) Then
+      # On va lire le DEPREC du plan fiscal pour connaitre son mode et sa règle particulière
+      # FQ58522 : utilisation d'un FOR car un READ ne permet pas l'utilisation de l'instruction COLUMNS
+      # Read [DEPP]DEP0=[F:DEPF]AASREF;G301FIS;[F:DEPF]FIYENDDAT;[F:DEPF]PERENDDAT
+      Columns [F:DEFI](DPM,ALWAMT,ALWCUM,DPRDUR)
+      For [F:DEFI]DEP0 Where AASREF=[F:DEPF]AASREF and DPRPLN=G301FIS and FIYENDDAT=[F:DEPF]FIYENDDAT and PERENDDAT=[F:DEPF]PERENDDAT
+        If [F:DEFI]DPM = G_DPMDF Then
+          [F:FLUE]DERFLGDF  = G_OUI
+        Else
+          [F:FLUE]DERFLGDF  = G_NON
+        Endif
+
+        If ([F:DEFI]ALWAMT + [F:DEFI]ALWCUM > 0) or (([F:DEFI]DPRDUR <> [F:DEPF]DPRDUR) and ([F:DEFI]DPRDUR=1))
+          [F:FLUE]DERFLGEXC = G_OUI
+        Else
+          [F:FLUE]DERFLGEXC = G_NON
+        Endif
+      Next
+      Columns [F:DEFI]
+    Endif
+  Else
+    [F:FLUE]DERDPR  = 0
+    [F:FLUE]DERRVE  = 0
+  Endif
+
+  # Alimentation des zones pour l'Italie
+  [F:FLUE]DPRRAT    = [F:DEPF]DPRRAT
+  [F:FLUE]DPRRAT2   = [F:DEPF]DPRRAT2
+
+  # Actualisation
+  # -------------
+  If [F:DEPF]DPRBAS <> [L]L_DPRBAS
+    # On constate la variation
+    [F:FLUE]INCBUY += [F:DEPF]DPRBAS - [L]L_DPRBAS
+  Endif
+
+  # Sortie
+  # ------
+  [F:FLUE]DCRSAL    = [F:FLUP]DCRSAL
+  [F:FLUE]DCRDPEOUT = [F:FLUP]DCRDPEOUT
+  [F:FLUE]ISSAMT    = [F:FLUP]ISSAMT : # zone Italie
+  [F:FLUE]GAL       = [F:FLUP]GAL    : # zone Italie
+  [F:FLUE]ISSTYP    = [F:FLUP]ISSTYP : # FQ75615
+
+  # Reprise de dérogatoire sur sortie pour le plan comptable
+  # Reprise de réintégration fiscale sur sortie pour le plan fiscal
+  If [F:DEPF]DPRPLN=G301CPT or [F:DEPF]DPRPLN=G301FIS Then
+    [F:FLUE]DERISS  = [F:FLUP]DERISS
+  Endif
+
+  # Rubriques calculées
+  # -------------------
+  # Début FQ63381 : RVAAMT ne doit pas être pris en compte dans le calcul des valeurs bilan fin d'exercice
+  #[F:FLUE]DPRBASEND =  [F:FLUE]DPRBASSTR + [F:FLUE]RVAAMT + [F:FLUE]INCBUY + (max(abs([F:FLUE]INCTRF),abs([F:FLUE]INCFCY))*sgn([F:FLUE]INCTRF+[F:FLUE]INCFCY))
+#&                                                         - [F:FLUE]DCRSAL - (max(abs([F:FLUE]DCRTRF),abs([F:FLUE]DCRFCY))*sgn([F:FLUE]DCRTRF+[F:FLUE]DCRFCY))
+  #[F:FLUE]BSEVALEND =  [F:FLUE]DPRBASEND - [F:FLUE]RVAAMT
+  [F:FLUE]DPRBASEND =  [F:FLUE]DPRBASSTR + [F:FLUE]INCBUY + (max(abs([F:FLUE]INCTRF),abs([F:FLUE]INCFCY))*sgn([F:FLUE]INCTRF+[F:FLUE]INCFCY))
+&                                        - [F:FLUE]DCRSAL - (max(abs([F:FLUE]DCRTRF),abs([F:FLUE]DCRFCY))*sgn([F:FLUE]DCRTRF+[F:FLUE]DCRFCY))
+  [F:FLUE]BSEVALEND =  [F:FLUE]DPRBASEND
+  # Fin FQ63381
+  [F:FLUE]DPRCUMEND =  [F:FLUE]DPRCUMSTR + (max(abs([F:FLUE]INCDPRTRF),abs([F:FLUE]INCDPRFCY))*sgn([F:FLUE]INCDPRTRF+[F:FLUE]INCDPRFCY)) + [F:FLUE]DPE + [F:FLUE]EXCDPR
+&                    - [F:FLUE]DCRDPEOUT - (max(abs([F:FLUE]DCRDPRTRF),abs([F:FLUE]DCRDPRFCY))*sgn([F:FLUE]DCRDPRTRF+[F:FLUE]DCRDPRFCY))
+
+  # Alimentation des zones pour l'IAS FQ75615
+  [F:FLUE]NBVEND       = [F:FLUP]NBVEND
+  [F:FLUE]NSPVALEND    = [F:FLUP]NSPVALEND
+  [F:FLUE]RVACUMEND    = [F:FLUE]RVACUMSTR + [F:FLUE]RVAAMT - [F:FLUE]RVARVEDPE - [F:FLUE]RVARVEIML - [F:FLUE]RVARVEISS
+  [F:FLUE]IMLCUMEND    = [F:FLUE]IMLCUMSTR + [F:FLUE]IML    - [F:FLUE]IMLRVE    - [F:FLUE]IMLRVEISS
+  [F:FLUE]SALCLSDATEND = [F:FLUP]SALCLSDATEND
+  [F:FLUE]AASTYPEND    = [F:FLUP]AASTYPEND
+  [F:FLUE]GRACUMEND    = [F:FLUP]GRACUMEND
+
+  If [F:FLUE]SALCLSDATSTR <> [F:FLUE]SALCLSDATEND
+    If [F:FLUE]SALCLSDATEND = [0/0/0]
+      [F:FLUE]SALCLSVAR = [F:FLUP]NBVEND * -1
+    Else
+      [F:FLUE]SALCLSVAR = [F:FLUP]NBVEND
+    Endif
+  Endif
+
+  If [F:DEPF]RVAAMT + [F:DEPF]PERRVACUM <> 0
+    [F:FLUE]DPRBASRVA = func TRTFLUX.CUMUL_REEVAL([F:FLUE]AASREF, [F:FLUE]DPRPLN, [F:FLUE]FIYSTRDAT, [F:FLUE]FIYENDDAT)
+  Endif
+
+  # FQ79819 : Cas particulier de la réévaluation fin d'exercice
+  If ([F:DEPF]RVATIADAT = GVML_ERENDEX)
+    If ([F:DEPF]RVATYP = GVML_MODVMA)
+      # Par valeur marché. On doit solder le cumul d'amortissement dans la période et l'exercice, et diminuer la base du montant de réévaluation
+      [F:FLUE]DCRDPERVA  = [F:FLUE]DPRCUMEND
+      [F:FLUE]DPRCUMEND  = 0
+      [F:FLUE]DPRBASEND += [F:FLUE]DPRBASRVA
+    Endif
+    If ([F:DEPF]RVATYP = GVML_MODCOE or [F:DEPF]RVATYP = GVML_MODIND) : # FQ85936
+      # Par valeur coefficient
+      [F:FLUE]DPRBASEND += [F:FLUE]DPRBASRVA
+      # If faut déterminer la sur-dotation liée à la réévaluation, et pour cela lire le DEPREC suivant qui doit
+      # correspondre à la première période du prochain exercice
+      Filter [F:DEPN] Where FIYSTRDAT = [F:DEPF]FIYENDDAT+1
+      Read   [F:DEPN]DEP0(2)=[F:DEPF]AASREF;[F:DEPF]DPRPLN
+      If fstat : Raz [F:DEPN] : Endif
+      Filter [F:DEPN]
+      # Attention : la champ DCRDPERVA marque une diminution, il faut que la valeur soit négative si c'est une augmentation
+      [F:FLUE]DCRDPERVA  = ([F:FLUE]DPRCUMSTR + [F:FLUE]DPE + [F:FLUE]EXCDPR) - [F:DEPN]DPRCUM
+      [F:FLUE]DPRCUMEND -= [F:FLUE]DCRDPERVA
+    Endif
+  Endif
+
+  [F:FLUE]NSPVALVAR    = [F:FLUE]NSPVALEND - [F:FLUE]NSPVALSTR
+
+  # Point d'entrée avant création du flux exercice
+  # ----------------------------------------------
+  GPOINT="CREAT_FLUE" : Gosub ENTREE From EXEFNC
+
+  #--------------------------------
+  # ENREGISTREMENT DU FLUX EXERCICE
+  #--------------------------------
+  #*FQ92637 si on vient du PREP2054 ou du PREP2055, on récupère le flux recomposé
+  #* dans une classe temporaire [WFLU] et on n'écrit rien dans la table des flux.
+  #* [WFLU] sera exploité pour alimenter les tables préparatoires aux éditions.
+  If PRPT
+    [F:WFLU] = [F:FLUE]
+    End
+  Endif #FQ92637 END
+
+  Write [FLUE]
+  If fstat Then
+    Call ECR_TRACE("GENERE_FLUX_EXERCICE 2"-[F:FLUE]CPY-num$([F:FLUE]TYP)-[F:FLUE]TXSCAT-num$([F:FLUE]DPRPLN)-[F:FLUE]AASREF-format$("DD2",[F:FLUE]FIYSTRDAT)-format$("DD2",[F:FLUE]PERSTRDAT)-num$(
+& fstat),1) From GESECRAN
+    RERROR = -10 : # Erreur en écriture de flux
+    End
+  Endif
+End
+
+########################################
+# SOLDE_FLUX_ORIGINE_EXERCICE
+#
+# Lors d'un transfert, solde et enregistre le flux origine
+# et prépare le flux destination
+########################################
+$SOLDE_FLUX_ORIGINE_EXERCICE
+  # On ne constate un transfert exercice que pour les bien en augmentation dans un exercice antérieur
+  If ([F:FAS]AASIPTDAT < [F:DEPF]FIYSTRDAT) or ([F:DEPF]STRDPRDAT < [F:DEPF]FIYSTRDAT and [F:DEPF]DPRCUM <> 0)
+
+    # SOLDE DU FLUX ORIGINE
+    # ---------------------
+
+    # Transfert de compte
+    If [F:FLUP]TXSCAT <> [F:FLUE]TXSCAT
+      [F:FLUE]DCRDPRTRF = [F:FLUE]DPRCUMSTR +                  [F:FLUE]INCDPRTRF
+      [F:FLUE]DCRTRF    = [F:FLUE]DPRBASSTR + [F:FLUE]INCBUY + [F:FLUE]INCTRF
+    Endif
+
+    # Transfert de site financier
+    If [F:FLUP]FCY <> [F:FLUE]FCY
+      [F:FLUE]DCRDPRFCY = [F:FLUE]DPRCUMSTR +                  [F:FLUE]INCDPRFCY
+      [F:FLUE]DCRFCY    = [F:FLUE]DPRBASSTR + [F:FLUE]INCBUY + [F:FLUE]INCFCY
+    Endif
+
+    # Point d'entrée avant solde du flux exercice origine
+    # ---------------------------------------------------
+    GPOINT="SOLDE_FLUE" : Gosub ENTREE From EXEFNC
+
+    Write [FLUE]
+    If fstat Then
+      Call ECR_TRACE("SOLDE_FLUX_ORIGINE_EXERCICE 1"-[F:FLUE]CPY-num$([F:FLUE]TYP)-[F:FLUE]TXSCAT-num$([F:FLUE]DPRPLN)-[F:FLUE]AASREF-format$("DD2",[F:FLUE]FIYSTRDAT)-format$("DD2",[F:FLUE]PERSTRDAT)-
+& num$(fstat),1) From GESECRAN
+      RERROR = -10 : # Erreur en écriture de flux
+      End
+    Endif
+
+    # INITIALISATION DU FLUX DESTINATION
+    # ----------------------------------
+
+    # Transfert de compte
+    If [F:FLUP]TXSCAT <> [F:FLUE]TXSCAT
+      [F:FLUE]TXSCATORI = [F:FLUE]TXSCAT
+      [F:FLUE]TXSCAT    = [F:FLUP]TXSCAT
+
+      [F:FLUE]INCDPRTRF = [F:FLUE]DCRDPRTRF
+      [F:FLUE]INCTRF    = [F:FLUE]DCRTRF
+      [F:FLUE]DCRDPRTRF = 0
+      [F:FLUE]DCRTRF    = 0
+    Endif
+
+    # Transfert de site financier
+    If [F:FLUP]FCY <> [F:FLUE]FCY
+      [F:FLUE]FCYORI    = [F:FLUE]FCY
+      [F:FLUE]FCY       = [F:FLUP]FCY
+
+      [F:FLUE]INCDPRFCY = [F:FLUE]DCRDPRFCY
+      [F:FLUE]INCFCY    = [F:FLUE]DCRFCY
+      [F:FLUE]DCRDPRFCY = 0
+      [F:FLUE]DCRFCY    = 0
+    Endif
+
+    [F:FLUE]BSEVALSTR   = 0
+    [F:FLUE]DPRBASSTR   = 0
+    [F:FLUE]INCBUY      = 0
+    [F:FLUE]DPRCUMSTR   = 0
+  Else
+    [F:FLUE]FCY       = [F:FLUP]FCY
+    [F:FLUE]TXSCAT    = [F:FLUP]TXSCAT
+  Endif
+Return
+
+########################################
+# DESINIT_EXERCICE
+#
+# On ne gère plus le flux, on les supprime pour le contexte
+# Appelé par SUBCNX
+########################################
+Subprog DESINIT_EXERCICE (PCPY, PTYP, PPLN, PFLUTRATXS, RERROR)
+Value    Char    PCPY
+Value    Integer PTYP
+Value    Integer PPLN
+Value    Char    PFLUTRATXS()
+Variable Integer RERROR
+
+Local Integer LCNX
+
+  RERROR = 0
+  If clalev([F:FIS])  = 0 : Local File FISCYEAR            [FIS]  : Endif : # Exercices
+  If clalev([F:FLUE]) = 0 : Local File FXDLIFL             [FLUE] : Endif : # Suivi des flux (Exercice)
+
+  Call GET_CNX_FROM_PLAN (PCPY, PPLN, LCNX) From GLOBIENS
+  If LCNX <= 0 Then
+    # Contexte inexistant
+    RERROR = -1
+  Else
+    Read[FIS]FIY1=PCPY;LCNX;GVML_TECOURA
+    If fstat Then
+      # Erreur de lecture d'exercice
+      RERROR = -4
+    Else
+      If [F:FIS]INDCURPER > 1 Then
+        # Faut pas qu'il y ait eu de clôture périodique dans l'exercice
+        RERROR = -5
+      Else
+        If PTYP = GML_TFPLIASS Then
+          Delete [FLUE] Where CPY=PCPY and TYP=PTYP and DPRPLN=PPLN and FIYSTRDAT=[F:FIS]DATSTRFIY and CODTXS=PFLUTRATXS
+        Elsif PTYP = GML_TFCOMPTE Then
+          Delete [FLUE] Where CPY=PCPY and TYP=PTYP and DPRPLN=PPLN and FIYSTRDAT=[F:FIS]DATSTRFIY and CODTXS=""
+        Endif
+        If fstat Then
+          RERROR = -9 : # Erreur en suppression de flux
+        Endif
+      Endif
+    Endif
+  Endif
+End
+
+######################################## FQ75615
+# CUMUL_REEVAL
+#
+# Recherche et retourne le cumul des réévaluations pour une plage de dates donnée
+########################################
+Funprog CUMUL_REEVAL(PREF, PPLN, PDATSTR, PDATEND)
+Value Char    PREF
+Value Integer PPLN
+Value Date    PDATSTR
+Value Date    PDATEND
+
+  Local Decimal RET : RET = 0
+
+  Columns [F:E28](DPRBASO,DPRBASD,SNSEVE) : # FQ79819 : ajout de SNSEVE
+  For [F:E28] Where REF=PREF and DPRPLN = PPLN and EVTDAT >= PDATSTR and EVTDAT <= PDATEND
+    RET += (([F:E28]DPRBASD - [F:E28]DPRBASO) * (2*([F:E28]SNSEVE<2)-1))  : # FQ79819 : ajout de SNSEVE pour bien gérer les annulations
+  Next
+  Columns [F:E28]
+End RET
+
+#-------------------------------------------------------------------------------
+########################################
+# DESINIT_CONTEXTE
+#
+# Suppression du contexte, on purge les flux
+# Appelé par SUBCNX
+########################################
+Subprog DESINIT_CONTEXTE (PCPY, PTYP, PPLN, PFLUTRATXS, RERROR)
+Value    Char    PCPY
+Value    Integer PTYP
+Value    Integer PPLN
+Value    Char    PFLUTRATXS()
+Variable Integer RERROR
+
+Local Integer LCNX
+
+  RERROR = 0
+  If clalev([F:FIS])  = 0 : Local File FISCYEAR            [FIS]  : Endif : # Exercices
+  If clalev([F:FLUE]) = 0 : Local File FXDLIFL             [FLUE] : Endif : # Suivi des flux (Exercice)
+
+  Call GET_CNX_FROM_PLAN (PCPY, PPLN, LCNX) From GLOBIENS
+  If LCNX <= 0 Then
+    # Contexte inexistant
+    RERROR = -1
+  Else
+    If PTYP = GML_TFPLIASS Then
+       Delete [FLUE] Where CPY=PCPY and TYP=PTYP and DPRPLN=PPLN and CODTXS=PFLUTRATXS
+    Elsif PTYP = GML_TFCOMPTE Then
+       Delete [FLUE] Where CPY=PCPY and TYP=PTYP and DPRPLN=PPLN and CODTXS=""
+    Endif
+    If fstat Then
+       RERROR = -9 : # Erreur en suppression de flux
+    Endif
+  Endif
+End
+
+# FQ75129
+#**
+#* Création d'un flux spécial sur la période précédente pour les bien repris afin de gérer correctement
+#* les variations de bases et les transferts dans la période de création.
+#* Appelé par SUBFAS2
+#*
+#* @param PFAS   : classe F contenant le bien comptable
+#* @param PDEP   : classe F contenant le DEPREC courant
+#* @param RERROR : code retour
+#*!
+Funprog CREAT_FLUX_INITIAL(PFAS, PDEP, RERROR)
+Value Char       PFAS
+Value Char       PDEP
+Variable Integer RERROR
+
+  Local Char    LCPY(GLONCPY) : LCPY = evalue(PFAS+"CPY")
+  Local Integer LCNX          : LCNX = evalue(PDEP+"CNX")
+  Local Integer LPLN          : LPLN = evalue(PDEP+"DPRPLN")
+  Local Char    LGAC(GLONGAC)
+  Local Char    LCOA(GLONCOA)
+
+  If !clalev([F:FLU]) : Local File FXDLIFL    [FLU] : Endif
+  If !clalev([F:CNX]) : Local File CONTEXT    [CNX] : Endif
+  If !clalev([F:PFL]) : Local File PARFLUX    [PFL] : Endif
+  If !clalev([F:PFD]) : Local File PARFLUXDET [PFD] : Endif
+  If !clalev([F:DEP9]) : Local File DEPREC     [DEP9] : Endif : # FQ75615
+
+  Read [F:CNX]CNX0=LCPY;LCNX
+
+  If [F:CNX]ORIBASDPR(find(LPLN,[F:CNX]PLNCAA)-1)=GVML_OBIAS
+    LGAC = evalue(PFAS+"IASACC")
+    LCOA = [M:FPC]COA([M:FPC]IASLEDTYP-1)
+  Else
+    LGAC = evalue(PFAS+"GAC")
+    LCOA = [M:FPC]COA([M:FPC]GENLEDTYP-1)
+  Endif
+
+  # FQ75615
+  If find(G301SUB,[F:CNX]PLNCAA)
+    Read [F:DEP9]DEP0=evalue(PFAS+"AASREF");G301SUB;evalue(PDEP+"FIYENDDAT");evalue(PDEP+"PERENDDAT")
+    If fstat : Raz [F:DEP9] : Endif
+  Endif
+
+  If [F:CNX]FLUTRATXS(find(LPLN,[F:CNX]PLNCAA)-1) <> ""
+    # Liasse
+    Raz [F:FLU]
+    [F:FLU]TYP = GML_TFPLIASS
+    Read[PFD]PFD1=[F:CNX]FLUTRATXS(find(LPLN,[F:CNX]PLNCAA)-1);LCOA;LGAC
+    If fstat Then
+      RERROR = -8 : # Compte non défini dans le paramétrage des flux par liasse
+      End
+    Else
+      Read[PFL]PFL0=[F:PFD]CODTXS;[F:PFD]COA;[F:PFD]POSTXS
+    Endif
+    [F:FLU]TXSCAT = num$([F:PFD]POSTXS)
+    [F:FLU]TXSCLA = num$([F:PFL]CLATXS)
+    [F:FLU]CODTXS = [F:PFD]CODTXS
+    Gosub CRE_FLUX_INIT
+    If RERROR : End : Endif
+  Endif
+
+  If [F:CNX]FLUTRAACC(find(LPLN,[F:CNX]PLNCAA)-1) = G_OUI
+    # Compte
+    Raz [F:FLU]
+    [F:FLU]TYP    = GML_TFCOMPTE
+    [F:FLU]TXSCAT = LGAC
+    Gosub CRE_FLUX_INIT
+    If RERROR : End : Endif
+  Endif
+End
+
+$CRE_FLUX_INIT
+  [F:FLU]CPY       = evalue(PFAS+"CPY")
+  [F:FLU]FCY       = evalue(PFAS+"FCY")
+  [F:FLU]COA       = LCOA
+  [F:FLU]AASREF    = evalue(PFAS+"AASREF")
+  [F:FLU]DPRPLN    = evalue(PDEP+"DPRPLN")
+  [F:FLU]PERENDDAT = evalue(PDEP+"PERSTRDAT")-1
+  [F:FLU]GAC       = LGAC
+
+  [F:FLU]BSEVALEND = evalue(PDEP+"BSEVAL")
+  [F:FLU]DPRBASEND = evalue(PDEP+"DPRBAS")
+
+  [F:FLU]FLGSTATXS = GVML_TXSNON
+
+  # FQ75615
+  [F:FLU]AASTYPEND    = evalue(PFAS+"AASTYP")
+  If [F:CNX]ORIBASDPR(find(LPLN,[F:CNX]PLNCAA)-1) = GVML_OBIAS
+    [F:FLU]ACNEND     = evalue(PFAS+"IASACN")
+  Else
+    [F:FLU]ACNEND     = evalue(PFAS+"GACACN")
+  Endif
+  [F:FLU]SALCLSDATEND = evalue(PFAS+"SALCLSDAT")
+  [F:FLU]NSPVALEND    = evalue(PDEP+"NSPVAL")
+
+  Write [F:FLU]
+
+  If fstat
+    RERROR = -10
+  Endif
+Return
+# FIN FQ75129
+########################################################################################################
+
+#########################################################################
+#
+# GESTION DES MESSAGES
+#
+
+#########################################################################
+# Sous programme de conversion numero d'erreur / message d'erreur
+# En entrée : RERROR   - numéro d'erreur renvoyé par TRTFLUX
+# En sortie : LMESSAGE - message correspondant au numéro d'erreur
+#
+Subprog GERE_MSG_ERREUR_FLUX (RERROR, LMESSAGE)
+Value    Integer RERROR
+Variable Char    LMESSAGE
+
+  Case RERROR
+    When -1
+      LMESSAGE = mess(121,7770,1) : # Contexte inexistant
+    When -2
+      LMESSAGE = mess(122,7770,1) : # Plan non géré
+    When -3
+      LMESSAGE = mess(123,7770,1) : # Flux non géré sur ce plan
+    When -4
+      LMESSAGE = mess(124,7770,1) : # Erreur de lecture de l'exercice courant
+    When -5
+      LMESSAGE = mess(125,7770,1) : # Activation/désactivation des flux impossible lorsque des clôtures périodiques ont eu lieu dans l'exercice
+    When -6
+      LMESSAGE = mess(126,7770,1) : # Compte inexistant
+    When -7
+      LMESSAGE = mess(127,7770,1) : # Erreur en mise à jour des flux
+    When -8
+      LMESSAGE = mess(128,7770,1) : # Compte non défini dans le paramétrage des flux par liasse
+    When -9
+      LMESSAGE = mess(182,7770,1) : # Erreur en suppression des flux
+    When -10
+      LMESSAGE = mess(183,7770,1) : # Erreur en écriture des flux
+    When -11
+      LMESSAGE = mess(184,7770,1) : # Erreur en lecture des flux
+    When -12
+      LMESSAGE = mess(188,7770,1) : # Erreur en lecture de l'enregistrement d'amortissement
+    When Default
+      LMESSAGE = mess(129,7770,1) : # Erreur inconnue en gestion des flux
+  Endcase
+End
+

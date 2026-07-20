@@ -1,0 +1,977 @@
+#<AdxTL>@(#)1.0.0.0 $Revision$
+# ------------------------------------------------------------------------------ #
+# TRC1MAJ30 : M.a.j à effectuer lors du passage à version 6  Module Tronc commun #
+#             Extension du traitement TRCMAJ30                                   #
+# ------------------------------------------------------------------------------ #
+# Appelé par TRCMAJ30 dans ATRCMAJ30 : Sous-pro Avant mise à jour                #
+#                                                                                #
+#                                                                                #
+#   AV_MVC : Maj des tables BPCUSTMVT et LASTCUSMVT                              #
+#   - Table BPCUSTMVT  : Mouvements clients                                      #
+#           BPCRSK : Tiers risque : Client facture                               #
+#           CPY    : Société      : Société de FINRSPFCY                         #
+#           CUR    : Devise       : ACCCUR                                       #
+#           Bascule Mnts devise transaction : Ex : ORDBPCNOT vers ORDBPCNOTC     #
+#           Init Mnts devise société                                             #
+#           Init Mnts devise dossier                                             #
+#           Bascule LASDOCNUM, LASDOCDAT, LASDOCAMT dans nvelle table LASTCUSMVT #
+#   - Table LASTCUSMVT : Derniers mvts clients                                   #
+#           Init Enr. Dernier devis      : LASDOCXXX(0)                          #
+#           Init Enr. Dernière commande  : LASDOCXXX(1)                          #
+#           Init Enr. Dernière livraison : LASDOCXXX(2)                          #
+#           Init Enr. Dernière facture   : LASDOCXXX(3)                          #
+#           Init Enr. Dernier règlement  : LASDOCXXX(4)                          #
+#           Init Enr. Dernier impayé     : LASDOCXXX(5)                          #
+#                                                                                #
+#   AV_MVS : Maj des tables BPSUPPMVT et LASTSUPMVT                              #
+#   - Table BPSUPPMVT - Mouvements fournisseurs  :                               #
+#           BPSRSK    Tiers risque                                               #
+#           CPY       Société                                                    #
+#           CUR       Devise transaction                                         #
+#           Eclatement des montants en devises transaction, société et           #
+#           dossier avec en plus pour les commandes et réceptions les            #
+#           montants HT et TTC                                                   #
+#   - Table LASTSUPMVT - Derniers mvts fournisseurs                              #
+#           Alimentation de cette nouvelle table                                 #
+# ------------------------------------------------------------------------------ #
+# Appelé par TRCMAJ30 dans TRCMAJ30 : Sous-pro Après mise à jour                 #
+#                                                                                #
+#                                                                                #
+#   AP_MVC : Maj des tables BPCUSTMVT et LASTCUSMVT                              #
+#   - Table BPCUSTMVT/LASTCUSMVT : Appel resynchro des encours clients           #
+#                                                                                #
+#   AP_MVS : Maj des tables BPSUPPMVT et LASTSUPMVT                              #
+#   - Table BPSUPPMVT/LASTSUPMVT : Appel resynchro des encours fournisseurs      #
+#                                                                                #
+# ------------------------------------------------------------------------------ #
+
+
+
+#################################################################################
+# M.a.j. de BPCUSTMVT           : Mouvements clients
+#
+# - Init BPCRSK : Tiers risque : Client facture
+# - Init CPY    : Société      : Société de FINRSPFCY
+# - Init CUR    : Devise       : ACCCUR
+# - Bascule Mnts devise transaction : Ex : ORDBPCNOT vers ORDBPCNOTC
+# - Init Mnts devise société
+# - Init Mnts devise dossier
+# - Bascule LASDOCNUM, LASDOCDAT, LASDOCAMT dans nvelle table LASTCUSMVT
+#
+# M.a.j. de LASTCUSMVT          : Derniers mvts clients
+#
+# - Init Enr. Dernier devis      : LASDOCXXX(0)
+# - Init Enr. Dernière commande  : LASDOCXXX(1)
+# - Init Enr. Dernière livraison : LASDOCXXX(2)
+# - Init Enr. Dernière facture   : LASDOCXXX(3)
+# - Init Enr. Dernier règlement  : LASDOCXXX(4)
+# - Init Enr. Dernier impayé     : LASDOCXXX(5)
+#
+#################################################################################
+Subprog AV_MVC
+
+If filinfo(filpath("FIL","BPCUSTMVT","fde",[F:ADS]DOSSIER),0) <=0   End   Endif
+
+Call ECR_TIME("DOSMAJ30 Customer Transactions Process : Update BPCUSTMVT") From DOSSUB
+
+Local File =[F:ADS]DOSSIER+".BPCUSTMVT"  [MVC]
+Local File =[F:ADS]DOSSIER+".BPCUSTMVT"  [MVC1]
+Local File =[F:ADS]DOSSIER+".LASTCUSMVT" [LCM]
+Local File =[F:ADS]DOSSIER+".BPCUSTOMER" [BPC]
+Local File =[F:ADS]DOSSIER+".TABCUR"     [TCU]
+Local File =[F:ADS]DOSSIER+".TABCHANGE"  [TCH]
+If [F:ADS]MODULE(4)=2
+    Local File =[F:ADS]DOSSIER+".SQUOTE"    [SQH]
+    Local File =[F:ADS]DOSSIER+".SORDER"    [SOH]
+    Local File =[F:ADS]DOSSIER+".SDELIVERY" [SDH]
+Endif
+Local File =[F:ADS]DOSSIER+".SINVOICE"   [SIH]
+If [F:ADS]MODULE(2)=2
+    Local File =[F:ADS]DOSSIER+".PAYMENTH" [PYH]
+Endif
+
+Local Integer NBENR
+Raz NBENR
+
+Local Integer COMPTEUR, STOP
+Local Char    CLE1 (GLONBPR), CLE2 (GLONFCY)
+Local Char    PARAM(10), CRITERE (90)
+
+Local Integer WIFFTYP, WMVTTYP
+Local Char    WIFFFCY(GLONFCY), WCUR(GLONCUR), WCURRPT(GLONCUR), WCPY(GLONCPY), WBPCRSK(GLONBPC)
+
+Local Integer STAT, WTYPCUR
+Local Decimal WMNTDES, WAMT
+# Lecture du paramètre au cas où cela ne soit pas fait lors de la migration
+Global Char GCURSHR
+Call PARAM("","CURSHRFLD",PARAM) From ADOVAL : # Devise zones communes
+GCURSHR = PARAM
+
+Raz CLE1, CLE2
+Trbegin [MVC]
+$BOUCLE_MVC
+
+If  STOP=1
+  CRITERE = 'BPCNUM="'+CLE1+'" & FINRSPFCY>"'+CLE2+'" & CPY=""'
+  STOP = 2
+Elsif STOP=2
+  CRITERE = 'BPCNUM>"'+CLE1+'" & CPY=""'
+  STOP = 0
+Else
+  CRITERE = '1=1 & CPY=""'
+Endif
+
+#CRITERE = 'BPCNUM="DIS001" & CPY="" & find(FINRSPFCY,"ASN","GEN","MAR","PAR")'
+
+Raz COMPTEUR
+
+For [MVC]MVC0 Where evalue(CRITERE)
+    #Readlock [MVC] Curr  # FGR 11/03/2010 : X3SUIVI63191 : Ne sert à rien ici
+    #If fstat
+    #    Call ECR_TRACE("File BPCUSTMVT"-[F:MVC]BPCNUM-[F:MVC]FINRSPFCY+", Error ="-num$(fstat),1) From GESECRAN
+    #Else
+        # Init. tiers risque avec le client facture car jusqu'à présent le ctrl encours est fait sur le client facture
+        If [F:BPC]BPCNUM<>[F:MVC]BPCNUM
+            Read [BPC]BPC0=[F:MVC]BPCNUM : If fstat Raz [F:BPC] Endif
+        Endif
+        If [F:BPC]BPCNUM<>"" & [F:MVC]FINRSPFCY<>""
+            WBPCRSK=[F:BPC]BPCNUM : If [F:BPC]BPCINV<>"" WBPCRSK=[F:BPC]BPCINV Endif
+            Call GETDEV([F:ADS]DOSSIER,[F:MVC]FINRSPFCY) From TRTX3CPT
+
+            Call PARAM(GSOCIETE,"CNSTYPCUR",PARAM) From ADOVAL : # Type de cours pour consultation
+            WTYPCUR=val(PARAM)
+            WCPY=GSOCIETE
+            If [F:MVC]ACCCUR<>"" WCUR=[F:MVC]ACCCUR Else WCUR=GLOCALDEV Endif
+            If WCUR<>"" & WCPY<>""
+                # On recherche si l'enr correspondant existe (avec les éléments de la future clé)
+                Filter [MVC1] Where BPCRSK=WBPCRSK & CPY=WCPY & BPCNUM=[F:MVC]BPCNUM & CUR=WCUR
+                Read [MVC1] First
+                If fstat = 0
+                    #Readlock [MVC1] Curr  # FGR 11/03/2010 : X3SUIVI63191 : Ne sert à rien ici
+                    #If fstat = 1
+                    #  Call ECR_TRACE("File BPCUSTMVT"-[F:MVC1]BPCRSK-[F:MVC1]CPY-[F:MVC1]BPCNUM-[F:MVC1]CUR+", Error ="-num$(fstat),1) From GESECRAN
+                    #Endif
+                    Gosub INIT_MVC_MNT
+                    Rewrite [MVC1]
+                Else
+                    Raz [F:MVC1]
+                    [F:MVC1]BPCRSK=WBPCRSK
+                    [F:MVC1]CPY=WCPY
+                    [F:MVC1]BPCNUM=[F:MVC]BPCNUM
+                    [F:MVC1]CUR=WCUR
+                    [F:MVC1]ACCCUR=WCUR
+                    Gosub INIT_MVC_MNT
+                    Write [MVC1]
+                Endif
+                NBENR+=1
+                If fstat
+                    Call ECR_TRACE("File BPCUSTMVT"-[F:MVC1]BPCRSK-[F:MVC1]CPY-[F:MVC1]BPCNUM-[F:MVC1]CUR+", Error ="-num$(fstat),1) From GESECRAN
+                Else
+#                  Call ECR_TRACE("BPCUSTMVT="-[F:MVC1]BPCRSK-[F:MVC1]CPY-[F:MVC1]BPCNUM-[F:MVC1]CUR,0) From GESECRAN#
+                    Delete [MVC]
+                    COMPTEUR += 1
+                    If COMPTEUR > GMAXUPDTRS
+                        Commit
+                        Trbegin [MVC]
+                        CLE1=[F:MVC]BPCNUM : CLE2=[F:MVC]FINRSPFCY : STOP=1 : Break
+                    Endif
+                Endif
+                Filter [MVC1]
+            Else
+                Delete [MVC]
+            Endif
+        Else
+            Delete [MVC]
+        Endif
+    #Endif
+Next
+If STOP : Goto BOUCLE_MVC : Endif
+Commit
+
+Call ECR_TRACE("DOSMAJ30 : Processed records number :"-num$(NBENR),0) From GESECRAN
+
+Close Local File [MVC]
+Close Local File [MVC1]
+Close Local File [LCM]
+Close Local File [BPC]
+Close Local File [TCU]
+Close Local File [TCH]
+If [F:ADS]MODULE(4)=2
+    Close Local File [SQH]
+    Close Local File [SOH]
+    Close Local File [SDH]
+Endif
+Close Local File [SIH]
+If [F:ADS]MODULE(2)=2
+    Close Local File [PYH]
+Endif
+
+
+End
+
+$INIT_MVC_MNT
+Local Integer I,W_DEB,W_FIN
+
+# Initialisation des mnts en devise transaction
+[F:MVC1]ORDBPCNOTC+=[F:MVC]ORDBPCNOT : [F:MVC1]ORDBPCATIC+=[F:MVC]ORDBPCATI
+[F:MVC1]ORDBPINOTC+=[F:MVC]ORDBPINOT : [F:MVC1]ORDBPIATIC+=[F:MVC]ORDBPIATI
+[F:MVC1]DLVOSTC   +=[F:MVC]DLVOST    : [F:MVC1]NIVDLVC   +=[F:MVC]NIVDLV
+[F:MVC1]NPTINVC   +=[F:MVC]NPTINV
+[F:MVC1]NYTBILC(0)+=[F:MVC]NYTBIL(0) : [F:MVC1]NYTBILC(1)+=[F:MVC]NYTBIL(1) : [F:MVC1]NYTBILC(2)+=[F:MVC]NYTBIL(2)
+[F:MVC1]BLCC      +=[F:MVC]BLC
+[F:MVC1]LNDBPCNOTC+=[F:MVC]LNDBPCNOT : [F:MVC1]LNDBPCATIC+=[F:MVC]LNDBPCATI
+[F:MVC1]LNDBPINOTC+=[F:MVC]LNDBPINOT : [F:MVC1]LNDBPIATIC+=[F:MVC]LNDBPIATI
+[F:MVC1]LNDDLVC   +=[F:MVC]LNDDLV
+# Initialisation des mnts en devise societe
+If [F:BPC]BPCNUM<>[F:MVC1]BPCRSK
+    Read [BPC]BPC0=[F:MVC1]BPCRSK : If fstat Raz [F:BPC] Endif
+Endif
+If [F:MVC1]CUR<>GLOCALDEV
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]ORDBPCNOT,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]ORDBPCNOTL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]ORDBPCATI,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]ORDBPCATIL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]ORDBPINOT,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]ORDBPINOTL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]ORDBPIATI,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]ORDBPIATIL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]DLVOST,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]DLVOSTL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]NIVDLV,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NIVDLVL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]NPTINV,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NPTINVL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]NYTBIL(0),WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NYTBILL(0)+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]NYTBIL(1),WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NYTBILL(1)+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]NYTBIL(2),WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NYTBILL(2)+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]BLC,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]BLCL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDBPCNOT,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDBPCNOTL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDBPCATI,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDBPCATIL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDBPINOT,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDBPINOTL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDBPIATI,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDBPIATIL+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,GLOCALDEV,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDDLV,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDDLVL+=WMNTDES
+Else
+    [F:MVC1]ORDBPCNOTL+=[F:MVC]ORDBPCNOT : [F:MVC1]ORDBPCATIL+=[F:MVC]ORDBPCATI
+    [F:MVC1]ORDBPINOTL+=[F:MVC]ORDBPINOT : [F:MVC1]ORDBPIATIL+=[F:MVC]ORDBPIATI
+    [F:MVC1]DLVOSTL   +=[F:MVC]DLVOST    : [F:MVC1]NIVDLVL   +=[F:MVC]NIVDLV
+    [F:MVC1]NPTINVL   +=[F:MVC]NPTINV
+    [F:MVC1]NYTBILL(0)+=[F:MVC]NYTBIL(0) : [F:MVC1]NYTBILL(1)+=[F:MVC]NYTBIL(1) : [F:MVC1]NYTBILL(2)+=[F:MVC]NYTBIL(2)
+    [F:MVC1]BLCL      +=[F:MVC]BLC
+    [F:MVC1]LNDBPCNOTL+=[F:MVC]LNDBPCNOT : [F:MVC1]LNDBPCATIL+=[F:MVC]LNDBPCATI
+    [F:MVC1]LNDBPINOTL+=[F:MVC]LNDBPINOT : [F:MVC1]LNDBPIATIL+=[F:MVC]LNDBPIATI
+    [F:MVC1]LNDDLVL   +=[F:MVC]LNDDLV
+Endif
+# Initialisation des mnts en devise dossier
+# On prend la devise zone commune si elle est renseignée sinon on prend la devise dossier
+If GCURSHR <> "" WCURRPT=GCURSHR Else WCURRPT=GSYSCUR Endif
+If [F:MVC1]CUR<>WCURRPT
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]ORDBPCNOT,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]ORDBPCNOTR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]ORDBPCATI,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]ORDBPCATIR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]ORDBPINOT,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]ORDBPINOTR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]ORDBPIATI,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]ORDBPIATIR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]DLVOST,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]DLVOSTR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]NIVDLV,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NIVDLVR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]NPTINV,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NPTINVR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]NYTBIL(0),WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NYTBILR(0)+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]NYTBIL(1),WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NYTBILR(1)+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]NYTBIL(2),WMNTDES, STAT) From TRTDEV
+    [F:MVC1]NYTBILR(2)+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]BLC,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]BLCR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDBPCNOT,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDBPCNOTR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDBPCATI,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDBPCATIR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDBPINOT,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDBPINOTR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDBPIATI,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDBPIATIR+=WMNTDES
+    Call CONVERT([F:MVC1]CUR,WCURRPT,GLOCALDEV,WTYPCUR,date$,[F:MVC]LNDDLV,WMNTDES, STAT) From TRTDEV
+    [F:MVC1]LNDDLVR+=WMNTDES
+Else
+    [F:MVC1]ORDBPCNOTR+=[F:MVC]ORDBPCNOT : [F:MVC1]ORDBPCATIR+=[F:MVC]ORDBPCATI
+    [F:MVC1]ORDBPINOTR+=[F:MVC]ORDBPINOT : [F:MVC1]ORDBPIATIR+=[F:MVC]ORDBPIATI
+    [F:MVC1]DLVOSTR   +=[F:MVC]DLVOST    : [F:MVC1]NIVDLVR   +=[F:MVC]NIVDLV
+    [F:MVC1]NPTINVR   +=[F:MVC]NPTINV
+    [F:MVC1]NYTBILR(0)+=[F:MVC]NYTBIL(0) : [F:MVC1]NYTBILR(1)+=[F:MVC]NYTBIL(1) : [F:MVC1]NYTBILR(2)+=[F:MVC]NYTBIL(2)
+    [F:MVC1]BLCR      +=[F:MVC]BLC
+    [F:MVC1]LNDBPCNOTR+=[F:MVC]LNDBPCNOT : [F:MVC1]LNDBPCATIR+=[F:MVC]LNDBPCATI
+    [F:MVC1]LNDBPINOTR+=[F:MVC]LNDBPINOT : [F:MVC1]LNDBPIATIR+=[F:MVC]LNDBPIATI
+    [F:MVC1]LNDDLVR   +=[F:MVC]LNDDLV
+Endif
+
+# Bascule tableau LASDOCXXX dans la nouvelle table LASTCUSMVT
+If [F:ADS]MODULE(4)=2 W_DEB=0 Else W_DEB=3 Endif
+If [F:ADS]MODULE(2)=2 W_FIN=5 Else W_FIN=3 Endif
+
+For I=W_DEB To W_FIN
+    If [F:MVC]LASDOCNUM(I)="" Goto NXTDOC Endif
+    # Vérification que le dernier n° document existe toujours
+    # S'il n'existe pas faut-il le rechercher ? Risque de pb de perfs si oui voir TRTCNSBAG
+    Case I
+        When 0 : # Dernier devis
+            WIFFTYP=4 : WMVTTYP=1
+            If [F:SQH]SQHNUM<>[F:MVC]LASDOCNUM(I)
+                Read [SQH]SQH0=[F:MVC]LASDOCNUM(I) : If fstat Raz [F:SQH] : Raz WIFFTYP, WMVTTYP : Endif
+            Endif
+            WIFFFCY=[F:SQH]SALFCY : WCUR=[F:SQH]CUR : WAMT=[F:SQH]QUOATI
+        When 1 : # Dernière commande
+            WIFFTYP=6 : WMVTTYP=2
+            If [F:SOH]SOHNUM<>[F:MVC]LASDOCNUM(I)
+                Read [SOH]SOH0=[F:MVC]LASDOCNUM(I) : If fstat Raz [F:SOH] : Raz WIFFTYP, WMVTTYP : Endif
+            Endif
+            WIFFFCY=[F:SOH]SALFCY : WCUR=[F:SOH]CUR : WAMT=[F:SOH]ORDATI
+        When 2 : # Dernière livraison
+            WIFFTYP=7 : WMVTTYP=3
+            If [F:SDH]SDHNUM<>[F:MVC]LASDOCNUM(I)
+                Read [SDH]SDH0=[F:MVC]LASDOCNUM(I) : If fstat Raz [F:SDH] : Raz WIFFTYP, WMVTTYP : Endif
+            Endif
+            WIFFFCY=[F:SDH]SALFCY : WCUR=[F:SDH]CUR : WAMT=[F:SDH]DLVATI
+        When 3 : # Dernière facture
+            WIFFTYP=9 : WMVTTYP=5
+            If [F:SIH]NUM<>[F:MVC]LASDOCNUM(I)
+                Read [SIH]SIH0=[F:MVC]LASDOCNUM(I) : If fstat Raz [F:SIH] : Raz WIFFTYP, WMVTTYP : Endif
+            Endif
+            WIFFFCY=[F:SIH]FCY    : WCUR=[F:SIH]CUR : WAMT=[F:SIH]AMTATI
+        When 4 : # Dernier règlement
+            WIFFTYP=15 : WMVTTYP=10
+            If [F:PYH]NUM<>[F:MVC]LASDOCNUM(I)
+                Read [PYH]PYH0=[F:MVC]LASDOCNUM(I) : If fstat Raz [F:PYH] : Raz WIFFTYP, WMVTTYP : Endif
+            Endif
+            WIFFFCY=[F:PYH]FCY    : WCUR=[F:PYH]CUR : WAMT=[F:PYH]AMTCUR
+        When 5 : # Dernier impayé
+            WIFFTYP=16 : WMVTTYP=11
+            If [F:PYH]NUM<>[F:MVC]LASDOCNUM(I)
+                Read [PYH]PYH0=[F:MVC]LASDOCNUM(I) : If fstat Raz [F:PYH] : Raz WIFFTYP, WMVTTYP : Endif
+            Endif
+            WIFFFCY=[F:PYH]FCY    : WCUR=[F:PYH]CUR : WAMT=[F:PYH]AMTCUR
+    Endcase
+    If WIFFTYP<>0
+        #Readlock [LCM]LCM0 = [F:MVC]BPCNUM;WIFFTYP;GSOCIETE  # FGR 11/03/2010 : X3SUIVI63191 : Ne sert à rien ici
+        Read [LCM]LCM0 = [F:MVC]BPCNUM;WIFFTYP;GSOCIETE  # FGR 11/03/2010 : X3SUIVI63191
+        If fstat = 1
+            Call ECR_TRACE("File LASTCUSMVT"-[F:MVC]BPCNUM-num$(WIFFTYP)-GSOCIETE+", Error ="-num$(fstat),1) From GESECRAN
+        Elsif fstat = 4 | fstat = 5
+            Raz [F:LCM]
+            [F:LCM]BPCNUM    = [F:MVC]BPCNUM
+            [F:LCM]IFFTYP    = WIFFTYP
+            [F:LCM]CPY       = GSOCIETE
+            [F:LCM]MVTTYP    = WMVTTYP
+            [F:LCM]MVTDAT    = [F:MVC]LASDOCDAT(I)
+            [F:LCM]VCRNUM    = [F:MVC]LASDOCNUM(I)
+            [F:LCM]IFFFCY    = WIFFFCY 
+            [F:LCM]CUR       = WCUR
+            [F:LCM]AMT       = WAMT
+            If evalue ("dim([F:LCM]CREUSR)")>0 [F:LCM]CREUSR = GUSER:Endif
+            If evalue ("dim([F:LCM]CREDAT)")>0 [F:LCM]CREDAT = date$:Endif
+            Write [LCM]
+            If fstat
+                Call ECR_TRACE("File LASTCUSMVT"-[F:MVC]BPCNUM-num$(WIFFTYP)-GSOCIETE+", Error ="-num$(fstat),1) From GESECRAN
+            Endif
+        Elsif fstat = 0 : # Ce cas ne devrait pas arriver
+            [F:LCM]MVTDAT    = [F:MVC]LASDOCDAT(I)
+            [F:LCM]VCRNUM    = [F:MVC]LASDOCNUM(I)
+            [F:LCM]IFFFCY    = WIFFFCY 
+            [F:LCM]CUR       = WCUR
+            [F:LCM]AMT       = [F:MVC]LASDOCAMT(I)
+            If evalue ("dim([F:MVC]UPDDAT)")>0 [F:MVC]UPDDAT = date$:Endif
+            If evalue ("dim([F:MVC]UPDUSR)")>0 [F:MVC]UPDUSR = GUSER:Endif
+            Rewrite [LCM]
+            If fstat
+                Call ECR_TRACE("File LASTCUSMVT"-[F:MVC]BPCNUM-num$(WIFFTYP)-GSOCIETE+", Error ="-num$(fstat),1) From GESECRAN
+            Endif
+        Endif
+    Endif
+    $NXTDOC
+Next
+
+# Récupération des données comptables
+[F:MVC1]FCTOST    +=[F:MVC]FCTOST
+[F:MVC1]UNPNBR    +=[F:MVC]UNPNBR
+If [F:MVC]UNPDAT>[F:MVC1]UNPDAT       [F:MVC1]UNPDAT=[F:MVC]UNPDAT : Endif
+If [F:MVC]FUPDAT>[F:MVC1]FUPDAT
+    [F:MVC1]FUPDAT=[F:MVC]FUPDAT
+    [F:MVC1]FUPLEV=[F:MVC]FUPLEV
+Endif
+If [F:MVC]MAXFUPLEV>[F:MVC1]MAXFUPLEV [F:MVC1]MAXFUPLEV=[F:MVC]MAXFUPLEV : Endif
+Return
+
+
+#-----------------------------------------------------------------#
+# Traitement des mouvements fournisseurs                          #
+# --------------------------------------------------------------- #
+# Table BPSUPPMVT - Mouvements fournisseurs  :                    #
+#   BPSRSK    Tiers risque                                        #
+#   CPY       Société                                             #
+#   CUR       Devise transaction                                  #
+#   Eclatement des montants en devises transaction, société et    #
+#     dossier avec en plus pour les commandes et réceptions les   #
+#     montants HT et TTC                                          #
+#                                                                 #
+# Table LASTSUPMVT - Derniers mvts fournisseurs                   #
+#   Alimentation de cette nouvelle table                          #
+#-----------------------------------------------------------------#
+Subprog AV_MVS
+#-----
+If filinfo(filpath("FIL","BPSUPPMVT","fde",[F:ADS]DOSSIER),0)<=0  End : Endif
+#-----
+Gosub SET_FIRST   From TRTFIRST
+#----- Tables tronc commun et superviseur -----#
+Local File =[F:ADS]DOSSIER+".BPSUPPMVT"   [MVS]
+Local File =[F:ADS]DOSSIER+".BPSUPPMVT"   [MVS2]
+Local File =[F:ADS]DOSSIER+".LASTSUPMVT"  [LSM]
+Local File =[F:ADS]DOSSIER+".BPSUPPLIER"  [BPS]
+Local File =[F:ADS]DOSSIER+".PINVOICE"    [PIH]
+Local File =[F:ADS]DOSSIER+".TABCUR"      [TCU]
+Local File =[F:ADS]DOSSIER+".TABCHANGE"   [TCH]
+#----- Tables achats -----#
+If [F:ADS]MODULE(5)=2
+  Local File =[F:ADS]DOSSIER+".PQUOTAT"   [PQH]
+  Local File =[F:ADS]DOSSIER+".PORDER"    [POH]
+  Local File =[F:ADS]DOSSIER+".PRECEIPT"  [PTH]
+  Local File =[F:ADS]DOSSIER+".PRECEIPTD" [PTD]
+Endif
+#----- Table tiers -----#
+If [F:ADS]MODULE(2)=2
+  Local File =[F:ADS]DOSSIER+".PAYMENTH"  [PYH]
+Endif
+#-----
+Local File =[F:ADS]DOSSIER+".ATYPE"       [ATY]
+#-----
+If dim(GLONBPR)<1  Global Shortint GLONBPR : Endif
+If dim(GLONFCY)<1  Global Shortint GLONFCY : Endif
+If dim(GLONVCR)<1  Global Shortint GLONVCR : Endif
+If dim(GLONCUR)<1  Global Shortint GLONCUR : Endif
+#-----
+Read [ATY] CODTYP="BPR"  : If fstat  Raz [F:ATY] : [F:ATY]LNGTYP=10 : Endif
+GLONBPR=[F:ATY]LNGTYP
+Read [ATY] CODTYP="FCY"  : If fstat  Raz [F:ATY] : [F:ATY]LNGTYP=5  : Endif
+GLONFCY=[F:ATY]LNGTYP
+Read [ATY] CODTYP="VCR"  : If fstat  Raz [F:ATY] : [F:ATY]LNGTYP=15 : Endif
+GLONVCR=[F:ATY]LNGTYP
+Read [ATY] CODTYP="CUR"  : If fstat  Raz [F:ATY] : [F:ATY]LNGTYP=5  : Endif
+GLONCUR=[F:ATY]LNGTYP
+#-----
+Close Local File [ATY]
+#-----
+Local Integer  COMPTEUR, STOP, WNBR
+Local Integer  STA
+Local Char     CLE1(GLONBPR), CRITERE(100)
+Local Char     CLE2(GLONFCY)
+#-----
+Local Libelle  WIFFTYP
+Local Libelle  WMVTTYP
+Local Date     WMVTDAT
+Local Char     VCRNUM (GLONVCR)
+Local Char     WCUR   (GLONCUR)
+Local Decimal  WAMT, WAMT2
+Local Char     WIFFFCY(GLONFCY)
+Local Char     WBPSNUM(GLONBPR)
+Local Char     WFINRSPFCY(GLONFCY)
+#-----
+Raz CLE1, CLE2, STOP, WNBR
+Call ECR_TIME("DOSMAJ30 Supplier Transactions Process 1 : Update BPSUPPMVT") From DOSSUB
+$BOUCLE_MVS
+If  STOP=1
+  CRITERE = 'BPSNUM="'+CLE1+'" & FINRSPFCY>"'+CLE2+'" & CPY=""'
+  STOP = 2
+Elsif STOP=2
+  CRITERE = 'BPSNUM>"'+CLE1+'" & CPY=""'
+  STOP = 0
+Else
+  CRITERE = '1=1 & CPY=""'
+Endif
+Raz COMPTEUR
+Trbegin [MVS],[LSM]
+  For [MVS] MVS0 Where evalue(CRITERE)
+    WBPSNUM   =[F:MVS]BPSNUM
+    WFINRSPFCY=[F:MVS]FINRSPFCY
+    Call GETDEV([F:ADS]DOSSIER,[F:MVS]FINRSPFCY) From TRTX3CPT
+    Read [BPS] BPS0=[F:MVS]BPSNUM : If fstat  Raz [F:BPS] : Endif
+    If [F:BPS]BPSINV=""  [F:BPS]BPSINV=[F:BPS]BPSNUM : Endif
+    #-----
+    [F:MVS]BPSRSK =[F:BPS]BPSINV
+    [F:MVS]CPY    =GSOCIETE
+    [F:MVS]CUR    =[F:MVS]ACCCUR
+    #----- Montants en devise transaction -----#
+    [F:MVS]ORDNOTC   =[F:MVS]ORDAMT
+    [F:MVS]ORDATIC   =[F:MVS]ORDAMT
+    [F:MVS]RCPNOTC   =[F:MVS]RCPAMT
+    [F:MVS]RCPATIC   =[F:MVS]RCPAMT
+    [F:MVS]BILAMTC(0)=[F:MVS]BILAMT(0)
+    [F:MVS]BILAMTC(1)=[F:MVS]BILAMT(1)
+    [F:MVS]BILAMTC(2)=[F:MVS]BILAMT(2)
+    [F:MVS]BLCAMTC   =[F:MVS]BLCAMT
+    [F:MVS]INVAMTC   =[F:MVS]INVAMT
+    #----- Montants en devise société -----#
+    If [F:MVS]CUR<>GLOCALDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]ORDNOTC,[F:MVS]ORDNOTL,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]ORDATIC,[F:MVS]ORDATIL,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]RCPNOTC,[F:MVS]RCPNOTL,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]RCPATIC,[F:MVS]RCPATIL,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]BILAMTC(0),[F:MVS]BILAMTL(0),STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]BILAMTC(1),[F:MVS]BILAMTL(1),STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]BILAMTC(2),[F:MVS]BILAMTL(2),STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]BLCAMTC,[F:MVS]BLCAMTL,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GLOCALDEV,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]INVAMTC,[F:MVS]INVAMTL,STA) From TRTDEV
+    Else
+      [F:MVS]ORDNOTL   =[F:MVS]ORDNOTC
+      [F:MVS]ORDATIL   =[F:MVS]ORDATIC
+      [F:MVS]RCPNOTL   =[F:MVS]RCPNOTC
+      [F:MVS]RCPATIL   =[F:MVS]RCPATIC
+      [F:MVS]BILAMTL(0)=[F:MVS]BILAMTC(0)
+      [F:MVS]BILAMTL(1)=[F:MVS]BILAMTC(1)
+      [F:MVS]BILAMTL(2)=[F:MVS]BILAMTC(2)
+      [F:MVS]BLCAMTL   =[F:MVS]BLCAMTC
+      [F:MVS]INVAMTL   =[F:MVS]INVAMTC
+    Endif
+    #----- Montants en devise dossier -----#
+    If [F:MVS]CUR<>GCURSHR
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]ORDNOTC,[F:MVS]ORDNOTR,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]ORDATIC,[F:MVS]ORDATIR,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]RCPNOTC,[F:MVS]RCPNOTR,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]RCPATIC,[F:MVS]RCPATIR,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]BILAMTC(0),[F:MVS]BILAMTR(0),STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]BILAMTC(1),[F:MVS]BILAMTR(1),STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]BILAMTC(2),[F:MVS]BILAMTR(2),STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]BLCAMTC,[F:MVS]BLCAMTR,STA) From TRTDEV
+      Call CONVERT([F:MVS]CUR,GCURSHR,GLOCALDEV,[F:BPS]CHGTYP,date$,
+&                  [F:MVS]INVAMTC,[F:MVS]INVAMTR,STA) From TRTDEV
+    Else
+      [F:MVS]ORDNOTR   =[F:MVS]ORDNOTC
+      [F:MVS]ORDATIR   =[F:MVS]ORDATIC
+      [F:MVS]RCPNOTR   =[F:MVS]RCPNOTC
+      [F:MVS]RCPATIR   =[F:MVS]RCPATIC
+      [F:MVS]BILAMTR(0)=[F:MVS]BILAMTC(0)
+      [F:MVS]BILAMTR(1)=[F:MVS]BILAMTC(1)
+      [F:MVS]BILAMTR(2)=[F:MVS]BILAMTC(2)
+      [F:MVS]BLCAMTR   =[F:MVS]BLCAMTC
+      [F:MVS]INVAMTR   =[F:MVS]INVAMTC
+    Endif
+    #----- Ecriture ou réécriture mouvements fournisseurs ([F:MVS2]) -----#
+    Filter [MVS2] Where BPSRSK=[F:MVS]BPSRSK
+&                     & CPY   =[F:MVS]CPY
+&                     & BPSNUM=[F:MVS]BPSNUM
+&                     & CUR   =[F:MVS]CUR
+    Read [MVS2] First
+    If !fstat
+      [F:MVS2]ORDNOTC   +=[F:MVS]ORDNOTC
+      [F:MVS2]ORDATIC   +=[F:MVS]ORDATIC
+      [F:MVS2]RCPNOTC   +=[F:MVS]RCPNOTC
+      [F:MVS2]RCPATIC   +=[F:MVS]RCPATIC
+      [F:MVS2]BILAMTC(0)+=[F:MVS]BILAMTC(0)
+      [F:MVS2]BILAMTC(1)+=[F:MVS]BILAMTC(1)
+      [F:MVS2]BILAMTC(2)+=[F:MVS]BILAMTC(2)
+      [F:MVS2]BLCAMTC   +=[F:MVS]BLCAMTC
+      [F:MVS2]INVAMTC   +=[F:MVS]INVAMTC
+      #-----
+      [F:MVS2]ORDNOTL   +=[F:MVS]ORDNOTL
+      [F:MVS2]ORDATIL   +=[F:MVS]ORDATIL
+      [F:MVS2]RCPNOTL   +=[F:MVS]RCPNOTL
+      [F:MVS2]RCPATIL   +=[F:MVS]RCPATIL
+      [F:MVS2]BILAMTL(0)+=[F:MVS]BILAMTL(0)
+      [F:MVS2]BILAMTL(1)+=[F:MVS]BILAMTL(1)
+      [F:MVS2]BILAMTL(2)+=[F:MVS]BILAMTL(2)
+      [F:MVS2]BLCAMTL   +=[F:MVS]BLCAMTL
+      [F:MVS2]INVAMTL   +=[F:MVS]INVAMTL
+      #-----
+      [F:MVS2]ORDNOTR   +=[F:MVS]ORDNOTR
+      [F:MVS2]ORDATIR   +=[F:MVS]ORDATIR
+      [F:MVS2]RCPNOTR   +=[F:MVS]RCPNOTR
+      [F:MVS2]RCPATIR   +=[F:MVS]RCPATIR
+      [F:MVS2]BILAMTR(0)+=[F:MVS]BILAMTR(0)
+      [F:MVS2]BILAMTR(1)+=[F:MVS]BILAMTR(1)
+      [F:MVS2]BILAMTR(2)+=[F:MVS]BILAMTR(2)
+      [F:MVS2]BLCAMTR   +=[F:MVS]BLCAMTR
+      [F:MVS2]INVAMTR   +=[F:MVS]INVAMTR
+      #-----
+      [F:MVS2]UPDUSR=GUSER
+      [F:MVS2]UPDDAT=date$
+      COMPTEUR+=1
+      Rewrite [MVS2]
+      If fstat
+        Call ECR_TRACE("File BPSUPPMVT"-[F:MVS2]BPSRSK-[F:MVS2]CPY-[F:MVS2]BPSNUM-[F:MVS2]CUR+
+&                      ", Error ="-num$(fstat),1) From GESECRAN
+      Endif
+    Else
+      [F:MVS2]=[F:MVS]
+      Raz [F:MVS2]FINRSPFCY, [F:MVS2]UPDUSR, [F:MVS2]UPDDAT
+      [F:MVS2]CREUSR=GUSER
+      [F:MVS2]CREDAT=date$
+      COMPTEUR+=1
+      Write [MVS2]
+      If fstat
+        Call ECR_TRACE("File BPSUPPMVT"-[F:MVS2]BPSRSK-[F:MVS2]CPY-[F:MVS2]BPSNUM-[F:MVS2]CUR+
+&                      ", Error ="-num$(fstat),1) From GESECRAN
+      Endif
+    Endif
+    #----- Si module achats actif -----#
+    If [F:ADS]MODULE(5)=2
+      #----- Ecriture Derniers mouvements appel d'offre -----#
+      If [F:MVS]LASPQHNUM<>""
+        Read [PQH] PQH0=[F:MVS]LASPQHNUM
+        If !fstat
+          WIFFTYP=1
+          WMVTTYP=1
+          WMVTDAT=[F:MVS]LASPQHDAT
+          WVCRNUM=[F:MVS]LASPQHNUM
+          WCUR   =""
+          WAMT   =0
+          WIFFFCY=[F:PQH]PQHFCY
+          Gosub CREATION_LSM
+        Endif
+      Endif
+      #----- Ecriture Derniers mouvements commande -----#
+      If [F:MVS]LASPOHNUM<>""
+        Read [POH] POH0=[F:MVS]LASPOHNUM
+        If !fstat
+          WIFFTYP=3
+          WMVTTYP=3
+          WMVTDAT=[F:MVS]LASORDDAT
+          WVCRNUM=[F:MVS]LASPOHNUM
+          WCUR   =[F:POH]CUR
+          WAMT   =[F:POH]TTVORD
+          WIFFFCY=[F:POH]POHFCY
+          Gosub CREATION_LSM
+        Endif
+      Endif
+      #----- Ecriture Derniers mouvements réception -----#
+      If [F:MVS]LASPTHNUM<>""
+        Read [PTH] PTH0=[F:MVS]LASPTHNUM
+        If !fstat
+          WIFFTYP=4
+          WMVTTYP=4
+          WMVTDAT=[F:MVS]LASRCPDAT
+          WVCRNUM=[F:MVS]LASPTHNUM
+          WCUR   =[F:PTH]CUR
+          WAMT   =0
+          For [PTD] PTD0 Where PTHNUM=[F:PTH]PTHNUM
+            If [F:PTD]NETCUR<>[F:PTH]CUR
+              Call CONVERT([F:PTD]NETCUR,[F:PTH]CUR,GLOCALDEV,[F:PTH]CHGTYP,[F:PTH]RCPDAT,
+&                          [F:PTD]LINATIAMT,WAMT2,STA) From TRTDEV
+            Else
+              WAMT2=[F:PTD]LINATIAMT
+            Endif
+            WAMT+=WAMT2
+          Next
+          WIFFFCY=[F:PTH]PRHFCY
+          Gosub CREATION_LSM
+        Endif
+      Endif
+    Endif
+    #----- Ecriture Derniers mouvements facture/avoir -----#
+    If [F:MVS]LASINVNUM<>""
+      Read [PIH] PIH0=[F:MVS]LASINVNUM
+      If !fstat
+        If [F:PIH]PIHTYP>2  WIFFTYP=7  Else  WIFFTYP=6 : Endif
+        WMVTTYP=6
+        WMVTDAT=[F:MVS]LASINVDAT
+        WVCRNUM=[F:MVS]LASINVNUM
+        WCUR   =[F:PIH]CUR
+        WAMT   =[F:PIH]AMTATI
+        WIFFFCY=[F:PIH]FCY
+        Gosub CREATION_LSM
+      Endif
+    Endif
+    #----- Ecriture Derniers mouvements règlement -----#
+    If [F:ADS]MODULE(2)=2
+      If [F:MVS]LASPAYNUM<>""
+        Read [PYH] PYH0=[F:MVS]LASPAYNUM
+        If !fstat
+          WIFFTYP=8
+          WMVTTYP=8
+          WMVTDAT=[F:MVS]LASPAYDAT
+          WVCRNUM=[F:MVS]LASPAYNUM
+          WCUR   =[F:PYH]CUR
+          WAMT   =[F:PYH]AMTCUR
+          WIFFFCY=[F:PYH]FCY
+          Gosub CREATION_LSM
+        Endif
+      Endif
+    Endif
+    #----- Suppression ancien enregistrement Mouvements fournisseurs -----#
+    COMPTEUR+=1
+    Delete [MVS] Where BPSNUM=WBPSNUM & FINRSPFCY=WFINRSPFCY & CPY=""
+    If fstat
+      Call ECR_TRACE("File BPSUPPMVT"-[F:MVS]BPSNUM-[F:MVS]FINRSPFCY+", Error ="-num$(fstat),1) From GESECRAN
+    Endif
+    #-----
+    WNBR+=1
+    If COMPTEUR>GMAXUPDTRS  CLE1=[F:MVS]BPSNUM : CLE2 =[F:MVS]FINRSPFCY : STOP=1 : Break : Endif
+  Next
+Commit
+If STOP Goto BOUCLE_MVS : Endif
+#-----
+Close Local File [MVS], [MVS2], [LSM], [BPS], [PIH], [TCU], [TCH]
+#-----
+If [F:ADS]MODULE(5)=2  Close Local File [PQH], [POH], [PTH], [PTD] : Endif
+If [F:ADS]MODULE(2)=2  Close Local File [PYH] : Endif
+#-----
+Call ECR_TIME("DOSMAJ30 Supplier Transactions Process 1 : Ended ("+num$(WNBR)+")") From DOSSUB
+#-----
+Gosub UNSET_FIRST From TRTFIRST
+End
+
+#---------------------------------------------------#
+# Ecriture ou réécriture derniers mvts fournisseurs #
+#---------------------------------------------------#
+$CREATION_LSM
+Read [LSM] LSM0=[F:MVS]BPSNUM;WIFFTYP;GSOCIETE
+If !fstat
+  [F:LSM]MVTTYP=WMVTTYP
+  [F:LSM]MVTDAT=WMVTDAT
+  [F:LSM]VCRNUM=WVCRNUM
+  [F:LSM]CUR   =WCUR
+  [F:LSM]AMT   =WAMT
+  [F:LSM]IFFFCY=WIFFFCY 
+  [F:LSM]UPDUSR=GUSER
+  [F:LSM]UPDDAT=date$
+  COMPTEUR+=1
+  Rewrite [LSM]
+  If fstat
+    Call ECR_TRACE("File LASTSUPMVT"-[F:MVS]BPSNUM-num$(WIFFTYP)-GSOCIETE+", Error ="-num$(fstat),1) From GESECRAN
+  Endif
+Else
+  Raz [F:LSM]
+  [F:LSM]BPSNUM=[F:MVS]BPSNUM
+  [F:LSM]IFFTYP=WIFFTYP
+  [F:LSM]CPY   =GSOCIETE
+  [F:LSM]MVTTYP=WMVTTYP
+  [F:LSM]MVTDAT=WMVTDAT
+  [F:LSM]VCRNUM=WVCRNUM
+  [F:LSM]CUR   =WCUR
+  [F:LSM]AMT   =WAMT
+  [F:LSM]IFFFCY=WIFFFCY
+  [F:LSM]CREUSR=GUSER
+  [F:LSM]CREDAT=date$
+  COMPTEUR+=1
+  Write [LSM]
+  If fstat
+    Call ECR_TRACE("File LASTSUPMVT"-[F:MVS]BPSNUM-num$(WIFFTYP)-GSOCIETE-WLSMFCY+", Error ="-num$(fstat),1) From GESECRAN
+  Endif
+Endif
+Return
+
+#####################################################
+#  Appel de la resynchro des encours clients        #
+# ------------------------------------------------- #
+# Ne rien faire si le module vente n'est pas actif  #
+#####################################################
+Subprog AP_MVC
+#-----
+If [F:ADS]MODULE(4)<>2  End : Endif
+If filinfo(filpath("FIL","BPCUSTMVT","fde",[F:ADS]DOSSIER),0)<=0  End : Endif
+#-----
+Gosub SET_FIRST   From TRTFIRST
+#-----
+Call ECR_TIME("DOSMAJ30 Customer Transactions Process 2 : Update BPCUSTMVT") From DOSSUB
+
+#----- Tables tronc commun et superviseur -----#
+Local File =[F:ADS]DOSSIER+".BPCUSTMVT"   [MVC]
+Local File =[F:ADS]DOSSIER+".BPSUPPMVT"   [MVS]
+Local File =[F:ADS]DOSSIER+".LASTCUSMVT"  [LCM]
+Local File =[F:ADS]DOSSIER+".LASTSUPMVT"  [LSM]
+Local File =[F:ADS]DOSSIER+".BPARTNER"    [BPR] 
+Local File =[F:ADS]DOSSIER+".BPCUSTOMER"  [BPC]
+Local File =[F:ADS]DOSSIER+".BPSUPPLIER"  [BPS]
+Local File =[F:ADS]DOSSIER+".ITMMASTER"   [ITM]
+Local File =[F:ADS]DOSSIER+".SINVOICE"    [SIH]
+Local File =[F:ADS]DOSSIER+".PINVOICE"    [PIH]
+Local File =[F:ADS]DOSSIER+".PERIOD"      [PER]
+Local File =[F:ADS]DOSSIER+".FISCALYEAR"  [FIY]
+Local File =[F:ADS]DOSSIER+".GACCOUNT"    [GAC]
+Local File =[F:ADS]DOSSIER+".TABCUR"      [TCU]
+Local File =[F:ADS]DOSSIER+".TABCHANGE"   [TCH]
+Local File =[F:ADS]DOSSIER+".COMPANY"     [CPY]
+Local File =[F:ADS]DOSSIER+".FACILITY"    [FCY]
+#----- Tables vente -----#
+Local File =[F:ADS]DOSSIER+".SQUOTE"      [SQH]
+Local File =[F:ADS]DOSSIER+".SQUOTED"     [SQD]
+Local File =[F:ADS]DOSSIER+".SORDER"      [SOH]
+Local File =[F:ADS]DOSSIER+".SDELIVERY"   [SDH]
+Local File =[F:ADS]DOSSIER+".SDELIVERYD"  [SDD]
+Local File =[F:ADS]DOSSIER+".SINVOICEV"   [SIV]
+Local File =[F:ADS]DOSSIER+".SRETURN"     [SRH]
+#----- Tables achats -----#
+If [F:ADS]MODULE(5)=2
+  Local File =[F:ADS]DOSSIER+".PQUOTAT"   [PQH]
+  Local File =[F:ADS]DOSSIER+".PORDER"    [POH]
+  Local File =[F:ADS]DOSSIER+".PORDERQ"   [POQ]
+  Local File =[F:ADS]DOSSIER+".PRECEIPT"  [PTH]
+  Local File =[F:ADS]DOSSIER+".PRECEIPTD" [PTD]
+Endif
+#----- Tables tiers -----#
+If [F:ADS]MODULE(2)=2
+  Local File =[F:ADS]DOSSIER+".PAYMENTH"  [PYH]
+  Local File =[F:ADS]DOSSIER+".TABPAYTYP" [TPY]
+Endif
+#----- Tables comptabilité -----#
+If [F:ADS]MODULE(1)=2
+  Local File =[F:ADS]DOSSIER+".BALANCE"   [BAL]
+Endif
+
+#--------------------------------------------#
+# L_TOUSOC    : Indicateur toutes société    #
+#               1 = Non,  2 = Oui            #
+# L_SOC       : Société à traiter            #
+# L_TOUCLIENT : Indicateur tous clients      #
+#               1 = Non,  2 = Oui            #
+# L_CLIENT    : Client à traiter             #
+# L_TRACE     : Ecriture d'une trrace        #
+#               1 = Non,  2 = Oui            #
+#--------------------------------------------#
+Call RESYNCHRO_BPCMVT(2,"",2,"",2) From FUNBPCMVT
+#Call RESYNCHRO_BPCMVT(2,"",1,"LD61",2) From FUNBPCMVT : # Pour test
+#-----
+Close Local File [MVC], [LCM], [BPR], [BPC], [ITM], [SIH], [PER], [FIY], [GAC], 
+&                [TCU], [TCH], [CPY], [FCY], [SQH], [SQD], [SOH], [SDH], [SDD],
+&                [SIV], [SRH]
+#-----
+If [F:ADS]MODULE(2)=2  Close Local File [PYH], [TPY] : Endif
+If [F:ADS]MODULE(1)=2  Close Local File [BAL] : Endif
+#-----
+Call ECR_TRACE("DOSMAJ30 Customer Transactions Process 2 : Ended",0) From GESECRAN
+
+#-----
+Gosub UNSET_FIRST From TRTFIRST
+End
+
+#####################################################
+#  Appel de la resynchro des encours fournisseurs   #
+# ------------------------------------------------- #
+# Ne rien faire si le module achats n'est pas actif #
+#####################################################
+Subprog AP_MVS
+#-----
+If [F:ADS]MODULE(5)<>2  End : Endif
+If filinfo(filpath("FIL","BPSUPPMVT","fde",[F:ADS]DOSSIER),0)<=0  End : Endif
+#-----
+Gosub SET_FIRST   From TRTFIRST
+#-----
+Call ECR_TIME("DOSMAJ30 Supplier Transactions Process 2 : Update BPSUPPMVT") From DOSSUB
+#----- Tables tronc commun et superviseur -----#
+Local File =[F:ADS]DOSSIER+".BPCUSTMVT"   [MVC]
+Local File =[F:ADS]DOSSIER+".BPSUPPMVT"   [MVS]
+Local File =[F:ADS]DOSSIER+".LASTSUPMVT"  [LSM]
+Local File =[F:ADS]DOSSIER+".BPARTNER"    [BPR] 
+Local File =[F:ADS]DOSSIER+".BPCUSTOMER"  [BPC]
+Local File =[F:ADS]DOSSIER+".BPSUPPLIER"  [BPS]
+Local File =[F:ADS]DOSSIER+".ITMMASTER"   [ITM]
+Local File =[F:ADS]DOSSIER+".PINVOICE"    [PIH]
+Local File =[F:ADS]DOSSIER+".PERIOD"      [PER]
+Local File =[F:ADS]DOSSIER+".FISCALYEAR"  [FIY]
+Local File =[F:ADS]DOSSIER+".GACCOUNT"    [GAC]
+Local File =[F:ADS]DOSSIER+".TABCUR"      [TCU]
+Local File =[F:ADS]DOSSIER+".TABCHANGE"   [TCH]
+Local File =[F:ADS]DOSSIER+".COMPANY"     [CPY]
+Local File =[F:ADS]DOSSIER+".FACILITY"    [FCY]
+#----- Tables achats -----#
+Local File =[F:ADS]DOSSIER+".PQUOTAT"     [PQH]
+Local File =[F:ADS]DOSSIER+".PORDER"      [POH]
+Local File =[F:ADS]DOSSIER+".PORDERQ"     [POQ]
+Local File =[F:ADS]DOSSIER+".PRECEIPT"    [PTH]
+Local File =[F:ADS]DOSSIER+".PRECEIPTD"   [PTD]
+#----- Tables tiers -----#
+If [F:ADS]MODULE(2)=2
+  Local File =[F:ADS]DOSSIER+".PAYMENTH"  [PYH]
+  Local File =[F:ADS]DOSSIER+".TABPAYTYP" [TPY]
+Endif
+#----- Tables comptabilité -----#
+If [F:ADS]MODULE(1)=2
+  Local File =[F:ADS]DOSSIER+".BALANCE"   [BAL]
+Endif
+#-----
+Call RESYNCHRO_BPSMVT(2,"",2,"",1) From FUNBPSMVT
+#-----
+Close Local File [MVC], [MVS], [LSM], [BPR], [BPC], [BPS], [ITM], [PIH], [PER],
+&                [FIY], [GAC], [TCU], [TCH], [CPY], [FCY], [PQH], [POH], [POQ],
+&                [PTH], [PTD]
+#-----
+If [F:ADS]MODULE(2)=2  Close Local File [PYH], [TPY] : Endif
+If [F:ADS]MODULE(1)=2  Close Local File [BAL] : Endif
+#-----
+Call ECR_TIME("DOSMAJ30 Supplier Transactions Process 2 : Ended") From DOSSUB
+#-----
+Gosub UNSET_FIRST From TRTFIRST
+End
+
+#-------------------------------------------------------------------------------------------------------#
+# FGR 16/12/2009 : X3SUIVI60425 : Migration modèles import/export
+# MDJ 04/01/2010 : X3SUIVI61043 : Migration modèles import/export module Immobilisations  
+# FGR 07/01/2010 : X3SUIVI61328 : Ajout des modèles FREECEXP et FREECINT
+#-------------------------------------------------------------------------------------------------------#
+Subprog IMPORTEXPORT(DOSSIER, DOSREF)
+Value Char DOSSIER
+Value Char DOSREF
+
+  #-- Migration des modèles import/export
+  Call ECR_TIME(mess(81,125,1) - ": AOBJEXT") From DOSSUB : # maj table
+  Local File =DOSREF + ".AOBJEXT"  [AOE6]
+  Local File =DOSSIER + ".AOBJEXT" [AOE5]
+  Local File =DOSREF + ".AEXPV3"   [AEV6]
+  Filter [AOE6] Where EXT = "SIHIMPCAL" or EXT = "SIHIMPNCAL" or EXT = "BOMC" or EXT = "BOMP" or EXT = "ITC" or EXT = "ROU"
+&                  or EXT = "PIHFL" or EXT = "PNHFL" or EXT = "POHFL" or EXT = "PSHFL" or EXT = "PTHFL" or EXT = "SDHFL"
+&                  or EXT = "SOHFL" or EXT = "SQHFL" or EXT = "BOMS" or EXT = "CLL" or EXT = "CON" or EXT = "COT"
+&                  or EXT = "ITC2" or EXT = "ITN" or EXT = "LDS" or EXT = "MST" or EXT = "OPP" or EXT = "PBL"
+&                  or EXT = "QUE" or EXT = "RSE" or EXT = "SCS" or EXT = "SOL" or EXT = "SRE" or EXT = "TCK"
+&                  or EXT = "TSK"
+&                  or find (EXT, "DICO", "FAS", "FAMI", "FASX3", "IVY", "IVYW", "LEA", "LOF", "OCCU", "PHY", "RUBASSDEF")
+&                  or left$(EXT,3) = "LOC"
+&                  or left$(EXT,3) = "PNH" 
+&                  or left$(EXT,3) = "BPC" or left$(EXT,3) = "BPP" or left$(EXT,3) = "BPS" or left$(EXT,3) = "PIH"
+&                  or EXT = "FREECEXP" or EXT = "FREECINT"
+  For [AOE6] 
+    Read [AOE5]AOE0=[F:AOE6]EXT
+    If fstat or [F:AOE5]CODACT = "" or [F:AOE5]CODACT < "X" Then
+      Call COPOBJ(DOSREF, DOSSIER, "AOE", [F:AOE6]EXT, "", "", "") From ACOPIE
+      Call ECR_TRACE("AOBJEXT - copied" - [F:AOE6]EXT,0) From GESECRAN
+      #
+      Filter [AEV6] Where MODELE = [F:AOE6]EXT
+      For [AEV6]
+        Call COPOBJ(DOSREF, DOSSIER, "AEV", [F:AEV6]CODE, "", "", "") From ACOPIE
+        Call ECR_TRACE("     AEXPV3- copied" - [F:AEV6]CODE - "/" - [F:AEV6]MODELE ,0) From GESECRAN
+      Next
+      Filter [AEV6]
+    Else
+      Call ECR_TRACE("AOBJEXT - not copied" - [F:AOE6]EXT - [F:AOE5]CODACT,-1) From GESECRAN
+    Endif
+  Next
+  Filter [AOE6]
+  Close Local File [AOE5], [AOE6], [AEV6]
+  Call ECR_TIME(mess(81,125,1) - ": AOBJEXT - Ended") From DOSSUB : # maj table
+End

@@ -1,0 +1,432 @@
+#<AdxTL>@(#)12.0.0.0 $Revision$
+##########################################################################
+# UTIGPA25   Migration to v6 - Update of Direct Orders                   #
+# ---------------------------------------------------------------------- #
+##########################################################################
+
+Call MAJ_UTIGPA25
+End
+
+#################################
+Subprog MAJ_UTIGPA25
+Local Char DOSSIER(30) : DOSSIER=nomap
+Call SAIDOS(DOSSIER,"") From SAIDOS
+Call OUVRE_TRACE("UTIGPA25: Update direct orders (assignment based)") From LECFIC
+Call TEMPON("O") From GESECRAN
+If DOSSIER<>"" Call EXE_UTIGPA25(DOSSIER,1) : Endif
+Call FERME_TRACE From LECFIC
+Call TEMPOFF     From GESECRAN
+Call LEC_TRACE From LECFIC
+End
+
+#################################
+Subprog EXE_UTIGPA25(DOSSIER,TRACE)
+Value Char    DOSSIER
+Value Integer TRACE
+
+Local Integer IOK, NBMTO, NBOK, FMI3, FMI5, TYP, SIMUL, DBG, RET
+Local Decimal LQTY
+Local Char    WMSG(80), SOHSEL(GLONVCR+1)
+
+If filinfo(filpath("FIL","SORDERQ","fde",DOSSIER),0)<=0
+   End
+Endif
+
+RET=filinfo(filpath("ECR","MLIK","msk",DOSSIER),0)
+If RET<0
+    If !clalev([F:ADS]) : Local File ADOSSIER [ADS] : Endif
+    If [F:ADS]DOSSIER <> DOSSIER
+       Read [ADS]DOSSIER = DOSSIER
+    Else
+       fstat=0
+    Endif
+    If fstat=0
+       Call VALID("MLIK",DOSSIER,[F:ADS]NBRLAN,[F:ADS]LAN,1,RET) From VALMSK
+       RET=filinfo(filpath("ECR","MLIK","msk",DOSSIER),0)
+    Endif
+Endif
+If RET<0 : End : Endif
+
+If TRACE
+  WMSG="2"
+  Call SAICAR(WMSG,"UTIPGPA25",mess(25,133,1),"M",1,4,"",RET) From GESECRAN : # Simulation
+  If RET<>2 : End : Endif
+  If WMSG="2" : SIMUL=1 : Endif
+
+  Call SAICAR(SOHSEL,"UTIPGPA25",mess(1,306,1),"A",0,GLONVCR+1,"",RET) From GESECRAN : # Commande client
+  If RET<>2 : End : Endif
+  If left$(SOHSEL,1)="?" : DBG=1 : SOHSEL=right$(SOHSEL,2) : Endif
+Endif
+
+WMSG=""
+If SOHSEL<>""  : WMSG-= "-"-mess(1,306,1)-SOHSEL : Endif
+If SIMUL       : WMSG-= "-"-mess(25,133,1)       : Endif
+
+Call ECR_TRACE("UTIGPA25: Process Start on : "+DOSSIER-WMSG,0) From GESECRAN
+
+#----- Ouverture des fichiers -----#
+Local File =DOSSIER+".SORDERQ"  [SOQ]
+Local File =DOSSIER+".ORDERS"   [ORD2]
+Local File =DOSSIER+".ORDERS"   [ORD3]
+
+Local File =DOSSIER+".ORDERS"   [ORDB]
+Local File =DOSSIER+".MTOLINK"  [MLK]
+Local File =DOSSIER+".MTOLINK"  [MLK1]
+Local File =DOSSIER+".PARMTO"   [PTO]
+Local Mask =DOSSIER+".MLIK"     [MLIK]
+
+If filinfo(filpath("FIL","PORDERQ","fde",DOSSIER),0)>0
+   Local File =DOSSIER+".PORDERQ"  [POQ]
+   FMI3=1
+Endif
+
+If filinfo(filpath("FIL","MFGITM","fde",DOSSIER),0)>0
+   Local File =DOSSIER+".MFGITM"   [MFI]
+   FMI5=1
+Endif
+
+#--- Inhibation temporaire des points d'entrée si l'utilitaire n'est pas lancé du dossier traité
+If DOSSIER<>nomap & dim([V]GNBENTREE)>0
+   Local Integer SAV_GNBENTREE
+   SAV_GNBENTREE = [V]GNBENTREE
+   [V]GNBENTREE=0
+Endif
+
+#----- Début de transaction   -----#
+Call DEBTRANS From GLOCK
+Trbegin [ORD2], [SOQ], [ORDB], [MLK1], [MLK]
+
+If SOHSEL<>""
+   Filter [ORD2] Where VCRNUM=[L]SOHSEL
+Endif
+
+If DBG : Dbgaff : Endif : #CHECK IGNORE_LIGNE
+
+# read firm sales orders in direct order mode if quantity not totally allocated and not affected yet
+For [ORD2]ORD0 Where find(WIPTYP,1,8)<>0 & find(FMI,3,5)<>0 & RMNEXTQTY>ALLQTY & WIPSTA=1
+
+    If !TRACE & [F:ORD2]MTOQTY<>0 : Goto NXT_MTO : Endif
+
+    Read [SOQ]SOQ0=[F:ORD2]VCRNUM;[F:ORD2]VCRLIN;[F:ORD2]VCRSEQ
+    If fstat | ([F:SOQ]FMINUM="" & [F:ORD2]MTOQTY=0) : Goto NXT_MTO : Endif
+
+    # read corresponding PO/TR/WO
+    Case [F:SOQ]FMI
+      When 3   : TYP=14 : # PO/TR
+      When 5   : TYP=10 : # WO
+      When Default : Goto NXT_MTO
+    Endcase
+
+    IOK=0
+    For [ORD3]ORD3 Where [F:ORD3]STOFCY=[F:ORD2]STOFCY & [F:ORD3]ITMREF=[F:ORD2]ITMREF & [F:ORD3]VCRTYP=[L]TYP
+&                      & [F:ORD3]VCRNUM=[F:SOQ]FMINUM & [F:ORD3]VCRLIN=[F:SOQ]FMILIN & [F:ORD3]VCRSEQ=[F:SOQ]FMISEQ
+      IOK = 1
+    Next
+
+    If !IOK
+        # PO/TR/WO order not found
+        Case [L]TYP
+          When 14 : # read POQ record
+                Read [POQ]POQ0=[F:SOQ]FMINUM;[F:SOQ]FMILIN;[F:SOQ]FMISEQ
+                If fstat : IOK=-1 : Endif
+            When 10 :   # read MFI record
+                Read [MFI]MFI0=[F:SOQ]FMINUM;[F:SOQ]FMILIN
+                If fstat : IOK=-3 : Endif
+         Endcase
+    Elsif [F:ORD3]WIPSTA<>1
+         IOK=-7
+         If DOSSIER=nomap
+           Gosub RAZMTO_ORD3
+           Case [F:SOQ]FMI
+             When 3 : Call RAZFMIPOH([F:SOQ]FMINUM, [F:SOQ]FMILIN, [F:SOQ]FMISEQ, RET) From TRTACHCDE1
+             When 5 : Call RAZFMIMFG([F:SOQ]FMINUM, [F:SOQ]FMILIN, RET) From MFGAUTLIB
+           Endcase
+           Read [ORD2] =
+           If fstat : Raz [F:ORD2] : Endif
+         Else
+           Gosub TRACE : Goto NXT_MTO
+         Endif
+    Endif
+
+    If IOK<=0
+         If IOK<0
+            # reset FMI data, except if PO/TR/WO order disappeared by closure of resource document
+            # in this case POQ/MFI record still exists, except if the closed document disappeared
+            # because of the history/purge process
+            Readlock [SOQ] Curr
+            If fstat : Goto NXT_MTO : Endif
+            If IOK=-7 : IOK=7 : Else IOK=0 : Endif
+            Gosub TRACE
+
+            Raz [F:SOQ]FMINUM, [F:SOQ]FMILIN, [F:SOQ]FMISEQ
+            Rewrite [SOQ]
+            If fstat
+               Call ECR_TRACE("File SORDERQ"-[F:SOQ]SOHNUM-num$([F:SOQ]SOPLIN)-num$([F:SOQ]SOQSEQ)+
+&                             ", ERROR ="-num$(fstat),1) From GESECRAN
+            Endif
+         Endif
+
+         If [F:ORD2]MTOQTY<>0
+            Readlock [ORD2] =
+            Raz [F:ORD2]MTOQTY
+            Rewrite [ORD2]
+            If fstat
+               Call ECR_TRACE("File ORDERS"-[F:ORD2]STOFCY-num$([F:ORD2]WIPTYP)-[F:ORD2]VCRNUM-num$([F:ORD2]VCRLIN)-num$([F:ORD2]VCRSEQ)+
+&                              ", ERROR ="-num$(fstat),1) From GESECRAN
+            Endif
+         Endif
+
+    Elsif ([L]TYP=14 & FMI3) | ([L]TYP=10 & FMI5)
+        # PO/TR/WO order not found
+
+        LRET=0
+        For [MLK]MLK0 Where STOFCY=[F:ORD2]STOFCY & ITMREF=[F:ORD2]ITMREF & DEMTYP=2 & find(DWIPTYP,1,8)<>0
+&                         & DEMNUM=[F:ORD2]VCRNUM & DEMLIN=[F:ORD2]VCRLIN & DEMSEQ=[F:ORD2]VCRSEQ
+          If [F:MLK]RESSNUM<>[F:ORD3]VCRNUM | [F:MLK]RESSLIN<>[F:ORD3]VCRLIN | [F:MLK]RESSSEQ<>[F:ORD3]VCRSEQ
+&          | [F:MLK]RESSTYP<>[F:ORD3]VCRTYP | [F:MLK]RWIPTYP<>[F:ORD3]WIPTYP
+             Delete [MLK]
+          Else
+             LRET+= 1
+          Endif
+        Next
+
+        If !LRET
+          # there is no assignment => creation of it
+
+          If [F:ORD2]MTOQTY<>0
+            Readlock [ORD2] =
+            If fstat : IOK=-6 : Gosub TRACE : Goto NXT_MTO : Endif
+            Raz [F:ORD2]MTOQTY
+            Rewrite [ORD2]
+          Endif
+
+           Case [L]TYP
+              When 14 : # read POQ record
+                  Read [POQ]POQ0=[F:SOQ]FMINUM;[F:SOQ]FMILIN;[F:SOQ]FMISEQ
+                  If fstat
+                     IOK=-1
+                  Elsif [F:POQ]SOHNUM<>[F:SOQ]SOHNUM | [F:POQ]SOPLIN<>[F:SOQ]SOPLIN | [F:POQ]SOQSEQ<>[F:SOQ]SOQSEQ
+                    [F:POQ]SOHNUM = [F:SOQ]SOHNUM
+                    [F:POQ]SOPLIN = [F:SOQ]SOPLIN
+                    [F:POQ]SOQSEQ = [F:SOQ]SOQSEQ
+                    [F:POQ]ORI = 3
+                    Rewrite [POQ]
+                    If fstat=0 : IOK=2 : Gosub TRACE : IOK=1 : Else IOK=-2 : Endif
+                  Endif
+                  If IOK>0
+                     Gosub RAZMTO_ORD3
+                     Gosub CRE_MTO_SO_PO From PURMTOLIB
+                  Endif
+
+              When 10 :   # read MFI record
+                  Read [MFI]MFI0=[F:SOQ]FMINUM;[F:SOQ]FMILIN
+                  If fstat
+                     IOK=-3
+                  Elsif [F:MFI]FMI<>5 | [F:MFI]VCRNUMORI<>[F:SOQ]SOHNUM | [F:MFI]VCRLINORI<>[F:SOQ]SOPLIN | [F:MFI]VCRSEQORI<>[F:SOQ]SOQSEQ
+                     [F:MFI]FMI = 5
+                     [F:MFI]BPCTYPDEN = 2
+                     [F:MFI]BPCNUM    = [F:ORD2]BPRNUM
+                     [F:MFI]VCRTYPORI = 2
+                     [F:MFI]VCRNUMORI = [F:SOQ]SOHNUM
+                     [F:MFI]VCRLINORI = [F:SOQ]SOPLIN
+                     [F:MFI]VCRSEQORI = [F:SOQ]SOQSEQ
+                     Rewrite [MFI]
+                     If fstat=0 : IOK=4 : Gosub TRACE : IOK=1 :  Else IOK=-4 : Endif
+                  Endif
+                  If IOK>0
+                     Gosub RAZMTO_ORD3
+                     Gosub CRE_MTO_SO_WO_MFI From MFGMTOLIB
+                  Endif
+            Endcase
+
+            If IOK>0 & !func MTOLINKLIB.LINK_EXISTS([F:ORD2]STOFCY, 2, [F:ORD2]VCRNUM, [F:ORD2]VCRLIN, [F:ORD2]VCRSEQ, 1)
+               IOK=-9
+            Endif
+
+            If IOK>0 : NBMTO += 1 : Endif
+            Gosub TRACE
+
+        Elsif TRACE
+          # check the assignment found
+
+          For [MLK]MLK0 Where STOFCY=[F:ORD2]STOFCY & ITMREF=[F:ORD2]ITMREF & DEMTYP=2 & find(DWIPTYP,1,8)<>0
+&                             & DEMNUM=[F:ORD2]VCRNUM & DEMLIN=[F:ORD2]VCRLIN & DEMSEQ=[F:ORD2]VCRSEQ
+             Break
+          Next
+
+          If [F:MLK]FMIFLG<>2
+            IOK=-8 : Gosub TRACE : Goto NXT_MTO
+          Endif
+
+          LQTY=min([F:ORD2]RMNEXTQTY-[F:ORD2]ALLQTY,[F:ORD3]RMNEXTQTY)
+          If [F:ORD2]MTOQTY<>LQTY | [F:ORD2]MTOQTY<>LQTY | [F:MLK]LIKQTY<>LQTY
+            If [F:ORD2]MTOQTY<>LQTY
+                Readlock [ORD2] =
+                If fstat=0
+                   [F:ORD2]MTOQTY=LQTY
+                   Rewrite [ORD2]
+                   IOK=5 : Gosub TRACE
+                Endif
+            Endif
+            If [F:ORD3]MTOQTY<>LQTY
+                Readlock [ORD3] =
+                If fstat=0
+                  [F:ORD3]MTOQTY=LQTY
+                  Rewrite [ORD3]
+                  IOK=5 : Gosub TRACE
+                Endif
+            Endif
+            If [F:MLK]LIKQTY<>LQTY
+                Readlock [MLK] =
+                If fstat=0
+                  [F:MLK]LIKQTY=LQTY
+                  Rewrite [MLK]
+                  IOK=5 : Gosub TRACE
+                Endif
+            Endif
+            If [F:ORD2]MTOQTY<>LQTY | [F:ORD2]MTOQTY<>LQTY | [F:MLK]LIKQTY<>LQTY : IOK=-5 : Gosub TRACE : Endif
+          Endif
+
+          Case [L]TYP
+            When 14 : # read POQ record
+                Read [POQ]POQ0=[F:SOQ]FMINUM;[F:SOQ]FMILIN;[F:SOQ]FMISEQ
+                If fstat
+                  IOK=-1
+                Elsif [F:POQ]SOHNUM<>[F:SOQ]SOHNUM | [F:POQ]SOPLIN<>[F:SOQ]SOPLIN | [F:POQ]SOQSEQ<>[F:SOQ]SOQSEQ
+                  If IOK=-5
+                    IOK=-2
+                  Else
+                    # fausse contremarque => vraie contremarque
+                    [F:POQ]SOHNUM = [F:SOQ]SOHNUM
+                    [F:POQ]SOPLIN = [F:SOQ]SOPLIN
+                    [F:POQ]SOQSEQ = [F:SOQ]SOQSEQ
+                    [F:POQ]ORI = 3
+                    Rewrite [POQ]
+                    If fstat=0 : IOK=2 : Gosub TRACE : Else IOK=-2 : Endif
+                  Endif
+                Endif
+            When 10 :   # read MFI record
+                Read [MFI]MFI0=[F:SOQ]FMINUM;[F:SOQ]FMILIN
+                If fstat
+                  IOK=-3
+                Elsif [F:MFI]FMI<>5 | [F:MFI]VCRTYPORI<>2 | [F:MFI]VCRNUMORI<>[F:SOQ]SOHNUM | [F:MFI]VCRLINORI<>[F:SOQ]SOPLIN  | [F:MFI]VCRSEQORI<>[F:SOQ]SOQSEQ
+                  If IOK=-5
+                    IOK=-4
+                  Else
+                    # fausse contremarque => vraie contremarque
+                    [F:MFI]FMI = 5
+                    [F:MFI]BPCTYPDEN = 2
+                    [F:MFI]BPCNUM    = [F:ORD2]BPRNUM
+                    [F:MFI]VCRTYPORI = 2
+                    [F:MFI]VCRNUMORI = [F:SOQ]SOHNUM
+                    [F:MFI]VCRLINORI = [F:SOQ]SOPLIN
+                    [F:MFI]VCRSEQORI = [F:SOQ]SOQSEQ
+                    Rewrite [MFI]
+                    If fstat=0 : IOK=4 : Gosub TRACE :  Else IOK=-4 : Endif
+                  Endif
+                Endif
+          Endcase
+
+          If find(IOK,2,4) & [F:ORD3]FMI<>[F:SOQ]FMI
+             Readlock [ORD3]ORD0 =
+             If fstat=0
+                [F:ORD3]FMI = [F:SOQ]FMI
+                If IOK=4 : [F:ORD3]BPRNUM = [F:ORD2]BPRNUM : Endif
+                Rewrite [ORD3]
+             Endif
+           Endif
+        Endif
+
+        If IOK<0 and IOK<>-5 : Gosub TRACE : Endif
+
+        If IOK=1 : NBOK+=1 : Endif
+    Endif
+
+$NXT_MTO
+Next
+If SOHSEL<>""
+   Filter [ORD2]
+Endif
+
+If SIMUL : Rollback : Else Commit : Endif
+
+#----- Fin de transaction     -----#
+
+Call ECR_TRACE("N° of assignments created:"-num$(NBMTO),0) From GESECRAN
+If TRACE
+   Call ECR_TRACE("N° of assignments OK:"-num$(NBOK),0) From GESECRAN
+Endif
+Call ECR_TRACE("UTIGPA25 : End Process",0) From GESECRAN
+
+#--- Réactivation des points d'entrée
+If dim([L]SAV_GNBENTREE)>0
+    [V]GNBENTREE = SAV_GNBENTREE
+Endif
+End
+
+$TRACE
+If !TRACE : Return : Endif
+
+Case IOK
+  When 7  : WMSG = "ORDERS not firm -> reset FMI data"
+  When 5  : WMSG = "Assigned amount corrected"-num$([F:ORD2]MTOQTY)-num$([F:ORD3]MTOQTY)-num$([F:MLK]LIKQTY)-num$(LQTY)
+  When 4  : WMSG = "MFGITM FMI data reset"
+  When 2  : WMSG = "PORDERQ FMI data reset"
+  When 1  : WMSG = "Assignment created"
+  When 0  : WMSG = "ORDERS not found -> reset FMI data"
+  When -1 : WMSG = "PORDERQ not found"
+  When -2 : WMSG = "PORDERQ FMI data incorrect"
+  When -3 : WMSG = "MFGITM not found"
+  When -4 : WMSG = "MFGITM FMI data incorrect"
+  When -5 : WMSG = "Assigned amount inccorrect"-num$([F:ORD2]MTOQTY)-num$([F:ORD3]MTOQTY)-num$([F:MLK]LIKQTY)-num$(LQTY)
+  When -6 : WMSG = "No assignment but assigned amount"-num$([F:ORD2]MTOQTY)
+  When -7 : WMSG = "ORDERS not firm"
+  When -8 : WMSG = "Assignment incorrect (FMIFLG="+num$([F:MLK]FMIFLG)+")"
+  When -9 : WMSG = "Assignment not created"
+  When Default : Return
+Endcase
+
+RET = (IOK<0)-(IOK>0)
+Call ECR_TRACE([F:ORD2]STOFCY-[F:ORD2]ITMREF-[F:ORD2]VCRNUM-num$([F:ORD2]VCRLIN)-num$([F:ORD2]VCRSEQ)
+&             -"->"-[F:SOQ]FMINUM-num$([F:SOQ]FMILIN)-num$([F:SOQ]FMISEQ)-":"-num$(IOK)-':'-WMSG,RET) From GESECRAN
+Return
+
+$RAZMTO_ORD3
+If [F:ORD3]MTOQTY=0 : Return : Endif
+RET=GOK
+Raz [M:MLIK]
+[M:MLIK]MAJCOD    = "Z"
+[M:MLIK]STOFCY    = [F:ORD3]STOFCY
+[M:MLIK]ITMREF    = [F:ORD3]ITMREF
+[M:MLIK]RESSTYP   = [F:ORD3]VCRTYP
+[M:MLIK]RESSNUM   = [F:ORD3]VCRNUM
+[M:MLIK]RESSLIN   = [F:ORD3]VCRLIN
+[M:MLIK]RESSSEQ   = [F:ORD3]VCRSEQ
+[M:MLIK]FRCPRO    = 2                # pour supprimer les affectations forcées
+[M:MLIK]FMIFLG    = 9                # pour supprimer les affectations de contremarque  # GH 18/06/12
+[M:MLIK]FEEDBACK  = 1
+Call UPDMTOLINK From MTOLINKLIB
+GOK=RET
+Return
+
+########################################################################
+# Pour exécution automatique  en gestion de patch                      #
+########################################################################
+Subprog PATCH(APPLI)
+Value Char    APPLI
+
+If APPLI=GDOSX3 : End : Endif
+If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+Read [ADS] DOSSIER=APPLI : If fstat Raz [F:ADS] : Endif
+Call EXE_UTIGPA25(APPLI,0)
+End
+
+#######################################################################
+# Pour exécution depuis dosmaj6 (validation dossier)
+########################################################################
+Subprog UTI_MOUL(APPLI)
+Value Char    APPLI
+
+If APPLI=GDOSX3 : End : Endif
+Call EXE_UTIGPA25(APPLI,0)
+End

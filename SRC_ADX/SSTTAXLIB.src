@@ -1,0 +1,646 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+####################################################################################
+# Sage Sales Tax Library - Calculate Taxes via Java Bridge connection
+#
+# Process:    SSTTAXLIB
+#             SST_CALCTAX() = Calculate tax through Sage Sales Tax.  Also used to
+#                             commit documents.
+#             SST_CANTAX() = cancel tax on SST
+#
+####################################################################################
+
+#**
+#* SST_CALCTAX - Call Sage Sales Tax to calculate tax
+#*
+#* @param ERR - zero means no error, otherwise error
+#* @param ERRMSG - error message
+#*!
+Subprog SST_CALCTAX(ERR,ERRMSG)
+  Variable Char ERRMSG()
+  Variable Integer ERR
+  Raz ERRMSG,ERR
+
+  Local Integer CREDIT_MEMO
+  Local Clbfile TAX_RESULT(8),REMAIN_RESULT(8)
+
+
+  Local Char SST_ACCOUNT(30),SST_LICENSE(30),SST_URL(250),SST_CPY(25),TMP_VCRDAT(10),TMP_STR(10)
+  Local Integer I,POS1,POS2,NBDIS,J,X,NEWDETAILRECORD
+
+  #Syracuse
+  Local Char RESULT(20), FUNCTION(30)
+  Local Clbfile ARGUMENTS(0),RESHEAD(0),RESBODY(6)
+  Local Char COMMITSTATUS(10)
+
+  If [M:PTU]NBLIG3=0
+    ERR=1 : ERRMSG = mess(91,106,1)               # RBU: 90459
+    End                                           # RBU: 90549
+  Endif
+
+  If  [M:PTU]VCRDAT = [00/00/00]
+      TMP_VCRDAT = format$("D:YYYY[-]MM[-]DD",date$)
+  Else
+      TMP_VCRDAT = format$("D:YYYY[-]MM[-]DD",[M:PTU]VCRDAT)
+  Endif
+
+  If [M:PTU]VCRTYP = "ReturnInvoice"
+    CREDIT_MEMO=-1
+  Else
+    CREDIT_MEMO=1
+  Endif
+
+  # 105815.ns
+  # If !clalev([F:LTP])  Local File LTAPAR  [LTP]  Endif   # 106867.o
+  # Read [F:LTP]LTP0=nomap   # 106867.o
+  Local Decimal SSTDOCDISAMT  : SSTDOCDISAMT = 0
+  Local Char SSTDOCDISFLG(10) : SSTDOCDISFLG = "false"
+  # Local Integer SSTDOCDISCPY  : SSTDOCDISCPY = 0   # 106867.so
+  # SSTDOCDISCPY = find ([M:PTU]CPY, [F:LTP]CPY(0..dim([F:LTP]CPY)-1))
+  # If company document discount invoice element <> 0 see if it exists on this document and set amount
+  # For invoice element lines the Itmref field = DTA field (invoice element number)   # 106867.eo
+  I = 0
+  # If SSTDOCDISCPY <> 0 & [F:LTP]VCRDISDTA(SSTDOCDISCPY-1) <> 0   # 106867.so
+  #  I = find (num$([F:LTP]VCRDISDTA(SSTDOCDISCPY-1)),[M:PTU]DTA(0..[M:PTU]NBLIG3-1))
+  # Endif   # 106867.eo
+  # Document discount is not applicable for BP customer invoices
+  If GFONCTION<>"GESBIC" & GFONCTION<>"BPCVAL"   # 106867.n
+    I = find (num$([F:CPY]SFINUM),[M:PTU]DTA(0..[M:PTU]NBLIG3-1))   # 106867.n
+    If I & ([M:PTU]DTA(I-1) = [M:PTU]ITMREF(I-1))
+      SSTDOCDISAMT = ([M:PTU]AMTLIN(I-1)*-1) * CREDIT_MEMO
+      SSTDOCDISFLG = "true"
+    Endif
+  Endif   # 106867.n
+  # 105815.ne
+
+  # if document id is blank, send SalesInvoice through as SalesOrder and ReturnInvoice as ReturnOrder
+  # This is for SST otherwise SST will assign and store a document uuid number. This can occur when a sales tax
+  # request is made prior to have a document number assigned.
+  I=instr(1,[M:PTU]VCRTYP,"Invoice")
+  If I>0 & vireblc([M:PTU]VCRNUM,2)=""
+    [M:PTU]VCRTYP=left$([M:PTU]VCRTYP,I-1)+"Order"
+  Endif
+
+
+  If CREDIT_MEMO=-1
+    For I=0 To [M:PTU]NBLIG3-1
+      [M:PTU]AMTLIN(I)*=CREDIT_MEMO
+    Next
+  Endif
+
+  #**
+  #* Set SST header overrides if all detail overrides are the same
+  #*!
+  Local Char HDR_OVRTYP(type([M:PTU]DTLOVRTYP(0))-10),HDR_OVRDAT(type([M:PTU]DTLOVRDAT(0))-10), HDR_OVRREA(type([M:PTU]DTLOVRREA(0))-10)
+  Local Char STR_ARRAY(type([M:PTU]DTLOVRTYP(0))-10)(dim([M:PTU]DTLOVRTYP)-1)
+  Local Decimal HDR_OVRAMT, DCB_ARRAY(dim([M:PTU]DTLOVRTYP)-1)
+  Raz NBDIS
+
+  Call DISTINCT_CHARS([M:PTU]DTLOVRTYP(0..[M:PTU]NBLIG3-1),[L]STR_ARRAY, [L]NBDIS)
+
+  If  [L]STR_ARRAY<>""                            # First input array has a non-blank value
+     If [L]NBDIS=1 : Call DISTINCT_CHARS([M:PTU]DTLOVRDAT(0..[M:PTU]NBLIG3-1),[L]STR_ARRAY, [L]NBDIS) : Endif
+     If [L]NBDIS=1 : Call DISTINCT_CHARS([M:PTU]DTLOVRREA(0..[M:PTU]NBLIG3-1),[L]STR_ARRAY, [L]NBDIS) : Endif
+     If [L]NBDIS=1 : Call DISTINCT_DCB([M:PTU]DTLOVRAMT(0..[M:PTU]NBLIG3-1),[L]DCB_ARRAY, [L]NBDIS) : Endif
+  Else
+    [L]NBDIS=0
+  Endif
+
+  If  [L]NBDIS = 1
+    HDR_OVRTYP = [M:PTU]DTLOVRTYP(0)
+    HDR_OVRDAT = [M:PTU]DTLOVRDAT(0)
+    #122699.so CATUA
+    #Do not default to today's date if its blank
+    #If ctrans(HDR_OVRDAT,"- ","")=""
+    #  HDR_OVRDAT=format$("D:DD[-]MM[-]YYYY",date$)
+    #Endif
+    #122699.eo
+    HDR_OVRREA = [M:PTU]DTLOVRREA(0)
+    HDR_OVRAMT = [M:PTU]DTLOVRAMT(0)
+  Else
+    Raz HDR_OVRTYP,HDR_OVRDAT,HDR_OVRREA,HDR_OVRAMT
+  Endif
+  # End of header overrides
+
+  Call SST_PARAM([M:PTU]CPY,SST_CPY,SST_ACCOUNT,SST_LICENSE,SST_URL,ERR,ERRMSG) From SSTLIB
+  If  ERR: TEST_RESULT=ERRMSG  : Goto CALCTAX_CLEAR : Endif
+
+    SST_URL += "/1.0/tax/get"
+
+    FUNCTION = 'sstPost'
+
+    If GSSTCOMMIT = 1
+      COMMITSTATUS = "true"
+    Else
+      COMMITSTATUS = "false"
+    Endif
+
+    # Use , to separate values within an argument.
+    Append ARGUMENTS,    'CompanyCode~=~'        + SST_CPY
+    Append ARGUMENTS, '~,~Commit~=~'             + COMMITSTATUS
+    Append ARGUMENTS, '~,~DocType~=~'            + [M:PTU]VCRTYP
+    Append ARGUMENTS, '~,~DocCode~=~'            + [M:PTU]VCRNUM
+    Append ARGUMENTS, '~,~DocDate~=~'            + TMP_VCRDAT
+    Append ARGUMENTS, '~,~CustomerCode~=~'       + [M:PTU]BPR
+    Append ARGUMENTS, '~,~CustomerUsageType~=~'  + [M:PTU]SSTENTCOD
+    Append ARGUMENTS, '~,~CurrencyCode~=~'       + [M:PTU]CUR
+    Append ARGUMENTS, '~,~Discount~=~'           + num$(SSTDOCDISAMT)  # 105815.n  SEND the document discount element amount
+    If dim([M:PTU]BPIEECNUM)>0 #115280.n
+      #109282.sn SEND VAT registration id, if exists.
+      If [M:PTU]BPIEECNUM <> ""
+        Append ARGUMENTS, '~,~BusinessIdentificationNo~=~'  + [M:PTU]BPIEECNUM
+      Endif
+      #109282.en
+    Endif
+
+    #121467.sn - JOBRO
+    If HDR_OVRTYP <> "" & ctrans(HDR_OVRDAT,"- ","") <> "" #122699.n - CATUA Check both override type and date
+        Append ARGUMENTS, '~,~TaxOverride.Reason~=~'                + HDR_OVRREA
+        Append ARGUMENTS, '~,~TaxOverride.TaxOverrideType~=~'       + HDR_OVRTYP
+        Append ARGUMENTS, '~,~TaxOverride.TaxDate~=~'               + HDR_OVRDAT
+    Endif
+    #121467.en - JOBRO
+    #Don't add exemption no. argument unless an actual exemption no. exists.  I noticed
+    #that just by adding the ExemptionNo argument, even if the actual number is blank,
+    #will trigger an exempt transaction.
+    If [M:PTU]VATEXN <> ""
+      Append ARGUMENTS, '~,~ExemptionNo~=~'  + [M:PTU]VATEXN + '~,~'
+    Endif
+    #Append Shipment addresses to address array
+    For I = 0 To ([M:PTU]NBLIG1 - 1)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I) + '].AddressCode~=~' + [M:PTU]STOFCY(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I) + '].Line1~=~'       + [M:PTU]STOFCYLIG1(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I) + '].Line2~=~'       + [M:PTU]STOFCYLIG2(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I) + '].Line3~=~'       + [M:PTU]STOFCYLIG3(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I) + '].City~=~'        + [M:PTU]STOFCYCTY(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I) + '].Region~=~'      + [M:PTU]STOFCYSAT(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I) + '].PostalCode~=~'  + [M:PTU]STOFCYPOS(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I) + '].Country~=~'     + [M:PTU]STOFCYCRY(I)
+    Next I
+
+    #Append Delivery addresses to address array
+    For I = 0 To ([M:PTU]NBLIG2 - 1)
+#      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].AddressCode~=~' + [M:PTU]BPAADD(I)  # 107022.o
+      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].AddressCode~=~D' + [M:PTU]BPAADD(I)  # 107022.n
+      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].Line1~=~'       + [M:PTU]BPDADDLIG1(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].Line2~=~'       + [M:PTU]BPDADDLIG2(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].Line3~=~'       + [M:PTU]BPDADDLIG3(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].City~=~'        + [M:PTU]BPDCTY(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].Region~=~'      + [M:PTU]BPDSAT(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].PostalCode~=~'  + [M:PTU]BPDPOS(I)
+      Append ARGUMENTS, '~,~Addresses[' + num$(I + [M:PTU]NBLIG1) + '].Country~=~'     + [M:PTU]BPDCRY(I)
+    Next I
+
+    #Append Lines array
+    For I = 0 To ([M:PTU]NBLIG3 - 1)
+      Append ARGUMENTS, '~,~Lines[' + num$(I) + '].LineNo~=~'          + num$(I + 1)
+      Append ARGUMENTS, '~,~Lines[' + num$(I) + '].ItemCode~=~'        + num$([M:PTU]ITMREF(I))
+      Append ARGUMENTS, '~,~Lines[' + num$(I) + '].Description~=~'     + num$([M:PTU]ITMDES(I))
+      Append ARGUMENTS, '~,~Lines[' + num$(I) + '].Qty~=~'             + num$([M:PTU]QTY(I))
+      # If SSTDOCDISAMT <> 0 & [F:LTP]VCRDISDTA(SSTDOCDISCPY-1) = val([M:PTU]ITMREF(I))  # 105815.sn   # 106867.o
+      If SSTDOCDISAMT <> 0 & [F:CPY]SFINUM = val([M:PTU]ITMREF(I))  # 105815.sn   # 106867.n
+      # Cannot SKIP the document discount element because of the pass through all of the lines on the return, so set to 0
+        Append ARGUMENTS, '~,~Lines[' + num$(I) + '].Amount~=~'        + "0"
+      Else  # 105815.en
+        Append ARGUMENTS, '~,~Lines[' + num$(I) + '].Amount~=~'          + num$([M:PTU]AMTLIN(I))
+      Endif  # 105815.n
+      Append ARGUMENTS, '~,~Lines[' + num$(I) + '].TaxIncluded~=~'     + num$([M:PTU]PRITYP(I)-1)
+      Append ARGUMENTS, '~,~Lines[' + num$(I) + '].TaxCode~=~'         + [M:PTU]SSTCOD(I)
+      Append ARGUMENTS, '~,~Lines[' + num$(I) + '].OriginCode~=~'      + [M:PTU]DSTOFCY(I)
+      Append ARGUMENTS, '~,~Lines[' + num$(I) + '].DestinationCode~=~D' + [M:PTU]DBPAADD(I)  # 107022.n
+#     Append ARGUMENTS, '~,~Lines[' + num$(I) + '].DestinationCode~=~' + [M:PTU]DBPAADD(I)  # 107022.o
+      # Do not apply the document discount flag to other Invoice element lines (i.e. Itmref = DTA)  # 105815.sn
+      If [M:PTU]ITMREF(I) = [M:PTU]DTA(I)
+        Append ARGUMENTS, '~,~Lines[' + num$(I) + '].Discounted~=~'   + "false"
+      Else
+        Append ARGUMENTS, '~,~Lines[' + num$(I) + '].Discounted~=~'   + SSTDOCDISFLG
+      Endif  # 105815.ne
+    Next I
+
+    #Currently, X3 does not support Tax Overrides.  If overrides were supported, it would follow this format:
+    #TaxOveride.[FIELD] = [VALUE].  There are currently 4 fields: TaxOverrideType, TaxAmount, TaxDate, and Reason.
+    ARGUMENTS = func REPLACE_CHARACTERS(ARGUMENTS)
+    # Use commas to separate arguments.
+    ARGUMENTS = '"' + SST_ACCOUNT + ':' + SST_LICENSE + '","' + SST_URL + '","' + ARGUMENTS + '"'
+    Call SEND_REQUEST(FUNCTION,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG) From SSTLIB
+    If ERR : End : Endif
+    RESULT = func FINDVAL(RESBODY,"ResultCode")
+
+    # Issue 117247 - 2016-07-13 by ERMIL : Large invoices will not post
+    # When committing, don't reload taxes, just end.
+    # The commit is done - nothing more to see here.
+    If GSSTCOMMIT=1
+      If toupper(RESULT)="SUCCESS"
+        ERRMSG = RESULT
+      Else
+        ERR = 1
+        ERRMSG = func FINDVAL(RESBODY,"Summary")
+      Endif
+      End
+    Endif
+
+    If toupper(RESULT)="SUCCESS"
+      ERRMSG = RESULT
+      REMAIN_RESULT = RESBODY
+
+      Local Char TMP_STR(20), TAXNAME(20), COUNTRY(20), REGION(20), JURISTYPE(20), RATE(20), JURISNAME(20)
+      Local Char TAXDATE(20), LINENO(5)                 #ns 106738
+      Local Integer Z
+
+      TAXDATE = func FINDVAL(REMAIN_RESULT,"TaxDate")   #ne 106738
+
+      If CREDIT_MEMO=-1
+        For I=0 To [M:PTU]NBLIG3-1
+          [M:PTU]AMTLIN(I)*=CREDIT_MEMO
+        Next
+      Endif
+      I=0
+      J=0
+      Z=1  #n 106738
+      #  X3 Line item detail
+          While instr(1,REMAIN_RESULT,"LineNo")<>0
+               LINENO = func FINDVAL(REMAIN_RESULT,"LineNo")              #n 106738
+               #Call SST_PARSE_JSON(REMAIN_RESULT, "Rate",TMP_STR, ERR)   #o 106738
+               TMP_STR = func FINDVAL(REMAIN_RESULT,"Rate")               #n 106738
+               [M:PTU]TOTLINRAT(I) = val(TMP_STR)
+               #Call SST_PARSE_JSON(REMAIN_RESULT, "Tax",TMP_STR, ERR)    #o 106738
+               TMP_STR = func FINDVAL(REMAIN_RESULT,"Tax")                #n 106738
+               [M:PTU]TOTAMTTAX(I) = val(TMP_STR)*CREDIT_MEMO
+               I+=1
+               If  ERR or I>dim([M:PTU]TOTAMTTAX)-1
+                   Break
+               Endif
+
+            If ERR
+              ERRMSG=TAX_RESULT
+              Goto CALCTAX_CLEAR
+            Endif
+
+            #parsing Truncate at beginning of TaxDetails array
+            Call TRUNCATE_JSON(REMAIN_RESULT, "TaxDetails")
+
+            # Tax Jurisdiction Detail
+            While instr(1,REMAIN_RESULT,"JurisType") <> 0
+                 #If we get to the next tax details record and it is for the next LineNo, exit the loop.
+                 #parsing Check if LineNo was truncated when we truncated at TaxDetails.  If not, we must account for it.
+                 If LINENO = func FINDVAL(REMAIN_RESULT,"LineNo")         #ns 106738
+                   Z = instr(1,REMAIN_RESULT,"LineNo") + 10
+                 Else
+                   Z = 1
+                 Endif                                                    #ne 106738
+                 #If instr(1,REMAIN_RESULT,"LineNo") <> 0 & instr(1,REMAIN_RESULT,"JurisType") > instr(1,REMAIN_RESULT,"LineNo")    #o 106738
+                 If instr(Z,REMAIN_RESULT,"LineNo") <> 0 & instr(1,REMAIN_RESULT,"JurisType") > instr(Z,REMAIN_RESULT,"LineNo")     #ns 106738
+                   If Z > 1
+                     Call TRUNCATE_JSON(REMAIN_RESULT, "LineNo")
+                     Z=1
+                   Endif                                                                                                            #ne 106738
+                   Break
+                 Endif
+
+                 #Check if this detail tax record is already defined.  If so, just add taxable amount and tax amount.
+                 NEWDETAILRECORD=1
+                 X=0
+                 While X < J
+                    COUNTRY = func FINDVAL(REMAIN_RESULT,"Country")
+                    TAXNAME = func FINDVAL(REMAIN_RESULT,"TaxName")
+                    REGION = func FINDVAL(REMAIN_RESULT,"Region")
+                    JURISTYPE = func FINDVAL(REMAIN_RESULT,"JurisType")
+                    RATE = func FINDVAL(REMAIN_RESULT,"Rate")
+                    JURISNAME = func FINDVAL(REMAIN_RESULT,"JurisName")
+                    #Inv Element Issue.  Add [M:PTU]DTA(I-1) = "" if statement.  Invoice element detail records are not
+                    #aggregated like regular detail line items.
+                    If [M:PTU]DTA(I-1) = ""
+                      If [M:PTU]PAYS(X) = COUNTRY & [M:PTU]TAXNAM(X) = TAXNAME & [M:PTU]SAT(X) = REGION
+&                       & [M:PTU]JURTYP(X) = JURISTYPE & [M:PTU]TAXRAT(X) = val(RATE)*100 & [M:PTU]JURNAM(X) = JURISNAME
+                        #Call SST_PARSE_JSON(REMAIN_RESULT, "Taxable",TMP_STR, ERR)         #o 106738
+                        TMP_STR = func FINDVAL(REMAIN_RESULT,"Taxable")                     #n 106738
+                        [M:PTU]BASTAX(X) += val(TMP_STR)*CREDIT_MEMO
+                        [M:PTU]AMTNOT(X) = [M:PTU]BASTAX(J)*CREDIT_MEMO
+
+                        #Call SST_PARSE_JSON(REMAIN_RESULT, "Tax",TMP_STR, ERR)             #o 106738
+                        TMP_STR = func FINDVAL(REMAIN_RESULT,"Tax")                         #n 106738
+                        [M:PTU]AMTTAX(X) += val(TMP_STR)*CREDIT_MEMO
+
+                        #Remove remaining current tax details record
+                        #Call SST_PARSE_JSON(REMAIN_RESULT, "TaxName",TMP_STR, ERR)         #o 106738
+                        Call TRUNCATE_JSON(REMAIN_RESULT, "}")                              #n 106738
+                        NEWDETAILRECORD = 0
+                        Break
+                      Endif
+                    Endif
+                    X+=1
+                 Wend
+
+                 If NEWDETAILRECORD = 1
+                     #Call SST_PARSE_JSON(REMAIN_RESULT, "Country",TMP_STR, ERR)        #o 106738
+                     TMP_STR = func FINDVAL(REMAIN_RESULT,"Country")                    #n 106738
+                     [M:PTU]PAYS(J) = TMP_STR
+
+                     #Call SST_PARSE_JSON(REMAIN_RESULT, "Region",TMP_STR, ERR)         #o 106738#
+                     TMP_STR = func FINDVAL(REMAIN_RESULT,"Region")                     #n 106738
+                     [M:PTU]SAT(J) = TMP_STR
+
+                     #Call SST_PARSE_JSON(REMAIN_RESULT, "JurisType",TMP_STR, ERR)      #o 106738
+                     TMP_STR = func FINDVAL(REMAIN_RESULT,"JurisType")                  #n 106738
+                     [M:PTU]JURTYP(J) = TMP_STR
+
+                     #Call SST_PARSE_JSON(REMAIN_RESULT, "Taxable",TMP_STR, ERR)        #o 106738
+                     TMP_STR = func FINDVAL(REMAIN_RESULT,"Taxable")                    #n 106738
+                     [M:PTU]BASTAX(J) = val(TMP_STR)*CREDIT_MEMO
+                     [M:PTU]AMTNOT(J) = [M:PTU]BASTAX(J)*CREDIT_MEMO
+
+                     #Call SST_PARSE_JSON(REMAIN_RESULT, "Rate",TMP_STR, ERR)           #o 106738
+                     TMP_STR = func FINDVAL(REMAIN_RESULT,"Rate")                       #n 106738
+                     If !ERR : [M:PTU]TAXRAT(J) = val(TMP_STR)*100 : Endif
+
+                     #Call SST_PARSE_JSON(REMAIN_RESULT, "Tax",TMP_STR, ERR)            #o 106738
+                     TMP_STR = func FINDVAL(REMAIN_RESULT,"Tax")                        #o 106738
+                     [M:PTU]AMTTAX(J) = val(TMP_STR)*CREDIT_MEMO
+
+                     #Call SST_PARSE_JSON(REMAIN_RESULT, "JurisName",TMP_STR, ERR)      #o 106738
+                     TMP_STR = func FINDVAL(REMAIN_RESULT,"JurisName")                  #n 106738
+                     [M:PTU]JURNAM(J) = TMP_STR
+
+                     #Call SST_PARSE_JSON(REMAIN_RESULT, "TaxName",TMP_STR, ERR)        #o 106738
+                     TMP_STR = func FINDVAL(REMAIN_RESULT,"TaxName")                    #n 106738
+                     [M:PTU]TAXNAM(J) = TMP_STR
+                     Call TRUNCATE_JSON(REMAIN_RESULT, "}")                             #n 106738
+
+                     #TMP_STR = func FINDVAL(REMAIN_RESULT,"TaxDate")                   #oe 106738
+                     #parsing
+                     #[M:PTU]TAXDAT(J) = gdat$(val(seg$(TMP_STR,9,10)), val(seg$(TMP_STR,6,7)), val(seg$(TMP_STR,1,4)))     #oe 106738
+                     Onerrgo ERR_TAXDAT
+                     [M:PTU]TAXDAT(J) = gdat$(val(seg$(TAXDATE,9,10)), val(seg$(TAXDATE,6,7)), val(seg$(TAXDATE,1,4)))    #n 106738
+
+                     #Inv Element Issue.  Change [M:PTU]DTA(I) to [M:PTU]DTA(I-1).
+                     [M:PTU]DTADTL(J) = [M:PTU]DTA(I-1)
+
+                     J+=1
+                     If  ERR or J>dim([M:PTU]PAYS)-1
+                         Break
+                     Endif
+                Endif
+            Wend
+            [M:PTU]NBLIG5=J
+
+        Wend
+        [M:PTU]NBLIG3 = I
+        [M:PTU]VCRTOTTAX = sum([M:PTU]TOTAMTTAX)
+      Else
+        ERR = 1
+        ERRMSG = func FINDVAL(RESBODY,"Summary")
+      Endif
+
+  #**
+  #* Adxd clear and close
+  #*!
+  $CALCTAX_CLEAR
+
+End
+
+
+#**
+#* ERR_TAXDAT - if error on tax date conversion, skip tax date
+#*!
+$ERR_TAXDAT
+Resume
+
+
+
+#**
+#* SST_CANTAX-Cancel Tax document. Note, if the document has been posted, then cancelling will void the document but leave the
+#* document on Sage Sales Tax as voided. If the document, has been added to Sage Sales Tax but not posted, then cancelling the document
+#* Will delete the document from Sage Sales Tax. E.g., deleting an X3 invoice attached to an Sage Sales Tax tax document can only done
+#* prior to X3 Validation (posting), in which case the documnt would be deleted from Sage Sales Tax.
+#*
+#* @param X3_CPY - Passed - X3 company used to determine Sage Sales Tax Company
+#* @param TAX_DOCCODE - Passed - Invoice Document number or Id
+#* @param TAX_DOCTYPE - Passed - SalesInvoice, ReturnInvoice or PurchaseInvoice
+#* @param TAX_CANREA - Passed - Enumerated - Cancel reason - one of the following values -
+#*        AdjustmentCancelled, DocDeleted, DocVoided, PostFailed, Unspecified
+#* @param ERR - Returned - 0 if no error otherwise error
+#* @param ERRMSG - Returned - Error Message
+#*
+#*!
+Subprog SST_CANTAX(X3_CPY,TAX_DOCCODE,TAX_DOCTYPE,TAX_CANREA,ERR,ERRMSG)
+Value Char X3_CPY,TAX_DOCCODE,TAX_DOCTYPE,TAX_CANREA
+Variable Char ERRMSG()
+Variable Integer ERR
+
+Local Clbfile CANTAX_RESULT(4),REMAIN_RESULT(4),ARGUMENTS(0),RESHEAD(0),RESBODY(6)
+
+Local Char SST_ACCOUNT(30),SST_LICENSE(30),SST_URL(250),SST_CPY(25),FUNCTION(30),RESULT(20)
+
+If instr(1,"*PurchaseInvoice*PurchaseOrder*ReturnInvoice*ReturnOrder*SalesInvoice*SalesOrder*","*"+TAX_DOCTYPE+"*")=0
+    ERR=1
+    ERRMSG=AFNC.MES1(mess(371,192,1),TAX_DOCTYPE)
+    Goto CANTAX_CLEAR
+Endif
+
+If instr(1,"*AdjustmentCancelled*DocDeleted*DocVoided*PostFailed*Unspecified*","*"+TAX_CANREA+"*")=0
+    ERR=1
+    ERRMSG=AFNC.MES1(mess(372,192,1),TAX_CANREA)
+    Goto CANTAX_CLEAR
+Endif
+
+Raz ERRMSG,ERR,CANTAX_RESULT
+
+Call SST_PARAM(X3_CPY,SST_CPY,SST_ACCOUNT,SST_LICENSE,SST_URL,ERR,ERRMSG) From SSTLIB
+If  ERR: CANTAX_RESULT=ERRMSG  : Goto CANTAX_CLEAR : Endif
+
+  SST_URL += "/1.0/tax/cancel"
+
+  FUNCTION = 'sstPost'
+
+  Append ARGUMENTS, '"' + SST_ACCOUNT + ':' + SST_LICENSE + '",'
+
+  Append ARGUMENTS, '"' + SST_URL + '",'
+
+  Append ARGUMENTS,   '"CompanyCode~=~' + SST_CPY
+  Append ARGUMENTS, '~,~DocType~=~'     + TAX_DOCTYPE
+  Append ARGUMENTS, '~,~DocCode~=~'     + TAX_DOCCODE
+  Append ARGUMENTS, '~,~CancelCode~=~'  + TAX_CANREA
+  Append ARGUMENTS, '"'
+
+  Call SEND_REQUEST(FUNCTION,ARGUMENTS,RESHEAD,RESBODY,ERR,ERRMSG) From SSTLIB
+  If ERR : End : Endif
+
+  RESULT = func FINDVAL(RESBODY,"ResultCode")
+  If toupper(RESULT)="SUCCESS"
+    ERRMSG = RESULT
+    GOK=1
+  Else
+    ERR = 1
+    ERRMSG = func FINDVAL(RESBODY,"Summary")
+    #Per SAM issue 102274, ignore error from Avalara for Cancel.  This is the way GA 7.1 functioned.  This should be reviewed at a later time.
+    #Per the defect, an error message was bubbling up when following the steps to repeat.  However, the application code should not
+    #have been attempting a cancel under the circumstances.  The error is correct but no harm comes from attempting the cancel.
+    #GOK=0
+  Endif
+
+
+#**
+#* CANTAX_CLEAR - Close cancel Tax
+#*!
+$CANTAX_CLEAR
+End
+
+
+#**
+#* Return an array of distinct values fron an X3 array - Chars
+#*
+#* @param INP_ARRAY - Input array
+#* @param DISTINCT_VALUE - list of distinct values
+#* @param NBDIS - Number of distinct values (loop 0 to [L]NBDIS-1)
+#*!
+Subprog DISTINCT_CHARS(INP_ARRAY,DISTINCT_VALUE,NBDIS)
+Value Char INP_ARRAY()()
+Variable Char DISTINCT_VALUE()()
+Variable Integer NBDIS
+Local Integer I,NBDIS
+  Gosub DISTINCT
+End
+
+#**
+#* Return an array of distinct values fron an X3 array - Decimals
+#*
+#* @param INP_ARRAY - Input array
+#* @param DISTINCT_VALUE - list of distinct values
+#* @param NBDIS - Number of distinct values (loop 0 to [L]NBDIS-1)
+#*!
+Subprog DISTINCT_DCB(INP_ARRAY,DISTINCT_VALUE,NBDIS)
+Value Decimal INP_ARRAY()
+Variable Decimal DISTINCT_VALUE()
+Variable Integer NBDIS
+Local Integer I,NBDIS
+  Gosub DISTINCT
+End
+
+#**
+#* Determine distinct values independent of X3 type
+#*!
+$DISTINCT
+  Sorta INP_ARRAY
+  Raz NBDIS,DISTINCT_VALUE
+  DISTINCT_VALUE(0)=INP_ARRAY(0)
+  [L]NBDIS=1
+  For I=0 To dim(INP_ARRAY)-1
+    If DISTINCT_VALUE([L]NBDIS-1)<>INP_ARRAY(I)
+      [L]NBDIS+=1
+      DISTINCT_VALUE([L]NBDIS-1)=INP_ARRAY(I)
+    Endif
+  Next
+
+Return
+
+####################################################################################################
+Funprog FINDVAL(RESP,K)
+  Value    Clbfile  RESP
+  Value    Char     K
+
+  Local Integer X
+  Local Char SEGMENT(250)
+
+#119640 JOBRO - Looks like the batch server response is NOW the same as when ran
+#               interactively. So I am backing out 115663 since it no longer
+#               applies and causes an incorrect error message
+
+#119640.so
+#  #When in a batch process there are line breaks in the CLOB file
+#  #so we need to remove the colon and move extra spaces
+#  If GSERVEUR = 1 #SAM 115663.sn MJH 4/12/2016
+#    X = instr(1,RESP,'"'+ K )
+#  Else
+# 119640.eo
+
+  X = instr(1,RESP, '"' + K + '":')
+
+#  Endif                                #119640.o
+
+  If !X : End "" : Endif
+  X += len(K)+5
+
+#119640.so
+#  If GSERVEUR = 1
+#    SEGMENT = seg$(RESP,X+2,instr(X+2,RESP,'"')-2)
+#  Else
+#119640.eo
+
+  SEGMENT = seg$(RESP,X,instr(X,RESP,'"')-1)
+
+#  Endif  #119640.o
+
+End SEGMENT#SAM 115663.en MJH 4/12/2016
+#End seg$(RESP,X,instr(X,RESP,'"')-1) 115663.o
+
+####################################################################################################
+#Subprog SST_PARSE_JSON(STR_REMAIN, FIND_STR, STR_RESULT, ERR)                  #os 106738
+#  Variable Clbfile STR_REMAIN()
+#  Variable Char STR_RESULT()
+#  Variable Integer ERR
+#  Value Char FIND_STR()
+#  Local Integer X
+#
+#  X = instr(1,STR_REMAIN, '"' + FIND_STR + '":')
+#  If !X
+#    STR_RESULT = ""
+#    End
+#  Endif
+#  X += len(FIND_STR)+5
+#
+#  STR_RESULT = seg$(STR_REMAIN,X,instr(X,STR_REMAIN,'"')-1)
+#  STR_REMAIN = right$(STR_REMAIN,X)
+#
+#End                                                                           #oe 106738
+
+####################################################################################################
+# New function for parsing JSON - 106738
+Subprog TRUNCATE_JSON(STR_REMAIN, FIND_STR)
+  Variable Clbfile STR_REMAIN()
+  Value Char FIND_STR()
+
+  X = instr(1,STR_REMAIN, FIND_STR)
+
+  STR_REMAIN = right$(STR_REMAIN,X+1)
+
+End
+
+
+
+####################################################################################################
+Funprog REPLACE_CHARACTERS(TEXT)
+  Value Clbfile TEXT
+
+  Local Clbfile TMPTEXT
+  Local Integer CHARPOS1
+  Local Integer CHARPOS2
+
+  # Place escape character in front of backslash character
+  If instr(1,TEXT,'\')
+    CHARPOS1 = 1
+    CHARPOS2 = instr(1,TEXT,'\')
+
+    Repeat
+      TMPTEXT  = seg$(TEXT,CHARPOS1,CHARPOS2-1) + "\\"
+      CHARPOS1 = CHARPOS2 + 1
+      CHARPOS2 = instr(CHARPOS1,TEXT,'\')
+    Until CHARPOS2 = 0
+
+    TEXT = TMPTEXT + seg$(TEXT,CHARPOS1,len(TEXT))
+  Endif
+
+  # Place escape character in front of double quote character
+  If instr(1,TEXT,'"')
+    CHARPOS1 = 1
+    CHARPOS2 = instr(1,TEXT,'"')
+
+    Repeat
+      TMPTEXT += seg$(TEXT,CHARPOS1,CHARPOS2-1) + '\"'
+      CHARPOS1 = CHARPOS2 + 1
+      CHARPOS2 = instr(CHARPOS1,TEXT,'"')
+    Until CHARPOS2 = 0
+
+    TEXT = TMPTEXT + seg$(TEXT,CHARPOS1,len(TEXT))
+  Endif
+
+End TEXT
+

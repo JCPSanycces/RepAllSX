@@ -1,0 +1,636 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Class CCMIMPPOH - Purchase Orders Impact Analysis 'header'
+# Issue 109096/2 - 2015-11-24 by BAKHA : For non-conformance, send email to actioners
+
+$METHODS
+  Case CURPTH
+    When ""
+      Case ACTION
+        When "AINIT"                         : Gosub INITIALISE
+        When "CREATE_PURCHASE_ORDERS_BATCH"  : Gosub CREATE_PURCHASE_ORDERS_BATCH
+        When "CREATE_PURCHASE_ORDERS"        : Gosub CREATE_PURCHASE_ORDERS
+        When "CREATE_PURCHASE_ORDER_LINES"   : Gosub CREATE_PURCHASE_ORDER_LINES
+        When "VALIDATE_IMPLEMENT"            : Gosub VALIDATE_IMPLEMENT
+        When "UPDATE_STATUS"                 : Gosub UPDATE_STATUS
+        When "AUPDATE_AFTER"                 : Gosub NOTIFY_ACTIONER
+      Endcase
+  Endcase
+Return
+
+# --------------------------------------------------
+# Initialise 'header' properties ...
+$INITIALISE
+
+  Local Integer LINES
+
+  this.HOLD        = 1
+  this.IMPLEMENT   = 1
+  this.POHSUP      = 0
+  this.POHORDERS   = 0
+  this.POHQTY      = 0
+  this.POHAMT      = 0
+  this.POHAMTEX    = 0
+  this.TOTALLINES  = 0
+  this.POHPLASTA   = 4
+
+  this.IMPACTANAL  = 0
+
+  # Folder currency ...
+  this.FOLDCUR = fmet this.ACTX.APARAM.AGETVALCHAR(CST_ALEVFOLD, this.ACTX.AFOLDER, "RTZCUR")
+
+Return
+
+# ------------------------------------------------------
+# Operation: CREATE_PURCHASE_ORDERS_BATCH
+#
+# Called from Impact Analysis summary links.
+# Instantiate Batch Server process, Task: CCMIMPBATT.
+#
+$CREATE_PURCHASE_ORDERS_BATCH
+
+  Local Integer LOCAL_STATUS
+  Local Instance IMPPOH Using C_CCMIMPPOH
+  IMPPOH = NewInstance C_CCMIMPPOH AllocGroup null
+
+  Local Char    AFOLDER(30)
+  Local Char    USER(30)
+  Local Char    TASKNAME(30)
+  Local Date    DAT
+  Local Char    TIM(5)
+  Local Char    TBPAR(30)(1..10)
+  Local Char    TBVAL(250)(1..10)
+  Local Integer NBPAR
+  Local Integer TASKID
+  Local Char    TASKMESSAGE(250)
+
+  Local Integer LTIME
+  Local Char    CTIME(4)
+
+  # Read impact header
+  LOCAL_STATUS = fmet IMPPOH.AREAD(CRID)
+
+  ASTATUS = CST_AOK
+
+  If (IMPPOH.IMPACTANAL <> 1)
+
+    LTIME = time : CTIME = format$("N00:2", int(LTIME/3600)) +format$("N00:2", int((LTIME -(int(LTIME/3600) *3600)) /60))
+
+    USER       = IMPPOH.ACTX.USER
+    TASKNAME  = "CCMIMPBATT"
+    DAT       = date$
+    TIM       = CTIME
+    NBPAR = 1  : TBPAR(NBPAR) = "CRID"        : TBVAL(NBPAR) = CRID
+    NBPAR += 1 : TBPAR(NBPAR) = "TRANSACTION" : TBVAL(NBPAR) = "7"
+
+    # Impact Analysis 'Created' flag = "No" ...
+    IMPPOH.IMPACTANAL = 1
+    LOCAL_STATUS = fmet IMPPOH.AUPDATE()
+
+    ASTATUS = func ASYRMNGTREQ.CRERQT(IMPPOH.ACTX,
+&                              IMPPOH.ACTX.AFOLDER,
+&                              USER,
+&                              TASKNAME,
+&                              DAT,
+&                              TIM,
+&                              TBPAR,
+&                              TBVAL,
+&                              NBPAR,
+&                              TASKID,
+&                              TASKMESSAGE)
+
+  Endif
+
+  FreeGroup IMPPOH
+  ARET_VALUE = ASTATUS
+
+Return
+
+# -------------------------------------------------------------------------------
+# Custom Operation ...
+#
+# Called from (a) Change Request - change of status to "In review", and
+#             (b) Impact Analysis Sales Quotes - refresh.
+#
+$CREATE_PURCHASE_ORDERS
+
+  Local Integer LOCSTATUS, I, LINES, COUNT, FOUND
+  Local File CCMIMPPOD [CCMIPOD]
+  Local Instance SELCHGREQ Using C_CCMCHGREQ
+  Local Instance SELIMPPOH Using C_CCMIMPPOH
+
+  # Begin a Database Transaction ...
+  Local Integer TRANSACTION_PENDING
+  TRANSACTION_PENDING = adxlog
+  If (adxlog = 0)
+    Trbegin [CCMIPOD]
+  Endif
+
+  # Read Change Request ...
+  SELCHGREQ = NewInstance C_CCMCHGREQ AllocGroup null
+  LOCSTATUS = fmet SELCHGREQ.AREAD(CRID)
+
+  # Read Impact Analysis 'header' ...
+  SELIMPPOH = NewInstance C_CCMIMPPOH AllocGroup null
+  LOCSTATUS = fmet SELIMPPOH.AREAD(CRID)
+
+  # Is refresh possible? ...
+  If (LOCSTATUS = [V]CST_AOK and
+&     SELCHGREQ.CRSTATUS = 2)
+
+    # Clear lines ...
+    Delete [CCMIPOD] Where CRID = SELIMPPOH.CRID
+
+    # Initialise 'header' properties ...
+    SELIMPPOH.HOLD        = 1
+    SELIMPPOH.IMPLEMENT   = 1
+    SELIMPPOH.POHSUP      = 0
+    SELIMPPOH.POHORDERS   = 0
+    SELIMPPOH.POHQTY      = 0
+    SELIMPPOH.POHAMT      = 0
+    SELIMPPOH.POHAMTEX    = 0
+
+    # Folder currency ...
+    SELIMPPOH.FOLDCUR = fmet this.ACTX.APARAM.AGETVALCHAR(CST_ALEVFOLD, this.ACTX.AFOLDER, "RTZCUR")
+    LOCSTATUS = fmet SELIMPPOH.CREATE_PURCHASE_ORDER_LINES (SELIMPPOH.CRID, SELCHGREQ.PRODUCT, SELCHGREQ.ECCVALMAJ, SELCHGREQ.ECCVALMIN)
+
+  Endif
+
+  # If lines (i.e. unique orders) then set status to 1 (Plan) else set to 4 (Not applicable)
+  If (SELIMPPOH.POHORDERS >= 1)
+    SELIMPPOH.POHPLASTA = 1
+  Else
+    SELIMPPOH.POHPLASTA = 4
+    # If Plan Status is 4 (None) then Implement flag is always ticked ...
+    SELIMPPOH.IMPLEMENT = 2
+  Endif
+
+  SELIMPPOH.IMPACTANAL = 2
+
+  LOCSTATUS= fmet SELIMPPOH.AUPDATE()
+
+  # Commit or Rollback the Database Transaction ...
+  If (TRANSACTION_PENDING = 0)
+    If (ASTATUS <= [V]CST_AINFO)
+      Commit
+    Else
+      Rollback
+    Endif
+  Endif
+
+  FreeGroup SELIMPPOH
+  FreeGroup SELCHGREQ
+
+  LogicClose File [CCMIPOD]
+
+Return
+
+# -------------------------------------------------------------------------------
+# Custom Method ...
+#
+# Called from $CREATE_PURCHASE_ORDERS (above).
+#
+$CREATE_PURCHASE_ORDER_LINES
+  Local Instance SELCHGREQ Using C_CCMCHGREQ
+  SELCHGREQ = NewInstance C_CCMCHGREQ AllocGroup null
+  Local Char CRITERIA(250)
+
+  Local Integer I, LOCSTATUS, WRET, BLANK_VERSION
+  #MGG X3-38337_Product_Code_length_&_GLONITM_function
+  Local Char LAST_ITMREF(GLONITM)    : LAST_ITMREF = ""
+  #END MGG X3-38337_Product_Code_length_&_GLONITM_function
+  Local Date    WDATREF         : WDATREF     = AVOID.ADATE
+  Local Integer WLSTTYP         : WLSTTYP     = 3     # 1=first level, 2=last level, 3= multi-level
+  Local Integer WALTTYPSTR      : WALTTYPSTR  = 1     # 1=Sales (kit), 2=WO (Manufacturing), 3=EO (subcontracting BOM)
+  Local Integer WALTTYPEND      : WALTTYPEND  = 3     # 1=Sales (kit), 2=WO (Manufacturing), 3=EO (subcontracting BOM)
+  Local Integer WALTSTR         : WALTSTR     = 0     # From alt number : 0=all alternatives
+  Local Integer WALTEND         : WALTEND     = 0     # From alt number : 0=all alternatives
+  Local Char    MYCRIT(250)     : MYCRIT      = "1=1" # No particular Where criteria
+  Local Char    MYFOR (GLONFOR) : MYFOR       = ""    # Reference of a formula in table TABFOR [F:TFO] with FORTYP=31
+  Local File ITMMASTER [ITM]
+  Local File ITMCATEG [ITG]
+  Local Integer LINE_NUMBER     : LINE_NUMBER = 0
+  Local Char MYBPSNUM (GLONBPS)(0..)
+  Local Integer NO_SUPP   : NO_SUPP = 0
+  Local Char MYPOHNUM (GLONPOH)(0..)
+  Local Integer NO_ORDERS : NO_ORDERS = 0
+  #CATUA X3-38562.sn Set Product Code length to GLONITM
+  Local Char SUB_LINES_PRODUCT(GLONITM)
+  #CATUA X3-38562.en
+
+  Local Char SUB_ECCVALMAJ(10)
+  Local Char SUB_ECCVALMIN(10)
+
+  # Create lines for Change Request Product ...
+
+  BLANK_VERSION = CST_ATRUE
+  SUB_ECCVALMAJ = MAJOR_VERSION
+  SUB_ECCVALMIN = MINOR_VERSION
+  SUB_LINES_PRODUCT = PRODUCT
+  Gosub CREATE_PURCHASE_ORDER_SUB_LINES
+
+  Local Instance ALOG Using C_ALOG
+  ALOG = NewInstance C_ALOG AllocGroup null
+
+  # Check for semi-finished goods ...
+  Read [ITM]ITM0 = PRODUCT
+  If (fstat = 0)
+
+    Read [ITG]ITG1 = [F:ITM]TCLCOD; ""
+    If (fstat = 0 and
+&       [F:ITG]PURFLG = 2)
+
+      # CCM ...
+      Local File BOMWUS [BOW]
+      Call CALCULATE_WHERE_USED_ECC(this.ACTX,
+&                               PRODUCT,
+&                               MAJOR_VERSION,
+&                               MINOR_VERSION,
+&                               WDATREF,
+&                               WLSTTYP,
+&                               WALTTYPSTR,
+&                               WALTTYPEND,
+&                               WALTSTR,
+&                               WALTEND,
+&                               MYCRIT,
+&                               MYFOR,
+&                               WRET) From SUBBOW_SYRA
+      Filter [BOW] Where CREUSR = this.ACTX.USER and
+&                        BOWUID = adxuid(1)
+&                  Order By ITMREF
+      For [BOW]
+        If ([F:BOW]ITMREF <> LAST_ITMREF)
+          SUB_LINES_PRODUCT = [F:BOW]ITMREF
+          # if version managed
+
+          If (fmet SELCHGREQ.IS_PRODUCT_VERSION_MANAGED(SUB_LINES_PRODUCT) > 1)
+            Local File ECCVAL [EVL]
+            # for each version, create lines
+            CRITERIA = " 1=1 "
+            If [F:BOW]BOMSTRDAT<>[0/0/0]
+              CRITERIA+=" & STRDAT>=["+format$(GFMD,[F:BOW]BOMSTRDAT)+"]"
+            Endif
+            If [F:BOW]BOMENDDAT<>[0/0/0]
+              CRITERIA+=" & STRDAT<=["+format$(GFMD,[F:BOW]BOMENDDAT)+"]"
+            Endif
+
+            BLANK_VERSION = CST_ATRUE
+            For [EVL] Where ITMREF=[F:BOW]ITMREF & ECCTYP=[F:BOW]BOMALTTYP & BOMALT=[F:BOW]BOMALT  & evalue(CRITERIA)
+              SUB_ECCVALMAJ = [F:EVL]ECCVALMAJ
+              SUB_ECCVALMIN = [F:EVL]ECCVALMIN
+              Gosub CREATE_PURCHASE_ORDER_SUB_LINES
+              If (BLANK_VERSION = CST_ATRUE)
+                BLANK_VERSION = CST_AFALSE
+              Endif
+            Next
+            Close Local File [EVL]
+          Else
+            BLANK_VERSION = CST_AFALSE
+            SUB_ECCVALMAJ = ""
+            SUB_ECCVALMIN = ""
+            Gosub CREATE_PURCHASE_ORDER_SUB_LINES
+          Endif
+        Endif
+        LAST_ITMREF = [F:BOW]ITMREF
+      Next
+      # CCM ...
+      Delete [BOW] Where CREUSR = this.ACTX.USER and BOWUID = adxuid(1)
+
+      Close Local File [BOW]
+
+    Endif
+  Endif
+
+  # Update summary totals ...
+  this.POHSUP = NO_SUPP
+  this.POHORDERS = NO_ORDERS
+
+  this.TOTALLINES = LINE_NUMBER
+
+  Close Local File [ITM]
+  Close Local File [ITG]
+  FreeGroup SELCHGREQ
+Return
+
+
+# -------------------------------------------------------------------------------
+$CREATE_PURCHASE_ORDER_SUB_LINES
+
+  Local Integer LOCSTATUS, STAT, FOUND, COUNT
+  Local Decimal NETCALC, GROSSCALC, TAX
+  Local File PORDER [POH]
+  Local File PORDERQ [POQ]
+  Local File PORDERP [POP]
+  Local Instance CCMIMPPOD Using C_CCMIMPPOD
+  CCMIMPPOD = NewInstance C_CCMIMPPOD AllocGroup null
+
+  Local Char CRITERIA(250)
+
+  CRITERIA = " 1=1 "
+  If (SUB_ECCVALMAJ <> "")
+    If (BLANK_VERSION = CST_ATRUE)
+      CRITERIA += " and [F:POQ]ECCVALMAJ = '' or [F:POQ]ECCVALMAJ = SUB_ECCVALMAJ"
+    Else
+      CRITERIA += " and [F:POQ]ECCVALMAJ = SUB_ECCVALMAJ"
+    Endif
+
+    If (SUB_ECCVALMIN <>  "")
+      If (BLANK_VERSION = CST_ATRUE)
+        CRITERIA += " and [F:POQ]ECCVALMIN = '' or [F:POQ]ECCVALMIN = SUB_ECCVALMIN"
+      Else
+        CRITERIA += " and [F:POQ]ECCVALMIN = SUB_ECCVALMIN"
+      Endif
+    Endif
+  Endif
+
+  Filter [POQ] Where [F:POQ]ITMREF = SUB_LINES_PRODUCT and
+&                    [F:POQ]LINSTA <> 3 and
+&                    [F:POQ]WIPSTA <> 4 and
+&                    evalue(CRITERIA)
+
+  For [POQ]POQ0
+
+    LOCSTATUS = fmet CCMIMPPOD.AINIT()
+
+    LINE_NUMBER += 1
+
+    CCMIMPPOD.CRID          = CRID
+    CCMIMPPOD.LINENO        = LINE_NUMBER
+    CCMIMPPOD.SORTSEQ       = LINE_NUMBER
+    CCMIMPPOD.POHNUM        = [F:POQ]POHNUM
+    CCMIMPPOD.POPLIN        = [F:POQ]POPLIN
+    CCMIMPPOD.POQSEQ        = [F:POQ]POQSEQ
+    CCMIMPPOD.ITMREF        = SUB_LINES_PRODUCT
+    CCMIMPPOD.ECCVALMAJ     = [F:POQ]ECCVALMAJ
+    CCMIMPPOD.ECCVALMIN    = [F:POQ]ECCVALMIN
+    CCMIMPPOD.BPSNUM        = [F:POQ]BPSNUM
+    CCMIMPPOD.PRHFCY        = [F:POQ]PRHFCY
+    CCMIMPPOD.QTY           = [F:POQ]QTYUOM
+    CCMIMPPOD.LINSTA        = [F:POQ]LINSTA
+    CCMIMPPOD.WIPSTA        = [F:POQ]WIPSTA
+    CCMIMPPOD.TRANTYPE      = 7
+    CCMIMPPOD.LINESTATUS    = 1
+    CCMIMPPOD.STARTDATE     = AVOID.ADATE
+    CCMIMPPOD.ENDDATE       = AVOID.ADATE
+    CCMIMPPOD.COMPLETEDATE  = AVOID.ADATE
+    CCMIMPPOD.ACTIONID      = ""
+    CCMIMPPOD.ACTIONER      = ""
+    CCMIMPPOD.COMMENT       = ""
+
+    TAX = [F:POQ]LINATI - [F:POQ]LINAMT
+    Read [POH]POH0 = [F:POQ]POHNUM
+    Read [POP]POP0 = [F:POQ]POHNUM; [F:POQ]POPLIN; [F:POQ]POQSEQ
+
+    # get amount + tax
+    CCMIMPPOD.NETPRIATI = 0.00
+    NETCALC = ([F:POP]NETPRI * [F:POQ]QTYUOM) + TAX
+    If ([F:POH]CUR <> "")
+      Call ARRDEV (NETCALC, [F:POH]CUR) From TRTDIV
+    Endif
+
+    # get amount - tax
+    CCMIMPPOD.NETPRINOT = 0.00
+    GROSSCALC = ([F:POP]NETPRI * [F:POQ]QTYUOM) - TAX
+    If ([F:POH]CUR <> "")
+      Call ARRDEV (GROSSCALC, [F:POH]CUR) From TRTDIV
+    Endif
+
+    CCMIMPPOD.NETPRIATI = NETCALC
+    CCMIMPPOD.NETPRINOT = GROSSCALC
+    CCMIMPPOD.POHCUR    = [F:POH]CUR
+    CCMIMPPOD.FOLDCUR   = this.FOLDCUR
+
+    # Convert [amount - tax] to folder currency ...
+    If (CCMIMPPOD.POHCUR <> this.FOLDCUR)
+      Call CONVERT (this.ACTX,
+&                   CCMIMPPOD.POHCUR,
+&                   CCMIMPPOD.FOLDCUR,
+&                   CCMIMPPOD.FOLDCUR,
+&                   [F:POH]CHGTYP,
+&                   [F:POH]ORDDAT,
+&                   CCMIMPPOD.NETPRINOT,
+&                   CCMIMPPOD.CONAMNT,
+&                   STAT) From TRTDEV_SYRA
+    Else
+      CCMIMPPOD.CONAMNT  = CCMIMPPOD.NETPRINOT
+    Endif
+
+    LOCSTATUS = fmet CCMIMPPOD.AINSERT()
+
+    # Maintain unique SUPPLIER and order arrays / totals:
+    #
+    # Supplier ...
+    FOUND = CST_AFALSE
+    For COUNT = 0 To NO_SUPP
+      If (CCMIMPPOD.BPSNUM = MYBPSNUM(COUNT))
+        FOUND = CST_ATRUE
+        Break
+      Endif
+    Next
+    If (FOUND = CST_AFALSE)
+      MYBPSNUM(NO_SUPP) = CCMIMPPOD.BPSNUM
+      NO_SUPP = NO_SUPP +1
+    Endif
+
+    # Order ...
+    FOUND = CST_AFALSE
+    For COUNT = 0 To NO_ORDERS
+      If (CCMIMPPOD.POHNUM = MYPOHNUM(COUNT))
+        FOUND = CST_ATRUE
+        Break
+      Endif
+    Next
+    If (FOUND = CST_AFALSE)
+      MYPOHNUM(NO_ORDERS) = CCMIMPPOD.POHNUM
+      NO_ORDERS = NO_ORDERS +1
+    Endif
+
+    # Increment summary totals ...
+    this.POHQTY += CCMIMPPOD.QTY
+    this.POHAMTEX += CCMIMPPOD.CONAMNT
+
+  Next
+
+  LogicClose File [POH]
+  LogicClose File [POQ]
+  LogicClose File [POP]
+
+Return
+
+# -------------------------------------------------------------------------------
+# Update Sales Oreder Detail Plan 'header' status.
+#
+# Set status to:
+#
+# 4 'Not applicable'  ... if (No sales order lines) or (No actionable sales order lines and Planning complete),
+# 3 'Complete'        ... if (All actionable sales order lines are complete),
+# 2 'Implement'       ... if (Actionable sales order lines and Planning complete),
+# 1 'Plan'            ... if (Planning is not complete).
+
+$UPDATE_STATUS
+
+  Local Integer STAT, ACTIONLINES, LINESCOMP
+
+  # Count number of action lines ...
+  Local File CCMIMPPOD [CCMPOD]
+  Filter [CCMPOD] Where CRID = this.CRID and ACTIONID <> ""
+  ACTIONLINES = rowcount([CCMPOD])
+
+  # Count number of action lines completed ...
+  Filter [CCMPOD] Where CRID = this.CRID and LINESTATUS = 3
+  LINESCOMP = rowcount([CCMPOD])
+
+  Filter [CCMPOD]
+  LogicClose File [CCMPOD]
+
+  If (this.POHORDERS = 0) or
+&    (ACTIONLINES = 0 and this.IMPLEMENT = 2)
+    this.POHPLASTA = 4
+  Elsif (ACTIONLINES <> 0 and ACTIONLINES = LINESCOMP)
+    this.POHPLASTA = 3
+  Elsif (this.IMPLEMENT = 2)
+    this.POHPLASTA = 2
+  Else
+    this.POHPLASTA = 1
+  Endif
+
+  ARET_VALUE = CST_ATRUE
+
+Return
+
+# -------------------------------------------------------------------------------
+# "Planning complete" flag validation ...
+$VALIDATE_IMPLEMENT
+  Local Integer ACTIONLINES, LOCSTATUS
+
+  # count number of action lines
+  Local File CCMIMPPOD [CCMPOD]
+  Filter [CCMPOD] Where CRID = this.CRID and ACTIONID <> ""
+  ACTIONLINES = rowcount([CCMPOD])
+  LogicClose File [CCMPOD]
+
+  ASTATUS = CST_AOK
+
+  If (this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+    If (this.TOTALLINES > ACTIONLINES)
+#      LOCSTATUS = fmet this.ASETERROR ("IMPLEMENT", mess(62,2038,1), CST_AINFO)
+      LOCSTATUS = fmet this.ASETERROR ("", mess(62,2038,1), CST_AINFO)
+    Endif
+  Endif
+
+ ARET_VALUE = ASTATUS
+
+Return
+
+#
+# --------------------------------------------------
+# FUNCTION NAME:        NOTIFY_ACTIONER
+# FUNCTION DESCRIPTION: Notify Actioner
+# FUNCTION TYPE:        Subroutine
+# PARAMETERS:           N/A
+# RETURN_VALUE:         N/A
+#
+#
+$NOTIFY_ACTIONER
+
+  Local Instance CHANGE_REQUEST Using C_CCMCHGREQ
+  CHANGE_REQUEST = NewInstance C_CCMCHGREQ AllocGroup null
+  Local File CCMIMPPOD [POD]
+  Local Char LAST_ACTIONER(5)
+  Local Integer STAT
+  Local Integer EMAIL_TYPE
+  Local Char SUBJECT(250)
+  Local Clbfile BODY(0), OTHER_BODY(0)
+  Local Integer AC_EMAIL : AC_EMAIL = CST_AFALSE
+# Issue 109096/2 - send e-mails to actioners
+  Local Integer SENDEMAIL : SENDEMAIL = CST_AFALSE
+  STAT = fmet CHANGE_REQUEST.AREAD(this.CRID)
+
+  If (CHANGE_REQUEST.NCSREC = 2)
+    # Issue X3-76268 - 2018-02-13 by JUSYN : Remove/deactivate email notification NCS
+#    If (fmet this.ACTX.APARAM.AGETVALNUM(CST_ALEVFOLD, this.ACTX.AFOLDER, "NCSEMAILAC") <> 1 and
+#&     this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+#
+#      SENDEMAIL = CST_ATRUE
+#      EMAIL_TYPE = 3713  # Actioner
+#      BODY(0) = AVOID.ACLOB
+#      OTHER_BODY(0) = AVOID.ACLOB
+#      Append OTHER_BODY, mess(7,2039,1) +chr$(10)
+#      STAT = fmet CHANGE_REQUEST.BUILD_EMAIL(EMAIL_TYPE, SUBJECT, BODY, OTHER_BODY, "NCSPLAPOH")
+#    Endif
+    # End issue X3-76268
+  Else
+# End issue 109096/2
+    If (fmet this.ACTX.APARAM.AGETVALNUM(CST_ALEVFOLD, this.ACTX.AFOLDER, "CCMEMAILAC") <> 1 and
+&     this.snapshot.IMPLEMENT = 1 and this.IMPLEMENT = 2)
+
+      SENDEMAIL = CST_ATRUE
+      EMAIL_TYPE = 2066  # Actioner
+      BODY(0) = AVOID.ACLOB
+      OTHER_BODY(0) = AVOID.ACLOB
+      Append OTHER_BODY, mess(7,2039,1) +chr$(10)
+      STAT = fmet CHANGE_REQUEST.BUILD_EMAIL(EMAIL_TYPE, SUBJECT, BODY, OTHER_BODY, "CCMPLAPOH")
+    Endif
+# Issue 109096/2
+  Endif
+
+  If (SENDEMAIL = CST_ATRUE)
+# End issue 109096/2
+
+    Filter [POD] Where CRID = this.CRID and ACTIONER <> "" Order By ACTIONER
+    For [POD]
+      If ([F:POD]ACTIONER <> LAST_ACTIONER and
+&         [F:POD]ACTIONER <> this.ACTX.USER)
+
+        STAT = fmet CHANGE_REQUEST.SEND_EMAIL(this.ACTX.USER, [F:POD]ACTIONER, "", SUBJECT, BODY)
+
+        If (STAT = CST_AOK)
+          AC_EMAIL = CST_ATRUE
+        Endif
+
+        LAST_ACTIONER = [F:POD]ACTIONER
+
+      Endif
+    Next
+
+    If (AC_EMAIL = CST_ATRUE)
+      ASTATUS = fmet this.ASETERROR("", mess(60,2038,1), CST_AINFO)
+    Endif
+
+  Endif
+
+  LogicClose File [POD]
+  FreeGroup CHANGE_REQUEST
+
+Return
+
+$PROPERTIES
+  Case CURPRO
+  Endcase
+Return
+
+
+#**
+#* Label for coding event of CRUD
+#* @param CURPTH Local Char(250), contains the class path
+#* @param AEVENT Local Char(20), contains the event code
+#* @return ASTATUS Local Integer
+#*!
+$EVENTS
+#Case [L]CURPTH
+#   When ""
+#    Case [L]AEVENT
+#    Endcase
+#Endcase
+Return
+
+
+#**
+#* Label for coding your operations
+#* @param AOPERATION Local Char(20), contains the operation code
+#* @return ARET_VALUE (the type of the return value is declared in the method)
+#*!
+$OPERATIONS
+#Case [L]AOPERATION
+#Endcase
+Return
+

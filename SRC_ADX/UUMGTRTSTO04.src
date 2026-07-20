@@ -1,0 +1,385 @@
+#<AdxTL>@(#)6.0.0.0 $Revision$
+############################################################################
+# UUMGTRTSTO04   Migration tool for stock changes             Stock Module #
+############################################################################
+Local Char DOSSIER(30) : DOSSIER = nomap
+
+If !GSERVEUR
+  #--- Issue 108760 by TS
+  #Call SAIDOS(DOSSIER,"") From SAIDOS
+  Call SAIDOSHIS(DOSSIER,"") From SAIDOSHIS
+  #---
+Endif
+
+If DOSSIER <> ""
+  If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+  #--- Issue 108760 By TS
+  #Read [ADS] DOSSIER=[L]DOSSIER : If fstat Raz [F:ADS] : Endif
+  If func DOSSUB.FILL_ADS([L]DOSSIER)=0 : End : Endif
+  #---
+  If !GSERVEUR
+    Call TEMPON("O") From GESECRAN
+    Call OUVRE_TRACE("UUMGTRTSTO04") From LECFIC
+  Endif
+
+  Call MAJ_UUMGTRTSTO04(DOSSIER)
+
+  If !GSERVEUR
+    Call TEMPOFF     From GESECRAN
+    Call FERME_TRACE From LECFIC
+    Call LEC_TRACE From LECFIC
+  Endif
+
+Endif
+
+End
+############################################################################
+############################################################################
+Subprog RAZ_UUMGTRTSTO04(DOSSIER)
+Value Char DOSSIER
+
+Local Integer ERR
+
+##1 - verifications
+####################
+
+If [F:ADS]MODULE(6)<>2 : : # N= no module
+  End
+Endif
+
+Local Char WNAMSGHM
+Call MIGTABNAME (DOSSIER,"SCHGH",WNAMSGHM,ERR) From TRTMIG
+
+If ERR
+  End
+Endif
+
+#----- Présence des fichiers renommées...  -----#
+If filinfo(filpath("FIL",WNAMSGHM,"fde",DOSSIER),0) < 0
+  End
+Endif
+
+##2 - On vide les fichiers selon le cas
+#######################################
+
+Call MIGTABRAZ (DOSSIER,"SCHGH",ERR) From TRTMIG
+
+#----- Récupération du n° de version
+Local Char VERSION
+Call MIGGETVERSION (DOSSIER,VERSION,ERR) From TRTMIG
+If ERR
+  # N° de version incorrecte
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO04",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+##3 - On vide AMIGKEY pour le flux
+####################
+Call MIGRAZKEY (DOSSIER,"UUMGTRTSTO04",ERR) From TRTMIG
+
+End
+############################################################################
+############################################################################
+Subprog MAJ_UUMGTRTSTO04(DOSSIER)
+Value Char DOSSIER
+
+#--- Issue 108760 by TS
+#adxftl=10
+#adxwrb=10
+#NEWMOTEUR=1
+#---
+
+Local Integer ERR
+
+##1 - verifications
+####################
+
+If [F:ADS]MODULE(6)<>2 : : # N= no module
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO04",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+#----- Récupération du n° de version
+Local Char VERSION
+Call MIGGETVERSION (DOSSIER,VERSION,ERR) From TRTMIG
+If ERR
+  # N° de version incorrecte
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO04",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+Local Char WNAMSGHM
+Call MIGTABNAME (DOSSIER,"SCHGH",WNAMSGHM,ERR) From TRTMIG
+
+If ERR
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO04",7,ERR) From TRTMIG : #7=Erreur
+  End
+Endif
+
+#----- Présence des fichiers renommées...  -----#
+If filinfo(filpath("FIL",WNAMSGHM,"fde",DOSSIER),0) < 0
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO04",3,ERR) From TRTMIG : #3=Terminée
+  End
+Endif
+
+
+##2 - Traitements en cours
+####################
+
+Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO04",2,ERR) From TRTMIG : #2=En cours
+
+###################
+
+Call ECR_TIME("UUMGTRTSTO04 Stock Changes Process : Update SCHGH") From DOSSUB
+Call ECR_TRACE("UUMGTRTSTO04 : Process Start on : "+DOSSIER,0) From GESECRAN
+
+#----- Modification des fichiers où on va inserer -----#
+Gosub MIG_OUVRE From TRTMIG
+Call MIGTABINIT (DOSSIER,"SCHGH",ERR) From TRTMIG
+
+#----- Ouverture des fichiers -----#
+If clalev([F:SGH])  = 0 : Local File =DOSSIER+".SCHGH"     [SGH]  : Endif   # Fichier X3 "Vide"
+If clalev([F:SGHM]) = 0 : Local File =DOSSIER+"."+WNAMSGHM [SGHM] : Endif   # Fichier X3 renommé Avant Migration
+
+#-----  Déclaration des variables -----#
+# Déclaration des variables pour gérer les ruptures (évite les snapshot too old)
+Local Integer STOP, NB, ISVALID, NBLUS, NBCOMMIT
+Local Char CRITERE(250),CRITERESPE(250), HINTSPE(30)
+Local Integer NBMIGKEY : NBMIGKEY=3
+Local Char TABMIGKEY(30)(1..NBMIGKEY)
+Raz NBLUS, STOP, CRITERE, NBCOMMIT
+
+#déclaration des variables locales de travail
+Local Char     WSITE(GLONFCY) : Raz WSITE
+
+# pour les WriteB des tables détails
+Local Char WTAB_SGH (100) (adxwrb)
+Local Shortint WCPT_SGH
+
+Gosub OUVRE_STO From UUMGTRTSTO00
+Gosub OUVRE_STO04
+
+Filter [SGHM] Order By Key CLE=[F:SGHM]STOFCY;[F:SGHM]VCRNUM
+
+#-----  Lecture des clés -----#
+# Read de la table AMIGKEY "index migration" pour alimenter ACLE1/ACLE2/ACLE3/STOP
+Call MIGGETKEY (DOSSIER,"UUMGTRTSTO04",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT,ERR) From TRTMIG
+STOP=val(TABMIGKEY(NBMIGKEY))
+
+# PE pour ajout clause where
+Local Char FLUX
+Local Integer FILTRELIN
+FLUX="UUMGTRTSTO04" : FILTRELIN=0 : Raz HINTSPE : Raz CRITERESPE : Gosub PE_CRITSEL From TRTMIG
+If CRITERESPE="" : CRITERESPE="1=1" : Endif
+
+Call DEBTRANS From GLOCK
+Gosub SET_FIRST From TRTFIRST
+
+$LOOP_SGH00
+Raz NB
+If STOP = 1
+ STOP = 2
+ CRITERE = "[F:SGHM]STOFCY=TABMIGKEY(1) & [F:SGHM]VCRNUM>TABMIGKEY(2)"
+Elsif STOP=2
+ STOP = 0
+ CRITERE = "[F:SGHM]STOFCY>TABMIGKEY(1)"
+Else
+ CRITERE = "1=1"
+Endif
+
+Trbegin [SGH]
+GOK = 1
+
+For [SGHM]CLE(2) Hint Key=HINTSPE Where evalue(CRITERE) & evalue(CRITERESPE)
+  NBLUS+=1
+
+  # PE pour exclure ligne
+  If FILTRELIN
+      FLUX="UUMGTRTSTO04" : ISVALID=1 : Gosub PE_VERIFSEL From TRTMIG
+      If ISVALID=0 : Goto SUITE_BOUCLE : Endif
+  Endif
+
+#  version < V8, raz des champs v8
+  If val(VERSION)<GMIGX3VER80
+    Gosub RAZV8_SGH
+  Endif
+
+  [F:SGH] = [F:SGHM]
+
+  If WSITE<>[F:SGH]STOFCY
+    #----- Alimentation de la société sur l'entête -----#
+      Call RECUP_GLOBAL_CPT(DOSSIER,[F:SGH]STOFCY) From TRTX3CPT
+      WSITE=[F:SGH]STOFCY
+  Endif
+
+  #  version < V8, traitement v8
+  If val(VERSION)<GMIGX3VER80
+    Gosub MAJV8_SGH
+    If GOK<1 : Break : Endif
+  Endif
+
+  # --- alimentation des champs et écriture enreg
+
+  #--- Issue 108760 by TS
+  #If NEWMOTEUR
+  #    Gosub SGH_STK : # pour stocker ref
+  #    WriteB [F:SGH]
+  #Else
+  #    Write [F:SGH]
+  #Endif
+  #If fstat
+  #  If NEWMOTEUR & adxwrb>1
+  #    Call ECR_TRACE("File SCHGH, Error ="-num$(fstat),1) From GESECRAN
+  #    Gosub SGH_ERRTRA : # pour afficher les ref
+  #  Else
+  #    Call ECR_TRACE("File SCHGH(VCRNUM)"-[F:SGH]VCRNUM+", Error ="-num$(fstat),1) From GESECRAN
+  #  Endif
+  #  GOK=0 : Break
+  #Endif
+  Gosub SGH_STK : # pour stocker ref
+  WriteB [F:SGH]
+  If fstat
+    Call ECR_TRACE("File SCHGH, Error ="-num$(fstat),1) From GESECRAN
+    Gosub SGH_ERRTRA : # pour afficher les ref
+    GOK=0 : Break
+  Endif
+  #---
+
+  NB+=1
+  If NB>GMAXUPDTRS
+    TABMIGKEY(1) = [F:SGHM]STOFCY
+    TABMIGKEY(2) = [F:SGHM]VCRNUM
+    STOP=1
+    Break
+  Endif
+$SUITE_BOUCLE
+Next
+
+$FIN_BOUCLE
+If GOK<1
+  Rollback
+  Call MIGSTKENDFLG (DOSSIER,"UUMGTRTSTO04",7,ERR) From TRTMIG : #7=Erreur
+Else
+  #--- Issue 108760 by TS
+  #If NEWMOTEUR & adxwrb>1
+  #---
+    Flush [F:SGH]
+    If fstat
+        Call ECR_TRACE("File SCHGH, Error ="-num$(fstat),1) From GESECRAN
+        Gosub SGH_ERRTRA : # pour afficher les ref
+        GOK=0 : Goto FIN_BOUCLE : #on part sur rollback
+    Endif
+  #--- Issue 108760 by TS
+  #Endif
+  #---
+  # Stocker les valeurs de ACLE1/ACLE2/ACLE3/STOP dans la table AMIGKEY.
+  If STOP
+    TABMIGKEY(NBMIGKEY)=num$(STOP)
+  Else
+    Raz TABMIGKEY
+  Endif
+  Call MIGSTKKEY (DOSSIER,"UUMGTRTSTO04",NBMIGKEY,TABMIGKEY,NBLUS,NBCOMMIT+NB,ERR) From TRTMIG
+  If ERR
+   GOK=-1 : Goto FIN_BOUCLE
+  Endif
+  Commit
+  NBCOMMIT+=NB
+  Call MIGSTKPROGRESS (DOSSIER,"UUMGTRTSTO04",STOP,ERR) From TRTMIG
+  If STOP
+    Goto LOOP_SGH00
+  Endif
+Endif
+
+Gosub UNSET_FIRST From TRTFIRST
+
+Close Local File [SGH]
+Close Local File [SGHM]
+#----- Remise en état des fichiers où on a inseré -----#
+Call MIGTABEND (DOSSIER,"SCHGH",ERR) From TRTMIG
+Call MIGTRTEND (DOSSIER,"UUMGTRTSTO04") From TRTMIG
+Call ECR_TIME("UUMGTRTSTO04 : "+num$(NBLUS)+" records read,"-num$(NBCOMMIT)+" records processed.") From DOSSUB
+End
+############################################################################
+############################################################################
+$OUVRE_STO04
+
+Local File =DOSSIER+".STKTRS" [SRT]
+If dim([F:SGH]SGHTYP) > 0
+  Local File =DOSSIER+".FACGROUP"   [FGR]
+  # Issue 112403 - 2015-11-12 by BRBAN
+  If func AFNC.ACTIVDOS([F:ADS]DOSSIER,"TRSNE")>0
+    Local File =DOSSIER+".TABSGHTYP"  [TSG]
+  Endif
+Endif
+Local File =DOSSIER+".FACILITY" [FCY]
+
+Return
+############################################################################
+############################################################################
+$RAZV8_SGH
+If dim ([F:SGH]SGHTYP) > 0
+  Raz [F:SGH]SGHTYP
+Endif
+Return
+############################################################################
+############################################################################
+$SGH_STK
+Call STK (WTAB_SGH,WCPT_SGH,[F:SGH]VCRNUM) From TRTMIG
+Return
+############################################################################
+############################################################################
+$SGH_ERRTRA
+Call ERRTRA (WTAB_SGH,WCPT_SGH,"File SCHGH(VCRNUM)=") From TRTMIG
+Return
+############################################################################
+############################################################################
+$MAJV8_SGH
+
+#----- New field SGHTYP initialization -----#
+If dim([F:SGH]SGHTYP) > 0
+  If [F:SGH]SGHTYP = ""
+    Raz [F:SRT]
+    Local Char    SGFCY(GLONFCY)    : SGFCY=GFCY
+    Local Char    WSGHTYP(GLONTSG)
+    GFCY = [F:SGH]STOFCY
+    [F:SRT]BETFCYCOD = [F:SGH]BETFCYCOD
+    If [F:SRT]BETFCYCOD = 0 : [F:SRT]BETFCYCOD = 1 : Endif
+    Gosub SGHTYP From TRTSTKSGH1
+    If WSGHTYP<>""
+     [F:SGH]SGHTYP=WSGHTYP
+    Else
+     GOK=0 : Call ECR_TRACE("     1-File SCHGH"-[F:SGH]VCRNUM+", Error : Impossible to define a stock change type",1) From GESECRAN
+    Endif
+    GFCY=SGFCY
+  Endif
+Endif
+
+Return
+############################################################################
+############################################################################
+# Pour exécution automatique  en gestion de patch                          #
+############################################################################
+############################################################################
+Subprog PATCH(APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 : End : Endif
+If clalev([F:ADS])=0  Local File ADOSSIER [ADS] : Endif
+#--- Issue 108760 by TS
+#Read [ADS] DOSSIER=APPLI : If fstat Raz [F:ADS] : Endif
+If func DOSSUB.FILL_ADS(APPLI)=0 : End : Endif
+#---
+Call MAJ_UUMGTRTSTO04(APPLI)
+End
+############################################################################
+############################################################################
+# Pour exécution depuis dosmaj (validation dossier)
+############################################################################
+############################################################################
+Subprog UTI_MOUL (APPLI)
+Value Char    APPLI
+If APPLI=GDOSX3 End : Endif
+Call MAJ_UUMGTRTSTO04(APPLI)
+End
+############################################################################
+############################################################################
+
