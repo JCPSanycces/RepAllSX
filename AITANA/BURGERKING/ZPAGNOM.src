@@ -1,0 +1,272 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$ 
+Subprog INICIAR_IMPORT()
+  Local Char PCIF
+
+
+  # TIM = 1000
+  # BKS = 2000
+  If clalev([F:CPY]) = 0 : Local File COMPANY [F:CPY]  : Endif
+
+#  If !GSERVEUR Then
+#    Call TEMPON("Importación de ficheros de Pago de nómina") From GESECRAN
+#    Call OUVRE_TRACE("Proceso rellenado de tabla auxiliar") From LECFIC
+#  Endif
+
+
+  Filter [F:CPY] Where CPY = "TIM"
+  Read [F:CPY] First
+  PCIF = [F:CPY]CRN
+  Call IMPPAGNOM(PCIF, "TIM")
+
+  Filter [F:CPY] Where CPY = "BKS"
+  Read [F:CPY] First
+  PCIF = [F:CPY]CRN
+  Call IMPPAGNOM(PCIF, "BKS")
+
+  # traza
+#  If !GSERVEUR Then
+#    Call TEMPOFF() From GESECRAN
+#    Call ECR_TRACE("-------------------------------------", 0) From GESECRAN
+#    Call ECR_TRACE("Fin del proceso de importación de Pagos nóminas", 0) From GESECRAN
+#    Call ECR_TRACE("-------------------------------------", 0) From GESECRAN
+#    Call FERME_TRACE From LECFIC
+#    Call LEC_TRACE() From LECFIC
+#  Endif
+
+End
+
+
+#**
+#* Importación de asientos de pagos de nómina
+#*!
+Subprog IMPPAGNOM(PDOC, PCPY)
+  Local Char ZDATETIME(14)
+  Local Char NOMBRE_FICHERO(100)
+  Local Char LFICIMP(250)
+  Local Char LPLANTA, LREMESA_CUR, LREMESA_ANT, LCUENTA_CUR, LCUENTA_BANCO_ANT
+  Local Decimal LTOTAL_REMESA, LIMPORTE_REMESA
+  Local Integer LCONTADOR_LINEA, LTOTAL_REGISTROS
+# Primero tratar los registros con el método de pago 1
+# Para los registros con la misma Cuenta y misma remesa, crear una línea de asiento
+# Si cambiamos de remesa, crear otra línea de asiento negativa con el total de las líneas anteriores
+
+  If PCPY = "BKS" Then
+    LPLANTA = "2000"
+  Else
+    LPLANTA = "1000"
+  Endif
+
+  ZDATETIME = time$
+  ZDATETIME = mid$(ZDATETIME,1,2)+mid$(ZDATETIME,4,2)+mid$(ZDATETIME,7,2)
+  ZDATETIME = date$+ZDATETIME
+
+  NOMBRE_FICHERO = "PAGOSNOM_"+ZDATETIME+"_"+PCPY
+  LFICIMP = filpath("IMP",NOMBRE_FICHERO,"csv")
+
+#   If !GSERVEUR Then
+#          Call TEMPON("Fichero de " + PCPY + ":" + LFICIMP) From GESECRAN
+#          Call ECR_TRACE("Fichero de " + PCPY + ":" + LFICIMP, 0) From GESECRAN
+#   Endif
+
+# SELECCIONAR REGISTROS QUE NO SE HAYA PROCESADO - ZSTATUS = ''
+# VISTA ZVPAG
+  If clalev([F:ZVPAG]) = 0 : Local File ZVPAGNOM [F:ZVPAG]  : Endif
+  If clalev([F:ZPA]) = 0 : Local File ZPAGOSNOM [F:ZPA]  : Endif
+
+  Filter [F:ZVPAG] Where METODO_PAGO = 1 and DOC = PDOC # Order By ZVP0 Asc
+  LCONTADOR_LINEA = 0
+  LTOTAL_REGISTROS = rowcount([ZVPAG])
+  #Infbox num$(LTOTAL_REGISTROS)
+  #Infbox "Registros encontrados MP=1 :"   + num$(rowcount([ZVPAG]))
+#  If !GSERVEUR Then
+#     Call TEMPON("Registros encontrados MP=1 :"   + num$(rowcount([ZVPAG]))) From GESECRAN
+#     Call ECR_TRACE("Registros encontrados MP=1 :"   + num$(rowcount([ZVPAG])), 0) From GESECRAN
+#  Endif
+  For [ZVPAG]
+    If LREMESA_CUR = "" Then
+      LREMESA_CUR = [F:ZVPAG]REMESA
+      LREMESA_ANT = LREMESA_CUR
+      #Infbox "creo cabecera de " + LREMESA_CUR
+      LCONTADOR_LINEA = 0
+      Call CREAR_CABECERA_ASIENTO(LFICIMP, LREMESA_CUR, LPLANTA, [ZVPAG]FECHA)
+    Else
+      LREMESA_CUR = [F:ZVPAG]REMESA
+    Endif
+
+    If LREMESA_CUR = LREMESA_ANT Then
+        LTOTAL_REMESA += [F:ZVPAG]IMPORTE
+        LIMPORTE_REMESA = [F:ZVPAG]IMPORTE
+        LCUENTA_CUR = [F:ZVPAG]CUENTA
+        LCUENTA_BANCO_ANT = [F:ZVPAG]CUENTA_BANCO
+        LREMESA_ANT = [F:ZVPAG]REMESA
+
+        If LCONTADOR_LINEA = 0 Then
+           LCONTADOR_LINEA = 1
+        Else
+           LCONTADOR_LINEA += 1
+        Endif
+        Call CREAR_LINEA_ASIENTO(LFICIMP,1,[F:ZVPAG]IMPORTE, [F:ZVPAG]CUENTA, LPLANTA, LREMESA_CUR, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+    Else
+      # Marcar registros de la remesa como procesados
+      Trbegin [F:ZPA]
+      Update [F:ZPA] Where [F:ZPA]ZREMESA = LREMESA_ANT and [F:ZPA]ZMETODOPAGO = "1" and [F:ZPA]ZDOC = PDOC With [F:ZPA]ZSTATUS = "2"
+      Commit
+      # Crear linea negativa asiento ANT
+      #Infbox "remesa DIFERENTE a la anterior - CREO LÍNEA DE LA ANTERIOR" + LREMESA_ANT
+      LCONTADOR_LINEA += 1
+      Call CREAR_LINEA_ASIENTO(LFICIMP,-1, LTOTAL_REMESA, LCUENTA_BANCO_ANT, LPLANTA, LREMESA_ANT, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+      LTOTAL_REMESA = 0
+      # Crear cabecera asiento actual
+      LIMPORTE_REMESA = [F:ZVPAG]IMPORTE
+      LTOTAL_REMESA += [F:ZVPAG]IMPORTE
+      #LREMESA_CUR = [F:ZVPAG]REMESA
+      LREMESA_ANT = [F:ZVPAG]REMESA
+      # ME GUARDO LOS DATOS DEL REGISTRO ACTUAL COMO ANTERIORES YA
+      #LREMESA_ANT = LREMESA_CUR
+      LCUENTA_ANT = [F:ZVPAG]CUENTA
+      LCUENTA_BANCO_ANT = [F:ZVPAG]CUENTA_BANCO
+      #Infbox "CREO CABECERA " + LREMESA_CUR
+      LCONTADOR_LINEA = 0
+      Call CREAR_CABECERA_ASIENTO(LFICIMP,[F:ZVPAG]REMESA, LPLANTA, [F:ZVPAG]FECHA)
+      #Infbox "CREO linea " + [F:ZVPAG]REMESA
+      LCONTADOR_LINEA += 1
+      Call CREAR_LINEA_ASIENTO(LFICIMP,1, [F:ZVPAG]IMPORTE, [F:ZVPAG]CUENTA, LPLANTA, [F:ZVPAG]REMESA, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+    Endif
+    # MARCAR REGISTROS DE LA REMESA COMO PROCESADOS
+    # UPDATE ZSTATUS = 1 DE ZPAGOSNOM de la Remesa que estoy tratando
+    LTOTAL_REGISTROS -= 1
+    #Infbox num$(LTOTAL_REGISTROS)
+    If LTOTAL_REGISTROS = 0 Then
+      # ultimo registro
+      Trbegin [F:ZPA]
+      Update [F:ZPA] Where [F:ZPA]ZREMESA = LREMESA_ANT and [F:ZPA]ZMETODOPAGO = "1" and [F:ZPA]ZDOC = PDOC With [F:ZPA]ZSTATUS = "2"
+      Commit
+      # Crear linea negativa asiento ANT
+      #Infbox "remesa DIFERENTE a la anterior - CREO LÍNEA DE LA ANTERIOR" + LREMESA_ANT
+      LCONTADOR_LINEA += 1
+      #Infbox "DENTRO DE ULTIMO REGISTRO"
+      Call CREAR_LINEA_ASIENTO(LFICIMP,-1, LTOTAL_REMESA, LCUENTA_BANCO_ANT, LPLANTA, LREMESA_ANT, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+    Endif
+  Next
+
+
+
+  LREMESA_CUR = ""
+  LCONTADOR_LINEA = 0
+  Filter [F:ZVPAG] Where METODO_PAGO = 5 and DOC = PDOC # Order By ZVP0 Asc
+  LTOTAL_REGISTROS = rowcount([ZVPAG])
+  LTOTAL_REMESA = 0
+  # Infbox "Registros encontrados MP=5 :"   + num$(rowcount([ZVPAG]))
+#  If !GSERVEUR Then
+#     Call TEMPON("Registros encontrados MP=5 :"   + num$(rowcount([ZVPAG]))) From GESECRAN
+#     Call ECR_TRACE("Registros encontrados MP=5 :"   + num$(rowcount([ZVPAG])), 0) From GESECRAN
+#  Endif
+  For [ZVPAG]
+    If LREMESA_CUR = "" Then
+      LREMESA_CUR = [F:ZVPAG]REMESA
+      LREMESA_ANT = LREMESA_CUR
+      Call CREAR_CABECERA_ASIENTO(LFICIMP, LREMESA_CUR, LPLANTA, LREMESA_CUR)
+    Else
+      LREMESA_CUR = [F:ZVPAG]REMESA
+    Endif
+    If LREMESA_CUR = LREMESA_ANT Then
+      LCONTADOR_LINEA += 1
+      Call CREAR_LINEA_ASIENTO(LFICIMP,1,[F:ZVPAG]IMPORTE, [F:ZVPAG]CUENTA, LPLANTA,LREMESA_CUR, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+      LCONTADOR_LINEA += 1
+      Call CREAR_LINEA_ASIENTO(LFICIMP,-1,[F:ZVPAG]IMPORTE, [F:ZVPAG]CUENTA_BANCO, LPLANTA, LREMESA_CUR, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+    Else
+      # Marcar registros de la remesa como procesados
+      Trbegin [F:ZPA]
+      Update [F:ZPA] Where [F:ZPA]ZREMESA = LREMESA_CUR and [F:ZPA]ZMETODOPAGO = "5" and [F:ZPA]ZDOC = PDOC With [F:ZPA]ZSTATUS = "2"
+      Commit
+      LCONTADOR_LINEA = 0
+      Call CREAR_CABECERA_ASIENTO(LREMESA_CUR, LPLANTA)
+      LCONTADOR_LINEA += 1
+      Call CREAR_LINEA_ASIENTO(LFICIMP,1,[F:ZVPAG]IMPORTE, [F:ZVPAG]CUENTA,LPLANTA, [F:ZVPAG]REMESA, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+      LCONTADOR_LINEA += 1
+      Call CREAR_LINEA_ASIENTO(LFICIMP,-1,[F:ZVPAG]IMPORTE, [F:ZVPAG]CUENTA_BANCO, LPLANTA,[F:ZVPAG]REMESA, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+      LREMESA_CUR = [F:ZVPAG]REMESA
+      LREMESA_ANT = [F:ZVPAG]REMESA
+    Endif
+
+    # MARCAR REGISTROS DE LA REMESA COMO PROCESADOS
+    # UPDATE ZSTATUS = 1 DE ZPAGOSNOM de la Remesa que estoy tratando
+    LTOTAL_REGISTROS -= 1
+    If LTOTAL_REGISTROS = 0 Then
+       # para el último registro
+      LCONTADOR_LINEA += 1
+      Call CREAR_LINEA_ASIENTO(LFICIMP,1,[F:ZVPAG]IMPORTE, [F:ZVPAG]CUENTA,LPLANTA, [F:ZVPAG]REMESA, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+      LCONTADOR_LINEA += 1
+      Call CREAR_LINEA_ASIENTO(LFICIMP,-1,[F:ZVPAG]IMPORTE, [F:ZVPAG]CUENTA_BANCO, LPLANTA,[F:ZVPAG]REMESA, LCONTADOR_LINEA,LTOTAL_REGISTROS)
+      Trbegin [F:ZPA]
+      Update [F:ZPA] Where [F:ZPA]ZREMESA = LREMESA_CUR and [F:ZPA]ZMETODOPAGO = "5" and [F:ZPA]ZDOC = PDOC With [F:ZPA]ZSTATUS = "2"
+      Commit
+    Endif
+  Next
+
+   #Infbox "Registros encontrados MP=1 :"   + num$(rowcount([ZVPAG]))
+#  If !GSERVEUR Then
+#     Call TEMPON("Llamada a import del fichero :"   + LFICIMP) From GESECRAN
+#     Call ECR_TRACE("Llamada a import del fichero :"   + LFICIMP, 0) From GESECRAN
+#  Endif
+   Call EJECUTAR_IMPORT(LFICIMP)
+
+End
+
+
+Subprog CREAR_CABECERA_ASIENTO(PFICHERO, PREMESA, PPLANTA, PFECHA)
+  Local Date LFECHA
+  Openo PFICHERO Using [ZPAG]
+  adxifs=';'
+  adxirs = chr$(13) + chr$(10)
+
+  LFECHA = gdat$(val(mid$(PFECHA,1,2)),val(mid$(PFECHA,4,2)),val(mid$(PFECHA,7,2)))
+
+  Wrseq "G", "PNOM",PPLANTA, "PNOM","",num$(format$("D:YYYYMMDD",LFECHA)),"EUR","","STDCO", "PNOM - " + PREMESA Using [ZPAG]
+  Openo Using [ZPAG]
+
+End
+
+
+Subprog CREAR_LINEA_ASIENTO(PFICHERO, PTIPO, PIMPORTE, PCUENTA, PPLANTA, PREMESA, PCONTADOR_REGISTROS,PTOTAL_REGISTROS)
+
+  Openo PFICHERO Using [ZPAG]
+  adxifs=';'
+  adxirs = chr$(13) + chr$(10)
+  If PCUENTA = "460000" Then
+    LBPR = "GEN"
+  Else
+    LBPR = ""
+  Endif
+  Wrseq "D", PCONTADOR_REGISTROS , "1" , PCONTADOR_REGISTROS, PPLANTA,"" ,PCUENTA, LBPR , "PNOM - " + PREMESA ,  PTIPO,  PIMPORTE , "EUR", PREMESA Using [ZPAG]
+  Openo Using [ZPAG]
+
+End
+
+
+##############################################################################################################################
+#**
+#*
+#*!
+Subprog EJECUTAR_IMPORT(PFILE)
+
+  Local Char PARAM(15)(1..4) , VALEUR(15)
+
+  Gosub INIT From GIMPOBJ
+
+  Gosub DEBUT From GIMPOBJ
+  Gosub OK_SAI From GIMPOBJ
+  Gosub CONTROLE From GIMPOBJ
+
+  [M:IMP2]MODIMP = "PNOM"
+  [M:IMP2]NOMIMP = PFILE
+
+  Gosub EXEC From GIMPOBJ
+  Gosub TERMINE From GIMPOBJ
+
+#  If GERRTRACE = 1 and GERRTRACE = 3 Then
+#    Errbox "Errores en la generación de los asientos. Revise la traza", "Revisar la traza " + GTRACE Titled "Import YCOM"
+#    Call LECFIC("TRA",GTRACE,"tra") From LECFIC
+#  Endif
+End
+

@@ -1,0 +1,99 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+# Shipping operation (stateless) of an order
+# The order instance is present (this), but the order [L]ORDNUM is not read yet
+$SHIP
+Local Integer I, J, TRANSACTION_PENDING
+Local Instance SHIPMENT Using C_YSHIP
+
+# In service mode, the order might not exist or be already shipped. If it is the case, stop
+  ASTATUS=fmet this.AREAD([L]ORDNUM)
+  If ASTATUS>=[V]CST_AERROR
+    ASTATUS=fmet this.ASETERROR("ORDNUM","The order does not exist",ASTATUS) : Return
+  Elsif this.ORDSTA>=3
+    ASTATUS=fmet this.ASETERROR("ORDSTA","Order already shipped or invoiced",[V]CST_AERROR) : Return
+  Endif
+
+# If this operation is embedded in an existing transaction, don't open it
+  If adxlog<>0 : TRANSACTION_PENDING=1 : Else Trbegin YSHIP : Endif
+
+# Instantiate and create a shipping order with the quantities not yet shipped
+  SHIPMENT=NewInstance C_YSHIP AllocGroup this
+  ASTATUS=fmet SHIPMENT.AINIT
+
+  If ASTATUS<[V]CST_AERROR
+
+    # Get the next shipment number
+    Local File YSHIP [YS] Where ORDNUM=this.ORDNUM : SHIPMENT.DLVNUM=rowcount([YS])+1
+
+    # Set the other header properties
+    SHIPMENT.ORDNUM=this.ORDNUM : SHIPMENT.DLVDAT=date$ : SHIPMENT.CUSTOMER=this.CUSTOMER
+
+    # Loop on the order lines. Only the lines that have a quantity not shipped are generated
+    SHIPMENT.TOTAL=0
+    For I=1 To maxtab(this.LINES)
+      If this.LINES(I).QTY>this.LINES(I).DLVQTY : # Select only lines not completely shipped
+        J=fmet SHIPMENT.ADDLINE("SHIPLINES",[V]CST_ALASTPOS)
+        If J<0 : ASTATUS=fmet this.ASETERROR("","Unable to create shipment lines",[V]CST_AERROR) : Break : Endif
+        SHIPMENT.SHIPLINES(J).ORDNUM=this.ORDNUM
+        SHIPMENT.SHIPLINES(J).DLVNUM=SHIPMENT.DLVNUM
+        SHIPMENT.SHIPLINES(J).NUMLIN=J
+        SHIPMENT.SHIPLINES(J).ITEM=this.LINES(I).ITEM
+        SHIPMENT.SHIPLINES(J).QTY=this.LINES(I).QTY-this.LINES(I).DLVQTY
+        SHIPMENT.TOTAL+=this.LINES(I).UNITPRICE*SHIPMENT.SHIPLINES(J).QTY*(1-this.LINES(I).DISCOUNT/100)
+      Endif
+    Next I
+
+    # Use the creation method on the shipment
+    If ASTATUS<[V]CST_AERROR : ASTATUS=fmet SHIPMENT.AINSERT() : Endif
+
+    # Update the order
+    If ASTATUS<[V]CST_AERROR
+
+      # Set OPERATION to "SHIP" allows modification of shipped quanties
+      this.OPERATION="SHIP"
+
+      # Loop on lines and modify quantities
+      For I=1 To maxtab(this.LINES)
+        If this.LINES(I).QTY>this.LINES(I).DLVQTY : # Select only lines not completely shipped
+          this.LINES(I).DLVQTY=this.LINES(I).QTY  : # Quantities are shipped
+        Endif
+      Next I
+
+      # Call the update method
+      ASTATUS=fmet this.AUPDATE()
+    Endif
+  Endif
+
+# Close the transaction if the transaction was opened
+  If TRANSACTION_PENDING=0
+    If ASTATUS>=[V]CST_AERROR : Rollback : Else : Commit : Endif
+  Endif
+
+# Get the document generation option parameter value (direct read to avoid buffer effects)
+Local Integer DOCGEN
+  Local File ADOVAL
+  Read [ADW]ADW0="";"";"YDOCGEN"
+  DOCGEN=val([ADW]VALEUR)
+
+# Generate the order document
+  If ASTATUS<[V]CST_AERROR
+    Case DOCGEN:
+      When 2 : OK=func YDOC.CREATE_HTML_SHIP(SHIPMENT,"Ship_"+num$(SHIPMENT.ORDNUM)+"_"+num$(SHIPMENT.DLVNUM)+".html",
+&    "Shipment For customer"-SHIPMENT.CUSTOMER)
+      When 3 : OK=func YDOC.CREATE_JSON_DOC(SHIPMENT,"Ship_"+num$(SHIPMENT.ORDNUM)+"_"+num$(SHIPMENT.DLVNUM)+".json",
+&    "Shipment For customer"-SHIPMENT.CUSTOMER)
+    Endcase
+  Endif
+
+# Get the web publication option parameter value (direct read to avoid buffer effects)
+Local Integer PUBLISH
+  Read [ADW]ADW0="";"";"YPUBLISH"
+  PUBLISH=val([ADW]VALEUR)
+
+# Call the web service publication
+  If PUBLISH=2 and ASTATUS<[V]CST_AERROR
+    Gosub PUBLISH_SHIPMENT From YWEBSERV
+  Endif
+
+Return
+
