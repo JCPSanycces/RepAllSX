@@ -1,0 +1,4927 @@
+#<AdxTL>@(#)3.0.0.0 $Revision$
+#CHECK UNUSED_BEGIN
+Local Integer I, WNBSERIEB
+Local Char    WSERNUM(GLONSER)
+Local Char    WSERNUMF(GLONSER)
+
+Local Char WCRIT(100), WCRITSTO1(150)
+Call DECODE_STAT("A*,Q*,R*,R1*",WCRIT) From TRTCATEG
+# Remplacement des '%' par la variable à tester
+Call CREE_FORMULE(WCRIT,"[F:STO1]STA",WCRITSTO1) From TRTCATEG
+Infbox WCRIT
+Infbox WCRITSTO1
+
+WSERNUM="A10B-123"
+WSERNUMF="A10B-132"
+WNBSERIE = val(ctrans(WSERNUMF,sigma(I=1,47,chr$(I))+sigma(I=58,255,chr$(I)),""))
+&         -val(ctrans(WSERNUM ,sigma(I=1,47,chr$(I))+sigma(I=58,255,chr$(I)),""))
+&         +1
+Infbox num$(WNBSERIE)
+End
+
+$CRESOW
+For I=0 To 9000
+   [M:SOW]NUMLIG(I) =mod((I+1)*5,1000)
+   [M:SOW]WSTOCOU(I)=I
+   [M:SOW]WQTYSTU(I)=0
+   [M:SOW]WQTYSTUACT(I)=I*10
+Next I
+[M:SOW]NBLIG=I+1
+Return
+
+$TRISOW
+Sorta [M:SOW]NBLIG [M:SOW]NBLIG Order By [M:SOW]NUMLIG(indice)
+Return
+
+$DELSOW
+For I=0 To 9000
+   Raz [M:SOW]NUMLIG(I),[M:SOW]WSTOCOU(I),[M:SOW]WQTYSTU(I),[M:SOW]WQTYSTUACT(I)
+Next I
+[M:SOW]NBLIG=0
+Return
+#CHECK UNUSED_END
+
+########################################################################
+# Traitement STKALL - Librairie composants d'allocation/sortie    V140 #
+########################################################################
+#
+# STOCKALG    Algorithme de détermination du stock à allouer ou sortir
+# GENSTOALL   Allocation d'une ligne document
+#             (Ecriture des allocations dans STOALL)
+# ENRSTOALL   Gestion des allocation technique d'une ligne document
+#             avec possibilité de désallocation ou réallocation
+#             d'une ligne de pièce origine
+#             (Exploitation écran STOSORW pour écriture alloc STOALL)
+# MAJALLORI   Mise à jour des allocations d'une ligne de pièce origine
+#             à partir de l'écran STOSORW (stockage sortie OF)
+#             (Ex: maj des allocations d'un OF lors du suivi (sortie OF))
+# CTLALL      Contrôle d'autorisation de sortie des allocations (cdes & OF)
+#             selon la règle de gestion des sorties pour le mvt à traiter
+# DELALL      Désallocation d'une ligne document
+# DIMALL      Diminution d'une ligne document
+# CREALL      Création d'une allocation
+# SUPALL      Suppression d'une allocation
+# MODALL      Modification d'une allocation
+# CHGALL      Transfert d'allocations (changement de clé)
+# CSOALL      Consommation des réservations clients (production?)
+# STODISALL   Stock disponible pour allocations (Commande ou OF)
+# PURGLO      Suppression des allocations globales temporaires échues
+# RECH_PICLOC Recherche emplacement de consommation exclusif
+# MODZONALL   Modification du contenu des allocations d'une pièce
+# ALL_WEIGHING Vérification si une ligne de stock est en cours de pesée
+#
+########################################################################
+
+########################################################################
+# STOCKALG    Algorithme d'allocation
+########################################################################
+# Prérequis    : Buffer article en ligne               : [F:ITM]
+#                Buffer catégorie article en ligne     : [F:ITG]
+#                Buffer article-site en ligne          : [F:ITF]
+#                Buffer cumuls articles-sites en ligne : [F:ITV]
+#                Buffer règle d'allocation en ligne    : [F:TRU]
+#                   si paramètre entrée WTRUCOD <> ""
+#
+########################################################################
+# Paramètres E : LRUP     = Génération ruptures  (0=Non / 1=Oui)
+#                WTRUCOD  = Règle d'allocation
+#            S : LFULLTAB = 1 si tableau plein (Chargt incomplet)
+#                LRET     = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+# Entrée       : Ecran ALLPAR [ALP] (Bloc 1)
+#                - alimenter TRSCOD avec la zone 'Règle de gestion' de la
+#                  transaction document
+#                - alimenter STOLOC avec emp poste charge si OF, EO ou suivi OF
+#                - alimenter PECINTLOC avec 2 pour traiter les emplacements
+#                  internes (si non alimenté est forcé à 2)
+#                - alimenter PECSCOLOC avec 2 pour traiter les emplacements
+#                  sous-traitants
+#                - alimenter PECPLFLOC avec 2 pour traiter les emplacements
+#                  en attente de rangement
+#                - alimenter PECCUNLOK avec 2 pour traiter les emplacements
+#                  en cours d'inventaire (si commande ou OF)
+#                - alimenter PECQLYCTL avec 2 pour traiter les stocks
+#                  faisant l'objet d'une demande d'analyse (si commande ou OF)
+#                - alimenter PECOWNER avec le propriétaire du stock à consommer
+#                  si allocation du stock d'un tiers
+#                  (suivi OF: opération sous-traitance (chez le sous-traitant))
+#                  (retour d'une réception de sous-traitance)
+#                - alimenter AUZSST avec s-statuts autorisés sur emplacement
+#                  à réapprovisionner (si réappro zones de consommation)
+#                - alimenter WRH avec le dépôt de la ligne de document
+########################################################################
+# Sorties      : Ecran ALLPAR [ALP] (Tableau)
+#                [M:ALP]NBLIG      = Nb lignes stock
+#                [M:ALP]WSTOCOU    = Chrono stock
+#                [M:ALP]WQTYSTU    = Quantité US
+#                [M:ALP]WQTYSTUACT = Quantité US active
+#                [M:ALP]WALLTYP    = Type allocation (M.294)
+#
+########################################################################
+Subprog STOCKALG(LRUP,WTRUCOD,LFULLTAB,LRET)
+Value    Integer LRUP
+Value    Char    WTRUCOD
+Variable Integer LFULLTAB
+Variable Integer LRET
+
+Local Integer  I, J, K, NOL, WRET, WNBL, WLOCFLT
+Local Integer  WE1, WE2, WE3, WT1, WT2, WT3
+Local Integer  ACTSLS              : # Valeur du code activité SLS
+Local Char     WSHTLOT(GLONLOT)    : # Lot obligatoire si rupture
+Local Char     WSHTLOC(GLONLOC)    : # Emplacement obligatoire si rupture
+Local Char     WSHTLOCTYP(GLONTLO) : # Type emplacement obligatoire si rupture
+Local Char     WSHTWRH(GLONWRH)    : # Dépôt obligatoire si rupture
+Local Char     LWRH(GLONWRH)       : # Dépôt
+Local Integer  LSST                : # Sous-traitance 0/1
+Local Shortint WA, WQ, WR, WAQR
+Local Shortint WUD, WUS, WUC
+Local Shortint WUDO, WUDE, WUDI, WUDS
+Local Shortint WUCO, WUCE, WUCI, WUCS
+Local Char     WCRIT(80)
+#--- Issue 103189
+#Local Char     WCRITLOT(240)      : # Filtre lot
+Local Char     WCRITLOT(250)      : # Filtre lot
+#---
+Local Char     WCRITSTO1(240)     : # Filtre statut
+Local Char     WCRITSTO2(240)     : # Filtre unités et propriétaire
+Local Char     WCRITSTO3(250)     : # Filtre emplacement
+Local Char     WDEFLOC(GLONLOC), WDEFLOC2(GLONLOC), WDEFLOC3(GLONLOC)
+Local Char     WDEFLOCTYP(GLONTLO), WDEFLOCTYP2(GLONLOC), WDEFLOCTYP3(GLONLOC)
+Local Char     WAUZSST(30)
+#Local Char     WLOT(GLONLOT)
+Local Decimal  WPCUDIS, WSTUDIS, WSTUACTDIS
+Local Decimal  WQTY, WQTYARR
+Local Integer  WTRSTYP
+Local Integer  WINCLOT            : # No incrémentation lot
+Local Char     WSVGLOT(GLONLOT)   : # Sauvegarde lot pour incrémentation
+Local Decimal  WQTELOT            : # Qté dispo sur un lot
+Local Char     WUNTLOT(4)         : # No incrémentation du lot à traiter
+
+#------------------------------------------------------------------------
+# Resynchro des qtés en cours de traitement pour l'article et le site
+#------------------------------------------------------------------------
+# PE pour conditionner l'exécution de la resynchro suite à des pb de performances
+Local Integer WSTOWIPW : [L]WSTOWIPW=1
+GPOINT="STOWIPW" : Gosub ENTREE From EXEFNC
+If [L]WSTOWIPW=1
+   Local Char  WPARAM(250)(1..20)
+   WPARAM(1) = [M:ALP]ITMREF
+   WPARAM(2) = [M:ALP]STOFCY
+   Call TRAITE_NUM(GBIDD1,WPARAM,"","FUNSTOWIPW","",1,"XYFUNSTOWIPW") From GTRAITE
+Endif
+#------------------------------------------------------------------------
+
+LRET = 0
+LFULLTAB = 0
+
+If clalev([F:ACV]) =0  Local File ACTIV      [ACV]   Endif
+If clalev([F:SRU]) =0  Local File TABSTORUL  [SRU]   Endif
+If clalev([F:STL1])=0  Local File STOLOT     [STL1]  Endif
+If clalev([F:SLF1])=0  Local File STOLOTFCY  [SLF1]  Endif
+If clalev([F:STO1])=0  Local File STOCK      [STO1]  Endif
+If clalev([F:STA1])=0  Local File STOALL     [STA1]  Endif
+If clalev([F:STS]) =0  Local File STOSER     [STS]   Endif
+If clalev([F:STC]) =0  Local File STOLOC     [STC]   Endif
+If clalev([F:ITF]) =0  Local File ITMFACILIT [ITF]   Endif
+#DLUBPC
+If clalev([F:ITU]) =0  Local File ITMBPC [ITU]   Endif
+
+Read [ACV]CODACT="SLS"
+If !fstat ACTSLS=[F:ACV]DIME Endif
+If ACTSLS = 0
+   GOK=0  : Call ERREUR (mess(339,199,1)-'SLS') From GESECRAN
+   LRET=1 : End
+Endif
+
+Default Mask [ALP]
+
+# Si non renseigné car ajouté 05.08
+If [M:ALP]PECINTLOC=0 [M:ALP]PECINTLOC=2 Endif
+
+WTRSTYP=[M:ALP]TRSTYP
+
+If find([M:ALP]VCRTYP,2,10,36)
+   # Si cde vente                     --> type mvt = livraison ou livraison prêt
+   # Si OF                            --> type mvt = sortie OF ou s-traitance
+   [M:ALP]WPCU(NOL)       = [F:STO1]PCU# Si ordre s-traitance             --> type mvt = sortie s-traitance
+   Case [M:ALP]VCRTYP
+    When  2 : If WTRSTYP=0   : # au cas où [M:ALP]TRSTYP ne serait pas renseigné
+                 WTRSTYP = 4
+              Endif
+    When 10 : If [M:ALP]PECSCOLOC=2
+                 WTRSTYP = 29
+              Else
+                 WTRSTYP = 6
+              Endif
+    When 36 : WTRSTYP = 29
+   Endcase
+Endif
+
+# Inutile : Buffer ITF en ligne est un prérequis
+#lecture ITMFACILIT  pour recuperer STOMGTCOD   hcb ST
+#If [F:ITF]STOFCY <> [M:ALP]STOFCY | [F:ITF]ITMREF <> [F:ITM]ITMREF
+#   Read [ITF]ITF0 = [F:ITM]ITMREF;[M:ALP]STOFCY
+#   If fstat
+#      Raz [F:ITF]
+#   Endif
+#Endif
+
+#DLUBPC
+#DLU Client
+#lecture ITMBPC  pour recuperer DLUBPC
+If [M:ALP]BPRNUM <> ""
+   Read [ITU]ITU0 = [F:ITM]ITMREF;[M:ALP]BPRNUM
+   If fstat
+      Raz [F:ITU]
+   Endif
+Endif
+
+# Chargement des données article dans l'écran
+[M:ALP]STU       = [F:ITM]STU
+[M:ALP]STOMGTCOD = [F:ITF]STOMGTCOD
+
+# Lecture de la règle de gestion à utiliser
+Call LECSRU([M:ALP]STOFCY,[F:ITM]TCLCOD,WTRSTYP,[M:ALP]TRSCOD,"",LRET) From STKLIB
+If LRET<>0 : GOK=0 : End : Endif
+
+GPOINT="PARSTO" : Gosub ENTREE From EXEFNC
+# Chargement des filtres sur le lot
+Gosub FILTRE_LOT
+
+# Chargement des filtres sur les stock, à partir des règles d'allocation
+Gosub FILTRE_STOCK
+
+# Pour court-circuiter entièrement 'Gosub LEC_LOT' mettre GPE à 1
+GPE=0
+GPOINT="FILSTO" : Gosub ENTREE From EXEFNC
+
+# Lecture des lots selon ordre de déstockage avec
+# lecture et chargement des lignes de stock éligibles
+If GPE<>1 Gosub LEC_LOT Endif
+
+
+#ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ#
+# Pour les tests ( a supprimer ultérieurement)
+#If clalev([M:ZALP])
+#   [M:ZALP]TRUCOD=WTRUCOD
+#   [M:ZALP]STOART=WDEFLOC
+#Endif
+#ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ#
+
+
+# Exploitation des règles d'allocation sur les lignes de stock éligibles
+# pour déterminer les allocations ou sorties à réaliser
+
+If [L]WTRUCOD=""
+   WNOMTRAIT="STKALL"
+Else
+   WNOMTRAIT="WV"+WTRUCOD
+Endif
+Gosub TRT_ALLOC From =WNOMTRAIT
+
+#--- Dem 68926
+GPOINT="RECHALL" : Gosub ENTREE From EXEFNC
+
+# Quantité à traiter
+[L]WQTY = [M:ALP]QTY
+
+#--- Traitement du mono-lot
+
+If [L]WTRUCOD<>"" & [F:TRU]UNTLOT=2 & [F:ITM]LOTMGTCOD>=2
+   Raz [L]WINCLOT, [L]WQTELOT
+   For I=0 To [M:ALP]NBLIG-1
+      J=[M:ALP]NLIG(I)
+      #--- Bug 70118
+      #If val(left$([M:ALP]WCOND(J),4))<>[L]WINCLOT
+      If val(left$([M:ALP]WCOND(I),4))<>[L]WINCLOT
+      #---
+         Raz [L]WQTELOT
+         #--- Bug 70118
+         #[L]WINCLOT = val(left$([M:ALP]WCOND(J),4))
+         [L]WINCLOT = val(left$([M:ALP]WCOND(I),4))
+         #---
+      Endif
+      If [M:ALP]TYPQTY=1
+         [L]WQTELOT += [M:ALP]WQTYSTUAVA(J)
+      Else
+         [L]WQTELOT += [M:ALP]WQTYACTAVA(J)
+      Endif
+      If [L]WQTELOT>=[L]WQTY
+         [L]WUNTLOT=num$([L]WINCLOT)
+         Break
+      Endif
+   Next I
+Endif
+
+For I=0 To [M:ALP]NBLIG-1
+   J=[M:ALP]NLIG(I)
+   # Si mono-lot, ne prendre que le lot identifié par WUNTLOT
+   If [L]WTRUCOD<>"" & [F:TRU]UNTLOT=2 & [F:ITM]LOTMGTCOD>=2
+      #--- Bug 70118
+      #If left$([M:ALP]WCOND(J),4)<>[L]WUNTLOT
+      If left$([M:ALP]WCOND(I),4)<>[L]WUNTLOT
+      #---
+         [M:ALP]WFLG(J)=9 : Goto NEXT_ALP
+      Endif
+   Endif
+
+   #--- Dem 63558
+   #If [M:ALP]WQTYSTUAVA(J)<>0
+   GPE=0
+   #---
+   GOK=1
+   GPOINT="PECSTOALG" : Gosub ENTREE From EXEFNC
+   If GOK=0
+      GOK=1 : [M:ALP]WFLG(J)=9 : Goto NEXT_ALP
+   Endif
+   #--- Dem 63558
+   #Endif
+   Break ([L]WQTY=0)
+   If GPE=0
+   #---
+      [M:ALP]WFLG(J)=1
+      # Quantité en US
+      If [M:ALP]TYPQTY=1
+         # La ligne n'a pas encore été prise en compte
+         If [M:ALP]WQTYSTU(J)=0
+            [M:ALP]WQTYSTU(J) = min([L]WQTY,[M:ALP]WQTYSTUAVA(J))
+            #--- Dem 28702
+            # Si UC complète
+            If [L]WTRUCOD<>"" & [F:TRU]CPLPCU=2 & [M:ALP]WPCU(J)<>[M:ALP]STU
+#&            & [M:ALP]WQTYSTU(J)<>[M:ALP]WQTYSTUAVA(J) : #--- Bug 82445
+               [L]WQTYARR = int([M:ALP]WQTYSTU(J)/[M:ALP]WPCUSTUCOE(J))*[M:ALP]WPCUSTUCOE(J)
+               If [L]WQTYARR>0
+                  [M:ALP]WQTYSTU(J) = [L]WQTYARR
+               Else
+                  [M:ALP]WQTYSTU(J) = 0
+                  [M:ALP]WFLG(J)=9 : Goto NEXT_ALP
+               Endif
+            Endif
+            #---
+            [M:ALP]WQTYSTUACT(J) = [M:ALP]WQTYSTU(J)
+            # Si gestion en titres ou UI, calcul quantité en UA
+            Case [F:ITF]STOMGTCOD
+             When 3 : If [M:ALP]WPOT(J)<>0
+                         [M:ALP]WQTYSTUACT(J)=[M:ALP]WQTYSTU(J)*([M:ALP]WPOT(J)/100)
+                         Call QTEARR([M:ALP]WQTYSTUACT(J),[M:ALP]STU) From TRTDIV
+                      Endif
+             When 4 : If [M:ALP]WPOT(J)<>0
+                         [M:ALP]WQTYSTUACT(J)=[M:ALP]WQTYSTU(J)* [M:ALP]WPOT(J)
+                         Call QTEARR([M:ALP]WQTYSTUACT(J),[M:ALP]STU) From TRTDIV
+                      Endif
+            Endcase
+            [L]WQTY -= [M:ALP]WQTYSTU(J)
+            Break ([L]WQTY=0)
+         Endif
+      # Quantité en UA
+      Else
+         # La ligne n'a pas encore été prise en compte
+         If [M:ALP]WQTYSTUACT(J)=0
+            [M:ALP]WQTYSTUACT(J) = min([L]WQTY,[M:ALP]WQTYACTAVA(J))
+            [M:ALP]WQTYSTU(J)    = [M:ALP]WQTYSTUACT(J)
+            # Si gestion en titres ou UI, calcul quantité en US
+            Case [F:ITF]STOMGTCOD
+             When 3 : If [M:ALP]WPOT(J)<>0
+                         [M:ALP]WQTYSTU(J)=[M:ALP]WQTYSTUACT(J)/([M:ALP]WPOT(J)/100)
+                         Call QTEARR([M:ALP]WQTYSTU(J),[M:ALP]STU) From TRTDIV
+                      Endif
+             When 4 : If [M:ALP]WPOT(J)<>0
+                         [M:ALP]WQTYSTU(J)=[M:ALP]WQTYSTUACT(J)/ [M:ALP]WPOT(J)
+                         Call QTEARR([M:ALP]WQTYSTU(J),[M:ALP]STU) From TRTDIV
+                      Endif
+            Endcase
+            #--- Dem 28702
+            # Si UC complète
+            If [L]WTRUCOD<>"" & [F:TRU]CPLPCU=2 & [M:ALP]WPCU(J)<>[M:ALP]STU
+#&            & [M:ALP]WQTYSTUACT(J)<>[M:ALP]WQTYACTAVA(J) : #--- Bug 82445
+               [L]WQTYARR = int([M:ALP]WQTYSTU(J)/[M:ALP]WPCUSTUCOE(J))*[M:ALP]WPCUSTUCOE(J)
+               If [L]WQTYARR>0
+                  If [L]WQTYARR<>[M:ALP]WQTYSTU(J)
+                     [M:ALP]WQTYSTU(J)    = [L]WQTYARR
+                     [M:ALP]WQTYSTUACT(J) = [M:ALP]WQTYSTU(J)
+                     # Si gestion en titres ou UI, calcul quantité en UA
+                     Case [F:ITF]STOMGTCOD
+                      When 3 : If [M:ALP]WPOT(J)<>0
+                                  [M:ALP]WQTYSTUACT(J)=[M:ALP]WQTYSTU(J)*([M:ALP]WPOT(J)/100)
+                                  Call QTEARR([M:ALP]WQTYSTUACT(J),[M:ALP]STU) From TRTDIV
+                               Endif
+                      When 4 : If [M:ALP]WPOT(J)<>0
+                                  [M:ALP]WQTYSTUACT(J)=[M:ALP]WQTYSTU(J)* [M:ALP]WPOT(J)
+                                  Call QTEARR([M:ALP]WQTYSTUACT(J),[M:ALP]STU) From TRTDIV
+                               Endif
+                     Endcase
+                  Endif
+               Else
+                  [M:ALP]WQTYSTU(J)    = 0
+                  [M:ALP]WQTYSTUACT(J) = 0
+                  [M:ALP]WFLG(J)=9 : Goto NEXT_ALP
+               Endif
+            Endif
+            #---
+            [L]WQTY -= [M:ALP]WQTYSTUACT(J)
+            Break ([L]WQTY=0)
+         Endif
+      Endif
+   #--- Dem 63558
+   Endif
+$NEXT_ALP
+Next I
+
+# Quantité allouée
+[M:ALP]ALLQTY = [M:ALP]QTY - [L]WQTY
+# Quantité rupture
+[M:ALP]ALLQTYSHT = [M:ALP]QTY - [M:ALP]ALLQTY
+
+Raz [M:ALP]WRH, [M:ALP]LOT, [M:ALP]LOC, [M:ALP]STA
+
+# Si génération de rupture autorisée, stockage des lot et emplacement
+If LRUP=1
+   [M:ALP]LOT    = WSHTLOT
+   [M:ALP]LOC    = WSHTLOC
+   [M:ALP]LOCTYP = WSHTLOCTYP
+   [M:ALP]WRH    = WSHTWRH
+Endif
+
+End
+
+#-----------------------------------------------------------#
+# Chargement des filtres sur le lot                         #
+#-----------------------------------------------------------#
+$FILTRE_LOT
+Local Char NBDAY(10)
+NBDAY=""
+
+#DLU Client, calcul du nbre de jours à retrancher à la DLU article
+If [F:ITU]DLUBPC <> 0
+  Call CALNBDAYCLI([F:ITM]EXYMGTCOD,[F:ITM]SHL,[F:ITM]SHLUOM,[F:ITF]DLU,[F:ITU]DLUBPC,NBDAY) From STKLIB
+Endif
+
+#--- Issue 103189
+#WCRITLOT='ITMREF=[M:ALP]ITMREF'
+WCRITLOT='[F:SLF1]ITMREF=[M:ALP]ITMREF'
+#---
+
+# Si lot renseigné dans filtre allocation
+If !find([M:ALP]LOT,"","*")
+   [M:ALP]LOT = vireblc([M:ALP]LOT,1)
+   #--- Issue 103189
+   #WCRITLOT  +='&pat(LOT,[M:ALP]LOT)<>0'
+   WCRITLOT  +='&pat([F:SLF1]LOT,[M:ALP]LOT)<>0'
+   #---
+   # Stockage lot pour rupture
+   WSHTLOT    = [M:ALP]LOT
+Endif
+
+# Lots périmés interdits    # hcb v6dlu nouvelle gestion
+If [F:SRU]SHLLOT<>3
+   If [F:SRU]SHLLOT=1
+      If [M:ALP]DLVDAT<>[0/0/0]
+         WCRITLOT+='&([F:STL1]SHLDAT=[0/0/0]|[F:STL1]SHLDAT>=[M:ALP]DLVDAT)'
+      Else
+         WCRITLOT+='&([F:STL1]SHLDAT=[0/0/0]|[F:STL1]SHLDAT>=[M:ALP]BESDAT)'
+      Endif
+   Endif
+   If [F:SRU]SHLLOT=2
+      If [M:ALP]DLVDAT<>[0/0/0]
+         #DLUBPC
+         WCRITLOT+='&([F:STL1]DLUDAT=[0/0/0]|[F:STL1]DLUDAT'+NBDAY+'>=[M:ALP]DLVDAT)'
+      Else
+         #DLUBPC
+         WCRITLOT+='&([F:STL1]DLUDAT=[0/0/0]|[F:STL1]DLUDAT'+NBDAY+'>=[M:ALP]BESDAT)'
+      Endif
+   Endif
+Endif
+
+#--- Issue 103189
+WCRITLOT+='&sum(WA*[F:SLF1]AAACUMQTY,WQ*[F:SLF1]QQQCUMQTY,WR*[F:SLF1]RRRCUMQTY)>0'
+
+Return
+
+#-----------------------------------------------------------#
+# Chargement des filtres sur les lignes de stock, à partir  #
+# - du filtre allocation (si commande ou OF)                #
+# - des règles d'allocation                                 #
+# - de la règle de gestion (si sortie)(pour sous-statuts)   #
+# - des caractéristiques du type mouvement (catégorie art)  #
+#-----------------------------------------------------------#
+$FILTRE_STOCK
+
+Raz WA, WQ, WR, WAQR
+Raz WCRIT, WCRITSTO1, WCRITSTO2, WCRITSTO3
+
+#------------------------------------------------------------------------
+# Filtre sur les statuts pour restreindre les lignes de stocks éligibles
+#------------------------------------------------------------------------
+
+# Si statuts renseignés dans filtre allocation
+If !find([M:ALP]STA,"","*")
+   # Décodage de la liste de statuts --> transformation en
+   # une formule contenant des 'pat(%,statut)'
+   Call DECODE_STAT([M:ALP]STA,WCRIT) From TRTCATEG
+   # Remplacement des '%' par la variable à tester
+   Call CREE_FORMULE(WCRIT,"[F:STO1]STA",WCRITSTO1) From TRTCATEG
+   If instr(1,WCRITSTO1,chr$(34)+"A") WA=1 Endif
+   If instr(1,WCRITSTO1,chr$(34)+"Q") WQ=1 Endif
+   If instr(1,WCRITSTO1,chr$(34)+"R") WR=1 Endif
+   Raz WCRIT
+# Sinon si autres documents, prise en compte des sous-statuts autorisés
+Elsif !find([M:ALP]VCRTYP,2,10,36) & !find([F:SRU]AUZSST,"","*")
+   Call CREE_FORMULE([F:SRU]FORSTA,"[F:STO1]STA",WCRITSTO1) From TRTCATEG
+   If instr(1,WCRITSTO1,chr$(34)+"A") WA=1 Endif
+   If instr(1,WCRITSTO1,chr$(34)+"Q") WQ=1 Endif
+   If instr(1,WCRITSTO1,chr$(34)+"R") WR=1 Endif
+Endif
+
+# S'il n'y avait pas de filtre statut, on traite ceux de la règle d'allocation
+# restreint par les statuts autorisés pour le mouvement ds la catégorie article
+If WCRITSTO1=""
+   # Si commande, OF ou EO
+   If find([M:ALP]VCRTYP,2,10,36)
+      If WTRUCOD<>""
+         # Statuts autorisés par les règles d'allocation
+         For I=0 To dim([F:TRU]STAFLT)-1
+            If [F:TRU]STAFLT(I)<>0
+               If find([F:TRU]STAFLT(I),1,3,5,7) WA=1  Endif
+               If find([F:TRU]STAFLT(I),2,3,6,7) WQ=1  Endif
+               If find([F:TRU]STAFLT(I),4,5,6,7) WR=1  Endif
+            Endif
+         Next I
+         WAQR = WA+2*WQ+4*WR
+      Endif
+   # Autres pièces
+   Else
+      # Statuts autorisés par la règle de gestion de stock
+      WAQR=[F:SRU]AUZSTA
+   Endif
+
+   # Alimentation du filtre sur le statut
+   Case WAQR
+      When 1       : WCRITSTO1='left$([F:STO1]STA,1)="A"'
+                     WA=1
+      When 2       : WCRITSTO1='left$([F:STO1]STA,1)="Q"'
+                     WQ=1
+      When 3       : WCRITSTO1='(left$([F:STO1]STA,1)="A"|left$([F:STO1]STA,1)="Q")'
+                     WA=1 : WQ=1
+      When 4       : WCRITSTO1='left$([F:STO1]STA,1)="R"'
+                     WR=1
+      When 5       : WCRITSTO1='(left$([F:STO1]STA,1)="A"|left$([F:STO1]STA,1)="R")'
+                     WA=1 : WR=1
+      When 6       : WCRITSTO1='(left$([F:STO1]STA,1)="Q"|left$([F:STO1]STA,1)="R")'
+                     WQ=1 : WR=1
+      When 7       : WCRITSTO1='1=1'
+                     WA=1 : WQ=1 : WR=1
+      When Default : WCRITSTO1='left$([F:STO1]STA,1)="A"'
+                     WA=1 : WAQR=1
+   Endcase
+Endif
+
+# Pas de demande d'analyse
+If [M:ALP]PECQLYCTL<>2
+   If WCRITSTO1<>""
+      WCRITSTO1 = "("+WCRITSTO1+")"
+   Endif
+   WCRITSTO1 += '&[F:STO1]QLYCTLDEM=""'
+Endif
+
+#-----------------------------------------------------------------------
+# Filtre sur les unités pour restreindre les lignes de stocks éligibles
+#-----------------------------------------------------------------------
+Raz WUDO, WUDE, WUDI, WUDS
+Raz WUCO, WUCE, WUCI, WUCS
+WUD=1 : WUS=1 : WUC=1
+
+If WTRUCOD=""
+   # Si pas de règle d'allocation --> toutes les unités sans contrainte de coef
+   WUS=2 : WUDO=1 : WUCO=1
+Else
+   # Unités autorisées par les règles d'allocation
+   For I=0 To dim([F:TRU]DOCFLT)-1
+      If [F:TRU]STUFLT(I)=2 WUS=2 Endif             : # US
+      Case [F:TRU]COEFLT(I)
+       When 1  : If [F:TRU]DOCFLT(I)=2 WUDO=1 Endif : # UD sans contrainte
+                 If [F:TRU]PCUFLT(I)=2 WUCO=1 Endif : # UC sans contrainte
+       When 2  : If [F:TRU]DOCFLT(I)=2 WUDE=1 Endif : # UD coef =
+                 If [F:TRU]PCUFLT(I)=2 WUCE=1 Endif : # UC coef =
+       When 3  : If [F:TRU]DOCFLT(I)=2 WUDI=1 Endif : # UD coef <=
+                 If [F:TRU]PCUFLT(I)=2 WUCI=1 Endif : # UC coef <=
+       When 4  : If [F:TRU]DOCFLT(I)=2 WUDS=1 Endif : # UD coef >=
+                 If [F:TRU]PCUFLT(I)=2 WUCS=1 Endif : # UC coef >=
+      Endcase
+   Next I
+Endif
+
+# Valeur de WUD et WUC (Unité document et unités conditionnement)
+#    1 : non
+#    2 : oui sans contrainte
+#    3 : oui coef =
+#    4 : oui coef <=
+#    5 : oui coef >=
+WUD=1
+If WUDO=1
+   WUD=2
+   Raz WUDE,WUDI,WUDS
+Elsif WUDI=1 & WUDS=1
+   WUD=2
+   Raz WUDE,WUDI,WUDS
+Elsif WUDI=1
+   WUD=4
+   Raz WUDE
+Elsif WUDS=1
+   WUD=5
+   Raz WUDE
+Elsif WUDE=1
+   WUD=3
+Endif
+
+WUC=1
+If WUCO=1
+   WUC=2
+   Raz WUCE,WUCI,WUCS
+Elsif WUCI=1 & WUCS=1
+   WUC=2
+   Raz WUCE,WUCI,WUCS
+Elsif WUCI=1
+   WUC=4
+   Raz WUCE
+Elsif WUCS=1
+   WUC=5
+   Raz WUCE
+Elsif WUCE=1
+   WUC=3
+Endif
+
+# Constitution du filtre unité/coef selon US,UD et UC ainsi que le filtre coef
+If WUS=2
+   # Si US à oui
+   Case WUC
+    When 1: WCRITSTO2='[F:STO1]PCU=[M]STU'                                                            :# US
+    When 2: WCRITSTO2='1=1'                                                                           :# Toutes les unités
+    When 3: WCRITSTO2='[F:STO1]PCU=[M]STU|([F:STO1]PCU<>[M]STU&[F:STO1]PCUSTUCOE =[M]PCUSTUCOE)'      :# US ou UC Coef =
+    When 4: WCRITSTO2='[F:STO1]PCU=[M]STU|([F:STO1]PCU<>[M]STU&[F:STO1]PCUSTUCOE<=[M]PCUSTUCOE)'      :# US ou UC Coef<=
+    When 5: WCRITSTO2='[F:STO1]PCU=[M]STU|([F:STO1]PCU<>[M]STU&[F:STO1]PCUSTUCOE>=[M]PCUSTUCOE)'      :# US ou UC Coef>=
+   Endcase
+Else
+   # Si US à non
+   Case WUC
+    When 1: WCRITSTO2='[F:STO1]STOCOU=0'                                                              :# Rien
+    When 2: WCRITSTO2='([F:STO1]PCU<>[M]STU&[F:STO1]PCU<>[F:ITM]STU)'                                 :# Toutes les UC
+    When 3: WCRITSTO2='([F:STO1]PCU<>[M]STU&[F:STO1]PCU<>[F:ITM]STU&[F:STO1]PCUSTUCOE =[M]PCUSTUCOE)' :# UC Coef =
+    When 4: WCRITSTO2='([F:STO1]PCU<>[M]STU&[F:STO1]PCU<>[F:ITM]STU&[F:STO1]PCUSTUCOE<=[M]PCUSTUCOE)' :# UC Coef<=
+    When 5: WCRITSTO2='([F:STO1]PCU<>[M]STU&[F:STO1]PCU<>[F:ITM]STU&[F:STO1]PCUSTUCOE>=[M]PCUSTUCOE)' :# UC Coef>=
+   Endcase
+Endif
+# Rajout des contrainte sur l'UD
+Case WUD
+ When 2: WCRITSTO2+='|[F:STO1]PCU=[M]PCU'                                                             :# Ou UD
+ When 3: WCRITSTO2+='|([F:STO1]PCU=[M]PCU&[F:STO1]PCUSTUCOE =[M]PCUSTUCOE)'                           :# Ou UD Coef =
+ When 4: WCRITSTO2+='|([F:STO1]PCU=[M]PCU&[F:STO1]PCUSTUCOE<=[M]PCUSTUCOE)'                           :# Ou UD Coef<=
+ When 5: WCRITSTO2+='|([F:STO1]PCU=[M]PCU&[F:STO1]PCUSTUCOE>=[M]PCUSTUCOE)'                           :# Ou UD Coef>=
+Endcase
+
+# Exploitation du filtre sur le propriétaire
+If [M:ALP]PECOWNER=""
+   WCRITSTO2+='&[F:STO1]OWNER=[F:STO1]STOFCY'
+Else
+   WCRITSTO2+='&find([F:STO1]OWNER,[F:STO1]STOFCY,[M:ALP]PECOWNER)'
+Endif
+
+#-----------------------------------------------------------------------------
+# Filtre sur les emplacements pour restreindre les lignes de stocks éligibles
+# WCRITSTO3 contient les emplacements exclusifs
+#-----------------------------------------------------------------------------
+
+Raz WDEFLOC, WDEFLOC2, WDEFLOC3, WSHTLOC
+Raz WDEFLOCTYP, WDEFLOCTYP2, WDEFLOCTYP3, WSHTLOCTYP
+Raz WSHTWRH
+# Catégorie emplacement à prendre en compte
+If [M:ALP]PECINTLOC=2
+   If [M:ALP]PECPLFLOC=2
+      If [M:ALP]PECSCOLOC=2
+         WCRIT = 'find([F:STO1]LOCCAT,1,2,4)<>0'
+      Else
+         WCRIT = 'find([F:STO1]LOCCAT,1,2)<>0'
+      Endif
+   Elsif [M:ALP]PECSCOLOC=2
+      WCRIT = 'find([F:STO1]LOCCAT,1,4)<>0'
+   Else
+      WCRIT = '[F:STO1]LOCCAT=1'
+   Endif
+Elsif [M:ALP]PECPLFLOC=2
+   If [M:ALP]PECSCOLOC=2
+      WCRIT = 'find([F:STO1]LOCCAT,2,4)<>0'
+   Else
+      WCRIT = '[F:STO1]LOCCAT=2'
+   Endif
+Elsif [M:ALP]PECSCOLOC=2
+   WCRIT = '[F:STO1]LOCCAT=4'
+Else
+   # Pour ne rien avoir (paramétrage incohérent)
+   WCRIT = '[F:STO1]LOCCAT=9'
+Endif
+
+# Si emplacement renseigné dans filtre allocation
+If !find([M:ALP]LOC,"","*")
+   [M:ALP]LOC=vireblc([M:ALP]LOC,1)
+   WCRITSTO3+='&(pat([F:STO1]LOC,[M:ALP]LOC)<>0'
+   Raz [M:ALP]LOCTYP
+Elsif !find([M:ALP]LOCTYP,"","*")
+   [M:ALP]LOCTYP=vireblc([M:ALP]LOCTYP,1)
+   WCRITSTO3+='&(pat([F:STO1]LOCTYP,[M:ALP]LOCTYP)<>0'
+   Raz [M:ALP]LOC
+Else
+   Raz [M:ALP]LOC,[M:ALP]LOCTYP
+Endif
+
+# Récupération types emplacement ou emplacement par défaut
+# de l'article-site pour le type mouvement
+Gosub ALI_DEFLOC
+
+# Si règle d'allocations
+If WTRUCOD<>""
+   # Détermination du nombre de ligne de la règle
+   I = find(0,[F:TRU]LOCFLT(0..dim([F:TRU]LOCFLT)-1))
+   If I=0
+      WNBL = dim([F:TRU]LOCFLT)
+   Else
+      WNBL = I-1
+   Endif
+   If min([F:TRU]LOCFLT(0..WNBL-1))>1
+      # Si OF / EO ou sortie OF / EO et emplacement poste de charge, on le rajoute
+      If find([M:ALP]VCRTYP,10,36) | find([M:ALP]TRSTYP,6,29)
+         #--- Issue 102809 by TS
+         #If [M:ALP]STOLOC<>""
+         If [M:ALP]STOLOC<>"" & find(2,[F:TRU]LOCFLT(0..WNBL-1))
+         #---
+            If WCRITSTO3<>""
+               WCRITSTO3+="|"
+            Else
+               WCRITSTO3+="&("
+            Endif
+            #--- Issue 103189
+            #WCRITSTO3+='pat([F:STO1]LOC,[M:ALP]STOLOC)'
+            WCRITSTO3+='pat([F:STO1]LOC,[M:ALP]STOLOC)<>0'
+            #---
+            # Si emp local exclusif et sans joker on le stocke pour les ruptures
+            If max([F:TRU]LOCFLT)=2
+&            & !instr(1,[M:ALP]STOLOC,'*') & !instr(1,[M:ALP]STOLOC,'?')
+&            & !instr(1,[M:ALP]STOLOC,'!') & !instr(1,[M:ALP]STOLOC,'#')
+               WSHTLOC=[M:ALP]STOLOC
+            Endif
+            #--- Issue 102809 by TS
+            # Seul l'emplacement local est dans les règles --> c'est fini.
+            #If min([F:TRU]LOCFLT)=2 Return Endif
+            #---
+         Endif
+         # Si pas d'emplacement poste de charge, on le force à tous
+         If [M:ALP]STOLOC="" [M:ALP]STOLOC="*" Endif
+         #--- Issue 102809 by TS
+         # Seul l'emplacement local est dans les règles --> c'est fini.
+         If max([F:TRU]LOCFLT)=2
+            Goto FILTRE_STOCK_SUI
+         Endif
+         #---
+      Endif
+
+      # 'Emplacement1': renseigné ds la règle de gestion et présent ds la règle d'alloc
+      If WDEFLOC<>"" & WDEFLOCTYP<>"" & find(3,[F:TRU]LOCFLT(0..WNBL-1))
+         If WCRITSTO3<>""
+            WCRITSTO3+="|"
+         Else
+            WCRITSTO3+="&("
+         Endif
+         If WDEFLOC="*" & WDEFLOCTYP="*"
+            WCRITSTO3+='pat([F:STO1]LOC,WDEFLOC)'
+         Elsif WDEFLOC<>"*"
+            WCRITSTO3+='pat([F:STO1]LOC,WDEFLOC)'
+         Else
+            WCRITSTO3+='pat([F:STO1]LOCTYP,WDEFLOCTYP)'
+         Endif
+      Endif
+      # 'Emplacement2': renseigné ds la règle de gestion et présent ds la règle d'alloc
+      If WDEFLOC2<>"" & WDEFLOCTYP2<>"" & find(4,[F:TRU]LOCFLT(0..WNBL-1))
+         If WCRITSTO3<>""
+            WCRITSTO3+="|"
+         Else
+            WCRITSTO3+="&("
+         Endif
+         If WDEFLOC2="*" & WDEFLOCTYP2="*"
+            WCRITSTO3+='pat([F:STO1]LOC,WDEFLOC2)'
+         #--- Bug 70911
+         #Elsif WDEFLOC<>"*"
+         Elsif WDEFLOC2<>"*"
+         #---
+            WCRITSTO3+='pat([F:STO1]LOC,WDEFLOC2)'
+         Else
+            WCRITSTO3+='pat([F:STO1]LOCTYP,WDEFLOCTYP2)'
+         Endif
+      Endif
+      # 'Emplacement3': renseigné ds la règle de gestion et présent ds la règle d'alloc
+      If WDEFLOC3<>"" & WDEFLOCTYP3<>"" & find(5,[F:TRU]LOCFLT(0..WNBL-1))
+         If WCRITSTO3<>""
+            WCRITSTO3+="|"
+         Else
+            WCRITSTO3+="&("
+         Endif
+         If WDEFLOC3="*" & WDEFLOCTYP3="*"
+            WCRITSTO3+='pat([F:STO1]LOC,WDEFLOC3)'
+         #--- Bug 70911
+         #Elsif WDEFLOC<>"*"
+         Elsif WDEFLOC3<>"*"
+         #---
+            WCRITSTO3+='pat([F:STO1]LOC,WDEFLOC3)'
+         Else
+            WCRITSTO3+='pat([F:STO1]LOCTYP,WDEFLOCTYP3)'
+         Endif
+      Endif
+
+      # Alimentation (type) emplacement de rupture si nécessaire
+      If WSHTLOC=""
+         # I,J et K contiennent la 1ère position des catégories emp 1,2 et 3
+         # dans le tableau des règles d'allocation (0 si absent)
+         I = find(3,[F:TRU]LOCFLT(0..WNBL-1))
+         J = find(4,[F:TRU]LOCFLT(0..WNBL-1))
+         K = find(5,[F:TRU]LOCFLT(0..WNBL-1))
+         # WE1,WE2 et WE3 contiennent 1 si emp par défaut 1,2 et 3
+         Raz WE1, WE2, WE3
+         If WDEFLOC <>"" & !instr(1,WDEFLOC,'*')  & !instr(1,WDEFLOC,'?')
+&                        & !instr(1,WDEFLOC,'!')  & !instr(1,WDEFLOC,'#')
+            WE1=1
+         Endif
+         If WDEFLOC2<>"" & !instr(1,WDEFLOC2,'*') & !instr(1,WDEFLOC2,'?')
+&                        & !instr(1,WDEFLOC2,'!') & !instr(1,WDEFLOC2,'#')
+            WE2=1
+         Endif
+         If WDEFLOC3<>"" & !instr(1,WDEFLOC3,'*') & !instr(1,WDEFLOC3,'?')
+&                        & !instr(1,WDEFLOC3,'!') & !instr(1,WDEFLOC3,'#')
+            WE3=1
+         Endif
+         # WT1,WT2 et WT3 contiennent 1 si type emp par défaut 1,2 et 3
+         Raz WT1, WT2, WT3
+         If WDEFLOCTYP <>"" & !instr(1,WDEFLOCTYP,'*') &!instr(1,WDEFLOCTYP,'?')
+&                           & !instr(1,WDEFLOCTYP,'!') &!instr(1,WDEFLOCTYP,'#')
+            WT1=1
+         Endif
+         If WDEFLOCTYP2<>"" & !instr(1,WDEFLOCTYP2,'*')&!instr(1,WDEFLOCTYP2,'?')
+&                           & !instr(1,WDEFLOCTYP2,'!')&!instr(1,WDEFLOCTYP2,'#')
+            WT2=1
+         Endif
+         If WDEFLOCTYP3<>"" & !instr(1,WDEFLOCTYP3,'*')&!instr(1,WDEFLOCTYP3,'?')
+&                           & !instr(1,WDEFLOCTYP3,'!')&!instr(1,WDEFLOCTYP3,'#')
+            WT3=1
+         Endif
+         # WLOCFLT contient la valeur max des catégories d'emplacement (3,4 ou 5)
+         WLOCFLT = max([F:TRU]LOCFLT)
+
+         #--- Issue 102809 by TS
+         # Si emplacement local paramétré dans la règle et OF / EO ou sortie OF / EO
+         # on a déjà traité le type et l'emplacement de rupture
+         If min([F:TRU]LOCFLT(0..WNBL-1))=2 & (find([M:ALP]VCRTYP,10,36) | find([M:ALP]TRSTYP,6,29))
+            Goto FILTRE_STOCK_SUI
+         Endif
+         #---
+
+         # Exploitation des règles d'allocation pour déterminer
+         # le type ou l'emplacement de rupture
+         Gosub ALI_LOCATION
+
+      Endif
+
+   # Si on a au moins une fois 'pas de filtre'
+   Else
+      Raz WCRITSTO3
+   Endif
+# Si pas de règle d'allocation
+Else
+   Raz WCRITSTO3
+Endif
+
+#--- Issue 102809 by TS
+$FILTRE_STOCK_SUI
+
+# Constitution finale du filtre emplacement
+If WCRITSTO3=""
+   WCRITSTO3=WCRIT
+Else
+   WCRITSTO3=WCRIT+WCRITSTO3+')'
+Endif
+Raz WCRIT
+
+If [M:ALP]PECCUNLOK<>2
+   WCRITSTO3+='&[F:STO1]CUNLOKFLG<>2'
+Endif
+# Filtre sur dépôt ligne document
+If GWRHACT=2
+   If [M:ALP]WRH<>""
+      WCRITSTO3+='&[F:STO1]WRH=[M:ALP]WRH'
+      # Alimentation dépôt rupture
+      WSHTWRH=[M:ALP]WRH
+   # Filtre sur dépôt article-site si exclusif
+   Else
+      LSST=0
+      # Sous-traitance
+      If (find([M:ALP]VCRTYP,10,12) & [M:ALP]PECSCOLOC=2)
+&       |(find([M:ALP]VCRTYP,3,4)   & [M:ALP]TRSTYP=20)
+&       |([M:ALP]VCRTYP=34          & [M:ALP]LOCCAT=4)
+          LSST=1
+      Endif
+      Call WRHAUTO([M:ALP]STOFCY,[M:ALP]ITMREF,[M:ALP]VCRTYP,LSST,LWRH)
+&          From STKWRH
+      If !find(LWRH,"","*")
+         WCRITSTO3+='&pat([F:STO1]WRH,LWRH)'
+         # Alimentation dépôt rupture si pas de joker
+         If !instr(1,LWRH,'*') & !instr(1,LWRH,'?')
+&         & !instr(1,LWRH,'!') & !instr(1,LWRH,'#')
+            WSHTWRH=LWRH
+         Endif
+      Endif
+   Endif
+Endif
+
+Return
+
+#-----------------------------------------------------------#
+# Récupération types emplacement ou emplacement par défaut  #
+# de l'article-dépôt ou article-site pour le type mouvement #
+#-----------------------------------------------------------#
+$ALI_DEFLOC
+
+Local Char WABR
+Raz I
+
+# Si gestion de dépôt et emplacements par défaut gérés sur article-dépôt
+If GWRHACT=2 & [F:ITW]LOCDEFFLG=2
+   WABR="[F:ITW]"
+# Sinon emplacements par défaut gérés sur article-site
+Else
+   WABR="[F:ITF]"
+Endif
+
+# Si emplacement 1 renseigné
+If [F:SRU]LOCNUM<>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      WDEFLOC    = evalue(WABR+"DEFLOC(I-1)")
+      WDEFLOCTYP = evalue(WABR+"DEFLOCTYP(I-1)")
+      If WDEFLOC="" WDEFLOC="*" Endif
+      If WDEFLOCTYP="" | WDEFLOC<>"*" WDEFLOCTYP="*" Endif
+   Else
+      WDEFLOC   ="*"
+      WDEFLOCTYP="*"
+   Endif
+Endif
+# Si emplacement 2 renseigné
+If [F:SRU]LOCNUM2<>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM2-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM2-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      WDEFLOC2    = evalue(WABR+"DEFLOC(I-1)")
+      WDEFLOCTYP2 = evalue(WABR+"DEFLOCTYP(I-1)")
+      If WDEFLOC2="" WDEFLOC2="*" Endif
+      If WDEFLOCTYP2="" | WDEFLOC2<>"*" WDEFLOCTYP2="*" Endif
+   Else
+      WDEFLOC2   ="*"
+      WDEFLOCTYP2="*"
+   Endif
+Endif
+# Si emplacement 3 renseigné
+If [F:SRU]LOCNUM3<>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM3-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM3-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      WDEFLOC3    = evalue(WABR+"DEFLOC(I-1)")
+      WDEFLOCTYP3 = evalue(WABR+"DEFLOCTYP(I-1)")
+      If WDEFLOC3="" WDEFLOC3="*" Endif
+      If WDEFLOCTYP3="" | WDEFLOC3<>"*" WDEFLOCTYP3="*" Endif
+   Else
+      WDEFLOC3   ="*"
+      WDEFLOCTYP3="*"
+   Endif
+Endif
+Return
+
+#--- Bug 82423
+#---------------------------------------------#
+# Exploitation des règles d'allocation pour   #
+# déterminer le (type) emplacement de rupture #
+#---------------------------------------------#
+$ALI_LOCATION
+
+# Pas de (type)emplacement rupture si un des couples type/emp vaut "*"
+If (I<>0 & WDEFLOC ='*' & WDEFLOCTYP ='*')
+& |(J<>0 & WDEFLOC2='*' & WDEFLOCTYP2='*')
+& |(K<>0 & WDEFLOC3='*' & WDEFLOCTYP3='*')
+   WSHTLOC   =""
+   WSHTLOCTYP=""
+   Return
+Endif
+
+# Si uniquement catègorie emp 1, stockage rupture
+If WLOCFLT=3
+   If WE1=1
+      WSHTLOC=WDEFLOC
+   Elsif WT1=1
+      WSHTLOCTYP=WDEFLOCTYP
+   Endif
+Elsif WLOCFLT=4
+   # Si uniquement catègorie emp 2, stockage rupture
+   If I=0
+      # Stockage dans (type) emplacement de rupture
+      If WE2=1
+         WSHTLOC=WDEFLOC2
+      Elsif WT2=1
+         WSHTLOCTYP=WDEFLOCTYP2
+      Endif
+   Endif
+Elsif WLOCFLT=5
+   # Si uniquement catègorie emp 3, stockage rupture
+   If I=0 & J=0
+      # Stockage dans (type) emplacement de rupture
+      If WE3=1
+         WSHTLOC=WDEFLOC3
+      Elsif WT3=1
+         WSHTLOCTYP=WDEFLOCTYP3
+      Endif
+   Endif
+Endif
+
+Return
+
+#---------------------------------------------#
+# Exploitation des règles d'allocation pour   #
+# déterminer le (type) emplacement de rupture #
+#---------------------------------------------#
+#$ALI_LOCATION
+## Pas de (type)emplacement rupture si un des couples type/emp vaut "*"
+##--- Bug 60306
+##If (WDEFLOC ='*' & WDEFLOCTYP ='*') |(WDEFLOC2='*' & WDEFLOCTYP2='*')
+##&                                   |(WDEFLOC3='*' & WDEFLOCTYP3='*')
+#If (I<>0 & WDEFLOC ='*' & WDEFLOCTYP ='*')
+#& |(J<>0 & WDEFLOC2='*' & WDEFLOCTYP2='*')
+#& |(K<>0 & WDEFLOC3='*' & WDEFLOCTYP3='*')
+##---
+#   WSHTLOC   =""
+#   WSHTLOCTYP=""
+#   Return
+#Endif
+## Si uniquement catègorie emp 1, stockage rupture
+#If WLOCFLT=3
+#   If WE1=1
+#      WSHTLOC=WDEFLOC
+#   Elsif WT1=1
+#      WSHTLOCTYP=WDEFLOCTYP
+#   Endif
+#Elsif WLOCFLT=4
+#   # Si uniquement catègorie emp 2, stockage rupture
+#   If I=0
+#      # Stockage dans (type) emplacement de rupture
+#      If WE2=1
+#         WSHTLOC=WDEFLOC2
+#      Elsif WT2=1
+#         WSHTLOCTYP=WDEFLOCTYP2
+#      Endif
+#   # Si catègorie emp 1 puis 2
+#   Elsif I<J
+#      Gosub E1_E2
+#   # Si catègorie emp 2 puis 1
+#   Else
+#      Gosub E2_E1
+#   Endif
+#Elsif WLOCFLT=5
+#   # Si uniquement catègorie emp 3, stockage rupture
+#   If I=0 & J=0
+#      # Stockage dans (type) emplacement de rupture
+#      If WE3=1
+#         WSHTLOC=WDEFLOC3
+#      Elsif WT3=1
+#         WSHTLOCTYP=WDEFLOCTYP3
+#      Endif
+#   # Si catègorie emp 1, 2 et 3
+#   Elsif I>0 & J>0
+#      Case min(I,J,K)
+#       When I : If J<K
+#                   Gosub E1_E2
+#                   If WSHTLOC="" & WSHTLOCTYP=""
+#                      If WE3=1
+#                         WSHTLOC=WDEFLOC3
+#                      Elsif WT3=1
+#                         WSHTLOCTYP=WDEFLOCTYP3
+#                      Endif
+#                   Endif
+#                Else
+#                   Gosub E1_E3
+#                   If WSHTLOC="" & WSHTLOCTYP=""
+#                      If WE2=1
+#                         WSHTLOC=WDEFLOC2
+#                      Elsif WT2=1
+#                         WSHTLOCTYP=WDEFLOCTYP2
+#                      Endif
+#                   Endif
+#                Endif
+#       When J : If I<K
+#                   Gosub E2_E1
+#                   If WSHTLOC="" & WSHTLOCTYP=""
+#                      If WE3=1
+#                         WSHTLOC=WDEFLOC3
+#                      Elsif WT3=1
+#                         WSHTLOCTYP=WDEFLOCTYP3
+#                      Endif
+#                   Endif
+#                Else
+#                   Gosub E2_E3
+#                   If WSHTLOC="" & WSHTLOCTYP=""
+#                      If WE1=1
+#                         WSHTLOC=WDEFLOC
+#                      Elsif WT1=1
+#                         WSHTLOCTYP=WDEFLOCTYP
+#                      Endif
+#                   Endif
+#                Endif
+#       When K : If I<J
+#                   Gosub E3_E1
+#                   If WSHTLOC="" & WSHTLOCTYP=""
+#                      If WE2=1
+#                         WSHTLOC=WDEFLOC2
+#                      Elsif WT2=1
+#                         WSHTLOCTYP=WDEFLOCTYP2
+#                      Endif
+#                   Endif
+#                Else
+#                   Gosub E3_E2
+#                   If WSHTLOC="" & WSHTLOCTYP=""
+#                      If WE1=1
+#                         WSHTLOC=WDEFLOC
+#                      Elsif WT1=1
+#                         WSHTLOCTYP=WDEFLOCTYP
+#                      Endif
+#                   Endif
+#                Endif
+#      Endcase
+#   # Si catègorie emp 1 et 3
+#   Elsif I>0
+#      # Si catègorie emp 1 puis 3
+#      If I<K
+#         Gosub E1_E3
+#      # Si catègorie emp 3 puis 1
+#      Else
+#         Gosub E3_E1
+#      Endif
+#   # Si catègorie emp 2 et 3
+#   Else
+#      # Si catègorie emp 2 puis 3
+#      If J<K
+#         Gosub E2_E3
+#      # Si catègorie emp 3 puis 2
+#      Else
+#         Gosub E3_E2
+#      Endif
+#   Endif
+#Endif
+#Return
+#---------------------------------------------#
+# Stockage dans (type) emplacement de rupture #
+#---------------------------------------------#
+#$E1_E2
+#If WE1=1
+#   WSHTLOC=WDEFLOC
+#Elsif WT1=1
+#   WSHTLOCTYP=WDEFLOCTYP
+#Elsif WE2=1
+#   WSHTLOC=WDEFLOC2
+#Elsif WT2=1
+#   WSHTLOCTYP=WDEFLOCTYP2
+#Endif
+#Return
+#$E1_E3
+#If WE1=1
+#   WSHTLOC=WDEFLOC
+#Elsif WT1=1
+#   WSHTLOCTYP=WDEFLOCTYP
+#Elsif WE3=1
+#   WSHTLOC=WDEFLOC3
+#Elsif WT3=1
+#   WSHTLOCTYP=WDEFLOCTYP3
+#Endif
+#Return
+#$E2_E1
+#If WE2=1
+#   WSHTLOC=WDEFLOC2
+#Elsif WT2=1
+#   WSHTLOCTYP=WDEFLOCTYP2
+#Elsif WE1=1
+#   WSHTLOC=WDEFLOC
+#Elsif WT1=1
+#   WSHTLOCTYP=WDEFLOCTYP
+#Endif
+#Return
+#$E2_E3
+#If WE2=1
+#   WSHTLOC=WDEFLOC2
+#Elsif WT2=1
+#   WSHTLOCTYP=WDEFLOCTYP2
+#Elsif WE3=1
+#   WSHTLOC=WDEFLOC3
+#Elsif WT3=1
+#   WSHTLOCTYP=WDEFLOCTYP3
+#Endif
+#Return
+#$E3_E1
+#If WE3=1
+#   WSHTLOC=WDEFLOC3
+#Elsif WT3=1
+#   WSHTLOCTYP=WDEFLOCTYP3
+#Elsif WE1=1
+#   WSHTLOC=WDEFLOC
+#Elsif WT1=1
+#   WSHTLOCTYP=WDEFLOCTYP
+#Endif
+#Return
+#$E3_E2
+#If WE3=1
+#   WSHTLOC=WDEFLOC3
+#Elsif WT3=1
+#   WSHTLOCTYP=WDEFLOCTYP3
+#Elsif WE2=1
+#   WSHTLOC=WDEFLOC2
+#Elsif WT2=1
+#   WSHTLOCTYP=WDEFLOCTYP2
+#Endif
+#Return
+#--- Bug 82423 end
+
+#-----------------------------------------------------------#
+# Sélection des lots dans l'ordre de déstockage             #
+#-----------------------------------------------------------#
+$LEC_LOT
+
+If [M:ALP]FILSTO="" [M:ALP]FILSTO='1=1' Endif
+
+#--- Issue 103189
+#Case [F:TRU]LOTMGT
+# When 1       : # Par lot
+#                Filter [STL1] Where evalue(WCRITLOT)
+#&                             Order By Key STL0
+# When 2       : # FIFO
+#                Filter [STL1] Where evalue(WCRITLOT)
+#&                             Order By Key STL1
+# When 3       : # FEFO
+#                Filter [STL1] Where evalue(WCRITLOT)
+#&                             Order By Key STL2
+# When 4       : # LIFO
+#                Filter [STL1] Where evalue(WCRITLOT)
+#&                             Order By Key STL1 Desc
+# When Default : # Pas de règle d'allocation --> FIFO
+#                Filter [STL1] Where evalue(WCRITLOT)
+#&                             Order By Key STL1
+#Endcase
+Case [F:TRU]LOTMGT
+ When 1       : # Par lot
+                Link [STL1] With [SLF1]SLF0=[F:STL1]ITMREF;[F:STL1]LOT;[F:STL1]SLO;[M:ALP]STOFCY
+&                           As [LNK1]
+&                           Where evalue(WCRITLOT)
+&                           Order By Key STL0
+ When 2       : # FIFO
+                Link [STL1] With [SLF1]SLF0=[F:STL1]ITMREF;[F:STL1]LOT;[F:STL1]SLO;[M:ALP]STOFCY
+&                           As [LNK1]
+&                           Where evalue(WCRITLOT)
+&                           Order By Key STL1
+ When 3       : # FEFO
+                Link [STL1] With [SLF1]SLF0=[F:STL1]ITMREF;[F:STL1]LOT;[F:STL1]SLO;[M:ALP]STOFCY
+&                           As [LNK1]
+&                           Where evalue(WCRITLOT)
+&                           Order By Key STL2
+ When 4       : # LIFO
+                Link [STL1] With [SLF1]SLF0=[F:STL1]ITMREF;[F:STL1]LOT;[F:STL1]SLO;[M:ALP]STOFCY
+&                           As [LNK1]
+&                           Where evalue(WCRITLOT)
+&                           Order By Key STL1 Desc
+ When Default :
+                Link [STL1] With [SLF1]SLF0=[F:STL1]ITMREF;[F:STL1]LOT;[F:STL1]SLO;[M:ALP]STOFCY
+&                           As [LNK1]
+&                           Where evalue(WCRITLOT)
+&                           Order By Key STL1
+Endcase
+#---
+
+# L'alimentation de WA,WQ et WR à été réalisé dans $FILTRE_STOCK
+
+Effzo [M:ALP]20
+Raz NOL, [M:ALP]NBLIG
+WINCLOT=1000
+WSVGLOT=""
+
+#--- Issue 103189
+# Lecture des lots non nuls et non périmés
+#For [STL1] Hint Key STL0
+#   Read [SLF1]SLF0=[F:STL1]ITMREF;[F:STL1]LOT;[F:STL1]SLO;[M:ALP]STOFCY
+#   If !fstat & sum(WA*[F:SLF1]AAACUMQTY,WQ*[F:SLF1]QQQCUMQTY,WR*[F:SLF1]RRRCUMQTY)>0
+For [LNK1]
+#---
+   # Si mono-lot
+   If WTRUCOD<>"" & [F:TRU]UNTLOT=2 & [F:ITM]LOTMGTCOD>=2
+      # Si rupture lot
+      If [F:STL1]LOT<>WSVGLOT
+         WINCLOT += 1
+         WSVGLOT  = [F:STL1]LOT
+      Endif
+   Endif
+   Gosub LEC_STOCK
+   #--- Issue 103189
+   #Endif
+   If NOL>ACTSLS Break Endif
+Next
+#--- Issue 103189
+#Filter [STL1]
+
+[M:ALP]NBLIG = NOL
+
+Return
+
+#-----------------------------------------------------------#
+# Lecture des lignes stock selon les règles d'allocation    #
+# pour chargement de celles-ci en tableau                   #
+#-----------------------------------------------------------#
+$LEC_STOCK
+
+GPE=0
+GPOINT="SORTSTO"
+Gosub ENTREE From EXEFNC
+If GPE<>0 Return Endif
+
+# Si article géré en série E/S, classement FIFO ou LIFO des no série
+If [F:ITM]SERMGTCOD=3
+#--- Bug 62574
+#   Case [F:TRU]LOTMGT
+#    When 1,3    : # Par no série
+#                  Filter [STO1] Where ITMREF=[M:ALP]ITMREF & STOFCY=[M:ALP]STOFCY
+#&                      & LOT=[F:STL1]LOT & SLO=[F:STL1]SLO
+#&                      & evalue(WCRITSTO1) & evalue(WCRITSTO2) & evalue(WCRITSTO3)
+#&                      & evalue([M:ALP]FILSTO)
+#&                               Order By SERNUM
+#    When 4      : # LIFO
+#                  Filter [STO1] Where ITMREF=[M:ALP]ITMREF & STOFCY=[M:ALP]STOFCY
+#&                      & LOT=[F:STL1]LOT & SLO=[F:STL1]SLO
+#&                      & evalue(WCRITSTO1) & evalue(WCRITSTO2) & evalue(WCRITSTO3)
+#&                      & evalue([M:ALP]FILSTO)
+#&                               Order By RCPDAT Desc;SERNUM Desc
+#    When Default: # FIFO
+#                  Filter [STO1] Where ITMREF=[M:ALP]ITMREF & STOFCY=[M:ALP]STOFCY
+#&                      & LOT=[F:STL1]LOT & SLO=[F:STL1]SLO
+#&                      & evalue(WCRITSTO1) & evalue(WCRITSTO2) & evalue(WCRITSTO3)
+#&                      & evalue([M:ALP]FILSTO)
+#&                               Order By RCPDAT;SERNUM
+#   Endcase
+#   For [STO1] Hint Key STO3
+#      # Chargement de la ligne de stock
+#      Gosub TRAITE_STOCK
+#      If WRET=1
+#         Goto LEC_STOCK_SUI2
+#      Elsif WRET=2
+#         Break
+#      Endif
+#      $LEC_STOCK_SUI2
+#   Next
+#   Filter [STO1]
+   Case [F:TRU]LOTMGT
+    When 1,3    : # Par no série
+                  Link [STO1] With [STS]STS0=ITMREF;SERNUM
+&                              As   [STOL]
+&                              Order By Key CLE=[F:STS]SERNUM
+    When 4      : # LIFO
+                  Link [STO1] With [STS]STS0=ITMREF;SERNUM
+&                              As   [STOL]
+&                              Order By Key CLE=[F:STS]RCPDAT Desc;[F:STS]SERNUM Desc
+    When Default: # FIFO
+                  Link [STO1] With [STS]STS0=ITMREF;SERNUM
+&                              As   [STOL]
+&                              Order By Key CLE=[F:STS]RCPDAT;[F:STS]SERNUM
+   Endcase
+   Filter [STOL] Where ITMREF=[M:ALP]ITMREF & STOFCY=[M:ALP]STOFCY
+&                    & LOT=[F:STL1]LOT & SLO=[F:STL1]SLO
+&                    & evalue(WCRITSTO1) & evalue(WCRITSTO2) & evalue(WCRITSTO3)
+&                    & evalue([M:ALP]FILSTO)
+   For [STOL] Hint Key STO3
+      # Chargement de la ligne de stock
+      Gosub TRAITE_STOCK
+      If WRET=1
+         Goto LEC_STOCK_SUI2
+      Elsif WRET=2
+         Break
+      Endif
+      $LEC_STOCK_SUI2
+   Next
+   Filter [STOL]
+   #--- Fin bug 62574
+Else
+   Case [F:TRU]LOTMGT
+    When 4      : # LIFO
+                  Filter [STO1] Where ITMREF=[M:ALP]ITMREF & STOFCY=[M:ALP]STOFCY
+&                      & LOT=[F:STL1]LOT & SLO=[F:STL1]SLO
+&                      & evalue(WCRITSTO1) & evalue(WCRITSTO2) & evalue(WCRITSTO3)
+&                      & evalue([M:ALP]FILSTO)
+&                               Order By LOC Desc; STOCOU Desc
+    When Default: # FIFO
+                  Filter [STO1] Where ITMREF=[M:ALP]ITMREF & STOFCY=[M:ALP]STOFCY
+&                      & LOT=[F:STL1]LOT & SLO=[F:STL1]SLO
+&                      & evalue(WCRITSTO1) & evalue(WCRITSTO2) & evalue(WCRITSTO3)
+&                      & evalue([M:ALP]FILSTO)
+&                               Order By LOC; STOCOU
+   Endcase
+
+   For [STO1] Hint Key STO3
+      # Chargement de la ligne de stock
+      Gosub TRAITE_STOCK
+      If WRET=1
+         Goto LEC_STOCK_SUI
+      Elsif WRET=2
+         Break
+      Endif
+      $LEC_STOCK_SUI
+   Next
+   Filter [STO1]
+Endif
+
+Return
+
+#-----------------------------------------------------------#
+# Traitement des lignes stock (vérification, chargement)    #
+#-----------------------------------------------------------#
+
+$TRAITE_STOCK
+Raz WRET
+# Si emplacement attente rangement et document effectuant des sorties
+# la ligne de stock en attente de rangement doit être complète
+If [F:STO1]LOCCAT=2 & !find([M:ALP]VCRTYP,2,10,36)
+   Call CTLPLFLOC([F:STO1]ITMREF,"[F:STO1]",WRET) From STKSOR
+   If WRET<>0
+      WRET=1 : Return
+   Endif
+Endif
+# Si réapprovisionnement des zones de consommation, il faut exclure
+# les lignes de stock qui sont dans des emplacements réapprovisionnnables
+If [M:ALP]TRSTYP=25 & [F:STO1]LOC<>""
+   Read [STC]STC0=[M:ALP]STOFCY;[F:STO1]LOC
+   If !fstat & [F:STC]REAFLG=2
+      #--- Bug 64939
+      #WRET=1 : Return
+      GPE = 0
+      GPOINT="ALLREA" : Gosub ENTREE From EXEFNC
+      If GPE=0 WRET=1 : Return Endif
+      #---
+   Endif
+Endif
+# Si réappro des zones de consommation, contrôle
+# des sous-statuts autorisés sur l'emplacement
+If [M:ALP]VCRTYP=34 & !find([M:ALP]AUZSST,"","*")
+   Local Char WFORSTA(200), WCRITSTOF(240)
+   # Construction de la formule :
+   Call DECODE_STAT([M:ALP]AUZSST,WFORSTA) From TRTCATEG
+   Call CREE_FORMULE(WFORSTA,"[F:STO1]STA",WCRITSTOF) From TRTCATEG
+   If !evalue(WCRITSTOF)
+      WRET=1 : Return
+   Endif
+Endif
+# Disponible sur la ligne de stock
+Call STODISSOR("[F:STO1]","[F:ITM]","",WPCUDIS,WSTUDIS,WSTUACTDIS) From STKLIB
+If WSTUDIS > 0
+   # Test si tableau plein
+   If ACTSLS=0 | NOL>=ACTSLS-1
+      LFULLTAB = 1
+      WRET=2 : Return
+   Endif
+   # Chargement ligne de stock en tableau
+   Gosub CHARGE_STOCK
+Endif
+Return
+
+#-----------------------------------------------------------#
+# Chargement des lignes stock dans le tableau               #
+#-----------------------------------------------------------#
+$CHARGE_STOCK
+
+# Pas d'alimentation de WQTYSTU et WQTYSTUACT
+# ces zones contiendront les quantités à allouer ou sortir
+
+[M:ALP]WINCLOT(NOL)    = num$([L]WINCLOT)
+[M:ALP]WLOTCREDAT(NOL) = [F:STL1]LOTCREDAT
+[M:ALP]WSHLDAT(NOL)    = [F:STL1]SHLDAT
+[M:ALP]WALLTYP(NOL)    = 2
+[M:ALP]WSTOCOU(NOL)    = [F:STO1]STOCOU
+[M:ALP]WLOT(NOL)       = [F:STO1]LOT
+[M:ALP]WSLO(NOL)       = [F:STO1]SLO
+[M:ALP]WSERNUM(NOL)    = [F:STO1]SERNUM
+[M:ALP]WSTA(NOL)       = [F:STO1]STA
+[M:ALP]WLOC(NOL)       = [F:STO1]LOC
+[M:ALP]WLOCTYP(NOL)    = [F:STO1]LOCTYP
+[M:ALP]WLOCCAT(NOL)    = [F:STO1]LOCCAT
+[M:ALP]WWRH(NOL)       = [F:STO1]WRH
+[M:ALP]WPCU(NOL)       = [F:STO1]PCU
+[M:ALP]WPCUSTUCOE(NOL) = [F:STO1]PCUSTUCOE
+[M:ALP]WQTYSTUAVA(NOL) = WSTUDIS
+[M:ALP]WQTYACTAVA(NOL) = WSTUACTDIS
+[M:ALP]WPOT(NOL)       = 1
+Case [F:ITF]STOMGTCOD
+ When 3 : If [F:STL1]POT<>0 [M:ALP]WPOT(NOL)=[F:STL1]POT Endif
+ When 4 : If [F:STL1]ACT<>0 [M:ALP]WPOT(NOL)=[F:STL1]ACT Endif
+Endcase
+If [M:ALP]PECOWNER<>"" & [F:STO1]OWNER=[M:ALP]PECOWNER
+   [M:ALP]WOWN(NOL)="1"
+Else
+   [M:ALP]WOWN(NOL)="2"
+Endif
+Raz [M:ALP]WQTYSTU(NOL)
+Raz [M:ALP]WQTYSTUACT(NOL)
+Raz [M:ALP]WCOND(NOL)
+Raz [M:ALP]WFLG(NOL)
+
+[M:ALP]NLIG(NOL)=NOL
+
+NOL += 1
+
+Return
+
+#--------------------------------------------------------------------------#
+# Traitement des lignes de stock éligibles pour déterminer les allocations #
+# ou sorties à réaliser, dans le cas où il n'y a pas de règle d'allocation #
+# Dans ce cas :                                                            #
+#    toutes les unités (UD puis autres unités) quelque soit le coef        #
+#    classement FIFO                                                       #
+#    si commande, OF ou EO, uniquement statut 'A'                          #
+#    sinon        tous les statuts (restreint par la règle de gestion)     #
+#--------------------------------------------------------------------------#
+$TRT_ALLOC
+
+If find([M:ALP]VCRTYP,2,10,36)
+   For I=0 To [M]NBLIG-1
+      [M]WCOND(I)=string$(left$([M]WSTA(I),1)='A'&[M]WPCU(I)=[M]PCU&pat([M]WLOC(I),[M]LOC),'1000A1'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='A'&[M]WPCU(I)=[M]PCU&[M]WCOND(I)='','1000A2'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='A'&pat([M]WLOC(I),[M]LOC)&[M]WCOND(I)='','1000B1'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='A'&[M]WCOND(I)='','1000B2'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +'9999Z'
+   Next I
+Else
+   For I=0 To [M]NBLIG-1
+      [M]WCOND(I)=string$(left$([M]WSTA(I),1)='A'&[M]WPCU(I)=[M]PCU&pat([M]WLOC(I),[M]LOC),'1000A1'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='A'&[M]WPCU(I)=[M]PCU&[M]WCOND(I)='','1000A2'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='A'&pat([M]WLOC(I),[M]LOC)&[M]WCOND(I)='','1000B1'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='A'&[M]WCOND(I)='','1000B2'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='Q'&[M]WPCU(I)=[M]PCU&pat([M]WLOC(I),[M]LOC)&[M]WCOND(I)='','1000C1'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='Q'&[M]WPCU(I)=[M]PCU&[M]WCOND(I)='','1000C2'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='Q'&pat([M]WLOC(I),[M]LOC)&[M]WCOND(I)='','1000D1'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='Q'&[M]WCOND(I)='','1000D2'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='R'&[M]WPCU(I)=[M]PCU&pat([M]WLOC(I),[M]LOC)&[M]WCOND(I)='','1000E1'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='R'&[M]WPCU(I)=[M]PCU&[M]WCOND(I)='','1000E2'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='R'&pat([M]WLOC(I),[M]LOC)&[M]WCOND(I)='','1000F1'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +string$(left$([M]WSTA(I),1)='R'&[M]WCOND(I)='','1000F2'+format$('D:4YMMDD',[M]WLOTCREDAT(I)))
+&                +'9999Z'
+   Next I
+Endif
+
+# Tri du tableau sur deux colonnes seulement pour raisons de performance
+Sorta [M]NBLIG [M]WCOND,[M]NLIG
+[M]NBLIG=sigma(0,[M]NBLIG-1,[M]WCOND(indcum)<'9999Z')
+
+# Si gestion dépôt et dépôt préférentiel renseigné
+If GWRHACT=2 & !find(LWRH,"","*")
+   For I=0 To [M]NBLIG-1
+      If pat([M]WWRH(I),LWRH)
+         [M]WCOND(I)="1"+[M]WCOND(I)
+      Else
+         [M]WCOND(I)="9"+[M]WCOND(I)
+      Endif
+   Next I
+Endif
+
+# Si propriétaire
+If [M]PECOWNER<>""
+   For I=0 To [M]NBLIG-1
+      If [M]WCOND(I)="9999Z"
+         [M]WCOND(I)="9"+[M]WCOND(I)
+      Else
+         [M]WCOND(I)=[M]WOWN(I)+[M]WCOND(I)
+      Endif
+   Next I
+Endif
+
+Return
+
+########################################################################
+# GENSTOALL     Allocation d'une ligne document
+#               écriture alloc dans STOALL après algorithme STOCKALG
+########################################################################
+# Prérequis   : Buffer article en ligne : [F:ITM]
+#
+########################################################################
+# Paramètre E : LMAJ=Code MAJ           "C" = Mise à jour
+#                                        "" = Simulation
+#               LMOD=Mode allocation      1 = Globale
+#                                         2 = Détaillée
+#               LRUP=Génération ruptures  0 = Non
+#                                         1 = Oui
+#               LTRT=Alloc partielle      0 = Alloc partielle autorisée
+#                                         1 = Alloc partielle interdite
+#           S : LRET=Code retour          0 = OK
+#                                         1 = Erreur
+#                                         2 = Alloc totale impossible
+#
+########################################################################
+# Entrée      : Ecran ALLPAR [ALP] (Bloc 1)
+#               [M:ALP]TRSTYP    = Type mouvement (M.704)
+#                                  mettre  0 si OF
+#                                  mettre 17 si commande de prêt
+#                                          4 pour les autres commandes
+#               [M:ALP]TRSCOD    = Code mouvement
+#               [M:ALP]VCRTYP    = Type pièce (M.701)
+#               [M:ALP]VCRNUM    = Numéro pièce
+#               [M:ALP]VCRLIN    = Numéro ligne pièce
+#               [M:ALP]VCRSEQ    = Numéro séquence pièce
+#               [M:ALP]STOFCY    = Site stock
+#               [M:ALP]ITMREF    = Article
+#               [M:ALP]PCU       = Unité conditionnement
+#               [M:ALP]PCUSTUCOE = Coefficient UC/US
+#               [M:ALP]QTY       = Quantité
+#               [M:ALP]TYPQTY    = Type de quantité : 1=US/2=UA (M.720)
+#                                  dans ce cas, mettre toujours 2
+#               [M:ALP]BESDAT    = Date besoin
+#               [M:ALP]DLVDAT    = Date livraison
+#               [M:ALP]ALLDAT    = Date fin réservation client
+#               [M:ALP]PECRER    = Consommation des réservations (M.1)
+#               [M:ALP]VCRRER    = Identifiant réservations pour consommation
+#                                  Si cde vente : client livré (formaté:15x+3x)
+#               [M:ALP]STOLOC    = Emplacement poste de charge
+#                                  à renseigner si OF, EO ou suivi matière
+#               [M:ALP]PECINTLOC = Prise en compte emp internes
+#                                  (si non alimenté est forcé à 2)
+#               [M:ALP]PECSCOLOC = Prise en compte emp sous-traitant
+#                                  mettre 2 si s-traitance (OF/EO/Suivi matière)
+#               [M:ALP]PECPLFLOC = Prise en compte emp attente rangement
+#               [M:ALP]PECCUNLOK = Prise en compte stock en cours d'inventaire
+#                                  mettre à 2 si allocation (commande ou OF)
+#               [M:ALP]PECQLYCTL = Prise en compte stock avec demande d'analyse
+#                                  mettre à 2 si allocation (commande ou OF)
+#               [M:ALP]PECOWNER  = Propriétaire du stock
+#                                  à renseigner si allocation du stock d'un tiers
+#                                  (suivi OF: opération s-trait (chez s-trait))
+#                                  (retour réception sous-traitance)
+#               [M:ALP]FILSTO    = Filtre sur les lignes de stock
+#                                  le filtre doit être exprimé avec [F:STO1]
+#               [M:ALP]LOT       = Filtre lot ligne document
+#               [M:ALP]LOC       = Filtre emplacement ligne document
+#               [M:ALP]STA       = Filtre statut ligne document
+#                                  sous la forme : "A1*,A20"
+#               [M:ALP]AUZSST    = S-statuts autorisés sur emplacement à réappro
+#                                  à renseigner si réappro zones de consommation
+#               [M:ALP]LOCCAT    = Catégorie emplacement à réapprovisionner
+#                                  à renseigner si réappro zones de consommation
+#               [M:ALP]BPRNUM    = Tiers
+#                                  à alimenter si
+#                                  - OF ou EO (allocation matière sous-traitance)
+#                                  - Commande pour DLU client
+#               [M:ALP]BPAADD    = Adresse de livraison
+#                                  à alimenter si
+#                                  - OF ou EO (allocation matière sous-traitance)
+#               [M:ALP]WRH       = Dépôt
+#               -------------------------------------------------------
+#               Si allocation d'une ligne (cde ou OF) déjà allouée en global
+#               et si l'on souhaite détaillé ce global, alimentation de
+#               cette quantité pour calcul correct du stock disponible
+#               [M:ALP]ALLQTY     = Quantité déjà allouée en global
+#               Attention à faire un Raz dans le cas contraire
+########################################################################
+# Sortie      : Ecran ALLPAR [ALP] (Bloc 3)
+#               [M:ALP]ALLQTY     = Quantité allouée UA (théorique si simulation)
+#               [M:ALP]ALLQTYSHT  = Quantité rupture UA (théorique si simulation)
+#               [M:ALP]PECRERQTY  = Quantité réservée consommée UA
+#
+########################################################################
+Subprog GENSTOALL(LMAJ,LMOD,LRUP,LTRT,LRET)
+Value    Char     LMAJ
+Value    Integer  LMOD
+Value    Integer  LRUP
+Value    Integer  LTRT
+Variable Integer  LRET
+
+Local    Integer  LFULLTAB
+Local    Integer  I, J, K, WALL, WLOC, WTYP, WPRE
+Local    Decimal  WSTUACTDIS, WALLQTY, WALLQTYSHT, WQTY
+Local    Decimal  SVGQTY, WSVGQTY
+Local    Integer  WSTA, WA, WQ, WR
+Local    Char     WNUM
+Local    Char     WTRUCOD(GLONTRU)
+Local    Char     LDEFLOC(GLONLOC)
+Local    Char     LDEFLOCTYP(GLONTLO)
+Local    Char     LWRH(GLONWRH)       : # Dépôt
+Local    Integer  LSST                : # Sous-traitance 0/1
+
+If clalev([F:ITG]) =0  Local File ITMCATEG   [ITG]   Endif
+If clalev([F:ITF]) =0  Local File ITMFACILIT [ITF]   Endif
+If clalev([F:ITV]) =0  Local File ITMMVT     [ITV]   Endif
+If clalev([F:TRU]) =0  Local File TABALLRUL  [TRU]   Endif
+If clalev([F:SRU]) =0  Local File TABSTORUL  [SRU]   Endif
+If GWRHACT=2
+   If clalev([F:ITW]) =0  Local File ITMWRH    [ITW] Endif
+   If clalev([F:WRH]) =0  Local File WAREHOUSE [WRH] Endif
+Endif
+
+Raz LRET, WTYP
+
+#--- Dem 83547
+GPOINT="MOD_ALLPAR" : Gosub ENTREE From EXEFNC
+
+# Appel à l'algorithme d'allocation
+Gosub APPEL_ALGO
+
+If LRET<>0 End Endif
+
+# Chargement de l'emplacement (type) de consommation (si exclusif)
+Raz LDEFLOC, LDEFLOCTYP
+If find([M:ALP]VCRTYP,2,10,36) & [F:ITF]LOCMGTCOD=2
+   # Si prêt
+   If [M:ALP]TRSTYP=17
+      WPRE=2
+   Else
+      WPRE=1
+   Endif
+   Call RECH_PICLOC([M:ALP]VCRTYP,[M:ALP]STOFCY,[M:ALP]ITMREF,[M:ALP]STOLOC,
+&                   "",[M:ALP]PECSCOLOC,WPRE,"N",LDEFLOC,LDEFLOCTYP)
+Endif
+
+#------------------------------------------------
+# Exploitation des résultats de l'algorithme
+# Pas de création des allocations si simulation
+#------------------------------------------------
+# Si allocation détaillée
+If LMOD=2
+   # Si allocation partielle interdite et qté disponible < qté à allouer
+   If LTRT=1 & sum([M:ALP]WQTYSTU(0..[M:ALP]NBLIG-1))<[M:ALP]QTY
+      LRET=2 : End
+   Endif
+
+   If [M:ALP]QTY<>0
+      For I=0 To [M:ALP]NBLIG-1
+         J=[M:ALP]NLIG(I)
+         Break ([M:ALP]WFLG(J)=0)
+         If [M:ALP]WQTYSTUACT(J)<>0
+            If LMAJ="C"
+               Call CREALL([M:ALP]WALLTYP(J),[M:ALP]STOFCY,[M:ALP]ITMREF,
+&                          [M:ALP]WSTOCOU(J),[M:ALP]ALLDAT,[M:ALP]WQTYSTU(J),
+&                          [M:ALP]WQTYSTUACT(J),[M:ALP]VCRTYP,[M:ALP]VCRNUM,
+&                          [M:ALP]VCRLIN,[M:ALP]VCRSEQ,"",[M:ALP]BESDAT,
+&                          "","","","","","",0,0,LDEFLOC,LDEFLOCTYP,
+&                          [M:ALP]BPRNUM,[M:ALP]BPAADD,[M:ALP]PECSCOLOC,LRET)
+               If LRET<>0
+                  Raz [M:ALP]ALLQTY, [M:ALP]ALLQTYSHT
+                  Break
+               Endif
+            Endif
+            WALLQTY += [M:ALP]WQTYSTUACT(J)
+         Endif
+      Next I
+      If LRET<>0 End Endif
+   Endif
+
+   # Restitution de la quantité à allouer
+   [M:ALP]QTY = SVGQTY
+   # Détermination de la quantité en rupture
+   WALLQTYSHT = [M:ALP]QTY - WALLQTY
+
+   # Allocations seules (pas de ruptures)
+   If LRUP<>1 WALLQTYSHT=0 Endif
+
+   # Création d'une allocation de rupture si nécessaire
+   If WALLQTYSHT>0
+      If LMAJ="C"
+         Call CREALL(4,[M:ALP]STOFCY,[M:ALP]ITMREF,0,[M:ALP]ALLDAT,
+&                    0,WALLQTYSHT,[M:ALP]VCRTYP,[M:ALP]VCRNUM,
+&                    [M:ALP]VCRLIN,[M:ALP]VCRSEQ,"",[M:ALP]BESDAT,
+&                    [M:ALP]LOT,"","",[M:ALP]LOC,"",[M:ALP]WRH,0,0,"","",
+&                    [M:ALP]BPRNUM,[M:ALP]BPAADD,[M:ALP]PECSCOLOC,LRET)
+         If LRET<>0
+            Raz [M:ALP]ALLQTY, [M:ALP]ALLQTYSHT
+            End
+         Endif
+      Endif
+   Endif
+
+   [M:ALP]ALLQTY    = WALLQTY
+   [M:ALP]ALLQTYSHT = WALLQTYSHT
+
+# Si allocation globale
+Else
+   # Allocations globales
+   If WALLQTY <> 0
+      If LMAJ="C"
+         Call CREALL(1,[M:ALP]STOFCY,[M:ALP]ITMREF,0,[M:ALP]ALLDAT,0,WALLQTY,
+&                    [M:ALP]VCRTYP,[M:ALP]VCRNUM,[M:ALP]VCRLIN,[M:ALP]VCRSEQ,
+&                    "",[M:ALP]BESDAT,"","","","","","",0,0,"","",
+&                    [M:ALP]BPRNUM,[M:ALP]BPAADD,[M:ALP]PECSCOLOC,LRET)
+         If LRET<>0 End Endif
+      Endif
+      [M:ALP]ALLQTY = WALLQTY
+   Endif
+   # Ruptures globales
+   If WALLQTYSHT <> 0
+      If LMAJ="C"
+         Call CREALL(5,[M:ALP]STOFCY,[M:ALP]ITMREF,0,[M:ALP]ALLDAT,0,WALLQTYSHT,
+&                    [M:ALP]VCRTYP,[M:ALP]VCRNUM,[M:ALP]VCRLIN,[M:ALP]VCRSEQ,
+&                    "",[M:ALP]BESDAT,"","","","","","",0,0,"","",
+&                    [M:ALP]BPRNUM,[M:ALP]BPAADD,[M:ALP]PECSCOLOC,LRET)
+         If LRET<>0 End Endif
+      Endif
+      [M:ALP]ALLQTYSHT = WALLQTYSHT
+   Endif
+Endif
+
+# Consommation des réservations client (production?)
+If LMAJ="C"
+   If [M:ALP]PECRER=2 & [M:ALP]ALLQTY<>0
+      Case [M:ALP]VCRTYP
+       When 2 : WTYP=1
+                # Réservation client livré
+                WNUM=[M:ALP]VCRRER
+                WQTY=[M:ALP]ALLQTY
+                Call CSOALL(WTYP,WNUM,[M:ALP]ITMREF,[M:ALP]STOFCY,[M:ALP]BESDAT,WQTY,LRET)
+                If LRET=1 End Endif
+                WSVGQTY=WQTY
+                If WQTY<[M:ALP]ALLQTY
+                   WQTY=[M:ALP]ALLQTY-WQTY
+                   # Réservation client
+                   WNUM=vireblc(left$([M:ALP]VCRRER,15), 1)
+                   Call CSOALL(WTYP,WNUM,[M:ALP]ITMREF,[M:ALP]STOFCY,[M:ALP]BESDAT,WQTY,LRET)
+                   If LRET=1 End Endif
+                   WSVGQTY+=WQTY
+                Endif
+                [M:ALP]PECRERQTY=WSVGQTY
+       When Default :
+      Endcase
+   Endif
+Endif
+
+# Toutes les stock n'ont pu être chargées (code activité SLS insuffisant)
+# Des lignes de stock n'ont peut être pas été traitées
+# ou des manquants ont pu être générés à tord
+If LFULLTAB=1 & [M:ALP]ALLQTY<[M:ALP]QTY
+   Call MESSAGE(mess(340,199,1)+"\"+mess(468,199,1)) From GESECRAN
+Endif
+
+End
+
+########################################################################
+# Appel à l'algorithme d'allocation depuis GENSTOALL
+########################################################################
+$APPEL_ALGO
+
+Local Integer WE1, WE2, WE3, WT1, WT2, WT3, WNBL, WLOCFLT
+Local Char    WSHTWRH(GLONWRH)    : # Dépôt obligatoire si rupture
+Local Char    WSHTLOC(GLONLOC)    : # Emplacement obligatoire si rupture
+Local Char    WSHTLOCTYP(GLONTLO) : # Type emplacement obligatoire si rupture
+Local Char    WDEFLOC(GLONLOC), WDEFLOC2(GLONLOC), WDEFLOC3(GLONLOC)
+Local Char    WDEFLOCTYP(GLONTLO), WDEFLOCTYP2(GLONTLO), WDEFLOCTYP3(GLONTLO)
+Local Integer WTRSTYP
+Local Decimal LRERQTY
+
+Raz WDEFLOC, WDEFLOC2, WDEFLOC3
+Raz WDEFLOCTYP, WDEFLOCTYP2, WDEFLOCTYP3
+Raz LRERQTY, WALLQTY, WALLQTYSHT
+Raz [M:ALP]ALLQTYSHT, [M:ALP]PECRERQTY
+
+# Lecture des tables article
+Call LECITM([M:ALP]STOFCY,[M:ALP]ITMREF,"",0,[M:ALP]WRH,LRET) From STKLIB
+If LRET<>0 : Raz [M:ALP]ALLQTY : GOK=0 : Return : Endif
+
+If LMAJ="C"
+   #--- Issue 103815
+   # Lecture avec blocage cumuls article-site
+   #Call LECITV([M:ALP]STOFCY,[M:ALP]ITMREF,"",LRET) From STKLIB
+   #Case LRET
+   # When 1     : Raz LRET  : # enreg inexistant, sera créé lors de sa maj
+   # When 2     : GOK=-1    : # enreg bloqué
+   #              GLOCK="$ITMMVT"-[M:ALP]STOFCY-[M:ALP]ITMREF
+   # When 3,4   : GOK=0     : # mauvais paramètres
+   #Endcase
+   #If LRET<>0 : Raz [M:ALP]ALLQTY : Return : Endif
+   Read [ITV]ITV0=[M:ALP]ITMREF;[M:ALP]STOFCY
+   If find(fstat,4,5)
+      Raz [F:ITV]
+      [F:ITV]ITMREF = [M:ALP]ITMREF
+      [F:ITV]STOFCY = [M:ALP]STOFCY
+      Call ECRITV From STKLIB
+      If fstat
+         GOK=0 : Call FSTA("ITV") From GLOCK
+         Raz [M:ALP]ALLQTY
+         Return
+      Endif
+   Endif
+   #---
+Endif
+
+# Récupération de la règle d'allocation
+Case [M:ALP]VCRTYP
+ When 2              : # Commande
+                       WTRUCOD = [F:ITG]ALLRULORD
+ When 3,4,5,8        : # Préparation/Livraison sous-traitance
+                       If [M:ALP]TRSTYP=20
+                          WTRUCOD = [F:ITG]ALLRULSCO
+                       # Préparation, Livraison, Facture, Retour fou
+                       Else
+                          WTRUCOD = [F:ITG]ALLRULSHI
+                       Endif
+ When 6              : # Réception (conso matières sous-traitance)
+                       WTRUCOD = [F:ITG]ALLRULSCC
+ When 10             : # OF (opération de sous-traitance)
+                       If [M:ALP]PECSCOLOC=2
+                          WTRUCOD = [F:ITG]ALLRULSCC
+                       # OF (interne)
+                       Else
+                          WTRUCOD = [F:ITG]ALLRULMAT
+                       Endif
+ When 12             : # Suivi matière (opération de sous-traitance)
+                       If [M:ALP]PECSCOLOC=2
+                          WTRUCOD = [F:ITG]ALLRULSCC
+                       # Suivi matière (interne)
+                       Else
+                          WTRUCOD = [F:ITG]ALLRULMFG
+                       Endif
+ When 20,29,31,32,33 : # Sortie diverse, Changement de stock,
+                       # Assemblage, Désassemblage, Demande de service
+                       WTRUCOD = [F:ITG]ALLRULTRF
+ When 34             : # Réappro zones de consommation
+                       If [M:ALP]LOCCAT=4
+                          WTRUCOD = [F:ITG]ALLRULSCO
+                       Else
+                          WTRUCOD = [F:ITG]ALLRULTRF
+                       Endif
+ When 36             : # Ordre sous-traitance
+                       WTRUCOD = [F:ITG]ALLRULSCC
+ When Default
+Endcase
+
+#--- Issue 97538
+GPOINT="CHG_WTRUCOD" : Gosub ENTREE From EXEFNC
+
+Raz [F:TRU]
+If WTRUCOD<>""
+   # Lecture règle d'allocation
+   Read [TRU]TRU0=WTRUCOD
+   If fstat
+      GOK=0  : Call RSTA("TRU",WTRUCOD) From GLOCK
+      Raz [M:ALP]ALLQTY : LRET=1 : Return
+   Endif
+Endif
+
+If [M:ALP]ALLDAT=[0/0/0]
+   [M:ALP]ALLDAT=[31/12/2999]
+Endif
+
+# Si allocation détaillée
+If LMOD=2
+   WSTA=1
+   If WTRUCOD<>""
+      # Statuts autorisés par les règles d'allocation
+      For I=0 To dim([F:TRU]STAFLT)-1
+         If [F:TRU]STAFLT(I)<>0
+            If find([F:TRU]STAFLT(I),1,3,5,7) WA=1  Endif
+            If find([F:TRU]STAFLT(I),2,3,6,7) WQ=1  Endif
+            If find([F:TRU]STAFLT(I),4,5,6,7) WR=1  Endif
+         Endif
+      Next I
+      WSTA = WA+2*WQ+4*WR
+   Endif
+   Raz WLOC
+   # Prise en compte emplacement attente rangement
+   If [M:ALP]PECPLFLOC=2 WLOC+=1  Endif
+   # Prise en compte emplacement sous-traitant
+   If [M:ALP]PECSCOLOC=2 WLOC+=4  Endif
+   # Si pas d'emplacements internes
+   If [M:ALP]PECINTLOC=1 WLOC=WLOC*(-1) Endif
+   # Calcul stock disponible
+   Call STODISTOT("",WLOC,WSTA,[M:ALP]PECOWNER,WSTUACTDIS) From STKLIB
+
+   # On rajoute l'allouée global (limité à la qté à traiter)
+   WSTUACTDIS += min([M:ALP]QTY,[M:ALP]ALLQTY)
+
+   # Prise en compte des réservations client
+   If [M:ALP]PECRER=2 & [M:ALP]VCRRER<>""
+      #--- Bug 65986
+      #Call CAL_RERQTY(1, [M:ALP]ITMREF,[M:ALP]STOFCY,[M:ALP]VCRRER,LRERQTY)
+      Call CAL_RERQTY(1, [M:ALP]ITMREF,[M:ALP]STOFCY,[M:ALP]VCRRER,[M:ALP]BESDAT,LRERQTY)
+      #---
+      WSTUACTDIS += LRERQTY
+   Endif
+
+   # Si allocation partielle interdite et qté disponible < qté à allouer
+   If LTRT=1 & WSTUACTDIS < [M:ALP]QTY
+      LRET=2 : Return
+   Endif
+   # Si quantité disponible < quantité à allouer, on appelle l'algo avec
+   # comme quantité à allouer, la quantité disponible
+   SVGQTY = [M:ALP]QTY
+   If WSTUACTDIS < 0
+      [M:ALP]QTY = 0
+   Elsif WSTUACTDIS < [M:ALP]QTY
+      [M:ALP]QTY = WSTUACTDIS
+   Endif
+
+   If [M:ALP]QTY<>0
+      # Appel à l'algorithme d'allocation
+      Call STOCKALG(LRUP,WTRUCOD,LFULLTAB,LRET)
+      If LRET<>0 & GMESSAGE<>""
+         Call ERREUR(GMESSAGE) From GESECRAN
+         Return
+      Endif
+   # Pas d'appel à l'algo  --> récupération dépôt et emplacment exclusif
+   Else
+      # --> récupération du dépôt exclusif
+      If GWRHACT=2
+         # Dépôt ligne document
+         If [M:ALP]WRH<>""
+            # Alimentation dépôt rupture
+            WSHTWRH=[M:ALP]WRH
+         # Filtre sur dépôt article-site si exclusif
+         Else
+            LSST=0
+            # Sous-traitance
+            If (find([M:ALP]VCRTYP,10,12) & [M:ALP]PECSCOLOC=2)
+&             |(find([M:ALP]VCRTYP,3,4)   & [M:ALP]TRSTYP=20)
+&             |([M:ALP]VCRTYP=34          & [M:ALP]LOCCAT=4)
+                LSST=1
+            Endif
+            Call WRHAUTO([M:ALP]STOFCY,[M:ALP]ITMREF,[M:ALP]VCRTYP,LSST,LWRH)
+&                From STKWRH
+            If !find(LWRH,"","*")
+               # Alimentation dépôt rupture si pas de joker
+               If !instr(1,LWRH,'*') & !instr(1,LWRH,'?')
+&               & !instr(1,LWRH,'!') & !instr(1,LWRH,'#')
+                  WSHTWRH    = LWRH
+                  [M:ALP]WRH = LWRH
+               Endif
+            Endif
+         Endif
+      Endif
+      # --> récupération de l'emplacement exclusif
+      Raz [M:ALP]LOC, [M:ALP]LOCTYP
+      # Si règle d'allocations
+      If WTRUCOD<>""
+         WTRSTYP=[M:ALP]TRSTYP
+         If find([M:ALP]VCRTYP,2,10,36)
+            # Si cde vente                     --> type mvt = livraison ou livraison prêt
+            # Si OF                            --> type mvt = sortie OF ou s-traitance
+            # Si ordre s-traitance             --> type mvt = sortie s-traitance
+            Case [M:ALP]VCRTYP
+             When  2 : If WTRSTYP=0   : # si [M:ALP]TRSTYP n'est pas renseigné
+                          WTRSTYP = 4
+                       Endif
+             When 10 : If [M:ALP]PECSCOLOC=2
+                          WTRSTYP = 29
+                       Else
+                          WTRSTYP = 6
+                       Endif
+             When 36 : WTRSTYP = 29
+            Endcase
+         Endif
+         # Lecture de la règle de gestion à utiliser
+         Call LECSRU([M:ALP]STOFCY,[F:ITM]TCLCOD,WTRSTYP,[M:ALP]TRSCOD,"",LRET)
+&                    From STKLIB
+
+         # Récupération types emplacement ou emplacement par défaut
+         # de l'article-site pour le type mouvement
+         Gosub ALI_DEFLOC
+
+         # Détermination du nombre de ligne de la règle
+         I = find(0,[F:TRU]LOCFLT(0..dim([F:TRU]LOCFLT)-1))
+         If I=0
+            WNBL = dim([F:TRU]LOCFLT)
+         Else
+            WNBL = I-1
+         Endif
+         If min([F:TRU]LOCFLT(0..WNBL-1))>1
+            # Si OF / EO ou sortie OF / EO et emplacement local renseigné
+            If find([M:ALP]VCRTYP,10,36) | find([M:ALP]TRSTYP,6,29)
+               If [M:ALP]STOLOC<>""
+                  # Si emp local exclusif sans joker stockage pour les ruptures
+                  If max([F:TRU]LOCFLT)=2
+&                  & !instr(1,[M:ALP]STOLOC,'*') & !instr(1,[M:ALP]STOLOC,'?')
+&                  & !instr(1,[M:ALP]STOLOC,'!') & !instr(1,[M:ALP]STOLOC,'#')
+                     [M:ALP]LOC=[M:ALP]STOLOC
+                  Endif
+                  # Emp local dans les règles, mais non exclusif --> c'est fini
+                  If min([F:TRU]LOCFLT)=2 Return Endif
+               Endif
+            Endif
+            If [M:ALP]LOC=""
+               # I,J et K contiennent la 1ère position des catégories emp 1,2 et 3
+               # dans le tableau des règles d'allocation (0 si absent)
+               I = find(3,[F:TRU]LOCFLT(0..WNBL-1))
+               J = find(4,[F:TRU]LOCFLT(0..WNBL-1))
+               K = find(5,[F:TRU]LOCFLT(0..WNBL-1))
+               # WE1,WE2 et WE3 contiennent 1 si emp par défaut 1,2 et 3
+               Raz WE1, WE2, WE3
+               If WDEFLOC <>"" & !instr(1,WDEFLOC,'*')  & !instr(1,WDEFLOC,'?')
+&                              & !instr(1,WDEFLOC,'!')  & !instr(1,WDEFLOC,'#')
+                  WE1=1
+               Endif
+               If WDEFLOC2<>"" & !instr(1,WDEFLOC2,'*') & !instr(1,WDEFLOC2,'?')
+&                              & !instr(1,WDEFLOC2,'!') & !instr(1,WDEFLOC2,'#')
+                  WE2=1
+               Endif
+               If WDEFLOC3<>"" & !instr(1,WDEFLOC3,'*') & !instr(1,WDEFLOC3,'?')
+&                              & !instr(1,WDEFLOC3,'!') & !instr(1,WDEFLOC3,'#')
+                  WE3=1
+               Endif
+               # WT1,WT2 et WT3 contiennent 1 si type emp par défaut 1,2 et 3
+               Raz WT1, WT2, WT3
+               If WDEFLOCTYP <>"" & !instr(1,WDEFLOCTYP,'*') &!instr(1,WDEFLOCTYP,'?')
+&                                 & !instr(1,WDEFLOCTYP,'!') &!instr(1,WDEFLOCTYP,'#')
+                  WT1=1
+               Endif
+               If WDEFLOCTYP2<>"" & !instr(1,WDEFLOCTYP2,'*')&!instr(1,WDEFLOCTYP2,'?')
+&                                 & !instr(1,WDEFLOCTYP2,'!')&!instr(1,WDEFLOCTYP2,'#')
+                  WT2=1
+               Endif
+               If WDEFLOCTYP3<>"" & !instr(1,WDEFLOCTYP3,'*')&!instr(1,WDEFLOCTYP3,'?')
+&                                 & !instr(1,WDEFLOCTYP3,'!')&!instr(1,WDEFLOCTYP3,'#')
+                  WT3=1
+               Endif
+               # WLOCFLT contient la valeur max des catégories d'emp (3,4 ou 5)
+               WLOCFLT = max([F:TRU]LOCFLT)
+
+               Raz WSHTLOC, WSHTLOCTYP
+
+               # Exploitation des règles d'allocation pour déterminer
+               # le type ou l'emplacement de rupture
+               Gosub ALI_LOCATION From STKALL
+
+               [M:ALP]LOC   =WSHTLOC
+               [M:ALP]LOCTYP=WSHTLOCTYP
+
+            Endif
+         Endif
+      Endif
+   Endif
+# Si allocation globale
+Else
+   # Récupération des statuts autorisés
+   Raz WSTA
+   If [F:ITG]GLOAAAFLG=2 WSTA+=1 Endif
+   If [F:ITG]GLOQQQFLG=2 WSTA+=2 Endif
+   If [F:ITG]GLORRRFLG=2 WSTA+=4 Endif
+
+   Raz WLOC
+   # Prise en compte emplacement attente rangement
+   If [M:ALP]PECPLFLOC=2 WLOC+=1  Endif
+   # Prise en compte emplacement sous-traitant
+   If [M:ALP]PECSCOLOC=2 WLOC+=4  Endif
+   # Si pas d'emplacements internes
+   If [M:ALP]PECINTLOC=1 WLOC=WLOC*(-1) Endif
+   # Calcul stock disponible
+   Call STODISTOT("",WLOC,WSTA,[M:ALP]PECOWNER,WSTUACTDIS) From STKLIB
+
+   # Prise en compte des réservations client
+   If [M:ALP]PECRER=2 & [M:ALP]VCRRER<>""
+      #--- Bug 65986
+      #Call CAL_RERQTY(1, [M:ALP]ITMREF,[M:ALP]STOFCY,[M:ALP]VCRRER,LRERQTY)
+      Call CAL_RERQTY(1, [M:ALP]ITMREF,[M:ALP]STOFCY,[M:ALP]VCRRER,[M:ALP]BESDAT,LRERQTY)
+      #---
+      WSTUACTDIS += LRERQTY
+   Endif
+
+   # Si allocation partielle interdite et qté disponible < qté à allouer
+   If LTRT=1 & WSTUACTDIS < [M:ALP]QTY
+      LRET=2 : Return
+   Endif
+
+   If WSTUACTDIS > [M:ALP]QTY
+      WALLQTY    = [M:ALP]QTY
+      WALLQTYSHT = 0
+   Elsif WSTUACTDIS < 0
+      WALLQTY    = 0
+      WALLQTYSHT = [M:ALP]QTY
+   Else
+      WALLQTY    = WSTUACTDIS
+      WALLQTYSHT = ([M:ALP]QTY - WSTUACTDIS)
+   Endif
+   # Pas de génération des ruptures
+   If LRUP<>1 WALLQTYSHT=0 Endif
+Endif
+
+Return
+
+########################################################################
+# ENRSTOALL      Gestion des allocations techniques d'une ligne document
+#                écriture/suppression des allocations dans STOALL
+#                à partir de l'écran de travail STOSORW
+#                avec possibilité
+#                - de suppression des allocations de la pièce origine
+#                    Ex: livraison d'une ligne de commande allouée
+#                        livraison d'un EO alloué
+#                - de réallocation de la pièce origine
+#                    Ex: diminution qté livrée et livraison issue d'une
+#                        commande initialement allouée
+########################################################################
+########################################################################
+# Prérequis    : L'écran de travail STOSORW [SOW] doit être ouvert
+#
+########################################################################
+# Paramètres E : LLIG = Lien avec ligne document [M:XXX]WSTOSEQ(nolign-1)
+#                LTRT = Type de traitement :
+#                       0 = Allocation seule
+#                       1 = Allocation + désallocation ligne origine
+#                           si picking ou augmentation qte livrée
+#                           --> désallocation de cette qté sur l'origine
+#                               (commande, préparation, ordre SST, ...)
+#                       2 = Allocation + réallocation ligne origine
+#                           si diminution qte livrée
+#                           --> réallocation de cette qté sur l'origine
+#                               (commande, ...)
+#                       3 = Allocation + réallocation rupture ligne origine
+#                           si diminution qte livrée
+#                           --> réallocation rupture de cette qté sur l'origine
+#                               (ordre SST)
+#
+#            S : LRET = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+# Entrée : Ecran ALLPAR [ALP] (Bloc 1)
+#          [M:ALP]VCRTYP    = Type pièce (M.701)
+#          [M:ALP]VCRNUM    = Numéro pièce
+#          [M:ALP]VCRLIN    = Numéro ligne pièce
+#          [M:ALP]VCRSEQ    = Numéro séquence pièce
+#          [M:ALP]STOFCY    = Site stock
+#          [M:ALP]ITMREF    = Article
+#          [M:ALP]QTY       = Quantité (0 si annulation ligne)
+#          [M:ALP]TYPQTY    = Type de quantité : 1=US/2=UA (M.720)
+#                             dans ce cas, mettre toujours 2
+#          [M:ALP]BESDAT    = Date besoin
+#          [M:ALP]ALLDAT    = Date fin réservation client
+#          [M:ALP]MVTDES    = Désignation mouvement
+#          -------------------------------------------------------
+#          A alimenter si LTRT = 1 (désallocation pièce origine)
+#                           ou = 2 (réallocation pièce origine)
+#                           ou = 3 (réallocation rupture pièce origine)
+#          Attention : dans le cas contraire faire un raz de ces zones
+#          [M:ALP]VCRTYPORI = Type pièce origine (M.701)
+#          [M:ALP]VCRNUMORI = Numéro pièce origine
+#          [M:ALP]VCRLINORI = Numéro ligne pièce origine
+#          [M:ALP]VCRSEQORI = Numéro séquence pièce origine
+#          [M:ALP]ALLTYPORI = Type allocation pièce origine
+#                             1=Global / 2=Détaillé (M.450)
+#          -------------------------------------------------------
+#          A alimenter si LTRT = 1 (désallocation pièce origine)
+#                                  et augmentation quantité livrée
+#          [M:ALP]DESQTY    = Quantité initiale pièce
+#                             (ex: ancienne qté livrée [F:SDD]QTYSTU)
+#          -------------------------------------------------------
+#--- Bug 81869
+#          A alimenter si LTRT = 1 (désallocation pièce origine)
+#                                  et [M:ALP]VCRTYPORI=3
+#          [M:ALP]ALLQTY    = Quantité initiale allouée sur pièce origine
+#          -------------------------------------------------------
+#          A alimenter si LTRT = 2 (réallocation pièce origine)
+#                           ou = 3 (réallocation rupture pièce origine)
+#          [M:ALP]DESQTY    = Quantité initiale pièce
+#                             (ex: ancienne qté livrée [F:SDD]QTYSTU)
+#          [M:ALP]ALLQTY    = Quantité initiale allouée sur pièce origine
+#                             (ex: qté allouée commande [F:SDD]OALQTYSTU)
+#                             ou qté rupture à recréée sur pièce origine
+#                             (ex: min(old qté livrée, qté restant sur EO))
+#          -------------------------------------------------------
+#          A alimenter si LTRT = 3 (réallocation rupture pièce origine)
+#          [M:ALP]LOC       = Emplacement rupture
+#          [M:ALP]LOT       = Lot rupture
+#          [M:ALP]STA       = Statut rupture
+#          [M:ALP]BPRNUM    = Tiers
+#          [M:ALP]BPAADD    = Adresse Tiers
+#
+########################################################################
+# Sortie : Ecran ALLPAR [ALP] (Bloc 3)
+#          [M:ALP]ALLQTY    = Qté allouée (UA)
+#          [M:ALP]ALLQTYSHT = Qté rupture (UA)
+#          [M:ALP]DESQTY    = Qté désallouée pièce origine (LTRT=1)
+#                             Qté réallouée pièce origine  (LTRT=2)
+#          [M:ALP]DESQTYSHT = Qté rupture désallouée pièce origine (LTRT=1)
+#                             Qté rupture réallouée pièce origine  (LTRT=2 ou 3)
+#
+########################################################################
+Subprog ENRSTOALL(LLIG,LTRT,LRET)
+Value    Integer LLIG
+Value    Integer LTRT
+Variable Integer LRET
+
+Local Integer I, J, K, WI, WORI, WSTA, WMAJ
+Local Integer WALLTYP
+Local Decimal WQTY, WQTA, WSHT, WDIMQTY, WDIMQTA
+Local Decimal WQTATRT, WSHTTRT
+Local Decimal WALLQTY, WDESQTY, WREAQTY
+Local Decimal WSTUACTDIS
+
+# S'il ne s'agit pas d'une ligne à supprimer,
+# et le lien avec la ligne document n'est pas renseigné --> rien à faire
+If [M:ALP]QTY<>0 & LLIG=0 End Endif
+
+If !clalev([F:SWW])  Local File STOWIPW [SWW]  Endif
+
+# WDESQTY = qté initiale allouée pièce (qté livrée)
+# WALLQTY = qté initiale allouée pièce origine      (LTRT=2)
+#        ou qté rupture à recréée sur pièce origine (LTRT=3)
+# WREAQTY = qté à réallouée (rupture) sur la pièce origine
+If find(LTRT,2,3)
+   WDESQTY = [M:ALP]DESQTY
+   WALLQTY = [M:ALP]ALLQTY
+   WREAQTY = max(0,WALLQTY-[ALP]QTY)
+Endif
+# Calcul de la quantité à diminuer sur la pièce origine
+If LTRT=1
+   #--- Bug 81869
+   #WDIMQTY=[M:ALP]QTY-[M:ALP]DESQTY
+   If [M:ALP]VCRTYPORI=3
+      WDIMQTY=[M:ALP]ALLQTY
+   Else
+      WDIMQTY=[M:ALP]QTY-[M:ALP]DESQTY
+   Endif
+   #---
+Endif
+
+Raz LRET
+Raz [M:ALP]ALLQTY, [M:ALP]ALLQTYSHT
+Raz [M:ALP]DESQTY, [M:ALP]DESQTYSHT
+
+If clalev([F:STA]) = 0 Local File STOALL [STA] : Endif
+
+If !find(LTRT,1,2,3)
+   Raz [M:ALP]VCRTYPORI
+   Raz [M:ALP]VCRNUMORI
+   Raz [M:ALP]VCRLINORI
+   Raz [M:ALP]VCRSEQORI
+   Raz [M:ALP]ALLTYPORI
+Endif
+
+# WORI=0 --> Pas de pièce d'origine
+# WORI=1 --> Pièce d'origine et gestion en allocation globale
+# WORI=2 --> Pièce d'origine et gestion en allocation détaillée
+
+WORI=[M:ALP]ALLTYPORI
+
+# Calcul de la quantité à diminuer sur la pièce origine
+#If LTRT=1
+#   WDIMQTY=[M:ALP]QTY-[M:ALP]DESQTY
+#Endif
+
+# Si allocation pièce seule
+# ou avec désallocation pièce origine
+# ou avec réallocation globale pièce origine
+# ou avec réallocation détaillée pièce origine mais pas de qte à réallouer
+# ou avec réallocation rupture pièce origine
+# Suppression des allocations de la ligne de pièce à traiter
+If LTRT=0 | LTRT=1 | (LTRT=2 & WORI=1) | (LTRT=2 & WORI=2 & WREAQTY<=0) | LTRT=3
+   Call DELALL([M:ALP]VCRTYP,[M:ALP]VCRNUM,[M:ALP]VCRLIN,[M:ALP]VCRSEQ,
+&              [M:ALP]ITMREF,0,WQTA,WSHT,LRET)
+   If LRET<>0 End Endif
+Endif
+
+Raz WQTA, WSHT
+# Si allocation pièce avec désallocation globale pièce origine
+# Diminution allocation globale pièce origine
+If LTRT=1 & WORI=1
+   Call DIMALL([M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,[M:ALP]VCRLINORI,
+&              [M:ALP]VCRSEQORI,[M:ALP]ITMREF,3,WDIMQTY,WQTA,WSHT,LRET)
+   If LRET<>0 End Endif
+Endif
+# Si allocation pièce
+# ou avec désallocation pièce origine
+If find(LTRT,0,1)
+   # S'il ne s'agit pas d'une ligne à supprimer
+   # Traitement des lignes de stock saisies et stockées dans STOSORW
+   If [M:ALP]QTY<>0
+      For I=0 To [M:SOW]NBLIG-1
+         # Issue 103089 - 2014-12-02 by SR
+         GPOINT = "CREALL" : : Gosub ENTREE From EXEFNC
+         If [M:SOW]WSTOSEQ(I)=LLIG
+            # Si allocation pièce avec désallocation détaillée pièce origine
+            # Suppression ou diminution de l'allocation détaillée pièce origine
+            If LTRT=1 & WORI=2 & [M:SOW]WSTOCOU(I)<>0
+
+               WDIMQTA=min([M:SOW]WQTYSTUACT(I),WDIMQTY)
+               For [STA]STA1 Where VCRTYP=[M:ALP]VCRTYPORI &
+&                            VCRNUM=[M:ALP]VCRNUMORI & VCRLIN=[M:ALP]VCRLINORI &
+&                            VCRSEQ=[M:ALP]VCRSEQORI & STOCOU=[M:SOW]WSTOCOU(I)
+                  # Suppression de l'allocation correspondante de la pièce d'origine
+                  If [F:STA]QTYSTUACT<=WDIMQTA
+                     Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,LRET)
+                     If LRET<>0
+                        Raz [M:ALP]ALLQTY, [M:ALP]ALLQTYSHT
+                        Break 2
+                     Else
+                        WQTA    += [F:STA]QTYSTUACT
+                        WDIMQTA -= [F:STA]QTYSTUACT
+                     Endif
+                  # Diminution de l'allocation correspondante de la pièce d'origine
+                  Else
+                     WQTY=(-1)*WDIMQTA
+                     Call MODALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,WQTY,LRET)
+                     If LRET<>0
+                        Raz [M:ALP]ALLQTY, [M:ALP]ALLQTYSHT
+                        Break 2
+                     Else
+                        WQTA    -= WQTY
+                        WDIMQTA += WQTY
+                     Endif
+                  Endif
+                  Break(WDIMQTA<=0)
+               Next
+
+            Endif
+            # Allocation détail + dégestion de l'en cours d'allocation
+            WALLTYP=2+10
+            If [M:SOW]WSTOCOU(I)=0 WALLTYP=4 Endif
+            Call CREALL(WALLTYP,[M:ALP]STOFCY,[M:ALP]ITMREF,
+&                      [M:SOW]WSTOCOU(I),[M:ALP]ALLDAT,[M:SOW]WQTYSTU(I),
+&                      [M:SOW]WQTYSTUACT(I),[M:ALP]VCRTYP,[M:ALP]VCRNUM,
+&                      [M:ALP]VCRLIN,[M:ALP]VCRSEQ,"",[M:ALP]BESDAT,
+&                      [M:SOW]WLOT(I),[M:SOW]WSLO(I),[M:SOW]WSTA(I),
+&                      [M:SOW]WLOC(I),[M:SOW]WSERNUM(I),[M:SOW]WWRH(I),
+&                      [M:SOW]WALLSTU(I),[M:SOW]WALLSTUACT(I),"","","","",1,LRET)
+            If LRET<>0
+               Raz [M:ALP]ALLQTY, [M:ALP]ALLQTYSHT
+               Break
+            Endif
+            If WALLTYP=4
+               [M:ALP]ALLQTYSHT += [M:SOW]WQTYSTUACT(I)
+            Else
+               [M:ALP]ALLQTY    += [M:SOW]WQTYSTUACT(I)
+            Endif
+         Endif
+      Next I
+   Endif
+Endif
+
+If LRET<>0
+   If GMESSAGE<>"" Call ERREUR(GMESSAGE) From GESECRAN Endif
+   End
+Endif
+
+# Si allocation pièce avec désallocation détaillée pièce origine
+# Diminution de l'allocation détaillée pièce origine
+If LTRT=1 & WORI=2
+   WDIMQTY -= WQTA
+   If WDIMQTY>0
+      Call DIMALL([M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,[M:ALP]VCRLINORI,
+&                 [M:ALP]VCRSEQORI,[M:ALP]ITMREF,0,WDIMQTY,WQTY,WSHT,LRET)
+      If LRET<>0 End Endif
+      WQTA += WQTY
+   Endif
+Endif
+
+# Maj quantités désallouées de la pièce origine
+If LTRT=1
+   [M:ALP]DESQTY    = WQTA
+   [M:ALP]DESQTYSHT = WSHT
+Endif
+
+# Si allocation pièce avec réallocation pièce origine
+If LTRT=2
+   # Avec réallocation détaillée et qte à réallouer
+   If WORI=2 & WREAQTY>0
+      # S'il s'agit d'une ligne à supprimer
+      If [M:ALP]QTY=0
+         # Si qté initiale allouée pièce > qté à réallouer pièce origine
+         # diminution allocation pièce (à hauteur de ce qui est à réallouer)
+         If WDESQTY > WREAQTY
+            Call DIMALL([M:ALP]VCRTYP,[M:ALP]VCRNUM,[M:ALP]VCRLIN,[M:ALP]VCRSEQ,
+&                       [M:ALP]ITMREF,0,WDESQTY-WREAQTY,WQTATRT,WSHTTRT,LRET)
+            # La quantité à désallouer ne l'a pas été
+            If WQTATRT+WSHTTRT<>WDESQTY-WREAQTY
+               LRET=1 : Call ERREUR(mess(435,199,1)) From GESECRAN
+            Endif
+            If LRET<>0 End Endif
+         Endif
+         #--- Issue 92245
+         WREAQTY=min(WREAQTY,WDESQTY)
+         # Passage des allocations de la pièce traitée vers la pièce origine
+         Call CHGALL([M:ALP]VCRTYP,[M:ALP]VCRNUM,[M:ALP]VCRLIN,[M:ALP]VCRSEQ,
+&                    [M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,[M:ALP]VCRLINORI,
+&                    [M:ALP]VCRSEQORI,0,WREAQTY,WQTATRT,WSHTTRT,LRET)
+         # La quantité à traiter ne l'a pas été
+         If WQTATRT+WSHTTRT<>WREAQTY
+            LRET=1 : Call ERREUR(mess(435,199,1)) From GESECRAN
+         Endif
+         If LRET<>0 End Endif
+         # Maj quantités réallouées de la pièce origine
+         [M:ALP]DESQTY    = WQTATRT
+         [M:ALP]DESQTYSHT = WSHTTRT
+      # Il ne s'agit pas d'une ligne à supprimer
+      Else
+         # Nettoyage des allocations de la pièce
+         # et réallocation de la pièce origine
+         For [STA]STA1 Where VCRTYP=[M:ALP]VCRTYP & VCRNUM=[M:ALP]VCRNUM
+&                          & VCRLIN=[M:ALP]VCRLIN & VCRSEQ=[M:ALP]VCRSEQ
+&                          & ITMREF=[M:ALP]ITMREF
+            # Recherche des allocations modifiées
+            Gosub ALLOC_RECH
+
+            # Diminution allocation pièce (à hauteur de ce qui est à réallouer)
+            # puis passage des allocations de la pièce vers la pièce origine
+            If WQTY<>0
+               # Diminution de l'allocation de la pièce
+               Call MODALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,
+&                          ([F:STA]QTYSTUACT-WQTY)*(-1),LRET)
+               If LRET<>0 Break Endif
+               # Changement de référence de l'allocation
+               Readlock [STA] Curr
+               If fstat
+                  Call RSTA("STA",[F:STA]STOFCY-[F:STA]ITMREF-num$([F:STA]STOCOU)
+&                          -num$([F:STA]SEQ)) From GLOCK
+                  LRET=1 : Break
+               Else
+                  [F:STA]VCRTYP     = [M:ALP]VCRTYPORI
+                  [F:STA]VCRNUM     = [M:ALP]VCRNUMORI
+                  [F:STA]VCRLIN     = [M:ALP]VCRLINORI
+                  [F:STA]VCRSEQ     = [M:ALP]VCRSEQORI
+                  [F:STA]UPDDAT     = date$
+                  [F:STA]UPDUSR     = GUSER
+                  Call REWSTA From STKLIB
+                  If fstat
+                     Call FSTA("STA") From GLOCK
+                     LRET=1 : Break
+                  Endif
+               Endif
+               # Nouvelle quantité à réallouer
+               WREAQTY -= WQTY
+               # Maj quantité réallouée de la pièce origine
+               [M:ALP]DESQTY += WQTY
+
+            # Sinon suppression de l'allocation de la pièce
+            Else
+               Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,LRET)
+               If LRET<>0 Break Endif
+            Endif
+         Next
+         If LRET<>0 End Endif
+      Endif
+   Endif
+   # Allocation de la pièce
+   Gosub ALLOC_PIECE
+
+   # Si allocation pièce avec réallocation globale pièce origine
+   # et il reste une qté à réallouée
+   If WORI=1 & WREAQTY>0
+
+      If clalev([F:ITG]) =0  Local File ITMCATEG  [ITG]  Endif
+      If clalev([F:ITM]) =0  Local File ITMMASTER [ITM]  Endif
+      If [F:ITM]ITMREF<>[M:ALP]ITMREF
+         Read [ITM]ITM0=[M:ALP]ITMREF
+      Endif
+
+      #--- Lecture catégorie article/site
+      Read [ITG]ITG1=[F:ITM]TCLCOD;[M:ALP]STOFCY
+      If fstat
+         Read [ITG]ITG1=[F:ITM]TCLCOD;""
+      Endif
+      If fstat
+         WSTA=1
+      Else
+         Raz WSTA
+         If [F:ITG]GLOAAAFLG=2 WSTA+=1 Endif
+         If [F:ITG]GLOQQQFLG=2 WSTA+=2 Endif
+         If [F:ITG]GLORRRFLG=2 WSTA+=4 Endif
+      Endif
+      # Calcul stock disponible
+      Call STODISTOT("",1,WSTA,"",WSTUACTDIS) From STKLIB
+
+      If WSTUACTDIS > WREAQTY
+         WQTA = WREAQTY
+         WSHT = 0
+      Elsif WSTUACTDIS < 0
+         WQTA = 0
+         WSHT = WREAQTY
+      Else
+         WQTA = WSTUACTDIS
+         WSHT = WREAQTY-WSTUACTDIS
+      Endif
+
+      # Allocations globales
+      If WQTA<>0
+         Call CREALL(1,[M:ALP]STOFCY,[M:ALP]ITMREF,0,[M:ALP]ALLDAT,0,WQTA,
+&                   [M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,[M:ALP]VCRLINORI,
+&                   [M:ALP]VCRSEQORI,"",[M:ALP]BESDAT,"","","","","","",
+&                   0,0,"","","","",1,LRET)
+         If LRET<>0 End Endif
+      Endif
+      # Ruptures globales
+      If WSHT<>0
+         Call CREALL(5,[M:ALP]STOFCY,[M:ALP]ITMREF,0,[M:ALP]ALLDAT,0,WSHT,
+&                   [M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,[M:ALP]VCRLINORI,
+&                   [M:ALP]VCRSEQORI,"",[M:ALP]BESDAT,"","","","","","",
+&                   0,0,"","","","",1,LRET)
+         If LRET<>0 End Endif
+      Endif
+      # Maj quantités réallouées de la pièce origine
+      [M:ALP]DESQTY    = WQTA
+      [M:ALP]DESQTYSHT = WSHT
+   Endif
+Endif
+
+# Si allocation pièce avec réallocation rupture pièce origine
+If LTRT=3
+   If WREAQTY>0
+      # S'il s'agit d'une ligne à supprimer
+      If [M:ALP]QTY=0
+         WMAJ=0
+         For [STA]STA1 Where VCRTYP=[M:ALP]VCRTYPORI & VCRNUM=[M:ALP]VCRNUMORI &
+&                            VCRLIN=[M:ALP]VCRLINORI & VCRSEQ=[M:ALP]VCRSEQORI &
+&                            STOCOU=0
+            # Augmentation de la rupture de la pièce
+            Call MODALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,
+&                        WREAQTY,LRET)
+            WMAJ=1 : Break
+         Next
+         If LRET<>0 End Endif
+         If WMAJ=0
+            # Création de la rupture sur la pièce origine
+            Call CREALL(4,[M:ALP]STOFCY,[M:ALP]ITMREF,0,[M:ALP]ALLDAT,0,WREAQTY,
+&                      [M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,[M:ALP]VCRLINORI,
+&                      [M:ALP]VCRSEQORI,"",[M:ALP]BESDAT,[M:ALP]LOT,"",
+&                      [M:ALP]STA,[M:ALP]LOC,"",[M:ALP]WRH,0,0,"","",
+&                      [M:ALP]BPRNUM,[M:ALP]BPAADD,2,LRET)
+            If LRET<>0 End Endif
+         Endif
+         # Maj quantité rupture de la pièce origine
+         [M:ALP]DESQTYSHT = WREAQTY
+      # Il ne s'agit pas d'une ligne à supprimer
+      Else
+         # Nettoyage des allocations de la pièce
+         # et réallocation de la pièce origine
+         For [STA]STA1 Where VCRTYP=[M:ALP]VCRTYP & VCRNUM=[M:ALP]VCRNUM
+&                          & VCRLIN=[M:ALP]VCRLIN & VCRSEQ=[M:ALP]VCRSEQ
+&                          & ITMREF=[M:ALP]ITMREF
+            # Recherche des allocations modifiées
+            Gosub ALLOC_RECH
+
+            # Diminution allocation pièce (à hauteur de ce qui est à réallouer)
+            # puis passage des allocations de la pièce vers la pièce origine
+            If WQTY<>0
+               # Diminution de l'allocation de la pièce
+               Call MODALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,
+&                          ([F:STA]QTYSTUACT-WQTY)*(-1),LRET)
+               If LRET<>0 Break Endif
+
+               WMAJ=0
+               For [STA]STA1 Where VCRTYP=[M:ALP]VCRTYPORI &
+&                                  VCRNUM=[M:ALP]VCRNUMORI &
+&                                  VCRLIN=[M:ALP]VCRLINORI &
+&                                  VCRSEQ=[M:ALP]VCRSEQORI &
+&                                  STOCOU=0
+                  # Augmentation de la rupture de la pièce
+                  Call MODALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,
+&                             [F:STA]SEQ,WQTY,LRET)
+                  WMAJ=1 : Break
+               Next
+               If LRET<>0 Break Endif
+               If WMAJ=0
+                  # Création de la rupture sur la pièce origine
+                  Call CREALL(4,[M:ALP]STOFCY,[M:ALP]ITMREF,0,[M:ALP]ALLDAT,0,
+&                            WREAQTY,[M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,
+&                            [M:ALP]VCRLINORI,[M:ALP]VCRSEQORI,"",[M:ALP]BESDAT,
+&                            [M:ALP]LOT,"",[M:ALP]STA,[M:ALP]LOC,"",[M:ALP]WRH,
+&                            0,0,"","",[M:ALP]BPRNUM,[M:ALP]BPAADD,2,LRET)
+                  If LRET<>0 Break Endif
+               Endif
+
+               # Nouvelle quantité à réallouer
+               WREAQTY -= WQTY
+               # Maj quantité réallouée de la pièce origine
+               [M:ALP]DESQTY += WQTY
+
+            # Sinon suppression de l'allocation de la pièce
+            Else
+               Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,LRET)
+               If LRET<>0 Break Endif
+            Endif
+         Next
+         If LRET<>0 End Endif
+      Endif
+   Endif
+   # Allocation de la pièce
+   Gosub ALLOC_PIECE
+Endif
+
+End
+
+#-------------------------------------
+# Recherche des allocations modifiées
+#-------------------------------------
+$ALLOC_RECH
+# Recherche si l'allocation est dans l'écran de stockage
+# K contient le 'nolign' si celle-ci est présente
+Raz I,J,K
+$LOOP_STA_SOW
+If I<=[M:SOW]NBLIG-1 & [F:STA]STOCOU<>0
+   J = find(LLIG,[M:SOW]WSTOSEQ(I..[M:SOW]NBLIG-1))
+   If J<>0
+      If [M:SOW]WSTOCOU(J+I-1)=[F:STA]STOCOU
+         K=I+J
+      Else
+         I+=J
+         Goto LOOP_STA_SOW
+      Endif
+   Endif
+Endif
+Raz WQTY
+# Si l'alloc détaillée est à supprimer & il y a un reste à réallouer
+If K=0 & [F:STA]STOCOU<>0 & WREAQTY>0
+   # Détermination de la quantité à réallouer
+   If WREAQTY>=[F:STA]QTYSTUACT
+      WQTY=[F:STA]QTYSTUACT
+   Else
+      WQTY=WREAQTY
+   Endif
+   # Si l'ancienne qté est > à la nouvelle & il y a un reste à réallouer
+Elsif K<>0 & [F:STA]QTYSTUACT>[M:SOW]WQTYSTUACT(K-1) & WREAQTY>0
+   # Détermination de la quantité à réallouer
+   If WREAQTY>=[F:STA]QTYSTUACT-[M:SOW]WQTYSTUACT(K-1)
+      WQTY=[F:STA]QTYSTUACT-[M:SOW]WQTYSTUACT(K-1)
+   Else
+      WQTY=WREAQTY
+   Endif
+Endif
+
+Return
+
+#------------------------------------------------------
+# Si WTRT=2 ou 3 et modification de la quantité livrée
+#------------------------------------------------------
+$ALLOC_PIECE
+# Allocation de la pièce
+For I=0 To [M:SOW]NBLIG-1
+   If [M:SOW]WSTOSEQ(I)=LLIG
+      # Allocation détail + dégestion de l'en cours d'allocation
+      WALLTYP=2+10
+      If [M:SOW]WSTOCOU(I)=0 WALLTYP=4 Endif
+      Call CREALL(WALLTYP,[M:ALP]STOFCY,[M:ALP]ITMREF,
+&                [M:SOW]WSTOCOU(I),[M:ALP]ALLDAT,[M:SOW]WQTYSTU(I),
+&                [M:SOW]WQTYSTUACT(I),[M:ALP]VCRTYP,[M:ALP]VCRNUM,
+&                [M:ALP]VCRLIN,[M:ALP]VCRSEQ,"",[M:ALP]BESDAT,
+&                [M:SOW]WLOT(I),[M:SOW]WSLO(I),[M:SOW]WSTA(I),
+&                [M:SOW]WLOC(I),[M:SOW]WSERNUM(I),[M:SOW]WWRH(I),
+&                [M:SOW]WALLSTU(I),[M:SOW]WALLSTUACT(I),"","","","",1,LRET)
+      If LRET<>0
+         Raz [M:ALP]ALLQTY, [M:ALP]ALLQTYSHT
+         Break
+      Endif
+      If WALLTYP=4
+         [M:ALP]ALLQTYSHT += [M:SOW]WQTYSTUACT(I)
+      Else
+         [M:ALP]ALLQTY    += [M:SOW]WQTYSTUACT(I)
+      Endif
+   Endif
+Next I
+
+Return
+
+########################################################################
+# MAJALLORI      Mise à jour des allocations d'une ligne de pièce origine
+#                à partir de l'écran STOSORW (stockage stock à sortir)
+#                avant la mise à jour des stocks de cette sortie.
+#                Ex: maj des allocations d'un OF lors du suivi (sortie OF))
+########################################################################
+########################################################################
+# Prérequis    : L'écran de travail STOSORW [SOW] doit être ouvert
+#
+########################################################################
+# Paramètres E : LLIG = Lien avec ligne document [M:XXX]WSTOSEQ(nolign-1)
+#
+#            S : LRET = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+# Entrée       : Ecran ALLPAR [ALP] (Bloc 1)
+#                [M:ALP]STOFCY    = Site stock
+#                [M:ALP]ITMREF    = Article
+#                [M:ALP]QTY       = Quantité (en UA)
+#                [M:ALP]VCRTYPORI = Type pièce origine (M.701)
+#                [M:ALP]VCRNUMORI = Numéro pièce origine
+#                [M:ALP]VCRLINORI = Numéro ligne pièce origine
+#                [M:ALP]VCRSEQORI = Numéro séquence pièce origine
+#                [M:ALP]ALLTYPORI = Type allocation pièce origine
+#                                   1=Global / 2=Détaillé (M.450)
+#
+########################################################################
+# Sortie       : Ecran ALLPAR [ALP] (Bloc 3)
+#                [M:ALP]DESQTY    = Qté désallouée pièce origine
+#                [M:ALP]DESQTYSHT = Qté rupture désallouée pièce origine
+#
+########################################################################
+Subprog MAJALLORI(LLIG,LRET)
+Value    Integer LLIG
+Variable Integer LRET
+
+Local    Integer I, J, K, WSTA
+Local    Decimal WQTA, WSHT, WDIMQTY, WDIMQTA, WINIQTA
+Local    Decimal WQTYACT, WQTYPHY, WSOWACT, WSOWPHY
+
+# Lien avec ligne document non renseigné       --> rien à faire
+If LLIG=0 : LRET=1 : End : Endif
+# Pas de type d'allocation de la pièce origine --> rien à faire
+If !find([M:ALP]ALLTYPORI,1,2) : LRET=1 : End : Endif
+
+If !clalev([F:STA])  Local File STOALL    [STA]  Endif
+If !clalev([F:STO])  Local File STOCK     [STO]  Endif
+If !clalev([F:SWW])  Local File STOWIPW   [SWW]  Endif
+If !clalev([F:ITM])  Local File ITMMASTER [ITM]  Endif
+If [F:ITM]ITMREF<>[M:ALP]ITMREF
+   Read [ITM]ITM0=[M:ALP]ITMREF
+   If fstat
+      Call RSTA("ITM",[M:ALP]ITMREF) From GLOCK
+      LRET=1 : End
+   Endif
+Endif
+
+# Quantité à diminuer sur la pièce origine
+WDIMQTY=[M:ALP]QTY
+
+Raz LRET, WQTA, WSHT
+Raz [M:ALP]DESQTY, [M:ALP]DESQTYSHT
+
+# Diminution allocation globale pièce origine
+If [M:ALP]ALLTYPORI=1
+   Call DIMALL([M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,[M:ALP]VCRLINORI,
+&              [M:ALP]VCRSEQORI,[M:ALP]ITMREF,3,WDIMQTY,WQTA,WSHT,LRET)
+   If LRET<>0 End Endif
+Endif
+
+# Traitement des lignes de stock saisies et stockées dans STOSORW
+For I=0 To [M:SOW]NBLIG-1
+   If [M:SOW]WSTOSEQ(I)=LLIG
+      # Suppression ou diminution de l'allocation détaillée pièce origine
+      If [M:ALP]ALLTYPORI=2 & [M:SOW]WSTOCOU(I)<>0
+         Raz WSOWACT, WSOWPHY
+         # Quantité à diminuer
+         WDIMQTA=min([M:SOW]WQTYSTUACT(I),WDIMQTY)
+         # Quantité en cours de traitement initiale dans [SOW]
+         WINIQTA = [M:SOW]WQTYSTUACT(I)-[M:SOW]WALLSTUACT(I)
+
+         For [STA]STA1 Where VCRTYP=[M:ALP]VCRTYPORI & VCRNUM=[M:ALP]VCRNUMORI &
+&                            VCRLIN=[M:ALP]VCRLINORI & VCRSEQ=[M:ALP]VCRSEQORI &
+&                            STOCOU=[M:SOW]WSTOCOU(I)
+            # Suppression de l'allocation correspondante de la pièce d'origine
+            If [F:STA]QTYSTUACT<=WDIMQTA
+               Call SUPALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,LRET)
+               If LRET<>0
+                  Break 2
+               Else
+                  # Raz de la qté initialement allouée dans [SOW]
+                  Raz [M:SOW]WALLSTU(I)
+                  Raz [M:SOW]WALLSTUACT(I)
+                  WQTA    += [F:STA]QTYSTUACT
+                  WDIMQTA -= [F:STA]QTYSTUACT
+                  WSOWACT += [F:STA]QTYSTUACT
+                  WSOWPHY += [F:STA]QTYSTU
+               Endif
+            # Diminution de l'allocation correspondante de la pièce d'origine
+            Else
+               # Quantité à diminuer (en négatif)
+               WQTYACT=(-1)*WDIMQTA
+               Call MODALL([F:STA]STOFCY,[F:STA]ITMREF,[F:STA]STOCOU,[F:STA]SEQ,WQTYACT,LRET)
+               # Quantité à diminuer (en positif)
+               WQTYACT=(-1)*WQTYACT
+               If LRET<>0
+                  Break 2
+               Else
+                  # Diminution de la qté initialement allouée dans [SOW]
+                  WQTYPHY = (WQTYACT*[F:STA]QTYSTU)/[F:STA]QTYSTUACT
+                  #--- Bug 71256
+                  #Call QTEARR(WQTYPHY,[F:ITM]STU) From TRTDIV
+                  [M:SOW]WALLSTU(I)   -=WQTYPHY
+                  [M:SOW]WALLSTUACT(I)-=WQTYACT
+                  WQTA    += WQTYACT
+                  WDIMQTA -= WQTYACT
+                  WSOWACT += WQTYACT
+                  WSOWPHY += WQTYPHY
+               Endif
+            Endif
+            Break(WDIMQTA<=0)
+         Next
+         # Maj quantité en cours de traitement
+         Gosub MAJ_SWW
+      Endif
+   Endif
+Next I
+
+If LRET<>0
+   If GMESSAGE<>"" Call ERREUR(GMESSAGE) From GESECRAN Endif
+   End
+Endif
+
+# Diminution de l'allocation détaillée pièce origine
+If [M:ALP]ALLTYPORI=2
+   WDIMQTY -= WQTA
+   If WDIMQTY>0
+      Call DIMALL([M:ALP]VCRTYPORI,[M:ALP]VCRNUMORI,[M:ALP]VCRLINORI,
+&                 [M:ALP]VCRSEQORI,[M:ALP]ITMREF,0,WDIMQTY,WQTYACT,WSHT,LRET)
+      If LRET<>0 End Endif
+      WQTA += WQTYACT
+   Endif
+Endif
+
+# Maj quantités désallouées de la pièce origine
+[M:ALP]DESQTY    = WQTA
+[M:ALP]DESQTYSHT = WSHT
+
+End
+
+# Maj Quantité en cours de traitement
+$MAJ_SWW
+Readlock [STO]STO0=[M:ALP]STOFCY;[M:SOW]WSTOCOU(I)
+If !fstat
+   [F:STO]CUMWIPQTY += WSOWPHY
+   [F:STO]CUMWIPQTA += WSOWACT
+   Call ADD_STOWIPW([F:STO]STOCOU,WINIQTA,WSOWPHY,WSOWACT) From STKLIB
+   If WSOWACT=0
+      Rewrite [STO]
+      If fstat : Call FSTA("STO") From GLOCK : LRET=1 : Endif
+   Else
+      Unlock [STO]
+   Endif
+Endif
+Return
+
+########################################################################
+# CTLALL         Contrôle d'autorisation de sortie des allocations (cdes & OF)
+#                selon la règle de gestion des sorties pour le mvt à traiter
+########################################################################
+# Prérequis    : Buffer article en ligne : [F:ITM]
+#
+########################################################################
+# Paramètres E : LFCY    = Site stockage
+#                LTYP    = Type de pièce origine (M.701)
+#                LNUM    = Numéro pièce origine
+#                LLIN    = Numero ligne pièce origine
+#                LSEQ    = Numero sequence pièce origine
+#                LTRSTYP = Type mouvement (M.704)
+#                LTRSCOD = Code mouvement
+#                LSTA    = Filtre statut ligne document
+#                          sous la forme : "A1*,A20"
+#                LPLF    = Ligne de stock en attente de rangement et incomplète
+#                          (lot,s/lot,série) autorisées (1=non, 2=oui)
+#                          Mettre 1 pour les traitements automatiques
+#                          Mettre 2 pour les pickings (écran pour modifier)
+#            S : LQTY1   = Qte active allouée sortable
+#                LQTY2   = Qte active allouée non sortable
+#                LRET    = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+Subprog CTLALL(LFCY,LTYP,LNUM,LLIN,LSEQ,LTRSTYP,LTRSCOD,LSTA,LPLF,LQTY1,LQTY2,LRET)
+Value    Char    LFCY
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LTRSTYP
+Value    Char    LTRSCOD
+Value    Char    LSTA
+Value    Integer LPLF
+Variable Decimal LQTY1
+Variable Decimal LQTY2
+Variable Integer LRET
+
+Local    Integer I
+Local    Char    WCRIT(80), WCRITSTO(240)
+
+Raz LQTY1,LQTY2,LRET
+
+If clalev([F:SRU]) =0  Local File TABSTORUL  [SRU]   Endif
+If clalev([F:STA]) =0  Local File STOALL     [STA]   Endif
+If clalev([F:STO1])=0  Local File STOCK      [STO1]  Endif
+
+Raz I
+
+# Lecture de la règle de gestion pour le mouvement à traiter
+Call LECSRU(LFCY,[F:ITM]TCLCOD,LTRSTYP,LTRSCOD,"",LRET) From STKLIB
+If LRET<>0 : GOK=0 : End : Endif
+
+# Stockage dans WCRITSTO des statuts/sous-statuts autorisés
+Call CTRL_STATUT("[F:STO1]",LSTA,WCRITSTO)
+
+# Contrôle que les lignes allouées sont sortables
+For [STA]STA1 Where VCRTYP=LTYP & VCRNUM=LNUM & VCRLIN=LLIN & VCRSEQ=LSEQ &
+&                   ITMREF=[F:ITM]ITMREF & ALLTYP=2
+   Read [STO1]STO0=[F:STA]STOFCY;[F:STA]STOCOU
+   If fstat
+      LQTY2 += [F:STA]QTYSTUACT
+      Goto CTLALL_SUI
+   Endif
+   # Si ligne de stock en attente de rangement et incomplète non autorisée
+   If LPLF=1 & [F:STO1]LOCCAT=2
+      # Contrôle que la ligne de stock est complète
+      Call CTLPLFLOC([F:ITM]ITMREF,"[F:STO1]",LRET) From STKSOR
+      If LRET<>0
+         LQTY2 += [F:STA]QTYSTUACT
+         Goto CTLALL_SUI
+      Endif
+   Endif
+   # Demande d'analyse en cours
+   If [F:STO1]QLYCTLDEM<>""
+      LQTY2 += [F:STA]QTYSTUACT
+      Goto CTLALL_SUI
+   Endif
+   # Inventaire en cours
+   If [F:STO1]CUNLOKFLG=2
+      LQTY2 += [F:STA]QTYSTUACT
+   # Statut autorisé
+   Elsif evalue(WCRITSTO)
+      LQTY1 += [F:STA]QTYSTUACT
+   # Statut interdit
+   Else
+      LQTY2 += [F:STA]QTYSTUACT
+   Endif
+$CTLALL_SUI
+Next
+
+End
+
+########################################################################
+# DELALL         Suppression des allocations d'une ligne de document
+########################################################################
+# Paramètres E : LTYP = Type de pièce (M.701)
+#                LNUM = Numéro pièce
+#                LLIN = Numero ligne pièce
+#                LSEQ = Numero sequence pièce
+#                LITM = Article
+#                LOPT = Option suppression : 0 allocations + manquants
+#                                            1 allocations seules
+#                                            2 manquants seuls
+#                       +10 si pas de suppression des allocations/manquants
+#                           en cours de réapprovisionnement (SRGNUM<>"")
+#                           --> 10, 11 ou 12
+#            S : LQTA = Total allocations supprimées  (en UA)
+#                LSHT = Total manquants supprimées    (en UA)
+#                LRET = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+Subprog DELALL(LTYP,LNUM,LLIN,LSEQ,LITM,LOPT,LQTA,LSHT,LRET)
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Char    LITM
+Value    Integer LOPT
+Variable Decimal LQTA
+Variable Decimal LSHT
+Variable Integer LRET
+
+Local  Char      WCRITSTA(240)
+Local  Integer   WRET
+Local  Decimal   WCHR
+Local  Integer   WSEQ
+
+Raz LRET, LQTA, LSHT
+
+If clalev([F:STA1])=0  Local File STOALL [STA1]  Endif
+#--- Bug 84767
+If clalev([F:STA2])=0  Local File STOALL [STA2]  Endif
+
+WCRITSTA = 'VCRTYP=LTYP & VCRNUM=LNUM & VCRLIN=LLIN & VCRSEQ=LSEQ'
+If LITM<>""
+   WCRITSTA += '& ITMREF=LITM'
+Endif
+
+For [STA1]STA1 Where evalue(WCRITSTA)
+
+   GOK=1
+   GPOINT="DELALL" : Gosub ENTREE From EXEFNC
+   If GOK=0
+      GOK=1 : Goto NEXT_STA1
+   Endif
+
+   Case [F:STA1]ALLTYP
+    When 1,2 : If (LOPT=0 | LOPT=1) | ((LOPT=10 | LOPT=11)& [F:STA1]SRGNUM="") : #--- Bug 84767
+                  LQTA += [F:STA1]QTYSTUACT
+                  WCHR  = [F:STA1]STOCOU
+                  WSEQ  = [F:STA1]SEQ
+                  Call SUPALL([F:STA1]STOFCY,[F:STA1]ITMREF,WCHR,WSEQ,WRET)
+                  If WRET<>0 : LRET=WRET : Break : Endif
+                  #--- Bug 84767
+                  #--- Bug 99909
+                  #If [F:STA1]SRGNUM<>""
+                  If [F:STA1]SRGNUM<>"" & [F:STA1]VCRNUM<>[F:STA1]SRGNUM
+                  #---
+                     Gosub SUPALL_REO
+                     If LRET<>0 : Break : Endif
+                  Endif
+                  #---
+               Endif
+    When 4,5 : If (LOPT=0 | LOPT=2) | ((LOPT=10 | LOPT=12)& [F:STA1]SRGNUM="") : #--- Bug 84767
+                  LSHT += [F:STA1]QTYSTUACT
+                  WCHR  = [F:STA1]STOCOU
+                  WSEQ  = [F:STA1]SEQ
+                  Call SUPALL([F:STA1]STOFCY,[F:STA1]ITMREF,WCHR,WSEQ,WRET)
+                  If WRET<>0 : LRET=WRET : Break : Endif
+                  #--- Bug 84767
+                  #--- Bug 99909
+                  #If [F:STA1]SRGNUM<>""
+                  If [F:STA1]SRGNUM<>"" & [F:STA1]VCRNUM<>[F:STA1]SRGNUM
+                  #---
+                     Gosub SUPALL_REO
+                     If LRET<>0 : Break : Endif
+                  Endif
+                  #---
+               Endif
+  Endcase
+  $NEXT_STA1
+Next
+
+End
+
+#--- Bug 84767
+#--------------------------------------------------------
+# Suppression des allocations de réapprovisionnement
+# des zones de consommations ou ruptures sur emplacement
+#--------------------------------------------------------
+$SUPALL_REO
+Filter [STA2] Where [F:STA2]ITMREF=[F:STA1]ITMREF & [F:STA2]VCRTYP=34
+&                 & [F:STA2]STOFCY=[F:STA1]STOFCY & [F:STA2]ALLTYP=2
+&                 & [F:STA2]SRGNUM=[F:STA1]SRGNUM & [F:STA2]SRGLIN=[F:STA1]SRGLIN
+&             Order By Key STA2
+For [STA2]
+    WCHR = [F:STA2]STOCOU
+    WSEQ = [F:STA2]SEQ
+    Call SUPALL([F:STA2]STOFCY,[F:STA2]ITMREF,WCHR,WSEQ,WRET)
+    If WRET<>0 : LRET=WRET : Break : Endif
+Next
+Filter [STA2]
+Return
+#---
+
+########################################################################
+# DIMALL         Diminution des allocations d'une ligne de document
+########################################################################
+# Paramètres E : LTYP = Type de pièce (M.701)
+#                LNUM = Numéro pièce
+#                LLIN = Numero ligne pièce
+#                LSEQ = Numero sequence pièce
+#                LITM = Article
+#                LOPT = Option suppression : 0 manquants puis allocations
+#                                            1 allocations seules
+#                                            2 manquants seuls
+#                                            3 allocations puis manquants
+#                       +10 si pas de suppression des allocations/manquants
+#                           en cours de réapprovisionnement (SRGNUM<>"")
+#                           --> 10, 11, 12 ou 13
+#                LQTE = Total allocations à diminuer  (en UA)
+#            S : LQTA = Total allocation diminuées    (en UA)
+#                LSHT = Total manquants diminuées     (en UA)
+#                LRET = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+Subprog DIMALL(LTYP,LNUM,LLIN,LSEQ,LITM,LOPT,LQTE,LQTA,LSHT,LRET)
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Char    LITM
+Value    Integer LOPT
+Value    Decimal LQTE
+Variable Decimal LQTA
+Variable Decimal LSHT
+Variable Integer LRET
+
+Local    Char    WCRITSTA(240)
+Local    Integer WRET
+Local    Decimal WCHR
+Local    Integer WSEQ
+Local    Decimal WQTE, WQTEMOD
+
+Raz LRET, LQTA, LSHT
+WQTE = LQTE
+
+If clalev([F:STA1])=0  Local File STOALL [STA1]  Endif
+#--- Bug 84767
+If clalev([F:STA2])=0  Local File STOALL [STA2]  Endif
+
+#--- Bug 84767 : ajout des tests sur les valeurs 10, 11, 12 et 13
+Case LOPT
+ When 0, 10 : Gosub DIMALL_RUPT
+              If WQTE=0  Goto DIMALL_FIN Endif : # Toute la quantité a été traité
+              If LRET<>0 Goto DIMALL_FIN Endif : # Il y a eu un problème
+              Gosub DIMALL_ALLOC
+ When 1, 11 : Gosub DIMALL_ALLOC
+ When 2, 12 : Gosub DIMALL_RUPT
+ When 3, 13 : Gosub DIMALL_ALLOC
+              If WQTE=0  Goto DIMALL_FIN Endif : # Toute la quantité a été traité
+              If LRET<>0 Goto DIMALL_FIN Endif : # Il y a eu un problème
+              Gosub DIMALL_RUPT
+Endcase
+
+$DIMALL_FIN
+End
+
+# Diminution des allocations
+$DIMALL_ALLOC
+WCRITSTA = 'VCRTYP=LTYP & VCRNUM=LNUM & VCRLIN=LLIN & VCRSEQ=LSEQ'
+If LITM<>""
+   WCRITSTA += '&ITMREF=LITM'
+Endif
+WCRITSTA += '&find(ALLTYP,1,2)<>0'
+
+For [STA1]STA1 Where evalue(WCRITSTA)
+   WCHR  = [F:STA1]STOCOU
+   WSEQ  = [F:STA1]SEQ
+   If WQTE >= [F:STA1]QTYSTUACT
+      #--- Bug 84767
+      If LOPT<10 | (LOPT>=10 & [F:STA1]SRGNUM="")
+         Call SUPALL([F:STA1]STOFCY,[F:STA1]ITMREF,WCHR,WSEQ,WRET)
+         If WRET<>0 : LRET=WRET : Break : Endif
+         LQTA += [F:STA1]QTYSTUACT
+         WQTE -= [F:STA1]QTYSTUACT
+         #--- Bug 84767
+         #--- Bug 99909
+         #If [F:STA1]SRGNUM<>""
+         If [F:STA1]SRGNUM<>"" & [F:STA1]VCRNUM<>[F:STA1]SRGNUM
+         #---
+            Gosub SUPALL_REO
+            If LRET<>0 : Break : Endif
+         Endif
+         #---
+      #--- Bug 84767
+      Endif
+      If WQTE=0 : Break : Endif
+   Else
+      # Passage de la quantité à modifier en négatif
+      WQTEMOD = (-1)*WQTE
+      Call MODALL([F:STA1]STOFCY,[F:STA1]ITMREF,WCHR,WSEQ,WQTEMOD,WRET)
+      If WRET<>0 : LRET=WRET : Break : Endif
+      LQTA += WQTE
+      WQTE -= WQTE
+      Break
+   Endif
+Next
+
+Return
+
+# Diminution des ruptures
+$DIMALL_RUPT
+WCRITSTA = 'VCRTYP=LTYP & VCRNUM=LNUM & VCRLIN=LLIN & VCRSEQ=LSEQ'
+If LITM<>""
+   WCRITSTA += '&ITMREF=LITM'
+Endif
+WCRITSTA += '&find(ALLTYP,4,5)<>0'
+
+For [STA1]STA1 Where evalue(WCRITSTA)
+   WCHR  = [F:STA1]STOCOU
+   WSEQ  = [F:STA1]SEQ
+   If WQTE >= [F:STA1]QTYSTUACT
+      #--- Bug 84767
+      If LOPT<10 | (LOPT>=10 & [F:STA1]SRGNUM="")
+         Call SUPALL([F:STA1]STOFCY,[F:STA1]ITMREF,WCHR,WSEQ,WRET)
+         If WRET<>0 : LRET=WRET : Break : Endif
+         LSHT += [F:STA1]QTYSTUACT
+         WQTE -= [F:STA1]QTYSTUACT
+         #--- Bug 84767
+         #--- Bug 99909
+         #If [F:STA1]SRGNUM<>""
+         If [F:STA1]SRGNUM<>"" & [F:STA1]VCRNUM<>[F:STA1]SRGNUM
+         #---
+            Gosub SUPALL_REO
+            If LRET<>0 : Break : Endif
+         Endif
+         #---
+      #--- Bug 84767
+      Endif
+      If WQTE=0 : Break : Endif
+   Else
+      # Passage de la quantité à modifier en négatif
+      WQTEMOD = (-1)*WQTE
+      Call MODALL([F:STA1]STOFCY,[F:STA1]ITMREF,WCHR,WSEQ,WQTEMOD,WRET)
+      If WRET<>0 : LRET=WRET : Break : Endif
+      LSHT += WQTE
+      WQTE -= WQTE
+      Break
+   Endif
+Next
+
+Return
+
+########################################################################
+# CREALL         Création d'une allocation
+########################################################################
+# Paramètres E : LALL       = Type allocation (M.294)
+#                LFCY       = Site
+#                LITM       = Article
+#                LCHR       = Chrono stock
+#                LDAT       = Date fin réservation
+#                LQTY       = Quantité en US
+#                LQTA       = Quantité active
+#                LTYP       = Type de pièce (M.701)
+#                LNUM       = Numéro pièce
+#                LLIN       = Numero ligne pièce
+#                LSEQ       = Numero sequence pièce
+#                LPRE       = Numéro préparation
+#                LDTE       = Date du besoin
+#                LLOT       = Lot (si rupture)
+#                LSLO       = Sous-lot (si rupture)
+#                LSTA       = Statut (si rupture)
+#                LLOC       = Emplacement (si rupture)
+#                LSER       = Série (si rupture)
+#                LWRH       = Dépôt (si rupture)
+#                LALLQTY    = Quantité US déjà allouée
+#                LALLQTA    = Quantité active déjà allouée
+#                LDEFLOC    = Emplacement de consommation
+#                LDEFLOCTYP = Type emplacement de consommation
+#                LBPR       = Tiers (si sous-traitance)
+#                LADD       = Adresse de livraison (si sous-traitance)
+#                LSCO       = Sous-traitance (2=matière à livrer)
+#            S : LRET       = Code retour (0=OK / 1=Erreur)
+#
+#-----------------------------------------------------------------------
+# Entrée         [M:ALP]MVTDES pour stocker la désignation dans STOALL
+#
+########################################################################
+Subprog CREALL(LALL,LFCY,LITM,LCHR,LDAT,LQTY,LQTA,LTYP,LNUM,LLIN,LSEQ,
+&              LPRE,LDTE,LLOT,LSLO,LSTA,LLOC,LSER,LWRH,LALLQTY,LALLQTA,
+&              LDEFLOC,LDEFLOCTYP,LBPR,LADD,LSCO,LRET)
+Value    Integer  LALL
+Value    Char     LFCY
+Value    Char     LITM
+Value    Decimal  LCHR
+Value    Date     LDAT
+Value    Decimal  LQTY
+Value    Decimal  LQTA
+Value    Integer  LTYP
+Value    Char     LNUM
+Value    Integer  LLIN
+Value    Integer  LSEQ
+Value    Char     LPRE
+Value    Date     LDTE
+Value    Char     LLOT
+Value    Char     LSLO
+Value    Char     LSTA
+Value    Char     LLOC
+Value    Char     LSER
+Value    Char     LWRH
+Value    Decimal  LALLQTY
+Value    Decimal  LALLQTA
+Value    Char     LDEFLOC
+Value    Char     LDEFLOCTYP
+Value    Char     LBPR
+Value    Char     LADD
+Value    Integer  LSCO
+Variable Integer  LRET
+
+Local    Integer  WALL
+Local    Decimal  WQTY, WQTA, WALLQTY, WALLQTA
+Local    Decimal  LSTOCOU
+Local    Decimal  LWIPQTY
+Raz LRET
+
+If clalev([F:STA]) = 0 Local File STOALL [STA] : Endif
+If clalev([F:ITV]) = 0 Local File ITMMVT [ITV] : Endif
+If clalev([F:STO]) = 0 Local File STOCK  [STO] : Endif
+If clalev([F:STC]) = 0 Local File STOLOC [STC] : Endif
+
+WALL    = LALL
+WQTY    = LQTY
+WQTA    = LQTA
+WALLQTY = LALLQTY
+WALLQTA = LALLQTA
+
+# Pour utilisation de [F:STA]VCRTYP dans P.E. STOALL
+[F:STA]VCRTYP = LTYP
+
+# Maj du cumul alloué dans stock si allocation détaillé
+If find(WALL,2,12)
+   Gosub TRT_STO
+   WALL=2 : LALL=2
+Endif
+# Création allocation
+Gosub TRT_ALL
+# Maj cumuls article-site
+Gosub TRT_ITV
+
+If LRET<>0 & GMESSAGE<>""
+   Call ERREUR(GMESSAGE) From GESECRAN
+   Raz GMESSAGE
+Endif
+
+End
+
+########################################################################
+# SUPALL         Suppression d'une allocation
+########################################################################
+# Paramètres E : LFCY = Site
+#                LITM = Article
+#                LCHR = Chrono stock
+#                LCLE = Numero séquence attribué
+#            S : LRET = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+Subprog SUPALL(LFCY,LITM,LCHR,LCLE,LRET)
+Value    Char     LFCY
+Value    Char     LITM
+Value    Decimal  LCHR
+Value    Integer  LCLE
+Variable Integer  LRET
+
+Local    Integer  WALL
+Local    Decimal  WQTY, WQTA
+Local    Decimal  LSTOCOU
+Local    Decimal  LWIPQTY
+Raz LRET
+
+If clalev([F:STA]) = 0 Local File STOALL [STA] : Endif
+If clalev([F:ITV]) = 0 Local File ITMMVT [ITV] : Endif
+If clalev([F:STO]) = 0 Local File STOCK  [STO] : Endif
+
+Readlock [STA]STA0=LFCY;LITM;LCHR;LCLE
+If fstat=1
+   GOK=-1 : GLOCK = "$STOALL"-LFCY-LITM-num$(LCHR)-num$(LCLE)
+   LRET=1
+Elsif fstat
+   GOK=0 : Call RSTA("STA",LFCY-LITM-num$(LCHR)-num$(LCLE)) From GLOCK
+   LRET=1
+Else
+   WALL = [F:STA]ALLTYP
+   WQTY = 0-[F:STA]QTYSTU
+   WQTA = 0-[F:STA]QTYSTUACT
+   # Maj du cumul alloué dans stock si allocation détaillé
+   If WALL=2
+      Gosub TRT_STO
+      # Point d'entrée pour écriture dans une trace
+      If GTRACE<>"" GPOINT="ECRTRACE" : Gosub ENTREE From EXEFNC Endif
+   Endif
+   # Suppression allocation
+   If LRET=0
+      Delete [STA]
+      If fstat
+         GOK=0 : Call FSTA("STA") From GLOCK
+         LRET=1
+      Endif
+   Endif
+   # Maj cumuls article-site
+   Gosub TRT_ITV
+Endif
+
+If LRET<>0 & GMESSAGE<>""
+   Call ERREUR(GMESSAGE) From GESECRAN
+   Raz GMESSAGE
+Endif
+
+End
+
+########################################################################
+# MODALL         Modification d'une allocation
+########################################################################
+# Paramètres E : LFCY = Site
+#                LITM = Article
+#                LCHR = Chrono stock
+#                LCLE = Numero séquence attribué
+#                LQTA = Quantité UA à modifier   qte < 0 = diminution
+#                                                qte > 0 = augmentation
+#            S : LRET = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+Subprog MODALL(LFCY,LITM,LCHR,LCLE,LQTA,LRET)
+Value    Char     LFCY
+Value    Char     LITM
+Value    Decimal  LCHR
+Value    Integer  LCLE
+Value    Decimal  LQTA
+Variable Integer  LRET
+
+Local    Integer  WALL
+Local    Decimal  WQTY, WQTA
+Local    Decimal  LSTOCOU
+Local    Decimal  LWIPQTY
+Raz LRET
+
+If clalev([F:STA]) = 0 Local File STOALL    [STA] : Endif
+If clalev([F:ITV]) = 0 Local File ITMMVT    [ITV] : Endif
+If clalev([F:STO]) = 0 Local File STOCK     [STO] : Endif
+If clalev([F:ITM]) = 0 Local File ITMMASTER [ITM] : Endif
+
+If [F:ITM]ITMREF<>LITM  Read [ITM]ITM0=LITM Endif
+
+Readlock [STA]STA0=LFCY;LITM;LCHR;LCLE
+If fstat=1
+   GOK=-1 : GLOCK = "$STOALL"-LFCY-LITM-num$(LCHR)-num$(LCLE)
+   LRET=1
+Elsif fstat
+   GOK=0 : Call RSTA("STA",LFCY-LITM-num$(LCHR)-num$(LCLE)) From GLOCK
+   LRET=1
+Else
+   WALL = [F:STA]ALLTYP
+   WQTA = LQTA
+   If [F:STA]QTYSTU=0
+      WQTY = WQTA
+   Else
+      WQTY = (WQTA*[F:STA]QTYSTU)/[F:STA]QTYSTUACT
+      #--- Bug 71256
+      #Call QTEARR(WQTY,[F:ITM]STU) From TRTDIV
+   Endif
+
+   # Maj du cumul alloué dans stock si allocation détaillé
+   If WALL=2
+      Gosub TRT_STO
+   Endif
+   # Modification allocation
+   If LRET=0
+      If [F:STA]QTYSTU<>0
+         [F:STA]QTYSTU += WQTY
+      Endif
+      [F:STA]QTYSTUACT += WQTA
+
+      #--- Bug 89483
+      # Si diminution rupture manquant sous-traitance, on fait au mieux
+      # pour être sûr qu'il faut diminuer SRGQTYSTU
+      If [F:STA]STOCOU=0 & [F:STA]SRGNUM="" & [F:STA]SRGQTYSTU>0 & [F:STA]VCRTYP=10
+         [F:STA]SRGQTYSTU=max(0,[F:STA]SRGQTYSTU+WQTY)
+      Endif
+      #---
+
+      If [F:STA]QTYSTUACT<0
+         # Une allocation ne peut pas avoir une quantité négative
+         GOK=0  : GMESSAGE=mess(341,199,1)
+         LRET=1 : End
+      Elsif [F:STA]QTYSTUACT>0
+         Call REWSTA From STKLIB
+      Else
+         Delete [STA]
+      Endif
+      If fstat
+         GOK=0 : Call FSTA("STA") From GLOCK
+         LRET=1
+      Endif
+   Endif
+   # Maj cumuls article-site
+   Gosub TRT_ITV
+Endif
+
+If LRET<>0 & GMESSAGE<>""
+   Call ERREUR(GMESSAGE) From GESECRAN
+   Raz GMESSAGE
+Endif
+
+End
+
+########################################################################
+# CHGALL         Transfert d'allocation d'une pièce à une autre
+########################################################################
+# Paramètres E : ATYP = Type de pièce origine (M.701)
+#                ANUM = Numéro pièce origine
+#                ALIN = Numéro ligne pièce origine
+#                ASEQ = Numéro sequence pièce origine
+#                LTYP = Nouveau type de pièce (M.701)
+#                LNUM = Nouveau numéro pièce
+#                LLIN = Nouveau numéro ligne pièce
+#                LSEQ = Nouveau numéro sequence pièce
+#                LORD = Ordre de traitement (0=All puis Rup, 1=Rup puis All)
+#                LQTE = Quantité UA à traiter
+#            S : LQTA = Total allocations transférés (en UA)
+#                LSHT = Total manquants transférés   (en UA)
+#                LRET = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+Subprog CHGALL(ATYP,ANUM,ALIN,ASEQ,LTYP,LNUM,LLIN,LSEQ,LORD,LQTE,LQTA,LSHT,LRET)
+Value    Integer ATYP
+Value    Char    ANUM
+Value    Integer ALIN
+Value    Integer ASEQ
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Integer LORD
+Value    Decimal LQTE
+Variable Decimal LQTA
+Variable Decimal LSHT
+Variable Integer LRET
+
+LRET=0
+
+Local    Integer WSEQ, WIND
+Local    Char    WCRITSTA(240)
+
+If clalev([F:STA]) = 0 Local File STOALL [STA]   Endif
+If clalev([F:STA1])= 0 Local File STOALL [STA1]  Endif
+
+Raz LQTA, LSHT
+
+WIND=1
+WCRITSTA = 'VCRTYP=ATYP&VCRNUM=ANUM&VCRLIN=ALIN&VCRSEQ=ASEQ'
+If LORD=1
+   WCRITSTA += '&find(ALLTYP,4,5)<>0'
+Else
+   WCRITSTA += '&find(ALLTYP,1,2)<>0'
+Endif
+
+$CHGALL_SUI
+For [STA]STA1 Where evalue(WCRITSTA)
+   Readlock [STA] Curr
+   If fstat=1
+      GOK=-1 : GLOCK = "$STOALL"-num$(ATYP)-ANUM-num$(ALIN)-num$(ASEQ)
+      LRET=1 : Break
+   Elsif fstat
+      GOK= 0 : Call RSTA("STA",num$(ATYP)-ANUM-num$(ALIN)-num$(ASEQ)) From GLOCK
+      LRET=1 : Break
+   Else
+      If LQTE >= [F:STA]QTYSTUACT
+         # Changement de référence de l'allocation
+         [F:STA]VCRTYP     = LTYP
+         [F:STA]VCRNUM     = LNUM
+         [F:STA]VCRLIN     = LLIN
+         [F:STA]VCRSEQ     = LSEQ
+         [F:STA]UPDDAT     = date$
+         [F:STA]UPDUSR     = GUSER
+         Call REWSTA From STKLIB
+         If fstat
+            GOK =0 : Call FSTA("STA") From GLOCK
+            LRET=1 : Break
+         Endif
+         LQTE -= [F:STA]QTYSTUACT
+         If LORD=1
+            If WIND=1
+               LSHT += [F:STA]QTYSTUACT
+            Else
+               LQTA += [F:STA]QTYSTUACT
+            Endif
+         Else
+            If WIND=1
+               LQTA += [F:STA]QTYSTUACT
+            Else
+               LSHT += [F:STA]QTYSTUACT
+            Endif
+         Endif
+      Else
+         # Récupération du prochain no chrono à prendre
+         Filter [STA1] Where STOFCY=[F:STA]STOFCY & ITMREF=[F:STA]ITMREF & STOCOU=[F:STA]STOCOU
+&                            Order By Key STA0
+         Read [STA1] First
+         If fstat = 0  WSEQ =[F:STA1]SEQ-1
+         Else          WSEQ = 99999999
+         Endif
+         Filter [STA1]
+         # Réécriture de l'allocation pour la quantité restante
+         [F:STA]QTYSTU    -= LQTE
+         [F:STA]QTYSTUACT -= LQTE
+         [F:STA]UPDDAT     = date$
+         [F:STA]UPDUSR     = GUSER
+         Call REWSTA From STKLIB
+         If fstat
+            GOK =0 : Call FSTA("STA") From GLOCK
+            LRET=1 : Break
+         Endif
+         # Ecriture de l'allocation pour la quantité traitée
+         [F:STA]QTYSTU     = LQTE
+         [F:STA]QTYSTUACT  = LQTE
+         [F:STA]VCRTYP     = LTYP
+         [F:STA]VCRNUM     = LNUM
+         [F:STA]VCRLIN     = LLIN
+         [F:STA]VCRSEQ     = LSEQ
+         [F:STA]UPDDAT     = date$
+         [F:STA]UPDUSR     = GUSER
+         [F:STA]SEQ        = WSEQ
+         Call ECRSTA From STKLIB
+         If fstat
+            GOK =0 : Call FSTA("STA") From GLOCK
+            LRET=1 : Break
+         Endif
+         WSEQ -= 1
+         LQTE  = 0
+         If LORD=1
+            If WIND=1
+               LSHT += [F:STA]QTYSTUACT
+            Else
+               LQTA += [F:STA]QTYSTUACT
+            Endif
+         Else
+            If WIND=1
+               LQTA += [F:STA]QTYSTUACT
+            Else
+               LSHT += [F:STA]QTYSTUACT
+            Endif
+         Endif
+      Endif
+      If LQTE = 0 Break Endif
+   Endif
+Next
+
+If LRET<>0
+   Raz LQTA, LSHT
+   End
+Endif
+
+# Si après passage sur type 1 et 2, la quantité n'est pas entièrement traitée
+# on fait un passage pour traiter les ruptures
+If WIND=1 & LQTE<>0
+   WIND += 1
+   WCRITSTA = 'VCRTYP=ATYP&VCRNUM=ANUM&VCRLIN=ALIN&VCRSEQ=ASEQ'
+   If LORD=1
+      WCRITSTA += '&find(ALLTYP,1,2)<>0'
+   Else
+      WCRITSTA += '&find(ALLTYP,4,5)<>0'
+   Endif
+   Goto CHGALL_SUI
+Endif
+
+End
+
+########################################################################
+# CSOALL         Consommation des réservations clients (production?)
+########################################################################
+# Paramètres E : LTYP = Type de pièce (1=client)
+#                LNUM = Numéro pièce (no client+code adresse / 15x+3x)
+#                LITM = Article
+#                LFCY = Site
+#                LDAT = Date du besoin
+#                LQTA = Quantité UA à traiter
+#            S : LQTA = Quantité UA traitée
+#                LRET = Code retour (0=OK / 1=Erreur)
+#
+########################################################################
+Subprog CSOALL(LTYP,LNUM,LITM,LFCY,LDAT,LQTA,LRET)
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Char    LITM
+Value    Char    LFCY
+Value    Date    LDAT
+Variable Decimal LQTA
+Variable Integer LRET
+
+Local    Decimal WQTA, WQTY
+
+LRET=0
+WQTA=LQTA
+Raz LQTA
+
+If clalev([F:STA1])= 0 Local File STOALL [STA1]  Endif
+
+Filter [STA1] Where ITMREF=LITM & VCRTYP=LTYP & VCRNUM=LNUM &
+&                   STOFCY=LFCY & ALLDAT>=LDAT
+&             Order By ALLDAT
+For [STA1] Hint Key STA2
+   If find([F:STA1]ALLTYP,1,2)
+      If [F:STA1]QTYSTUACT > WQTA
+         WQTY=(-1)*WQTA
+         Call MODALL(LFCY,LITM,[F:STA1]STOCOU,[F:STA1]SEQ,WQTY,LRET)
+         If LRET=1 Break Endif
+         LQTA+=WQTA
+         Raz WQTA
+         Break
+      Else
+         WQTY=[F:STA1]QTYSTUACT
+         Call SUPALL(LFCY,LITM,[F:STA1]STOCOU,[F:STA1]SEQ,LRET)
+         If LRET=1 Break Endif
+         LQTA+=WQTY
+         WQTA-=WQTY
+         If WQTA<=0 Break Endif
+      Endif
+   Endif
+Next
+# Il y a eu un problème
+If LRET=1 Raz LQTA Endif
+
+Filter [STA1]
+
+End
+
+########################################################################
+# CTRL_STATUT    Alimentation expression WCRITSTO pour contrôle
+#                des statuts autorisés par le filtre allocation
+########################################################################
+# Prérequis    : Buffer règle de gestion en ligne : [F:SRU]
+#
+########################################################################
+# Paramètres E : LSTO     = Table stock "[F:STO]","[F:STO1]" ou "[F:STO2]"
+#                           Si non renseigné --> "[F:STO]"
+#                LSTA     = Statuts du filtre allocation
+#            S : WCRITSTO = Expression pour filtre statut
+#
+########################################################################
+Subprog CTRL_STATUT(LSTO,LSTA,WCRITSTO)
+Value    Char LSTO
+Value    Char LSTA
+Variable Char WCRITSTO()
+
+Local    Char WCRIT(80)
+Raz WCRIT, WCRITSTO
+
+If LSTO="" LSTO="[F:STO]" Endif
+# Si statuts renseignés dans filtre allocation
+If !find(LSTA,"","*")
+   # Décodage de la liste de statuts --> transformation en
+   # une formule contenant des 'pat(%,statut)'
+   Call DECODE_STAT(LSTA,WCRIT) From TRTCATEG
+   # Remplacement des '%' par la variable à tester
+   Call CREE_FORMULE(WCRIT,LSTO+"STA",WCRITSTO) From TRTCATEG
+   Raz WCRIT
+# Sinon prise en compte des sous-statuts autorisés
+Elsif !find([F:SRU]AUZSST,"","*")
+   Call CREE_FORMULE([F:SRU]FORSTA,LSTO+"STA",WCRITSTO) From TRTCATEG
+Endif
+# S'il n'y avait pas de filtre statut ou de sous-statuts autorisés,
+# on traite ceux de la règle de gestion
+If WCRITSTO=""
+   Case [F:SRU]AUZSTA
+      When 1       : If LSTO="[F:STO]"
+                        WCRITSTO='left$([F:STO]STA,1)="A"'
+                     Elsif LSTO="[F:STO1]"
+                        WCRITSTO='left$([F:STO1]STA,1)="A"'
+                     Else
+                        WCRITSTO='left$([F:STO2]STA,1)="A"'
+                     Endif
+      When 2       : If LSTO="[F:STO]"
+                        WCRITSTO='left$([F:STO]STA,1)="Q"'
+                     Elsif LSTO="[F:STO1]"
+                        WCRITSTO='left$([F:STO1]STA,1)="Q"'
+                     Else
+                        WCRITSTO='left$([F:STO2]STA,1)="Q"'
+                     Endif
+      When 3       : If LSTO="[F:STO]"
+                        WCRITSTO='find(left$([F:STO]STA,1),"A","Q")<>0'
+                     Elsif LSTO="[F:STO1]"
+                        WCRITSTO='find(left$([F:STO1]STA,1),"A","Q")<>0'
+                     Else
+                        WCRITSTO='find(left$([F:STO2]STA,1),"A","Q")<>0'
+                     Endif
+      When 4       : If LSTO="[F:STO]"
+                        WCRITSTO='left$([F:STO]STA,1)="R"'
+                     Elsif LSTO="[F:STO1]"
+                        WCRITSTO='left$([F:STO1]STA,1)="R"'
+                     Else
+                        WCRITSTO='left$([F:STO2]STA,1)="R"'
+                     Endif
+      When 5       : If LSTO="[F:STO]"
+                        WCRITSTO='find(left$([F:STO]STA,1),"A","R")<>0'
+                     Elsif LSTO="[F:STO1]"
+                        WCRITSTO='find(left$([F:STO1]STA,1),"A","R")<>0'
+                     Else
+                        WCRITSTO='find(left$([F:STO2]STA,1),"A","R")<>0'
+                     Endif
+      When 6       : If LSTO="[F:STO]"
+                        WCRITSTO='find(left$([F:STO]STA,1),"Q","R")<>0'
+                     Elsif LSTO="[F:STO1]"
+                        WCRITSTO='find(left$([F:STO1]STA,1),"Q","R")<>0'
+                     Else
+                        WCRITSTO='find(left$([F:STO2]STA,1),"Q","R")<>0'
+                     Endif
+      When 7       : WCRITSTO='1=1'
+      When Default : If LSTO="[F:STO]"
+                        WCRITSTO='left$([F:STO]STA,1)="A"'
+                     Elsif LSTO="[F:STO1]"
+                        WCRITSTO='left$([F:STO1]STA,1)="A"'
+                     Else
+                        WCRITSTO='left$([F:STO2]STA,1)="A"'
+                     Endif
+   Endcase
+Endif
+
+End
+
+########################################################################
+# CAL_RERQTY     Calcul de la quantité réservée client (ou production)
+########################################################################
+# Paramètres E : LTYP  = Type de pièce (1=client)
+#                LITM  = Article
+#                LFCY  = Site
+#                LNUM  = Identifiant réservations
+#                        Pour les ventes : client livré (formatté 15x+3x)
+#                LDAT  = Date besoin     : # Bug 65986
+#            S : LQTA  = Quantité réservée (en UA)
+#
+########################################################################
+Subprog CAL_RERQTY(LTYP,LITM,LFCY,LNUM,LDAT,LQTA)
+Value    Integer LTYP
+Value    Char    LITM
+Value    Char    LFCY
+Value    Char    LNUM
+Value    Date    LDAT
+Variable Decimal LQTA
+
+Local Char CRITNUM(80)
+Local Char WCLI(GLONBPC)
+Raz LQTA
+
+#--- Bug 65986
+If LDAT=[0/0/0] LDAT=date$ Endif
+
+If clalev([F:STA1])=0 Local File STOALL [STA1] Endif
+
+# Si client
+If LTYP=1
+   WCLI=vireblc(left$(LNUM,GLONBPC),1)
+   CRITNUM="VCRNUM=LNUM | VCRNUM=WCLI"
+Else
+   CRITNUM="VCRNUM=LNUM"
+Endif
+
+#--- Bug 65986
+#For [STA1]STA2 Where ITMREF=LITM & VCRTYP=LTYP & (VCRNUM=LNUM | evalue(CRITNUM))
+#&                  & STOFCY=LFCY & ALLDAT>=date$
+For [STA1]STA2 Where ITMREF=LITM & VCRTYP=LTYP & (VCRNUM=LNUM | evalue(CRITNUM))
+&                  & STOFCY=LFCY & ALLDAT>=LDAT
+#---
+   LQTA += [F:STA1]QTYSTUACT
+Next
+
+End
+
+########################################################################
+# Lecture ligne stock pour vérification et mise à jour
+########################################################################
+$TRT_STO
+Readlock [STO]STO0=LFCY;LCHR
+If fstat
+   Call RSTA("STO",LFCY-num$(LCHR)) From GLOCK
+   GOK=0 : LRET=1
+Else
+   [F:STO]CUMALLQTY += WQTY
+   [F:STO]CUMALLQTA += WQTA
+   # Si gestion d'en-cours d'allocation, dégestion de celui-ci
+   If WALL=12
+      [F:STO]CUMWIPQTY -= max(0,WQTY-WALLQTY)
+      [F:STO]CUMWIPQTA -= max(0,WQTA-WALLQTA)
+      # Dans le cas où l'on serait passé en négatif
+      [F:STO]CUMWIPQTY  = max(0,[F:STO]CUMWIPQTY)
+      [F:STO]CUMWIPQTA  = max(0,[F:STO]CUMWIPQTA)
+
+      # Suppression qté en cours de traitement
+      LSTOCOU = [F:STO]STOCOU
+      LWIPQTY = WQTY-WALLQTY
+      Call DEL_STOWIPW(LSTOCOU,LWIPQTY) From STKLIB
+
+   Endif
+   # Si augmentation qté allouée et cumul qté allouée <= qté stock
+   # ou diminution qté allouée et cumul qté allouée >= 0
+   If (WQTA>=0 & [F:STO]CUMALLQTA<=[F:STO]QTYSTUACT)
+&   | (WQTA<=0 & [F:STO]CUMALLQTA>=0)
+      [F:STO]UPDDAT     = date$
+      [F:STO]UPDUSR     = GUSER
+      [F:STO]EXPNUM     = [C]EXPORT
+      Call REWSTOA From STKLIB
+      If fstat
+         GOK=0 : Call FSTA("STO") From GLOCK
+         LRET=1
+      Else
+         GPOINT="ALLSTO" : Gosub ENTREE From EXEFNC
+      Endif
+   # Le stock a évolué (un utilisateur a pris le stock par ex:)
+   Else
+      GOK=0
+      Raz GMESSAGE
+      GMESSAGE+=[F:STO]ITMREF
+      If [F:STO]LOT<>""    GMESSAGE-=mess(43,197,1)-":"-[F:STO]LOT    Endif
+      If [F:STO]SLO<>""    GMESSAGE-=mess(456,197,1)-":"-[F:STO]SLO   Endif
+      If [F:STO]SERNUM<>""
+         If GMESSAGE<>"" GMESSAGE+="\" Endif
+         GMESSAGE+=mess(47,197,1)-":"-[F:STO]SERNUM
+      Endif
+      If [F:STO]LOC<>""
+         If GMESSAGE<>"" GMESSAGE+="\" Endif
+         GMESSAGE+=mess(44,197,1)-":"-[F:STO]LOC
+      Endif
+      If [F:STO]STA<>""
+         If GMESSAGE<>"" GMESSAGE+="\" Endif
+         GMESSAGE+=mess(399,198,1)-":"-[F:STO]STA
+      Endif
+      GMESSAGE+="\"+mess(45,196,1)-num$(WQTY)-mess(46,196,1)-num$([F:STO]QTYSTU-[F:STO]CUMALLQTY+WQTY)
+      GMESSAGE+="\"+mess(585,196,1)
+      LRET=1
+   Endif
+Endif
+Return
+
+########################################################################
+# Ecriture allocation
+########################################################################
+$TRT_ALL
+
+If LRET<>0 Return Endif
+
+#--- Issue 109725
+# Si allocation déjà existante pour le même chrono, réécriture de celle-ci
+Filter [STA] Where VCRTYP=LTYP & VCRNUM=LNUM & VCRLIN=LLIN & VCRSEQ=LSEQ &
+&                  STOCOU=LCHR & ITMREF=LITM & ALLTYP=2
+&            Order By Key STA1
+Read [STA] First
+Filter [STA]
+If fstat=0
+   [F:STA]QTYSTU    += WQTY
+   [F:STA]QTYSTUACT += WQTA
+   Call REWSTA From STKLIB
+   If fstat
+      GOK=0 : Call FSTA("STA") From GLOCK
+      LRET=1
+   Endif
+   Return
+Endif
+#---
+
+Filter [STA] Where STOFCY = LFCY & ITMREF = LITM & STOCOU = LCHR
+&            Order By Key STA0
+Read [STA] First
+If fstat=0
+   WSEQ =[F:STA]SEQ-1
+Else
+   WSEQ = 99999999
+Endif
+Filter [STA]
+
+Raz [F:STA]
+If dim([M:ALP]MVTDES)>0 [F:STA]MVTDES=[M:ALP]MVTDES Endif
+[F:STA]STOFCY    = LFCY
+[F:STA]ITMREF    = LITM
+[F:STA]STOCOU    = LCHR
+[F:STA]SEQ       = WSEQ
+#--- Bug 81957
+If LDAT=[0/0/0] LDAT=[31/12/2999] Endif
+[F:STA]ALLDAT    = LDAT
+[F:STA]QTYSTU    = WQTY
+[F:STA]QTYSTUACT = WQTA
+[F:STA]ALLTYP    = WALL
+[F:STA]VCRTYP    = LTYP
+[F:STA]VCRNUM    = LNUM
+[F:STA]VCRLIN    = LLIN
+[F:STA]VCRSEQ    = LSEQ
+[F:STA]PRENUM    = LPRE
+[F:STA]BESDAT    = LDTE
+[F:STA]BPRNUM    = LBPR
+[F:STA]BPAADD    = LADD
+[F:STA]SCOFLG    = LSCO
+If LLOT<>"" [F:STA]LOT    = LLOT Endif
+If LSLO<>"" [F:STA]SLO    = LSLO Endif
+If LSTA<>"" [F:STA]STA    = LSTA Endif
+If LLOC<>"" [F:STA]LOC    = LLOC Endif
+If LSER<>"" [F:STA]SERNUM = LSER Endif
+If LWRH<>"" [F:STA]WRH    = LWRH Endif
+[F:STA]CREDAT    = date$
+[F:STA]CREUSR    = GUSER
+[F:STA]EXPNUM    = [C]EXPORT
+
+# Si gestion dépôt, manquant détail et emplacement renseigné
+# alimentation du dépôt rupture
+If GWRHACT=2 & WALL=4 & LLOC<>""
+   Read [STC]STC0=LFCY;LLOC
+   If !fstat [F:STA]WRH=[F:STC]WRH Endif
+Endif
+
+# Si plan de réapprovisionnement
+# (création alloc détaillée à partir de STOREO ou STOALL (Type 4))
+# --> alimentation SRGNUM et SRGLIN avec VCRNUM et VCRLIN (liste de réappro)
+If LTYP=34
+   [F:STA]SRGNUM = LNUM
+   [F:STA]SRGLIN = LLIN
+Endif
+
+# Allocation détaillée et commande, OF ou EO
+If WALL=2 & find([F:STA]VCRTYP,2,10,36)
+   # Gestion emplacement et type ou emplacement exclusif de consommation
+   If [F:STO]LOC<>"" & (LDEFLOCTYP<>"" | LDEFLOC<>"")
+      # Emplacement exclusif de consommation ..
+      If LDEFLOC<>""
+         # ... différent de celui de l'allocation --> on le stocke
+         If pat([F:STO]LOC,LDEFLOC)=0
+            [F:STA]DEFLOC = LDEFLOC
+            # Si gestion dépôt et emplacement de conso sans jocker
+            # alimentation du dépôt rupture
+            If GWRHACT=2 & !instr(1,LDEFLOC,'*') & !instr(1,LDEFLOC,'?')
+&                        & !instr(1,LDEFLOC,'!') & !instr(1,LDEFLOC,'#')
+               Read [STC]STC0=LFCY;LDEFLOC
+               If !fstat [F:STA]DEFWRH=[F:STC]WRH Endif
+            Endif
+         Endif
+      # Type emplacement exclusif de consommation ..
+      Else
+         # ... différent de celui de l'allocation --> on le stocke
+         If pat([F:STO]LOCTYP,LDEFLOCTYP)=0
+            [F:STA]DEFLOCTYP = LDEFLOCTYP
+         Endif
+      Endif
+   Endif
+Endif
+
+# Si manquant sous-traitant, alimentation du code préparation
+If [F:STA]ALLTYP=4 & [F:STA]SCOFLG=2 & find([F:STA]VCRTYP,10,36)
+   Gosub REC_PRECOD
+Endif
+
+$TRT_ALL1
+Call ECRSTA From STKLIB
+Case fstat
+ When 0       : LCLE = [F:STA]SEQ
+ When 3       : If [F:STA]SEQ > 0
+                   [F:STA]SEQ -= 1
+                   Goto TRT_ALL1
+                Else
+                   GOK=0 : Call FSTA("STA") From GLOCK
+                   LRET=1
+                Endif
+ When Default : GOK=0 : Call FSTA("STA") From GLOCK
+                LRET=1
+Endcase
+Return
+
+########################################################################
+# Mise à jour des cumuls articles
+########################################################################
+$TRT_ITV
+
+If LRET<>0 Return Endif
+
+Readlock [ITV]ITV0=LITM;LFCY
+If fstat=1
+   GOK=-1 : GLOCK = "$ITMMVT"-LITM-LFCY
+   LRET=1
+Elsif fstat
+   # Création ITV
+   Raz [F:ITV]
+   [F:ITV]ITMREF=LITM
+   [F:ITV]STOFCY=LFCY
+   Case WALL
+    When 1 : [F:ITV]GLOALL = WQTA
+    When 2 : If find([F:STO]OWNER,LFCY,"")
+                If [F:STO]LOCCAT=4
+                   Case left$([F:STO]STA,1)
+                    When "A" : [F:ITV]SCOPHYALL = WQTA
+                    When "Q" : [F:ITV]SCOCTLALL = WQTA
+                    When "R" : [F:ITV]SCOREJALL = WQTA
+                   Endcase
+                Else
+                   Case left$([F:STO]STA,1)
+                    When "A" : [F:ITV]PHYALL = WQTA
+                    When "Q" : [F:ITV]CTLALL = WQTA
+                    When "R" : [F:ITV]REJALL = WQTA
+                   Endcase
+                Endif
+             Else
+                [F:ITV]SCCALL = WQTA
+             Endif
+    When 4 : [F:ITV]DETSHT = WQTA
+    When 5 : [F:ITV]GLOSHT = WQTA
+    When Default
+   Endcase
+   #########################################################
+   # Il faudra voir ce que l'on fait avec TRFSTO et TRASTO
+   # si transfert inter-site : à priori rien
+   #########################################################
+   # Si transfert inter-site
+   #If LTYP=22 [F:ITV]TRFSTO=WQTA Endif
+
+   Call ECRITV From STKLIB
+   If fstat
+      GOK=0 : Call FSTA("ITV") From GLOCK
+      LRET=1
+   Endif
+Else
+   # Mise à jour ITV
+   Case WALL
+    When 1 : [F:ITV]GLOALL += WQTA
+    When 2 : If find([F:STO]OWNER,LFCY,"")
+                If [F:STO]LOCCAT=4
+                   Case left$([F:STO]STA,1)
+                    When "A" : [F:ITV]SCOPHYALL += WQTA
+                    When "Q" : [F:ITV]SCOCTLALL += WQTA
+                    When "R" : [F:ITV]SCOREJALL += WQTA
+                   Endcase
+                Else
+                   Case left$([F:STO]STA,1)
+                    When "A" : [F:ITV]PHYALL += WQTA
+                    When "Q" : [F:ITV]CTLALL += WQTA
+                    When "R" : [F:ITV]REJALL += WQTA
+                   Endcase
+                Endif
+             Else
+                [F:ITV]SCCALL += WQTA
+             Endif
+    When 4 : [F:ITV]DETSHT += WQTA
+    When 5 : [F:ITV]GLOSHT += WQTA
+    When Default
+   Endcase
+   #########################################################
+   # Il faudra voir ce que l'on fait avec TRFSTO et TRASTO
+   # si transfert inter-site : à priori rien
+   #########################################################
+   # Si transfert inter-site
+   #If LTYP=22 [F:ITV]TRFSTO+=WQTA Endif
+
+   Call REWITV From STKLIB
+   If fstat
+      GOK=0 : Call FSTA("ITV") From GLOCK
+      LRET=1
+   Endif
+Endif
+Return
+
+
+########################################################################
+# STODISALL      Calcul stock disponible pour allocation manuelle
+#                d'une ligne de commande ou d'OF
+########################################################################
+#
+# Prérequis    : Ces tables doivent être ouvertes   ITMMASTER
+#
+########################################################################
+# Paramètres E : LFCY       = Site stock
+#                LITM       = Article
+#                LTYP       = Type pièce (M.701)   2 = Commande
+#                                                 10 = OF
+#                                                 36 = Ordre de sous-traitance (EO)
+#                LMOD       = Mode allocation      1 = Globale
+#                                                  2 = Détaillée
+#                LPECINTLOC = Prise en compte emp interne (si 0 alors Oui)
+#                                                  1 = Non
+#                                                  2 = Oui
+#                LPECPLFLOC = Prise en compte emp attente rangement
+#                                                  1 = Non
+#                                                  2 = Oui
+#                LPECSCOLOC = Prise en compte emp sous-traitant
+#                                                  1 = Non
+#                                                  2 = Oui
+#                LOWN       = Propriétaire (si "" alors LFCY)
+#                LVCRRER    = Identifiant pour consommation réservations clients
+#                             Si cde vente : client livré (formatté:15x+3x)
+#                             A renseigner si on souhaite cette consommation
+#            S : LSTUACTDIS = Quantité disponible en UA
+#                LRET       = Code retour          0 = OK
+#                                                  1 = Erreur
+#
+########################################################################
+Subprog STODISALL(LFCY,LITM,LTYP,LMOD,LPECINTLOC,LPECPLFLOC,LPECSCOLOC,LOWN,LVCRRER,LSTUACTDIS,LRET)
+Value    Char    LFCY
+Value    Char    LITM
+Value    Integer LTYP
+Value    Integer LMOD
+Value    Integer LPECINTLOC
+Value    Integer LPECPLFLOC
+Value    Integer LPECSCOLOC
+Value    Char    LOWN
+Value    Char    LVCRRER
+Variable Decimal LSTUACTDIS
+Variable Integer LRET
+
+Local    Char    WTRUCOD(6)
+Local    Integer WSTA, WA, WQ, WR, WLOC
+Local    Decimal LRERQTY
+
+Raz LRET, LSTUACTDIS, LRERQTY
+
+If clalev([F:TRU]) =0  Local File TABALLRUL  [TRU]   Endif
+If clalev([F:ITF]) =0  Local File ITMFACILIT [ITF]   Endif
+If clalev([F:ITG]) =0  Local File ITMCATEG   [ITG]   Endif
+If clalev([F:ITV]) =0  Local File ITMMVT     [ITV]   Endif
+
+If LPECINTLOC=0 LPECINTLOC=2 Endif
+
+# Lecture des tables article
+Call LECITM2(LFCY,LITM,"",LRET) From STKLIB
+If LRET<>0 : End : Endif
+
+# Récupération de la règle d'allocation (cde ou OF/Ordre sous-traitance)
+Case LTYP
+ When 2     : WTRUCOD = [F:ITG]ALLRULORD
+ When 10,36 : WTRUCOD = [F:ITG]ALLRULMAT
+ When Default
+Endcase
+
+Raz [F:TRU]
+If WTRUCOD<>""
+   # Lecture règle d'allocation
+   Read [TRU]TRU0=WTRUCOD
+   If fstat Raz WTRUCOD Endif
+Endif
+
+# Si allocation détaillée
+If LMOD=2
+   WSTA=1
+   If WTRUCOD<>""
+      # Statuts autorisés par les règles d'allocation
+      For I=0 To dim([F:TRU]STAFLT)-1
+         If [F:TRU]STAFLT(I)<>0
+            If find([F:TRU]STAFLT(I),1,3,5,7) WA=1  Endif
+            If find([F:TRU]STAFLT(I),2,3,6,7) WQ=1  Endif
+            If find([F:TRU]STAFLT(I),4,5,6,7) WR=1  Endif
+         Endif
+      Next I
+      WSTA = WA+2*WQ+4*WR
+   Endif
+   Raz WLOC
+   # Prise en compte emplacement attente rangement
+   If LPECPLFLOC=2 WLOC+=1  Endif
+   # Prise en compte emplacement sous-traitant
+   If LPECSCOLOC=2 WLOC+=4  Endif
+   # Si pas d'emplacements internes
+   If LPECINTLOC=1 WLOC=WLOC*(-1) Endif
+
+   # Calcul stock disponible
+   Call STODISTOT("",WLOC,WSTA,LOWN,LSTUACTDIS) From STKLIB
+
+   # Prise en compte des réservations client
+   If LVCRRER<>""
+      #--- Bug 65986
+      #Call CAL_RERQTY(1, LITM,LFCY,LVCRRER,LRERQTY)
+      Call CAL_RERQTY(1, LITM,LFCY,LVCRRER,date$,LRERQTY)
+      #---
+      LSTUACTDIS += LRERQTY
+   Endif
+
+# Si allocation globale
+Else
+   # Récupération des statuts autorisés
+   Raz WSTA
+   If [F:ITG]GLOAAAFLG=2 WSTA+=1 Endif
+   If [F:ITG]GLOQQQFLG=2 WSTA+=2 Endif
+   If [F:ITG]GLORRRFLG=2 WSTA+=4 Endif
+
+   Raz WLOC
+   # Prise en compte emplacement attente rangement
+   If LPECPLFLOC=2 WLOC+=1 Endif
+   # Prise en compte emplacement sous-traitant
+   If LPECSCOLOC=2 WLOC+=4 Endif
+   # Si pas d'emplacements internes
+   If LPECINTLOC=1 WLOC=WLOC*(-1) Endif
+   # Calcul stock disponible
+   Call STODISTOT("",WLOC,WSTA,LOWN,LSTUACTDIS) From STKLIB
+
+   # Prise en compte des réservations client
+   If LVCRRER<>""
+      #--- Bug 65986
+      #Call CAL_RERQTY(1, LITM,LFCY,LVCRRER,LRERQTY)
+      Call CAL_RERQTY(1, LITM,LFCY,LVCRRER,date$,LRERQTY)
+      #---
+      LSTUACTDIS += LRERQTY
+   Endif
+Endif
+
+End
+
+########################################################################
+# PURGLO     Suppression des allocations globales temporaires échues
+########################################################################
+#
+########################################################################
+# Paramètres E : LFCY   = Site stock
+#                LITM   = Article
+#                LDAT   = Date de référence (date du jour par défaut)
+#                LTRC   = 1 si fichier trace (ouv+ecr+ferme+lec)
+#                       = 2 si fichier trace (ecritures seules)
+#            S : LRET   = Code retour    0 = OK
+#                                        1 = Erreur
+#
+########################################################################
+Subprog PURGLO(LFCY,LITM,LDAT,LTRC,LRET)
+Variable Char    LFCY
+Variable Char    LITM
+Variable Date    LDAT
+Value    Integer LTRC
+Variable Integer LRET
+
+Local    Date    WDAT
+Local    Decimal WCHR
+Local    Decimal WSEQ
+Local    Integer WRET
+Local    Char    WMSG(120)
+
+# Préparation des paramètres
+LRET=0
+If LDAT=[0/0/0]
+   WDAT=date$
+Else
+   WDAT=LDAT
+Endif
+
+# Ouverture trace
+If LTRC=1
+   WMSG=mess(77,196,1)-":"-format$("D:"+GFMDAT,WDAT)
+   Call OUVRE_TRACE(WMSG) From LECFIC
+Endif
+
+# Ouvertures tables
+If clalev([F:ITV1])=0 : Local File ITMMVT [ITV1] : Endif
+If clalev([F:STA1])=0 : Local File STOALL [STA1] : Endif
+
+# Sélection enregistrements à traiter
+If LFCY=""
+   If LITM=""
+      Filter [STA1] Where VCRTYP=1 & (ALLTYP=1 | ALLTYP=5)
+&                   Order By Key STA1
+   Else
+      Filter [STA1] Where ITMREF=LITM & VCRTYP=1 &
+&                        (ALLTYP=1 | ALLTYP=5)
+&                   Order By Key STA2
+   Endif
+Else
+   If LITM=""
+      Filter [STA1] Where VCRTYP=1 & STOFCY=LFCY & (ALLTYP=1 | ALLTYP=5)
+&                   Order By Key STA1
+   Else
+      Filter [STA1] Where ITMREF=LITM & VCRTYP=1 & STOFCY=LFCY &
+&                        (ALLTYP=1 | ALLTYP=5)
+&                   Order By Key STA2
+   Endif
+Endif
+
+# Lecture
+For [STA1]
+   If [F:STA1]ALLDAT<>[0/0/0] & [F:STA1]ALLDAT<WDAT
+      WCHR = [F:STA1]STOCOU
+      WSEQ = [F:STA1]SEQ
+      Call SUPALL([F:STA1]STOFCY,[F:STA1]ITMREF,WCHR,WSEQ,WRET)
+      If WRET<>0 : LRET = WRET : Break : Endif
+      If LTRC<>0
+         WMSG = mess([F:STA1]ALLTYP,294,1)-":"-[F:STA1]ITMREF-
+&               mess([F:STA1]VCRTYP,701,1)-[F:STA1]VCRNUM-
+&               format$("D:"+GFMDAT,[F:STA1]ALLDAT)-":"-num$([F:STA1]QTYSTUACT)
+         Call ECR_TRACE(WMSG,0) From GESECRAN
+      Endif
+   Endif
+Next
+Filter [STA1]
+
+# Fin de traitement
+If LRET=0
+   If LTRC<>0
+      WMSG = mess(77,196,1)+" : "+format$("D:"+GFMDAT,WDAT)
+      Call ECR_TRACE(WMSG,0) From GESECRAN
+   Endif
+Else
+   If LTRC<>0
+      WMSG = mess(77,196,1)+" : "+format$("D:"+GFMDAT,WDAT)+mess(139,199,1)
+      Call ECR_TRACE(WMSG,1) From GESECRAN
+   Endif
+Endif
+If LTRC=1
+   Call FERME_TRACE From LECFIC
+   Call LEC_TRACE   From LECFIC
+Endif
+
+End
+
+########################################################################
+# RECH_PICLOC    Recherche de l'emplacement (ou type) de consommation
+#                en sortie de stock lors d'une allocation (cde ou OF)
+#                pour stockage dans celle-ci afin d'en permettre
+#                l'exploitation dans le plan de réapprovisionnement
+########################################################################
+# Prérequis    : Ces tables doivent être ouvertes   ITMMASTER  [F:ITM]
+#                                                   ITMCATEG   [F:ITG]
+#                                                   ITMFACILIT [F:ITF]
+#                                                   ITMMVT     [F:ITV]
+#                                                   TABSRU     [F:SRU]
+########################################################################
+# Paramètres E : LTYP       = Type pièce  2 = Commande
+#                                        10 = OF
+#                                        36 = EO
+#                LFCY       = Site
+#                LITM       = Article
+#                LSTOLOC    = Emplacement local (Poste de charge)
+#                LWRH       = Dépôt (normalement "")
+#                LSCO       = Sous-traitance (0 ou 1 = Non / 2 = Oui)
+#                LPRE       = Prêt           (0 ou 1 = Non / 2 = Oui)
+#                LLEC       = Lecture règle de gestion
+#                             ("" ou "O" = Oui / "N" = Non)
+#            S : LDEFLOC    = Emplacement de consommation exclusif
+#                LDEFLOCTYP = Type emplacement de consommation exclusif
+########################################################################
+Subprog RECH_PICLOC(LTYP,LFCY,LITM,LSTOLOC,LWRH,LSCO,LPRE,LLEC,LDEFLOC,LDEFLOCTYP)
+Value    Integer LTYP
+Value    Char    LFCY
+Value    Char    LITM
+Value    Char    LSTOLOC
+Value    Char    LWRH
+Value    Integer LSCO
+Value    Integer LPRE
+Value    Char    LLEC
+Variable Char    LDEFLOC
+Variable Char    LDEFLOCTYP
+
+Local    Integer I, J, K, WNBL, WLOCFLT, LRET, WTRSTYP
+Local    Integer WE1, WE2, WE3, WT1, WT2, WT3
+Local    Char    LSUP
+Local    Char    WTRU1COD(GLONTRU)
+Local    Char    WDEFLOC(GLONLOC), WDEFLOC2(GLONLOC), WDEFLOC3(GLONLOC)
+Local    Char    WDEFLOCTYP(GLONTLO), WDEFLOCTYP2(GLONLOC), WDEFLOCTYP3(GLONLOC)
+Local    Char    WSHTLOC(GLONLOC), WSHTLOCTYP(GLONTLO)
+
+Raz LRET, LDEFLOC, LDEFLOCTYP
+
+If !clalev([F:FCY])  Local File FACILITY [FCY] : Endif : # Bug 57755
+If [F:FCY]FCY<>LFCY Read [FCY]FCY0=LFCY Endif
+
+Call LECITM2(LFCY,LITM,LWRH,LRET) From STKLIB
+If LRET<>0 : Raz GMESSAGE : End : Endif
+
+If [F:ITF]LOCMGTCOD<>2 : End : Endif
+
+WTRU1COD=""
+Case LTYP
+ When  2 : If LSCO=2
+              WTRU1COD = [F:ITG]ALLRULSCO
+              WTRSTYP  = 20
+           Else
+              WTRU1COD = [F:ITG]ALLRULSHI
+              If LPRE=2
+                 WTRSTYP = 17
+              Else
+                 WTRSTYP = 4
+              Endif
+           Endif
+ When 10 : If LSCO=2
+              WTRU1COD = [F:ITG]ALLRULSCC
+              WTRSTYP  = 29
+           Else
+              WTRU1COD = [F:ITG]ALLRULMFG
+              WTRSTYP  = 6
+           Endif
+ When 36 : WTRU1COD = [F:ITG]ALLRULSCC
+           WTRSTYP  = 29
+
+Endcase
+
+If WTRU1COD="" End Endif
+
+If !clalev([F:TRU1]) Local File TABALLRUL [TRU1] Endif
+Read [TRU1]TRU0=WTRU1COD
+If fstat End Endif
+
+If LLEC<>"N"
+   # Lecture de la règle de gestion de sortie à utiliser
+   Call LECSRU(LFCY,[F:ITM]TCLCOD,WTRSTYP,"","",LRET) From STKLIB
+   If LRET<>0 : End : Endif
+Endif
+
+# Si gestion de dépôt sur le site
+If GWRHACT=2 & [F:FCY]WRHGES=2
+  # Récupération du dépôt par défaut sans joker
+  Case WTRSTYP
+    When  4,17 : LWRH=[F:ITF]SHIWRH
+    When 20    : LWRH=[F:ITF]SCOWRH
+    When  6    : LWRH=[F:ITF]MFGWRH
+    When 29    : LWRH=[F:ITF]SCCWRH
+  Endcase
+  If instr(1,LWRH,'*') | instr(1,LWRH,'?')| instr(1,LWRH,'!') | instr(1,LWRH,'#')
+    LWRH=""
+  Endif
+  # Lecture article dépôt
+  If LWRH<>""
+    Read [ITW]ITW0=LITM;LWRH
+    If fstat Raz [F:ITW] Endif
+  Endif
+Endif
+
+# Détermination du nombre de ligne de la règle
+I = find(0,[F:TRU1]LOCFLT(0..dim([F:TRU1]LOCFLT)-1))
+If I=0
+   WNBL = dim([F:TRU1]LOCFLT)
+Else
+   WNBL = I-1
+Endif
+# On a jamais 'Pas de filtre'
+If min([F:TRU1]LOCFLT(0..WNBL-1))>1
+   # Si OF/EO et emplacement local exclusif
+   #--- Issue 102809 by TS
+   #If find(LTYP,10,36) & max([F:TRU1]LOCFLT)=2 & LSTOLOC<>"*" : # LTYP=10 : # GH 07/02/2013 bug 87805
+   #   LDEFLOC = LSTOLOC
+   # Si OF/EO et uniquement emplacement local exclusif --> c'est fini
+   #Elsif find(LTYP,10,36) & min([F:TRU1]LOCFLT)=2             : # LTYP=10 : # GH 07/02/2013 bug 87805
+   #   End
+   If find(LTYP,10,36) & max([F:TRU1]LOCFLT)=2
+      If LSTOLOC<>"*" LDEFLOC=LSTOLOC Endif
+      End
+   #---
+   # Sinon traitement emplacements article exclusifs
+   Else
+      # Alimentation des types et emplacements par défaut
+      Gosub ALI_DEFLOCTYP
+
+      # WLOCFLT contient la valeur max des catégories d'emplacement (3,4 ou 5)
+      WLOCFLT = max([F:TRU1]LOCFLT)
+      Raz WSHTLOC, WSHTLOCTYP
+
+      #--- Issue 102809 by TS
+      # Si emplacement local paramétré dans la règle et OF / EO ou sortie OF / EO
+      # on a déjà traité le type et l'emplacement de rupture
+      If min([F:TRU1]LOCFLT(0..WNBL-1))=2 & (find(LTYP,10,36))
+         End
+      Endif
+      #---
+
+      # Alimentation du (type) emplacement de consommation exclusif
+      Gosub ALI_LOCATION
+
+      LDEFLOC    = WSHTLOC
+      LDEFLOCTYP = WSHTLOCTYP
+   Endif
+Endif
+
+End
+#----------------------------------------------------------------------#
+# Récupération type emp et emp par défaut de l'art-site                #
+#----------------------------------------------------------------------#
+$ALI_DEFLOCTYP
+
+Local Char    WABR
+# Si gestion de dépôt et emplacements par défaut gérés sur article-dépôt
+If GWRHACT=2 & LWRH<>"" & [F:ITW]LOCDEFFLG=2
+   WABR="[F:ITW]"
+# Sinon emplacements par défaut gérés sur article-site
+Else
+   WABR="[F:ITF]"
+Endif
+
+Raz WDEFLOC, WDEFLOC2, WDEFLOC3
+Raz WDEFLOCTYP, WDEFLOCTYP2, WDEFLOCTYP3
+
+#--- Stockage des 3 (types) d'emplacement par défaut
+# Si emplacement 1 renseigné dans règle de gestion
+If [F:SRU]LOCNUM<>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      WDEFLOC     = evalue(WABR+"DEFLOC(I-1)")
+      WDEFLOCTYP  = evalue(WABR+"DEFLOCTYP(I-1)")
+   Endif
+Endif
+# Si emplacement 2 renseigné dans règle de gestion
+If [F:SRU]LOCNUM2<>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM2-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM2-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      WDEFLOC2    = evalue(WABR+"DEFLOC(I-1)")
+      WDEFLOCTYP2 = evalue(WABR+"DEFLOCTYP(I-1)")
+   Endif
+Endif
+# Si emplacement 3 renseigné dans règle de gestion
+If [F:SRU]LOCNUM3<>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM3-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM3-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      WDEFLOC3    = evalue(WABR+"DEFLOC(I-1)")
+      WDEFLOCTYP3 = evalue(WABR+"DEFLOCTYP(I-1)")
+   Endif
+Endif
+
+# I,J et K contiennent la 1ère position des catégories emp 1,2 et 3
+# dans le tableau des règles d'allocation (absent si 0)
+I = find(3,[F:TRU1]LOCFLT(0..WNBL-1))
+J = find(4,[F:TRU1]LOCFLT(0..WNBL-1))
+K = find(5,[F:TRU1]LOCFLT(0..WNBL-1))
+
+# WE1,WE2 et WE3 contiennent 1 si emp par défaut 1,2 et 3
+Raz WE1, WE2, WE3
+If !find(WDEFLOC,"","*")  WE1=1 Endif
+If !find(WDEFLOC2,"","*") WE2=1 Endif
+If !find(WDEFLOC3,"","*") WE3=1 Endif
+# WT1,WT2 et WT3 contiennent 1 si type emp par défaut 1,2 et 3
+Raz WT1, WT2, WT3
+If !find(WDEFLOCTYP,"","*")  WT1=1 Endif
+If !find(WDEFLOCTYP2,"","*") WT2=1 Endif
+If !find(WDEFLOCTYP3,"","*") WT3=1 Endif
+
+Return
+
+########################################################################
+# MODZONALL      Modification du contenu des allocations d'une pièce
+########################################################################
+# Paramètres E : LTYP = Type de pièce origine (M.701)
+#                LNUM = Numéro pièce origine
+#                LLIN = Numéro ligne pièce origine
+#                LSEQ = Numéro sequence pièce origine
+#                LZON = Nom de la zone à modifier
+#                LVAL = Nouvelle valeur de la zone (en char)
+#                LRET = Code retour (0=OK)
+#
+########################################################################
+Subprog MODZONALL(LTYP,LNUM,LLIN,LSEQ,LZON,LVAL,LRET)
+Value    Integer LTYP
+Value    Char    LNUM
+Value    Integer LLIN
+Value    Integer LSEQ
+Value    Char    LZON
+Value    Char    LVAL
+Variable Integer LRET
+
+Local    Char    WCRITSTA(240)
+
+If clalev([F:STA]) = 0 Local File STOALL [STA]   Endif
+
+WCRITSTA = 'VCRTYP=LTYP&VCRNUM=LNUM'
+If LLIN<>0
+   WCRITSTA += '&VCRLIN=LLIN&VCRSEQ=LSEQ'
+Endif
+
+LRET=0
+
+For [STA]STA1 Where evalue(WCRITSTA)
+   Readlock [STA] Curr
+   If fstat=1
+      GOK=-1 : GLOCK = "$STOALL"-num$(LTYP)-LNUM-num$(LLIN)-num$(LSEQ)
+      LRET=1 : Break
+   Elsif fstat
+      GOK= 0 : Call RSTA("STA",num$(LTYP)-LNUM-num$(LLIN)-num$(LSEQ)) From GLOCK
+      LRET=1 : Break
+   Elsif evalue("dim([F:STA]"+LZON+")")>0
+      # Date ou Char
+      If evalue("type([F:STA]"+LZON+")")=3 | evalue("type([F:STA]"+LZON+")")>10
+         Assign "[F:STA]"+LZON With LVAL
+      # Numérique
+      Else
+         Assign "[F:STA]"+LZON With val(LVAL)
+      Endif
+      [F:STA]UPDDAT     = date$
+      [F:STA]UPDUSR     = GUSER
+      Call REWSTA From STKLIB
+      If fstat
+         GOK =0 : Call FSTA("STA") From GLOCK
+         LRET=1 : Break
+      Endif
+   Else
+      Unlock [STA]
+   Endif
+Next
+
+End
+
+########################################################################
+# Récupération type emp et emp par défaut de l'art-site paramétrés     #
+# dans la règle d'allocation/sortie pour filtre picking stock          #
+#----------------------------------------------------------------------#
+# Entrée :    LABR = Abréviation 'ALL','SOR','SOM' ou 'ALP'
+#
+# Sortie :    Renvoie GSTOLOC
+#                     GDEFLOC, GDEFLOC2, GDEFLOC3
+#                     GDEFLOCTYP, GDEFLOCTYP2, GDEFLOCTYP3
+#             pour filtrer le picking stock
+#             selon la règle d'allocation/sortie
+#
+# Prérequis : les buffers ITF, TRU et SRU doivent être en ligne
+########################################################################
+Subprog RECH_DEFLOCTYP(LABR)
+Value Char LABR
+
+Local Integer I,WNBL
+Local Char    WABR
+
+# Si gestion de dépôt et emplacements par défaut gérés sur article-dépôt
+If GWRHACT=2 & [F:ITW]LOCDEFFLG=2
+   WABR="[F:ITW]"
+# Sinon emplacements par défaut gérés sur article-site
+Else
+   WABR="[F:ITF]"
+Endif
+
+Raz GSTOLOC
+Raz GDEFLOC, GDEFLOC2, GDEFLOC3
+Raz GDEFLOCTYP, GDEFLOCTYP2, GDEFLOCTYP3
+
+# Détermination du nombre de ligne de la règle
+I = find(0,[F:TRU]LOCFLT(0..dim([F:TRU]LOCFLT)-1))
+If I=0
+   WNBL = dim([F:TRU]LOCFLT)
+Else
+   WNBL = I-1
+Endif
+
+# S'il y a au moins une fois 'Pas de filtre'
+If find(1,[F:TRU]LOCFLT(0..WNBL-1)) End Endif
+
+# S'il y a au moins une fois 'Emplacement local'
+# et que celui-ci est renseigné, on le stocke
+If find(2,[F:TRU]LOCFLT(0..WNBL-1))
+   Case LABR
+    When "ALL" : If !find([M:ALL]STOLOC,"","*") GSTOLOC=[M:ALL]STOLOC Endif
+    When "SOR" : If !find([M:SOR]STOLOC,"","*") GSTOLOC=[M:SOR]STOLOC Endif
+    When "SOM" : If !find([M:SOM]STOLOC,"","*") GSTOLOC=[M:SOM]STOLOC Endif
+    When "ALP" : If !find([M:ALP]STOLOC,"","*") GSTOLOC=[M:ALP]STOLOC Endif
+   Endcase
+Endif
+
+# S'il y a au moins une fois 'Emplacement 1' dans la règle,
+# et que celui-ci est dans les catégories de l'article-site,
+# on stocke l'emplacement voire le type d'emp s'ils sont renseignés
+If find(3,[F:TRU]LOCFLT(0..WNBL-1)) & [F:SRU]LOCNUM>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      If evalue("find("+WABR+"DEFLOC(I-1),'','*')")=0
+         GDEFLOC    = evalue(WABR+"DEFLOC(I-1)")
+      Elsif evalue("find("+WABR+"DEFLOCTYP(I-1),'','*')")=0
+         GDEFLOCTYP = evalue(WABR+"DEFLOCTYP(I-1)")
+      Endif
+   Endif
+Endif
+
+# S'il y a au moins une fois 'Emplacement 2' dans la règle,
+# et que celui-ci est dans les catégories de l'article-site,
+# on stocke l'emplacement voire le type d'emp s'ils sont renseignés
+If find(4,[F:TRU]LOCFLT(0..WNBL-1)) & [F:SRU]LOCNUM2>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM2-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM2-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      If evalue("find("+WABR+"DEFLOC(I-1),'','*')")=0
+         GDEFLOC2    = evalue(WABR+"DEFLOC(I-1)")
+      Elsif evalue("find("+WABR+"DEFLOCTYP(I-1),'','*')")=0
+         GDEFLOCTYP2 = evalue(WABR+"DEFLOCTYP(I-1)")
+      Endif
+   Endif
+Endif
+
+# S'il y a au moins une fois 'Emplacement 3' dans la règle,
+# et que celui-ci est dans les catégories de l'article-site,
+# on stocke l'emplacement voire le type d'emp s'ils sont renseignés
+If find(5,[F:TRU]LOCFLT(0..WNBL-1)) & [F:SRU]LOCNUM3>1
+   If WABR="[F:ITW]"
+      I = find([F:SRU]LOCNUM3-1,[F:ITW]LOCNUM(0..dim([F:ITW]LOCNUM)-1))
+   Else
+      I = find([F:SRU]LOCNUM3-1,[F:ITF]LOCNUM(0..dim([F:ITF]LOCNUM)-1))
+   Endif
+   If I<>0
+      If evalue("find("+WABR+"DEFLOC(I-1),'','*')")=0
+         GDEFLOC3    = evalue(WABR+"DEFLOC(I-1)")
+      Elsif evalue("find("+WABR+"DEFLOCTYP(I-1),'','*')")=0
+         GDEFLOCTYP3 = evalue(WABR+"DEFLOCTYP(I-1)")
+      Endif
+   Endif
+Endif
+
+End
+
+########################################################################
+# Recherche du code préparation si manquant sous-traitant
+########################################################################
+$REC_PRECOD
+
+If !clalev([F:ITM])  Local File ITMMASTER   [ITM]  Endif
+If !clalev([F:BPC])  Local File BPCUSTOMER  [BPC]  Endif
+
+If [F:ITM]ITMREF<>[F:STA]ITMREF
+   Read [ITM]ITM0=[F:STA]ITMREF
+   If fstat Raz [F:ITM] Endif
+Endif
+If [F:BPC]BPCNUM<>[F:STA]BPRNUM
+   Read [BPC]BPC0=[F:STA]BPRNUM
+   If fstat Raz [F:BPC] Endif
+Endif
+
+Call REC_PRECOD([F:STA]STOFCY,[F:STA]ITMREF,[F:ITM]TCLCOD,[F:ITM]TSICOD(0),
+&               [F:ITM]TSICOD(1),[F:ITM]TSICOD(2),[F:ITM]TSICOD(3),
+&               [F:ITM]TSICOD(4),[F:BPC]BPCNUM,[F:BPC]BCGCOD,[F:BPC]TSCCOD(0),
+&               [F:BPC]TSCCOD(1),[F:BPC]TSCCOD(2),[F:BPC]TSCCOD(3),
+&               [F:BPC]TSCCOD(4),[F:STA]PRECOD)  From STKLIB
+
+Return
+
+#--- Dem 83376
+########################################################################
+# ALL_WEIGHING   Contrôle si la ligne de stock est en cours de pesée :
+#                appelé depuis la fonction de changement de stock
+########################################################################
+########################################################################
+# Paramètres E : LFCY    = Site
+#                LITM    = Article
+#                LSTOCOU = Chrono stock
+#            S : LRET    = Code retour (0=OK / 1=En cours de pesée)
+#
+########################################################################
+Subprog ALL_WEIGHING(LFCY,LITM,LSTOCOU,LRET)
+Value    Char    LFCY
+Value    Char    LITM
+Value    Decimal LSTOCOU
+Variable Integer LRET
+LRET=0
+If GMODU(8) <> 2 # si Module GP absent on sort    hcb 86916
+   End
+Endif
+
+If !clalev([F:STA])  Local File STOALL  [STA]  Endif
+If !clalev([F:MFM])  Local File MFGMAT  [MFM]  Endif
+
+For [STA]STA0 Where STOFCY=LFCY & ITMREF=LITM & STOCOU=LSTOCOU & VCRTYP=10
+   Read [MFM]MFM0=[F:STA]VCRNUM;[F:STA]VCRLIN;[F:STA]VCRSEQ;[F:STA]ITMREF
+   If !fstat & [F:MFM]WGGBOX=2
+      LRET=1 : Break
+   Endif
+Next
+
+End
+#---
