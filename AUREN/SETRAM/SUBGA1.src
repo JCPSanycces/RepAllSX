@@ -1,0 +1,2499 @@
+#<AdxTL>@(#)0.0.0.0 $Revision$
+#
+#*********************************************************************
+#
+#                     GESTION DES PIECES COMPTABLES
+#
+#*********************************************************************
+#
+# Issue X3-105443 - 2019-01-02 by MDJ : Mutli Ledger - Import failed due to inactive dimension
+# Issue X3-63656 - 2018-02-09 by CBO : Same error when SCHEMA in line mode
+# CBO   02.11.17 X3-60690  Error on default value DIE/CCE when a SCHEMA is defined
+# CBO   14.03.17 121731    Erreur ODDIV sur pièces multi-sites
+#
+GBIDC2="" : GBIDC3="" : GFLAG=""
+Call OBJET("GAS",GBIDC2,GBIDC3) From GOBJET
+End
+
+$ACTION
+Case ACTION
+ When Default
+Endcase
+Return
+
+###########################################################################################################
+#
+# $CONTVAL --- Ensemble de vérifications sur les lignes d'écritures        (Appel sous SUBGAS - $VERIF_)
+#  Pour chaque type de référentiel...
+#   1) $CENTRAL --- Génération d'une ligne d'équilibre sur Journal de Trésorerie ou d'à-nouveau
+#   2) $LIAISON --- Génération d'une ligne d'équilibre inter-site
+#   3) $ECART   --- Génération d'une ligne d'écarts d'arrondis (MAJ des Montants référentiels)
+#
+#  Pour chaque identifiant
+#------------- Subprog CONTACC
+#------------- Subprog CONTCCE
+#------------- Subprog CONTDSP
+#
+#  Pour la pièce dans son ensenble
+#   4) $CONTDOE --- Contrôle liée à au modèle comptable Partie Double
+#   5) $CONTTET --- Contrôle la 'catégorie' de la pièce par rapport au paramétrage des types de pièces
+#   6) $CONTPCE --- Tous les Contrôles Lignes inter-référentiel
+#
+###########################################################################################################
+# $CALTOT  --- MAJ de [M]TOTDEB et [M]TOTCDT      (... + Traitements CPTBATCH & LOTIMPORT)
+###########################################################################################################
+# $CONTTAB --- Contrôle sur le nombre de lignes (message : "Tableau de saisie des lignes plein")
+###########################################################################################################
+# $SCHEMA  --- Gestion du schéma de comptes
+# $SETSOL  --- Gestion du bouton 'Solde' des montants
+# $CONTJOU --- Contrôle à la saisie du journal.
+# $CONTDAT --- Contrôle de l'exercice et période + des dates de validité (Traitements SUBGA0 & $CPTAUTO)
+# Subprog MESSPER --- Contrôle de la période (message : "Période Fermée")
+# $CONTBPR --- Contrôle à la saisie du tiers.
+# $SETDES  --- Initialise l'inititulé de la ligne (selon '/' ou '=')
+# $SETQTY  --- Intialise la quantité
+# ------------ Subprog AROQTE
+# Subprog INIDSP --- Initialise la répartition analytique
+###########################################################################################################
+
+###########################################################################################################
+#--- Ensemble de vérifications sur les lignes d'écritures
+# $CONTVAL appelé dans l'étiquette VERFIF_CRE de SUBGAS
+###########################################################################################################
+$CONTVAL
+#--- Contrôle qu'au moins une lignes est saisie.
+If ![M]NBLIG
+ STAT = 35 : Gosub MESSAGE From CPTAUTO : GMESSAGE = MESSA : mkstat = 2 : Return
+Endif
+
+# Déclation des variables...
+# -- la pièce est-elle multi_site...
+# ------ Première passe pour calculer le montant par site.
+Local Char    TBFCY(GLONFCY)(1..GNBSITE)
+Local Integer NBFCY, OKLIAIS, OKTCK
+
+OKLIAIS = 0
+For I=0 To [M:HAEW]NB-1
+ If [M:HAEW]FCYLIN(I)<>[M]FCY
+  If !find([M:HAEW]FCYLIN(I),TBFCY(1..dim(TBFCY)))
+   NBFCY += 1
+   If NBFCY>dim(TBFCY)
+    GMESSAGE = mess(31,106,1) : # Trop de sites différents
+    mkstat = 2 : Break
+   Else
+    TBFCY(NBFCY)  = [M:HAEW]FCYLIN(I)
+   Endif
+  Endif
+ Endif
+Next I
+If NBFCY
+ Local Decimal TBMNT(1..NBFCY), TBMNTLED(1..NBFCY)
+ Local Char    ZON(20), MES(50)
+ Local Char    TBSAC(GLONSAC)(1..NBFCY), TBACC(GLONGAC)(1..NBFCY), TBBPR(GLONBPR)(1..NBFCY), TBCOA(GLONCOA)(1..NBFCY)
+ Local Char    REFSAC(GLONSAC)
+ Local Libelle TBFLGLED(1..NBFCY)
+ Local Integer OK , OK1 , OK2
+# Local Integer NUM_LIAIS(GLONLED + 1)(0..NBFCY) # CBO
+ Local Integer NUM_LIAIS1(0..NBFCY),NUM_LIAIS2(0..NBFCY),NUM_LIAIS3(0..NBFCY),NUM_LIAIS4(0..NBFCY),NUM_LIAIS5(0..NBFCY)
+ Local Integer NUM_LIAIS6(0..NBFCY),NUM_LIAIS7(0..NBFCY),NUM_LIAIS8(0..NBFCY),NUM_LIAIS9(0..NBFCY),NUM_LIAIS10(0..NBFCY)
+ OKLIAIS = 1
+Endif
+
+Local Integer NUM_CTRL(10), NUM_ECART(10), LIG_ECART
+Local Integer INDD, INDF, NBLINCNT, NBLINCRT(0..NBFCY), MAXLIG
+MAXLIG = dim([M:HAEW]SAC)
+
+# Perf - 63838 : Vérification qu'aucune nouvelle ligne en automatique n'a été générée : ligne d'équilibre ($CENTRAL ou $LIAISON) ligne d'écart ($ECART)
+[L]TLIGAUT = [M:HAEW]NB
+# Propagation - 68678
+[L]TPROAUT = 0
+#
+
+#
+Local Tinyint FLGCSL
+Local Integer ASTATUS
+Local Char ERRMES(250)
+Local Char CSLFLO_CTRL(GLONADI), CSLFLO_ECART(GLONADI)
+Local Char CSLBPR_CTRL(GLONADI), CSLBPR_ECART(GLONADI)
+Local Integer NUM_CSLFLO_CTRL, NUM_CSLFLO_ECART
+Local Integer NUM_CSLBPR_CTRL, NUM_CSLBPR_ECART
+
+Onerrgo TRT_ERR
+
+#--- Contrôle l'équilibre de chaque référentiel
+#--- Trie le tableau par Type de référentiel
+Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]LEDTYP(indice),[M:HAEW]NUMLIN(indice)
+
+#--- Pour chaque référentiel,
+#       Vérification de l'équilibre
+#       Gestion de l'inter-site        COMPTE de LIAISON
+#       Gestion de l'Ecart d'Arrondi
+
+Raz INDD,INDF
+While INDF<=[M:HAEW]NB
+ If INDF>INDD & (INDF=[M:HAEW]NB | [M:HAEW]LEDTYP(INDD)<>[M:HAEW]LEDTYP(INDF))
+
+  If INDF<=[M:HAEW]NB : INDF-=1 : Endif
+
+  WTYP=[M:HAEW]LEDTYP(INDF)
+  WLED=[M:HAEW]LED(INDF)
+  Call INDLED(WLED,"",IND,AXE) From CPTDIV
+
+  # Pour chaque référentiel,
+  # Vérifier si période ouverte...
+  If GREP="C" or GREP="D"
+   Raz mkstat : Call CONTPER([M]ACCDAT,WTYP,[M]FCY) From CPTSUB #CHECK IGNORE_LINE
+   If mkstat : GMESSAGE -= "\("+mess(WTYP,2644,1)+")" : Break : Endif
+  Endif
+
+  # Pour chaque référentiel,
+  #  Vérification des montants en devise de transaction
+  #  Equilibre du Total Debit avec Total Crédit si Référentiel doit être 'Equilibré' (au cas où via la transaction de saisie)
+  NB = [M:HAEW]NB
+  If [M:HAEW]TOTDEB(WTYP-1)<>[M:HAEW]TOTCDT(WTYP-1) & ( [M:HAEF]BAL(WTYP-1)=2 or ([M:HAEF]BAL(WTYP-1)<>2 & [M:HAEF]EQL=2))
+   Case [F:JOU]TYP
+    When 3 : # Trésorerie
+     Call LEC_JCO_LEG(GCURLEG,GLEDCOA(IND),[F:JOU]JOU) From CPTLEC
+     If !fstat
+      CENTRAL = [F:JCO]ACC : Gosub CENTRAL
+      If mkstat : Break : Endif
+     Endif
+    When 7 : # A nouveau
+     Call LEC_COA(GLEDCOA(IND)) From CPTLEC
+     CENTRAL = [F:COA]ACCMIS(3) : Gosub CENTRAL
+     If mkstat : Break : Endif
+    When Default
+     GMESSAGE = mess(16,106,1)-mess(WTYP,2644,1) : # Pièce déséquilibrée
+     mkstat = 2 : Break
+   Endcase
+  Elsif [M:HAEF]BAL(WTYP-1)=2
+   # Pour une pièce avec des montants exclusivement nuls en devise de transaction (total de la pièce à zéro),
+   # l'utilisateur doit ajuster les montants forcés - 68193
+   If sum([M]CDT)=0 & sum([M]DEB)=0 & find(0,[M:HAEW]AMTFLG(INDD..INDF)) & sigma(INDD,INDF,[M:HAEW]AMTLED1(indcum)*[M:HAEW]SNS(indcum))<>0
+    # Pièce déséquilibrée en devise référentiel
+    GMESSAGE = mess(111,106,1)-"\("+mess(WTYP,2644,1)+")" : mkstat = 2 : Break
+   Endif
+   # Pour chaque référentiel,
+   #  Vérification des montants en devise de référentiel (avec montants forcés sur toutes les lignes !!!)
+   If [M:HAEF]RNDOPT(WTYP-1)<>2
+    If !find(0,[M:HAEW]AMTFLG(INDD..INDF))
+     If sigma(INDD,INDF,[M:HAEW]AMTLED1(indcum)*[M:HAEW]SNS(indcum))<>0
+      # Pièce déséquilibrée en devise référentiel
+      GMESSAGE = mess(111,106,1)-"\("+mess(WTYP,2644,1)+")" : mkstat = 2 : Break
+     Endif
+    Endif
+   Endif
+  Endif
+
+  If [M:HAEW]NB>NB or AFF
+   Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]LEDTYP(indice),[M:HAEW]IDTLIN(indice)
+   INDF+=[M:HAEW]NB-NB
+  Endif
+
+  # Ventile les informations si pièce multi site.
+  If OKLIAIS
+   NB = [M:HAEW]NB
+   Gosub LIAISON
+   If mkstat : Break : Endif
+   If [M:HAEW]NB>NB
+    Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]LEDTYP(indice),[M:HAEW]IDTLIN(indice)
+    INDF+=[M:HAEW]NB-NB
+   Endif
+  Endif
+
+  # Gestion des écarts d'arrondis
+  NB = [M:HAEW]NB
+  Gosub ECART
+  If mkstat : Break : Endif
+  If [M:HAEW]NB>NB
+   Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]LEDTYP(indice),[M:HAEW]IDTLIN(indice)
+   INDF+=[M:HAEW]NB-NB
+  Endif
+
+  #  Vérification de l'équilibre Partie double
+  If [M:HAEF]DOELEDC(WTYP-1)=2
+   Gosub EQUIL_KRU From SUBGASD
+   If mkstat : Break : Endif
+  Endif
+
+  INDD=INDF+1
+ Else
+  INDF+=1
+ Endif
+Wend
+If mkstat : STAT = 99  : Return : Endif
+
+# Propagation sur les lignes d'équilibre générées en automatique (seules les référentiels coché "non équilibré" sont concernés)
+If [M:HAEW]NB>[L]TLIGAUT
+ If [M]FLGGEN<>2 & TNBLED>1 & GFONCTION="GESGAS"
+  [L]NBLIN=[M:HAEW]NB
+  [L]TPROAUT = 1
+  Gosub LEDGEN From SUBGASB
+  If !OK : STAT=99 : Return : Endif
+ Endif
+Endif
+
+# Pour chaque identifiant, Contrôle Lignes (Appel CONTCCE, CONTDSP...)
+If [F:GDE]FLGLOT<>2
+ Gosub CONTLIG
+ If mkstat : STAT=99 : Return : Endif
+Endif
+
+# Pour la pièce dans son ensemble, Règle de contrôles défini sous le modèle comptable Partie double
+Gosub CONTDOE From SUBGASD
+If mkstat : STAT=99  : Return : Endif
+
+# Pour la pièce dans son ensemble, Règle de contrôles défini sous le modèle comptable
+Gosub CONTPCE
+If mkstat : STAT=99 : Return : Endif
+
+# Contrôle CAT par rapport au paramétrage des types de pièces.
+Gosub CONTTET
+If mkstat : STAT=99 : Return : Endif
+
+# Elimination des lignes à 0 (sauf pièces modèles)
+[L]NB = [M:HAEW]NB
+If [M]CAT<>5 & [M]REFINT<>"DUM"
+ If sum([M:HAEW]DEB(0..[M:HAEW]NB-1))<>0
+  NOL = 0
+  While NOL<=[M:HAEW]NB-1
+   If [M:HAEW]DEB(NOL)=0 & [M:HAEW]CDT(NOL)=0 & ([M:HAEW]AMTFLG(NOL)=0 or [M:HAEW]AMTLED1(NOL)=0)
+&                                             & [M:HAEW]IDTLIN(NOL)<>"ECART" & [M]FLGREP<>2
+    Dela NOL,1,[M:HAEW]NB-1 [M:HAEW]NB
+    [M:HAEW]NB -= 1
+    AFF = 1
+   Else
+    NOL += 1
+   Endif
+  Wend
+  If [M]NBLIG=0 : mkstat = 1 : Endif
+ Endif
+Endif
+
+If dim(GSIVNULL)>0 & GSIVNULL=2
+ If [M]CAT<>5 & sum([M:HAEW]CDT)=0 & sum([M:HAEW]DEB)=0
+&             & sigma(0,[M:HAEW]NB-1,abs([M:HAEW]AMTLED(indcum)))=0 & sigma(0,[M:HAEW]NB-1,abs([M:HAEW]AMTLED1(indcum)))=0
+&             & [M]FLGREP<>2
+  # Lignes nulles interdites
+  GMESSAGE = mess(91,106,1) : mkstat=2 : STAT=99 : Return
+ Endif
+Endif
+
+If [L]NB>[M:HAEW]NB & GFONCTION="GESGAS"
+ Raz [L]NB
+ For INDLED=1 To len(mess(0,2644,1))
+  If [M:HAEF]BAL(INDLED-1)=2 & [M:HAEF]RNDOPT(INDLED-1)<>2
+   NB=1 : Break
+  Endif
+ Next
+ If NB>0
+  Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]LEDTYP(indice),[M:HAEW]NUMLIN(indice)
+  Raz INDD,INDF
+  While INDF<=[M:HAEW]NB
+   If INDF>INDD & (INDF=[M:HAEW]NB | [M:HAEW]LEDTYP(INDD)<>[M:HAEW]LEDTYP(INDF))
+    If INDF<=[M:HAEW]NB : INDF-=1 : Endif
+    WTYP=[M:HAEW]LEDTYP(INDF)
+    If [M:HAEF]BAL(WTYP-1)=2
+     If [M:HAEF]RNDOPT(WTYP-1)<>2 & !find(0,[M:HAEW]AMTFLG(INDD..INDF)) & sigma(INDD,INDF,[M:HAEW]AMTLED1(indcum)*[M:HAEW]SNS(indcum))<>0
+      # Pièce déséquilibrée en devise référentiel
+      GMESSAGE = mess(111,106,1)-"\("+mess(WTYP,2644,1)+")" : mkstat = 2 : Break
+     Endif
+    Endif
+    INDD=INDF+1
+   Else
+    INDF+=1
+   Endif
+  Wend
+  If mkstat : STAT = 99  : Return : Endif
+ Endif
+Endif
+
+Onerrgo
+Return
+
+$TRT_ERR
+Call ECR_TRACE(errp-"("-num$(errl)-") :"-errmes$(errn)-errm, 1) From GESECRAN : mkstat=2
+Resume
+
+
+
+###########################################################################################################
+#   --- Génération d'une ligne d'équilibre sur Journal de Trésorerie ou d'à-nouveau
+###########################################################################################################
+$CENTRAL
+If CENTRAL=""
+ # Compte de trésorerie du plan xxx non défini dans le journal xxx
+ GMESSAGE = func AFNC.MES2(mess(125,106,1),GLEDCOA(IND),[F:JOU]JOU)
+ mkstat=2 : Return
+Endif
+
+Call LEC_GAC(CENTRAL,GLEDCOA(IND)) From CPTLEC
+If [F:GAC]SAC=2
+ GMESSAGE = mess(60,106,1) : mkstat = 2 : OK = 0 : Return
+ # Contrepartie automatique impossible
+Endif
+
+Local Char    ZON(20), CRIREG(80), LIGPCEAUTO(80)
+Local Integer INDCENTRAL
+Raz GNBSTR
+OK=1 : Call CONTACC(CENTRAL,WTYP,WLED,[M]FCY,[M]CUR,[M]ACCDAT)#CHECK IGNORE_LINE
+If mkstat : OK=0 : Return : Endif
+OK=1 : Gosub CONTTAB : If !OK : Return : Endif
+NOL = INDD
+INDCENTRAL = -1
+
+If GCOMPTA<>3 & [F:JOU]TYP = 3 : # Trésorerie
+ If clalev([F:PAN]) = 0 : Local File =GTABCPT+"PAYACCNUM"  [PAN] : Endif
+ While NOL<=INDF
+  If [M:HAEW]ACC(NOL)=CENTRAL & [M:HAEW]LEDTYP(NOL)=WTYP
+   [M:HAEW]TOTDEB(WTYP-1) -= [M:HAEW]DEB(NOL)
+   [M:HAEW]TOTCDT(WTYP-1) -= [M:HAEW]CDT(NOL)
+   #-- Vérification que l'écriture comptable existe sous la table PAYACCNUM
+   Filter [PAN] Where ACCNUM=[M:HAEW]ACCNUM(NOL)
+   Read [PAN]PAN0 First
+   Filter [PAN]
+   If !fstat
+    INDCENTRAL = NOL
+    NOL +=1
+   Else
+    If dim([M:HAEW]CRIMTC)>0    : CRIREG     = [M:HAEW]CRIMTC(NOL)    : Endif
+    If dim([M:HAEW]CODAUTACE)>0 : LIGPCEAUTO = [M:HAEW]CODAUTACE(NOL) : Endif
+    #-- Suppression de la ligne
+    Dela NOL,1,[M:HAEW]NB [M:HAEW]NB
+    [M:HAEW]NB -= 1
+   Endif
+  Else
+   NOL+=1
+  Endif
+ Wend
+Else
+ While NOL<=INDF
+  If [M:HAEW]ACC(NOL)=CENTRAL & [M:HAEW]LEDTYP(NOL)=WTYP
+   [M:HAEW]TOTDEB(WTYP-1) -= [M:HAEW]DEB(NOL)
+   [M:HAEW]TOTCDT(WTYP-1) -= [M:HAEW]CDT(NOL)
+   Dela NOL,1,[M:HAEW]NB [M:HAEW]NB
+   [M:HAEW]NB -= 1
+  Else
+   NOL+=1
+  Endif
+ Wend
+Endif
+#-- Création ou MAJ de ligne de compte de trésorerie
+If INDCENTRAL>-1
+ NOL = INDCENTRAL
+Else
+ NOL = [M:HAEW]NB
+Endif
+#-- L'importance du champ LIN pour la saisie colonne)
+Case [M:HAEF]TYPENT
+ When 1
+  # Saisie en colonne
+  If [L]NBLINCNT=0
+   [L]NBLINCNT=NOL
+   If INDCENTRAL=-1 & max([M:HAEW]LIN)>[L]NBLINCNT : [L]NBLINCNT=max([M:HAEW]LIN) : Endif
+  Endif
+ When 2
+  # Saisie en ligne
+  [L]NBLINCNT=NOL
+Endcase
+#
+[M:HAEW]ACC(NOL) = CENTRAL
+[M:HAEW]CDT(NOL) = ([M:HAEW]TOTDEB(WTYP-1)-[M:HAEW]TOTCDT(WTYP-1))*([M:HAEW]TOTDEB(WTYP-1)>[M:HAEW]TOTCDT(WTYP-1))
+[M:HAEW]DEB(NOL) = ([M:HAEW]TOTCDT(WTYP-1)-[M:HAEW]TOTDEB(WTYP-1))*([M:HAEW]TOTCDT(WTYP-1)>[M:HAEW]TOTDEB(WTYP-1))
+[M:HAEW]IDTLIN(NOL) = "CNTRL"
+[M:HAEW]SAC(NOL) = ""
+[M:HAEW]BPR(NOL) = ""
+Gosub NEWLIN
+If dim([M:HAEW]CRIMTC)>0    : [M:HAEW]CRIMTC(NOL)    = [L]CRIREG        : Endif
+If dim([M:HAEW]CODAUTACE)>0 : [M:HAEW]CODAUTACE(NOL) = [L]LIGPCEAUTO    : Endif
+Gosub CALTOT
+Return
+
+###########################################################################################################
+# --- Ventile les informations si pièce multi site.
+###########################################################################################################
+$LIAISON
+Local Integer I
+If [M:HAEF]BALFCY(WTYP-1)<>2 : Return : Endif
+Gosub CONTLIA
+If !OK | NBFCY=0 : Return : Endif
+For I=1 To NBFCY
+ If TBMNT(I) | TBMNTLED(I)
+  OK1 = 0 : OK2 = 0
+  For NOL=INDD To INDF
+   If [M:HAEW]ACC(NOL)=TBACC(I) & [M:HAEW]BPR(NOL)=TBBPR(I) & [M:HAEW]COA(NOL)=TBCOA(I)
+    If [M:HAEW]FCYLIN(NOL)=[M]FCY & !OK1
+     If [M:HAEW]DEB(NOL)<>0         : OK1=1
+     Elsif [M:HAEW]CDT(NOL)<>0      : OK1=-1
+     Elsif [M:HAEW]AMTLED1(NOL)<>0  : OK1=[M:HAEW]SNS(NOL)
+     Else                           : OK1=1
+     Endif
+     If TBFLGLED(I)
+      [M:HAEW]AMTFLG(NOL) = 1 : [M:HAEW]AMTLED1(NOL) = (OK1*[M:HAEW]AMTLED1(NOL))+TBMNTLED(I)
+     Else
+      [M:HAEW]AMTFLG(NOL) = 0 : [M:HAEW]AMTLED1(NOL) = 0
+     Endif
+     [M:HAEW]DEB(NOL) = [M:HAEW]DEB(NOL)-[M:HAEW]CDT(NOL)+TBMNT(I)
+     [M:HAEW]CDT(NOL) = 0
+     OK1 = NOL+1
+    Elsif [M:HAEW]FCYLIN(NOL)=TBFCY(I) & !OK2
+     If [M:HAEW]DEB(NOL)<>0         : OK2=1
+     Elsif [M:HAEW]CDT(NOL)<>0      : OK2=-1
+     Elsif [M:HAEW]AMTLED1(NOL)<>0  : OK2=[M:HAEW]SNS(NOL)
+     Else                           : OK2=1
+     Endif
+     If TBFLGLED(I)
+      [M:HAEW]AMTFLG(NOL) = 1 : [M:HAEW]AMTLED1(NOL) = (OK2*[M:HAEW]AMTLED1(NOL))-TBMNTLED(I)
+     Else
+      [M:HAEW]AMTFLG(NOL) = 0 : [M:HAEW]AMTLED1(NOL) = 0
+     Endif
+     [M:HAEW]DEB(NOL) = [M:HAEW]DEB(NOL)-[M:HAEW]CDT(NOL)-TBMNT(I)
+     [M:HAEW]CDT(NOL) = 0
+     OK2 = NOL+1
+    Endif
+    If OK1 & OK2 : Break : Endif
+   Endif
+  Next NOL
+
+  If !OK1
+   Gosub CONTTAB : If !OK : Break : Endif
+   NOL = [M:HAEW]NB
+   [M:HAEW]FCYLIN(NOL) = [M]FCY
+   [M:HAEW]SAC(NOL)    = TBSAC(I)
+   [M:HAEW]ACC(NOL)    = TBACC(I)
+   [M:HAEW]BPR(NOL)    = TBBPR(I)
+   If TBMNT(I)>=0
+     [M:HAEW]DEB(NOL)  = TBMNT(I)
+   Else
+     [M:HAEW]CDT(NOL)  = -TBMNT(I)
+   Endif
+   If TBFLGLED(I)
+    [M:HAEW]AMTFLG(NOL) = 1
+    If  TBMNT(I)<>0
+     [M:HAEW]AMTLED1(NOL) = TBMNTLED(I)*(([M:HAEW]DEB(NOL)<>0)-([M:HAEW]CDT(NOL)<>0))
+    Else
+     [M:HAEW]AMTLED1(NOL) = TBMNTLED(I)
+    Endif
+   Endif
+   [M:HAEW]IDTLIN(NOL) = "LIAIS"
+   Gosub NEWLIN  : OK=1 : # Ligne sur le compte de liaison du site de la pièce
+  Else
+   NOL = OK1-1
+   If [M:HAEW]DEB(NOL)<0
+    [M:HAEW]CDT(NOL) = -[M:HAEW]DEB(NOL) : [M:HAEW]DEB(NOL) = 0
+    If [M:HAEW]AMTFLG(NOL) = 1   : [M:HAEW]AMTLED1(NOL) =- [M:HAEW]AMTLED1(NOL) : Endif
+   Endif
+   Gosub MODLIN
+  Endif
+
+  If !OK2
+   Gosub CONTTAB : If !OK : Break : Endif
+   NOL = [M:HAEW]NB
+   [M:HAEW]FCYLIN(NOL) = TBFCY(I)
+   [M:HAEW]SAC(NOL)    = TBSAC(I)
+   [M:HAEW]ACC(NOL)    = TBACC(I)
+   [M:HAEW]BPR(NOL)    = TBBPR(I)
+   If TBMNT(I)>=0
+     [M:HAEW]CDT(NOL)  = TBMNT(I)
+   Else
+     [M:HAEW]DEB(NOL)  = -TBMNT(I)
+   Endif
+   If TBFLGLED(I)
+    [M:HAEW]AMTFLG(NOL) = 1
+    If TBMNT(I)<>0
+     [M:HAEW]AMTLED1(NOL) = TBMNTLED(I)*(([M:HAEW]CDT(NOL)<>0)-([M:HAEW]DEB(NOL)<>0))
+    Else
+     [M:HAEW]AMTLED1(NOL) = TBMNTLED(I)*-1
+    Endif
+   Endif
+   [M:HAEW]IDTLIN(NOL) = "LIAIS"
+   Gosub NEWLIN    : OK=1 : # Ligne sur le compte de liaison du site de la pièce
+  Else
+   NOL = OK2-1
+   If [M:HAEW]DEB(NOL)<0
+    [M:HAEW]CDT(NOL) = -[M:HAEW]DEB(NOL) : [M:HAEW]DEB(NOL) = 0
+    If [M:HAEW]AMTFLG(NOL) = 1   : [M:HAEW]AMTLED1(NOL) =- [M:HAEW]AMTLED1(NOL) : Endif
+   Endif
+   Gosub MODLIN
+  Endif
+ Endif
+Next I
+If !OK : Return : Endif
+Gosub CALTOT
+Return
+
+########
+$CONTLIA
+OK = 0
+If dim([M]FCYLIN)<=0 : Return : Endif
+# Issue 121731
+#Raz NBFCY, TBFCY,TBMNT,TBMNTLED,TBSAC,TBACC,TBBPR,TBCOA,TBFLGLED CBO
+Raz TBMNT,TBMNTLED,TBSAC,TBACC,TBBPR,TBCOA,TBFLGLED
+# End Issue 121731
+
+# Première passe pour calculer le montant par site.
+For NOL=INDD To INDF
+ If [M:HAEW]FCYLIN(NOL)<>[M]FCY
+  K = find([M:HAEW]FCYLIN(NOL),TBFCY(1..dim(TBFCY)))
+  If !K
+   NBFCY += 1
+   If NBFCY>dim(TBCOA)
+    GMESSAGE = mess(31,106,1) : # Trop de sites différents
+    mkstat = 2 : Break
+   Else
+    K = NBFCY
+    TBFCY(K)  = [M:HAEW]FCYLIN(NOL)
+    TBCOA(K)  = [M:HAEW]COA(NOL)
+    TBFLGLED(K)= 1
+   Endif
+  # Issue 121731
+  Else
+    TBCOA(K)  = [M:HAEW]COA(NOL)
+    TBFLGLED(K)= 1
+    # End Issue 121731
+  Endif
+
+  If [M:HAEW]DEB(NOL)<>0    : I=1
+  Elsif [M:HAEW]CDT(NOL)<>0 : I=-1
+  Else                      : I=[M:HAEW]SNS(NOL)
+  Endif
+  If [M:HAEW]AMTFLG(NOL)<>0 : [M:HAEW]AMTLED(NOL)=[M:HAEW]AMTLED1(NOL)
+  Else TBFLGLED(K)=0
+  Endif
+  TBMNT(K)    += [M:HAEW]DEB(NOL) - [M:HAEW]CDT(NOL)
+  TBMNTLED(K) += I*[M:HAEW]AMTLED(NOL)
+ Endif
+Next NOL
+If !NBFCY : Return : Endif
+# Deuxième passe pour vérifier si déséquilibre entre site.
+OK = 0
+For I=1 To NBFCY
+ If TBMNT(I)<>0 | TBMNTLED(I)<>0
+  OK = 1 : Break
+ Endif
+Next
+If !OK : Return : Endif
+# Dernière passe pour vérifier le paramètrage
+For K=1 To NBFCY
+ If TBMNT(K)<>0 | TBMNTLED(K)<>0
+  [L]OKTCK = 1
+  Read [TCK]TCK0 =  TBCOA(K);TBFCY(K);[M]FCY
+  If fstat
+   Read [TCK]TCK0 =  TBCOA(K);[M]FCY;TBFCY(K)
+   If fstat
+    Read [TCK]TCK0 =  TBCOA(K);"";""
+    If fstat
+     [L]OKTCK = 0
+    Endif
+   Endif
+  Endif
+  If [L]OKTCK
+   TBSAC(K)  = [F:TCK]SAC
+   TBACC(K)  = [F:TCK]ACC
+   TBBPR(K)  = [F:TCK]BPR
+  Endif
+ GPOINT = "TABACCLIK" : Gosub ENTREE From EXEFNC
+  If TBACC(K)=""
+   GMESSAGE = mess(32,106,1)-TBFCY(K)-"("+TBCOA(K)+")" : # Compte de liaison inexistant
+   mkstat = 2 : Break
+  Endif
+  Raz GNBSTR
+  Call CONTACC(TBACC(K),WTYP,WLED,[M]FCY,[M]CUR,[M]ACCDAT)#CHECK IGNORE_LINE
+  If mkstat : Break : Endif
+ Endif
+Next
+If OK & [M]CAT=4 : # Hors-bilan
+ GMESSAGE = mess(56,106,1) : # Génération automatique des écritures de liaison impossible
+ mkstat = 2
+Endif
+If mkstat : OK=0 : Endif
+Return
+
+###########################################################################################################
+# $ECART   --- Gestion des écarts d'arrondis
+###########################################################################################################
+$ECART
+Local Char DEVORG(GLONCUR), DEVDES(GLONCUR)
+Local Decimal COURS
+
+#-- Pièce modifiée en statut définitif, aucun (re)calcul.
+If GREP="M" & [F:HAE]STA=2 :  Return : Endif
+
+#-- Selon modèle comptable, "Saupoudrage" (1) ou "Gestion d'écart d'arrondis" (2) (RNDOPTBAL)
+If [M:HAEF]BAL(WTYP-1)=2 & [M:HAEF]RNDOPT(WTYP-1)<>2 : Gosub NO_ECART : Return : Endif
+
+#-- MAJ des montants Référentiels pour génère éventuellement des lignes d'écart d'arrondis !!
+#--   Ligne d'écart d'arrondis par Référentiel (boucle précédente) et par site
+#--   Masque GACCENTW trié par Référentiel
+#--     Indice de début du référentiel : Ligne INDD
+#--     Indice de fin   du référentiel : Ligne INDF
+
+I=dim(TBFCY) : If I<=0 : I=GNBSITE : Endif
+Local Decimal TBLED(I+1)
+Local Char    TBACC2(GLONGAC)(1..4), TBSEC(GLONCCE)(1..9)
+Local Integer OK1, OKGNR
+
+# Position des devises par rapport à l'Euro
+Call SETFLGDEV([M]CUR,[M]CPY,[M]RATDAT) From CPTDIV
+
+# Recherche Si pièce est déséquilibrée en devise de référentiel
+# Boucle pour alimenter TBLED => Montant référentiel par site.
+For NOL=INDD To INDF
+ If [M:HAEW]FCYLIN(NOL)=[M]FCY or [M:HAEF]BALFCY(WTYP-1)<>2
+  I=0
+ Else
+  I = find([M:HAEW]FCYLIN(NOL),TBFCY(1..NBFCY))
+ Endif
+
+ If [M:HAEW]DEB(NOL)<>0
+  If [M]CUR=[M:HAEW]CURLED(NOL)
+   [M:HAEW]AMTLED(NOL)=[M:HAEW]DEB(NOL)
+   Raz [M:HAEW]AMTFLG(NOL), [M:HAEW]AMTLED1(NOL)
+  Elsif [M:HAEW]AMTFLG(NOL)<>0
+   [M:HAEW]AMTLED(NOL)=[M:HAEW]AMTLED1(NOL)
+  Else
+   Call SETCOURS(NOL,DEVORG,DEVDES,COURS)
+   Call CONVERT3(DEVORG,DEVDES,[M:HAEW]CURLED(NOL),[M]TYPRAT,[M]RATDAT,
+&                 [M:HAEW]DEB(NOL),[M:HAEW]AMTLED(NOL),COURS,STAT) From CPTSUB
+   If STAT : # Pas de cours de devises [M]CUR -> [M:HAEW]CURLED(NOL) (RATDAT)
+    GMESSAGE=mess(16,114,1)-[M]CUR-"->"-[M:HAEW]CURLED(NOL)-"("+format$("D:"+GFMDAT,[M]RATDAT)+")"
+    mkstat=2 : Break
+   Endif
+  Endif
+  K=1
+ Elsif [M:HAEW]CDT(NOL)<>0
+  If [M]CUR=[M:HAEW]CURLED(NOL)
+   [M:HAEW]AMTLED(NOL)=[M:HAEW]CDT(NOL)
+   Raz [M:HAEW]AMTFLG(NOL), [M:HAEW]AMTLED1(NOL)
+  Elsif [M:HAEW]AMTFLG(NOL)<>0
+   [M:HAEW]AMTLED(NOL)=[M:HAEW]AMTLED1(NOL)
+  Else
+   Call SETCOURS(NOL,DEVORG,DEVDES,COURS)
+   Call CONVERT3(DEVORG,DEVDES,[M:HAEW]CURLED(NOL),[M]TYPRAT,[M]RATDAT,
+&                [M:HAEW]CDT(NOL),[M:HAEW]AMTLED(NOL),COURS,STAT) From CPTSUB
+   If STAT : # Pas de cours de devises [M]CUR -> [M:HAEW]CURLED(NOL) (RATDAT)
+    GMESSAGE=mess(16,114,1)-[M]CUR-"->"-[M:HAEW]CURLED(NOL)-"("+format$("D:"+GFMDAT,[M]RATDAT)+")"
+    mkstat=2 : Break
+   Endif
+  Endif
+  K=-1
+ Else
+  If [M]CUR=[M:HAEW]CURLED(NOL)
+   Raz [M:HAEW]AMTLED(NOL),[M:HAEW]AMTFLG(NOL),[M:HAEW]AMTLED1(NOL)
+  Elsif [M:HAEW]AMTFLG(NOL)<>0
+   [M:HAEW]AMTLED(NOL)=[M:HAEW]AMTLED1(NOL)
+  Else
+   Raz [M:HAEW]AMTLED(NOL),[M:HAEW]AMTFLG(NOL),[M:HAEW]AMTLED1(NOL)
+  Endif
+  K=[M:HAEW]SNS(NOL)
+ Endif
+
+ TBLED(I) += K*[M:HAEW]AMTLED(NOL)
+Next NOL
+If mkstat : Return : Endif
+
+#-- Génération d'une ligne d'écart dans le cas d'un Référentiel avec Saisie Equilibrée & Pièce "Hors-Bilan"
+If [M:HAEF]BAL(WTYP-1)=2 & [M]CAT<>4
+ #-- Si pièce déséquilibrée : TBLED(x)<>0
+ #--  Génération d'une ligne d'écart d'arrondis par Référentiel/Site
+ OK=1
+ For I=0 To NBFCY
+  If TBLED(I)<>0
+   #-- Position de K = Sens de l'écart (Crédit/Débit)
+   If TBLED(I)>0 : K=1 : Else K=2 : Endif
+   #-- Recherche du compte d'écart
+   If TBACC2(K)=""
+    Gosub SETCPTRND
+    If mkstat : Break : Endif
+   Endif
+   #-- Mise à jour du montant de l'écart si ligne déjà existante (=saisie)
+   OK1=K
+   For NOL=INDD To INDF
+    If [M:HAEW]ACC(NOL)=TBACC2(K) & [M:HAEW]BPR(NOL)="" & [M:HAEW]COA(NOL)=GLEDCOA(IND)
+&      & ((!I & [M:HAEW]FCYLIN(NOL)=[M]FCY) | (I & [M:HAEW]FCYLIN(NOL)=TBFCY(I)))
+     Gosub MTRNDLED : OK1=0
+    Endif
+    # Si MAJ effectuée => on sort
+    If !OK1 : Break : Endif
+   Next
+   # Si ligne d'écart non présente, création de la ligne d'écart d'arrondis
+   If OK1
+    K=OK1 : Gosub NEWLIGRND : If !OK : Break : Endif
+    Gosub MTRNDLED
+    Gosub NEWLIN
+
+    If LIG_ECART
+     # Génération d'une ligne sur Référentiel d'origine (montant nul)
+     K=OK1 : Gosub NEWLIGRND : If !OK : Break : Endif
+     SVG_WTYP = WTYP
+     WTYP     = [L]ORITYP :  Gosub NEWLIN
+     WTYP     = SVG_WTYP
+     Raz [M:HAEW]AMTLED(NOL), [M:HAEW]AMTFLG(NOL), [M:HAEW]AMTLED1(NOL)
+     [M:HAEW]ACCNUMORI(LIG_ECART) = [M:HAEW]ACCNUM(NOL)
+     # Il faut inverser l'ordre des lignes (indispensable pour $LIEN$, la ligne dit Origine doit précédé le ligne dit "Automatique")
+     K = [M:HAEW]LIN(LIG_ECART)
+     [M:HAEW]LIN(LIG_ECART) =  [M:HAEW]LIN(NOL)
+     [M:HAEW]LIN(NOL) =  K
+     LIG_ECART=0
+    Endif
+   Endif
+  Endif
+ Next I
+Endif
+Return
+
+$NO_ECART
+Local Integer STAT
+Gosub SETMSK From SUBGAS
+
+Local Decimal DEBLED(MAXLIG) , CDTLED(MAXLIG)
+Local Decimal AROLED
+Call LEC_CPY([M]CPY) From CPTLEC
+Call LEC_TCU([M:HAEW]CURLED(INDD)) From CPTLEC
+AROLED = [F:TCU]CURRND
+
+Call SETCOURS(INDD,DEVORG,DEVDES,COURS)
+Call CONVERT_SIT(DEVORG,DEVDES,[M:HAEW]CURLED(INDD),INDD,INDF
+&  ,[M:HAEW]DEB,DEBLED,[M:HAEW]CDT,CDTLED
+&  ,[M:HAEW]AMTFLG,[M:HAEW]AMTLED1,[M:HAEW]FCYLIN
+&  ,[M]TYPRAT,[M]RATDAT,COURS,AROLED,[M:HAEW]SNS,STAT) From SUBGA2
+If mkstat=2 : Return : Endif
+
+For I=INDD To INDF
+ If [M]CUR=[M:HAEW]CURLED(I)
+  If [M:HAEW]DEB(I)<>0
+   [M:HAEW]AMTLED(I)=[M:HAEW]DEB(I)
+   Raz [M:HAEW]AMTFLG(I), [M:HAEW]AMTLED1(I)
+  Else
+   [M:HAEW]AMTLED(I)=[M:HAEW]CDT(I)
+   Raz [M:HAEW]AMTFLG(I), [M:HAEW]AMTLED1(I)
+  Endif
+ Else
+  If [M:HAEW]CDT(I)<>0
+   [M:HAEW]AMTLED(I)=CDTLED(I)
+  Else
+   [M:HAEW]AMTLED(I)=DEBLED(I)-CDTLED(I)
+   If [M:HAEW]DEB(I)=0 & [M:HAEW]AMTLED(I)<0
+    [M:HAEW]SNS(I)      = -1
+    [M:HAEW]AMTLED (I) *= -1
+    [M:HAEW]QTY(I)     *= -1
+   Endif
+  Endif
+ Endif
+Next
+Return
+
+$SETCPTRND
+Call LEC_COA(GLEDCOA(IND)) From CPTLEC
+Case K
+ When 1 : TBACC2(K)=[F:COA]ACCMIS(12) : MES=mess(13,2649,1)
+ When 2 : TBACC2(K)=[F:COA]ACCMIS(11) : MES=mess(12,2649,1)
+Endcase
+If TBACC2(K)="" : # Paramètre non renseigné
+ GMESSAGE=mess(171,133,1)-":"-MES : mkstat=2 : Return
+Endif
+Call LEC_GAC(TBACC2(K),GLEDCOA(IND)) From CPTLEC
+If [F:GAC]SAC=2 : # Paramètre ZON - CPT : Compte non général
+ GMESSAGE=mess(81,123,1)-MES-"\"+TBACC2(K)-":"-mess(12,106,1) : mkstat=2 : Return
+Endif
+Return
+
+$NEWLIGRND
+Gosub CONTTAB : If !OK : Return : Endif
+NOL = [M:HAEW]NB
+If I=0 : [M:HAEW]FCYLIN(NOL) = [M]FCY
+Else   : [M:HAEW]FCYLIN(NOL) = TBFCY(I)
+Endif
+[M:HAEW]SAC(NOL)       = ""
+[M:HAEW]ACC(NOL)       = TBACC2(K)
+[M:HAEW]BPR(NOL)       = ""
+[M:HAEW]DEB(NOL)       = 0
+[M:HAEW]CDT(NOL)       = 0
+[M:HAEW]AMTLED(NOL)    = 0
+[M:HAEW]IDTLIN(NOL)    = "ECART"
+#-- L'importance du champ LIN pour la saisie colonne)
+Case [M:HAEF]TYPENT
+ When 1
+  # Saisie en colonne
+  If I=0
+   If [L]NBLINCRT=0 : [L]NBLINCRT=NOL : Endif
+  Else
+   If [L]NBLINCRT(I)=0 : [L]NBLINCRT(I)=NOL : Endif
+  Endif
+ When 2
+  # Saisie en ligne
+  If I=0
+   [L]NBLINCRT=NOL
+  Else
+   [L]NBLINCRT(I)=NOL
+  Endif
+Endcase
+Return
+
+$MTRNDLED
+If [M:HAEW]DEB(NOL)<>0    : K=1
+Elsif [M:HAEW]CDT(NOL)<>0 : K=-1
+Elsif [M:HAEW]SNS(NOL)<>0 : K=[M:HAEW]SNS(NOL)
+Else K=1
+Endif
+[M:HAEW]AMTLED(NOL)-= K*TBLED(I)
+[M:HAEW]AMTFLG(NOL) = 1
+[M:HAEW]AMTLED1(NOL)=[M:HAEW]AMTLED(NOL)
+Return
+
+$NEWLIN
+[M:HAEW]LED(NOL)    = WLED
+[M:HAEW]LEDTYP(NOL) = WTYP
+[M:HAEW]COA(NOL)    = GLEDCOA(IND)
+[M:HAEW]CURLED(NOL) = [M:HAEF]CURC(WTYP-1)
+[M:HAEW]AMTCUR(NOL) = [M:HAEW]DEB(NOL)+[M:HAEW]CDT(NOL)
+If [M:HAEW]DEB(NOL)<>0      : [M:HAEW]SNS(NOL)=1
+Elsif [M:HAEW]CDT(NOL)<>0   : [M:HAEW]SNS(NOL)=-1
+Elsif [M:HAEW]AMTLED(NOL)<0 : [M:HAEW]SNS(NOL)=-1
+Else [M:HAEW]SNS(NOL)=1
+Endif
+
+# Le champ LIN est important pour une saisie colonne
+Case [M:HAEW]IDTLIN(NOL)
+ When "CNTRL"
+  If [L]NBLINCNT>0
+   [M:HAEW]LIN(NOL) = [L]NBLINCNT+1
+  Else
+   [M:HAEW]LIN(NOL) = [M:HAEW]NB+1
+  Endif
+ When "LIAIS"
+  [M:HAEW]LIN(NOL) = [M:HAEW]NB+1
+  If [M:HAEW]DEB(NOL)=0 & [M:HAEW]CDT(NOL)=0 & [M:HAEW]AMTLED1(NOL)<0
+   [M:HAEW]SNS(NOL)      = -1
+   [M:HAEW]AMTLED1(NOL) *= -1
+  Endif
+ When "ECART"
+  K = find([M:HAEW]FCYLIN(NOL),TBFCY(1..NBFCY))
+  If K=0
+   If [L]NBLINCRT>0
+    [M:HAEW]LIN(NOL) = [L]NBLINCRT+1
+   Else
+    [M:HAEW]LIN(NOL) = [M:HAEW]NB+1
+   Endif
+  Else
+   If [L]NBLINCRT(K)>0
+    [M:HAEW]LIN(NOL) = [L]NBLINCRT(K)+1
+   Else
+    [M:HAEW]LIN(NOL) = [M:HAEW]NB+1
+   Endif
+  Endif
+Endcase
+
+If [M:HAEW]SNS(NOL)=1
+ Assign "[M:HAEW]TOTDEB("+num$(WTYP-1)+")" With evalue("[M:HAEW]TOTDEB("+num$(WTYP-1)+")") +  [M:HAEW]AMTCUR(NOL)
+Else
+ Assign "[M:HAEW]TOTCDT("+num$(WTYP-1)+")" With evalue("[M:HAEW]TOTCDT("+num$(WTYP-1)+")") +  [M:HAEW]AMTCUR(NOL)
+Endif
+
+[M:HAEW]LINREF(NOL) = [M:HAEW]LIN(NOL)
+[M:HAEW]EXPNUM(NOL) = [C]EXPORT
+[M:HAEW]FIY(NOL)  = [M:HAEF]FIY(WTYP-1)
+[M:HAEW]PER(NOL)  = [M:HAEF]PER(WTYP-1)
+
+# Initialisation standard selon le compte
+Call LEC_GAC([M:HAEW]ACC(NOL),[M:HAEW]COA(NOL)) From CPTLEC
+Case [M:HAEW]IDTLIN(NOL)
+ When "CNTRL"
+  # Ligne d'équilibre sur Journal (trésorerie ou à nouveau)
+  For ZON="DES", "FCYLIN", "TAX", "UOM", "QTY"  :  Gosub INIZON :  Next ZON
+  If func AFNC.ACTIV("PRCSL")
+   If !NUM_CSLFLO_CTRL
+    ZON = "CSLFLO" : Gosub INIZON
+    If [L]FLGCSL=[V]CST_AYES
+     [L]CSLFLO_CTRL=[M:HAEW]CSLFLO(NOL) : NUM_CSLFLO_CTRL=1
+    Else
+     [L]ASTATUS = func FINCSLLIB._GET_CSLFLGLED(GACTX, [M:HAEW]LED(NOL),FLGCSL,ERRMES)
+     If [L]FLGCSL=[V]CST_AYES : [L]CSLFLO_CTRL=[M:HAEW]CSLFLO(NOL) :  NUM_CSLFLO_CTRL=1 :  Endif
+    Endif
+   Else
+    [L]ASTATUS = func FINCSLLIB._GET_CSLFLGLED(GACTX,[M:HAEW]LED(NOL),FLGCSL,ERRMES)
+    If [L]FLGCSL=[V]CST_AYES & func FINCSLLIB._GET_CSLFLOFLGACC(GACTX,[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL))=[V]CST_AYES
+     [M:HAEW]CSLFLO(NOL)=[L]CSLFLO_CTRL
+    Endif
+   Endif
+   If !NUM_CSLBPR_CTRL
+    ZON = "CSLBPR" : Gosub INIZON
+    If [L]FLGCSL=[V]CST_AYES
+     [L]CSLBPR_CTRL=[M:HAEW]CSLBPR(NOL) : NUM_CSLBPR_CTRL=1
+    Else
+     [L]ASTATUS = func FINCSLLIB._GET_CSLFLGLED(GACTX,[M:HAEW]LED(NOL),FLGCSL,ERRMES)
+     If [L]FLGCSL=[V]CST_AYES : [L]CSLBPR_CTRL=[M:HAEW]CSLBPR(NOL) :  NUM_CSLBPR_CTRL=1 :  Endif
+    Endif
+   Else
+    [L]ASTATUS = func FINCSLLIB._GET_CSLFLGLED(GACTX,[M:HAEW]LED(NOL),FLGCSL,ERRMES)
+    If [L]FLGCSL=[V]CST_AYES & func FINCSLLIB._GET_CSLBPRFLGACC(GACTX,[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL))=[V]CST_AYES
+     [M:HAEW]CSLBPR(NOL)=[L]CSLBPR_CTRL
+    Endif
+   Endif
+  Endif
+ When "LIAIS"
+  # Ligne d'équilibre inter-site
+  [M:HAEW]TAX(NOL)=""
+  For ZON="DES", "TAX", "UOM", "QTY" :    Gosub INIZON :  Next ZON
+  If func AFNC.ACTIV("PRCSL")
+   For ZON="CSLFLO", "CSLBPR" :    Gosub INIZON :  Next ZON
+  Endif
+ When "ECART"
+  # Ligne d'écart
+  [M:HAEW]TAX(NOL)=""
+  For ZON="DES", "FCYLIN", "TAX", "UOM", "QTY"  :   Gosub INIZON :  Next ZON
+  If func AFNC.ACTIV("PRCSL")
+   If !NUM_CSLFLO_ECART
+    ZON = "CSLFLO" : Gosub INIZON : Gosub INIZON
+    If [L]FLGCSL=[V]CST_AYES
+     [L]CSLFLO_ECART=[M:HAEW]CSLFLO(NOL) :  NUM_CSLFLO_ECART=1
+    Else
+     [L]ASTATUS = func FINCSLLIB._GET_CSLFLGLED(GACTX, [M:HAEW]LED(NOL),FLGCSL,ERRMES)
+     If [L]FLGCSL=[V]CST_AYES : [L]CSLFLO_ECART=[M:HAEW]CSLFLO(NOL) :  NUM_CSLFLO_ECART=1 :  Endif
+    Endif
+   Else
+    [L]ASTATUS = func FINCSLLIB._GET_CSLFLGLED(GACTX,[M:HAEW]LED(NOL),FLGCSL,ERRMES)
+    If [L]FLGCSL=[V]CST_AYES & func FINCSLLIB._GET_CSLFLOFLGACC(GACTX,[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL))=[V]CST_AYES
+     [M:HAEW]CSLFLO(NOL)=[L]CSLFLO_ECART
+    Endif
+   Endif
+   If !NUM_CSLBPR_ECART
+    ZON = "CSLBPR" : Gosub INIZON
+    If [L]FLGCSL=[V]CST_AYES
+     [L]CSLBPR_ECART=[M:HAEW]CSLBPR(NOL) : NUM_CSLBPR_ECART=1
+    Else
+     [L]ASTATUS = func FINCSLLIB._GET_CSLFLGLED(GACTX,[M:HAEW]LED(NOL),FLGCSL,ERRMES)
+     If [L]FLGCSL=[V]CST_AYES : [L]CSLBPR_ECART=[M:HAEW]CSLBPR(NOL) :  NUM_CSLBPR_ECART=1 :  Endif
+    Endif
+   Else
+    [L]ASTATUS = func FINCSLLIB._GET_CSLFLGLED(GACTX,[M:HAEW]LED(NOL),FLGCSL,ERRMES)
+    If [L]FLGCSL=[V]CST_AYES & func FINCSLLIB._GET_CSLBPRFLGACC(GACTX,[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL))=[V]CST_AYES
+     [M:HAEW]CSLBPR(NOL)=[L]CSLBPR_ECART
+    Endif
+   Endif
+  Endif
+Endcase
+
+# Initialisation de l'ANALYTIQUE
+Raz [M:HAEW]PTV(NOL), [M:HAEW]PTF(NOL), [M:HAEW]CPA(NOL)
+If GLEDFLGANA(IND)=2
+ # Lors d'un ajout de lignes (CENTRAL ou ECART, lignes avec même identifiant), ici X3 alimente le masque HAEW (mono-référentiel)
+ # L'analytique a peut-être été déjà alimentée. (Attention surtout à l'axe commun à plusieurs référentiels)
+ If [F:GAC]DSP<>""
+  LIG_IDTLIN = find([M:HAEW]IDTLIN(NOL),[M:HAEW]IDTLIN(0..NOL-1))
+  Raz WDSP
+  If LIG_IDTLIN
+   For IND_IDTLIN=LIG_IDTLIN-1 To [M:HAEW]NB-1
+    If [M:HAEW]DSP(IND_IDTLIN)<>"" : WDSP=[M:HAEW]DSP(IND_IDTLIN) : Break : Endif
+   Next
+  Endif
+  If WDSP<>"" :
+   [M:HAEW]DSP(NOL) = WDSP
+  Else
+   [M:HAEW]DSP(NOL) = [F:GAC]DSP
+  Endif
+ Else
+  Call LEC_GDE([M:HAEF]DACDIA) From CPTLEC
+  Call SETAXECOM([M]CPY,NB_AXECOM,AXECOM) From CPTDIV
+  LIG_IDTLIN = find([M:HAEW]IDTLIN(NOL),[M:HAEW]IDTLIN(0..NOL-1))
+  For K=1 To GLEDDIENBR(IND)
+   WDIE = evalue("GDIE"+num$(K)+"("+num$(IND)+")")
+   Raz WCCE
+   If !NB_AXECOM or !find(WDIE,AXECOM(1..NB_AXECOM)) or !LIG_IDTLIN
+    # Dans le cas de l'écriture d'écart d'arrondis, la section par défaut de l'Axe est prioritaire.
+    If  [M:HAEW]IDTLIN(NOL)="ECART" & TBSEC(K)=""
+     Call LEC_DIE(WDIE) From CPTLEC
+     TBSEC(K)=[F:DIE]CCEMIS(0)
+     WCCE = TBSEC(K)
+    Endif
+   Else
+    # Recherche Axe commun.
+    For IND_IDTLIN=LIG_IDTLIN-1 To [M:HAEW]NB-1
+     If [M:HAEW]IDTLIN(NOL)=[M:HAEW]IDTLIN(IND_IDTLIN)
+      Call INDLED([M:HAEW]LED(IND_IDTLIN),WDIE,LED_IDTLIN,AXE_IDTLIN) From CPTDIV
+      If AXE_IDTLIN
+       WCCE =evalue("[M:HAEW]CCE"+num$(AXE_IDTLIN)+"("+num$(IND_IDTLIN)+")")
+       If WCCE<>"" : Break : Endif
+      Endif
+     Endif
+    Next
+   Endif
+   If WCCE=""
+    Call INICCE(WCCE,WDIE,[M:HAEW]LED(NOL),[M:HAEW]ACC(NOL),[F:GDE]CDE) From CPTINI
+   Endif
+   Assign "[M:HAEW]CCE"+num$(K)+"("+num$(NOL)+")" With WCCE
+  Next K
+ Endif
+Endif
+
+# Initialisation ACCNUM
+[M:HAEW]ACCNUM(NOL)    = (NOL+1)*-1
+
+Call ORILEDTYP([M]CPY,[M:HAEW]LEDTYP(NOL),[L]ORITYP) From CPTDIV
+
+If [L]ORITYP=0    # Type de référentiel non automatique.
+ Case [M:HAEW]IDTLIN(NOL)
+  When "CNTRL"
+  # Ligne d'équilibre sur Journal (trésorerie ou à nouveau)
+  NUM_CTRL([M:HAEW]LEDTYP(NOL)-1)=  [M:HAEW]ACCNUM(NOL)
+  When "LIAIS"
+  # Ligne d'équilibre inter-site
+  K = find([M:HAEW]FCYLIN(NOL),TBFCY(1..NBFCY))
+  Assign "NUM_LIAIS"+num$([M:HAEW]LEDTYP(NOL))+"("+num$(K)+")"  With [M:HAEW]ACCNUM(NOL)
+#  Local Integer III
+#  III = [M:HAEW]LEDTYP(NOL)
+#  NUM_LIAIS(III, K) =  [M:HAEW]ACCNUM(NOL)
+  When "ECART"
+  # Ligne d'écart
+  NUM_ECART([M:HAEW]LEDTYP(NOL)-1)=  [M:HAEW]ACCNUM(NOL)
+ Endcase
+Else         # Type de référentiel automatique
+ Case [M:HAEW]IDTLIN(NOL)
+  When "CNTRL"
+  # Ligne d'équilibre sur Journal (trésorerie ou à nouveau)
+  [M:HAEW]ACCNUMORI(NOL) = NUM_CTRL([L]ORITYP-1)
+  When "LIAIS"
+  # Ligne d'équilibre inter-site
+  K = find([M:HAEW]FCYLIN(NOL),TBFCY(1..NBFCY))
+#  [M:HAEW]ACCNUMORI(NOL) = NUM_LIAIS([L]ORITYP, K)
+  [M:HAEW]ACCNUMORI(NOL) = evalue("NUM_LIAIS"+num$([L]ORITYP)+"("+num$(K)+")")
+  When "ECART"
+  # Ligne d'écart
+  If NUM_ECART([L]ORITYP-1)<>0
+   [M:HAEW]ACCNUMORI(NOL) = NUM_ECART([L]ORITYP-1)
+  Else
+   # Cas où seul le montant référentiel du Type de Référentiel Automatique doit être équilibré
+   #  cad que le montant référentiel du Type de référentiel Saisi est équilibré.
+   #  dans ce cas, une ligne va être crée sur le référentiel dit Saisi pour faire le lien comptable
+   LIG_ECART = NOL
+  Endif
+ Endcase
+Endif
+
+If dim([M:HAEW]NUMLIN(NOL))>0 : [M:HAEW]NUMLIN(NOL) = NOL : Endif
+[M:HAEW]NB += 1  : AFF = 1
+Return
+
+$MODLIN
+[M:HAEW]AMTCUR(NOL) = [M:HAEW]DEB(NOL)+[M:HAEW]CDT(NOL)
+If [M:HAEW]DEB(NOL)<>0      : [M:HAEW]SNS(NOL)=1
+Elsif [M:HAEW]CDT(NOL)<>0   : [M:HAEW]SNS(NOL)=-1
+Elsif [M:HAEW]AMTLED(NOL)<0 : [M:HAEW]SNS(NOL)=-1
+Else [M:HAEW]SNS(NOL)=1
+Endif
+If [M:HAEW]DEB(NOL)=0 & [M:HAEW]CDT(NOL)=0 & [M:HAEW]AMTLED1(NOL)<0
+ [M:HAEW]SNS(NOL)      = -1
+ [M:HAEW]AMTLED1(NOL) *= -1
+Endif
+Return
+
+########
+$INIZON
+Gosub SETABR From SUBGA1
+nolign = NOL+1
+Case ZON
+ When "DES"
+  Call D_DES([M:HAEW]DES(NOL)) From SUBGA0
+  If [M:HAEW]DES(NOL)=""
+   Call LEC_GAC([M:HAEW]ACC(NOL),[M:HAEW]COA(NOL)) From CPTLEC
+   Call LECTEXTRA([M:HAEW]DES(NOL),"GACCOUNT","DESTRA",[F:GAC]COA,[F:GAC]ACC) From ATEXTRA
+  Endif
+ When "FCYLIN"
+  Call D_FCYLIN([M:HAEW]FCYLIN(NOL)) From SUBGA0
+ When "TAX"
+  Call D_TAX([M:HAEW]TAX(NOL)) From SUBGA0
+ When "UOM"
+  Call D_UOM([M:HAEW]UOM(NOL)) From SUBGA0
+  If [F:GAC]FLGUOM=2 : [M:HAEW]UOM(NOL) = [F:GAC]UOM :  Endif
+ When "QTY"
+  Call D_QTY([M:HAEW]QTY(NOL)) From SUBGA0
+ When "CSLFLO"
+  If [M:HAEW]CDT(NOL)<>0
+   [L]ASTATUS = func FINCSLLIB.GET_CSLFLO(GACTX,[M]CPY,[M:HAEW]LED(NOL),[M]JOU,[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL),-1,FLGCSL,[M:HAEW]CSLFLO(NOL),ERRMES)
+  Else
+   [L]ASTATUS = func FINCSLLIB.GET_CSLFLO(GACTX,[M]CPY,[M:HAEW]LED(NOL),[M]JOU,[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL),1,FLGCSL,[M:HAEW]CSLFLO(NOL),ERRMES)
+  Endif
+ When "CSLBPR"
+  [L]ASTATUS = func FINCSLLIB.GET_CSLBPR(GACTX,[M:HAEF]MAINCSLBPR,[M]CPY,[M:HAEW]LED(NOL),[M:HAEW]BPR(NOL),[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL),FLGCSL,[M:HAEW]CSLBPR(NOL),ERRMES)
+Endcase
+If GCOMPTA<>3  :#Compta
+ Read [GDD]GDD0 = [F:GDE]DIA;ZON
+ If fstat=0 & [F:GDD]DEFVAL<>""
+  Assign "[M:HAEW]"+ZON+"("+num$(NOL)+")" With evalue([F:GDD]DEFVAL)
+ Endif
+Endif
+Return
+
+#####
+$SETABR
+Local Char MSKDEF(4)
+For K=0 To 2
+ If evalue("dim([M:HAE"+num$(K)+"]"+ZON+")>0")
+  Case K
+   When 0 : MSKDEF = "HAE0"
+   When 1 : MSKDEF = "HAE1"
+   When 2 : MSKDEF = "HAE2"
+  Endcase
+  Break
+ Endif
+Next K
+Return
+
+###########################################################################################################
+# --- Contrôle CAT par rapport au paramétrage des types de pièces.
+###########################################################################################################
+$CONTTET
+If [M]CAT<1 | [M]CAT>len(mess(0,618,1)) : [M]CAT = 1 : Endif
+If [M]CAT=1 & ([M]STA<1 | [M]STA>2) : [M]STA = 1 : Endif
+Call CONTCAT([M]CAT)
+If mkstat : STAT = 99 : End : Endif
+Return
+
+#######################
+Subprog CONTCAT(VALEUR)
+Variable Integer VALEUR
+
+If VALEUR=1 & [F:GTE]VCRREA<>2
+ GMESSAGE = mess(7,107,1) : # Pièce réelles interdites
+ mkstat = 2
+Elsif find(VALEUR,2,3) & [F:GTE]VCRSIM<>2
+ GMESSAGE = mess(6,107,1) : # Pièces de simulation interdites
+ mkstat = 2
+Elsif VALEUR=4 & [F:GTE]VCROUTBSE<>2
+ GMESSAGE = mess(54,106,1) : # Pièces hors bilan interdites
+ mkstat = 2
+Elsif VALEUR=5 & [F:GTE]VCRMOD<>2
+ GMESSAGE = mess(55,106,1) : # Pièces modèles interdites
+ mkstat = 2
+Endif
+End
+
+###########################################################################################################
+# --- Contrôle Lignes avec même identifiant (Appel CONTACC, CONTCCE, CONTDSP)
+###########################################################################################################
+$CONTLIG
+# Perf - 63838 : Lancement des contrôles uniquement si aucune nouvelle ligne n'a été généré en automatique
+#         Variable TLIGAUT stock le nombre de lignes avant génération de ligne d'équilibre ($CENTRAL ou $LIAISON) et d'écart ($ECART)
+#         Variable TNBLED  indique le nombre de référentiel dit saissisable sous le modèle comptable de la société
+#         En saisie direct, les contrôles sont à nouveau effectuée - condition GFONCTION/GIMPORT ajoutée (69785)
+If [L]TLIGAUT=[M:HAEW]NB & TNBLED<=1 & (GFONCTION<>"GESGAS" | GIMPORT) : Return : Endif
+
+#-- Contrôles sur l'ensemble des lignes des référentiels saisis, générés et automatiques
+Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]IDTLIN(indice), [M:HAEW]LEDTYP(indice)
+
+Raz INDF
+While INDF<=[M:HAEW]NB-1
+ Raz GNBSTR,GSTRTYP,GSTRLED,GSTRCOA,GSTRACC
+ INDD=INDF
+ While INDF<MAXLIG & [M:HAEW]IDTLIN(INDD)=[M:HAEW]IDTLIN(INDF)
+  GNBSTR+=1
+  GSTRTYP(GNBSTR) = [M:HAEW]LEDTYP(INDF)
+  GSTRLED(GNBSTR) = [M:HAEW]LED(INDF)
+  Call INDLED(GSTRLED(GNBSTR),"",I,J) From CPTDIV
+  GSTRCOA(GNBSTR) = GLEDCOA(I)
+  GSTRACC(GNBSTR) = [M:HAEW]ACC(INDF)
+  INDF+=1
+ Wend
+ Gosub CTLLIG
+ If mkstat : Break : Endif
+Wend
+Return
+
+$CTLLIG
+Local Char TBCCE(GLONCCE)(1..9), BID1(GLONDIE), BID2(GLONCCE)
+Local Integer PRC
+For NOL=INDD To INDF-1
+# Gosub SETFCY
+ If [M:HAEW]ACC(NOL)<>""
+  Call CONTACC([M:HAEW]ACC(NOL),[M:HAEW]LEDTYP(NOL),[M:HAEW]LED(NOL),[M:HAEW]FCYLIN(NOL),[M]CUR,[M]ACCDAT)
+  If mkstat : Raz BID1 : Break : Endif
+ Endif
+ # Issue X3-16347
+ If dim([M:HAE1]ORIMOD)>0 & [M:HAE1]ORIMOD=2 & dim([M:HAE1]FLGGEN)>0 & [M:HAE1]FLGGEN=1
+  WCOA = [M:HAEW]COA(NOL)
+  If WCOA<>""
+   Call LEC_COA(WCOA) From CPTLEC
+   If [F:COA]TAXMGT = 2 :
+    WACC = [M:HAEW]ACC(NOL)
+    Call LEC_GAC(WACC,WCOA) From CPTLEC
+    If func FINTVT_SYRA.CTL_TAX(GACTX,WCOA,WACC,[M:HAEW]TAX(NOL),GMESSAGE)>=[V]CST_AERROR
+     mkstat = 2 : Raz BID1 : Break
+    Endif
+   Endif
+  Endif
+ Endif
+ # Endissue X3-16347
+ If [M]FLGREP<>2
+  Case [M:HAEW]DSP(NOL)
+   When "$"
+    For I=[M:HAEW]PTV(NOL) To [M:HAEW]PTF(NOL)
+     K=find([M:HAEW]LED(NOL),GLED(1..GLEDNBR))
+     For J=1 To GLEDDIENBR(K)
+      PRC = find(evalue("GDIE"+num$(J)+"("+num$(K)+")"),[M:VT2]TBDIE(0..dim([M:VT2]TBDIE)-1))
+      If PRC
+       BID1 = evalue("[M:VT2]TBDIE("+num$(PRC-1)+")")
+       BID2 = evalue("[M:VT2]TBCCE"+num$(PRC)+"("+num$(I)+")")
+       If !GIMPORT # Issue X3-105443
+         Call CONTCCE(BID2,[M:HAEW]LED(NOL),BID1,[M:HAEW]FCYLIN(NOL),[M]ACCDAT,[M:HAEW]ACC(NOL),[M:VT2]TBDIE,"[M:VT2]TBCCE#",I) From CPTCNT
+         If mkstat : GMESSAGE = BID2-GMESSAGE : Break 3 : Endif
+       Endif # Issue X3-105443
+      Endif
+     Next J
+    Next I
+   When ""
+    I=find([M:HAEW]LED(NOL),GLED(1..GLEDNBR))
+    Raz TBCCE
+    For J=1 To GLEDDIENBR(I)
+     TBCCE(J)=evalue("GDIE"+num$(J)+"("+num$(I)+")")
+    Next
+    For J=1 To GLEDDIENBR(I)
+     BID1 = TBCCE(J)
+     BID2 = evalue("[M:HAEW]CCE"+num$(J)+"("+num$(NOL)+")")
+     Call CONTCCE(BID2,[M:HAEW]LED(NOL),BID1,[M:HAEW]FCYLIN(NOL),[M]ACCDAT,[M:HAEW]ACC(NOL),[L]TBCCE,"[M:HAEW]CCE#",NOL) From CPTCNT
+     If mkstat : GMESSAGE = BID2-GMESSAGE : Break 2 : Endif
+    Next
+   When Default
+    Call CONTDSP([M:HAEW]DSP(NOL),[M:HAEW]FCYLIN(NOL),[M]ACCDAT)
+    If mkstat : Break : Endif
+  Endcase
+ Endif
+ If func AFNC.ACTIV("PRCSL")
+  If func FINCSLLIB.CTL_CSLFLO(GACTX,[M:HAEW]LED(NOL),[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL),FLGCSL,[M:HAEW]CSLFLO(NOL),ERRMES)<>[V]CST_AOK
+   GMESSAGE = ERRMES
+   mkstat = 2 : Raz BID1 : Break
+  Endif
+  If func FINCSLLIB.CTL_CSLBPR(GACTX,[M:HAEW]LED(NOL),[M:HAEW]COA(NOL),[M:HAEW]ACC(NOL),FLGCSL,[M:HAEW]CSLBPR(NOL),ERRMES)<>[V]CST_AOK
+   GMESSAGE = ERRMES
+   mkstat = 2 : Raz BID1 : Break
+  Endif
+ Endif
+Next NOL
+
+If mkstat
+ ## <PP/CP 12/12/07> Pour génération pièce auto avec transaction colonne.. A voir...
+ GMESSAGE = [M:HAEW]ACC(NOL)-BID1-mess([M:HAEW]LEDTYP(NOL),2644,1)-"("+num$([M:HAEW]IDTLIN(NOL))+")"-":"-GMESSAGE
+Endif
+Return
+
+###########################################################################################################
+# --- Contrôle Lignes inter référentiel, Règle de contrôles défini sous le modèle comptable
+###########################################################################################################
+$CONTPCE
+Local Char MODELE(GLONGCM)
+Call LEC_CPY([M]CPY) From CPTLEC
+Call SETGCM([M]CPY,MODELE) From CPTDIV
+Call LEC_GCM(MODELE) From CPTLEC          # Lecture du modèle comtpable
+Call LEC_GTE_LEG([F:CPY]LEG,[M]TYP) From CPTLEC     # Lecture du type de pièce
+
+#-- Pas de contrôle inter-référentiel
+If [F:GCM]NBRCTL<1 : Return : Endif
+
+#-- Contrôles soldes
+#--  Stock par type de référentiel
+Local Decimal  AMTDEB(1..len(mess(0,2644,1))), AMTCDT(1..len(mess(0,2644,1)))
+Local Integer  QTY(1..len(mess(0,2644,1)))
+Local Integer  I,J,K,VU,OKCTL
+
+#-- Pas de contrôle inter-référentiel
+If [F:GCM]NBRCTL<1 : Return : Endif
+
+#-- Les contrôles s'effectue sur un référentiel
+#--  Le référentiel doit être lié à un type de référentiel non automatique
+Local Integer NBCTL, NBTYP
+
+For NBCTL=1 To [F:GCM]NBRCTL
+ For NBTYP1=1 To len(mess(0,2644,1))
+  If [F:GCM]LED(NBTYP1-1)<>"" & [F:GCM]CFMAUT(NBTYP1-1)<>2 & [F:GCM]LED(NBTYP1-1)=[F:GCM]LED1(NBCTL-1)
+   For NBTYP2=1 To len(mess(0,2644,1))
+    If [F:GCM]LED(NBTYP2-1)<>"" & [F:GCM]CFMAUT(NBTYP2-1)<>2 & [F:GCM]LED(NBTYP2-1)=[F:GCM]LED2(NBCTL-1)
+     If [F:GTE]AUZLED(NBTYP1-1)=3 & [F:GTE]AUZLED(NBTYP2-1)=3
+      Gosub CTLPCE
+      If mkstat
+       # Contrôle inter-référentiels
+       GMESSAGE = mess(116,106,1)+"\"+GMESSAGE
+       Break 3 : Return
+      Endif
+     Endif
+    Endif
+   Next
+  Endif
+ Next
+Next
+Return
+
+$CTLPCE
+#----  Contrôle des soldes
+If instr(1,[F:GCM]CTLTYP(NBCTL-1),"A")
+ Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]LEDTYP(indice)
+ Raz INDD, AMTDEB, AMTCDT
+ While INDD<=[M:HAEW]NB-1
+  K = [M:HAEW]LEDTYP(INDD)
+  AMTDEB(K) += [M:HAEW]DEB(INDD)
+  AMTCDT(K) += [M:HAEW]CDT(INDD)
+  INDD+=1
+ Wend
+ If AMTDEB(NBTYP1)+AMTCDT(NBTYP1)<>AMTDEB(NBTYP2)+AMTCDT(NBTYP2)
+    GMESSAGE = mess(1,2235,1)-"\"-mess(NBTYP1,2644,1)-"("+num$(AMTDEB(NBTYP1))+")"-
+&             "\"-mess(NBTYP2,2644,1)-"("+num$(AMTDEB(NBTYP2))+")"
+    mkstat = 2 : Return
+ Endif
+Endif
+
+#---  Contrôle des montants & quantités
+If instr(1,[F:GCM]CTLTYP(NBCTL-1),"B") or instr(1,[F:GCM]CTLTYP(NBCTL-1),"C")
+ Sorta [M:HAEW]NB [M:HAEW]NB Order By [M:HAEW]IDTLIN(indice),[M:HAEW]LEDTYP(indice)
+ Raz INDD, INDF
+ OKCTL = 1
+ While INDD<=[M:HAEW]NB
+  # Même identifiant
+  If [M:HAEW]IDTLIN(INDD)=[M:HAEW]IDTLIN(INDF)
+   # Type de référentiel à contrôler
+   If find([M:HAEW]LEDTYP(INDD),NBTYP1,NBTYP2)<>0
+    # Imputation obligatoire (code plan/compte de chaque référentiel)
+    If OKCTL
+     K = find([M:HAEW]COA(INDD),[F:GCM]LED(NBTYP1-1),[F:GCM]LED(NBTYP2-1))
+     If K
+      Read [GAC]GAC0 = [M:HAEW]COA(INDD);[M:HAEW]ACC(INDD)
+      If K=1
+       VU = find([F:GCM]LED(NBTYP2-1),[F:GAC]OTHCOA(0..[F:GAC]COANBR-1))
+      Else
+       VU = find([F:GCM]LED(NBTYP1-1),[F:GAC]OTHCOA(0..[F:GAC]COANBR-1))
+      Endif
+      If VU & [F:GAC]OBYIPT=2
+       K = [M:HAEW]LEDTYP(INDD)
+       AMTDEB(K) += [M:HAEW]DEB(INDD)
+       AMTCDT(K) += [M:HAEW]CDT(INDD)
+       QTY(K)    += [M:HAEW]QTY(INDD)
+      Else
+       OKCTL = 0
+      Endif
+     Endif
+    Endif
+   Endif
+  Else
+   If OKCTL
+    If instr(1,[F:GCM]CTLTYP(NBCTL-1),"B")
+      # Contrôle des montants
+      If AMTDEB(NBTYP1)<>AMTDEB(NBTYP2)
+       GMESSAGE = mess(2,2235,1)-"("+[M:HAEW]COA(INDD)+"/"+[M:HAEW]ACC(INDD)+")"
+       GMESSAGE +="\"-mess(NBTYP1,2644,1)-"(DEB"-num$(AMTDEB(NBTYP1))+")"-
+&                "\"-mess(NBTYP2,2644,1)-"(DEB"-num$(AMTDEB(NBTYP2))+")"
+       mkstat = 2 : Break
+      Endif
+      If AMTCDT(NBTYP1)<>AMTCDT(NBTYP2)
+       GMESSAGE = mess(2,2235,1)-"("+[M:HAEW]COA(INDD)+"/"+[M:HAEW]ACC(INDD)+")"
+       GMESSAGE += "\"-mess(NBTYP1,2644,1)-"(CDT"-num$(AMTCDT(NBTYP1))+")"-
+&                 "\"-mess(NBTYP2,2644,1)-"(CDT"-num$(AMTCDT(NBTYP2))+")"
+       mkstat = 2 : Break
+      Endif
+    Endif
+    If instr(1,[F:GCM]CTLTYP(NBCTL-1),"C")
+      # Contrôle des quantités
+      If QTY(NBTYP1)<>QTY(NBTYP2)
+       GMESSAGE = mess(3,2235,1)-"("+[M:HAEW]COA(INDD)+"/"+[M:HAEW]ACC(INDD)+")"
+       GMESSAGE = "\"-mess(NBTYP1,2644,1)-"(QTY"-num$(QTY(NBTYP1))+")"-
+&                 "\"-mess(NBTYP2,2644,1)-"(QTY"-num$(QTY(NBTYP2))+")"
+       mkstat = 2 : Break
+      Endif
+    Endif
+   Endif
+   Raz AMTDEB, AMTCDT,QTY
+   OKCTL = 1
+   INDD-=1
+   INDF=INDD+1
+  Endif
+  INDD+=1
+ Wend
+Endif
+Return
+
+###########################################################################################################
+Subprog CONTACC(VALEUR,TYP,LED,FCY,CUR,DAT)
+Value Char    VALEUR
+Value Integer TYP
+Value Char    LED
+Value Char    FCY
+Value Char    CUR
+Value Date    DAT
+
+Local Integer I,J,K
+Local Integer IND,AXI
+
+Local Integer OK, NBLED
+Local Char    SITE(GLONFCY)
+Local Char    SOCIETE(GLONCPY)
+Local Char    WACC(GLONGAC)(0..8), WLED(GLONLED)(0..8), WTYP(2)(0..8), SVG_WTYP(2)(0..8)
+
+If clalev([F:GAC])=0 : Local File =GTABCPT+"GACCOUNT" [GAC] : Endif
+If clalev([F:FCY])=0 : Local File FACILITY [FCY] : Endif
+If clalev([F:CPY])=0 : Local File COMPANY  [CPY] : Endif
+If clalev([F:JCO])=0 : Local File GJOUCOA  [JCO] : Endif
+
+Call INDLED([L]LED,"",IND,AXI) From CPTDIV
+If VALEUR<>""
+ #-- Contrôle standard sur le compte
+ Call CONTACC(TYP,GLEDCOA(IND),VALEUR,FCY,CUR,DAT) From CPTCNT
+ If mkstat=2 : End : Endif
+
+ #--- Compte compatible avec le site/société.
+ [L]SITE = [L]FCY
+ Call LEC_FCY([L]SITE) From CPTLEC
+ If [F:FCY]FINFLG<>2
+  [L]SITE = [F:FCY]FINRSPFCY
+ Endif
+
+ # BYPERF C'est déjà fait dans CONTACC
+ #Call VERIF([F:GAC]FCY,[L]SITE,VALEUR) From CFYSUB
+ [L]SOCIETE = [F:FCY]LEGCPY
+
+
+ #--- Contrôle sur le compte de trésorerie  #CPPERF-déplacer sous GCOMPTA<>3
+# If  [L]CUR<>""
+#  Onerrgo CHUT From CONTROLE
+#  If !clalev([F:BAN]) : Local File BANK [BAN] : Endif
+#  Onerrgo
+#  If GERREUR
+#   GERREUR=0 : CONT_DEV = 1
+#  Else
+#   Filter [BAN] Where BANACC=VALEUR
+#   Read [BAN]BAN0 First
+#   Filter [BAN]
+#   If !fstat & dim([F:BAN]CHGDAT)>0 & [F:BAN]CHGDAT<>[0/0/0]
+#    CONT_DEV = 0 : Call CONTBAN(DAT,[F:BAN]BAN,[L]CUR) From CPTSUB
+#    If GERR=2 : mkstat=2 : End : Endif
+#   Else
+#    CONT_DEV = 1
+#   Endif
+#  Endif
+# Endif
+
+ #--- Contrôle sur le journal   (Remarque : Journal lu en entête)
+ If GCOMPTA<>3  :# Compta
+  Call LEC_CPY([L]SOCIETE) From CPTLEC
+  Call LEC_JCO_LEG([F:CPY]LEG,GLEDCOA(IND),[F:JOU]JOU) From CPTLEC
+  If !fstat
+   If !find(VALEUR,[F:JCO]ACC,[F:JCO]FRQACC(0..[F:JCO]FRQNBR-1)) : # On autorise les comptes fréquents
+    For I=0 To [F:JCO]FBDNBR-1
+     If pat(VALEUR,[F:JCO]FBDACC(I))
+      GMESSAGE = VALEUR-mess(14,106,1)-[F:JCO]JOU-"("+GLEDCOA(IND)+")" : # Compte interdit sur journal
+      mkstat = 2 : Break
+     Endif
+    Next I
+   Endif
+  Endif
+
+  #--- Contrôle sur le compte de trésorerie + CPPERF : sur journal de trésorerie
+  If  [L]CUR<>""  & [L]TYP=GTYPGEN & [F:JOU]TYP=3
+   Onerrgo CHUT From CONTROLE
+   If !clalev([F:BAN]) : Local File BANK [BAN] : Endif
+   Onerrgo
+   If GERREUR
+    GERREUR=0
+   Else
+    Filter [BAN] Where BANACC=VALEUR
+    Read [BAN]BAN0 First
+    Filter [BAN]
+    If !fstat & dim([F:BAN]CHGDAT)>0 & [F:BAN]CHGDAT<>[0/0/0]
+     Call CONTBAN(DAT,[F:BAN]BAN,[L]CUR) From CPTSUB
+     If GERR=2 : mkstat=2 : End : Endif
+    Endif
+   Endif
+  Endif
+ Endif
+Endif
+
+#########################################################################################
+#-- Contrôle inter-code plan
+#--- Compatibilité avec le type de pièce
+If VALEUR="" and [GTE]AUZLED([L]TYP-1)=3
+  GMESSAGE = mess(37,102,1)-"("+[F:GTE]TYP+")"  # Compte obligatoire
+  mkstat=2 : End
+Endif
+
+Local Char MESSA(200)
+Local Integer STAT
+
+# BYPERF  Un seul programme pour les contrôles inter-plans
+Call CNTINTACC(GNBSTR,GSTRCOA,GSTRACC,GLEDCOA(IND),VALEUR,MESSA,STAT) From CPTCNT
+If STAT : GMESSAGE = MESSA : mkstat = 2 : End : Endif
+
+#Call CNTIPTACC(GNBSTR,GSTRCOA,GSTRACC,MESSA,STAT) From CPTCNT
+#If STAT : GMESSAGE = MESSA : mkstat = 2 : End : Endif
+#Call CNTUOMACC(GNBSTR,GSTRCOA,GSTRACC,GLEDCOA(IND),VALEUR,MESSA,STAT) From CPTCNT
+#If STAT : GMESSAGE = MESSA : mkstat = 2 : End : Endif
+#Call CNTAUZACC(GNBSTR,GSTRCOA,GSTRACC,GLEDCOA(IND),VALEUR,MESSA,STAT) From CPTCNT
+#If STAT : GMESSAGE = MESSA : mkstat = 2 : End : Endif
+End
+
+###########################################################################################################
+Subprog CONTDSP(VALEUR,FCY,DAT)
+Variable Char    VALEUR
+Value    Char    FCY
+Value    Date    DAT
+If VALEUR = "" : End : Endif
+If clalev([F:DSP])=0 : Local File =GTABCPT+"CADSP" [DSP] : Endif
+Call CONTROLE("DSP","!",VALEUR,"1",mkstat) From CONTOBJ
+If mkstat : End : Endif
+#--- Répartition compatible avec le site/société.
+Call VERIF([F:DSP]FCY,[L]FCY,VALEUR) From CFYSUB
+If mkstat : End : Endif
+#--- Contrôle de validité de dates.
+Call CTLVLYDAT([L]DAT,[F:DSP]VLYSTR,[F:DSP]VLYEND) From CPTSUB
+If mkstat : GMESSAGE = VALEUR-GMESSAGE : End : Endif
+#--- Code d'accès... Droit d'execution.
+Call CONTEXE([F:DSP]ACS) From CPTSUB
+If mkstat : GMESSAGE = VALEUR-GMESSAGE : End : Endif
+End
+
+###########################################################################################################
+# --- Gestion du schéma de comptes
+###########################################################################################################
+Subprog SAISIE_MONTANT(OK, AMT, BPR, SCHEMA)
+Variable Decimal AMT
+Variable Integer OK
+Variable Char BPR
+Value Char SCHEMA()
+
+Local Char CAMT(250)
+Local Decimal TOTCOE
+
+# recherche dans le schéma choisi des lignes utilisant un compte collectif ET avec BPR non renseigné
+# [F:GAC]SAC=1 : type normal
+# [F:GAC]SAC=2 : type collectif
+#Link [GDC] With [GAC]GAC0=[GDC]ACC As [LNK] Where [GDC]DIA=SCHEMA and [GAC]SAC=2 and [GDC]BPR=""
+
+Local Integer FLGBPR
+Raz FLGBPR
+Read [GDA]GDA0 = SCHEMA
+For [GDC]  Where  [GDC]DIA=SCHEMA and [GDC]BPR=""
+ For I=1 To dim([F:GDC]ACC)
+  Read [GAC]GAC0 = [F:GDA]COA(I-1);[F:GDC]ACC(I-1)
+  If [F:GAC]SAC=2 & [F:GDC]BPR="" : FLGBPR=1 : Break 2 : Endif
+ Next
+Next
+
+Local Mask SAIAMT [SAMT]
+Raz [M:SAMT]
+[M:SAMT]SCHEMA=SCHEMA
+Call LECTEXTRA([M:SAMT]LIBEL,"GDIAACC","DESTRA",SCHEMA,"") From ATEXTRA
+[M:SAMT]LIBEL = SCHEMA-[M:SAMT]LIBEL
+If FLGBPR
+ [M:SAMT]SAIBPR=2
+Else
+ [M:SAMT]SAIBPR=1
+Endif
+# Paramètres du schéma de comptes
+Call DIALWIN(OK,mess(122,104,1)-SCHEMA,"FSAIAMT") From GESECRAN
+AMT = [M:SAMT]AMT
+BPR = [M:SAMT]BPR
+End
+
+#############
+$ERR_SCHEMA
+ # Ligne....Erreur en évaluation de la formule....
+ Call ERREUR(SCHEMA-mess(3,61,1)-num$([F:GDC]LINNUM)-mess(65,106,1)-[F:GDC]LIGDES) From GESECRAN
+ Resume
+Return
+
+#############
+$SCHEMA
+# Initialisation par rapport au schéma de compte / à la transaction de saisie / à la nature
+Local Decimal TOTMNT
+Local Integer NOL, I, INI
+Local Char    WCCE(GLONCCE)
+Local Char    ZON(20)
+Local Integer I,J,K,L,AXI,IND
+Local Char    IDT(5)
+
+Gosub CONTSCHE
+If !OK : Return : Endif
+
+Local Decimal AMT
+Local Char BPR(250)
+Call SAISIE_MONTANT(OK, AMT, BPR, SCHEMA)
+If OK<>2 : OK=0 : Return : Endif
+
+# somme des coefficients positifs
+Local Decimal TOTCOEF(1..2)
+For [GDC]GDC0 Where DIA=SCHEMA
+ If [F:GDC]COE<0
+  TOTCOEF(1) += [F:GDC]COE
+ Else
+  TOTCOEF(2) += [F:GDC]COE
+ Endif
+Next
+# pour la répartition on se base sur la somme de coefficients la plus élevée en valeur absolue
+# donc : si les 2 sommes ne sont pas égales, la pièce sera déséquilibrée
+TOTCOE = max(abs(TOTCOEF(1)), abs(TOTCOEF(2)))
+Local Decimal SOMME
+Local Decimal ARRO
+
+If [F:TCU]CUR<>[M:HAE1]CUR
+ Call LEC_TCU([M:HAE1]CUR) From CPTLEC
+Endif
+ARRO = 10^(-[F:TCU]DECNBR)
+SOMME = 0
+
+Local Integer FLGSAC
+Case [M:HAEF]TYPENT
+ When 1
+  # Saisie en colonne
+  For [GDC]GDC0 Where DIA=SCHEMA
+   Raz INI, FLGSAC
+   Gosub CONTTAB : If !OK : Break : Endif
+   NOL = [M]NBLIG
+   For J=1 To dim([F:GDC]ACC)
+    I = find([F:GDA]COA(J-1),[M:HAEF]COA(0..[M:HAEF]NBRLED))
+    If I & [F:GDC]ACC(J-1)<>""
+     Assign "[M]ACC"+num$(I)+"("+num$(NOL)+")" With [F:GDC]ACC(J-1)
+     Assign "[M]COA"+num$(I)+"("+num$(NOL)+")" With [M:HAEF]COA(I-1)
+     Call LEC_GAC([F:GDC]ACC(J-1),[M:HAEF]COA(I-1)) From CPTLEC
+     If [F:GAC]SAC=2
+      [L]FLGSAC=1
+      Assign "[M]SAC"+num$(I)+"("+num$(NOL)+")" With [F:GAC]ACCSHO
+     Endif
+     If [F:GAC]FLGVAT>1
+      If [F:GDC]VAT=""
+       Call PARAM([M]FCY,"EXETAX",[M]TAX(NOL)) From ADOVAL
+      Else
+       [M]TAX(NOL) = [F:GDC]VAT
+      Endif
+      Endif
+    Endif
+   Next
+   If [L]FLGSAC
+    If [F:GDC]BPR<>""
+     [M]BPR(NOL) = [F:GDC]BPR
+    Else
+     [M]BPR(NOL) = [L]BPR
+    Endif
+   Endif
+   Call INIT_CSLBPR_SCHEMA(NOL) From SUBGA00
+
+   If [F:GDC]DSP<>""
+    [M]DSP(NOL) = [F:GDC]DSP
+    For AXE=1 To 20
+     Assign "[M]CCE"+num$(AXE)+"("+num$(NOL)+")" With ""
+    Next AXE
+   Endif
+   If [M]DSP(NOL)=""
+    For K=0 To [F:GDA]NBRDIE
+     If [F:GDC]CCE(K)<>""
+      INI = 1
+      L = find([F:GDA]DIE(K),[M:HAEF]DIE(0..19))
+      If evalue("[M]CCE"+num$(L)+"("+num$(NOL)+")")=""
+       Assign "[M]CCE"+num$(L)+"("+num$(NOL)+")" With [F:GDC]CCE(K)
+      Endif
+     Endif
+    Next
+   Endif
+   If INI=1: [M]DSP(NOL)=""
+   Else      Call FLDDEFCAR([M]DSP(NOL),"DSP") From TRTGAS
+   Endif
+   If [M]DSP(NOL)=""
+    For I=0 To [M:HAEF]NBRLED-1
+     For J=1 To [M:HAEF]NBDIE(I)
+      K= find(evalue("[M:HAEF]DIE"+num$(J)+"("+num$(I)+")"),[M:HAEF]DIE(0..19))
+      WCCE=evalue("[M]CCE"+num$(K)+"(NOL)")
+      If WCCE=""
+# Issue X3-60690
+# Be carefull :
+# [M]CCE1, [M]CCE2...                 so use k
+# [M]DIE1, [M]DIE2...                 so use k
+# [M:HAEF]DIE(0), [M:HAEF]DIE(1)...   so use k - 1
+#
+# I think we can have a pb if k >= 10 when we call FLDDEFCAR
+#
+#       Call FLDDEFCAR(WCCE,"CCE"+num$(K+1)) From TRTGAS
+#       Call INICCE(WCCE,evalue("[M:HAEF]DIE("+num$(K-1)+")"),[M:HAEF]LED(I),evalue("[M]ACC"+num$(I+1)+"(NOL)"),[F:GDE]CDE) From CPTINI
+#       Assign "[M]CCE"+num$(K)+"(NOL)" With WCCE
+
+       Call FLDDEFCAR(WCCE, "CCE" + num$(K) + "." + [M:HAEF]DIE(K - 1)) From TRTGAS
+
+       Call INICCE(WCCE,
+&                  [M:HAEF]DIE(K - 1),
+&                  [M:HAEF]LED(I),
+&                  evalue("[M]ACC" + num$(I + 1) + "(NOL)"),
+&                  [F:GDE]CDE) From CPTINI
+       Assign "[M]CCE" + num$(K) + "(NOL)" With WCCE
+# End Issue X3-60690
+      Endif
+     Next
+    Next
+   Endif
+   Raz [M]PTV(NOL), [M]PTF(NOL)
+
+   # Gestion des montants + Libellé
+   Gosub COEF
+
+   GPOINT = "LOAD_GDALIN" : Gosub ENTREE From EXEFNC
+   [M]NBLIG += 1
+  Next
+
+ When 2
+  # Saisie en ligne
+  Raz [L]IDT
+  For [GDC]GDC0 Where DIA=SCHEMA
+   If [L]IDT=""
+    [L]IDT="A"
+   Else
+    Call INCLET([L]IDT,type([L]IDT)-10) From CPTLET
+   Endif
+   For I=0 To [F:GDA]COANBR-1
+    J = find([F:GDA]COA(I),[M:HAEF]COA(0..[M:HAEF]NBRLED-1))
+    If J & [F:GDC]ACC(I)<>""
+     Raz INI
+     Gosub CONTTAB : If !OK : Break 2 : Endif
+     NOL = [M]NBLIG
+     [M]IDTLIN(NOL)=[L]IDT
+     [M]LEDTYP(NOL)=[M:HAEF]LEDTYP(J-1)
+     [M]ACC1(NOL) = [F:GDC]ACC(I)
+     [M]COA1(NOL) = [F:GDA]COA(I)
+     Call LEC_GAC([F:GDC]ACC(I),[F:GDA]COA(I)) From CPTLEC
+     If [F:GAC]SAC=2
+      [M]SAC1(NOL) = [F:GAC]ACCSHO
+      If [F:GDC]BPR<>""
+       [M]BPR(NOL) = [F:GDC]BPR
+      Else
+       [M]BPR(NOL) = [L]BPR
+      Endif
+     Endif
+     If dim([M]ACCDES(NOL))>0
+      Call LECTEXTRA([M]ACCDES(NOL),"GACCOUNT","DESTRA",[F:GAC]COA,[F:GAC]ACC) From ATEXTRA
+     Endif
+
+     Call INIT_CSLBPR_SCHEMA(NOL) From SUBGA00
+
+     If [F:GDC]DSP<>""
+      [M]DSP(NOL) = [F:GDC]DSP
+      For AXE=1 To 20
+       Assign "[M]CCE"+num$(AXE)+"("+num$(NOL)+")" With ""
+      Next AXE
+     Endif
+     If [M]DSP(NOL)=""
+      For K=0 To [F:GDA]NBRDIE
+       If [F:GDC]CCE(K)<>""
+        INI = 1
+        L = find([F:GDA]DIE(K),[M:HAEF]DIE(0..19))
+        If evalue("[M]CCE"+num$(L)+"("+num$(NOL)+")")=""
+         Assign "[M]CCE"+num$(L)+"("+num$(NOL)+")" With [F:GDC]CCE(K)
+        Endif
+       Endif
+      Next
+     Endif
+
+     If INI=1: [M]DSP(NOL)=""
+     Else      Call FLDDEFCAR([M]DSP(NOL),"DSP") From TRTGAS
+     Endif
+     If [M]DSP(NOL)=""
+      For K=1 To [M:HAEF]NBDIE(J-1)
+       L= find(evalue("[M:HAEF]DIE"+num$(K)+"("+num$(J-1)+")"),[M:HAEF]DIE(0..19))
+       WCCE=evalue("[M]CCE"+num$(L)+"(NOL)")
+       If WCCE=""
+# issue X3-63656
+#        Call FLDDEFCAR(WCCE,"CCE"+num$(L)) From TRTGAS
+        Call FLDDEFCAR(WCCE, "CCE" + num$(L) + "." + evalue("[M:HAEF]DIE" + num$(K) + "(" + num$(J - 1) + ")")) From TRTGAS
+# End issue X3-63656
+
+        Call INICCE(WCCE,evalue("[M:HAEF]DIE("+num$(L-1)+")"),[M:HAEF]LED(J-1),[M]ACC1(NOL),[F:GDE]CDE) From CPTINI
+        Assign "[M]CCE"+num$(L)+"(NOL)" With WCCE
+       Endif
+      Next
+     Endif
+     Raz [M]PTV(NOL), [M]PTF(NOL)
+
+     # Gestion des montants + Libellé
+     Gosub COEF
+
+     GPOINT = "LOAD_GDALIN" : Gosub ENTREE From EXEFNC
+     [M]NBLIG += 1
+    Endif
+   Next
+  Next
+Endcase
+Gosub CALTOT
+Return
+
+#########
+$CONTSCHE
+OK = 0
+If SCHEMA="" : Return : Endif
+Call CONTROLE("GDA","",SCHEMA,"",mkstat) From CONTOBJ
+If mkstat : Return : Endif
+#--- Code d'accès... Droit d'execution.
+Call CONTEXE([F:GDA]ACS) From CPTSUB
+If mkstat : GMESSAGE = SCHEMA-GMESSAGE : Return : Endif
+#--- Contrôle de validité de dates.
+Call CTLVLYDAT([M]ACCDAT,[F:GDA]VLYSTR,[F:GDA]VLYEND) From CPTSUB
+If mkstat : GMESSAGE = SCHEMA-GMESSAGE : Return : Endif
+#--- Contrôles des comptes potentiellement saisissable
+Local Char WCOA(GLONCOA)(1..9)
+Local Integer NBCOA  : Raz NBCOA
+For I=0 To [M:HAEF]NBRLED-1
+ J = find([M:HAEF]COA(I),[F:GDA]COA(0..[F:GDA]COANBR-1))
+ If J
+  [L]NBCOA+=1
+  For [GDC]GDC0 Where DIA=SCHEMA
+   # The CONTACC calls the CNTINTACC program that uses the GSTRACC & GSTRCOA globals
+   # These globals are filled each time an entry is done in the journal
+   # To call the right control, these globals should be set with the right value
+   Raz GSTRACC,GSTRCOA, GNBSTR
+   # For each line of the account structure (=schéma de compte), we store the accounts whose the chart of accounts
+   # exists in the journal entry transaction
+   For K=0 To [F:GDA]COANBR-1
+    If find([F:GDA]COA(K),[M:HAEF]COA)
+     GSTRACC(K+1) = [F:GDC]ACC(K)
+     GSTRCOA(K+1) = [F:GDA]COA(K)
+     GNBSTR +=1
+    Endif
+   Next
+   Call CONTACC([F:GDC]ACC(J-1),[M:HAEF]LEDTYP(I),[M:HAEF]LED(I),[M]FCY,[M]CUR,[M]ACCDAT) From SUBGA1
+   If mkstat : Break 2 : Endif
+  Next
+ Endif
+Next
+If ![L]NBCOA
+ #  Plan de comptes incompatible
+ GMESSAGE = SCHEMA-mess(93,102,1)
+ mkstat = 2 : Return
+Endif
+OK = 1
+Return
+
+$COEF
+If TOTCOE=0
+ [M]DEB(NOL) = 0
+ [M]CDT(NOL) = 0
+Else
+ If [F:GDC]COE>0 # montant au débit
+  [M]DEB(NOL) = arr(AMT*(SOMME+[F:GDC]COE)/TOTCOE, ARRO) - arr(AMT*SOMME/TOTCOE, ARRO)
+ Else # montant au crédit, inversion du signe
+  [M]CDT(NOL) = arr(AMT*SOMME/TOTCOE, ARRO) - arr(AMT*(SOMME+[F:GDC]COE)/TOTCOE, ARRO)
+ Endif
+Endif
+SOMME += [F:GDC]COE
+If [F:GAC]FLGVAT>1 & [M:HAEF]TYPENT=2
+ If [F:GDC]VAT=""
+  Call PARAM([M]FCY,"EXETAX",[M]TAX(NOL)) From ADOVAL
+ Else
+  [M]TAX(NOL) = [F:GDC]VAT
+ Endif
+Endif
+If [F:GDC]LIGDES<>""
+ Onerrgo ERR_SCHEMA
+ Assign "[M]DES(NOL)" With evalue([F:GDC]LIGDES)
+ Onerrgo
+Endif
+Return
+
+
+###########################################################################################################
+$CALTOT
+[M]TOTDEB = sum([M]DEB(0..[M]NBLIG-1))
+[M]TOTCDT = sum([M]CDT(0..[M]NBLIG-1))
+Return
+
+###########################################################################################################
+$CONTTAB
+If [M:HAEW]NB>=dim([M:HAEW]ACC)
+ GMESSAGE = mess(33,106,1) : # Tableau de saisie des lignes plein
+ OK = 0 : mkstat = 2 : Return
+Endif
+OK = 1
+Return
+
+###########################################################################################################
+$SETSOL
+Local Decimal SOLDE, COURS
+Local Char    DEVAFF(GLONCUR),ABR(10)
+Local Integer STAT
+
+Call MSKABR("CUR",ABR) From SUBGASA
+DEVAFF = evalue("[M:"+ABR+"]CUR")
+
+Local Char WSAC(GLONSAC),WACC(GLONGAC),WFCY(GLONFCY)
+Call MSKABR("DSP",ABR) From SUBGASA
+WFCY = evalue("[M:"+ABR+"]FCYLIN("+num$(nolign-1)+")")
+
+For I=1 To 9
+ WACC = evalue("[M:"+ABR+"]ACC"+num$(I)+"("+num$(nolign-1)+")")
+ WSAC = evalue("[M:"+ABR+"]SAC"+num$(I)+"("+num$(nolign-1)+")")
+ J = find([M:HAEF]LEDTYP(I-1),[M:HAEF]TYPC(0..len(mess(0,2644,1))))
+ If J : COURS = [M:HAEF]RATMLTC(J-1) : Endif
+ If WSAC<>""
+  Call SOLDAT("",WSAC,WACC,[M]BPR(nolign-1),[M:HAEF]LEDTYP(I-1),[M]CPY,WFCY
+&          ,DEVAFF,COURS,[M]ACCDAT,SOLDE) From CNSCPTSTD
+  Break
+ Elsif WACC<>""
+  Call SOLDAT("","",WACC,[M]BPR(nolign-1),[M:HAEF]LEDTYP(I-1),[M]CPY,WFCY
+&          ,DEVAFF,COURS,[M]ACCDAT,SOLDE) From CNSCPTSTD
+   Break
+ Endif
+Next
+Return
+
+#######
+$SETFCY
+Local Char FCYREF(GLONFCY)
+If dim([M]FCYLIN)>0 & [M]FCYLIN(NOL)<>[M]FCY
+ FCYREF = [M]FCYLIN(NOL)
+Else
+ FCYREF = [M]FCY
+Endif
+Return
+
+###########################################################################################################
+$CONTJOU
+#--- Journal compatible avec le site/société.
+Call VERIF([F:JOU]FCY,[M]FCY,[F:JOU]JOU) From CFYSUB
+If mkstat : Return : Endif
+#--- Journal compatible avec les journaux liés au type de pièce
+Call LEC_GTE_LEG(GCURLEG,[M]TYP) From CPTLEC
+If [F:GTE]AUZJOU([F:JOU]TYP-1)<>2
+ GMESSAGE = [F:JOU]JOU-mess(8,106,1)-[M]TYP
+ # Journal non autorisé sur ce type de pièce
+ mkstat = 2 : Return
+Endif
+#--- Code d'accès... Droit d'execution.
+Call CONTEXE([F:JOU]ACS) From CPTSUB
+If mkstat : GMESSAGE = [F:JOU]JOU-GMESSAGE : Return : Endif
+#--- Etat du journal compatible avec la société
+Read [JST]JST0 = [M]CPY;[F:JOU]JOU
+If fstat | [F:JST]OPGSTRDAT>[M]ACCDAT | ([F:JST]OPGENDDAT<>[0/0/0] and [F:JST]OPGENDDAT<[M]ACCDAT)
+ GMESSAGE = [F:JOU]JOU-mess(92,104,1)-"("+format$("D:"+GFMDAT,[M]ACCDAT)+")"
+ mkstat = 2 : Return :  # Journal non ouvert
+Endif
+#--- Compte interdit... (Même contrôle en CONTACC mais cdt sous GOMPTA<>3 ?)
+If VALEUR<>[M]JOU
+ Local Integer I, K, NOL,NBLED, IND
+ Local Char WLED(GLONLED),WACC(GLONGAC), WCUR(GLONCUR)
+ Case [M:HAEF]TYPENT
+  When 1 : NBLED = [M:HAEF]NBRLED    # Saisie en colonne
+  When 2 : NBLED = 1                 # Saisie en ligne
+ Endcase
+ For NOL=0 To [M]NBLIG-1
+  For J=1 To [L]NBLED
+   WACC=evalue("[M]ACC"+num$(J)+"("+num$(NOL)+")")
+   If WACC<>""
+    Case [M:HAEF]TYPENT
+     When 1 : Call LECLED([M]CPY,[M:HAEF]LEDTYP(J-1),WLED,WCUR) From CPTDIV   :     # Saisie en colonne
+     When 2 : Call LECLED([M]CPY,[M]LEDTYP(NOL),WLED,WCUR) From CPTDIV        :     # Saisie en ligne
+    Endcase
+    Call INDLED(WLED,"",IND,K) From CPTDIV
+    Call LEC_JCO_LEG(GCURLEG,GLEDCOA(IND),[F:JOU]JOU) From CPTLEC
+    If !find(WACC,[F:JCO]ACC,[F:JCO]FRQACC(0..[F:JCO]FRQNBR-1))
+     For I=0 To dim([F:JCO]FBDACC)-1
+      If pat(WACC,[F:JCO]FBDACC(I))
+       # Ligne no NOL - ACC Compte interdit sur le journal JOU
+       GMESSAGE = mess(47,106,1)-num$(NOL+1)-"\"+WACC-mess(14,106,1)-[M]JOU-"("+GLEDCOA(IND)+")"
+       mkstat = 2 : Break 3
+      Endif
+     Next I
+    Endif
+   Endif
+  Next J
+ Next NOL
+Endif
+#--- Journal de trésorerie... Devise de Compte à vérifer.
+
+Return
+
+####################################################################################################
+# V150 : Passer $CONTDAT en Subprog CONTDAT() pour gérer la date de l'extourne
+#02/08 : A revoir l'extourne... il serait préférable d'appeller un CALL EXTOURNE
+#Subprog CONTDAT(VALEUR)
+#Variable Date VALEUR
+
+$CONTDAT
+Local Char    BID(30), BID1(30), BID2(30)
+Local Decimal OFIY
+Local Integer NBLED
+Local Integer I, J
+
+# Vérifie qu'un au moins des référentiels saisissable possède un exercice/période ouvert.
+For I=0 To [M:HAEF]NBRLED-1
+ mkstat=0
+ Call CONTPER(VALEUR,[M:HAEF]LEDTYP(I),[M]FCY) From CPTSUB
+ If !mkstat : Break : Endif
+Next
+If mkstat
+ GMESSAGE = mess(1,104,1)-"\"-GMESSAGE : # Date incorrecte
+ mkstat = 2 : Return
+Endif
+
+If GCOMPTA<>3  :# Compta
+ Call CTLVLYDAT(VALEUR,[F:GDE]VLYSTR,[F:GDE]VLYEND) From CPTSUB
+ If mkstat : GMESSAGE = [F:GDE]DIA-GMESSAGE : Return : Endif
+Endif
+If dim([F:GTE]VLYSTR)>0
+ Call CTLVLYDAT(VALEUR,[F:GTE]VLYSTR,[F:GTE]VLYEND) From CPTSUB
+ If mkstat : GMESSAGE = [F:GTE]TYP-GMESSAGE : Return : Endif
+Endif
+
+If VALEUR<>[M]ACCDAT & [F:GDE]FLGLOT<>2
+ #-- Changement d'exericice interdit.
+ #-- Lecture de tous les référentiels. Si un changement, recherche de ce référentiel dans la pièce.
+ If !clalev([F:DAE3]) : Local File GACCENTRYD  [DAE3] : Endif
+ For I=0 To [M:HAEF]NBRC-1
+  Call GETEXE([M]CPY,[M:HAEF]TYPC(I),VALEUR,OFIY) From CPTSUB
+  If GREP<>"D" & [M:HAEF]FIY(I)<>OFIY
+   Filter [DAE3] Where TYP=[M]TYP & NUM=[M]NUM & LEDTYP=[M:HAEF]TYPC(I)
+   Read [DAE3]First
+   If !fstat
+    GMESSAGE = mess(5,106,1) : # Changement d'exercice interdit
+    mkstat = 2 : Break
+   Endif
+  Endif
+ Next
+ Filter [DAE3]
+ If mkstat : Return : Endif
+
+ #--- Contrôle de validité de dates : comptes, répartition et sections
+ Case [M:HAEF]TYPENT
+  When 1 : NBLED = [M:HAEF]NBRLED    # Saisie en colonne
+  When 2 : NBLED = 1                 # Saisie en ligne
+ Endcase
+ For I=0 To [M]NBLIG-1
+  For J=1 To [L]NBLED
+   # Collectif / Compte
+   BID1= evalue("[M]SAC"+num$(J)+"("+num$(I)+")")
+   If BID1<>""
+    BID2 = evalue("[M]COA"+num$(J)+"("+num$(I)+")")
+    Read [F:GAC]GAC1=BID2;BID1
+    Call CTLVLYDAT(VALEUR,[F:GAC]VLYSTR,[F:GAC]VLYEND) From CPTSUB
+    If mkstat : GMESSAGE=mess(27,102,1)-[F:GAC]ACC-GMESSAGE : Break 2: Endif : # Collectif
+   Else
+    BID= evalue("[M]ACC"+num$(J)+"("+num$(I)+")")
+    If BID<>""
+     BID2 = evalue("[M]COA"+num$(J)+"("+num$(I)+")")
+     Call LEC_GAC(BID,BID2) From CPTLEC
+     Call CTLVLYDAT(VALEUR,[F:GAC]VLYSTR,[F:GAC]VLYEND) From CPTSUB
+     If mkstat : GMESSAGE=mess(2,113,1)-BID-GMESSAGE : Break 2 : Endif : # Compte
+    Endif
+   Endif
+   # Répartition
+   Case [M]DSP(I)
+    When ""
+    When "$"
+     For K=[M]PTV(I) To [M]PTF(I)
+      For AXI=1 To 20
+       BID = evalue("[M:VT2]TBCCE"+num$(AXI)+"("+num$(K)+")")
+       If BID<>""
+        Call LEC_CCE(BID,[M:HAEF]DIE(AXI-1)) From CPTLEC
+        Call CTLVLYDAT(VALEUR,[F:CCE]VLYSTR,[F:CCE]VLYEND) From CPTSUB
+        If mkstat : GMESSAGE=mess(48,105,1)-BID-GMESSAGE : Break 2 : Endif : # Section
+       Endif
+      Next
+     Next
+    When Default
+     Call LEC_DSP([M]DSP(I)) From CPTLEC
+     Call CTLVLYDAT(VALEUR,[F:DSP]VLYSTR,[F:DSP]VLYEND) From CPTSUB
+     If mkstat : GMESSAGE=mess(23,106,1)-[M]DSP(I)-GMESSAGE : Endif : # Répartition ana
+   Endcase
+   If mkstat : Break 2 : Endif
+   # Sections
+   For AXI=1 To 20
+    BID=evalue("[M]CCE"+num$(AXI)+"("+num$(I)+")")
+    If BID<>""
+     Call LEC_CCE(BID,[M:HAEF]DIE(AXI-1)) From CPTLEC
+     Call CTLVLYDAT(VALEUR,[F:CCE]VLYSTR,[F:CCE]VLYEND) From CPTSUB
+     If mkstat : GMESSAGE=mess(48,105,1)-BID-GMESSAGE : Break 2 : Endif : # Section
+    Endif
+   Next AXI
+  Next J
+ Next I
+ If mkstat : Return : Endif
+Endif
+Return
+
+###########################################################################################################
+Subprog MESSPER(DAT,LEDTYP,SITE)
+Value Date    DAT
+Value Integer LEDTYP
+Value Char    SITE
+
+Local Decimal OFIY, OPER
+Local Integer OK
+
+Call GETPER(SITE,LEDTYP,DAT,OFIY,OPER) From CPTSUB
+If [F:PER]PERSTA>2
+ GMESSAGE = mess(36,101,1) : # Période fermée
+ Call ERREUR(GMESSAGE) From GESECRAN
+ mkstat=2
+Endif
+End
+
+###########################################################################################################
+$INITBPR
+Local Integer I, J, OK
+Local Char    CODCPT(GLONCAC)
+
+Gosub SETPRIO
+Raz OK , GMESSAGE
+For I=1 To len(PRIO)
+ mkstat = 0 : Raz [F:GAC]
+ Case mid$(PRIO,I,1)
+  When "1"
+   If [F:BPR]BPCFLG=2 : # Client
+    Call LEC_BPC(VALEUR) From CPTLEC
+    Call INIT_COMPTE(VALEUR,GSOCIETE,"C",CODCPT) From CPTSUB
+    If [L]CODCPT<>""
+     Read [CAC]CAC0 = 2;[L]CODCPT;WCOA
+     Call LEC_GAC([F:CAC]ACC(0),WCOA) From CPTLEC
+     If [F:GAC]AUZBPR(0)=2
+      Call CONTACC([F:GAC]ACC,[M:HAEF]LEDTYP(LEDIND-1),[M:HAEF]LED(LEDIND-1),[M]FCYLIN(NOL),[M]CUR,[M]ACCDAT) From SUBGA1
+      If !mkstat : OK=1 : Break : Endif
+     Endif
+    Endif
+   Endif
+  When "2"
+   If [F:BPR]BPSFLG=2 : # Fournisseur
+    Call LEC_BPS(VALEUR) From CPTLEC
+    Call INIT_COMPTE(VALEUR,GSOCIETE,"F",CODCPT) From CPTSUB
+    If [L]CODCPT<>""
+     Read [CAC]CAC0 = 3;[L]CODCPT;WCOA
+     Call LEC_GAC([F:CAC]ACC(0),WCOA) From CPTLEC
+     If [F:GAC]AUZBPR(1)=2
+      Call CONTACC([F:GAC]ACC,[M:HAEF]LEDTYP(LEDIND-1),[M:HAEF]LED(LEDIND-1),[M]FCYLIN(NOL),[M]CUR,[M]ACCDAT) From SUBGA1
+      If !mkstat : OK=1 : Break : Endif
+     Endif
+    Endif
+   Endif
+  When Default
+   If clalev([F:BPR])=0 : Local File =GTABCPT+"BPARTNER" [BPR] : Endif
+   Call LEC_BPR(VALEUR) From CPTLEC
+   If [F:BPR]ACCCOD<>""
+    Read [CAC]CAC0 = 17;[F:BPR]ACCCOD;WCOA
+    Call LEC_GAC([F:CAC]ACC(0),WCOA) From CPTLEC
+    If [F:GAC]AUZBPR(5)=2
+     Call CONTACC([F:GAC]ACC,[M:HAEF]LEDTYP(LEDIND-1),[M:HAEF]LED(LEDIND-1),[M]FCYLIN(NOL),[M]CUR,[M]ACCDAT) From SUBGA1
+     If !mkstat : OK=1 : Break : Endif
+    Endif
+   Endif
+  Endcase
+ Next I
+ If OK
+  Gosub SETACC
+  Gosub CONTBPRACC
+  Return
+ Endif
+Return
+
+###########################################################################################################
+$CONTBPR
+Local Integer I, J, OK
+Gosub SETPRIO
+Raz OK , GMESSAGE
+If [L]WACC<>""
+ Call LEC_GAC(WACC,WCOA) From CPTLEC
+ If [F:GAC]SAC<>2 : Return : Endif
+ OKBPR+=1
+ Gosub CONTBPRACC
+Else
+ # Message d'erreur
+ #       => Transaction ligne
+ #       => Transaction colonne et dernier colonne compte et aucun compte renseigné
+ If [M:HAEF]TYPENT=2 or ([M:HAEF]TYPENT=1 & LEDIND=[M:HAEF]NBRLED & !OKBPR) :
+  GMESSAGE = mess(44,106,1) : # Impossible de déterminer le compte collectif
+  mkstat = 2 : End
+ Endif
+Endif
+Return
+
+##########
+$CONTBPRACC
+Raz OK , GMESSAGE
+If [F:BPR]BPCFLG=2 & [F:GAC]AUZBPR(0)=2
+ If clalev([F:BPC])=0 : Local File =GTABCPT+"BPCUSTOMER" [BPC] : Endif
+ Call LEC_BPC(VALEUR) From CPTLEC
+ If [M]FLGREP=2 or [M]REFINT<>"" or [F:BPC]BPCSTA=2 : # Pour les à-nouveaux et les écritures internes
+  OK = 1 : Return
+ Else
+  GMESSAGE = mess(4,119,1)
+ Endif
+Endif
+If [F:BPR]BPSFLG=2 & [F:GAC]AUZBPR(1)=2
+ If clalev([F:BPS])=0 : Local File =GTABCPT+"BPSUPPLIER" [BPS] : Endif
+ Call LEC_BPS(VALEUR) From CPTLEC
+ If [M]FLGREP=2 or [M]REFINT<>"" or [F:BPS]ENAFLG=2 : # Pour les à-nouveaux
+  OK = 1 : Return
+ Else
+  GMESSAGE = mess(5,119,1)
+ Endif
+Endif
+OK += [F:BPR]BPTFLG=2 & [F:GAC]AUZBPR(2)=2
+OK += [F:BPR]FCTFLG=2 & [F:GAC]AUZBPR(3)=2
+OK += [F:BPR]REPFLG=2 & [F:GAC]AUZBPR(4)=2
+OK += [F:BPR]BPRACC=2 & [F:GAC]AUZBPR(5)=2
+If OK : Return : Endif
+If GMESSAGE=""
+ GMESSAGE = mess(45,106,1)-"\("+[F:GAC]COA-[F:GAC]ACC+"/"+[F:BPR]BPRNUM+")" : # Tiers incompatible avec le collectif
+Endif
+mkstat=2
+Return
+
+########
+$SETPRIO
+Local Char    PRIO(10)
+If GCOMPTA<>3 & clalev([F:GDE])>0 :# Compta
+ PRIO = [F:GDE]BPRFLG
+Endif
+If PRIO=""
+ PRIO = "1234567890"
+Endif
+Return
+
+########
+$SETACC
+Case [M:HAEF]TYPENT
+ When 1
+ # Saisie en colonne
+  Assign "[M:"+ABR+"]ACC"+num$(LEDIND)+"(NOL)" With [F:GAC]ACC
+  If [F:GAC]SAC=2
+   Assign "[M:"+ABR+"]SAC"+num$(LEDIND)+"(NOL)" With [F:GAC]ACCSHO
+  Else
+   Assign "[M:"+ABR+"]SAC"+num$(LEDIND)+"(NOL)" With ""
+  Endif
+  Case LEDIND
+   When 1 : Call AM_ACC1(num$(evalue("[M:"+ABR+"]ACC1(NOL)"))) From SUBGA0
+   When 2 : Call AM_ACC2(num$(evalue("[M:"+ABR+"]ACC2(NOL)"))) From SUBGA0
+   When 3 : Call AM_ACC3(num$(evalue("[M:"+ABR+"]ACC3(NOL)"))) From SUBGA0
+   When 4 : Call AM_ACC4(num$(evalue("[M:"+ABR+"]ACC4(NOL)"))) From SUBGA0
+   When 5 : Call AM_ACC5(num$(evalue("[M:"+ABR+"]ACC5(NOL)"))) From SUBGA0
+   When 6 : Call AM_ACC6(num$(evalue("[M:"+ABR+"]ACC6(NOL)"))) From SUBGA0
+   When 7 : Call AM_ACC7(num$(evalue("[M:"+ABR+"]ACC7(NOL)"))) From SUBGA0
+   When 8 : Call AM_ACC8(num$(evalue("[M:"+ABR+"]ACC8(NOL)"))) From SUBGA0
+   When 9 : Call AM_ACC9(num$(evalue("[M:"+ABR+"]ACC9(NOL)"))) From SUBGA0
+  Endcase
+ When 2
+ # Saisie en ligne
+  Assign "[M:"+ABR+"]ACC1(NOL)" With [F:GAC]ACC
+  If [F:GAC]SAC=2
+   Assign "[M:"+ABR+"]SAC1(NOL)" With [F:GAC]ACCSHO
+  Else
+   Assign "[M:"+ABR+"]SAC1(NOL)" With ""
+  Endif
+  Call AM_ACC1(num$(evalue("[M:"+ABR+"]ACC1(NOL)"))) From SUBGA0
+Endcase
+OKBPR+=1
+Return
+
+###########################################################################################################
+$SETDES
+Local Char WCOA(GLONCOA),WACC(GLONGAC), ABR(10)
+Gosub SETNOL
+#Issue 83008 – 2018-04-06 by MADOR - VATLINGNR : in GESGAS description '=' is KO
+If dim([L]VATLINGNRFLG) > 0 and [L]VATLINGNRFLG = 1
+ NOL -= 1
+Endif
+#Issue end
+Call MSKABR("DES",ABR) From SUBGASA
+Case [M:HAEF]TYPENT
+ When 1
+  # Saisie en colonne
+  For I=1 To [M:HAEF]NBRLED
+   WACC = evalue("[M:"+ABR+"]ACC"+num$(I)+"("+num$(NOL)+")")
+   If WACC<>""
+    #WCOA = evalue("[M:"+ABR+"]COA"+num$(I)+"("+num$(NOL)+")")
+    WCOA = [M:HAEF]COA(I-1)
+    WSAC = evalue("[M:"+ABR+"]SAC"+num$(I)+"("+num$(NOL)+")")
+    Call LEC_GAC(WACC,WCOA) From CPTLEC
+    If VALEUR="/" | (VALEUR="=" & NOL=0)
+     If WSAC=""
+      Call LECTEXTRA(VALEUR,"GACCOUNT","DESTRA",[F:GAC]COA,[F:GAC]ACC) From ATEXTRA
+     Else
+      Call LEC_BPR([M]BPR(NOL)) From CPTLEC
+      VALEUR = [F:BPR]BPRNAM
+     Endif
+    Elsif VALEUR="="
+     VALEUR = [M]DES(NOL-1)
+    Endif
+    Break
+   Endif
+  Next
+ When 2
+  # Saisie en ligne
+   WACC = evalue("[M:"+ABR+"]ACC1("+num$(NOL)+")")
+   If WACC<>""
+    WCOA = evalue("[M:"+ABR+"]COA1("+num$(NOL)+")")
+    WSAC = evalue("[M:"+ABR+"]SAC1("+num$(NOL)+")")
+    Call LEC_GAC(WACC,WCOA) From CPTLEC
+    If VALEUR="/" | (VALEUR="=" & NOL=0)
+     If WSAC=""
+      Call LECTEXTRA(VALEUR,"GACCOUNT","DESTRA",[F:GAC]COA,[F:GAC]ACC) From ATEXTRA
+     Else
+      Call LEC_BPR([M]BPR(NOL)) From CPTLEC
+      VALEUR = [F:BPR]BPRNAM
+     Endif
+    Elsif VALEUR="="
+     VALEUR = [M]DES(NOL-1)
+    Endif
+   Endif
+Endcase
+Return
+
+###########################################################################################################
+$SETQTY
+Local Integer OK, I, STAT
+
+#-- La zone quantité est elle présente...
+Call DD_QTY(OK) From SUBGA0
+If !OK : Return : Endif
+
+Local Char WCOA(GLONCOA),WACC(GLONGAC),ABR(10)
+Call MSKABR("QTY",ABR) From SUBGASA
+Gosub SETNOL
+Case [M:HAEF]TYPENT
+ When 1
+  # Saisie en colonne
+  For I=1 To [M:HAEF]NBRLED
+   WACC = evalue("[M:"+ABR+"]ACC"+num$(I)+"(NOL)")
+   If WACC<>""
+    WCOA = [M:HAEF]COA(I-1)
+    Call LEC_GAC(WACC,WCOA) From CPTLEC
+    If [F:GAC]FLGUOM=2 & [F:GAC]VALUOM<>0
+     If dim([M]TYPRAT)>0
+      Call CONVERT([M]CUR,GCURSHR,GCURSHR,[M]TYPRAT,[M]RATDAT
+&                 ,[M]DEB(NOL)+[M]CDT(NOL),VALEUR,STAT) From TRTDEV
+     Else
+      Call CONVERT([M]CUR,GCURSHR,GCURSHR,[F:GTE]TYPRAT,[M]RATDAT
+&                 ,[M]DEB(NOL)+[M]CDT(NOL),VALEUR,STAT) From TRTDEV
+     Endif
+     VALEUR = VALEUR/[F:GAC]VALUOM
+     Call AROQTE(VALEUR,[F:GAC]UOM) From CPTINI
+    Endif
+   Endif
+  Next
+ When 2
+  # Saisie en ligne
+   WACC = evalue("[M:"+ABR+"]ACC1(NOL)")
+   If WACC<>""
+    WCOA = evalue("[M:"+ABR+"]COA1(NOL)")
+    Call LEC_GAC(WACC,WCOA) From CPTLEC
+    If [F:GAC]FLGUOM=2 & [F:GAC]VALUOM<>0
+     If dim([M]TYPRAT)>0
+      Call CONVERT([M]CUR,GCURSHR,GCURSHR,[M]TYPRAT,[M]RATDAT
+&                ,[M]DEB(NOL)+[M]CDT(NOL),VALEUR,STAT) From TRTDEV
+     Else
+      Call CONVERT([M]CUR,GCURSHR,GCURSHR,[F:GTE]TYPRAT,[M]RATDAT
+&                ,[M]DEB(NOL)+[M]CDT(NOL),VALEUR,STAT) From TRTDEV
+     Endif
+     VALEUR = VALEUR/[F:GAC]VALUOM
+     Call AROQTE(VALEUR,[F:GAC]UOM) From CPTINI
+    Endif
+   Endif
+Endcase
+Return
+
+#######
+$SETNOL
+Local Integer NOL
+NOL = nolign-1
+Return
+
+###########################################################################################################
+Subprog INIDSP(VALEUR,ACC,COA)
+Variable Char VALEUR
+Value    Char ACC
+Value    Char COA
+If VALEUR<>"" | [L]ACC="" : End : Endif
+If !clalev([F:GAC]) : Local File =GTABCPT+"GACCOUNT" [GAC] : Endif
+Call LEC_GAC([L]ACC,[L]COA) From CPTLEC
+VALEUR = [F:GAC]DSP
+End
+
+
+###########################################################################################################
+Subprog INIPRO(COA,ACC)
+Value    Char COA()
+Variable Char ACC()
+
+# Initialisation par règle de prorogation.
+# Utilisation de variable globale qui sauvegarde la struture.
+Local Integer NB, IND, AXE
+Local Char CRIBLE
+Raz mkstat
+For NB=1 To GNBSTR
+ Call INDLED(GSTRLED(NB),"",IND,AXE) From CPTDIV
+ If [L]COA<>"" & GSTRACC(NB)<>"" & [L]COA = GLEDCOA(IND) : # Demande 55712
+  [L]ACC = GSTRACC(NB)
+  mkstat = 2 : Break
+ Endif
+ Call INIACC(GLEDCOA(IND),GSTRACC(NB),[L]COA,[L]ACC,CRIBLE) From CPTINI
+ If [L]ACC<>"" : Break : Endif
+Next
+If [L]ACC<>"" & [L]ACC = [L]CRIBLE : mkstat=2  : Endif
+End
+
+###########################################################################################################
+Subprog UPDPRO(TYP,COA,ACC)
+Value    Integer TYP
+Value    Char    COA()
+Variable Char    ACC()
+
+# Modification des comptes selon les règles de prorogation.
+# Utilisation de variable globale qui sauvegarde la struture.
+Local Integer NB, IND, AXE
+Local Char CRIBLE
+Raz mkstat
+For NB=1 To GNBSTR
+ If NB<>TYP
+  Call INDLED(GSTRLED(NB),"",IND,AXE) From CPTDIV
+  If [L]COA<>"" & GSTRACC(NB)<>"" & [L]COA = GLEDCOA(IND) : # Demande 55712
+   [L]ACC = GSTRACC(NB)
+   mkstat = 2 : Break
+  Endif
+  Call INIACC(GLEDCOA(IND),GSTRACC(NB),[L]COA,[L]ACC,CRIBLE) From CPTINI
+  If [L]ACC<>"" : Break : Endif
+ Endif
+Next
+If [L]ACC<>"" & [L]ACC = [L]CRIBLE : mkstat=2  : Endif
+End
+
+###########################################################################################################
+Subprog SETCOURS(NUM,DEV1,DEV2,RAT)
+Value    Integer NUM
+Variable Char DEV1
+Variable Char DEV2
+Variable Decimal RAT
+
+DEV1 = [M]CUR
+DEV2 = [M:HAEW]CURLED(NUM)
+
+Local Integer INDLED
+INDLED = [M:HAEW]LEDTYP(NUM)-1
+
+## Bug 56942
+If [M:HAEF]RATDIVC(INDLED)=0 & [M:HAEF]RATMLTC(INDLED)=0 & DEV1=DEV2
+ [M:HAEF]RATDIVC(INDLED)=1
+ [M:HAEF]RATMLTC(INDLED)=1
+Endif
+## Fin bug 56942
+
+If [M:HAEF]RATDIVC(INDLED)=1 # Comportement V140
+ RAT  = [M:HAEF]RATMLTC(INDLED)
+Else
+ If [M:HAEF]RATDIVC(INDLED)=0
+  RAT = 0
+ Else
+  RAT  = [M:HAEF]RATMLTC(INDLED)/[M:HAEF]RATDIVC(INDLED)
+ Endif
+Endif
+[L]RAT  = arr([L]RAT,10^-GDECRCU) ## Issue $79877
+If DEV1<>DEV2 & ( ([M:HAEF]RATMLTC(INDLED)=0 & [F:GCM]DACRAT(INDLED)<>2) | ([M:HAEF]RATDIVC(INDLED)=0 & [F:GCM]DACRAT(INDLED)<>1))
+ GMESSAGE=mess(16,114,1)-DEV1-"->"-DEV2-"("+format$("D:"+GFMDAT,[M]RATDAT)+")"
+ mkstat=2
+Endif
+End
+
+###########################################################################################################
+Subprog SETDES_ON_VAT_LINE(VALEUR)
+#Issue 83008 – 2018-04-06 by MADOR - VATLINGNR : in GESGAS description '=' is KO
+Variable Char VALEUR
+
+Local Integer VATLINGNRFLG : [L]VATLINGNRFLG = 1
+Gosub SETDES
+[L]VATLINGNRFLG = 0
+#Issue end
+End
+
